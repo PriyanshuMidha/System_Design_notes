@@ -3,9 +3,9 @@
 types of drive
 
 - hdd[[HDD]]
-- SSD[[SSD]]
-- USB[[USB]]
-- SD card[[SD Cards]]
+- SSDSSD
+- USBUSB
+- SD cardSD Cards
 
 ## Complete notes
 
@@ -64,7 +64,7 @@ flowchart TD
 
 ### Key terms
 
-`SSD`, `HDD`, `capacity`, `IOPS`, `backup`
+`SSD`, `HDD`, `capacity`, `IOPS`, `[[Backup and Restore|backup]]`
 
 ### Real project example
 

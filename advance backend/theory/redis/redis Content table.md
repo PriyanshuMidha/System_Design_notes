@@ -13,7 +13,7 @@ uses of Redis [[uses of redis]]
 
 ## Revision dashboard
 
-Redis is an in-memory data store used for cache, sessions, queues, pub/sub, rate limiting, counters, and real-time backend features.
+Redis is an in-memory data store used for cache, [[Sessions and Cookies|sessions]], queues, pub/sub, rate limiting, counters, and real-time backend features.
 
 ### Study order
 
@@ -67,3 +67,47 @@ flowchart LR
 | leaderboard | Sorted set |
 | unique online users | Set |
 | sliding rate limit | Sorted set |
+
+## Related backend notes
+
+- [[cache]] and [[type of cache]] explain general caching concepts.
+- [[API Caching with Redis]] explains Redis as API cache.
+- [[Rate limiting with Redis]] explains Redis counters/token buckets/sliding windows.
+- [[Message Queue with Redis]], [[Background Jobs]], and [[Worker Architecture]] explain async work.
+- [[Sessions and Cookies]] explains Redis session-store use cases.
+
+## Visual topic map
+
+Use this map like the Excalidraw roadmap: follow the arrows first, then open the linked notes.
+
+```mermaid
+flowchart LR
+  N1["what is redis"]
+  N2["uses of redis"]
+  N3["API Caching with Redis"]
+  N4["Rate limiting with Redis"]
+  N5["Message Queue with Redis"]
+  N6["redis setup"]
+  N1 --> N2
+  N2 --> N3
+  N3 --> N4
+  N4 --> N5
+  N5 --> N6
+```
+
+## Color legend
+
+- <span class="sd-key">Blue</span> = core concept
+- <span class="sd-good">Green</span> = recommended pattern
+- <span class="sd-risk">Red</span> = risk or failure mode
+- <span class="sd-tradeoff">Purple</span> = tradeoff
+- <span class="sd-2026">Orange</span> = current 2026 update
+
+## Linked notes in this map
+
+- [[what is redis]]
+- [[uses of redis]]
+- [[API Caching with Redis]]
+- [[Rate limiting with Redis]]
+- [[Message Queue with Redis]]
+- [[redis setup]]

@@ -13,7 +13,7 @@ chat app
 
 ## Complete notes
 
-Queue is a linear data structure.
+[[Message Queue with Redis|Queue]] is a linear data structure.
 
 It follows FIFO.
 

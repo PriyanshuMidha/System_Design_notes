@@ -1,5 +1,7 @@
 # Advance backend content table
 
+- [[START HERE - Advanced Backend SDE3 Path]]
+
 ## Course Part 1
 
 - [[Basic backend content table]]
@@ -31,7 +33,7 @@
 
 ## Revision dashboard
 
-Advanced Backend + AI means learning how modern backend systems run, scale, cache, queue work, design architecture, connect with LLMs, retrieve knowledge, and deploy to cloud.
+Advanced Backend + AI means learning how modern backend systems run, scale, [[cache]], queue work, design architecture, connect with LLMs, retrieve knowledge, and deploy to cloud.
 
 ## Big picture diagram
 
@@ -86,3 +88,28 @@ flowchart LR
 - AI engineering connects backend with LLMs and tools.
 - RAG connects LLMs with private documents.
 - AWS/CI-CD deploys the system to production.
+
+## Missing topic groups added
+
+- [[API Design Content Table]]
+- [[Auth Security Content Table]]
+- [[Database Content Table]]
+- [[Reliability Content Table]]
+- [[Observability Content Table]]
+- [[Deployment Strategies Content Table]]
+- [[AWS Services Content Table]]
+
+## Language backend implementation track
+
+- [[Golang Backend Content Table]]
+
+## SDE-3 upgrade topics
+
+- [[SDE3 Backend Roadmap]]
+- [[Distributed Systems Content Table]]
+- [[Data Modeling Content Table]]
+- [[Production Debugging Content Table]]
+- [[Testing Strategy Content Table]]
+- [[Architecture Patterns Content Table]]
+- [[Performance Engineering Content Table]]
+- [[System Design Practice Content Table]]

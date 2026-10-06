@@ -21,11 +21,11 @@ The app should be easy to deploy, scale, monitor, and recover.
 
 ## Example
 
-Instead of installing everything on one server, we package the app in containers and run it on cloud infrastructure.
+Instead of installing everything on one server, we package the app in [[Docker_Image_Container|containers]] and run it on cloud infrastructure.
 
 ## Benefit
 
-Cloud native apps can handle change better because they are built for automation and scaling.
+Cloud native apps can handle change better because they are built for automation and [[Scaling Concepts|scaling]].
 
 ## Revision notes
 
@@ -64,7 +64,7 @@ flowchart LR
 
 ### Key terms
 
-`container`, `CI/CD`, `observability`, `autoscaling`
+`container`, `CI/CD`, `observability`, `[[Autoscaling|autoscaling]]`
 
 ### Real project example
 

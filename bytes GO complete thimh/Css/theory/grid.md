@@ -70,7 +70,7 @@ flowchart TD
 
 ### Key terms
 
-`grid container`, `tracks`, `row`, `column`, `gap`, `area`
+`grid [[Docker_Image_Container|container]]`, `tracks`, `row`, `column`, `gap`, `area`
 
 ### Real project example
 

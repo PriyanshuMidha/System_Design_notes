@@ -1,4 +1,4 @@
-different level of DNS server
+different level of [[whtat DNS|DNS]] server
 
 - root level
 - Top level Domain(TLD)
@@ -20,7 +20,7 @@ different level of DNS server
 
 ### What it is
 
-DNS lookup is the step-by-step process of finding the IP for a domain.
+DNS lookup is the step-by-step process of finding the IP for a [[Domain DNS HTTPS SSL TLS|domain]].
 
 ### Why it matters
 
@@ -61,7 +61,7 @@ sequenceDiagram
 
 ### Key terms
 
-`recursive resolver`, `root server`, `TLD`, `authoritative server`, `cache`
+`recursive resolver`, `root server`, `TLD`, `authoritative server`, `[[cache]]`
 
 ### Real project example
 

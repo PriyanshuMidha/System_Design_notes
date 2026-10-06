@@ -27,7 +27,7 @@ Cloud native topic map:
 
 ### Main idea
 
-Cloud native apps are built for automation, scaling, resilience, and observability.
+Cloud native apps are built for automation, [[Scaling Concepts|scaling]], resilience, and observability.
 
 ### Study order
 

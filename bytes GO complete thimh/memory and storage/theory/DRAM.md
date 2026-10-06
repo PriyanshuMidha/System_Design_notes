@@ -6,9 +6,9 @@ it is high maintenance
 
 ## TYPE of DRAM
 
-- FPM DRAM[[FPM DRAM]]  not used
-- EDO  DRAM[[EDO  DRAM]]. not used
-- SDRAM[[ SDRAM]]
+- FPM DRAMFPM DRAM  not used
+- EDO  DRAMEDO DRAM. not used
+- SDRAMSDRAM
 - DDR SDRAM[[DDR SDRAM]]
 - GDDRM SDRM[[ GDDRM SDRM]]
 

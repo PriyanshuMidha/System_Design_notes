@@ -73,7 +73,7 @@ flowchart TD
 
 ### Key terms
 
-`min heap`, `max heap`, `priority queue`, `top K`
+`min heap`, `max heap`, `priority [[Message Queue with Redis|queue]]`, `top K`
 
 ### Real project example
 

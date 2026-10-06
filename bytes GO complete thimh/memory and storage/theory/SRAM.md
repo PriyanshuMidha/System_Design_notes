@@ -2,7 +2,7 @@
 
 it is a static type of memory
 used in high speed applications
-this is used where cpu caching is used quick access time is important
+this is used where cpu [[API Caching with Redis|caching]] is used quick access time is important
 
 - cpu caches
 - Faster than DRAM
@@ -25,7 +25,7 @@ It is faster than DRAM and does not need constant refreshing.
 
 ## Use case
 
-CPU cache like L1, L2, and L3 often uses SRAM.
+CPU [[cache]] like L1, L2, and L3 often uses SRAM.
 
 ## Revision notes
 

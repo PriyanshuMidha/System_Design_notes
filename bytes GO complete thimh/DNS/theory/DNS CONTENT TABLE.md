@@ -21,7 +21,7 @@ DNS topic map:
 
 ### Main idea
 
-DNS converts domain names into IP addresses and uses caching to reduce lookup time.
+DNS converts domain names into IP addresses and uses [[API Caching with Redis|caching]] to reduce lookup time.
 
 ### Study order
 

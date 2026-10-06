@@ -8,7 +8,7 @@ CONTENT TABLE
 
 ## Complete notes
 
-Cache topic map:
+[[cache|Cache]] topic map:
 
 - [[type of cache]] explains cache levels and examples.
 - [[cache used for]] explains why cache is used.

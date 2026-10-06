@@ -84,3 +84,12 @@ flowchart LR
 - Replication copies data for read scaling.
 - Sharding splits data for write/storage scaling.
 - Microservices are powerful but add distributed-system complexity.
+
+## Related foundational notes
+
+- [[whtat DNS|DNS]] for domain-to-IP lookup before traffic reaches the backend.
+- [[what is latency|Latency]] for understanding delay and performance.
+- [[cache]] and [[API Caching with Redis]] for reducing repeated backend/database work.
+- [[REST API]] and [[Api architecture cntent table|API Architecture]] for API communication styles.
+- [[API Gateway]], [[Load Balancer]], and [[Nginx]] for request routing.
+- [[Logs Metrics Traces]] and [[Monitoring and Alerting]] for production debugging.

@@ -18,7 +18,7 @@ it give the data for the static data like img and  video
 
 ## Kakfa
 
-the message can be cache for a long period of time based on retention value
+the message can be [[cache]] for a long period of time based on retention value
 
 ![[Pasted image 20260907025440.png]]
 
@@ -38,7 +38,7 @@ the message can be cache for a long period of time based on retention value
 
 ### What it is
 
-Real cache examples show where caching appears in daily systems.
+Real cache examples show where [[API Caching with Redis|caching]] appears in daily systems.
 
 ### Why it matters
 
@@ -71,7 +71,7 @@ flowchart LR
 
 ### Key terms
 
-`browser cache`, `CDN`, `Redis`, `database cache`, `CPU cache`
+`browser cache`, `CDN`, `[[what is redis|Redis]]`, `database cache`, `CPU cache`
 
 ### Real project example
 

@@ -6,7 +6,7 @@ is part of the React core and is used for managing state within the component tr
 
 ## Redux:
 
-edux is a state management library that provides a global state container for the entire application. It allows you to manage the application state in a predictable and centralized manner.
+edux is a state management library that provides a global state [[Docker_Image_Container|container]] for the entire application. It allows you to manage the application state in a predictable and centralized manner.
 
 ##  Advantages of using `Redux Toolkit over Redux`?
 

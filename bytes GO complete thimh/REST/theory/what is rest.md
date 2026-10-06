@@ -8,7 +8,7 @@ Representational stae transfer
 
 ## Complete notes
 
-REST means Representational State Transfer.
+[[REST API|REST]] means Representational State Transfer.
 
 It is an API style based on resources.
 

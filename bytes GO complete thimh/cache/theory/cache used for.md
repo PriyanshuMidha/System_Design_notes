@@ -4,7 +4,7 @@
 
 ## Complete notes
 
-Cache is used to store frequently used data closer to where it is needed.
+[[cache|Cache]] is used to store frequently used data closer to where it is needed.
 
 ## Why cache is used
 
@@ -65,7 +65,7 @@ flowchart LR
 
 ### Key terms
 
-`latency`, `database load`, `response time`, `throughput`
+`[[what is latency|latency]]`, `database load`, `response time`, `throughput`
 
 ### Real project example
 

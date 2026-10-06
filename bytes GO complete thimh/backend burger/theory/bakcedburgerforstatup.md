@@ -25,7 +25,7 @@ For a startup, backend should start simple.
 
 ## Simple stack example
 
-Frontend → API server → Database → Logs/monitoring
+Frontend → API server → Database → Logs/[[Monitoring and Alerting|monitoring]]
 
 ## Revision notes
 
@@ -65,7 +65,7 @@ flowchart TD
 
 ### Key terms
 
-`MVP`, `monolith`, `logs`, `database`, `auth`
+`MVP`, `[[Monolith and Microservices|monolith]]`, `logs`, `database`, `auth`
 
 ### Real project example
 

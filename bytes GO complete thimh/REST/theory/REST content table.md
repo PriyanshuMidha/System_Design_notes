@@ -5,7 +5,7 @@
 
 ## Complete notes
 
-REST topic map:
+[[REST API|REST]] topic map:
 
 - [[what is rest]] explains REST idea.
 - [[use of rest]] explains where REST is used.

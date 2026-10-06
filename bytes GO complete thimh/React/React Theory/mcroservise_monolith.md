@@ -11,14 +11,14 @@ Scalability
 
 A `monolithic` architecture, also known as a monolithic application, is a traditional software architectural style in which an entire application is built as a single, self-contained unit. In a monolithic architecture
 Single Codebase
-Scaling Challenges
+[[Scaling Concepts|Scaling]] Challenges
 Single Deployment Uni
 
 ![[Pasted image 20260803230911.png]]
 
 ## Complete notes
 
-Monolith and microservice are backend architecture styles.
+[[Monolith and Microservices|Monolith]] and microservice are backend architecture styles.
 
 ## Monolith
 

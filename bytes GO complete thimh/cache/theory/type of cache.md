@@ -2,7 +2,7 @@
 
 ## L1
 
-it is the fastest cache  it is integrated int the cpu itself so it is fast is has smaller space
+it is the fastest [[cache]]  it is integrated int the cpu itself so it is fast is has smaller space
 
 ## L2
 

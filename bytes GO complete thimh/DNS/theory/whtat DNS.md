@@ -4,7 +4,7 @@ so it convert the human readble google .com to a ip addresss
 
 ## Complete notes
 
-DNS means Domain Name System.
+DNS means [[Domain DNS HTTPS SSL TLS|Domain]] Name System.
 
 It converts a human name like `google.com` into an IP address like `142.250.x.x`.
 

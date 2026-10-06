@@ -59,7 +59,7 @@ flowchart TD
 
 ### Key terms
 
-`platter`, `read/write head`, `capacity`, `latency`
+`platter`, `read/write head`, `capacity`, `[[what is latency|latency]]`
 
 ### Real project example
 

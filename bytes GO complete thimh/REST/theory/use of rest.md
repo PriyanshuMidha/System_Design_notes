@@ -10,7 +10,7 @@ version change
 
 ## Complete notes
 
-REST is used to connect frontend, backend, mobile apps, and third-party systems.
+[[REST API|REST]] is used to connect frontend, backend, mobile apps, and third-party systems.
 
 ## Common uses
 

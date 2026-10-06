@@ -59,7 +59,7 @@ flowchart TD
 
 ### Key terms
 
-`register`, `cache`, `RAM`, `virtual memory`
+`register`, `[[cache]]`, `RAM`, `virtual memory`
 
 ### Real project example
 

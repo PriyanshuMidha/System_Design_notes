@@ -15,7 +15,7 @@ const [data, setData] = useState([]);
 
 useEffect(() => {
 // Fetch data and update the state
-fetch('https://api.example.com/data')
+fetch('[[Domain DNS HTTPS SSL TLS|https]]://api.example.com/data')
 .then(response => response.json())
 .then(data => setData(data));
 }, []);

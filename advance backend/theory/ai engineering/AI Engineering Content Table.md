@@ -45,3 +45,42 @@ flowchart LR
 - Memory keeps useful information.
 - LangChain provides building blocks.
 - LangGraph controls multi-step agent flow.
+
+## Visual topic map
+
+Use this map like the Excalidraw roadmap: follow the arrows first, then open the linked notes.
+
+```mermaid
+flowchart LR
+  N1["Introduction to AI Engineering"]
+  N2["LLM Fundamentals"]
+  N3["Prompt Engineering"]
+  N4["LangChain Fundamentals"]
+  N5["LangGraph"]
+  N6["AI Agents"]
+  N7["Production AI Best Practices"]
+  N1 --> N2
+  N2 --> N3
+  N3 --> N4
+  N4 --> N5
+  N5 --> N6
+  N6 --> N7
+```
+
+## Color legend
+
+- <span class="sd-key">Blue</span> = core concept
+- <span class="sd-good">Green</span> = recommended pattern
+- <span class="sd-risk">Red</span> = risk or failure mode
+- <span class="sd-tradeoff">Purple</span> = tradeoff
+- <span class="sd-2026">Orange</span> = current 2026 update
+
+## Linked notes in this map
+
+- [[Introduction to AI Engineering]]
+- [[LLM Fundamentals]]
+- [[Prompt Engineering]]
+- [[LangChain Fundamentals]]
+- [[LangGraph]]
+- [[AI Agents]]
+- [[Production AI Best Practices]]

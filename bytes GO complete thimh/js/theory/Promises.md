@@ -101,7 +101,7 @@ so the resolve get called and return to asyn function
 
 // async function getAllUsers(){
 //     try {
-//         const response = await fetch('https://jsonplaceholder.typicode.com/users')
+//         const response = await fetch('[[Domain DNS HTTPS SSL TLS|https]]://jsonplaceholder.typicode.com/users')
 
 //         const data = await response.json()
 //         console.log(data);
