@@ -111,3 +111,7 @@ flowchart LR
 - [[Rate limiting with Redis]]
 - [[Message Queue with Redis]]
 - [[redis setup]]
+
+## Missing advanced caching topics
+
+- [[Caching Patterns and Types]]

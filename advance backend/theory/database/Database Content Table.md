@@ -1,56 +1,105 @@
 # Database Content Table
 
-- [[Database Indexing]]
-- [[Transactions]]
-- [[Connection Pooling]]
-- [[Database Migration]]
-- [[Backup and Restore]]
-- [[CAP Theorem]]
-- [[Consistent Hashing]]
+Database design covers storage, consistency, transactions, indexing, replication, migrations, backups, and query performance.
 
-## Revision dashboard
+## Study order
 
-Database engineering is about storing, querying, [[Scaling Concepts|scaling]], backing up, and protecting data.
+1. [[Transactions]]
+2. [[Database Indexing]]
+3. [[Query Plans and EXPLAIN]]
+4. [[Connection Pooling]]
+5. [[Database Migration]]
+6. [[Backup and Restore]]
+7. [[Database Replication]]
+8. [[Database Sharding]]
+9. [[CAP Theorem]]
+10. [[Consistent Hashing]]
 
-## Visual topic map
+## Complete notes
 
-Use this map like the Excalidraw roadmap: follow the arrows first, then open the linked notes.
+A database is not just where data is stored. It controls correctness, latency, durability, and recovery.
+
+For every backend design, ask:
+
+- what must be transactional?
+- what must be unique?
+- what are the common query filters?
+- what indexes are required?
+- what happens during migration?
+- how is data backed up and restored?
+- what happens if primary database fails?
+
+## Database decision flow
 
 ```mermaid
-flowchart LR
-  N1["Transactions"]
-  N2["Database Indexing"]
-  N3["Connection Pooling"]
-  N4["Database Replication"]
-  N5["Database Sharding"]
-  N6["Backup and Restore"]
-  N7["Database Migration"]
-  N1 --> N2
-  N2 --> N3
-  N3 --> N4
-  N4 --> N5
-  N5 --> N6
-  N6 --> N7
+flowchart TD
+  Data[Data requirements] --> Txn{Need transactions?}
+  Txn -- yes --> SQL[Relational DB]
+  Txn -- no --> Access{Key/document access?}
+  Access -- yes --> NoSQL[NoSQL]
+  SQL --> Index[Index design]
+  Index --> Pool[Connection pool]
+  Pool --> Migrate[Migrations]
+  Migrate --> Backup[Backup/restore]
+  Backup --> Scale[Replication/sharding]
 ```
 
-## Color legend
+## How this applies to InvoiceOps
 
-- <span class="sd-key">Blue</span> = core concept
-- <span class="sd-good">Green</span> = recommended pattern
-- <span class="sd-risk">Red</span> = risk or failure mode
-- <span class="sd-tradeoff">Purple</span> = tradeoff
-- <span class="sd-2026">Orange</span> = current 2026 update
+Use Postgres for core data:
 
-## Linked notes in this map
+- users
+- workspaces
+- clients
+- invoices
+- invoice_items
+- payments
+- webhook_events
+- audit_logs
 
-- [[Transactions]]
-- [[Database Indexing]]
-- [[Connection Pooling]]
-- [[Database Replication]]
-- [[Database Sharding]]
-- [[Backup and Restore]]
-- [[Database Migration]]
+Critical constraints:
 
-## Grill audit additions
+- unique `users.email`
+- unique `webhook_events(provider,event_id)`
+- foreign keys for invoice/client/workspace relationships
+- indexes for workspace-scoped lists
 
-- [[Query Plans and EXPLAIN]]
+## Common mistakes
+
+- no transaction around multi-row business updates
+- no index on frequent filters
+- no uniqueness constraint for idempotency
+- migration changes that lock big tables
+- connection pool too large or too small
+- no tested restore process
+
+## Senior interview bank
+
+### 1. What belongs in a transaction?
+
+All writes that must succeed or fail together. For InvoiceOps, payment webhook event insert, payment insert, invoice update, and audit log should be one transaction.
+
+### 2. How do indexes help and hurt?
+
+Indexes speed reads but cost extra storage and slow writes. Add them based on real query patterns.
+
+### 3. Why is backup not enough?
+
+You need restore testing. A backup that cannot be restored within required time is not useful.
+
+## Reviewer checklist
+
+- Are transactional boundaries clear?
+- Are uniqueness constraints defined?
+- Are indexes tied to queries?
+- Are migrations safe?
+- Is restore tested?
+- Is replication/sharding justified by scale?
+
+## Missing database scale and search topics
+
+- [[Advanced Index Types]]
+- [[Sharding Patterns]]
+- [[Cassandra and Wide Column Stores]]
+- [[Search Architecture]]
+- [[Time Series and Analytics Storage]]

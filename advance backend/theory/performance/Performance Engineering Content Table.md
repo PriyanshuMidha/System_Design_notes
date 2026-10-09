@@ -1,52 +1,91 @@
 # Performance Engineering Content Table
 
-- [[Capacity Estimation]]
-- [[Bottleneck Analysis]]
-- [[Profiling]]
-- [[Backpressure]]
-- [[Hot Keys and Hot Partitions]]
-- [[Cache Stampede Avalanche Penetration]]
+Performance engineering is finding and removing bottlenecks so the system meets latency, throughput, and cost goals.
 
-## Revision dashboard
+## Study order
 
-Performance engineering is measuring and improving latency, throughput, cost, and resource usage.
+1. [[Capacity Estimation]]
+2. [[Bottleneck Analysis]]
+3. [[Profiling]]
+4. [[Backpressure]]
+5. [[Hot Keys and Hot Partitions]]
+6. [[Cache Stampede Avalanche Penetration]]
+7. [[Thread Pools and Blocking IO]]
 
-## Visual topic map
+## Complete notes
 
-Use this map like the Excalidraw roadmap: follow the arrows first, then open the linked notes.
+Performance is not guessing. It is measurement plus tradeoffs.
+
+A senior backend engineer asks:
+
+- what is the latency target?
+- what is p50/p95/p99?
+- what is throughput?
+- what is the bottleneck: CPU, memory, DB, network, lock, queue, downstream dependency?
+- what happens under overload?
+- what gets cached and invalidated?
+- what is the cost of the optimization?
+
+## Performance flow
 
 ```mermaid
-flowchart LR
-  N1["Capacity Estimation"]
-  N2["Bottleneck Analysis"]
-  N3["Profiling"]
-  N4["Backpressure"]
-  N5["Hot Keys and Hot Partitions"]
-  N6["Cache Stampede Avalanche Penetration"]
-  N1 --> N2
-  N2 --> N3
-  N3 --> N4
-  N4 --> N5
-  N5 --> N6
+flowchart TD
+  Goal[Latency/throughput goal] --> Measure[Measure baseline]
+  Measure --> Bottleneck[Find bottleneck]
+  Bottleneck --> Fix[Apply focused fix]
+  Fix --> Validate[Load test/profile]
+  Validate --> Guard[Metrics and alerts]
 ```
 
-## Color legend
+## How this applies to InvoiceOps
 
-- <span class="sd-key">Blue</span> = core concept
-- <span class="sd-good">Green</span> = recommended pattern
-- <span class="sd-risk">Red</span> = risk or failure mode
-- <span class="sd-tradeoff">Purple</span> = tradeoff
-- <span class="sd-2026">Orange</span> = current 2026 update
+Performance appears in:
 
-## Linked notes in this map
+- dashboard summary queries
+- invoice list pagination
+- client search
+- webhook processing latency
+- reminder worker throughput
+- database connection pool sizing
+- Redis cache for expensive dashboard data
 
-- [[Capacity Estimation]]
-- [[Bottleneck Analysis]]
-- [[Profiling]]
-- [[Backpressure]]
-- [[Hot Keys and Hot Partitions]]
-- [[Cache Stampede Avalanche Penetration]]
+## Easy example
 
-## Grill audit additions
+If dashboard refresh is slow, cache `dashboard:{workspace_id}:summary` for 30 seconds and invalidate after invoice/payment changes.
 
-- [[Thread Pools and Blocking IO]]
+## Difficult production example
+
+If one workspace has millions of invoices, `GET /invoices` can become slow even with pagination unless indexes match filters like `workspace_id`, `status`, and `due_date`.
+
+## Common mistakes
+
+- optimizing without measuring
+- looking only at average latency, not p95/p99
+- adding cache without invalidation plan
+- unlimited concurrency with no backpressure
+- no database indexes for filters
+- ignoring hot keys/partitions
+- benchmarking locally and assuming production behavior
+
+## Senior interview bank
+
+### 1. How do you debug slow API latency?
+
+Break down time by handler, service, database, cache, external API, and serialization. Use logs/traces/metrics, then optimize the largest contributor.
+
+### 2. When do you add cache?
+
+Add cache when reads are repeated, data can tolerate staleness, and invalidation/TTL rules are clear.
+
+### 3. What is backpressure?
+
+Backpressure is slowing or rejecting incoming work when the system cannot safely process more, preventing collapse.
+
+## Reviewer checklist
+
+- Is there a measurable SLO?
+- Are p95/p99 tracked?
+- Is the bottleneck proven?
+- Is pagination/indexing correct?
+- Is cache invalidation defined?
+- Is overload behavior explicit?

@@ -79,3 +79,7 @@ flowchart LR
 - [[Vector Databases]]
 - [[Semantic Search]]
 - [[AI Chat with PDFs and Websites]]
+
+## Missing vector database topics
+
+- [[Vector Database Architecture]]
