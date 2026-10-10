@@ -47,6 +47,27 @@ type CartItem struct {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    factory := NewProductFactory()
+
+    milk1 := factory.Get("sku_milk", "Milk", "Amul")
+    milk2 := factory.Get("sku_milk", "Milk", "Amul")
+
+    fmt.Println(milk1 == milk2)
+}
+```
+
+## Example output
+
+```text
+true
+```
+
+Both cart items share the same product metadata object.
+
 ## Real-life example
 
 Thousands of cart/order items can reference the same product metadata instead of duplicating product name, brand, image URL, and category everywhere in memory.

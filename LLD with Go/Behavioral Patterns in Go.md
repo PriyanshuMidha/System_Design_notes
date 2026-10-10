@@ -25,19 +25,19 @@ Behavioral patterns make these responsibilities explicit.
 
 ## Subtopics
 
-| Pattern | Core purpose | Real-world analogy | Go note |
-|---|---|---|---|
-| Observer | Notifies subscribers when state changes | YouTube subscribers get video notification | [[Observer Pattern in Go]] |
-| Strategy | Swaps algorithms at runtime | GPS changes driving/walking route | [[Strategy Pattern in Go]] |
-| Command | Turns an action into an executable object | waiter sends order ticket to kitchen | [[Command Pattern in Go]] |
-| State | Behavior changes with internal state | vending machine changes after coin inserted | [[State Pattern in Go]] |
-| Iterator | Traverses collection without exposing internals | flipping pages in a book | [[Iterator Pattern in Go]] |
-| Template Method | Fixed algorithm skeleton with variable steps | house blueprint with customizable parts | [[Template Method Pattern in Go]] |
-| Chain of Responsibility | Passes request through handlers | support hotline routing | [[Chain of Responsibility Pattern in Go]] |
-| Mediator | Coordinates objects through central mediator | airport control tower | [[Mediator Pattern in Go]] |
-| Memento | Saves/restores internal state | Ctrl+Z undo | [[Memento Pattern in Go]] |
-| Visitor | Adds operations over object structure | tax auditor visits different shops | [[Visitor Pattern in Go]] |
-| Interpreter | Evaluates expressions/rules | reading musical notation | [[Interpreter Pattern in Go]] |
+| Pattern                 | Core purpose                                    | Real-world analogy                          | Go note                                   |
+| ----------------------- | ----------------------------------------------- | ------------------------------------------- | ----------------------------------------- |
+| Observer                | Notifies subscribers when state changes         | YouTube subscribers get video notification  | [[Observer Pattern in Go]]                |
+| Strategy                | Swaps algorithms at runtime                     | GPS changes driving/walking route           | [[Strategy Pattern in Go]]                |
+| Command                 | Turns an action into an executable object       | waiter sends order ticket to kitchen        | [[Command Pattern in Go]]                 |
+| State                   | Behavior changes with internal state            | vending machine changes after coin inserted | [[State Pattern in Go]]                   |
+| Iterator                | Traverses collection without exposing internals | flipping pages in a book                    | [[Iterator Pattern in Go]]                |
+| Template Method         | Fixed algorithm skeleton with variable steps    | house blueprint with customizable parts     | [[Template Method Pattern in Go]]         |
+| Chain of Responsibility | Passes request through handlers                 | support hotline routing                     | [[Chain of Responsibility Pattern in Go]] |
+| Mediator                | Coordinates objects through central mediator    | airport control tower                       | [[Mediator Pattern in Go]]                |
+| Memento                 | Saves/restores internal state                   | Ctrl+Z undo                                 | [[Memento Pattern in Go]]                 |
+| Visitor                 | Adds operations over object structure           | tax auditor visits different shops          | [[Visitor Pattern in Go]]                 |
+| Interpreter             | Evaluates expressions/rules                     | reading musical notation                    | [[Interpreter Pattern in Go]]             |
 
 ## Diagram
 

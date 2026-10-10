@@ -47,6 +47,30 @@ func (a *RazorpayAdapter) Charge(ctx context.Context, req ChargeRequest) (string
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    adapter := NewRazorpayAdapter(&RazorpayClient{})
+
+    paymentID, err := adapter.Charge(context.Background(), ChargeRequest{
+        UserID: "user_1",
+        Amount: 49900,
+    })
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+    fmt.Println("payment id:", paymentID)
+}
+```
+
+## Example output
+
+```text
+payment id: rzp_123
+```
+
 ## Real-life example
 
 Razorpay, Stripe, internal wallet, and COD can all have different SDK methods. Your service should call your own `PaymentGateway`, not external SDKs directly.

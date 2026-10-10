@@ -55,6 +55,29 @@ func (b *EventBus) Publish(ctx context.Context, event Event) error {
 }
 ```
 
+## How main calls it
+
+```go
+type PrintHandler struct{}
+func (PrintHandler) Handle(ctx context.Context, event Event) error {
+    fmt.Println("handled event:", event.Name, event.OrderID)
+    return nil
+}
+
+func main() {
+    bus := NewEventBus()
+    bus.Subscribe("order.created", PrintHandler{})
+
+    _ = bus.Publish(context.Background(), Event{Name: "order.created", OrderID: "order_1"})
+}
+```
+
+## Example output
+
+```text
+handled event: order.created order_1
+```
+
 ## Real-life example
 
 When an order is placed, the system may need to send notification, write audit log, update analytics, and trigger fulfillment. Observer avoids putting all those responsibilities directly inside `CreateOrder`.

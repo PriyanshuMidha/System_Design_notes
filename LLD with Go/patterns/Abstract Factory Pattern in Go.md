@@ -66,6 +66,31 @@ func NewUIFactory(theme string) (UIFactory, error) {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    factory, err := NewUIFactory("dark")
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+
+    button := factory.CreateButton()
+    checkbox := factory.CreateCheckbox()
+
+    fmt.Println(button.Render())
+    fmt.Println(checkbox.Render())
+}
+```
+
+## Example output
+
+```text
+dark button
+dark checkbox
+```
+
 ## Real-life example
 
 In backend, use Abstract Factory when you need a whole provider family: `PaymentGateway`, `RefundGateway`, and `WebhookVerifier` for Razorpay should be created together and not mixed with Stripe versions.

@@ -43,6 +43,29 @@ func (d *Draft) Restore(s Snapshot) {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    draft := &Draft{}
+    draft.Update("old title", "old body")
+
+    snapshot := draft.Save()
+    draft.Update("new title", "new body")
+    draft.Restore(snapshot)
+
+    fmt.Println(draft.title)
+    fmt.Println(draft.body)
+}
+```
+
+## Example output
+
+```text
+old title
+old body
+```
+
 ## Real-life example
 
 A CMS or invoice editor can allow undo: before editing an invoice draft, save a snapshot. If the user cancels, restore the previous state.

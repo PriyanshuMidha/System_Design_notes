@@ -48,6 +48,35 @@ func (s *CachedProductService) GetProduct(ctx context.Context, id string) (Produ
 }
 ```
 
+## How main calls it
+
+```go
+type RealProductService struct{}
+func (RealProductService) GetProduct(ctx context.Context, id string) (Product, error) {
+    fmt.Println("calling real service")
+    return Product{ID: id, Name: "Milk"}, nil
+}
+
+func main() {
+    service := NewCachedProductService(RealProductService{})
+    p1, _ := service.GetProduct(context.Background(), "p1")
+    p2, _ := service.GetProduct(context.Background(), "p1")
+
+    fmt.Println(p1.Name)
+    fmt.Println(p2.Name)
+}
+```
+
+## Example output
+
+```text
+calling real service
+Milk
+Milk
+```
+
+The real service is called once; the second response comes from cache.
+
 ## Real-life example
 
 A product service proxy can cache product details so order/cart services do not repeatedly call a slow downstream catalog service.

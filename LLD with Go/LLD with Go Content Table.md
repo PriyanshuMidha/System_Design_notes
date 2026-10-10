@@ -138,8 +138,25 @@ These are not all GoF patterns, but they matter in Go backend LLD:
 
 ## Practice problems
 
+- [[LLD Question Bank with Answers]]
+- [[Go LLD Folder Structure for Practice]]
+- [[LLD Practice Roadmap]]
 - [[Inventory Order Assignment LLD in Go]]
+- [[Delivery Partner Assignment LLD in Go]]
 - [[Logging System LLD in Go]]
+
+## How to run examples
+
+Every pattern note now has:
+
+- `## How main calls it`
+- `## Example output`
+
+For practice, copy the pattern code and the `main` example into one `package main` file, add the imports shown by the code, then run:
+
+```bash
+go run main.go
+```
 
 ## What each pattern maps to in backend
 

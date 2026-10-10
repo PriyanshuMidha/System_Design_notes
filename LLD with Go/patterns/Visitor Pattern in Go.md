@@ -40,6 +40,27 @@ func (TaxVisitor) VisitFood(f Food) int64 { return f.Price * 5 / 100 }
 func (TaxVisitor) VisitElectronics(e Electronics) int64 { return e.Price * 18 / 100 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    visitor := TaxVisitor{}
+
+    foodTax := Food{Price: 1000}.Accept(visitor)
+    electronicsTax := Electronics{Price: 1000}.Accept(visitor)
+
+    fmt.Println(foodTax)
+    fmt.Println(electronicsTax)
+}
+```
+
+## Example output
+
+```text
+50
+180
+```
+
 ## Real-life example
 
 Different product categories may have different tax, shipping, or compliance calculations. Visitor can add operations without changing traversal logic.

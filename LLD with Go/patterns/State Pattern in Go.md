@@ -64,6 +64,29 @@ func (o *Order) MoveTo(next OrderStatus) error {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    order := &Order{ID: "order_1", Status: Created}
+
+    _ = order.MoveTo(Reserved)
+    _ = order.MoveTo(Paid)
+
+    fmt.Println(order.Status)
+
+    err := order.MoveTo(Delivered)
+    fmt.Println(err)
+}
+```
+
+## Example output
+
+```text
+paid
+invalid order state transition
+```
+
 ## Real-life example
 
 An order cannot go from `created` directly to `delivered`. State transition logic prevents invalid lifecycle movement and makes edge cases easier to discuss.

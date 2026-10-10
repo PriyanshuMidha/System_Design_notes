@@ -46,6 +46,30 @@ func (c *Category) CountProducts() int {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    grocery := &Category{name: "Grocery"}
+    dairy := &Category{name: "Dairy"}
+
+    dairy.Add(Product{name: "Milk"})
+    dairy.Add(Product{name: "Curd"})
+    grocery.Add(dairy)
+    grocery.Add(Product{name: "Bread"})
+
+    fmt.Println(grocery.Name())
+    fmt.Println(grocery.CountProducts())
+}
+```
+
+## Example output
+
+```text
+Grocery
+3
+```
+
 ## Real-life example
 
 Zepto catalog has categories and subcategories. A category can contain products and more categories. Composite lets you calculate counts or traverse uniformly.

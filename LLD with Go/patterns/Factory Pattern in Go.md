@@ -53,6 +53,32 @@ func NewNotifier(channel string) (Notifier, error) {
 }
 ```
 
+## How main calls it
+
+For practice, make each notifier print its channel, then call the factory from `main`.
+
+```go
+func (EmailNotifier) Send(ctx context.Context, to string, message string) error {
+    fmt.Println("email to", to+":", message)
+    return nil
+}
+
+func main() {
+    notifier, err := NewNotifier("email")
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+    _ = notifier.Send(context.Background(), "user@example.com", "order placed")
+}
+```
+
+## Example output
+
+```text
+email to user@example.com: order placed
+```
+
 ## Real-life example
 
 For order updates, Zepto can notify users by push, SMS, WhatsApp, or email. The order service should not construct each provider directly. It asks a factory for the notifier.

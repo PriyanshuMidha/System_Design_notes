@@ -79,6 +79,36 @@ func (s *AssignmentService) Assign(ctx context.Context, order Order, stores []St
 }
 ```
 
+## How main calls it
+
+For practice, put the pattern code and this `main` in the same `package main` file.
+
+```go
+func main() {
+    service := NewAssignmentService(NearestAvailableStoreStrategy{})
+
+    order := Order{ID: "order_1"}
+    stores := []Store{
+        {ID: "store_far", Distance: 5.2, HasStock: true},
+        {ID: "store_near", Distance: 1.1, HasStock: true},
+        {ID: "store_empty", Distance: 0.5, HasStock: false},
+    }
+
+    store, err := service.Assign(context.Background(), order, stores)
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+    fmt.Println("assigned store:", store.ID)
+}
+```
+
+## Example output
+
+```text
+assigned store: store_near
+```
+
 ## Real-life example
 
 Zepto may select a dark store by nearest distance today. Later they may use stock confidence, picker load, delivery partner availability, or SLA. Strategy lets you add a new algorithm without rewriting checkout.

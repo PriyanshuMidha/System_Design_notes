@@ -58,6 +58,29 @@ func (s *Service) Checkout(ctx context.Context, userID string, productID string,
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    service := NewService(fakeInventory{}, fakePayment{}, fakeOrders{})
+
+    orderID, err := service.Checkout(context.Background(), "user_1", "milk", 2, 12000)
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+    fmt.Println("created order:", orderID)
+}
+```
+
+## Example output
+
+```text
+created order: order_123
+```
+
+Here `fakeInventory`, `fakePayment`, and `fakeOrders` are small test implementations of the interfaces.
+
 ## Real-life example
 
 A client clicks Place Order. Behind one API, the backend validates cart, reserves stock, charges payment, creates order, and sends notification. Facade gives the caller one simple entry point.

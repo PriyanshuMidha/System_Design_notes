@@ -47,6 +47,26 @@ type PDFExporter struct{}
 func (PDFExporter) Export(title string, rows []string) ([]byte, error) { return []byte(title), nil }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    report := NewReport("daily revenue", []string{"100", "200"}, CSVExporter{})
+    data, err := report.Generate()
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+    fmt.Println(string(data))
+}
+```
+
+## Example output
+
+```text
+daily revenue
+```
+
 ## Real-life example
 
 InvoiceOps can generate invoice reports, payment reports, and tax reports. Each can export as CSV/PDF. Bridge prevents creating combinations like `InvoicePDFReport`, `InvoiceCSVReport`, `PaymentPDFReport`, etc.

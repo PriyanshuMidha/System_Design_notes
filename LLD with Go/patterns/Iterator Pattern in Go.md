@@ -43,6 +43,26 @@ func (it *Iterator) Next() Order {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    iterator := NewIterator([]Order{{ID: "o1"}, {ID: "o2"}})
+
+    for iterator.HasNext() {
+        order := iterator.Next()
+        fmt.Println(order.ID)
+    }
+}
+```
+
+## Example output
+
+```text
+o1
+o2
+```
+
 ## Real-life example
 
 A report generator can iterate over paginated orders without knowing whether data comes from memory, DB pages, or a streaming API.

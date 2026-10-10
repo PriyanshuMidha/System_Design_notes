@@ -58,6 +58,31 @@ func (r *InMemoryRepository) FindByID(ctx context.Context, id string) (Order, er
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    repo := NewInMemoryRepository()
+
+    _ = repo.Save(context.Background(), Order{ID: "order_1", UserID: "user_1", Status: "created"})
+    order, err := repo.FindByID(context.Background(), "order_1")
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+
+    fmt.Println(order.ID)
+    fmt.Println(order.Status)
+}
+```
+
+## Example output
+
+```text
+order_1
+created
+```
+
 ## Real-life example
 
 In an interview, you can implement `InMemoryRepository` quickly. In production, the same service can use `PostgresOrderRepository` without changing business logic.

@@ -46,6 +46,33 @@ func Auth(next http.Handler) http.Handler {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    finalHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintln(w, "order created")
+    })
+
+    handler := Logging(Auth(finalHandler))
+    _ = http.ListenAndServe(":8080", handler)
+}
+```
+
+## Example output
+
+For an authorized request:
+
+```text
+order created
+```
+
+Server log:
+
+```text
+method=GET path=/ duration=...
+```
+
 ## Real-life example
 
 Gin middleware for auth, request ID, logging, CORS, recovery, metrics, and rate limiting is Decorator in practice.

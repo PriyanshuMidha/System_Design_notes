@@ -42,6 +42,27 @@ func (c CancelOrderCommand) Execute(ctx context.Context) error {
 }
 ```
 
+## How main calls it
+
+```go
+type OrderCanceller struct{}
+func (OrderCanceller) Cancel(ctx context.Context, orderID string) error {
+    fmt.Println("cancelled order:", orderID)
+    return nil
+}
+
+func main() {
+    cmd := NewCancelOrderCommand("order_1", OrderCanceller{})
+    _ = cmd.Execute(context.Background())
+}
+```
+
+## Example output
+
+```text
+cancelled order: order_1
+```
+
 ## Real-life example
 
 Admin actions, order cancellation, retryable jobs, and scheduled tasks can be represented as commands. A worker can execute them later.

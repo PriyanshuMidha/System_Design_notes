@@ -42,6 +42,35 @@ func (m *CheckoutMediator) Checkout(ctx context.Context, req Request) (string, e
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    mediator := &CheckoutMediator{
+        inventory: fakeInventory{},
+        payment:   fakePayment{},
+        orders:    fakeOrders{},
+    }
+
+    orderID, err := mediator.Checkout(context.Background(), Request{
+        UserID: "user_1", ProductID: "milk", Quantity: 1, Amount: 6000,
+    })
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+    fmt.Println(orderID)
+}
+```
+
+## Example output
+
+```text
+order_123
+```
+
+The fake services are small implementations used only for testing the mediator flow.
+
 ## Real-life example
 
 Checkout coordinates inventory, payment, orders, notifications, and delivery. Without a mediator/facade, each component may start calling every other component directly.

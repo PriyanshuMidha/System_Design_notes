@@ -55,6 +55,30 @@ func NewAPIClient(options ...Option) *APIClient {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    client := NewAPIClient(
+        WithBaseURL("https://api.invoiceops.local"),
+        WithTimeout(5*time.Second),
+        WithRetries(3),
+    )
+
+    fmt.Println(client.baseURL)
+    fmt.Println(client.timeout)
+    fmt.Println(client.retries)
+}
+```
+
+## Example output
+
+```text
+https://api.invoiceops.local
+5s
+3
+```
+
 ## Real-life example
 
 A payment client may need base URL, API key, timeout, retry count, logger, and metrics. Functional options keep construction readable without many constructors.

@@ -44,6 +44,27 @@ func (e AndExpr) Match(p Product) bool {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    rule := AndExpr{
+        Left:  StatusExpr{Status: "active"},
+        Right: MaxPriceExpr{Price: 500},
+    }
+
+    fmt.Println(rule.Match(Product{Status: "active", Price: 399}))
+    fmt.Println(rule.Match(Product{Status: "inactive", Price: 399}))
+}
+```
+
+## Example output
+
+```text
+true
+false
+```
+
 ## Real-life example
 
 An admin wants to create product filters like `status = active AND price < 500`. Interpreter can model each condition as an expression tree.

@@ -37,6 +37,32 @@ func (t InvoiceTemplate) Clone() InvoiceTemplate {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    template := InvoiceTemplate{
+        Currency: "INR",
+        Items: []LineItem{{Name: "Platform fee", Price: 1000}},
+    }
+
+    invoice := template.Clone()
+    invoice.Items[0].Price = 1200
+
+    fmt.Println(template.Items[0].Price)
+    fmt.Println(invoice.Items[0].Price)
+}
+```
+
+## Example output
+
+```text
+1000
+1200
+```
+
+The output proves the clone has its own copied item slice.
+
 ## Real-life example
 
 An invoice app may have recurring invoice templates. Each month, the system clones the template, changes dates and invoice number, and saves a new invoice.

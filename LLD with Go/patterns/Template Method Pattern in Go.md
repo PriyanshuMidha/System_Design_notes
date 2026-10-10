@@ -37,6 +37,28 @@ func ProcessFile(ctx context.Context, p FileProcessor, raw []byte) error {
 }
 ```
 
+## How main calls it
+
+```go
+type CSVProcessor struct{}
+func (CSVProcessor) Parse(ctx context.Context, raw []byte) (any, error) { return string(raw), nil }
+func (CSVProcessor) Validate(ctx context.Context, data any) error { return nil }
+func (CSVProcessor) Save(ctx context.Context, data any) error {
+    fmt.Println("saved:", data)
+    return nil
+}
+
+func main() {
+    _ = ProcessFile(context.Background(), CSVProcessor{}, []byte("invoice.csv"))
+}
+```
+
+## Example output
+
+```text
+saved: invoice.csv
+```
+
 ## Real-life example
 
 CSV invoice import and JSON invoice import follow the same workflow: parse, validate, save. Only individual steps differ.

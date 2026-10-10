@@ -42,6 +42,25 @@ func GetConfig() *Config {
 }
 ```
 
+## How main calls it
+
+```go
+func main() {
+    c1 := GetConfig()
+    c2 := GetConfig()
+
+    fmt.Println(c1.AppName)
+    fmt.Println(c1 == c2)
+}
+```
+
+## Example output
+
+```text
+invoiceops
+true
+```
+
 ## Real-life example
 
 Configuration loaded once at startup can be singleton-like. A logger can also be shared. But services and repositories should usually be passed explicitly.

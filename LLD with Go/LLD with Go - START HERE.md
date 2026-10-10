@@ -126,3 +126,13 @@ In Go, prefer simple composition first. Use a named pattern only when it removes
 - Go Effective Go: https://go.dev/doc/effective_go
 - Go testing docs: https://go.dev/doc/tutorial/add-a-test
 - Go context package: https://pkg.go.dev/context
+
+## Practice question path
+
+After reading the principles and patterns, practice from here:
+
+1. [[LLD Practice Roadmap]]
+2. [[Go LLD Folder Structure for Practice]]
+3. [[LLD Question Bank with Answers]]
+
+Use the same solving flow for every question: requirements, entities, APIs/methods, repositories, patterns, core code, edge cases.
