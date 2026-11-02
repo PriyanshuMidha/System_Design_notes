@@ -180,7 +180,7 @@ flowchart LR
   - Plain Title Case, with no typos.
   - "Go …" appears only in 04 and 06.
   - Use ` - ` instead of `:` in file names.
-- **Note structure.** Every topic note follows [[Note Template]]:
+- **Note structure.** Every topic note follows [[Topic Note Template]]:
   1. TL;DR
   2. why it exists
   3. mental model
@@ -210,7 +210,7 @@ flowchart LR
 
 ### What a rebuilt note looks like
 
-[[Sample - Consistent Hashing]] next to the old `Consistent Hashing` note:
+[[Consistent Hashing]] next to the old `Consistent Hashing` note:
 
 | | Old note | Rebuilt sample |
 | --- | --- | --- |
@@ -307,7 +307,7 @@ Why this order inside Stage 1:
 4. **Who writes.** Two options:
    - **Me in chat.** I write a few notes per turn and you see each one.
    - **A multi-agent workflow per folder.** Writer agents work in parallel, with a checker per note for facts, compiling and links. It is much faster, but costs roughly 30–60k tokens per note: about 1M tokens for a 20-note folder, around 15M for the whole vault (rough estimate). Say "use a workflow" to switch it on.
-5. **Note style.** Open [[Sample - Consistent Hashing]]. Is that the right depth and length for every note?
+5. **Note style.** Open [[Consistent Hashing]]. Is that the right depth and length for every note?
 
 ## 7. Detailed audits
 
@@ -318,6 +318,6 @@ Why this order inside Stage 1:
 - [[Audit E - ByteByteGo Fundamentals and Frontend]]: 76 notes, plus the image audit
 - [[Audit F - LLD with Go]]: 60 notes, 17 drawings, and compile results
 - [[Rebuild Tracker]]: all 373 new notes, with checkboxes
-- [[Note Template]] · [[Sample - Consistent Hashing]]
+- [[Topic Note Template]] · [[Consistent Hashing]]
 
 Nothing outside `00 Rebuild/` was changed during this review.

@@ -18,6 +18,7 @@ updated: 2026-11-02
 - [ ] **Progress** · - 🆕 · from: NEW
 - [ ] **Templates/Topic Note** · - 🆕 · from: NEW
 - [ ] **Templates/MOC** · - 🆕 · from: NEW
+- [ ] **README (repo root, GitHub landing page)** · - · from: README.md (today only the title "System_Design_notes")
 
 ## 01 CS Fundamentals · 27 notes
 
@@ -114,21 +115,21 @@ updated: 2026-11-02
 ## 05 APIs · 15 notes
 
 - [ ] **05 APIs MOC** · - · from: folder map, written last
-- [ ] **Choosing an API Style** · B · from: Api architecture cntent table
-- [ ] **REST and HTTP API Design** · B · from: REST API (+ bbg REST ×3; Go REST code → 06); what is rest, use of rest (+ Api architecture/REST API; Go REST coding stays in 06)
-- [ ] **API Contract Design and OpenAPI** · I · from: API Contract Design, API Design Content Table
-- [ ] **API Error Handling** · I · from: API Error Handling
-- [ ] **Pagination, Filtering and Sorting** · I · from: Pagination
-- [ ] **API Versioning and Backward Compatibility** · I · from: API Versioning
-- [ ] **Idempotency and Idempotency Keys** · I · from: NEW here (source: `reliability/Idempotency`, `Go Webhooks Idempotency`, other reviewers); Idempotency (+ webhook example from Reliability Content Table)
-- [ ] **File Upload Architecture** · I · from: File Upload Architecture (+ Go File Uploads, AWS S3 presign part)
-- [ ] **Webhooks - Sending and Receiving** · I · from: Webhooks, Webhook Processing (+ Go Webhooks Idempotency)
-- [ ] **SOAP and WSDL (Legacy Integrations)** · B · from: SOAP
-- [ ] **GraphQL** · I · from: GRAPHQL (+ Go GraphQL Backend concepts); Go GraphQL Backend
-- [ ] **gRPC** · I/A · from: GRPC (+ concept parts of the 10 Go gRPC/proto notes)
-- [ ] **Protocol Buffers and Schema Evolution** · I · from: Go Protocol Buffers Deep Dive, Go Proto Versioning Best Practices
-- [ ] **Real-time APIs - WebSocket, SSE and Long Polling** · I/A · from: WEBSOCKET (+ reliability/WebSocket Scaling, Go WebSocket Realtime)
-- [ ] **API Gateway and BFF** · A · from: API Gateway
+- [x] **Choosing an API Style** · B · ✅ · from: Api architecture cntent table
+- [x] **REST and HTTP API Design** · B · ✅ · from: REST API (+ bbg REST ×3; Go REST code → 06); what is rest, use of rest (+ Api architecture/REST API; Go REST coding stays in 06)
+- [x] **API Contract Design and OpenAPI** · I · ✅ · from: API Contract Design, API Design Content Table
+- [x] **API Error Handling** · I · ✅ · from: API Error Handling
+- [x] **Pagination, Filtering and Sorting** · I · ✅ · from: Pagination
+- [x] **API Versioning and Backward Compatibility** · I · ✅ · from: API Versioning
+- [x] **Idempotency and Idempotency Keys** · I · ✅ · from: NEW here (source: `reliability/Idempotency`, `Go Webhooks Idempotency`, other reviewers); Idempotency (+ webhook example from Reliability Content Table)
+- [x] **File Upload Architecture** · I · ✅ · from: File Upload Architecture (+ Go File Uploads, AWS S3 presign part)
+- [x] **Webhooks - Sending and Receiving** · I · ✅ · from: Webhooks, Webhook Processing (+ Go Webhooks Idempotency)
+- [x] **SOAP and WSDL (Legacy Integrations)** · B · ✅ · from: SOAP
+- [x] **GraphQL** · I · ✅ · from: GRAPHQL (+ Go GraphQL Backend concepts); Go GraphQL Backend
+- [x] **gRPC** · I/A · ✅ · from: GRPC (+ concept parts of the 10 Go gRPC/proto notes)
+- [x] **Protocol Buffers and Schema Evolution** · I · ✅ · from: Go Protocol Buffers Deep Dive, Go Proto Versioning Best Practices
+- [x] **Real-time APIs - WebSocket, SSE and Long Polling** · I/A · ✅ · from: WEBSOCKET (+ reliability/WebSocket Scaling, Go WebSocket Realtime)
+- [x] **API Gateway and BFF** · A · ✅ · from: API Gateway
 
 ## 06 Backend Engineering in Go · 29 notes
 
@@ -166,26 +167,26 @@ updated: 2026-11-02
 ## 07 Databases · 23 notes
 
 - [ ] **07 Databases MOC** · - · from: folder map, written last
-- [ ] **SQL Essentials** · B 🆕 · from: NEW
-- [ ] **SQL vs NoSQL** · B · from: SQL vs NoSQL
-- [ ] **Relational Schema Design** · B · from: Schema Design, Data Modeling Content Table
+- [ ] **SQL Essentials** · B 🆕 · ✏️ draft · from: NEW
+- [ ] **SQL vs NoSQL** · B · ✏️ draft · from: SQL vs NoSQL
+- [ ] **Relational Schema Design** · B · ✏️ draft · from: Schema Design, Data Modeling Content Table
 - [ ] **Transactions and ACID** · B · from: Transactions
 - [ ] **Indexing Fundamentals** · B · from: Database Indexing (+ basics from Advanced Index Types)
-- [ ] **Storage Engines - B-tree vs LSM and WAL** · I 🆕 · from: NEW
-- [ ] **Isolation Levels and MVCC** · I 🆕 · from: NEW
+- [ ] **Storage Engines - B-tree vs LSM and WAL** · I 🆕 · ✏️ draft · from: NEW
+- [ ] **Isolation Levels and MVCC** · I 🆕 · ✏️ draft · from: NEW
 - [ ] **Locking - Optimistic vs Pessimistic** · I · from: Optimistic and Pessimistic Locking
 - [ ] **Query Plans and EXPLAIN** · I · from: Query Plans and EXPLAIN
 - [ ] **Index Types and Index Design** · I · from: Advanced Index Types
-- [ ] **N+1 Query Problem** · I · from: N Plus One Query Problem
-- [ ] **Connection Pooling** · I · from: Connection Pooling
-- [ ] **Zero-Downtime Schema Migrations** · I · from: Database Migration
+- [ ] **N+1 Query Problem** · I · ✏️ draft · from: N Plus One Query Problem
+- [ ] **Connection Pooling** · I · ✏️ draft · from: Connection Pooling
+- [ ] **Zero-Downtime Schema Migrations** · I · ✏️ draft · from: Database Migration
 - [ ] **Backup, PITR and Disaster Recovery** · I · from: Backup and Restore
 - [ ] **Materialized Views and Denormalization** · I · from: Materialized Views
 - [ ] **NoSQL Data Modeling** · I · from: NoSQL Data Modeling
-- [ ] **Replication** · I · from: Database Replication
-- [ ] **Partitioning and Sharding** · A · from: Sharding Patterns, Database Sharding
-- [ ] **Consistent Hashing** · ✏️ sample drafted in [[Sample - Consistent Hashing]] · A · from: `00 Rebuild/Sample - Consistent Hashing` (replaces Consistent Hashing)
-- [ ] **Wide-Column Stores and Cassandra** · A · from: Cassandra and Wide Column Stores
+- [ ] **Replication** · I · ✏️ draft · from: Database Replication
+- [ ] **Partitioning and Sharding** · A · ✏️ draft · from: Sharding Patterns, Database Sharding
+- [x] **Consistent Hashing** · A · ✅ · from: `00 Rebuild/Sample - Consistent Hashing` (replaces Consistent Hashing)
+- [ ] **Wide-Column Stores and Cassandra** · A · ✏️ draft · from: Cassandra and Wide Column Stores
 - [ ] **Search Engines and Inverted Indexes** · A · from: Search Architecture, Search Indexes
 - [ ] **Time-Series and Columnar Storage** · A · from: Time Series and Analytics Storage
 - [ ] **Distributed SQL** · A 🆕 · from: NEW
@@ -388,45 +389,45 @@ updated: 2026-11-02
 - [ ] **SOLID in Go** · B · from: SOLID Principles in Go LLD
 - [ ] **UML for LLD** · B · from: UML for LLD Interviews
 - [ ] **Design Patterns Overview and Chooser** · B · from: Creational, Structural, Behavioral Patterns in Go; Content Table (pattern → backend table)
-- [ ] **Patterns/Strategy and Template Method** · I · from: Strategy Pattern in Go, Template Method Pattern in Go
-- [ ] **Patterns/Factory and Abstract Factory** · I · from: Factory Pattern in Go, Abstract Factory Pattern in Go
-- [ ] **Patterns/Builder and Functional Options** · I · from: Builder and Functional Options Pattern in Go
-- [ ] **Patterns/Singleton and sync.Once** · I · from: Singleton Pattern in Go
-- [ ] **Patterns/Adapter** · I · from: Adapter Pattern in Go
-- [ ] **Patterns/Decorator and Middleware** · I · from: Decorator Middleware Pattern in Go
-- [ ] **Patterns/Proxy** · I · from: Proxy Pattern in Go
-- [ ] **Patterns/Facade (vs Mediator)** · I · from: Facade Pattern in Go, Mediator Pattern in Go
-- [ ] **Patterns/Composite** · I · from: Composite Pattern in Go
-- [ ] **Patterns/Observer and Event Bus** · I · from: Observer Pattern in Go
-- [ ] **Patterns/State Machines in Go** · I · from: State Pattern in Go + Vending Machine state-interface code
-- [ ] **Patterns/Chain of Responsibility and Pipelines** · I · from: Chain of Responsibility Pattern in Go
-- [ ] **Patterns/Command, Undo and Memento** · I · from: Command Pattern in Go, Memento Pattern in Go
-- [ ] **Patterns/Iterator and range-over-func** · I · from: Iterator Pattern in Go (rewrite)
-- [ ] **Patterns/Repository and Unit of Work** · I · from: Repository Pattern in Go
-- [ ] **Patterns/Rare GoF Patterns in Go** · A · from: Prototype, Bridge, Flyweight, Visitor, Interpreter (+ the full Mediator form)
+- [x] **Patterns/Strategy and Template Method** · I · ✅ · from: Strategy Pattern in Go, Template Method Pattern in Go
+- [x] **Patterns/Factory and Abstract Factory** · I · ✅ · from: Factory Pattern in Go, Abstract Factory Pattern in Go
+- [x] **Patterns/Builder and Functional Options** · I · ✅ · from: Builder and Functional Options Pattern in Go
+- [x] **Patterns/Singleton and sync.Once** · I · ✅ · from: Singleton Pattern in Go
+- [x] **Patterns/Adapter** · I · ✅ · from: Adapter Pattern in Go
+- [x] **Patterns/Decorator and Middleware** · I · ✅ · from: Decorator Middleware Pattern in Go
+- [x] **Patterns/Proxy** · I · ✅ · from: Proxy Pattern in Go
+- [x] **Patterns/Facade (vs Mediator)** · I · ✅ · from: Facade Pattern in Go, Mediator Pattern in Go
+- [x] **Patterns/Composite** · I · ✅ · from: Composite Pattern in Go
+- [x] **Patterns/Observer and Event Bus** · I · ✅ · from: Observer Pattern in Go
+- [x] **Patterns/State Machines in Go** · I · ✅ · from: State Pattern in Go + Vending Machine state-interface code
+- [x] **Patterns/Chain of Responsibility and Pipelines** · I · ✅ · from: Chain of Responsibility Pattern in Go
+- [x] **Patterns/Command, Undo and Memento** · I · ✅ · from: Command Pattern in Go, Memento Pattern in Go
+- [x] **Patterns/Iterator and range-over-func** · I · ✅ · from: Iterator Pattern in Go (rewrite)
+- [x] **Patterns/Repository and Unit of Work** · I · ✅ · from: Repository Pattern in Go
+- [x] **Patterns/Rare GoF Patterns in Go** · A · ✅ · from: Prototype, Bridge, Flyweight, Visitor, Interpreter (+ the full Mediator form)
 - [ ] **Concurrency for LLD** · A · from: Concurrency in Go LLD
 - [ ] **Testing LLD Code** · I · from: Testing LLD Code in Go
-- [ ] **Practice/Parking Lot** · B · from: Parking Lot LLD in Go
-- [ ] **Practice/Vending Machine** · B · from: Vending Machine LLD in Go
-- [ ] **Practice/Library Management** · B · from: Library Management LLD in Go
-- [ ] **Practice/Meeting Room Scheduler** · B · from: Meeting Room Scheduler LLD in Go
-- [ ] **Practice/LRU Cache with TTL** · B · from: LRU Cache LLD in Go
-- [ ] **Practice/Elevator System** · B · from: Elevator System LLD in Go (rewrite + NEW drawing + tests)
+- [x] **Practice/Parking Lot** · B · ✅ · from: Parking Lot LLD in Go
+- [x] **Practice/Vending Machine** · B · ✅ · from: Vending Machine LLD in Go
+- [x] **Practice/Library Management** · B · ✅ · from: Library Management LLD in Go
+- [x] **Practice/Meeting Room Scheduler** · B · ✅ · from: Meeting Room Scheduler LLD in Go
+- [x] **Practice/LRU Cache with TTL** · B · ✅ · from: LRU Cache LLD in Go
+- [x] **Practice/Elevator System** · B · ✅ · from: Elevator System LLD in Go (rewrite + NEW drawing + tests)
 - [ ] **Practice/Tic-Tac-Toe and Snake and Ladder** · B 🆕 · from: NEW
-- [ ] **Practice/Cart Checkout with Coupons** · I · from: Cart Checkout with Coupons LLD in Go
-- [ ] **Practice/Inventory Order Assignment (Dark Store)** · I · from: Inventory Order Assignment LLD in Go
-- [ ] **Practice/Delivery Partner Assignment** · I · from: Delivery Partner Assignment LLD in Go
-- [ ] **Practice/Notification Service** · I · from: Notification System LLD in Go
-- [ ] **Practice/Rate Limiter** · I · from: Rate Limiter LLD in Go
-- [ ] **Practice/Logging Library** · I · from: Logging System LLD in Go
-- [ ] **Practice/File Search (Unix find)** · I · from: File Search Unix Find LLD in Go
+- [x] **Practice/Cart Checkout with Coupons** · I · ✅ · from: Cart Checkout with Coupons LLD in Go
+- [x] **Practice/Inventory Order Assignment (Dark Store)** · I · ✅ · from: Inventory Order Assignment LLD in Go
+- [x] **Practice/Delivery Partner Assignment** · I · ✅ · from: Delivery Partner Assignment LLD in Go
+- [x] **Practice/Notification Service** · I · ✅ · from: Notification System LLD in Go
+- [x] **Practice/Rate Limiter** · I · ✅ · from: Rate Limiter LLD in Go
+- [x] **Practice/Logging Library** · I · ✅ · from: Logging System LLD in Go
+- [x] **Practice/File Search (Unix find)** · I · ✅ · from: File Search Unix Find LLD in Go
 - [ ] **Practice/ATM** · I 🆕 · from: NEW
 - [ ] **Practice/In-memory KV Store with TTL and Transactions** · I 🆕 · from: NEW
 - [ ] **Practice/Task Scheduler (delayed and recurring jobs)** · I 🆕 · from: NEW
 - [ ] **Practice/Circuit Breaker** · I 🆕 · from: NEW
-- [ ] **Practice/Movie Ticket Booking** · A · from: Movie Ticket Booking LLD in Go
-- [ ] **Practice/Splitwise Expense Sharing** · A · from: Splitwise Expense Sharing LLD in Go
-- [ ] **Practice/Food Ordering System** · A · from: Food Ordering System LLD in Go
+- [x] **Practice/Movie Ticket Booking** · A · ✅ · from: Movie Ticket Booking LLD in Go
+- [x] **Practice/Splitwise Expense Sharing** · A · ✅ · from: Splitwise Expense Sharing LLD in Go
+- [x] **Practice/Food Ordering System** · A · ✅ · from: Food Ordering System LLD in Go
 - [ ] **Practice/Pub-Sub Message Queue** · A 🆕 · from: NEW
 - [ ] **Practice/Ride Sharing** · A 🆕 · from: NEW
 - [ ] **Practice/Hotel Booking** · A 🆕 · from: NEW
