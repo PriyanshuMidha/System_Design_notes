@@ -2,7 +2,7 @@
 tags: [moc]
 status: draft
 generated: true
-updated: 2026-11-03
+updated: 2026-11-04
 ---
 
 # 06 Backend Engineering in Go MOC

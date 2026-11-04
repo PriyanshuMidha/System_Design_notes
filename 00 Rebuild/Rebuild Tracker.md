@@ -13,8 +13,8 @@ updated: 2026-11-02
 
 ## 00 Home
 
-- [ ] **Home** · B · from: START HERE - Advanced Backend SDE3 Path, Advancxe backend content table (nav part), SDE3 Backend Roadmap (+ Excalidraw)
-- [ ] **Conventions** · B 🆕 · from: NEW
+- [x] **Home** · B · ✅ · from: START HERE - Advanced Backend SDE3 Path, Advancxe backend content table (nav part), SDE3 Backend Roadmap (+ Excalidraw)
+- [x] **Conventions** · B 🆕 · ✅ · from: NEW
 - [ ] **Progress** · - 🆕 · from: NEW
 - [ ] **Templates/Topic Note** · - 🆕 · from: NEW
 - [ ] **Templates/MOC** · - 🆕 · from: NEW
@@ -193,95 +193,95 @@ updated: 2026-11-02
 
 ## 08 Caching & Redis · 12 notes
 
-- [ ] **08 Caching & Redis MOC** · - · from: folder map, written last
-- [ ] **Caching Fundamentals** · B · from: Caching Patterns and Types (locations) + bbg cache folder (other reviewer); real_cache, cache used for (text part)
-- [ ] **Redis Fundamentals** · B · from: what is redis
-- [ ] **Redis Hands-on Setup with Go** · B · from: redis setup
-- [ ] **Caching Patterns** · I · from: Caching Patterns and Types, API Caching with Redis
-- [ ] **Cache Invalidation, TTL and Consistency** · I · from: Caching Patterns and Types
-- [ ] **Cache Eviction Policies - LRU, LFU, TTL** · I · from: Caching Patterns and Types (+ LLD LRU Cache link); data structure/cache (text part)
-- [ ] **Redis Data Structures and When to Use Each** · I · from: what is redis, redis Content table (data-choice table), uses of redis
-- [ ] **Redis Use Cases** · I · from: uses of redis, redis setup headings
-- [ ] **Redis Persistence - RDB and AOF** · I 🆕 · from: NEW
-- [ ] **Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys** · A · from: Caching Patterns and Types (stampede) + `performance/Cache Stampede Avalanche Penetration` (other reviewer); Cache Stampede Avalanche Penetration (+ stampede section of Caching Patterns and Types)
-- [ ] **Redis Replication, Sentinel and Cluster** · A 🆕 · from: NEW + AWS ElastiCache
-- [ ] **Redis in Production - Memory, Latency, Security** · A 🆕 · from: NEW (+ redis setup production points)
+- [x] **08 Caching & Redis MOC** · - · ✅ · from: folder map, written last
+- [x] **Caching Fundamentals** · B · ✅ · from: Caching Patterns and Types (locations) + bbg cache folder (other reviewer); real_cache, cache used for (text part)
+- [x] **Redis Fundamentals** · B · ✅ · from: what is redis
+- [x] **Redis Hands-on Setup with Go** · B · ✅ · from: redis setup
+- [x] **Caching Patterns** · I · ✅ · from: Caching Patterns and Types, API Caching with Redis
+- [x] **Cache Invalidation, TTL and Consistency** · I · ✅ · from: Caching Patterns and Types
+- [x] **Cache Eviction Policies - LRU, LFU, TTL** · I · ✅ · from: Caching Patterns and Types (+ LLD LRU Cache link); data structure/cache (text part)
+- [x] **Redis Data Structures and When to Use Each** · I · ✅ · from: what is redis, redis Content table (data-choice table), uses of redis
+- [x] **Redis Use Cases** · I · ✅ · from: uses of redis, redis setup headings
+- [x] **Redis Persistence - RDB and AOF** · I 🆕 · ✅ · from: NEW
+- [x] **Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys** · A · ✅ · from: Caching Patterns and Types (stampede) + `performance/Cache Stampede Avalanche Penetration` (other reviewer); Cache Stampede Avalanche Penetration (+ stampede section of Caching Patterns and Types)
+- [x] **Redis Replication, Sentinel and Cluster** · A 🆕 · ✅ · from: NEW + AWS ElastiCache
+- [x] **Redis in Production - Memory, Latency, Security** · A 🆕 · ✅ · from: NEW (+ redis setup production points)
 
 ## 09 Messaging & Async · 15 notes
 
-- [ ] **09 Messaging & Async MOC** · - · from: folder map, written last
-- [ ] **Queues vs Streams and Broker Comparison** · B · from: Message Broker Comparison
-- [ ] **Event-Driven Architecture Basics** · B 🆕 · from: NEW
-- [ ] **Background Jobs and Worker Pools** · B · from: Background Jobs, Worker Architecture
-- [ ] **Redis as a Queue - Lists, Streams and Pub-Sub** · I · from: Message Queue with Redis
-- [ ] **Delivery Semantics and Exactly-Once** · I · from: Exactly Once Myth
-- [ ] **Dead Letter Queues and Poison Messages** · I · from: Dead Letter Queue
-- [ ] **Scheduled Jobs - Cron to Durable Schedulers** · I · from: Cron Jobs, Durable Job Scheduler
-- [ ] **Backpressure and Flow Control** · I · from: Backpressure
-- [ ] **Message Ordering and Partition Keys** · I 🆕 · from: NEW
-- [ ] **Transactional Outbox and CDC** · A · from: Outbox Pattern
-- [ ] **Kafka and Event Streaming** · A · from: Event Streaming
-- [ ] **AWS SQS, SNS and EventBridge** · I 🆕 · from: NEW
-- [ ] **Event Schemas and Schema Registry** · A · from: Schema Registry
-- [ ] **Workflow Engines and Durable Execution** · A 🆕 · from: NEW
-- [ ] **Stream Processing Basics** · A 🆕 · from: NEW
+- [x] **09 Messaging & Async MOC** · - · ✅ · from: folder map, written last
+- [x] **Queues vs Streams and Broker Comparison** · B · ✅ · from: Message Broker Comparison
+- [x] **Event-Driven Architecture Basics** · B 🆕 · ✅ · from: NEW
+- [x] **Background Jobs and Worker Pools** · B · ✅ · from: Background Jobs, Worker Architecture
+- [x] **Redis as a Queue - Lists, Streams and Pub-Sub** · I · ✅ · from: Message Queue with Redis
+- [x] **Delivery Semantics and Exactly-Once** · I · ✅ · from: Exactly Once Myth
+- [x] **Dead Letter Queues and Poison Messages** · I · ✅ · from: Dead Letter Queue
+- [x] **Scheduled Jobs - Cron to Durable Schedulers** · I · ✅ · from: Cron Jobs, Durable Job Scheduler
+- [x] **Backpressure and Flow Control** · I · ✅ · from: Backpressure
+- [x] **Message Ordering and Partition Keys** · I 🆕 · ✅ · from: NEW
+- [x] **Transactional Outbox and CDC** · A · ✅ · from: Outbox Pattern
+- [x] **Kafka and Event Streaming** · A · ✅ · from: Event Streaming
+- [x] **AWS SQS, SNS and EventBridge** · I 🆕 · ✅ · from: NEW
+- [x] **Event Schemas and Schema Registry** · A · ✅ · from: Schema Registry
+- [x] **Workflow Engines and Durable Execution** · A 🆕 · ✅ · from: NEW
+- [x] **Stream Processing Basics** · A 🆕 · ✅ · from: NEW
 
 ## 10 Distributed Systems & Resilience · 20 notes
 
-- [ ] **10 Distributed Systems & Resilience MOC** · - · from: folder map, written last
-- [ ] **Distributed Systems Fundamentals** · B 🆕 · from: NEW
-- [ ] **Timeouts, Retries and Backoff** · B · from: Retry and Backoff
-- [ ] **Circuit Breaker** · B · from: Circuit Breaker
-- [ ] **Bulkheads and Concurrency Limits** · I · from: Thread Pools and Blocking IO
-- [ ] **Load Shedding and Graceful Degradation** · I · from: Graceful Degradation
-- [ ] **CAP and PACELC** · B · from: CAP Theorem
-- [ ] **Consistency Models** · I · from: Consistency Models
-- [ ] **High Availability and Failover** · I · from: High Availability and Failover
-- [ ] **Quorums and Leaderless Replication** · I · from: Quorum Reads and Writes
-- [ ] **Clocks and Ordering** · A · from: Clock Skew and Time
-- [ ] **Consensus - Raft and Paxos** · A · from: Consensus
-- [ ] **Leader Election** · A · from: Leader Election
-- [ ] **Distributed Locks and Fencing Tokens** · A · from: Distributed Locks
-- [ ] **Two-Phase Commit** · A 🆕 · from: NEW
-- [ ] **Saga Pattern** · A · from: Saga Pattern
-- [ ] **CQRS** · A · from: CQRS
-- [ ] **Event Sourcing** · A · from: Event Sourcing
-- [ ] **CRDTs and Conflict Resolution** · A 🆕 · from: NEW
-- [ ] **Failure Detection, Gossip and Membership** · A 🆕 · from: NEW
-- [ ] **Multi-Region Architecture** · A · from: Multi Region Architecture
+- [x] **10 Distributed Systems & Resilience MOC** · - · ✅ · from: folder map, written last
+- [x] **Distributed Systems Fundamentals** · B 🆕 · ✅ · from: NEW
+- [x] **Timeouts, Retries and Backoff** · B · ✅ · from: Retry and Backoff
+- [x] **Circuit Breaker** · B · ✅ · from: Circuit Breaker
+- [x] **Bulkheads and Concurrency Limits** · I · ✅ · from: Thread Pools and Blocking IO
+- [x] **Load Shedding and Graceful Degradation** · I · ✅ · from: Graceful Degradation
+- [x] **CAP and PACELC** · B · ✅ · from: CAP Theorem
+- [x] **Consistency Models** · I · ✅ · from: Consistency Models
+- [x] **High Availability and Failover** · I · ✅ · from: High Availability and Failover
+- [x] **Quorums and Leaderless Replication** · I · ✅ · from: Quorum Reads and Writes
+- [x] **Clocks and Ordering** · A · ✅ · from: Clock Skew and Time
+- [x] **Consensus - Raft and Paxos** · A · ✅ · from: Consensus
+- [x] **Leader Election** · A · ✅ · from: Leader Election
+- [x] **Distributed Locks and Fencing Tokens** · A · ✅ · from: Distributed Locks
+- [x] **Two-Phase Commit** · A 🆕 · ✅ · from: NEW
+- [x] **Saga Pattern** · A · ✅ · from: Saga Pattern
+- [x] **CQRS** · A · ✅ · from: CQRS
+- [x] **Event Sourcing** · A · ✅ · from: Event Sourcing
+- [x] **CRDTs and Conflict Resolution** · A 🆕 · ✅ · from: NEW
+- [x] **Failure Detection, Gossip and Membership** · A 🆕 · ✅ · from: NEW
+- [x] **Multi-Region Architecture** · A · ✅ · from: Multi Region Architecture
 
 ## 11 System Design · 29 notes
 
-- [ ] **11 System Design MOC** · - · from: folder map, written last
-- [ ] **System Design Fundamentals** · B · from: System Design introduction, System Design Content Table
-- [ ] **Scaling Basics** · B · from: Scaling Concepts
-- [ ] **Back-of-the-Envelope Estimation** · B · from: Capacity Estimation
-- [ ] **Load Balancing** · B · from: Load Balancer
-- [ ] **System Design Interview Framework** · B · from: How to Answer System Design, System Design Practice Content Table
-- [ ] **Unique ID Generation** · I 🆕 · from: NEW
-- [ ] **Rate Limiting - Algorithms and Distributed Design** · I/A · from: Rate limiting with Redis (+ `LLD with Go/practice/Rate Limiter LLD in Go` concepts, API Abuse layering)
-- [ ] **Bloom Filters and Probabilistic Data Structures** · I · from: Bloom/sketch part of bbg data-structure notes
-- [ ] **Service Discovery** · I 🆕 · from: NEW
-- [ ] **Hot Keys and Hot Partitions** · A · from: Hot Keys and Hot Partitions
-- [ ] **Scaling WebSockets** · A · from: WebSocket Scaling
-- [ ] **Geospatial Indexing** · A 🆕 · from: NEW
-- [ ] **Case Study - URL Shortener** · B · from: Design URL Shortener
-- [ ] **Case Study - Notification System** · I · from: Design Notification System
-- [ ] **Case Study - Key-Value Store** · I 🆕 · from: NEW
-- [ ] **Case Study - Search Autocomplete** · I 🆕 · from: NEW
-- [ ] **Case Study - News Feed** · I · from: Design News Feed
-- [ ] **Case Study - Chat System** · I · from: Design Chat System
-- [ ] **Case Study - Ticket Booking** · I 🆕 · from: NEW
-- [ ] **Case Study - Leaderboard and Top-K** · I 🆕 · from: NEW
-- [ ] **Case Study - Payment System** · A · from: Design Payment System
-- [ ] **Case Study - File Storage and Sync** · A · from: Design File Storage
-- [ ] **Case Study - Web Crawler** · A 🆕 · from: NEW
-- [ ] **Case Study - Ride Sharing and Proximity** · A 🆕 · from: NEW
-- [ ] **Case Study - Distributed Job Scheduler** · A 🆕 · from: NEW
-- [ ] **Case Study - Metrics and Logging Platform** · A 🆕 · from: NEW
-- [ ] **Case Study - Video Streaming** · A 🆕 · from: NEW
-- [ ] **Case Study - Distributed Message Queue** · A 🆕 · from: NEW
-- [ ] **Case Study - Ad Click Aggregation** · A 🆕 · from: NEW
+- [x] **11 System Design MOC** · - · ✅ · from: folder map, written last
+- [x] **System Design Fundamentals** · B · ✅ · from: System Design introduction, System Design Content Table
+- [x] **Scaling Basics** · B · ✅ · from: Scaling Concepts
+- [x] **Back-of-the-Envelope Estimation** · B · ✅ · from: Capacity Estimation
+- [x] **Load Balancing** · B · ✅ · from: Load Balancer
+- [x] **System Design Interview Framework** · B · ✅ · from: How to Answer System Design, System Design Practice Content Table
+- [x] **Unique ID Generation** · I 🆕 · ✅ · from: NEW
+- [x] **Rate Limiting - Algorithms and Distributed Design** · I/A · ✅ · from: Rate limiting with Redis (+ `LLD with Go/practice/Rate Limiter LLD in Go` concepts, API Abuse layering)
+- [x] **Bloom Filters and Probabilistic Data Structures** · I · ✅ · from: Bloom/sketch part of bbg data-structure notes
+- [x] **Service Discovery** · I 🆕 · ✅ · from: NEW
+- [x] **Hot Keys and Hot Partitions** · A · ✅ · from: Hot Keys and Hot Partitions
+- [x] **Scaling WebSockets** · A · ✅ · from: WebSocket Scaling
+- [x] **Geospatial Indexing** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - URL Shortener** · B · ✅ · from: Design URL Shortener
+- [x] **Case Study - Notification System** · I · ✅ · from: Design Notification System
+- [x] **Case Study - Key-Value Store** · I 🆕 · ✅ · from: NEW
+- [x] **Case Study - Search Autocomplete** · I 🆕 · ✅ · from: NEW
+- [x] **Case Study - News Feed** · I · ✅ · from: Design News Feed
+- [x] **Case Study - Chat System** · I · ✅ · from: Design Chat System
+- [x] **Case Study - Ticket Booking** · I 🆕 · ✅ · from: NEW
+- [x] **Case Study - Leaderboard and Top-K** · I 🆕 · ✅ · from: NEW
+- [x] **Case Study - Payment System** · A · ✅ · from: Design Payment System
+- [x] **Case Study - File Storage and Sync** · A · ✅ · from: Design File Storage
+- [x] **Case Study - Web Crawler** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - Ride Sharing and Proximity** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - Distributed Job Scheduler** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - Metrics and Logging Platform** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - Video Streaming** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - Distributed Message Queue** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - Ad Click Aggregation** · A 🆕 · ✅ · from: NEW
 
 ## 12 Security & Auth · 12 notes
 
@@ -462,9 +462,9 @@ updated: 2026-11-02
 ## 19 Interview & Career · 6 notes
 
 - [x] **19 Interview & Career MOC** · - · ✅ · from: folder map, written last
-- [ ] **Backend Roadmap and Tech Landscape** · B · from: backendburgerDiagram (+ the SDE3 roadmap notes)
-- [ ] **SDE-3 Readiness Checklist** · I · from: 2026 SDE3 Gap Checklist, SDE3 Backend Roadmap, START HERE (completion checklist)
+- [x] **Backend Roadmap and Tech Landscape** · B · ✅ · from: backendburgerDiagram (+ the SDE3 roadmap notes)
+- [x] **SDE-3 Readiness Checklist** · I · ✅ · from: 2026 SDE3 Gap Checklist, SDE3 Backend Roadmap, START HERE (completion checklist)
 - [x] **Learning Resources** · B · ✅ · from: Advancxe backend content table (syllabus), plus the other reviewers' coverage maps (Go Bootcamp Course Coverage Map, CodeWithAryan LLD Playlist Coverage Map, Go YouTube Topic Links); Go YouTube Topic Links, Go Backend Complete Notes (resource table, 9 unique URLs), Go Bootcamp Course Coverage Map (curriculum list); CodeWithAryan LLD Playlist Coverage Map
-- [ ] **Go Interview Questions and Traps** · I 🆕 · from: NEW (Go reviewer gap: nil-interface trap, loop vars, slices aliasing, map iteration, goroutine leaks)
+- [x] **Go Interview Questions and Traps** · I 🆕 · ✅ · from: NEW (Go reviewer gap: nil-interface trap, loop vars, slices aliasing, map iteration, goroutine leaks)
 - [x] **LLD Round Playbook** · B · ✅ · from: LLD Practice Roadmap (daily method, interviewer checks), the Zepto time table, the Interview Approach script
 - [x] **Company Rounds/Zepto-style Product LLD Round** · I · ✅ · from: Zepto SDE1 LLD Round Pattern

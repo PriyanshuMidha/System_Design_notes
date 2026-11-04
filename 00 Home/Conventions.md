@@ -1,6 +1,10 @@
 ---
 tags: [home]
-updated: 2026-11-02
+level: basic
+status: reviewed
+prereqs: []
+related: ["[[Home]]"]
+updated: 2026-11-04
 ---
 
 # Conventions

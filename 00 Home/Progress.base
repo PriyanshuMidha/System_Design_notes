@@ -1,0 +1,66 @@
+filters:
+  and:
+    - file.folder.startsWith(this.file.folder) == false
+    - or:
+        - file.hasTag("home")
+        - note["status"] != null
+
+formulas:
+  folder: file.folder.split("/")[0]
+
+properties:
+  note.status:
+    displayName: Status
+  note.level:
+    displayName: Level
+  formula.folder:
+    displayName: Folder
+
+views:
+  - type: table
+    name: All notes
+    order:
+      - file.name
+      - formula.folder
+      - note.level
+      - note.status
+    sort:
+      - property: formula.folder
+        direction: ASC
+      - property: file.name
+        direction: ASC
+
+  - type: table
+    name: Still draft
+    filters:
+      and:
+        - note["status"] == "draft"
+    order:
+      - file.name
+      - formula.folder
+      - note.level
+    sort:
+      - property: formula.folder
+        direction: ASC
+
+  - type: table
+    name: Reviewed
+    filters:
+      and:
+        - note["status"] == "reviewed"
+    order:
+      - file.name
+      - formula.folder
+      - note.level
+    sort:
+      - property: formula.folder
+        direction: ASC
+
+  - type: table
+    name: Reference notes
+    filters:
+      and:
+        - note["type"] == "reference"
+    order:
+      - file.name
+      - formula.folder

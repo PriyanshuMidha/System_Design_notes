@@ -1,6 +1,10 @@
 ---
 tags: [home]
-updated: 2026-11-02
+level: basic
+status: reviewed
+prereqs: []
+related: ["[[Conventions]]", "[[Rebuild Tracker]]", "[[Rebuild Plan]]"]
+updated: 2026-11-04
 ---
 
 # Home
@@ -109,3 +113,7 @@ flowchart LR
 ## Rebuild status
 
 The vault is being rebuilt folder by folder. [[Rebuild Tracker]] shows the progress, and [[Rebuild Plan]] explains why and how.
+
+- **Done:** 05 APIs, 07 Databases, 08 Caching & Redis, 09 Messaging & Async, 10 Distributed Systems & Resilience, 11 System Design, 17 LLD.
+- **Partially done:** 19 Interview & Career.
+- **Not yet started:** 00 Home, 01 CS Fundamentals, 02 Networking & Web, 03 Frontend, 04 Go Language, 06 Backend Engineering in Go, 12 Security & Auth, 13 DevOps & Cloud, 14 Observability & SRE, 15 Testing, 16 Software Architecture, 18 AI Engineering.
