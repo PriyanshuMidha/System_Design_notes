@@ -71,19 +71,19 @@ updated: 2026-11-02
 
 ## 03 Frontend · 12 notes
 
-- [ ] **03 Frontend MOC** · - · from: folder map, written last
-- [ ] **How Browsers Load and Render a Page** · B · from: asyncVSdeffer, the Real DOM part of Real_virtual
-- [ ] **CSS Fundamentals - Cascade, Selectors, Box Model** · B · from: Types, CLASS_ID, styles, inline_block, sudo class, shadows
-- [ ] **CSS Layout - Position, Flexbox, Grid** · B · from: Position, flex, grid
-- [ ] **JavaScript Core - Types, Scope, Hoisting, Closures, this** · B · from: variables, strings, Promitive_non_Primitive_Types, functions, scope, core_Concepts (JS parts)
-- [ ] **JavaScript Objects, Arrays and Iteration** · B · from: Objects, Arrays, Loops, filters
-- [ ] **DOM, Events and Timers** · B · from: Dom
-- [ ] **JavaScript Async - Event Loop, Promises, async-await** · I · from: Promises, async_await
-- [ ] **React Fundamentals - Components, JSX, Props, State** · B · from: core_Concepts
-- [ ] **React Hooks** · I · from: hooks
-- [ ] **React Rendering - Virtual DOM, Reconciliation, Lifecycle** · I · from: Real_virtual, LIFE_Of _REact
-- [ ] **React State Management - Props, Context, Redux** · I · from: Prop dilling, redux
-- [ ] **React Routing and Rendering Strategies - CSR, SSR, SSG** · I · from: routing, core_Concepts (SPA, client vs server routing, lazy/Suspense)
+- [x] **03 Frontend MOC** · - · ✅ · from: folder map, written last
+- [x] **How Browsers Load and Render a Page** · B · ✅ · from: asyncVSdeffer, the Real DOM part of Real_virtual
+- [x] **CSS Fundamentals - Cascade, Selectors, Box Model** · B · ✅ · from: Types, CLASS_ID, styles, inline_block, sudo class, shadows
+- [x] **CSS Layout - Position, Flexbox, Grid** · B · ✅ · from: Position, flex, grid
+- [x] **JavaScript Core - Types, Scope, Hoisting, Closures, this** · B · ✅ · from: variables, strings, Promitive_non_Primitive_Types, functions, scope, core_Concepts (JS parts)
+- [x] **JavaScript Objects, Arrays and Iteration** · B · ✅ · from: Objects, Arrays, Loops, filters
+- [x] **DOM, Events and Timers** · B · ✅ · from: Dom
+- [x] **JavaScript Async - Event Loop, Promises, async-await** · I · ✅ · from: Promises, async_await
+- [x] **React Fundamentals - Components, JSX, Props, State** · B · ✅ · from: core_Concepts
+- [x] **React Hooks** · I · ✅ · from: hooks
+- [x] **React Rendering - Virtual DOM, Reconciliation, Lifecycle** · I · ✅ · from: Real_virtual, LIFE_Of _REact
+- [x] **React State Management - Props, Context, Redux** · I · ✅ · from: Prop dilling, redux
+- [x] **React Routing and Rendering Strategies - CSR, SSR, SSG** · I · ✅ · from: routing, core_Concepts (SPA, client vs server routing, lazy/Suspense)
 
 ## 04 Go Language · 23 notes
 
@@ -352,16 +352,16 @@ updated: 2026-11-02
 
 ## 15 Testing · 10 notes
 
-- [ ] **15 Testing MOC** · - · from: folder map, written last
-- [ ] **Testing Strategy and the Test Pyramid** · B · from: Testing Pyramid, Testing Strategy Content Table, the shared testing Q&A bank
-- [ ] **Unit, Integration and E2E Tests** · B · from: Unit Integration E2E Tests (links 04 for `testing` package basics)
-- [ ] **Test Doubles and Mocking in Go** · B 🆕 · from: NEW
-- [ ] **Test Data Strategy** · I · from: Test Data Strategy
-- [ ] **Contract Testing** · I · from: Contract Testing
-- [ ] **Fuzz and Property-Based Testing** · I 🆕 · from: NEW
-- [ ] **Testing Async and Event-Driven Systems** · I 🆕 · from: NEW
-- [ ] **Load and Performance Testing** · I · from: Load Testing, golang backend/Go Benchmarking wrk h2load ghz pprof (load-tool half); Go Benchmarking wrk h2load ghz pprof (wrk/h2load/ghz part)
-- [ ] **Chaos Engineering** · A · from: Chaos Testing
+- [x] **15 Testing MOC** · - · ✅ · from: folder map, written last
+- [x] **Testing Strategy and the Test Pyramid** · B · ✅ · from: Testing Pyramid, Testing Strategy Content Table, the shared testing Q&A bank
+- [x] **Unit, Integration and E2E Tests** · B · ✅ · from: Unit Integration E2E Tests (links 04 for `testing` package basics)
+- [x] **Test Doubles and Mocking in Go** · B 🆕 · ✅ · from: NEW
+- [x] **Test Data Strategy** · I · ✅ · from: Test Data Strategy
+- [x] **Contract Testing** · I · ✅ · from: Contract Testing
+- [x] **Fuzz and Property-Based Testing** · I 🆕 · ✅ · from: NEW
+- [x] **Testing Async and Event-Driven Systems** · I 🆕 · ✅ · from: NEW
+- [x] **Load and Performance Testing** · I · ✅ · from: Load Testing, golang backend/Go Benchmarking wrk h2load ghz pprof (load-tool half); Go Benchmarking wrk h2load ghz pprof (wrk/h2load/ghz part)
+- [x] **Chaos Engineering** · A · ✅ · from: Chaos Testing
 - [ ] **Testing in CI/CD, Flaky Tests and Testing in Production** · A 🆕 · from: NEW
 
 ## 16 Software Architecture · 12 notes
