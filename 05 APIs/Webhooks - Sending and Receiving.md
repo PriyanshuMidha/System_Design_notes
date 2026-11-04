@@ -25,6 +25,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A webhook is an HTTP `POST` that one system sends to a URL you registered, the moment something happens ("payment succeeded"). The receiver must check the signature on the raw body, store the event, answer `2xx` fast and do the real work later, because deliveries can be duplicated, late, out of order or forged. The sender must queue, sign, retry with backoff and protect itself from slow or malicious customer URLs.
 
+> [!abstract] Core idea
+> - A webhook is just an HTTP `POST` from the sender to a URL you registered, fired when an event happens.
+> - Receiver rule: verify the signature on the **raw** body, store the event, return `2xx` fast, process later.
+> - Every delivery can be duplicated, late, out of order or forged, so dedupe by event id and make the business update idempotent.
+> - Sender rule: write the event in the same transaction as the data change (an outbox), then retry with backoff from a queue.
+> - Classic mistake: doing slow work or calling other services before answering, which causes timeouts and duplicate retries.
+
 ## 1. Why it exists
 
 A marketplace has 20,000 open payments at a payment provider and needs to know when each one settles.
@@ -100,7 +107,7 @@ flowchart LR
     DIS --> DLQ
 ```
 
-- The **outbox** ([[Transactional Outbox and CDC]]) guarantees that an event exists if and only if the domain change committed. Sending the `POST` inside the request that changed the data loses events on crashes and sends events for rolled-back changes.
+- The **outbox** (a table written in the same transaction as the business change, read later by a dispatcher; see [[Transactional Outbox and CDC]]) guarantees that an event exists if and only if the domain change committed. Sending the `POST` inside the request that changed the data loses events on crashes and sends events for rolled-back changes.
 - **Fan-out** creates one delivery per endpoint, so one slow customer never delays another.
 - Each attempt is **signed**, sent with a short timeout through a client that refuses internal addresses, and **logged** (status, latency, response snippet) so customers can debug from a delivery-log page.
 - Failures are retried with **exponential backoff and jitter** over hours or days ([[Timeouts, Retries and Backoff]]). After the last retry the delivery goes to a **dead-letter** state that customers can replay. An endpoint that fails for days is **disabled** and its owner notified.
@@ -123,6 +130,51 @@ stateDiagram-v2
 ```
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare receiver: verify the HMAC over the raw bytes, dedupe by event id, acknowledge. The full version below adds timestamps for replay protection, a durable inbox table, async workers and the sender side.
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"sync"
+)
+
+var secret = []byte("whsec_test")
+var (
+	mu   sync.Mutex
+	seen = map[string]bool{} // stand-in for a table with a UNIQUE event id
+)
+
+func handle(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body) // raw bytes: verify before parsing
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	want := hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(want), []byte(r.Header.Get("X-Signature"))) {
+		http.Error(w, "bad signature", http.StatusUnauthorized)
+		return
+	}
+	id := r.Header.Get("X-Event-Id")
+	mu.Lock()
+	if !seen[id] {
+		seen[id] = true // store, then a worker processes it later
+	}
+	mu.Unlock()
+	w.WriteHeader(http.StatusOK) // ack fast, duplicates included
+}
+
+func main() { http.HandleFunc("/webhooks", handle); http.ListenAndServe(":8080", nil) }
+```
+
+### Full version
 
 **The bytes.** The provider signs `"<timestamp>.<raw body>"` with HMAC-SHA256 and sends:
 

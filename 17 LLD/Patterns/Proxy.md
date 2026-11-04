@@ -18,6 +18,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A proxy is an object with **the same interface as the real object** (the *subject*) that stands in front of it and decides **whether, when and how** a call reaches it. In Go it is a struct that implements the subject's interface and holds the real implementation in a field. Typical jobs: caching, access checks, lazy creation, calling a remote service, and limiting load.
 
+> [!abstract] Core idea
+> - A proxy has the same interface as the real object and stands in front of it.
+> - It decides whether, when and how a call reaches the real object: caching, access checks, lazy creation, remote calls.
+> - The rule that matters: the caller cannot tell a proxy from the real thing, so it is added at wiring time without changing callers.
+> - Classic mistake: a cache proxy that lets many concurrent misses all hit the backend at once (a cache stampede).
+
 ## 1. Why it exists
 
 A cart service shows 8 products per cart and calls the catalog service for each one. At an estimated 2,000 cart views per second that is 16,000 catalog calls per second, each about 40 ms over the network (estimate). The catalog data changes a few times a day, so almost all of those calls fetch the same answers again.
@@ -80,7 +86,7 @@ classDiagram
 The auth and caching proxies hold a `next Catalog`, and the lazy proxy builds its subject on first use, so proxies stack: `auth → cache → lazy → remote client`. A call to the caching proxy runs these steps:
 
 1. Read the map under `RLock`. A fresh entry (positive or negative) is a **hit**: return it.
-2. On a **miss**, call `singleflight.Group.DoChan(id, fn)`. If a flight for `id` is already running, this caller joins it instead of starting a new one.
+2. On a **miss**, call `singleflight.Group.DoChan(id, fn)` (`singleflight` from `golang.org/x/sync` makes concurrent calls for the same key share one execution and its result). If a flight for `id` is already running, this caller joins it instead of starting a new one.
 3. Inside the flight: look again (a flight that just finished may have filled the entry), then call the backend with a detached context and a timeout.
 4. Store the answer with a TTL: found products for 1 minute, "not found" for 10 seconds. Never cache timeouts or 5xx errors.
 5. Every waiter receives the same result. A waiter whose own context ends returns early; the flight keeps going for the others.
@@ -109,9 +115,54 @@ sequenceDiagram
     P-->>A: Milk 1L (no backend call)
 ```
 
+### Whiteboard version
+
+A caching proxy with a map and a mutex; the second call is a hit and never reaches the real catalog. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Catalog interface{ Name(id string) string }
+
+type RealCatalog struct{ calls int }
+
+func (r *RealCatalog) Name(id string) string { r.calls++; return "product-" + id }
+
+// CachingProxy has the same interface and holds the real subject.
+type CachingProxy struct {
+	mu    sync.Mutex
+	real  Catalog
+	cache map[string]string
+}
+
+func (p *CachingProxy) Name(id string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v, ok := p.cache[id]; ok {
+		return v // hit: the real catalog is never called
+	}
+	v := p.real.Name(id)
+	p.cache[id] = v
+	return v
+}
+
+func main() {
+	real := &RealCatalog{}
+	var c Catalog = &CachingProxy{real: real, cache: map[string]string{}}
+	c.Name("42")
+	c.Name("42")
+	fmt.Println(real.calls) // 1
+}
+```
+
 ## 4. Worked example
 
-One `package main` with three proxies over one subject: protection (scope check from the context), caching (RWMutex, TTL, negative caching, singleflight, invalidation, hit and miss counters) and virtual (lazy creation with `sync.OnceValues`, Go 1.21+). It compiles with Go 1.24 and passes `go vet` and `go test -race`. The only dependency is `golang.org/x/sync`. On Go 1.24 run `go get golang.org/x/sync@v0.19.0`: later x/sync releases require Go 1.25 or 1.26, so a bare `go get` makes the go command switch to a newer toolchain.
+One `package main` with three proxies over one subject: protection (scope check from the context), caching (RWMutex, TTL, negative caching, which also caches "not found" for a short time, singleflight, invalidation, hit and miss counters) and virtual (lazy creation with `sync.OnceValues`, Go 1.21+). It compiles with Go 1.24 and passes `go vet` and `go test -race`. The only dependency is `golang.org/x/sync`. On Go 1.24 pin the version you tested with, `go get golang.org/x/sync@v0.19.0`: newer x/sync releases can raise their minimum Go version (as of November 2026 they require Go 1.25+), and then a bare `go get` makes the go command switch to a newer toolchain.
 
 ```go
 // Command proxy puts three proxies in front of one product catalog:

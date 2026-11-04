@@ -1,7 +1,7 @@
 ---
 tags: [databases, postgresql, performance, go]
 level: intermediate
-status: draft
+status: reviewed
 prereqs: ["[[Transactions and ACID]]", "[[Processes, Threads and Context Switching]]"]
 related: ["[[Database Access (database-sql, pgx, sqlc)]]", "[[N+1 Query Problem]]", "[[Bulkheads and Concurrency Limits]]", "[[AWS 08 - RDS and Aurora]]", "[[Replication]]", "[[Zero-Downtime Schema Migrations]]", "[[Debugging Database Performance]]"]
 sources:
@@ -22,6 +22,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > A connection pool keeps a few database connections open and lends them to requests, because opening a PostgreSQL connection is slow and every connection costs the server a whole process. In Go, `*sql.DB` and `pgxpool.Pool` are pools. Size each pool so that **all instances together** stay under the database's connection limit, and so that requests queue in the app instead of piling onto the database.
+
+> [!abstract] Core idea
+> - Opening a database connection is slow and each one costs the server a process, so keep a few open and lend them out.
+> - A pool is a bounded queue: when every connection is busy, requests wait in the app instead of overloading the database.
+> - Size it with Little's Law (busy connections = requests/s x seconds each holds one), and keep the total across all pods under the database limit.
+> - Classic mistake: forgetting `rows.Close()` or holding a connection across a network call, which drains the pool.
 
 ## 1. Why it exists
 
@@ -112,12 +118,48 @@ stateDiagram-v2
 
 ## 4. Worked example
 
+### Whiteboard version
+
+A pool is a buffered channel of connections plus a deadline on waiting.
+
+```go
+package pool
+
+import "context"
+
+type Conn struct{ ID int }
+
+// Pool lends at most cap(free) connections; callers queue when all are out.
+type Pool struct{ free chan *Conn }
+
+func New(n int) *Pool {
+	p := &Pool{free: make(chan *Conn, n)}
+	for i := 0; i < n; i++ {
+		p.free <- &Conn{ID: i}
+	}
+	return p
+}
+
+func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
+	select {
+	case c := <-p.free:
+		return c, nil
+	case <-ctx.Done(): // waited too long: give up instead of piling on
+		return nil, ctx.Err()
+	}
+}
+
+func (p *Pool) Release(c *Conn) { p.free <- c }
+```
+
+`*sql.DB` and `pgxpool` add what this leaves out: opening connections lazily, health checks, maximum lifetime and idle time, and wait statistics. The sizing walkthrough below is about choosing the numbers.
+
 **Sizing InvoiceOps with Little's Law.** Little's Law says the average number of busy connections is `L = λ × W`: arrival rate times how long each request holds a connection.
 
 - Peak load: 1,200 requests/s across the fleet (an estimate for this example).
 - Each request holds a connection for about 5 ms in total: 3 queries plus the gaps between them inside its transaction (an estimate; measure yours with `AcquireDuration` and query timings).
 - So `L = 1,200 × 0.005 = 6` connections busy on average across the **whole fleet**.
-- Bursts and p99 need headroom. With 3× headroom you need about 18 for the fleet, or 3 per pod at 6 pods. Round up to `MaxOpenConns = 5`.
+- Bursts and p99 need headroom. With 3× headroom you need about 18 for the fleet, or 3 per pod at 6 pods. Round up to `MaxOpenConns = 5`, which leaves extra slack for one slow pod or a dependency stall.
 
 Now check both limits:
 

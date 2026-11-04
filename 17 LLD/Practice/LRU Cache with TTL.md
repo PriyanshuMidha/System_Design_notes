@@ -21,6 +21,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An LRU (least recently used) cache keeps at most N entries and, when full, throws out the entry nobody has touched for the longest time. A hash map finds an entry in O(1), and a doubly linked list ordered by recency tells you the oldest one in O(1). TTL (time to live) gives each entry an expiry time: expired entries are never returned, are removed lazily on read and actively by a sweeper, and are evicted before any live entry when the cache is full.
 
+> [!abstract] Core idea
+> - A hash map finds an entry by key in O(1).
+> - A doubly linked list keeps entries in recency order: the front is the newest, the back is the eviction victim.
+> - Every `Get` and `Put` moves the entry to the front; the node stores its key so eviction can delete it from the map.
+> - An expired entry is never returned: drop it when read, sweep it in the background, and evict it before any live entry.
+> - Classic mistake: using `RLock` in `Get`, although `Get` moves the node and so writes to the list.
+
 ## Problem statement
 
 ```text
@@ -34,6 +41,15 @@ acceptable for entries that carry a TTL). Many goroutines use the cache.
 
 - It tests data-structure choice (map plus doubly linked list), pointer handling, generics and guarding shared state with one mutex.
 - The TTL part tests time handling: lazy plus active expiry, an injected clock, and keeping the hot path cheap.
+
+### Solving path
+
+1. Clarify capacity, TTL rules, eviction callbacks and concurrency.
+2. Choose the structures: map plus doubly linked list, plus a min-heap of expiry times.
+3. Write the list helpers: `remove`, `pushFront`, `moveToFront`.
+4. Write `Get` and `Put` under one mutex, with eviction when full.
+5. Add TTL: lazy expiry on `Get`, `Sweep` for active expiry, expired-first eviction.
+6. Test with an injected clock (no sleeps) and with `-race`.
 
 ## Step 1: Clarify requirements
 
@@ -162,6 +178,12 @@ Nothing is persisted, so there is no repository. When the cache must be shared b
 Not used, and why: a Strategy interface for eviction in the base version is YAGNI with one policy. One mutex guards map, list and heap together because they must change atomically ([[Concurrency for LLD]]).
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> Aim for about 150 lines in the room.
+> - **Write:** `node`, `LRU` with `New`, `Get`, `Put`, `Delete`, `Len`, and the list helpers `remove`, `pushFront` and `moveToFront`; per-entry `expiresAt` checked in `Get`.
+> - **Add if time remains:** `expiryHeap` with `setExpiry`, `Sweep`, and the eviction callback through `notify`.
+> - **Talk only:** `RunJanitor`, sharding the cache for a 32-core hot spot, and lock-free or approximate LRU.
 
 Folder layout: `lru/lru.go` (the cache, list and heap helpers), `lru/lru_test.go`, and `cmd/demo/main.go` for wiring (`New[string, []byte](1000, nil, logEvict)`, then `t := time.NewTicker(time.Second)`, `defer t.Stop()` and `go c.RunJanitor(ctx, t.C, 1000)`; cancel `ctx` on shutdown so the janitor goroutine exits). The whole package is one file here so it compiles as shown.
 

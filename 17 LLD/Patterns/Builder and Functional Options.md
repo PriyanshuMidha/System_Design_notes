@@ -21,6 +21,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > When an object has many optional settings, Go gives you three shapes: a **config struct** (`http.Server{Addr: ":8080"}`), **functional options** (`NewAPIClient(WithTimeout(3*time.Second))`), and a **chained builder** (`Select("id").From("shows").Build()`). All three do the same four things: start from defaults, apply the caller's choices, check the result once, and hand back a ready object or an error.
 
+> [!abstract] Core idea
+> - Many optional settings? Start from defaults and let the caller name only what differs.
+> - Functional options are small functions (`WithTimeout(3*time.Second)`) that each change one field of the object being built.
+> - The rule that matters: validate once, after all options are applied, and return an error instead of a half-built object.
+> - Classic mistake: a positional constructor like `New("", 0, 3, nil)` where nobody can tell which zero means "default".
+
 ## 1. Why it exists
 
 An HTTP client for a payment provider needs a base URL, a timeout, a retry count, extra headers, a clock and a logger. The first version is a positional constructor with six parameters, and a typical call reads `NewAPIClient("", 0, 3, nil, nil, nil)`.
@@ -106,9 +112,49 @@ flowchart TD
     C -->|no| FO["Functional options: New(required args, opts...)"]
 ```
 
+### Whiteboard version
+
+The four steps are defaults, apply options, validate once, return. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Client struct {
+	timeout time.Duration
+	retries int
+}
+
+type Option func(*Client)
+
+func WithTimeout(d time.Duration) Option { return func(c *Client) { c.timeout = d } }
+func WithRetries(n int) Option           { return func(c *Client) { c.retries = n } }
+
+func NewClient(opts ...Option) (*Client, error) {
+	c := &Client{timeout: 5 * time.Second, retries: 2} // 1. defaults
+	for _, o := range opts {                           // 2. caller's changes
+		o(c)
+	}
+	if c.timeout <= 0 || c.retries < 0 { // 3. one final check
+		return nil, errors.New("invalid client config")
+	}
+	return c, nil // 4. ready object
+}
+
+func main() {
+	c, err := NewClient(WithTimeout(2 * time.Second))
+	fmt.Println(c.timeout, c.retries, err) // 2s 2 <nil>
+}
+```
+
 ## 4. Worked example
 
-One `package main` with the owner's `APIClient` (`WithBaseURL`, `WithTimeout`, `WithRetries`, defaults in the constructor), now with options that can fail, a final `validate`, options for test injection, an interface-style option set and a small PostgreSQL query builder. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with an `APIClient` (`WithBaseURL`, `WithTimeout`, `WithRetries`, defaults in the constructor), options that can fail, a final `validate`, options for test injection, an interface-style option set and a small PostgreSQL query builder. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
 ```go
 package main

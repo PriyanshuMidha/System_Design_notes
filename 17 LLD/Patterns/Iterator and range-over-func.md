@@ -18,6 +18,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An **iterator** hands out the items of a collection one at a time, so the caller never needs to know whether they come from a slice, a tree or pages of a database table. Since Go 1.23 the idiomatic Go iterator is a function you can `range` over: an `iter.Seq[V]` or `iter.Seq2[K, V]` that calls `yield` for each item and stops as soon as `yield` returns `false`. Older styles (`Next`/`Err`/`Close`, callbacks) are still everywhere in the standard library; channel-based iterators are a trap.
 
+> [!abstract] Core idea
+> - An iterator hands out items one at a time, hiding where they come from (slice, tree, database pages).
+> - In Go 1.23+ an iterator is a function `func(yield func(V) bool)` that you can `range` over.
+> - The one rule: when `yield` returns `false` (the caller broke out of the loop), stop immediately and clean up.
+> - Classic mistake: a channel fed by a goroutine as an iterator. If the caller stops early, the goroutine blocks forever and leaks.
+
 ## 1. Why it exists
 
 An admin tool must find the first order above ₹500 in an `orders` table that may hold millions of rows. Three bad options:
@@ -30,7 +36,7 @@ An iterator gives the caller a plain loop and keeps three things inside it:
 
 - **Storage is hidden.** The same loop works over a slice in tests and over database pages in production.
 - **Evaluation is lazy.** Nothing is fetched until the loop asks for it. In the worked example, finding the sixth order with a page size of 4 costs **2** page fetches out of 3.
-- **Paging and cleanup live in one place.** The iterator knows the keyset, the page size and when to release the cursor.
+- **Paging and cleanup live in one place.** The iterator knows the keyset (the last ID seen, used as `WHERE id > $last` for the next page), the page size and when to release the cursor.
 
 ## 2. Mental model
 
@@ -128,6 +134,39 @@ sequenceDiagram
 2. It fetches one page with **keyset pagination** (`WHERE id > $last ORDER BY id LIMIT $n`) and yields each row.
 3. If `yield` returns `false` (the loop body hit `break`), the iterator returns at once: no more pages, and the deferred release runs.
 4. A page shorter than the page size is the last one. A failed fetch is yielded as `(Order{}, err)` and ends the iteration.
+
+### Whiteboard version
+
+The bare idea: a function that yields matching items and stops when `yield` returns false. The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import (
+	"fmt"
+	"iter"
+)
+
+// Evens yields the even numbers of xs, one at a time.
+func Evens(xs []int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for _, x := range xs {
+			if x%2 == 0 && !yield(x) {
+				return // the caller broke out of the loop: stop now
+			}
+		}
+	}
+}
+
+func main() {
+	for x := range Evens([]int{1, 2, 3, 4, 6, 8}) {
+		if x > 4 {
+			break // yield returns false, Evens returns
+		}
+		fmt.Println(x) // 2, then 4
+	}
+}
+```
 
 ## 4. Worked example
 
@@ -562,8 +601,8 @@ A push iterator is a function call per item. `iter.Pull` switches between two st
 | `iter.Seq` / `Seq2` | Push: call `yield` per item | Default for new Go APIs since 1.23 | One call per item; errors need `Seq2` or an `Err` method |
 | Next/Err/Close | Pull: the caller drives | Resources that must be closed (`sql.Rows`) | The caller must check `Err` and call `Close` |
 | Callback with stop signal | Push via a named callback | APIs older than 1.23 (`fs.WalkDir`, `sync.Map.Range`) | Cannot use `break`; stop values differ per API |
-| `iter.Pull` | Turns a push iterator into `next`/`stop` | Zipping or merging two sequences | About 70 ns per item measured above; must call `stop` |
-| Channel + goroutine | Producer sends on a channel | Real concurrency: a producer that should run ahead | Leaks on early stop unless cancelled; about 180 ns per item |
+| `iter.Pull` | Turns a push iterator into `next`/`stop` | Zipping or merging two sequences | Roughly 30× slower per item than range-over-func in the measurement above (exact ns depend on the machine); must call `stop` |
+| Channel + goroutine | Producer sends on a channel | Real concurrency: a producer that should run ahead | Leaks on early stop unless cancelled; roughly 70× slower per item than range-over-func in the measurement above |
 
 **Composing.** `slices.Values`, `slices.All`, `maps.Keys` and `maps.Values` produce iterators; `slices.Collect`, `slices.Sorted` and `maps.Collect` consume them. Generic adapters such as `Filter` and `Map` (about 10 lines each) sit in between and stay lazy: `slices.Collect(Map(Filter(seq, keep), f))` touches each item once and builds only the final slice.
 
@@ -619,7 +658,7 @@ Sorting by a non-unique column needs a tie-breaker in both the `ORDER BY` and th
 ## 9. Interview questions
 
 > [!question]- Why not return a channel from a goroutine as an iterator? (trap)
-> If the consumer stops early, the producer blocks on its next send forever: a goroutine leak per call. It is also slow: measured here at about 180 ns per item against 2.5 ns for range-over-func. Use `iter.Seq`; use a channel only for real concurrency, with a `ctx` to stop the producer.
+> If the consumer stops early, the producer blocks on its next send forever: a goroutine leak per call. It is also slow: in the measurement above it cost roughly 70 times more per item than range-over-func (absolute numbers depend on the machine). Use `iter.Seq`; use a channel only for real concurrency, with a `ctx` to stop the producer.
 
 > [!question]- What must an iterator do when `yield` returns false?
 > Return immediately without calling `yield` again; calling it again panics at run time. Returning also runs the iterator's `defer` statements, which is where cursors and files are released.
@@ -628,7 +667,7 @@ Sorting by a non-unique column needs a tie-breaker in both the `ORDER BY` and th
 > Either `iter.Seq2[T, error]` and handle the error inside the loop, or the `Next`/`Err` style where the caller checks `Err()` after the loop. `bufio.Scanner.Scan` returns `false` both at EOF and on error, so skipping `Err()` turns a failure into a silently short result.
 
 > [!question]- When would you use `iter.Pull`?
-> When you need to drive two sequences in step, such as merging two sorted streams or comparing them item by item, or to adapt a push iterator to a `Next()` API. Always `defer stop()`. Each step costs a stack switch (about 73 ns per item measured here), so do not use it where a plain range works.
+> When you need to drive two sequences in step, such as merging two sorted streams or comparing them item by item, or to adapt a push iterator to a `Next()` API. Always `defer stop()`. Each step costs a goroutine stack switch (roughly 30 times the per-item cost of a plain range-over-func loop in the measurement above), so do not use it where a plain range works.
 
 > [!question]- Design an iterator over a large orders table.
 > `iter.Seq2[Order, error]` that fetches pages with keyset pagination (`WHERE id > $last ORDER BY id LIMIT $n`), yields each row, stops on a short page, yields the fetch error as the second value, and releases its cursor in a `defer`. Test the full run, an early break and a mid-scan failure.

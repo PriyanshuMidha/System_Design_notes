@@ -16,6 +16,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A controller owns N elevator cars. Hall buttons (floor plus up or down) go through a dispatcher that picks a car; cabin buttons go straight to their car. Each car keeps two stop sets, one for calls served going up and one going down, and serves them in LOOK order: keep going while calls remain ahead, then turn. A tick-based `Step()` makes the whole simulation deterministic to test.
 
+> [!abstract] Core idea
+> - A controller owns N cars; hall calls go through a dispatcher that picks a car, cabin calls go straight to their car.
+> - Each car keeps two stop sets: stops to serve going up and stops to serve going down.
+> - The one rule (LOOK): keep moving in the current direction while calls remain ahead, then turn.
+> - A tick-based `Step()` moves every car one step, so tests run deterministically without sleeping.
+> - Classic mistake: setting the car to Idle whenever the door closes even though calls remain.
+
 ## Problem statement
 
 ```text
@@ -25,6 +32,15 @@ Hall buttons send (floor, Up|Down); the controller assigns a car. Cabin buttons 
 capacity (overweight), out-of-service cars and fire recall. Button presses arrive
 concurrently with the controller loop.
 ```
+
+### Solving path
+
+1. Clarify floors, number of cars, capacity, out-of-service and fire recall.
+2. Model `car` with position, direction, state and two stop sets.
+3. Write LOOK: `nextDir`, `shouldStop`, `serve` and `settle`.
+4. Write the `Dispatcher` interface with a nearest-suitable-car rule.
+5. Write `Controller` with `HallCall`, `CabinCall` and `Step` under one mutex.
+6. Test with ticks: direction changes, no wrong-direction pickups, overweight and out-of-service.
 
 ## Step 1: Clarify requirements
 
@@ -114,6 +130,12 @@ None: car state changes every tick and lives in memory. A trip log for tuning di
 | [[Command, Undo and Memento]] | Extension: in the event-loop design, each press becomes a request object sent on a channel to the goroutine that owns the cars |
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> Aim for about 150 lines in the room.
+> - **Write:** `Direction`, `State`, `car` with `addStop`, `step`, `settle`, `nextDir`, `hasCallsBeyond`, `shouldStop` and `serve`, the `Dispatcher` interface with `NearestSuitable`, and `Controller` with `NewController`, `HallCall`, `CabinCall` and `Step`.
+> - **Add if time remains:** `Status`, `SetOutOfService`, `SetLoad` and `Run`.
+> - **Talk only:** fire recall details, destination dispatch, SCAN versus FCFS, and the event-loop alternative to the mutex.
 
 LOOK lives in `nextDir` and `shouldStop`. A common bug is to set Idle whenever the door closes, even with calls left; `settle` avoids it by choosing the next state from the remaining calls.
 
@@ -504,7 +526,7 @@ xychart-beta
 | `TestOverweightHoldsDoor` | The door stays open while overweight and closes on the tick after the load drops |
 | `TestConcurrentPressesWithTickLoop` | 8 goroutines press 400 buttons while `Run` ticks; under `-race` every call is still served |
 
-Measured: `go test -race -cover` on Go 1.24.4 passes all 9 tests with 99.2% statement coverage.
+Measured: `go test -race -cover` on Go 1.24.4 passes all 9 tests with about 98% statement coverage (97.6–99.2% across runs; the concurrency tests reach some branches only on some schedules).
 
 ```go
 // File: elevator_test.go

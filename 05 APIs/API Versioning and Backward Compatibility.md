@@ -24,6 +24,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > **Backward compatibility** means a client written last year still works after today's deploy. Most changes can be made compatibly (add a field, add an endpoint). A **breaking change** (remove, rename or retype a field, change a meaning) needs a new **API version** that old clients do not see until they opt in, plus a planned way to retire the old version.
 
+> [!abstract] Core idea
+> - Most changes can be backward compatible: add fields and endpoints, never remove or change meaning.
+> - A **breaking change** needs a new version that old clients do not see until they opt in.
+> - Serve every version from one core: build the latest response, then walk it back for older clients.
+> - Retire old versions on a published schedule with `Deprecation` and `Sunset` headers.
+> - Classic mistake: copying the whole codebase per version, so every fix must be made N times.
+
 ## 1. Why it exists
 
 Your payments API returns `"amount": 49900` (an integer, in paise). The mobile app parses it straight into an `Int`. The backend team decides amounts should carry their currency and ships:
@@ -108,6 +115,31 @@ flowchart LR
 - After the sunset, answer `410 Gone` rather than `404`: the version existed and was removed on purpose.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+One core shape, walked back for an older version. The full version below adds the production concerns.
+
+```go
+package versioning
+
+// Charge is always built in the latest shape.
+type Charge struct {
+	ID     string
+	Amount map[string]any // since 2025-09-01: {"value": 499, "currency": "INR"}
+}
+
+// Render walks the latest shape back for clients pinned to an older version.
+func Render(c Charge, version string) map[string]any {
+	out := map[string]any{"id": c.ID, "amount": c.Amount}
+	if version < "2025-09-01" { // ISO dates compare correctly as strings
+		out["amount"] = c.Amount["value"] // old clients expect a plain number
+	}
+	return out
+}
+```
+
+### Full version
 
 A charge resource with two breaking changes: on 2025-03-01 the status enum gained `partially_refunded`; on 2025-09-01 `amount` became an object. One core handler renders the latest shape; the policy walks it back for older clients, adds deprecation headers, and rejects retired or unknown versions. It compiles and passes `go vet` and `go test -race` on Go 1.24 (`slices.Backward` needs Go 1.23 or later).
 

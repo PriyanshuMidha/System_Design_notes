@@ -23,6 +23,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > SOAP is an XML messaging protocol: every call is an XML **Envelope** with an optional **Header** and a **Body**, usually sent with HTTP `POST`, and errors come back as a **Fault**. **WSDL** is the XML contract that lists the operations, their XML schemas and the endpoint URL. You rarely design new SOAP APIs today, but banks, insurers, travel systems and governments still expose them, so you must know how to call one safely and hide it behind your own clean API.
 
+> [!abstract] Core idea
+> - A SOAP call is an XML Envelope (Header + Body) sent with HTTP `POST`; errors come back as a Fault in the body.
+> - WSDL is the XML contract: operations, message schemas and the endpoint URL; tools generate clients from it.
+> - Rule: wrap the SOAP service in an adapter so the rest of your code only sees domain types and domain errors.
+> - Classic mistake: building XML by string concatenation without escaping, or treating an HTTP 500 Fault as a generic network error.
+
 ## 1. Why it exists
 
 Around 2000, companies wanted programs on different platforms (Java, .NET, mainframes) to call each other over the internet. HTTP and XML were already supported on every one of those platforms, so SOAP put a typed XML message inside an HTTP `POST`, and WSDL described it precisely enough for tools to **generate the client code**.
@@ -166,6 +172,56 @@ This is the common **document/literal wrapped** style: the Body holds one elemen
 
 ## 4. Worked example
 
+### Whiteboard version
+
+The bare call: build an escaped envelope, `POST` it with the `SOAPAction` header, decode the body or the Fault. The full adapter below adds timeouts, retries only for safe operations, fault mapping and the anti-corruption layer.
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/xml"
+	"fmt"
+	"net/http"
+)
+
+const envelope = `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body><GetBalance xmlns="urn:bank"><Account>%s</Account></GetBalance></soap:Body>
+</soap:Envelope>`
+
+type resp struct {
+	Balance string `xml:"Body>GetBalanceResponse>Balance"`
+	Fault   string `xml:"Body>Fault>faultstring"`
+}
+
+func getBalance(url, account string) (string, error) {
+	var buf bytes.Buffer
+	xml.EscapeText(&buf, []byte(account)) // never paste raw input into XML
+	body := fmt.Sprintf(envelope, buf.String())
+	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "text/xml; charset=utf-8")
+	req.Header.Set("SOAPAction", `"urn:bank#GetBalance"`)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	var r resp
+	if err := xml.NewDecoder(res.Body).Decode(&r); err != nil {
+		return "", err
+	}
+	if r.Fault != "" {
+		return "", fmt.Errorf("soap fault: %s", r.Fault)
+	}
+	return r.Balance, nil
+}
+
+func main() { fmt.Println(getBalance("http://localhost:8080/bank", "ACC-1")) }
+```
+
+### Full version
+
 A Go service calls the bank through an **adapter** (an anti-corruption layer). Nothing outside the adapter sees XML; callers get a domain `Balance` or a domain error.
 
 ```mermaid
@@ -271,7 +327,10 @@ func (c *Client) Call(ctx context.Context, action string, in, out any) error {
 		return f
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("soap: HTTP %d: %v", resp.StatusCode, err)
+		if err != nil {
+			return fmt.Errorf("soap: HTTP %d: %w", resp.StatusCode, err)
+		}
+		return fmt.Errorf("soap: HTTP %d", resp.StatusCode)
 	}
 	return err
 }

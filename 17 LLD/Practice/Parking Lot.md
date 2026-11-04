@@ -16,6 +16,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > The parking lot is the classic first LLD round. You model spots, tickets and vehicles, keep "which spot" and "how much" as two swappable strategies, and make "pick a free spot and mark it taken" one atomic step so two gates can never get the same spot. Money is `int64` paise and the clock is injected, so every fee is testable.
 
+> [!abstract] Core idea
+> - The lot is a list of floors, each a list of spots; a ticket links one vehicle to one spot by ID.
+> - Two swappable strategies: one picks the spot (allocation), one computes the fee (pricing).
+> - The one rule: "find a free spot" and "mark it taken" happen under the same lock, so two gates never get the same spot.
+> - Money is `int64` paise and the clock is injected, so fees are exact and testable.
+> - Classic mistake: checking for a free spot, unlocking, then marking it taken (a race), or using `float64` for money.
+
 ## Problem statement
 
 ```text
@@ -25,6 +32,15 @@ Handle lost tickets and many entry gates working at the same time.
 ```
 
 - It tests clean entity modelling (Spot, Ticket, Vehicle), two independent strategies (allocation and pricing), and the classic race: two cars at two gates must never get the same spot. Time box: 10 minutes for Steps 1-4, 10 for Steps 5-6, 25-40 for the code, 10 for edge cases.
+
+### Solving path
+
+1. Ask the clarifying questions: spot types, pricing rule, lost ticket, number of gates.
+2. Name the entities: `Vehicle`, `Spot`, `Ticket`, `Receipt`, `ParkingLot`.
+3. Pull out the two things that change: allocation and pricing become interfaces.
+4. Write `Park` and `Exit` with the pick-and-mark step under one mutex.
+5. Add the lost-ticket flow and the injected clock.
+6. Test concurrency (many goroutines, one spot), fees and the lost ticket; then discuss the multi-instance database version.
 
 ## Step 1: Clarify requirements
 
@@ -272,6 +288,12 @@ cmd/demo/main.go  -> builds floors, picks strategies, injects time.Now, runs a p
 - `cmd/demo/main.go`: wiring only.
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> Aim for about 150 lines in the room.
+> - **Write:** `VehicleType`, `Vehicle`, `Spot`, `Ticket`, `Receipt`, the `AllocationStrategy` interface with `LowestFloorFirst`, the `PricingStrategy` interface with `HourlyPricing`, and `ParkingLot` with `NewParkingLot`, `Park`, `Exit` and `close`.
+> - **Add if time remains:** `ExitLostTicket` and `FreeCount`, plus one race test.
+> - **Talk only:** `FallbackAllocation`, the repositories and SQL schema, sharding the mutex, and multi-instance allocation.
 
 ### Walkthrough
 

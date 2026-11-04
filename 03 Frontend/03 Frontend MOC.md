@@ -2,7 +2,7 @@
 tags: [moc]
 status: draft
 generated: true
-updated: 2026-11-02
+updated: 2026-11-03
 ---
 
 # 03 Frontend MOC

@@ -1,7 +1,7 @@
 ---
 tags: [databases, nosql, data-modeling]
 level: basic
-status: draft
+status: reviewed
 prereqs: ["[[SQL Essentials]]"]
 related: ["[[NoSQL Data Modeling]]", "[[Relational Schema Design]]", "[[Partitioning and Sharding]]", "[[Distributed SQL]]", "[[CAP and PACELC]]", "[[Wide-Column Stores and Cassandra]]", "[[Transactional Outbox and CDC]]"]
 sources:
@@ -15,7 +15,7 @@ sources:
   - "Discord Engineering, How Discord Stores Billions of Messages (2017-01-13)"
   - "Discord Engineering, How Discord Stores Trillions of Messages (2023-03-06)"
   - "Uber Engineering, Designing Schemaless, Uber Engineering's Scalable Datastore Using MySQL (2016-01-12)"
-  - "Instagram Engineering, Sharding & IDs at Instagram (2012)"
+  - "Instagram engineering blog, Sharding & IDs at Instagram"
   - "Bronson et al., TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC 2013)"
   - "Corbett et al., Spanner: Google's Globally-Distributed Database (OSDI 2012)"
   - "AWS What's New, Amazon Aurora PostgreSQL Limitless Database is generally available (2024-10-31)"
@@ -26,6 +26,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > **SQL** (relational) databases store tables with a declared schema and let you join them, query them any way you like, and change many rows in one transaction. **NoSQL** is an umbrella for stores built on other data models (documents, key-value pairs, wide rows, graphs) that usually give up ad-hoc joins in exchange for a data layout matched to a few known queries at large scale. Choose by access patterns, relationships, consistency and scale, not by the label: NoSQL stores now have transactions, and SQL databases now scale out.
+
+> [!abstract] Core idea
+> - Pick a store from its access patterns (which queries, how often, how big), not from the SQL or NoSQL label.
+> - Relational: one fact stored once, joined at read time, any new question answerable with SQL, multi-row transactions.
+> - Document or key-value: data laid out to match a few known queries, scaled by partition key; new questions need new copies of the data.
+> - Classic mistake: writing two stores from one request (a dual write). Keep one source of truth and copy changes out with an outbox or CDC.
 
 ## 1. Why it exists
 
@@ -98,7 +104,7 @@ In practice both are per-operation settings, not product properties:
 | PostgreSQL    | Read Committed; asynchronous replicas may lag              | Serializable isolation; synchronous replication                          |
 | MySQL InnoDB  | Repeatable Read                                            | Serializable                                                             |
 | MongoDB       | write concern `majority` (since 5.0), read concern `local` | read concern `majority` or `linearizable`; multi-document transactions   |
-| DynamoDB      | eventually consistent reads                                | `ConsistentRead=true` on the table (not on global secondary indexes); transactions |
+| DynamoDB      | eventually consistent reads                                | `ConsistentRead=true` on the table or a local secondary index (not on global secondary indexes); transactions |
 | Cassandra     | consistency level chosen per request                       | `QUORUM` reads and writes; lightweight transactions (Paxos) for compare-and-set |
 
 ### Scaling paths
@@ -141,6 +147,28 @@ flowchart TD
 The question "does it need transactions?" no longer separates the two sides: MongoDB (multi-document since 4.0) and DynamoDB (`TransactWriteItems`) both offer them.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The same read, two ways. Relational stores each fact once and joins on read; a document store keeps a copy shaped for this one query.
+
+```sql
+-- Relational: any question, joins at read time
+SELECT i.number, c.name, SUM(it.quantity * it.unit_price_minor)
+FROM invoices i
+JOIN clients c        ON c.id = i.client_id
+JOIN invoice_items it ON it.invoice_id = i.id
+WHERE i.id = 42
+GROUP BY i.number, c.name;
+```
+
+```text
+Document store: one key fetch, data pre-joined
+GET invoice#42 -> { number, client: {name}, items: [{quantity, unit_price_minor}] }
+(client renamed? every invoice document holding the copy must be updated)
+```
+
+The full worked example below goes pattern by pattern through InvoiceOps with rates and picks a store for each.
 
 **Choosing stores for InvoiceOps.** Start from access patterns with rough rates (all rates are estimates for a product with 10,000 active workspaces):
 
@@ -211,7 +239,7 @@ Choosing by workload:
 - *"NoSQL is schemaless."* The schema moved from the database into every reader.
 - *"NoSQL is faster."* Speed comes from data laid out for the query. A key lookup is fast in any engine that is built for that key.
 
-**Polyglot persistence costs.** Every extra store adds backups, upgrades, monitoring, security review and on-call knowledge. Data copied between stores needs one writer and a pipeline: writing to Postgres and Elasticsearch from the same request is a *dual write* that silently diverges when one side fails. Use an outbox or CDC, and run a reconciliation job.
+**Polyglot persistence costs.** Every extra store adds backups, upgrades, monitoring, security review and on-call knowledge. Data copied between stores needs one writer and a pipeline: writing to Postgres and Elasticsearch from the same request is a *dual write* that silently diverges when one side fails. Use an outbox (a table written in the same transaction as the change, which a relay then publishes) or CDC (change data capture: streaming changes out of the database log), and run a reconciliation job.
 
 ## 7. In production
 

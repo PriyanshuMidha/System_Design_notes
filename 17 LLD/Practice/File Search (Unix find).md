@@ -18,6 +18,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Model the file system as a **Composite** tree (File, Directory, Symlink all implement `Node`) and model the query as a second tree of small **filters** joined by AND, OR and NOT. One loop walks the first tree and asks the second tree about each file. Popping from the end of the frontier gives depth-first search (DFS), popping from the front gives breadth-first search (BFS), and a `visited` set stops symlink cycles.
 
+> [!abstract] Core idea
+> - Two trees: the file tree (Composite: `File`, `Directory`, `Symlink` share one `Node` interface) and the filter tree (small filters joined by `And`, `Or`, `Not`).
+> - One loop keeps a frontier, the list of nodes found but not yet visited. Pop from the end and it is DFS; pop from the front and it is BFS.
+> - A `visited` set of directories reached through symlinks stops cycles; a max depth stops the walk early.
+> - Classic mistakes: one search function with a growing list of flag parameters, and following symlinks without a visited set (an infinite loop).
+
 ## Problem statement
 
 ```text
@@ -26,6 +32,16 @@ that match filters on name (glob), extension and size. Filters can be combined w
 AND / OR / NOT, e.g. `ext=.go AND size<1048576`. Support DFS or BFS traversal, a max
 depth, and do not loop forever on symlink cycles.
 ```
+
+**Solving path**
+
+1. Clarify: which filters, how they combine, DFS or BFS, max depth, symlinks.
+2. Model the tree: `Node`, `File`, `Directory`, `Symlink`.
+3. Model filters as one-method objects and combine them with `And`, `Or`, `Not`.
+4. Write one `Search` loop over a frontier, with order, depth and cycle checks.
+5. Return matches with their paths, plus skipped errors.
+6. Discuss the query parser, the real disk (`io/fs`) and parallel search.
+7. Test each filter, the combinators, DFS vs BFS order, depth and a symlink cycle.
 
 What it really tests: modeling a tree uniformly ([[Composite]]), modeling filter logic as composable objects (Specification and Interpreter) instead of a growing `if` chain, and safe traversal: cycles, depth limits, permission errors and cancellation. Time box: 10 minutes for requirements and entities, 10 for APIs, 25 to 40 for code, 10 for edge cases.
 
@@ -172,6 +188,11 @@ cmd/find/main.go      -> flags -> Parse -> SearchFS(os.DirFS(root)) -> print pat
 - `search.go`, `walk_fs.go` and `parallel.go` are the only files that know about depth, cycles and order.
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `Node`, `File`, `Directory`, `Symlink`; `Filter` + `FilterFunc`; `NameGlob`, `ExtensionIs`, `SizeLessThan`, `SizeGreaterThan`; `And`, `Or`, `Not`; `Order`, `Options`, `Match`, `Result`; and `Search`.
+>
+> **Talk through only (extensions):** `Parse` (the query-string parser), `SearchFS` over a real `fs.FS`, `ParallelSearch`, an index for huge trees, and cancellation details beyond the `ctx` check.
 
 ```mermaid
 flowchart TD

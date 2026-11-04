@@ -8,13 +8,19 @@ sources:
   - "Gamma, Helm, Johnson, Vlissides, Design Patterns (1994), Observer"
   - "Go standard library docs: os/signal Notify and Stop, context.AfterFunc (Go 1.21), sync.OnceFunc (Go 1.21), errors.Join (Go 1.20), slices.DeleteFunc"
   - "PostgreSQL 17 docs: SELECT ... FOR UPDATE SKIP LOCKED"
-updated: 2026-11-02
+updated: 2026-11-03
 ---
 
 # Observer and Event Bus
 
 > [!summary] TL;DR
 > In the Observer pattern a *subject* keeps a list of *observers* and calls each of them when something happens, without knowing what they do. An **event bus** is the same idea with topics: code publishes `order.created`, and every handler subscribed to that topic runs. The hard parts in Go are concurrency (a locked handler list), failures (one bad handler must not stop the rest), slow handlers, unsubscribing, and not announcing events that were never committed.
+
+> [!abstract] Core idea
+> - A publisher announces "this happened" on a topic; every subscriber to that topic gets called. The publisher does not know who listens.
+> - Copy the handler list under the lock, then call handlers **outside** the lock, so a slow or re-entrant handler cannot block the bus.
+> - One failing or panicking handler must not stop the others.
+> - Classic mistake: publishing an event inside a database transaction that later rolls back. Publish after commit, through the **transactional outbox** (an event row saved in the same transaction and sent later by a relay; see [[Transactional Outbox and CDC]]).
 
 ## 1. Why it exists
 
@@ -61,6 +67,8 @@ classDiagram
     }
     class AsyncSubscriber {
         -ch chan Event
+        -stopping chan struct
+        -senders WaitGroup
         -policy Policy
         -dropped atomic.Int64
         +Handle(ctx, Event) error
@@ -81,7 +89,7 @@ classDiagram
 
 **Subscribing:** `Subscribe` appends a new `*subscription` under the write lock and returns an `unsubscribe` function wrapped in `sync.OnceFunc`, so calling it twice is harmless. Each subscription is a distinct pointer, which matters because a `HandlerFunc` value cannot be compared with `==`.
 
-**Asynchronous delivery:** wrap a slow handler in an `AsyncSubscriber`. It is itself a `Handler`, so it plugs into the same bus. `Handle` only puts the event on a buffered channel; one goroutine per subscriber drains it in order. When the buffer is full, the policy decides: **Block** (the publisher waits: back-pressure) or **DropNewest** (the event is dropped and counted).
+**Asynchronous delivery:** wrap a slow handler in an `AsyncSubscriber`. It is itself a `Handler`, so it plugs into the same bus. `Handle` only puts the event on a buffered channel; one goroutine per subscriber drains it in order. When the buffer is full, the policy decides: **Block** (the publisher waits: back-pressure) or **DropNewest** (the event is dropped and counted). A blocked publisher waits **without holding any lock**, so `Close` can always stop intake: it wakes every blocked sender with `ErrClosed`, drains what was already accepted, and returns once the handler has finished those events.
 
 **Publish after commit.** An in-process bus forgets everything when the process dies, and publishing inside a database transaction announces orders that may roll back. The fix is the transactional outbox: write the event row in the **same transaction** as the order, and let a relay publish committed rows.
 
@@ -108,6 +116,51 @@ sequenceDiagram
     R->>DB: keep evt_1 unpublished, retry later
     R->>B: Publish(evt_1) again
     Note over E,A: redelivery: consumers must be idempotent (dedupe on evt_1)
+```
+
+### Whiteboard version
+
+The bare idea: a map from topic to handlers, and `Publish` calls each one. The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import (
+	"fmt"
+	"slices"
+	"sync"
+)
+
+type Handler func(payload string)
+
+type Bus struct {
+	mu   sync.RWMutex
+	subs map[string][]Handler
+}
+
+func NewBus() *Bus { return &Bus{subs: map[string][]Handler{}} }
+
+func (b *Bus) Subscribe(topic string, h Handler) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.subs[topic] = append(b.subs[topic], h)
+}
+
+func (b *Bus) Publish(topic, payload string) {
+	b.mu.RLock()
+	hs := slices.Clone(b.subs[topic]) // copy the list under the lock
+	b.mu.RUnlock()
+	for _, h := range hs { // call handlers outside the lock
+		h(payload)
+	}
+}
+
+func main() {
+	bus := NewBus()
+	bus.Subscribe("order.created", func(p string) { fmt.Println("email:", p) })
+	bus.Subscribe("order.created", func(p string) { fmt.Println("analytics:", p) })
+	bus.Publish("order.created", "order 42")
+}
 ```
 
 ## 4. Worked example
@@ -213,16 +266,19 @@ var ErrClosed = errors.New("subscriber closed")
 // so a slow handler cannot slow the publisher (with DropNewest) and
 // events reach it in publish order.
 type AsyncSubscriber struct {
-	mu      sync.RWMutex // read-held while sending, so Close never closes under a sender
-	closed  bool
-	ch      chan Event
-	policy  Policy
-	done    chan struct{}
-	dropped atomic.Int64
+	mu       sync.RWMutex // guards closed and senders.Add; never held while waiting
+	closed   bool
+	senders  sync.WaitGroup // Handle calls that may still send on ch
+	stopping chan struct{}  // closed by Close: wakes every blocked sender
+	ch       chan Event
+	policy   Policy
+	done     chan struct{} // closed when the worker has drained ch
+	dropped  atomic.Int64
 }
 
 func NewAsync(h Handler, buffer int, p Policy, onErr func(error)) *AsyncSubscriber {
-	a := &AsyncSubscriber{ch: make(chan Event, buffer), policy: p, done: make(chan struct{})}
+	a := &AsyncSubscriber{ch: make(chan Event, buffer), policy: p,
+		stopping: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(a.done)
 		for e := range a.ch {
@@ -235,11 +291,17 @@ func NewAsync(h Handler, buffer int, p Policy, onErr func(error)) *AsyncSubscrib
 }
 
 func (a *AsyncSubscriber) Handle(ctx context.Context, e Event) error {
+	// Register as a sender under the lock, then send WITHOUT the lock: a sender
+	// blocked on a full buffer must not stop Close or other callers.
 	a.mu.RLock()
-	defer a.mu.RUnlock()
 	if a.closed {
+		a.mu.RUnlock()
 		return ErrClosed
 	}
+	a.senders.Add(1)
+	a.mu.RUnlock()
+	defer a.senders.Done()
+
 	if a.policy == DropNewest {
 		select {
 		case a.ch <- e:
@@ -251,19 +313,25 @@ func (a *AsyncSubscriber) Handle(ctx context.Context, e Event) error {
 	select {
 	case a.ch <- e:
 		return nil
+	case <-a.stopping: // Close was called: give up instead of waiting for room
+		return ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-// Close stops intake, lets the worker drain the buffer, and waits for it.
+// Close stops intake at once (blocked senders get ErrClosed), lets the worker
+// drain what was already accepted, and waits for it. Safe to call twice.
 func (a *AsyncSubscriber) Close() {
 	a.mu.Lock()
-	if !a.closed {
-		a.closed = true
-		close(a.ch)
-	}
+	first := !a.closed
+	a.closed = true
 	a.mu.Unlock()
+	if first {
+		close(a.stopping) // wake every sender blocked on a full buffer
+		a.senders.Wait()  // no Handle can still send on ch after this
+		close(a.ch)       // so closing it cannot panic a sender
+	}
 	<-a.done
 }
 
@@ -329,7 +397,7 @@ analytics handled: 1 | subscribers left: 2
 
 Read it closely. The SMS failure did not stop the other handlers. On redelivery the email handler, which is **not** idempotent, sent a second email, while analytics, wrapped in `Idempotent`, counted the order once. That is the whole argument for idempotent consumers in one run.
 
-The tests check error and panic isolation, unsubscribing from inside a handler, concurrent subscribe and publish under the race detector, both slow-subscriber policies, idempotent redelivery and a closed subscriber:
+The tests check error and panic isolation, unsubscribing from inside a handler, concurrent subscribe and publish under the race detector, both slow-subscriber policies, idempotent redelivery, a closed subscriber, and `Close` releasing a sender that is blocked on a full buffer with a context that never ends:
 
 ```go
 package main
@@ -479,9 +547,67 @@ func TestClosedSubscriberRejectsEvents(t *testing.T) {
 		t.Fatalf("err = %v, want ErrClosed", err)
 	}
 }
+
+// A Block-policy sender is stuck: the handler is stuck and the buffer is full,
+// and its context never ends. Close must still stop intake at once: the stuck
+// sender and any new sender get ErrClosed, and Close returns once the handler
+// finishes the event it holds and the buffered one.
+func TestCloseReturnsWhileASendIsBlocked(t *testing.T) {
+	gate := make(chan struct{})
+	var handled atomic.Int64
+	a := NewAsync(HandlerFunc(func(context.Context, Event) error { <-gate; handled.Add(1); return nil }), 1, Block, func(error) {})
+	released := false
+	defer func() {
+		if !released {
+			close(gate) // let a failing run clean up
+		}
+	}()
+	for range 2 { // 1 in the handler's hand, 1 in the buffer
+		if err := a.Handle(context.Background(), Event{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for len(a.ch) != 1 { // wait until the worker took the first event
+		time.Sleep(time.Millisecond)
+	}
+	stuck := make(chan error, 1)
+	go func() { stuck <- a.Handle(context.Background(), Event{}) }() // blocks: no room, no deadline
+	time.Sleep(20 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() { a.Close(); close(closed) }()
+	select {
+	case err := <-stuck:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("blocked sender got %v, want ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not release the blocked sender")
+	}
+	late := make(chan error, 1)
+	go func() { late <- a.Handle(context.Background(), Event{}) }()
+	select {
+	case err := <-late:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("new sender got %v, want ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a new Handle call is blocked behind Close")
+	}
+	released = true
+	close(gate)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the handler finished")
+	}
+	if h := handled.Load(); h != 2 {
+		t.Fatalf("handled %d events, want the 2 accepted before Close", h)
+	}
+}
 ```
 
-`go test -race -count=3` passes all seven tests on every run.
+`go test -race -count=3` passes all eight tests on every run. The last test is a regression test: an earlier version held the read lock while blocked on `a.ch <- e`, so with a stuck handler and a context that never ends, `Close` (which needs the write lock) waited forever, and the waiting writer also blocked every new `Handle`. Against that version the test fails with "Close did not release the blocked sender".
 
 ### The outbox rows (PostgreSQL 17)
 
@@ -524,7 +650,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 
 | Policy | What happens when the buffer is full | Pick it for |
 | --- | --- | --- |
-| Block | The publisher waits until there is room or its context ends | Events that must not be lost in process; back-pressure is acceptable |
+| Block | The publisher waits until there is room, its context ends, or the subscriber is closed (`ErrClosed`) | Events that must not be lost in process; back-pressure is acceptable |
 | Drop newest | The new event is discarded and a counter goes up | Metrics, analytics, UI refresh hints |
 | Drop oldest | The oldest queued event is discarded for the new one | "Latest state wins" feeds such as live location |
 | Bigger buffer | More memory absorbs bursts | Short bursts only; it postpones the choice |
@@ -546,6 +672,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - **Handlers doing too much synchronously.** A 2-second handler makes every publish take 2 seconds. Move it behind an `AsyncSubscriber`.
 - **No idempotency in consumers.** Outbox delivery is at-least-once, so every consumer must de-duplicate on the event ID, as the run above shows.
 - **Calling handlers under the lock.** A handler that subscribes or unsubscribes deadlocks, and a slow handler blocks every `Subscribe`.
+- **Blocking on a channel under a lock.** The same mistake in the async subscriber: a sender waiting for buffer room while holding a read lock stops `Close` and, behind the waiting writer, every new sender. Never wait under a lock; select on a stop channel instead.
 - **Leaking subscribers.** A request-scoped object that subscribes and never unsubscribes stays reachable from the bus forever, along with everything it references. Call `unsubscribe` with `defer`, or tie it to a context with `context.AfterFunc`.
 - **Goroutine per event.** It looks asynchronous and free, but it has no ordering, no limit and no place for errors to go.
 
@@ -569,7 +696,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - **Why copy the slice, not just read it.** `slices.DeleteFunc` shifts elements inside the same backing array (and, since Go 1.22, zeroes the tail). If `Publish` ranged over the shared slice after unlocking, an unsubscribe could rewrite it mid-loop. `slices.Clone` under the read lock gives `Publish` a private snapshot. The cost is one small allocation per publish; copy-on-write (build a new slice on every subscribe or unsubscribe and swap it) moves that cost to the rare writes.
 - **Snapshot semantics.** A handler that unsubscribes during a publish still receives the event in flight, because the snapshot was taken before. A handler subscribed during a publish receives only later events. State this guarantee; tests rely on it.
 - **Ordering guarantees.** The synchronous bus gives subscription order per event and publish order per publishing goroutine. Two goroutines publishing at once have no defined order between their events. `AsyncSubscriber` keeps publish order per subscriber because one goroutine drains one FIFO channel. There is no order across subscribers.
-- **Close without a panic.** Sending on a closed channel panics. `AsyncSubscriber` holds a read lock while sending and takes the write lock to close, so `Close` can never close the channel under a sender, and a late `Handle` gets `ErrClosed`.
+- **Close without a panic, and without a hang.** Sending on a closed channel panics, so `Close` must never close `ch` under a sender. The tempting fix, holding a read lock for the whole send and taking the write lock to close, hangs: a Block-policy sender waiting for room keeps the read lock, `Close` waits for the write lock forever if the handler is stuck and the sender's context never ends, and because Go's `RWMutex` makes new readers queue behind a waiting writer, every new `Handle` blocks too. Instead, `Handle` holds the read lock only to check `closed` and register itself in a `sync.WaitGroup`, then sends with `select` on `ch`, a `stopping` channel and `ctx.Done()`. `Close` sets `closed` under the write lock (so no new sender can register), closes `stopping` (every blocked sender returns `ErrClosed`), waits for the registered senders, and only then closes `ch`. An event that wins the race into the buffer just before `stopping` fires is still handled, because the worker drains `ch` until it is closed. `Close` itself still waits for the worker to finish the accepted events; a handler that never returns needs its own timeout.
 - **Idempotency belongs to the consumer.** The outbox guarantees at-least-once delivery, not exactly-once. The `Idempotent` wrapper keeps the seen set in memory; in production it is a `processed_events` table with a unique key, written in the same transaction as the handler's side effect. See [[Idempotency and Idempotency Keys]].
 - **Typed events.** Topics as strings are flexible but unchecked. A generic `Bus[T any]` per event type catches a handler of the wrong event type at compile time. A `switch e := ev.(type)` over event structs is the weaker option: it replaces string topics with types, but a mismatch shows up only at run time. Generics are covered in [[Generics and Iterators]].
 
@@ -585,7 +712,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 > A handler that calls `Subscribe` or `unsubscribe` asks for the write lock while its own goroutine holds the read lock, so it deadlocks. A slow handler also blocks every `Subscribe` call. Copy the slice under the lock and call handlers after releasing it.
 
 > [!question]- A subscriber is much slower than the publisher. What are your options?
-> Give it its own buffered channel and goroutine, then choose what happens when the buffer fills: block the publisher (back-pressure), drop the newest, drop the oldest, or grow the buffer for bursts. Count drops. For events that must never be lost, move them out of process to the outbox and a broker.
+> Give it its own buffered channel and goroutine, then choose what happens when the buffer fills: block the publisher (back-pressure), drop the newest, drop the oldest, or grow the buffer for bursts. Count drops. With blocking, the publisher must wait with `select` on the channel, its context and a stop channel, never while holding a lock, or closing the subscriber can hang. For events that must never be lost, move them out of process to the outbox and a broker.
 
 > [!question]- How do you avoid leaking subscribers in Go?
 > `Subscribe` returns an `unsubscribe` function; call it with `defer` or tie it to a context with `context.AfterFunc`. Monitor subscriber counts per topic: a number that only grows is a leak.
@@ -602,7 +729,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - Guard the map with `sync.RWMutex`; clone the slice, then call handlers outside the lock.
 - Call every handler; `errors.Join` the errors; recover panics per handler.
 - `Subscribe` returns `unsubscribe` (`sync.OnceFunc`); call it or leak.
-- Slow handlers: buffered channel per subscriber + policy (block, drop newest, drop oldest) + drop counter.
+- Slow handlers: buffered channel per subscriber + policy (block, drop newest, drop oldest) + drop counter; a blocked send selects on the channel, `ctx.Done()` and a stop channel, outside any lock.
 - Order: per subscriber at best; never across goroutines or subscribers.
 - Publish after commit through the transactional outbox; consumers de-duplicate on event ID.
 

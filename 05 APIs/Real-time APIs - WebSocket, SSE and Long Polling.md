@@ -24,6 +24,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Plain HTTP only answers when the client asks. Real-time APIs let the **backend push to the frontend without a new request**, because a connection stays open. **Long polling** holds a request open until there is news; **Server-Sent Events (SSE)** keep one HTTP response open and stream events down it; a **WebSocket** upgrades the connection into a two-way message channel.
 
+> [!abstract] Core idea
+> - Plain HTTP only answers when asked; real-time APIs keep a connection open so the server can push.
+> - Long polling holds a request until there is news; SSE streams events down one HTTP response; WebSocket is a two-way channel.
+> - Rule: pick SSE for server-to-client updates, WebSocket only when the client also sends often.
+> - Classic mistake: no heartbeats, no resume after reconnect, and unbounded buffers for slow clients.
+
 ## 1. Why it exists
 
 A trading screen shows prices that change several times a second. With plain request/response the browser has to ask.
@@ -165,6 +171,43 @@ stateDiagram-v2
 **Over HTTP/2 and HTTP/3**, WebSockets use extended `CONNECT` (RFC 8441 and RFC 9220) so one connection can carry many sockets. Most deployments still upgrade over HTTP/1.1.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare SSE endpoint: set `text/event-stream`, write `id:` and `data:` lines, flush, stop when the client leaves. The full version below adds resume with `Last-Event-ID`, a replay buffer, slow-consumer limits and heartbeats.
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+)
+
+func events(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	for i := 1; ; i++ {
+		select {
+		case <-r.Context().Done(): // client went away
+			return
+		case <-time.After(time.Second):
+			fmt.Fprintf(w, "id: %d\ndata: tick %d\n\n", i, i) // blank line ends an event
+			flusher.Flush()
+		}
+	}
+}
+
+func main() { http.HandleFunc("/events", events); http.ListenAndServe(":8080", nil) }
+```
+
+### Full version
 
 An SSE hub in Go 1.24 with the standard library. It shows four design points: resume with `Last-Event-ID`, a replay buffer, a bounded per-client buffer that disconnects slow consumers, and heartbeat comments. The file also computes `Sec-WebSocket-Accept`. It compiles and passes `go vet` and `go test -race` on Go 1.24.4, using `net/http/httptest` for real HTTP connections.
 
@@ -463,7 +506,7 @@ func TestAcceptKeyRFC6455Example(t *testing.T) {
 
 ## 5. Variants and comparison
 
-The owner's comparison, corrected and extended:
+Side by side, topic by topic:
 
 | Topic | WebSocket | SSE |
 | --- | --- | --- |
@@ -522,7 +565,7 @@ The owner's comparison, corrected and extended:
 
 ### Scaling, briefly
 
-The full treatment, with capacity numbers, lives in [[Scaling WebSockets]]. The owner's scale-out picture, redrawn:
+The full treatment, with capacity numbers, lives in [[Scaling WebSockets]]. The scale-out picture:
 
 ```mermaid
 flowchart LR

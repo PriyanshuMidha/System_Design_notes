@@ -17,6 +17,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > **Strategy** puts an algorithm that changes (how to pick a store, how to price a parking slot) behind a small interface or a function type, and hands it to the code that uses it. **Template Method** is the opposite split: a fixed workflow function runs the steps in order, and the caller supplies the steps through an interface. In Go both mean "pass behaviour in as a value"; neither needs inheritance.
 
+> [!abstract] Core idea
+> - **Strategy:** the part that varies (a pricing rule, a store-picking rule) becomes a value, an interface or a function, that the caller passes in.
+> - **Template Method:** one function owns the fixed order of steps; the caller supplies only the steps.
+> - The rule that matters: separate what stays fixed from what changes, and pass the changing part in as a value.
+> - Classic mistake: a growing `switch city { ... }` inside the service, or (in Go) trying to fake inheritance with struct embedding, where the embedded type's method never calls your override.
+
 ## 1. Why it exists
 
 A quick-commerce backend assigns each order to a dark store. Mumbai wants the **nearest store with stock**. Bengaluru, during the evening peak, wants the **least loaded store**. Product wants to try a third rule next month. Pricing for the parking feature has the same shape: an hourly base price, plus a weekend surcharge in some cities, plus a coupon in others.
@@ -121,9 +127,52 @@ The highlighted boxes are the variable steps that `CSVPayments` supplies. Everyt
 
 **The embedding trap.** It is tempting to write a `BaseJob` struct with a `Run` method that calls `b.Validate()`, embed it in `StrictJob`, and "override" `Validate`. It does not work: `Run` is promoted, but its receiver is the embedded `BaseJob`, which has no link back to the outer struct, so `Run` still calls `BaseJob.Validate`. Go method calls through embedding are resolved statically; there is no virtual dispatch. The test `TestEmbeddingDoesNotOverride` below proves it. [[Structs, Methods and Embedding]] explains promotion in full.
 
+### Whiteboard version
+
+Strategy is a one-method interface plus types that implement it; Template Method is a plain function that runs the steps of an interface in a fixed order. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import "fmt"
+
+// Strategy: the varying rule is a value the caller passes in.
+type Pricer interface{ Price(hours int) int }
+
+type Hourly struct{ Rate int }
+
+func (h Hourly) Price(hours int) int { return h.Rate * hours }
+
+type FlatDay struct{ Fee int }
+
+func (f FlatDay) Price(int) int { return f.Fee }
+
+// Template Method: a fixed skeleton; the steps come from an interface.
+type Importer interface {
+	Parse() error
+	Validate() error
+	Save() error
+}
+
+func Run(im Importer) error {
+	for _, step := range []func() error{im.Parse, im.Validate, im.Save} {
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func main() {
+	for _, p := range []Pricer{Hourly{Rate: 40}, FlatDay{Fee: 300}} {
+		fmt.Println(p.Price(5)) // 200, then 300
+	}
+}
+```
+
 ## 4. Worked example
 
-One `package main` with the owner's store-selection code (tightened), a function strategy, a per-call registry, a composed pricer, a generic Template Method and the embedding trap. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with store-selection code, a function strategy, a per-call registry, a composed pricer, a generic Template Method and the embedding trap. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
 ```go
 package main

@@ -22,6 +22,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Protocol Buffers (protobuf) is a binary format for structured data. You declare messages in a `.proto` file, giving every field a **number**. On the wire, only those numbers and compact values travel, never field names. A schema can evolve safely for years if you follow a few rules: add fields with new numbers, never reuse a number, and `reserved` what you delete.
 
+> [!abstract] Core idea
+> - Protobuf is a compact binary format; every field in a `.proto` message has a number.
+> - Only field numbers and values go on the wire, never names, so renaming a field is safe but renumbering is not.
+> - Rule: add fields with new numbers, never reuse a number, and `reserved` the numbers and names you delete.
+> - Classic mistake: changing a field's type or reusing a deleted number, so old readers silently decode garbage.
+
 ## 1. Why it exists
 
 An `InvoicePaid` event is written by the billing service and read by six consumers (email, ledger, analytics and others) that deploy on their own schedules. Billing adds a `currency` field on Monday; the ledger consumer will not redeploy until Friday.
@@ -91,7 +97,7 @@ This file was compiled with `protocompile` v0.14.1 (a pure-Go compiler) to check
 
 ### Wire format
 
-Each field is encoded as a **tag**, then a value. The tag is a varint holding `field_number << 3 | wire_type`.
+Each field is encoded as a **tag**, then a value. The tag is a varint (a variable-length integer: 7 bits per byte, high bit means "more bytes follow") holding `field_number << 3 | wire_type`.
 
 | Wire type | ID | Used for | Value layout |
 | --- | --- | --- | --- |
@@ -151,6 +157,35 @@ flowchart LR
 - Go's `protojson` deliberately adds random whitespace in some builds, so nobody can depend on byte-exact output. Compare parsed values, not strings.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: one field encoded by hand as a tag (`number << 3 | wire type`) plus a varint value. The full version below uses the real `google.golang.org/protobuf` library and tests evolution cases.
+
+```go
+package main
+
+import "fmt"
+
+// Encode field 1 (varint) the way protobuf does: tag = number<<3 | wireType.
+func appendVarint(b []byte, v uint64) []byte {
+	for v >= 0x80 {
+		b = append(b, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(b, byte(v))
+}
+
+func main() {
+	const fieldNumber, wireVarint = 1, 0
+	var b []byte
+	b = appendVarint(b, fieldNumber<<3|wireVarint) // tag byte 0x08
+	b = appendVarint(b, 150)                       // value 150 -> 0x96 0x01
+	fmt.Printf("% x\n", b)                         // 08 96 01: no field name on the wire
+}
+```
+
+### Full version
 
 The code builds the `Invoice` message (fields 1 and 2 only) at runtime from a descriptor, the same structure `protoc` produces, so the real `google.golang.org/protobuf` v1.36.10 library encodes it without code generation. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -397,7 +432,7 @@ For how events carry schemas across teams, see [[Event Schemas and Schema Regist
 
 ### Evolution rules
 
-The owner's original list, with the reasons:
+The rules, each with its reason:
 
 1. **Never reuse a field number**, and never change the number of an existing field. Old data and old readers would decode the new field's bytes as the old field.
 2. **Delete with `reserved`.** Reserve both the number and the name (as `Invoice` does for 4 and `client_name`), so the compiler rejects reuse.

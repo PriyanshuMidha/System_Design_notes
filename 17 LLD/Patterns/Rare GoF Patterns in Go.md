@@ -18,11 +18,17 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Several Gang of Four patterns (1994) were shaped by the C++ of that time, which had no closures and only inheritance-based interfaces. Go's first-class functions, type switches, value copies and implicit interfaces cover much of what they do. **Bridge, Prototype, Flyweight, Visitor, Interpreter and Mediator** are rare in Go backends, but each still has one situation where the full pattern pays off. This note gives each one its intent, that situation, a real example (from the standard library wherever one exists) and a short tested Go form.
 
+> [!abstract] Core idea
+> - These six patterns exist mostly because 1994 C++ lacked closures, type switches and implicit interfaces; Go often needs only a function or a switch.
+> - Bridge = two independent hierarchies joined by a field; Prototype = copy then fix shared slices/maps; Flyweight = share the immutable part.
+> - Visitor = a type switch in Go; Interpreter = parse to a tree of nodes, each with `Eval`; Mediator = colleagues talk only to a hub.
+> - Classic mistake: reaching for the full pattern when a function value or a `switch` does the job.
+
 ## 1. Why it exists
 
 Interviewers still ask "implement Visitor in Go" or "what is Flyweight?". Writing the 1994 C++ shape in Go gives code that reviewers would reject, and declaring the pattern useless misses the case where it is the best tool. The useful answer has two halves: what Go does instead, and when the full pattern still wins.
 
-Section 5 puts all seven side by side: the problem, the Go answer, a standard-library example, and when the full pattern still pays.
+Section 5 puts the six coded patterns (plus Memento, as a table row only) side by side: the problem, the Go answer, a standard-library example, and when the full pattern still pays.
 
 ## 2. Mental model
 
@@ -462,7 +468,7 @@ func (p *queryParser) atom() (Expr, error) {
 }
 ```
 
-- **Consistency:** `size>1MB` means strictly greater than 1,048,576 bytes, and the code uses `>`. A file of exactly 1 MB passes `NOT size>1MB` (tested). The old note's diagram said `<` while its code used `<=`.
+- **Consistency:** `size>1MB` means strictly greater than 1,048,576 bytes, and the code uses `>`. A file of exactly 1 MB passes `NOT size>1MB` (tested).
 - **Real examples:** `text/template` parses a template into a tree and `Execute` walks it; `regexp/syntax` parses a pattern into a syntax tree before compiling it; `go/parser` builds `go/ast` trees. For business rules, embed CEL (`cel-go`) or `expr-lang/expr` instead of writing a language.
 - **Worth it when:** users or configuration write the rules (search filters, coupon conditions, alert rules) and the language is small. Add parentheses and a depth limit before exposing it to users.
 
@@ -554,6 +560,40 @@ func (r *Room) Send(from *Member, text string) {
 - **The risk:** every new interaction rule lands in the mediator until it becomes a god object. Split it by concern (one mediator per form, per room) when it grows.
 - **Concurrency:** the sketch runs on one goroutine. In a server, members speak from different goroutines, so the room must guard its maps and inboxes with a mutex, or run as one goroutine that reads messages from a channel. A mediator that calls colleagues back must not hold its lock during the call; the lock discipline is in [[Facade (vs Mediator)]].
 - **Worth it when:** many components interact through rules that change together: form widgets that enable each other, a game lobby, a chat room. The standard library has no clear example.
+
+### Whiteboard version
+
+The bare idea of the Interpreter used in the worked example: a tiny AST where each node evaluates itself (here built by hand, not parsed). The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import "fmt"
+
+type File struct {
+	Name string
+	Size int64
+}
+
+// Interpreter: each AST node evaluates itself against a file.
+type Expr interface{ Eval(File) bool }
+
+type SizeGT struct{ N int64 }
+type Not struct{ X Expr }
+type And struct{ L, R Expr }
+
+func (e SizeGT) Eval(f File) bool { return f.Size > e.N }
+func (e Not) Eval(f File) bool    { return !e.X.Eval(f) }
+func (e And) Eval(f File) bool    { return e.L.Eval(f) && e.R.Eval(f) }
+
+func main() {
+	// "size>1KB AND NOT size>1MB", built by hand instead of parsed
+	q := And{SizeGT{1 << 10}, Not{SizeGT{1 << 20}}}
+	for _, f := range []File{{"a.txt", 512}, {"b.log", 4096}, {"c.iso", 1 << 30}} {
+		fmt.Println(f.Name, q.Eval(f)) // a false, b true, c false
+	}
+}
+```
 
 ## 4. Worked example
 

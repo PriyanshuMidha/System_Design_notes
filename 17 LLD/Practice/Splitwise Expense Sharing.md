@@ -17,6 +17,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Keep money as `int64` paise, make each split type a **Strategy** (equal, exact, percent) picked by a **Factory**, and keep **one net balance per user per group**: payers go up, participants go down, and the nets always sum to zero. An expense stores its computed payer and share maps, so delete applies the same deltas negated. Simplify debts greedily: the biggest debtor pays the biggest creditor until everyone is at zero, in at most n−1 transfers.
 
+> [!abstract] Core idea
+> - Money is `int64` paise, never `float64` rupees.
+> - Each split type (equal, exact, percent) is a strategy that must return shares that add up to exactly the total; leftover paise go to users in a fixed order.
+> - Keep one net balance per user per group: payers go up, participants go down, and all nets sum to zero.
+> - Delete applies the expense's stored deltas with a minus sign; simplify pays the biggest debtor to the biggest creditor until everyone is at zero.
+> - Classic mistake: re-running the split to delete (rules or rounding may have changed), or using floats so a paisa disappears.
+
 ## Problem statement
 
 ```text
@@ -25,6 +32,16 @@ An expense can be split equally, by exact amounts, or by percentage. Show each
 user's balance, suggest a simplified set of payments to settle the group, and
 support deleting an expense.
 ```
+
+**Solving path**
+
+1. Clarify: split types, rounding rule, multiple payers, delete and settle.
+2. Define `SplitStrategy` and the three splits, picked by a factory.
+3. Validate the request: positive amount, participants, no duplicates, payers sum to the total.
+4. Apply the shares to net balances and store them on the expense.
+5. Delete by applying the stored deltas negated.
+6. Code greedy `SimplifyDebts`.
+7. Test rounding, validation, delete as exact undo and simplify.
 
 It tests a clean Strategy for split types, strict validation, and **exact money math with no lost paise**. It also tests the balance model (one net per user per group), reversibility (delete is an exact undo) and a small greedy algorithm. Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
@@ -238,6 +255,11 @@ cmd/demo/main.go   -> wiring: repositories, service, HTTP handlers
 - `simplify.go` works on a copy of the balances and never holds the lock while computing.
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `SplitStrategy`, `EqualSplit`, `ExactSplit`, `PercentSplit`, `floorShares`, `SortedOrder`, `NewSplitStrategy`; `AddExpenseRequest`, `Expense`, `Transfer`; `Service` with `CreateGroup`, `AddExpense`, `DeleteExpense`, `applyDeltas`, `GetBalances` and `SimplifyDebts`.
+>
+> **Talk through only (extensions):** `LargestRemainder` rounding, multiple payers, `Settle`, request-ID idempotency, currencies, editing an expense and the SQL schema.
 
 ```mermaid
 flowchart TD

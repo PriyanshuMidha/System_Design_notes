@@ -17,6 +17,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Separate the **cart** (a mutable draft pinned to one restaurant) from the **order** (created once at checkout, with a price snapshot). `PlaceOrder` takes an idempotency key, freezes the cart, charges outside the lock and saves the order, so double taps never charge twice and a failed payment never loses the cart. Status changes go through a **transition table that checks the actor**. Refunds are written to an **outbox** in the same step as the status change and sent by a relay with retries, and a timer job **auto-rejects** orders the restaurant did not accept in time.
 
+> [!abstract] Core idea
+> - The cart is a mutable draft pinned to one restaurant; the order is created once at checkout and keeps a snapshot of names and prices.
+> - `PlaceOrder` takes an idempotency key, freezes the cart, charges outside the lock, then saves; a double tap charges once and a failed payment keeps the cart. See [[Idempotency and Idempotency Keys]].
+> - Every status change goes through one transition table that also checks who is allowed to make it.
+> - Refunds go into an outbox (a pending-work row written together with the status change, sent later by a relay with retries); a timer auto-rejects orders the restaurant ignores.
+> - Classic mistakes: computing the total from the live menu, and calling the refund gateway inline right after setting `REJECTED`.
+
 ## Problem statement
 
 ```text
@@ -25,6 +32,16 @@ items to a cart and places an order with payment. The restaurant accepts or reje
 then prepares it, and a delivery partner picks it up and delivers it. Users are notified
 on every status change. Handle cancellation, payment failure and duplicate order retries.
 ```
+
+**Solving path**
+
+1. Clarify: one restaurant per cart, payment flow, who can change which status, cancellation and refund rules.
+2. Separate `Cart` (draft) from `Order` (snapshot).
+3. Write the transition table keyed by from, to and actor.
+4. Code `PlaceOrder`: idempotency, freeze, charge outside the lock, save.
+5. Code `UpdateStatus` with listeners for notifications.
+6. Add the refund outbox and the auto-reject job.
+7. Test double taps, payment failure, illegal transitions and refunds.
 
 It tests an explicit order **state machine** with role-based transitions and a safe `PlaceOrder`: price snapshot, idempotency key, no double charge. It also tests whether payment, delivery and notifications stay behind interfaces instead of inside the order logic, and whether refunds survive a gateway outage. Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
@@ -321,6 +338,11 @@ cmd/demo/main.go   -> wiring: repositories, adapter, assigner, listeners, HTTP h
 - `service.go` and `jobs.go` are the only files that take locks, and neither calls a port while holding one.
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `MenuItem`, `Cart`, `OrderStatus`, `Actor`, `OrderLine`, `Order`; the transition table with `canMove`; `PaymentGateway`; `Service` with `AddToCart`, `PlaceOrder`, `buildDraftLocked`, `chargeAndSave`, `transitionLocked` and `UpdateStatus`.
+>
+> **Talk through only (extensions):** The refund outbox (`RefundTask`, `ProcessRefunds`, `RefundStatus`), `ExpireUnaccepted`, `DeliveryAssigner`, `StatusListener` notifications, `SetItemPrice`, and the SQL schema.
 
 ```mermaid
 sequenceDiagram

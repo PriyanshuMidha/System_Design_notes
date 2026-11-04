@@ -1,7 +1,7 @@
 ---
 tags: [databases, performance, orm, graphql]
 level: intermediate
-status: draft
+status: reviewed
 prereqs: ["[[SQL Essentials]]", "[[Indexing Fundamentals]]"]
 related: ["[[Query Plans and EXPLAIN]]", "[[Connection Pooling]]", "[[GraphQL]]", "[[Database Access (database-sql, pgx, sqlc)]]", "[[Materialized Views and Denormalization]]", "[[Distributed Tracing with OpenTelemetry]]"]
 sources:
@@ -18,6 +18,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > Code runs **1** query to load a list, then **1 more query per item** to load something related, so a page of 50 rows costs 51 round trips to the database. Each query is fast, but the waiting adds up. The fix is to fetch the related rows for the whole list at once: a JOIN, one batched `WHERE id = ANY($1)` query, or a loader that batches the lookups for you.
+
+> [!abstract] Core idea
+> - The loop is the bug: one query for the list, then one query per row inside a loop.
+> - Each query is fast; the cost is the network round trip, paid N times in a row.
+> - The rule: fetch related rows for the whole list at once (JOIN, or one `WHERE id = ANY($1)` query).
+> - Classic mistake: "fixing" it with goroutines. That still sends N queries and can exhaust the connection pool.
 
 ## 1. Why it exists
 
@@ -89,6 +95,45 @@ flowchart LR
 ```
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: the slow version calls the database inside the loop; the fast one collects IDs, runs one batched query, and joins in a map.
+
+```go
+package wb
+
+type Invoice struct{ ID, ClientID int64 }
+type Client struct{ ID int64; Name string }
+
+// Bad: 1 query for the list, then 1 query per invoice.
+func namesSlow(invs []Invoice, getClient func(int64) Client) []string {
+	out := make([]string, 0, len(invs))
+	for _, inv := range invs {
+		out = append(out, getClient(inv.ClientID).Name) // N round trips
+	}
+	return out
+}
+
+// Good: collect IDs, one batched query, then join in memory.
+func namesFast(invs []Invoice, clientsByIDs func([]int64) []Client) []string {
+	ids := make([]int64, 0, len(invs))
+	for _, inv := range invs {
+		ids = append(ids, inv.ClientID)
+	}
+	byID := make(map[int64]Client)
+	for _, c := range clientsByIDs(ids) { // 1 round trip: WHERE id = ANY($1)
+		byID[c.ID] = c
+	}
+	out := make([]string, 0, len(invs))
+	for _, inv := range invs {
+		out = append(out, byID[inv.ClientID].Name) // a missing client gives ""; the full version checks
+	}
+	return out
+}
+```
+
+The full version below adds production concerns: workspace scoping, context, a missing-client check, and tests.
 
 The repository interface and both versions of the list handler (Go 1.24, passes `go vet` and `go test -race`):
 
@@ -174,6 +219,14 @@ func (s *PGStore) ClientsByIDs(ctx context.Context, ws int64, ids []int64) ([]Cl
 	}
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Client]) // closes rows
 }
+```
+
+With sqlc, the same query is declared once and sqlc generates a method that takes `[]int64`. sqlc does not allow mixing `$n` and named parameters in one query, so both are named here:
+
+```sql
+-- name: ClientsByIDs :many
+SELECT id, name FROM clients
+WHERE workspace_id = @workspace_id AND id = ANY(@ids::bigint[]);
 ```
 
 The test that stops this bug from coming back counts queries against a fake store and checks that the count **does not grow with the page size**:
@@ -376,7 +429,7 @@ func (l *Loader[K, V]) dispatch(ctx context.Context, b *batch[K, V]) {
 }
 ```
 
-Its test runs 300 concurrent resolver-style calls for 100 distinct clients. `maxBatch` is set to 100, so the batch fires as soon as the last key arrives and the test is deterministic:
+Its test runs 300 concurrent resolver-style calls for 100 distinct clients. `maxBatch` is set to 100, so the batch fires as soon as the last key arrives and the test is deterministic. One caveat of this design: the batch runs with the context of the caller that opened it, so if that caller's context is cancelled, every caller in that batch gets the error. Inside one request all callers share the request context, which is another reason to keep one loader per request:
 
 ```go
 func TestLoaderCoalescesConcurrentLoads(t *testing.T) {

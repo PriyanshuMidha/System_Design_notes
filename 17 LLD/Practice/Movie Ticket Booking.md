@@ -17,6 +17,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Put the seat's state on **ShowSeat** (this seat for this show), not on the physical Seat. `LockSeats` checks every requested seat and then locks all of them in one critical section, so a multi-seat hold is all-or-nothing and two users can never hold one seat. Holds expire after a TTL; the payment webhook confirms idempotently by payment ID, and a payment that arrives after the hold expired queues exactly one refund in an outbox instead of stealing seats back.
 
+> [!abstract] Core idea
+> - Seat state belongs to `ShowSeat` (this seat for this show), not to the physical `Seat`.
+> - A multi-seat hold is all-or-nothing: check every seat, then lock all of them inside one critical section.
+> - Holds expire after a TTL (time to live); an expired hold counts as free right away, and a sweeper cleans it up.
+> - Payment confirmation is idempotent by payment ID. A payment that arrives after its hold expired queues one refund in an outbox (a list of pending side effects saved in the same step and sent later by a relay); it never takes seats back.
+> - Classic mistake: locking seats one by one, so a failure halfway leaves a partial hold.
+
 ## Problem statement
 
 ```text
@@ -24,6 +31,16 @@ Design movie ticket booking like BookMyShow. Users browse movies and shows, view
 the seat map, lock one or more seats for a few minutes, pay, and get a confirmed
 booking. Expired locks must be released. Two users must never book the same seat.
 ```
+
+**Solving path**
+
+1. Clarify: hold TTL, max seats per hold, payment flow, what happens on late payment.
+2. Model `Seat` vs `ShowSeat` and the seat states (available, locked, booked).
+3. Code `LockSeats`: check all, then lock all, under one lock.
+4. Code `ConfirmBooking`: idempotent by payment ID, owner and expiry checks.
+5. Add `ReleaseHold` and the expiry sweeper.
+6. Add the late-payment refund outbox and the PostgreSQL version of the lock.
+7. Test concurrent locking, expiry, duplicate callbacks and late payment.
 
 It tests one thing above all: **no double booking** under heavy concurrency, which needs atomic, all-or-nothing multi-seat locking with a time to live (TTL). It also tests the seat state machine, idempotent payment callbacks, the late-payment refund path, and modeling `ShowSeat` apart from `Seat`. Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
@@ -311,6 +328,11 @@ cmd/demo/main.go   -> wiring: repositories, pricing, service, HTTP handlers, bot
 - `jobs.go` never calls the gateway while holding `s.mu`.
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `SeatState`, `showSeat`, `Hold`, `Booking`, `Payment`; `Service` with `NewService`, `AddShow`, `free`, `LockSeats`, `ConfirmBooking`, `ReleaseHold`, `releaseLocked`, `ReleaseExpiredLocks` and `SeatState`.
+>
+> **Talk through only (extensions):** `PricingStrategy`, the refund outbox (`Refund`, `queueRefund`, `ProcessRefunds`, `RefundStatus`), `SELECT ... FOR UPDATE` in PostgreSQL, Redis holds, and a waiting room for blockbuster openings.
 
 ```mermaid
 sequenceDiagram
@@ -946,7 +968,7 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 | Guessable hold IDs (`hold-1`, `hold-2`) | Anyone can probe other users' holds | Random IDs from `crypto/rand.Text`; `ReleaseHold` also checks the owner |
 | Unknown IDs in a lookup | Nil dereference panic | `SeatState` returns `ErrShowNotFound` or `ErrSeatNotFound` |
 | Sweeper races confirm | Both touch one hold | Same mutex in code; in SQL both filter `WHERE hold_id = $1 AND state = 'locked'` |
-| SQL deadlock | Two transactions lock rows in different orders | If you lock with `SELECT ... FOR UPDATE` before updating, add `ORDER BY seat_id` so every transaction locks rows in the same order; sorting the input array alone does not decide the order in which the scan locks rows |
+| SQL deadlock | Two overlapping multi-seat holds lock rows in different orders. This applies to the multi-row conditional `UPDATE ... WHERE seat_id = ANY($3)` too, not only to `SELECT ... FOR UPDATE` | Lock first with `SELECT ... WHERE seat_id = ANY($3) ORDER BY seat_id FOR UPDATE`, then update, so every transaction locks rows in the same order (sorting the input array alone does not decide the scan's lock order). Also retry the transaction on SQLSTATE `40P01` (deadlock detected) |
 | A bug in hold logic | Two bookings per seat | The partial unique index `uq_active_seat` is the final guarantee |
 | Hot show (blockbuster opening) | One mutex or one row set is contended | Per-show locks, Redis `SET seat:{show}:{seat} <hold> NX PX 600000` (run for all seats in one Lua script, so a multi-seat hold stays all-or-nothing), and a waiting room (Step 10) |
 

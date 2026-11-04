@@ -25,6 +25,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An **API contract** is the written promise of what an API accepts and returns: URLs, fields, types, limits, errors and headers. **OpenAPI** is the standard file format for writing that promise for HTTP APIs, so machines can lint it, diff it, generate code from it and test against it. Design the contract first, evolve it only by additive changes, and let CI reject anything that would break existing clients.
 
+> [!abstract] Core idea
+> - The **contract** is the written promise of what the API accepts and returns; OpenAPI is the machine-readable file for it.
+> - Write the contract first, review it like code, and generate docs, clients and tests from it.
+> - Evolve only by adding: new optional fields and endpoints are safe; removing, renaming or retyping is breaking.
+> - Clients are tolerant readers (ignore unknown fields); servers are strict about requests.
+> - Classic mistake: treating required, optional and nullable as the same thing.
+
 ## 1. Why it exists
 
 A mobile app shows an order's total from `order.total`. A backend developer renames it to `order.total_amount` because it reads better. The change passes code review and every server test.
@@ -318,40 +325,50 @@ The difference matters most in partial updates. With JSON Merge Patch, an absent
 
 ### What counts as a breaking change
 
-A change is breaking if **any existing, correctly written client** can fail or misbehave. The rules differ for what clients send and what they receive:
-
-| Change | In a request | In a response |
-| --- | --- | --- |
-| Add an optional field | Safe | Safe for tolerant readers |
-| Add a required field | **Breaking** | Safe |
-| Remove or rename a field | **Breaking** | **Breaking** |
-| Change a type or format | **Breaking** | **Breaking** |
-| Make a required field optional | Safe | **Breaking**: clients assume it is there |
-| Make an optional field required | **Breaking** | Safe |
-| Add an enum value | Safe | **Breaking** for strict clients, safe if documented as open |
-| Tighten validation (`maxLength` 500 → 200) | **Breaking** | Not applicable |
-| Change a status code, error code, default value or sort order | **Breaking** | **Breaking** |
-
-```mermaid
-flowchart TD
-    A["Proposed contract change"] --> B{"Does it remove, rename or retype anything, or change a status code, error code, default or sort order?"}
-    B -- yes --> BR["Breaking: new major version or a new field beside the old one"]
-    B -- no --> C{"Is it in a request or a response?"}
-    C -- request --> D{"New required input, or stricter validation?"}
-    D -- yes --> BR
-    D -- no --> OK["Additive: ship in the current version"]
-    C -- response --> E{"Could a strict client reject it? New enum value, field now optional"}
-    E -- yes --> F{"Was the field documented as open or optional from day one?"}
-    F -- yes --> OK
-    F -- no --> BR
-    E -- no --> OK
-```
+A change is breaking if **any existing, correctly written client** can fail or misbehave. The full classification table lives in [[API Versioning and Backward Compatibility]]. The one contract-specific point to remember is that direction matters: adding a required field or tightening validation breaks requests but not responses, while making a required field optional or adding an enum value breaks responses (clients assume the field is there or switch exhaustively) but not requests.
 
 The safe path for a rename: add `total_amount`, keep sending `total`, mark `total` as `deprecated: true` in the spec, watch until no client reads it, then remove it in the next major version (see [[API Versioning and Backward Compatibility]]).
 
 **Tolerant reader.** Clients should read only the fields they need, ignore fields they do not know, and map unknown enum values to an "unknown" case. Servers can then add things freely. This is the half of the robustness principle that works well; being liberal in what a server *accepts* is riskier, because sloppy input becomes behaviour clients then depend on.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+Tolerant on responses, strict on requests. The full version below adds the production concerns.
+
+```go
+package contract
+
+import (
+	"bytes"
+	"encoding/json"
+)
+
+type Order struct {
+	ID     string  `json:"id"`
+	Status string  `json:"status"` // open enum: keep unknown values
+	Note   *string `json:"note"`   // nil = absent or null
+}
+
+// Client side: tolerant reader. Unknown fields are ignored by default.
+func DecodeResponse(b []byte) (Order, error) {
+	var o Order
+	err := json.Unmarshal(b, &o)
+	return o, err
+}
+
+// Server side: strict about requests. Unknown fields are a 400.
+func DecodeRequest(b []byte) (Order, error) {
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	var o Order
+	err := d.Decode(&o)
+	return o, err
+}
+```
+
+### Full version
 
 A Go 1.24 client for the `Order` schema above, written as a tolerant reader. It shows three contract rules in code: unknown fields and enum values do not break decoding, the server can still be strict about requests, and absent, `null` and set are three different states. It passes `go vet` and `go test -race`.
 

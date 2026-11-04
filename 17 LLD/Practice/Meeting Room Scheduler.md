@@ -17,6 +17,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A meeting room scheduler is one rule and one race. The rule: half-open intervals `[start, end)` clash only if `start < otherEnd && otherStart < end`. The race: two people booking one room at the same moment, solved by checking and inserting under a per-room lock in memory, or an `EXCLUDE USING gist` constraint in Postgres. Recurring meetings expand in the organizer's time zone inside a bounded window and book all or nothing.
 
+> [!abstract] Core idea
+> - A booking is a half-open interval `[start, end)`: it includes the start and excludes the end.
+> - The one rule: two bookings clash only if `start < otherEnd && otherStart < end`.
+> - Check for a clash and insert the booking under the same per-room lock, so two clicks at once cannot both win.
+> - Keep each room's bookings sorted, so a binary search plus two neighbour checks finds a clash.
+> - Classic mistake: using `<=` (closed intervals), which makes a 10:00-11:00 and an 11:00-12:00 meeting clash.
+
 ## Problem statement
 
 ```text
@@ -26,6 +33,15 @@ interval and fit N people, book a room, and cancel their booking.
 Two people must never hold the same room at overlapping times, even if they click
 "Book" at the same moment. Code the booking method.
 ```
+
+### Solving path
+
+1. Clarify interval rules, capacity, cancellation and recurring meetings.
+2. Write the overlap test and agree on half-open intervals in UTC.
+3. Model `Room`, `Booking` and a per-room sorted calendar.
+4. Write `BookRoom`: validate, pick rooms, check and insert under the room lock.
+5. Add `FindAvailableRooms` and `CancelBooking`.
+6. Add recurring series (all or nothing), then test the race and the boundaries.
 
 ## Step 1: Clarify requirements
 
@@ -220,6 +236,12 @@ cmd/demo/main.go  -> wiring: NewService(SmallestFit{}, time.Now), add rooms, boo
 - The Step 8 block below is these files merged into one, so it compiles standalone.
 
 ## Step 8: Core code
+
+> [!tip] What to code in a 60-minute round
+> Aim for about 150 lines in the room.
+> - **Write:** `Room`, `Booking`, `Status`, `Overlaps`, `BookingRequest`, `calendar` with `conflictIndex`, and `Service` with `NewService`, `AddRoom`, `validate`, `BookRoom`, `bookIn` and `CancelBooking`.
+> - **Add if time remains:** `FindAvailableRooms`, the `RoomSelector` interface with `SmallestFit`, and `ConflictError`.
+> - **Talk only:** `Series` and `BookSeries` (recurring meetings), the Postgres `EXCLUDE USING gist` constraint, and multi-server booking.
 
 ### Walkthrough
 

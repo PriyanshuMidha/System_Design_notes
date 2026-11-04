@@ -20,6 +20,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A **factory** is a function that decides which concrete type to build and hands it back behind an interface, so callers never write `&SMSNotifier{...}` themselves. An **abstract factory** builds a whole family of related objects (charge, refund and webhook check for one payment provider) from one choice, so pieces from different families cannot be mixed. In Go both are usually just functions and small interfaces.
 
+> [!abstract] Core idea
+> - A **factory** is a function that picks the concrete type and returns it behind an interface; callers never write the struct literal themselves.
+> - An **abstract factory** returns a whole matching family (charge, refund, webhook check) from one choice, so you cannot mix providers.
+> - The rule that matters: the choice of concrete type is made in exactly one place, usually from config.
+> - Classic mistake: returning a typed nil pointer as an interface, which makes `err != nil` or `n != nil` true when you expected false.
+
 ## 1. Why it exists
 
 An order service notifies users on four events: placed, shipped, delivered and refunded. Each user picks a channel: email, SMS, push or WhatsApp.
@@ -112,9 +118,48 @@ sequenceDiagram
     R-->>M: nil, *UnknownKindError
 ```
 
+### Whiteboard version
+
+The factory is one `switch` that maps a config string to a concrete type and returns it as the interface. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import "fmt"
+
+type Notifier interface{ Send(to, msg string) error }
+
+type Email struct{}
+
+func (Email) Send(to, msg string) error { fmt.Println("email", to, msg); return nil }
+
+type SMS struct{}
+
+func (SMS) Send(to, msg string) error { fmt.Println("sms", to, msg); return nil }
+
+// Factory: the only place that knows the concrete types.
+func NewNotifier(channel string) (Notifier, error) {
+	switch channel {
+	case "email":
+		return Email{}, nil
+	case "sms":
+		return SMS{}, nil
+	}
+	return nil, fmt.Errorf("unknown channel %q", channel)
+}
+
+func main() {
+	n, err := NewNotifier("sms")
+	if err != nil {
+		panic(err)
+	}
+	_ = n.Send("+91-98xxxxxx", "order shipped")
+}
+```
+
 ## 4. Worked example
 
-One `package main` with the owner's notifier factory (fixed so it compiles: the old note declared `EmailNotifier.Send` twice, which fails with `method EmailNotifier.Send already declared`), a typed error, the typed-nil trap, a registry and the Razorpay and Stripe families. The provider calls are in-memory stand-ins for the SDKs; the webhook checks use each provider's documented HMAC-SHA256 scheme, simplified for Stripe (no timestamp tolerance check). Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with a notifier factory, a typed error, the typed-nil trap, a registry and the Razorpay and Stripe families. The provider calls are in-memory stand-ins for the SDKs; the webhook checks use each provider's documented HMAC-SHA256 scheme, simplified for Stripe (no timestamp tolerance check). Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
 ```go
 package main
@@ -587,7 +632,7 @@ What to notice:
 | Factory method | Interface method or func value that creates a product | A collaborator must create objects whose type the caller chooses | One more indirection |
 | Abstract factory | Interface with one factory method per product | Several products must come from the same family | A family interface to keep in sync; every new product touches every family |
 
-The textbook abstract factory is a UI toolkit: a `LightTheme` factory makes a light button and a light checkbox, and a `DarkTheme` factory makes dark ones. The old note used that example; it shows the idea, but backend code meets the pattern in provider families, cloud SDKs and database drivers instead.
+The textbook abstract factory is a UI toolkit: a `LightTheme` factory makes a light button and a light checkbox, and a `DarkTheme` factory makes dark ones. It shows the idea, but backend code meets the pattern in provider families, cloud SDKs and database drivers instead.
 
 **Return an interface or a concrete type?** A common Go proverb is "accept interfaces, return structs": `NewSMSNotifier` returns `*SMSNotifier`, so callers see its whole API and the type can gain methods without breaking anyone. A factory is the exception: its whole job is to choose among types, so it must return the interface. If a "factory" always returns the same type, it is a constructor and should return that type.
 

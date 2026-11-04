@@ -18,6 +18,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An **adapter** makes something you do not control (a payment SDK, a courier API, a plain function) fit an interface **you** own. Your service calls `PaymentGateway.Charge(ctx, req)`; a `RazorpayAdapter` translates that call into the SDK's own method, adds the timeout the SDK lacks, and translates the SDK's errors into your domain errors. In Go, `http.HandlerFunc` is the best-known adapter: it turns a function into an `http.Handler`.
 
+> [!abstract] Core idea
+> - An adapter makes code you do not own (an SDK, an API) fit an interface you do own.
+> - It translates three things: the call (names and units), the context (cancellation and timeout) and the errors (SDK errors become your domain errors).
+> - The rule that matters: SDK types never leak past the adapter into business code.
+> - Classic mistake: an adapter that ignores `ctx` and returns raw SDK errors, so callers cannot cancel or decide what to retry.
+
 ## 1. Why it exists
 
 A checkout service accepts Razorpay, Stripe, an internal wallet and cash on delivery. Each provider has its own SDK: different method names, amount types, metadata formats and error types. If the checkout code calls the SDKs directly:
@@ -27,7 +33,7 @@ A checkout service accepts Razorpay, Stripe, an internal wallet and cash on deli
 - Error handling diverges: one place retries a declined card, which can never succeed, while another fails a request on a transient `SERVER_ERROR` that one retry would have fixed.
 - An SDK method without a `context.Context` parameter cannot be cancelled. If the provider hangs for 60 seconds, so does the checkout request, holding a goroutine and a connection the whole time.
 
-The old note's adapter had exactly the last two problems: it ignored `ctx` and returned SDK errors unchanged. The adapter below fixes both.
+The adapter below avoids the last two problems: it honours `ctx` and translates SDK errors into domain errors.
 
 ## 2. Mental model
 
@@ -109,9 +115,55 @@ Two details make this safe:
 - The result channel has a buffer of 1, so the goroutine can always send and exit, even when nobody is waiting any more. With an unbuffered channel it would block forever: a goroutine leak per timeout.
 - A timeout **abandons** the call; it does not cancel it. The provider may still charge the customer. That is why a timeout maps to `ErrUnknownOutcome` ("check the payment status before retrying"), not to "failed".
 
+### Whiteboard version
+
+The adapter implements our interface and converts rupees, context and errors at the boundary. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+// Our interface.
+type PaymentGateway interface {
+	Charge(ctx context.Context, paise int64) error
+}
+
+// Their SDK: different name, different units, no context.
+type RzpSDK struct{}
+
+func (RzpSDK) CreatePayment(amountRupees float64) error { return nil }
+
+var ErrDeclined = errors.New("payment declined")
+
+// The adapter translates the call in, and the errors out.
+type RazorpayAdapter struct{ sdk RzpSDK }
+
+func (a RazorpayAdapter) Charge(ctx context.Context, paise int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := a.sdk.CreatePayment(float64(paise) / 100); err != nil {
+		return fmt.Errorf("%w: %v", ErrDeclined, err)
+	}
+	return nil
+}
+
+var _ PaymentGateway = RazorpayAdapter{} // compile-time check
+
+func main() {
+	var g PaymentGateway = RazorpayAdapter{}
+	fmt.Println(g.Charge(context.Background(), 13600)) // <nil>
+}
+```
+
 ## 4. Worked example
 
-One `package main` with the owner's `PaymentGateway`, `ChargeRequest` and `RazorpayAdapter`, now with context handling, a timeout, error translation, a compile-time check, a function adapter and a fake SDK. `RzpError` codes are modeled on Razorpay's documented error codes; the SDK itself is an in-memory stand-in. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with `PaymentGateway`, `ChargeRequest` and `RazorpayAdapter`, including context handling, a timeout, error translation, a compile-time check, a function adapter and a fake SDK. `RzpError` codes are modeled on Razorpay's documented error codes; the SDK itself is an in-memory stand-in. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
 ```go
 package main

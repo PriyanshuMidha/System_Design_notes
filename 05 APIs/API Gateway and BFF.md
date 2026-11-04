@@ -24,6 +24,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An **API gateway** is the single front door for outside clients: a reverse proxy that terminates TLS, authenticates, rate-limits, routes each request to the right service and records what happened. A **BFF (backend for frontend)** is a small service per client type (web, iOS, partner) that calls several services and shapes one response for that client. Keep both free of business rules: the gateway does cross-cutting checks, the BFF does composition, and the services still make their own authorization decisions.
 
+> [!abstract] Core idea
+> - A gateway is one reverse proxy in front of all services: TLS, authentication, rate limits, routing, logs.
+> - A BFF (backend for frontend) is one small service per client type that calls several services and shapes one response.
+> - Rule: no business logic in either; services still make their own authorization decisions.
+> - Classic mistake: trusting identity headers like `X-User-Id` that a client could set, instead of setting them only from a verified token.
+
 ## 1. Why it exists
 
 A shop splits its monolith into 30 services. Without a gateway:
@@ -71,7 +77,7 @@ flowchart LR
 
 - **TLS termination** and HTTP/2 or HTTP/3 to clients ([[HTTP-1.1 vs HTTP-2 vs HTTP-3]]); plain HTTP or mTLS to upstreams.
 - **Validation:** body size limits, required headers, optionally the request body against the OpenAPI schema.
-- **Authentication** verifies tokens or API keys ([[JWT - Structure, Validation and Pitfalls]], [[OAuth 2.0 and OpenID Connect]]). The gateway caches the identity provider's JWKS keys so it validates signatures locally.
+- **Authentication** verifies tokens or API keys ([[JWT - Structure, Validation and Pitfalls]], [[OAuth 2.0 and OpenID Connect]]). The gateway caches the identity provider's JWKS (JSON Web Key Set, its published public signing keys) so it validates signatures locally.
 - **Coarse authorization** answers "may this caller use this route at all?" (scope `orders:read`, partner plan). Fine-grained decisions ("may user 42 see order 7?") stay in the service.
 - **Rate limits and quotas** per API key, user or route ([[Rate Limiting - Algorithms and Distributed Design]]).
 - **Routing** by path, host, header or weight, then **service discovery** to pick a healthy instance ([[Service Discovery]]).
@@ -159,6 +165,43 @@ Rules for a BFF:
 - It **contains no domain rules**. "Can this order be cancelled?" belongs to the orders service; the BFF only shows the answer.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: check credentials, match a path prefix, forward to the owning service. The full version below adds request IDs, longest-prefix matching, identity headers from a verified token, load shedding and a canary split.
+
+```go
+package main
+
+import (
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+)
+
+func main() {
+	routes := map[string]*httputil.ReverseProxy{
+		"/users/":  httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: "users:8080"}),
+		"/orders/": httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: "orders:8080"}),
+	}
+	http.ListenAndServe(":8443", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" { // real gateway: verify the JWT
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		for prefix, proxy := range routes {
+			if strings.HasPrefix(r.URL.Path, prefix) {
+				proxy.ServeHTTP(w, r)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+}
+```
+
+### Full version
 
 A minimal gateway in Go: request IDs, longest-prefix routing, identity headers set only from a verified token, per-route load shedding and a weighted canary. It compiles and passes `go vet` and `go test -race` on Go 1.24. A production gateway is a product (section 5), not 80 lines; the code shows what each step really does.
 

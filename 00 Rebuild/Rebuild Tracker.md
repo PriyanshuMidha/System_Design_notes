@@ -114,7 +114,7 @@ updated: 2026-11-02
 
 ## 05 APIs · 15 notes
 
-- [ ] **05 APIs MOC** · - · from: folder map, written last
+- [x] **05 APIs MOC** · - · ✅ · from: folder map, written last
 - [x] **Choosing an API Style** · B · ✅ · from: Api architecture cntent table
 - [x] **REST and HTTP API Design** · B · ✅ · from: REST API (+ bbg REST ×3; Go REST code → 06); what is rest, use of rest (+ Api architecture/REST API; Go REST coding stays in 06)
 - [x] **API Contract Design and OpenAPI** · I · ✅ · from: API Contract Design, API Design Content Table
@@ -166,30 +166,30 @@ updated: 2026-11-02
 
 ## 07 Databases · 23 notes
 
-- [ ] **07 Databases MOC** · - · from: folder map, written last
-- [ ] **SQL Essentials** · B 🆕 · ✏️ draft · from: NEW
-- [ ] **SQL vs NoSQL** · B · ✏️ draft · from: SQL vs NoSQL
-- [ ] **Relational Schema Design** · B · ✏️ draft · from: Schema Design, Data Modeling Content Table
-- [ ] **Transactions and ACID** · B · from: Transactions
-- [ ] **Indexing Fundamentals** · B · from: Database Indexing (+ basics from Advanced Index Types)
-- [ ] **Storage Engines - B-tree vs LSM and WAL** · I 🆕 · ✏️ draft · from: NEW
-- [ ] **Isolation Levels and MVCC** · I 🆕 · ✏️ draft · from: NEW
-- [ ] **Locking - Optimistic vs Pessimistic** · I · from: Optimistic and Pessimistic Locking
-- [ ] **Query Plans and EXPLAIN** · I · from: Query Plans and EXPLAIN
-- [ ] **Index Types and Index Design** · I · from: Advanced Index Types
-- [ ] **N+1 Query Problem** · I · ✏️ draft · from: N Plus One Query Problem
-- [ ] **Connection Pooling** · I · ✏️ draft · from: Connection Pooling
-- [ ] **Zero-Downtime Schema Migrations** · I · ✏️ draft · from: Database Migration
-- [ ] **Backup, PITR and Disaster Recovery** · I · from: Backup and Restore
-- [ ] **Materialized Views and Denormalization** · I · from: Materialized Views
-- [ ] **NoSQL Data Modeling** · I · from: NoSQL Data Modeling
-- [ ] **Replication** · I · ✏️ draft · from: Database Replication
-- [ ] **Partitioning and Sharding** · A · ✏️ draft · from: Sharding Patterns, Database Sharding
+- [x] **07 Databases MOC** · - · ✅ · from: folder map, written last
+- [x] **SQL Essentials** · B 🆕 · ✅ · from: NEW
+- [x] **SQL vs NoSQL** · B · ✅ · from: SQL vs NoSQL
+- [x] **Relational Schema Design** · B · ✅ · from: Schema Design, Data Modeling Content Table
+- [x] **Transactions and ACID** · B · ✅ · from: Transactions
+- [x] **Indexing Fundamentals** · B · ✅ · from: Database Indexing (+ basics from Advanced Index Types)
+- [x] **Storage Engines - B-tree vs LSM and WAL** · I 🆕 · ✅ · from: NEW
+- [x] **Isolation Levels and MVCC** · I 🆕 · ✅ · from: NEW
+- [x] **Locking - Optimistic vs Pessimistic** · I · ✅ · from: Optimistic and Pessimistic Locking
+- [x] **Query Plans and EXPLAIN** · I · ✅ · from: Query Plans and EXPLAIN
+- [x] **Index Types and Index Design** · I · ✅ · from: Advanced Index Types
+- [x] **N+1 Query Problem** · I · ✅ · from: N Plus One Query Problem
+- [x] **Connection Pooling** · I · ✅ · from: Connection Pooling
+- [x] **Zero-Downtime Schema Migrations** · I · ✅ · from: Database Migration
+- [x] **Backup, PITR and Disaster Recovery** · I · ✅ · from: Backup and Restore
+- [x] **Materialized Views and Denormalization** · I · ✅ · from: Materialized Views
+- [x] **NoSQL Data Modeling** · I · ✅ · from: NoSQL Data Modeling
+- [x] **Replication** · I · ✅ · from: Database Replication
+- [x] **Partitioning and Sharding** · A · ✅ · from: Sharding Patterns, Database Sharding
 - [x] **Consistent Hashing** · A · ✅ · from: `00 Rebuild/Sample - Consistent Hashing` (replaces Consistent Hashing)
-- [ ] **Wide-Column Stores and Cassandra** · A · ✏️ draft · from: Cassandra and Wide Column Stores
-- [ ] **Search Engines and Inverted Indexes** · A · from: Search Architecture, Search Indexes
-- [ ] **Time-Series and Columnar Storage** · A · from: Time Series and Analytics Storage
-- [ ] **Distributed SQL** · A 🆕 · from: NEW
+- [x] **Wide-Column Stores and Cassandra** · A · ✅ · from: Cassandra and Wide Column Stores
+- [x] **Search Engines and Inverted Indexes** · A · ✅ · from: Search Architecture, Search Indexes
+- [x] **Time-Series and Columnar Storage** · A · ✅ · from: Time Series and Analytics Storage
+- [x] **Distributed SQL** · A 🆕 · ✅ · from: NEW
 
 ## 08 Caching & Redis · 12 notes
 
@@ -382,13 +382,13 @@ updated: 2026-11-02
 
 ## 17 LLD · 51 notes
 
-- [ ] **17 LLD MOC** · - · from: folder map, written last
-- [ ] **LLD Interview Method** · B · from: LLD Interview Approach in Go, LLD Practice Roadmap (10 steps), Go LLD Folder Structure for Practice
-- [ ] **OOP in Go - Structs, Interfaces, Embedding** · B · from: Go LLD Mental Model, Error Handling and Interfaces in Go LLD (interfaces half), CodeWithAryan map + UML (Java→Go tables)
-- [ ] **Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion** · B · from: DRY, KISS, YAGNI Principle notes + NEW (cohesion/coupling, Law of Demeter, composition over inheritance)
-- [ ] **SOLID in Go** · B · from: SOLID Principles in Go LLD
-- [ ] **UML for LLD** · B · from: UML for LLD Interviews
-- [ ] **Design Patterns Overview and Chooser** · B · from: Creational, Structural, Behavioral Patterns in Go; Content Table (pattern → backend table)
+- [x] **17 LLD MOC** · - · ✅ · from: folder map, written last
+- [x] **LLD Interview Method** · B · ✅ · from: LLD Interview Approach in Go, LLD Practice Roadmap (10 steps), Go LLD Folder Structure for Practice
+- [x] **OOP in Go - Structs, Interfaces, Embedding** · B · ✅ · from: Go LLD Mental Model, Error Handling and Interfaces in Go LLD (interfaces half), CodeWithAryan map + UML (Java→Go tables)
+- [x] **Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion** · B · ✅ · from: DRY, KISS, YAGNI Principle notes + NEW (cohesion/coupling, Law of Demeter, composition over inheritance)
+- [x] **SOLID in Go** · B · ✅ · from: SOLID Principles in Go LLD
+- [x] **UML for LLD** · B · ✅ · from: UML for LLD Interviews
+- [x] **Design Patterns Overview and Chooser** · B · ✅ · from: Creational, Structural, Behavioral Patterns in Go; Content Table (pattern → backend table)
 - [x] **Patterns/Strategy and Template Method** · I · ✅ · from: Strategy Pattern in Go, Template Method Pattern in Go
 - [x] **Patterns/Factory and Abstract Factory** · I · ✅ · from: Factory Pattern in Go, Abstract Factory Pattern in Go
 - [x] **Patterns/Builder and Functional Options** · I · ✅ · from: Builder and Functional Options Pattern in Go
@@ -405,15 +405,15 @@ updated: 2026-11-02
 - [x] **Patterns/Iterator and range-over-func** · I · ✅ · from: Iterator Pattern in Go (rewrite)
 - [x] **Patterns/Repository and Unit of Work** · I · ✅ · from: Repository Pattern in Go
 - [x] **Patterns/Rare GoF Patterns in Go** · A · ✅ · from: Prototype, Bridge, Flyweight, Visitor, Interpreter (+ the full Mediator form)
-- [ ] **Concurrency for LLD** · A · from: Concurrency in Go LLD
-- [ ] **Testing LLD Code** · I · from: Testing LLD Code in Go
+- [x] **Concurrency for LLD** · A · ✅ · from: Concurrency in Go LLD
+- [x] **Testing LLD Code** · I · ✅ · from: Testing LLD Code in Go
 - [x] **Practice/Parking Lot** · B · ✅ · from: Parking Lot LLD in Go
 - [x] **Practice/Vending Machine** · B · ✅ · from: Vending Machine LLD in Go
 - [x] **Practice/Library Management** · B · ✅ · from: Library Management LLD in Go
 - [x] **Practice/Meeting Room Scheduler** · B · ✅ · from: Meeting Room Scheduler LLD in Go
 - [x] **Practice/LRU Cache with TTL** · B · ✅ · from: LRU Cache LLD in Go
 - [x] **Practice/Elevator System** · B · ✅ · from: Elevator System LLD in Go (rewrite + NEW drawing + tests)
-- [ ] **Practice/Tic-Tac-Toe and Snake and Ladder** · B 🆕 · from: NEW
+- [x] **Practice/Tic-Tac-Toe and Snake and Ladder** · B 🆕 · ✅ · from: NEW
 - [x] **Practice/Cart Checkout with Coupons** · I · ✅ · from: Cart Checkout with Coupons LLD in Go
 - [x] **Practice/Inventory Order Assignment (Dark Store)** · I · ✅ · from: Inventory Order Assignment LLD in Go
 - [x] **Practice/Delivery Partner Assignment** · I · ✅ · from: Delivery Partner Assignment LLD in Go
@@ -421,19 +421,19 @@ updated: 2026-11-02
 - [x] **Practice/Rate Limiter** · I · ✅ · from: Rate Limiter LLD in Go
 - [x] **Practice/Logging Library** · I · ✅ · from: Logging System LLD in Go
 - [x] **Practice/File Search (Unix find)** · I · ✅ · from: File Search Unix Find LLD in Go
-- [ ] **Practice/ATM** · I 🆕 · from: NEW
-- [ ] **Practice/In-memory KV Store with TTL and Transactions** · I 🆕 · from: NEW
-- [ ] **Practice/Task Scheduler (delayed and recurring jobs)** · I 🆕 · from: NEW
-- [ ] **Practice/Circuit Breaker** · I 🆕 · from: NEW
+- [x] **Practice/ATM** · I 🆕 · ✅ · from: NEW
+- [x] **Practice/In-memory KV Store with TTL and Transactions** · I 🆕 · ✅ · from: NEW
+- [x] **Practice/Task Scheduler (delayed and recurring jobs)** · I 🆕 · ✅ · from: NEW
+- [x] **Practice/Circuit Breaker** · I 🆕 · ✅ · from: NEW
 - [x] **Practice/Movie Ticket Booking** · A · ✅ · from: Movie Ticket Booking LLD in Go
 - [x] **Practice/Splitwise Expense Sharing** · A · ✅ · from: Splitwise Expense Sharing LLD in Go
 - [x] **Practice/Food Ordering System** · A · ✅ · from: Food Ordering System LLD in Go
-- [ ] **Practice/Pub-Sub Message Queue** · A 🆕 · from: NEW
-- [ ] **Practice/Ride Sharing** · A 🆕 · from: NEW
-- [ ] **Practice/Hotel Booking** · A 🆕 · from: NEW
-- [ ] **Practice/Order Book Matching Engine** · A 🆕 · from: NEW
-- [ ] **Practice/Digital Wallet and Ledger** · A 🆕 · from: NEW
-- [ ] **LLD Problem Cheat Sheet** · I · from: LLD Question Bank with Answers (rewritten and brought in line with the full notes)
+- [x] **Practice/Pub-Sub Message Queue** · A 🆕 · ✅ · from: NEW
+- [x] **Practice/Ride Sharing** · A 🆕 · ✅ · from: NEW
+- [x] **Practice/Hotel Booking** · A 🆕 · ✅ · from: NEW
+- [x] **Practice/Order Book Matching Engine** · A 🆕 · ✅ · from: NEW
+- [x] **Practice/Digital Wallet and Ledger** · A 🆕 · ✅ · from: NEW
+- [x] **LLD Problem Cheat Sheet** · I · ✅ · from: LLD Question Bank with Answers (rewritten and brought in line with the full notes)
 
 ## 18 AI Engineering · 20 notes
 
@@ -461,10 +461,10 @@ updated: 2026-11-02
 
 ## 19 Interview & Career · 6 notes
 
-- [ ] **19 Interview & Career MOC** · - · from: folder map, written last
+- [x] **19 Interview & Career MOC** · - · ✅ · from: folder map, written last
 - [ ] **Backend Roadmap and Tech Landscape** · B · from: backendburgerDiagram (+ the SDE3 roadmap notes)
 - [ ] **SDE-3 Readiness Checklist** · I · from: 2026 SDE3 Gap Checklist, SDE3 Backend Roadmap, START HERE (completion checklist)
-- [ ] **Learning Resources** · B · from: Advancxe backend content table (syllabus), plus the other reviewers' coverage maps (Go Bootcamp Course Coverage Map, CodeWithAryan LLD Playlist Coverage Map, Go YouTube Topic Links); Go YouTube Topic Links, Go Backend Complete Notes (resource table, 9 unique URLs), Go Bootcamp Course Coverage Map (curriculum list); CodeWithAryan LLD Playlist Coverage Map
+- [x] **Learning Resources** · B · ✅ · from: Advancxe backend content table (syllabus), plus the other reviewers' coverage maps (Go Bootcamp Course Coverage Map, CodeWithAryan LLD Playlist Coverage Map, Go YouTube Topic Links); Go YouTube Topic Links, Go Backend Complete Notes (resource table, 9 unique URLs), Go Bootcamp Course Coverage Map (curriculum list); CodeWithAryan LLD Playlist Coverage Map
 - [ ] **Go Interview Questions and Traps** · I 🆕 · from: NEW (Go reviewer gap: nil-interface trap, loop vars, slices aliasing, map iteration, goroutine leaks)
-- [ ] **LLD Round Playbook** · B · from: LLD Practice Roadmap (daily method, interviewer checks), the Zepto time table, the Interview Approach script
-- [ ] **Company Rounds/Zepto-style Product LLD Round** · I · from: Zepto SDE1 LLD Round Pattern
+- [x] **LLD Round Playbook** · B · ✅ · from: LLD Practice Roadmap (daily method, interviewer checks), the Zepto time table, the Interview Approach script
+- [x] **Company Rounds/Zepto-style Product LLD Round** · I · ✅ · from: Zepto SDE1 LLD Round Pattern

@@ -23,6 +23,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A list endpoint never returns "all rows". It returns one **page** (for example 20 orders) plus a **cursor**: a token that says where the next page starts. The fast, stable way to build it is **keyset pagination**: remember the sort key of the last row you returned and ask the database for rows *after* that key, using an index, instead of skipping rows with `OFFSET`.
 
+> [!abstract] Core idea
+> - Never return all rows: return one page plus a **cursor** that says where the next page starts.
+> - **Keyset** pagination (also called seek pagination) remembers the sort key of the last row and asks for rows after it, using an index.
+> - Always sort by a unique tie-breaker (for example `created_at, id`) so no row is skipped or repeated.
+> - Allow-list filter and sort fields; never paste them into SQL.
+> - Classic mistake: deep `OFFSET`, which gets slower with every page and shifts when rows are inserted.
+
 ## 1. Why it exists
 
 A customer with 200,000 orders opens "My orders". Without pagination, `GET /orders` serializes 200,000 rows (about 40 MB of JSON at 200 bytes per order, an estimate), holds them in server memory, and the phone shows 20 of them.
@@ -137,6 +144,30 @@ sequenceDiagram
 ```
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea in SQL: the first page, then every next page seeks past the last row seen. The full version below adds the production concerns.
+
+```sql
+-- First page
+SELECT id, created_at, total FROM orders
+WHERE customer_id = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 21;  -- ask for 21, return 20; the extra row says "there is a next page"
+
+-- Next page: the cursor holds (created_at, id) of the last row returned
+SELECT id, created_at, total FROM orders
+WHERE customer_id = $1
+  AND (created_at, id) < ($2, $3)
+ORDER BY created_at DESC, id DESC
+LIMIT 21;
+
+-- Index that makes both queries a seek, not a scan
+CREATE INDEX orders_customer_created_id ON orders (customer_id, created_at DESC, id DESC);
+```
+
+### Full version
 
 The list handler's core in Go: parse and allow-list the query, build the keyset SQL, apply the `limit + 1` trick, and issue an HMAC-signed cursor bound to the filter and sort. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 

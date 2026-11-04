@@ -9,13 +9,20 @@ sources:
   - "Go 1.20 release notes: errors.Join"
   - "Go 1.21 release notes: context.WithoutCancel"
   - "PostgreSQL 17 docs: UPDATE, CHECK constraints, transaction isolation"
-updated: 2026-11-02
+updated: 2026-11-03
 ---
 
 # Inventory Order Assignment (Dark Store)
 
 > [!summary] TL;DR
 > A quick-commerce order must come from one dark store near the customer that has every item. The service claims the client's idempotency key, asks a store-selection strategy for full-stock stores nearest first, reserves every item at one store all-or-nothing (falling back to the next store if it loses a race), and saves the order as `reserved` with a 10-minute payment hold. Every undo runs even if the client hung up, and every status change is a compare-and-set.
+
+> [!abstract] Core idea
+> - Stock per (store, product) is the contended resource; reserve it with a conditional decrement (`qty = qty - n WHERE qty >= n`).
+> - Reserve every item at one store all or nothing, in product-ID order; if any fails, roll back and try the next store.
+> - An idempotency key (a client-chosen ID for one order attempt) makes a retry return the same order.
+> - Every status change is a compare-and-set (CAS: change only if the current value is still what you read), so payment and expiry cannot both win.
+> - Classic mistake: running the undo on the request context, so a client hang-up skips the release and leaks stock.
 
 ## Problem statement
 
@@ -28,6 +35,15 @@ to delivery partner assignment. Design the classes, APIs, DB schema; code PlaceO
 ```
 
 What it tests: an **atomic multi-item reservation** (all items or none, no overselling under concurrency), and clean separation of store selection (Strategy), the order lifecycle (state machine) and retries (idempotency key). The senior signal is that no failure path leaks a reservation or an idempotency key.
+
+### Solving path
+
+1. Clarify the radius, payment hold, cancellation and retries.
+2. Model `Store`, `OrderItem`, `Order` and the `OrderStatus` state machine.
+3. Write `StoreSelector`: active stores within 3 km with every item, nearest first.
+4. Write `PlaceOrder`: normalize, claim the key, select stores, reserve all at one store, save.
+5. Add rollback with `context.WithoutCancel` and CAS status transitions.
+6. Add `ExpireHolds` and `Cancel`, then test the last-packet race and retries.
 
 ## Step 1: Clarify requirements
 
@@ -67,7 +83,7 @@ The hardest use case, and the one to code: **PlaceOrder**, which selects the nea
 | `Order` | ID, UserID, StoreID, Items, TotalPaise, Status, CreatedAt | What was bought and from where |
 | `OrderItem` | ProductID, Qty, PricePaise | One line; the price is copied at order time |
 | `OrderStatus` | reserved, confirmed, packed, cancelled | Lifecycle with legal transitions |
-| `IdempotencyKey` | UserID, Key, OrderID (empty while running) | Makes retries safe |
+| `IdempotencyKey` | UserID, Key, OrderID (empty while running), Attempt, LeaseUntil | Makes retries safe; the lease lets a retry recover a key whose claimer crashed, and the attempt number fences the crashed claimer out |
 | `Event` | Name, OrderID, Amount | `order.created`, `order.cancelled`, `refund.requested` |
 
 Modelling insight: **a product is not an inventory item.** "Amul milk 500 ml" is global; stock lives per (store, product), and that row is what concurrent orders contend on. `OrderItem` copies the price, so later price changes do not change old orders.
@@ -100,8 +116,8 @@ classDiagram
   }
   class OrderRepository {
     <<interface>>
-    +ClaimKey(ctx, userID, key) string, bool
-    +BindKey(ctx, userID, key, orderID) error
+    +ClaimKey(ctx, userID, key, now, lease) string, int64, bool
+    +BindKey(ctx, userID, key, attempt, orderID) error
     +Save(ctx, o) error
     +CompareAndSetStatus(ctx, id, from, to) error
   }
@@ -137,7 +153,7 @@ stateDiagram-v2
 POST /orders                 Idempotency-Key: <uuid per checkout tap>
   {"items": [{"product_id": "milk", "qty": 2}], "lat": 12.97, "lng": 77.59}
   -> 201 {order_id, store_id, status: "reserved", total_paise, pay_by}
-  -> 409 out of stock everywhere | 409 same key in progress | 400 invalid
+  -> 409 out of stock everywhere | 409 same key in progress (lease not expired) | 400 invalid
 GET  /orders/{id}
 POST /orders/{id}/cancel
 POST /internal/orders/{id}/payment-confirmed      (payment service)
@@ -194,20 +210,30 @@ CREATE TABLE order_items (
 );
 
 CREATE TABLE idempotency_keys (
-    user_id    TEXT NOT NULL,
-    key        TEXT NOT NULL,
-    order_id   TEXT NULL,                 -- NULL while the first request is running
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id, key)            -- a second insert fails: it is a retry
+    user_id     TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    order_id    TEXT NULL,                -- NULL while the first request is running
+    attempt     BIGINT NOT NULL DEFAULT 1,  -- fencing token: +1 on every takeover
+    lease_until TIMESTAMPTZ NOT NULL,     -- an unbound claim may be taken over after this
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, key)            -- a second insert conflicts: it is a retry
 );
 ```
 
-The reservation is one transaction per candidate store, items in `product_id` order (one lock order everywhere, so no deadlock):
+The reservation is one transaction per candidate store, items in `product_id` order (one lock order everywhere, so no deadlock). The lease and fencing statements below (the claim, the fenced bind and the fenced release) follow the PostgreSQL 17 `INSERT ... ON CONFLICT DO UPDATE ... WHERE` and `RETURNING` syntax but have **not been executed against PostgreSQL**; only the Go version was compiled and tested.
 
 ```sql
--- Claim the key first, in its own statement; 0 rows inserted means a retry.
-INSERT INTO idempotency_keys (user_id, key) VALUES ($1, $2)
-ON CONFLICT (user_id, key) DO NOTHING;
+-- Claim the key first, in its own statement. $3 = now and $4 = now + lease, both
+-- from the injected clock. A row back means claimed (attempt = the fencing token):
+-- a new key, or a takeover of an unbound claim whose lease has ended.
+-- No row back means a retry: read order_id to tell "finished" from "still running".
+INSERT INTO idempotency_keys (user_id, key, attempt, lease_until)
+VALUES ($1, $2, 1, $4)
+ON CONFLICT (user_id, key) DO UPDATE
+SET attempt = idempotency_keys.attempt + 1, lease_until = EXCLUDED.lease_until
+WHERE idempotency_keys.order_id IS NULL
+  AND idempotency_keys.lease_until <= $3
+RETURNING attempt;
 
 BEGIN;
 -- once per item, in product_id order; $1 = qty, $2 = store_id, $3 = product_id
@@ -219,11 +245,18 @@ INSERT INTO orders (id, user_id, store_id, status, total_paise)
 VALUES ($1, $2, $3, 'reserved', $4);
 INSERT INTO order_items (order_id, product_id, qty, price_paise)
 VALUES ($1, $2, $3, $4);                  -- once per line
-UPDATE idempotency_keys SET order_id = $1 WHERE user_id = $2 AND key = $3;
+-- fenced bind: 0 rows means a retry took the key over (ErrLeaseLost): ROLLBACK,
+-- which also undoes this attempt's reservation and order
+UPDATE idempotency_keys SET order_id = $1
+WHERE user_id = $2 AND key = $3 AND attempt = $4 AND order_id IS NULL;
 COMMIT;
+
+-- fenced release after a failed attempt: free the key now, keep the attempt counter
+UPDATE idempotency_keys SET lease_until = '-infinity'
+WHERE user_id = $1 AND key = $2 AND attempt = $3 AND order_id IS NULL;
 ```
 
-Each statement numbers its own placeholders from `$1`. In SQL the order insert and the key binding commit together, so neither can fail alone. The in-memory repositories below make them separate calls, which is exactly why the code needs the compensation for a failed `BindKey`. A status change is also a compare-and-set: `UPDATE orders SET status = $1 WHERE id = $2 AND status = $3` ([[Locking - Optimistic vs Pessimistic]]).
+Each statement numbers its own placeholders from `$1`. In SQL the order insert and the key binding commit together, so neither can fail alone, and the `attempt = $4` condition makes the bind the fence: a late attempt whose lease was taken over binds 0 rows and rolls its whole reservation back. The in-memory repositories below make them separate calls, which is exactly why the code needs the compensation for a failed `BindKey`. A status change is also a compare-and-set: `UPDATE orders SET status = $1 WHERE id = $2 AND status = $3` ([[Locking - Optimistic vs Pessimistic]]).
 
 ## Step 7: Patterns
 
@@ -254,14 +287,20 @@ cmd/demo/main.go   -> wires the Mem* repositories, NearestWithFullStock{MaxDista
 
 ## Step 8: Core code
 
+> [!tip] What to code in a 60-minute round
+> Aim for about 150 lines in the room.
+> - **Write:** `Location`, `Store`, `OrderItem`, `OrderStatus` with `CanMoveTo`, `Order`, the three repository interfaces, `MemInventory` (`Reserve`, `Release`, `HasAll`), `NearestWithFullStock`, and `Service` with `PlaceOrder`, `place`, `reserveAll`, `releaseAll`, `transition` and `normalize`.
+> - **Add if time remains:** `MemOrders` key claims, `ConfirmPayment`, `Cancel` and `ExpireHolds`.
+> - **Talk only:** the key lease with attempt numbers, events and the refund flow, the SQL schema, and split orders across stores.
+
 `PlaceOrder(ctx, req)`:
 
 1. `normalize` merges duplicate lines, rejects empty carts and bad quantities, and sorts by product ID: the same lock order for every request.
-2. `ClaimKey(user, key)`: a retry with a bound key returns that order; an unbound key means the first request is in flight (`ErrInProgress`).
+2. `ClaimKey(user, key, now, lease)`: a retry with a bound key returns that order; an unbound key inside its lease means the first request is in flight (`ErrInProgress`). **Another leak to avoid:** if the process crashes after the claim and before `BindKey`, a claim with no lease stays "in progress" forever and every retry gets 409. Here the claim stores `leaseUntil = now + 1 min` from the injected clock (`DefaultKeyLease`, well above the 200 ms target), and a retry that finds an unbound claim past its lease takes it over with `attempt + 1`. The crashed attempt's orphan order, if it saved one, is cancelled by the expiry job like any unpaid hold.
 3. `selector.Select` returns active stores within 3 km that have every item, nearest first. It reads without locks, so it can be stale.
 4. For each candidate, `reserveAll` does one conditional decrement per item; on the first failure it releases what it took and the loop tries the next store.
 5. Save the order as `reserved` with `CreatedAt` from the injected clock. **Leak to avoid:** if `Save` fails, a naive version releases the stock with the request's `ctx`. After a client disconnect that `ctx` is cancelled, so a real database release fails too, the error is dropped, and the units stay held forever. Here every compensation runs with `context.WithoutCancel(ctx)` (Go 1.21+), and `releaseAll` returns its failures (`errors.Join`, Go 1.20+) instead of hiding them.
-6. `BindKey`. **Second leak to avoid:** if it fails after a successful save, a naive version returns the error and leaves the key "in progress" forever (every retry gets `ErrInProgress`) while the stock stays held until expiry. Here the order is moved `reserved → cancelled` by compare-and-set, the stock is released and the key is freed, so the same key works on the next try. If even that compare-and-set fails, its error is reported with the rest and the expiry job cancels the hold later.
+6. `BindKey`. **Second leak to avoid:** if it fails after a successful save, a naive version returns the error and leaves the key "in progress" forever (every retry gets `ErrInProgress`) while the stock stays held until expiry. Here the order is moved `reserved → cancelled` by compare-and-set, the stock is released and the key is freed, so the same key works on the next try. If even that compare-and-set fails, its error is reported with the rest and the expiry job cancels the hold later. `BindKey` and `ReleaseKey` carry the attempt number, so they are **fenced**: an attempt that was only slow and lost its key to a takeover gets `ErrLeaseLost` from `BindKey`, goes down this same path (its order cancelled, its stock released), and its `ReleaseKey` leaves the new attempt's claim alone. `ReleaseKey` frees a key by ending its lease instead of deleting the row, so the attempt counter never goes back to 1 and a late attempt can never match a newer claim.
 7. Publish `order.created`.
 
 Lifecycle methods go through `transition`: check `CanMoveTo`, then `CompareAndSetStatus(from, to)`, so racing callers (cancel versus payment, payment versus expiry) cannot both win. `Cancel` releases stock only when it won, and when it moved a **confirmed** (paid) order it also publishes `refund.requested` with the amount. This service does not own payment; the payment service refunds idempotently by order ID. Publish it through an outbox so it cannot be lost ([[Transactional Outbox and CDC]]).
@@ -274,10 +313,12 @@ sequenceDiagram
   participant SEL as StoreSelector
   participant INV as InventoryRepository
   U->>S: PlaceOrder with idempotency key
-  S->>OR: ClaimKey user, key
+  S->>OR: ClaimKey user, key, lease
   alt key already bound
     S-->>U: same order as before
-  else first time
+  else unbound, lease still running
+    S-->>U: 409 in progress
+  else new key, or lease expired: take over with attempt + 1
     S->>SEL: Select customer, stores, items
     SEL-->>S: full-stock stores, nearest first
     loop each candidate store
@@ -290,8 +331,8 @@ sequenceDiagram
           S->>INV: Release all with WithoutCancel ctx
           S->>OR: ReleaseKey
         else saved
-          S->>OR: BindKey to order id
-          alt BindKey fails
+          S->>OR: BindKey to order id, fenced by attempt
+          alt BindKey fails or lease lost
             S->>OR: CAS reserved to cancelled
             S->>INV: Release all, then ReleaseKey
           else bound
@@ -330,6 +371,7 @@ var (
 	ErrBadTransition = errors.New("inventory: invalid order state transition")
 	ErrInProgress    = errors.New("inventory: same idempotency key is still in progress")
 	ErrReleaseFailed = errors.New("inventory: stock release failed, reconcile")
+	ErrLeaseLost     = errors.New("inventory: idempotency key lease expired and was taken over")
 )
 
 type Location struct{ Lat, Lng float64 }
@@ -396,11 +438,15 @@ type InventoryRepository interface {
 }
 
 type OrderRepository interface {
-	// ClaimKey inserts (user_id, key). claimed=false means the key exists:
-	// orderID != "" -> finished earlier, return that order; "" -> still running.
-	ClaimKey(ctx context.Context, userID, key string) (orderID string, claimed bool, err error)
-	BindKey(ctx context.Context, userID, key, orderID string) error
-	ReleaseKey(ctx context.Context, userID, key string) error
+	// ClaimKey inserts (user_id, key) with a lease until now+lease, or takes over
+	// an unbound key whose lease has ended (its claimer crashed). claimed=false
+	// means the key is held: orderID != "" -> finished earlier, return that order;
+	// "" -> still running. attempt is the fencing token of the claim (+1 per takeover).
+	ClaimKey(ctx context.Context, userID, key string, now time.Time, lease time.Duration) (orderID string, attempt int64, claimed bool, err error)
+	// BindKey succeeds only for the attempt that still holds the key; otherwise
+	// ErrLeaseLost. ReleaseKey frees the key only for that attempt.
+	BindKey(ctx context.Context, userID, key string, attempt int64, orderID string) error
+	ReleaseKey(ctx context.Context, userID, key string, attempt int64) error
 	Save(ctx context.Context, o Order) error
 	Get(ctx context.Context, id string) (Order, error)
 	// CompareAndSetStatus: UPDATE orders SET status = $1 WHERE id = $2 AND status = $3
@@ -475,38 +521,58 @@ func (m *MemInventory) Release(ctx context.Context, storeID, productID string, q
 	return nil
 }
 
+// keyClaim is one row of idempotency_keys.
+type keyClaim struct {
+	orderID    string    // "" while in progress
+	attempt    int64     // fencing token, never reset, so a late attempt stays fenced out
+	leaseUntil time.Time // an unbound claim may be taken over from this moment
+}
+
 type MemOrders struct {
 	mu     sync.Mutex
 	orders map[string]Order
-	keys   map[string]string // userID|key -> orderID ("" while in progress)
+	keys   map[string]keyClaim // userID|key -> claim
 }
 
 func NewMemOrders() *MemOrders {
-	return &MemOrders{orders: make(map[string]Order), keys: make(map[string]string)}
+	return &MemOrders{orders: make(map[string]Order), keys: make(map[string]keyClaim)}
 }
 
-func (m *MemOrders) ClaimKey(ctx context.Context, userID, key string) (string, bool, error) {
+func (m *MemOrders) ClaimKey(ctx context.Context, userID, key string, now time.Time, lease time.Duration) (string, int64, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	k := userID + "|" + key
-	if id, ok := m.keys[k]; ok {
-		return id, false, nil
+	c, ok := m.keys[k]
+	if ok && (c.orderID != "" || now.Before(c.leaseUntil)) {
+		return c.orderID, c.attempt, false, nil // finished, or still running inside its lease
 	}
-	m.keys[k] = ""
-	return "", true, nil
+	// New key, a released key, or a takeover of a claim whose lease ended.
+	c = keyClaim{attempt: c.attempt + 1, leaseUntil: now.Add(lease)}
+	m.keys[k] = c
+	return "", c.attempt, true, nil
 }
 
-func (m *MemOrders) BindKey(ctx context.Context, userID, key, orderID string) error {
+func (m *MemOrders) BindKey(ctx context.Context, userID, key string, attempt int64, orderID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.keys[userID+"|"+key] = orderID
+	k := userID + "|" + key
+	c, ok := m.keys[k]
+	if !ok || c.attempt != attempt || c.orderID != "" {
+		return fmt.Errorf("%w: attempt %d", ErrLeaseLost, attempt)
+	}
+	c.orderID = orderID
+	m.keys[k] = c
 	return nil
 }
 
-func (m *MemOrders) ReleaseKey(ctx context.Context, userID, key string) error {
+func (m *MemOrders) ReleaseKey(ctx context.Context, userID, key string, attempt int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.keys, userID+"|"+key)
+	k := userID + "|" + key
+	if c, ok := m.keys[k]; ok && c.attempt == attempt && c.orderID == "" {
+		c.leaseUntil = time.Time{} // free at once; the attempt counter is kept
+		m.keys[k] = c
+	}
 	return nil
 }
 
@@ -633,12 +699,17 @@ type Service struct {
 	events   EventPublisher
 	now      func() time.Time
 	holdFor  time.Duration // unpaid reservations expire after this
+	keyLease time.Duration // an unbound idempotency key may be taken over after this
 	seq      atomic.Int64
 }
 
+// DefaultKeyLease must be longer than a healthy PlaceOrder takes (about 200 ms);
+// after it, a retry assumes the claimer crashed and takes the key over.
+const DefaultKeyLease = time.Minute
+
 func NewService(st StoreRepository, inv InventoryRepository, ord OrderRepository,
 	sel StoreSelector, ev EventPublisher, now func() time.Time, holdFor time.Duration) *Service {
-	return &Service{stores: st, inv: inv, orders: ord, selector: sel, events: ev, now: now, holdFor: holdFor}
+	return &Service{stores: st, inv: inv, orders: ord, selector: sel, events: ev, now: now, holdFor: holdFor, keyLease: DefaultKeyLease}
 }
 
 // PlaceOrder: validate -> idempotency claim -> pick store -> reserve all items -> save order.
@@ -650,31 +721,33 @@ func (s *Service) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (Order,
 	if req.UserID == "" || req.IdempotencyKey == "" {
 		return Order{}, fmt.Errorf("%w: user and idempotency key required", ErrInvalidOrder)
 	}
-	existingID, claimed, err := s.orders.ClaimKey(ctx, req.UserID, req.IdempotencyKey)
+	existingID, attempt, claimed, err := s.orders.ClaimKey(ctx, req.UserID, req.IdempotencyKey, s.now(), s.keyLease)
 	if err != nil {
 		return Order{}, err
 	}
 	if !claimed {
 		if existingID == "" {
-			return Order{}, ErrInProgress // first request still running; client retries later
+			return Order{}, ErrInProgress // first request still inside its lease; client retries later
 		}
 		return s.orders.Get(ctx, existingID) // retry: same answer, no second reservation
 	}
 	undo := context.WithoutCancel(ctx) // compensations must run even if the client hung up
 	o, err := s.place(ctx, req, items)
 	if err != nil {
-		_ = s.orders.ReleaseKey(undo, req.UserID, req.IdempotencyKey) // failed: allow a fresh retry
+		_ = s.orders.ReleaseKey(undo, req.UserID, req.IdempotencyKey, attempt) // failed: allow a fresh retry
 		return Order{}, err
 	}
-	if err := s.orders.BindKey(ctx, req.UserID, req.IdempotencyKey, o.ID); err != nil {
+	if err := s.orders.BindKey(ctx, req.UserID, req.IdempotencyKey, attempt, o.ID); err != nil {
 		// The order is saved but no retry can find it: cancel it and give the stock and
-		// the key back, or the hold and the "in progress" key would leak.
+		// the key back, or the hold and the "in progress" key would leak. ErrLeaseLost
+		// (a retry took the key over after the lease) takes the same path, and the
+		// fenced ReleaseKey below then leaves the new attempt's claim alone.
 		if cerr := s.orders.CompareAndSetStatus(undo, o.ID, Reserved, Cancelled); cerr == nil {
 			err = errors.Join(err, s.releaseAll(undo, o.StoreID, o.Items))
 		} else {
 			err = errors.Join(err, cerr) // not cancelled: report it; the expiry job frees the hold
 		}
-		_ = s.orders.ReleaseKey(undo, req.UserID, req.IdempotencyKey)
+		_ = s.orders.ReleaseKey(undo, req.UserID, req.IdempotencyKey, attempt)
 		return Order{}, err
 	}
 	s.events.Publish(ctx, Event{Name: "order.created", OrderID: o.ID})
@@ -860,8 +933,10 @@ func total(items []OrderItem) int64 {
 | `TestSaveFailureAfterDisconnectReleasesStock` | The client hangs up during `Save`: stock is back to 5 and the key is free. With the release on the request `ctx` instead, this test fails with "milk = 4, want 5" (checked by running it) |
 | `TestBindKeyFailureCancelsOrderAndFreesKey` | A failed `BindKey` cancels the order, returns the stock, and the same key then succeeds |
 | `TestCancelAfterPaymentRequestsRefund` | Only the paid order emits `refund.requested`, with its 6,000 paise |
+| `TestCrashedClaimIsTakenOverAfterLease` | The process dies after `Save` and before `BindKey` (simulated with `runtime.Goexit` in a hook). A retry inside the lease gets `ErrInProgress`; after the lease and the expiry job, the retry succeeds, a second retry replays it, and exactly one unit of milk is held. Without the lease this test fails with "same idempotency key is still in progress" |
+| `TestLateOriginalIsFencedOut` | The first attempt is slow, not dead: a retry takes the key over before its `BindKey`. The original gets `ErrLeaseLost`, cancels its own order and returns its stock; the key keeps pointing at the retry's order |
 
-Measured: `go test -race -cover` on Go 1.24.4 passes all 12 test functions with 90.6 to 91.0% statement coverage across six runs (the concurrency tests reach some branches only on some schedules).
+Measured: `go test -race -cover` on Go 1.24.4 passes all 14 test functions with 91.4% statement coverage, and `go test -race -count=3` passes on every run (the concurrency tests reach some branches only on some schedules).
 
 ```go
 // File: inventory_test.go
@@ -871,6 +946,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -1159,11 +1235,12 @@ func (c ctxInventory) Release(ctx context.Context, s, p string, q int) error {
 	return c.MemInventory.Release(ctx, s, p, q)
 }
 
-// faultyOrders fails Save or BindKey on demand; onSave runs first (the client hangs up).
+// faultyOrders fails Save or BindKey on demand; onSave and onBind run first
+// (the client hangs up, the process crashes, or time passes).
 type faultyOrders struct {
 	*MemOrders
 	saveErr, bindErr error
-	onSave           func()
+	onSave, onBind   func()
 }
 
 func (f *faultyOrders) Save(ctx context.Context, o Order) error {
@@ -1176,11 +1253,14 @@ func (f *faultyOrders) Save(ctx context.Context, o Order) error {
 	return f.MemOrders.Save(ctx, o)
 }
 
-func (f *faultyOrders) BindKey(ctx context.Context, u, k, id string) error {
+func (f *faultyOrders) BindKey(ctx context.Context, u, k string, attempt int64, id string) error {
+	if f.onBind != nil {
+		f.onBind()
+	}
 	if f.bindErr != nil {
 		return f.bindErr
 	}
-	return f.MemOrders.BindKey(ctx, u, k, id)
+	return f.MemOrders.BindKey(ctx, u, k, attempt, id)
 }
 
 func newFaulty(f *fixture, orders *faultyOrders) *Service {
@@ -1202,7 +1282,7 @@ func TestSaveFailureAfterDisconnectReleasesStock(t *testing.T) {
 	if got := f.inv.Available("near", "milk"); got != 5 {
 		t.Fatalf("milk = %d, want 5: the reservation leaked", got)
 	}
-	if _, claimed, _ := f.orders.ClaimKey(context.Background(), "u1", "k1"); !claimed {
+	if _, _, claimed, _ := f.orders.ClaimKey(context.Background(), "u1", "k1", f.now, time.Minute); !claimed {
 		t.Fatal("the key must be free for a retry")
 	}
 }
@@ -1258,6 +1338,72 @@ func TestCancelAfterPaymentRequestsRefund(t *testing.T) {
 		t.Fatalf("refunds %+v, want one for the paid order, 6000 paise", refunds)
 	}
 }
+
+// The process dies after claiming the key and saving the order, before BindKey.
+// Inside the lease a retry is told to wait; after the lease (and the 10-minute
+// hold, which cancels the orphan order) the retry takes the key over and
+// succeeds exactly once, and later retries replay that order.
+func TestCrashedClaimIsTakenOverAfterLease(t *testing.T) {
+	f := newFixture()
+	orders := &faultyOrders{MemOrders: f.orders, onBind: runtime.Goexit} // dies here, like a crash
+	svc, ctx := newFaulty(f, orders), context.Background()
+	crashed := make(chan struct{})
+	go func() {
+		defer close(crashed)
+		_, _ = svc.PlaceOrder(ctx, req("k1", milk))
+	}()
+	<-crashed
+	orders.onBind = nil
+
+	f.now = f.now.Add(30 * time.Second) // inside the lease: the first attempt may still be running
+	if _, err := svc.PlaceOrder(ctx, req("k1", milk)); !errors.Is(err, ErrInProgress) {
+		t.Fatalf("retry inside the lease: %v, want ErrInProgress", err)
+	}
+	f.now = f.now.Add(11 * time.Minute) // past the lease and the payment hold
+	if n, err := svc.ExpireHolds(ctx); n != 1 || err != nil {
+		t.Fatalf("expiry cancelled %d orphan orders (%v), want 1", n, err)
+	}
+	o, err := svc.PlaceOrder(ctx, req("k1", milk))
+	if err != nil {
+		t.Fatalf("retry after the lease: %v", err)
+	}
+	if again, err := svc.PlaceOrder(ctx, req("k1", milk)); err != nil || again.ID != o.ID {
+		t.Fatalf("second retry: %v %v, want order %s", again.ID, err, o.ID)
+	}
+	if got := f.inv.Available("near", "milk"); got != 4 {
+		t.Fatalf("milk = %d, want 4: exactly one live reservation", got)
+	}
+}
+
+// The first attempt is only slow, not dead: its lease ends before BindKey and a
+// retry takes the key over and finishes. The late original is fenced out: its
+// BindKey fails, it cancels its own order and gives its stock back, and the key
+// still points at the retry's order.
+func TestLateOriginalIsFencedOut(t *testing.T) {
+	f := newFixture()
+	orders := &faultyOrders{MemOrders: f.orders}
+	svc, ctx := newFaulty(f, orders), context.Background()
+	var retry Order
+	var retryErr error
+	orders.onBind = func() {
+		orders.onBind = nil
+		f.now = f.now.Add(2 * DefaultKeyLease)
+		retry, retryErr = svc.PlaceOrder(ctx, req("k1", milk))
+	}
+	if _, err := svc.PlaceOrder(ctx, req("k1", milk)); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("late original: %v, want ErrLeaseLost", err)
+	}
+	if retryErr != nil {
+		t.Fatal(retryErr)
+	}
+	if o, err := svc.PlaceOrder(ctx, req("k1", milk)); err != nil || o.ID != retry.ID {
+		t.Fatalf("replay: %v %v, want the takeover's order %s", o.ID, err, retry.ID)
+	}
+	reserved, _ := f.orders.ListByStatus(ctx, Reserved)
+	if got := f.inv.Available("near", "milk"); got != 4 || len(reserved) != 1 {
+		t.Fatalf("milk = %d, reserved orders = %d, want 4 and 1", got, len(reserved))
+	}
+}
 ```
 
 ## Step 9: Edge cases
@@ -1271,6 +1417,8 @@ func TestCancelAfterPaymentRequestsRefund(t *testing.T) {
 | Milk reserved, bread fails | `reserveAll` releases what it took (SQL: rollback) |
 | Client retries after a timeout | `(user_id, key)` claim; the retry returns the first order |
 | Double tap, two requests at once | One claims the key; the other gets `ErrInProgress` (409) and polls |
+| Process crashes after claiming the key | The claim has a 1-minute lease; after it a retry takes the key over with `attempt + 1`; the crashed attempt's orphan order (if saved) expires with the 10-minute hold, and in SQL an unsaved one rolled back with its transaction |
+| The "crashed" attempt was only slow | `BindKey` is fenced by the attempt number: the late attempt gets `ErrLeaseLost`, cancels its own order and releases its stock |
 | Client disconnects during `Save` | Compensation uses `context.WithoutCancel`, so the release still runs |
 | `BindKey` fails after `Save` | Order cancelled by CAS, stock released, key freed |
 | User never pays | `ExpireHolds` after 10 minutes, CAS from `reserved` only |
@@ -1280,7 +1428,7 @@ func TestCancelAfterPaymentRequestsRefund(t *testing.T) {
 | Store goes offline after `Select` | `ListActive` filters; in SQL the reserve transaction also checks `stores.active` |
 | A release itself fails (DB blip) | `releaseAll` returns `ErrReleaseFailed` with the store, product and quantity; a reconciliation job compares `available + reserved` with the physical count |
 
-Common mistakes: read stock then update it in a separate step; reserve item by item with no rollback; run compensations on the request context; ignore release errors; no state machine; no idempotency key; "nearest store" hard-coded in the service; logic in the HTTP handler.
+Common mistakes: an in-progress key with no lease, so one crash blocks the key forever; a takeover with no attempt number, so the late original binds over the new order; read stock then update it in a separate step; reserve item by item with no rollback; run compensations on the request context; ignore release errors; no state machine; no idempotency key; "nearest store" hard-coded in the service; logic in the HTTP handler.
 
 ## Step 10: Tradeoffs and extensions
 
@@ -1309,7 +1457,7 @@ Common mistakes: read stock then update it in a separate step; reserve item by i
 
 ![[Inventory Order Assignment LLD Drawing.excalidraw]]
 
-The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder` chain with red failure branches (existing key, partial rollback, no store), the order state machine and the tables with their key constraints. It predates the two leak fixes in Step 8: when you redraw it, add the "Save fails" and "BindKey fails" branches with their undo, and the `refund.requested` event on cancel-after-payment.
+The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder` chain with red failure branches (existing key, partial rollback, no store), the order state machine and the tables with their key constraints. It predates the two leak fixes in Step 8: when you redraw it, add the "Save fails" and "BindKey fails" branches with their undo, the `refund.requested` event on cancel-after-payment, and the key lease with takeover and the attempt-number fence.
 
 ## Interview questions
 
@@ -1320,7 +1468,10 @@ The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder
 > If the client disconnected, `ctx` is cancelled, so a real database call inside the release fails at once and the stock stays held. Run undo steps with `context.WithoutCancel(ctx)` (Go 1.21+), which keeps the values but drops the cancellation, and never discard their errors.
 
 > [!question]- The order saved but binding the idempotency key failed. What happens?
-> No retry can find the order, and an unbound key looks "in progress" forever. Cancel the order with a compare-and-set, release its stock, and free the key, so the client's retry creates a fresh order. In SQL, bind the key in the same transaction as the order insert so this cannot happen.
+> No retry can find the order, and an unbound key looks "in progress" until its lease ends (forever, without a lease). Cancel the order with a compare-and-set, release its stock, and free the key, so the client's retry creates a fresh order. In SQL, bind the key in the same transaction as the order insert so this cannot happen.
+
+> [!question]- The server crashed between claiming the key and binding it. What do retries see?
+> Without a lease, `ErrInProgress` (409) forever. So the claim stores `lease_until` from the injected clock, and a retry that finds an unbound claim past its lease takes it over in the same `INSERT ... ON CONFLICT DO UPDATE ... WHERE lease_until <= now` statement, bumping `attempt`. The bind is `UPDATE ... WHERE attempt = $n AND order_id IS NULL`, so if the first attempt was only slow it binds 0 rows and rolls back instead of overwriting. Keep the lease well above a healthy request's duration.
 
 > [!question]- Payment confirmation and hold expiry fire at the same moment. Who wins?
 > Whoever's compare-and-set lands first: both run `UPDATE orders SET status = $1 WHERE id = $2 AND status = 'reserved'`. If expiry wins, the late `ConfirmPayment` gets `ErrBadTransition` and the payment service refunds. A paid order is never cancelled by expiry.
@@ -1334,7 +1485,7 @@ The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder
 ## Interview explanation
 
 ```text
-I treat stock per store and product as the contended resource. PlaceOrder first claims the client's idempotency key, then a pluggable StoreSelector returns active stores within 3 km that have every item, nearest first. For each candidate I reserve all items with conditional decrements in one transaction, in product-id order; if any item fails I roll back and try the next store, so a store that sold its last unit a millisecond ago does not fail the order. The order is saved as reserved with a 10-minute payment hold, and the key is bound to it in the same transaction. Every undo runs with context.WithoutCancel so a client hang-up cannot leak stock, and if the key cannot be bound I cancel the order and free the key. A sweeper with an injected clock cancels unpaid orders, and every status change is a compare-and-set, so payment and expiry cannot both win. Cancelling a paid order releases stock and publishes refund.requested for the payment service, and order.created goes out for delivery assignment.
+I treat stock per store and product as the contended resource. PlaceOrder first claims the client's idempotency key with a short lease and an attempt number, so a retry can take over a claim whose process crashed while a late original stays fenced out; then a pluggable StoreSelector returns active stores within 3 km that have every item, nearest first. For each candidate I reserve all items with conditional decrements in one transaction, in product-id order; if any item fails I roll back and try the next store, so a store that sold its last unit a millisecond ago does not fail the order. The order is saved as reserved with a 10-minute payment hold, and the key is bound to it in the same transaction. Every undo runs with context.WithoutCancel so a client hang-up cannot leak stock, and if the key cannot be bound I cancel the order and free the key. A sweeper with an injected clock cancels unpaid orders, and every status change is a compare-and-set, so payment and expiry cannot both win. Cancelling a paid order releases stock and publishes refund.requested for the payment service, and order.created goes out for delivery assignment.
 ```
 
 ## Cheat sheet
@@ -1342,7 +1493,7 @@ I treat stock per store and product as the contended resource. PlaceOrder first 
 - Stock lives per (store, product); reserve with a conditional decrement; `CHECK (available_qty >= 0)`.
 - Normalize and sort items: one lock order, no deadlocks.
 - Selection is optimistic; a lost race falls back to the next nearest full-stock store.
-- Idempotency: claim key, place, bind key; any failure frees the key; a bind failure cancels the order.
+- Idempotency: claim key with a lease, place, bind key fenced by the attempt number; any failure frees the key; a bind failure or lost lease cancels the order; an expired claim is taken over.
 - Compensations use `context.WithoutCancel` and report errors with `errors.Join`.
 - Status moves are compare-and-set; expiry only from `reserved`; cancel-after-payment requests a refund.
 

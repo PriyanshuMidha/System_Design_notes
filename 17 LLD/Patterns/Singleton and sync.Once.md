@@ -19,6 +19,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A **singleton** is one shared instance of something for the whole program, such as the loaded config or a connection pool. In Go you rarely need the pattern: build the one instance in `main` and pass it to whoever needs it. When something really must be created lazily on first use, `sync.Once` (or `sync.OnceValue` / `sync.OnceValues`, since Go 1.21) runs the creation exactly once, even when many goroutines ask at the same moment.
 
+> [!abstract] Core idea
+> - A singleton is one shared instance for the whole program, such as the config or a connection pool.
+> - In Go, prefer building that one instance in `main` and passing it to whoever needs it.
+> - When creation must be lazy, `sync.Once` / `sync.OnceValues` runs it exactly once, even under many goroutines.
+> - Classic mistake: `if cfg == nil { cfg = load() }`, which is a data race; a second mistake is a hidden global that tests cannot replace.
+
 ## 1. Why it exists
 
 A checkout service reads its config (database URL, worker count) and opens one connection pool. Two problems appear without a plan for "exactly one":
@@ -83,9 +89,45 @@ flowchart TD
     C -->|"yes, and a later retry may succeed"| LZ["Mutex plus done flag (Lazy): retries after an error"]
 ```
 
+### Whiteboard version
+
+Three goroutines ask for the config at once and `load` runs a single time. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Config struct{ DBURL string }
+
+func load() (*Config, error) {
+	fmt.Println("loading once")
+	return &Config{DBURL: "postgres://localhost/app"}, nil
+}
+
+// OnceValues runs load exactly once, even with many goroutines calling.
+var getConfig = sync.OnceValues(load)
+
+func main() {
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cfg, err := getConfig()
+			fmt.Println(cfg.DBURL, err)
+		}()
+	}
+	wg.Wait() // "loading once" is printed one time
+}
+```
+
 ## 4. Worked example
 
-One `package main` with the owner's `GetConfig` on `sync.Once` (now returning its error instead of a silent `nil`), `sync.OnceValues`, a retrying `Lazy[T]`, the panic rules, a mutable shared `Flags` with its own lock, and a composition-root service. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with `GetConfig` on `sync.Once` (returning its error instead of a silent `nil`), `sync.OnceValues`, a retrying `Lazy[T]`, the panic rules, a mutable shared `Flags` with its own lock, and a composition-root service. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
 ```go
 package main
@@ -420,7 +462,7 @@ What to notice:
 
 ## 6. Trade-offs and when not to use
 
-Use a single shared instance for (from the owner's list): config loaded once, a shared logger, a metrics registry, an expensive immutable lookup table, and a connection pool.
+Use a single shared instance for : config loaded once, a shared logger, a metrics registry, an expensive immutable lookup table, and a connection pool.
 
 Do **not** use a singleton for:
 

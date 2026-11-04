@@ -1,7 +1,7 @@
 ---
 tags: [databases, postgresql, migrations, deployment]
 level: intermediate
-status: draft
+status: reviewed
 prereqs: ["[[Relational Schema Design]]", "[[Transactions and ACID]]", "[[Locking - Optimistic vs Pessimistic]]"]
 related: ["[[Schema Migrations in Go Services]]", "[[Rollback and Safe Migrations]]", "[[Deployment Strategies - Rolling, Blue-Green, Canary]]", "[[Index Types and Index Design]]", "[[Replication]]", "[[Backup, PITR and Disaster Recovery]]", "[[API Versioning and Backward Compatibility]]"]
 sources:
@@ -19,6 +19,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > A schema migration changes tables while the app keeps serving traffic. Two things cause outages: DDL that takes a strong lock and makes every query on the table wait, and schema changes that break the app version still running. The fix is **expand → migrate → contract**: add the new shape, move code and data to it over several deploys, and remove the old shape last. Use DDL that only holds its lock for a moment.
+
+> [!abstract] Core idea
+> - Two things cause outages: a lock that queues every query on the table, and a schema the still-running old app version cannot handle.
+> - The rule: expand, migrate, contract. Add the new shape, move code and data over several deploys, remove the old shape last.
+> - Every DDL statement runs with a short `lock_timeout`, so it gives up instead of blocking traffic.
+> - Classic mistake: renaming or dropping a column in one deploy while old app pods still read it.
 
 ## 1. Why it exists
 
@@ -96,6 +102,29 @@ stateDiagram-v2
 A failed build leaves an `INVALID` index. Queries ignore it, but it still costs write overhead (and a unique one still enforces uniqueness). Drop it and retry, or `REINDEX INDEX CONCURRENTLY` it. Only one concurrent build can run per table at a time.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea for a column rename, one step per deploy:
+
+```sql
+-- Deploy 1 (expand): add the new column; the app writes both columns
+SET lock_timeout = '2s';
+ALTER TABLE clients ADD COLUMN display_name text;
+
+-- Background job (migrate): copy old rows in small batches
+UPDATE clients SET display_name = name
+WHERE id BETWEEN 1 AND 10000 AND display_name IS NULL;
+
+-- Deploy 2: the app reads display_name only
+
+-- Deploy 3 (contract): remove the old column once no code uses it
+SET lock_timeout = '2s';
+ALTER TABLE clients DROP COLUMN name;
+```
+
+The full version below adds production concerns: a type change on a 20-million-row table, dual writes, batched backfill, and adding `NOT NULL` without a long lock.
+
 
 **Goal:** move InvoiceOps money from `invoices.total numeric(12,2)` to `invoices.total_minor bigint NOT NULL` (integer paise), across 20 million rows, with no downtime.
 

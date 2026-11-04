@@ -20,6 +20,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An operation is **idempotent** when doing it twice has the same effect as doing it once. Networks force clients to retry, so every write that can be retried must be idempotent. `PUT` and `DELETE` are idempotent by definition; `POST` is not, so the client sends an **`Idempotency-Key`** header and the server remembers the key and the response, so a retry gets the stored answer instead of a second charge.
 
+> [!abstract] Core idea
+> - **Idempotent** means doing it twice has the same effect as doing it once; retries are only safe for idempotent operations.
+> - Make the operation naturally idempotent first (`PUT`, unique constraints, conditional updates).
+> - For `POST`, the client sends an `Idempotency-Key`; the server stores key + response and replays it on retry.
+> - Claim the key atomically, and reject the same key with a different body (`422`).
+> - Classic mistake: check-then-insert without a lock or unique constraint, so two concurrent retries both run.
+
 ## 1. Why it exists
 
 A user taps **Pay ₹499**. The app sends `POST /v1/payments`; the server charges the card at the payment service provider (PSP) and commits the payment. The response is on its way back when the phone switches from Wi-Fi to mobile data, and the app's 10-second timeout fires. The app cannot tell "the request never arrived" from "it worked but the answer got lost", so it retries, or the user taps again. Without protection, the user is charged twice.
@@ -73,7 +80,7 @@ When none of these fit ("charge this card", "send this SMS", "create a transfer"
 | `request_hash` | SHA-256 fingerprint of method, path and body; the same key must always mean the same request |
 | `status` | `in_progress` or `completed` |
 | `response_code`, `response_body` | What to replay on a retry, including errors |
-| `locked_at` | When the current attempt claimed the key; detects stuck claims and acts as a fencing token |
+| `locked_at` | When the current attempt claimed the key; detects stuck claims and acts as a fencing token (a value the writer must still hold for its write to be accepted, so a stale attempt cannot overwrite a newer one) |
 | `created_at` | Expiry: records are deleted after a published window (24 hours at Stripe) |
 
 4. On each request the server **claims first**: insert the record, and only the request whose insert succeeded may do the work. Everyone else reads the existing record:
@@ -147,6 +154,38 @@ stateDiagram-v2
 ```
 
 ## 4. Worked example
+
+### Whiteboard version
+
+A map and a lock show the core idea. The full version below adds the production concerns.
+
+```go
+package idem
+
+import "sync"
+
+type Store struct {
+	mu   sync.Mutex
+	done map[string]string // key -> stored response
+}
+
+// Do runs fn once per key; a retry with the same key gets the stored answer.
+func (s *Store) Do(key string, fn func() string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock() // holding the lock across fn keeps the sketch simple
+	if resp, ok := s.done[key]; ok {
+		return resp
+	}
+	if s.done == nil {
+		s.done = map[string]string{}
+	}
+	resp := fn()
+	s.done[key] = resp
+	return resp
+}
+```
+
+### Full version
 
 A Go middleware for `POST` and `PATCH`: it fingerprints the request, claims the key atomically, returns `409` while the first attempt runs, `422` for a reused key with a different body, replays completed responses (errors included), releases the key on `5xx`, and fences stale claims. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 

@@ -20,6 +20,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > When an API call fails, the response must tell the **client program** what went wrong (a status code and a stable error code it can branch on), tell the **human** how to fix it (a readable message, with every invalid field listed), and tell **you** where to look (a request ID that links to the full error in your logs). The standard body for this over HTTP is **Problem Details** (RFC 9457, `application/problem+json`).
 
+> [!abstract] Core idea
+> - Every error response carries three things: a status code, a **stable error code** clients branch on, and a human message.
+> - Use one body format, Problem Details (RFC 9457, `application/problem+json`), and list every invalid field at once.
+> - Convert domain errors to HTTP in **one** mapping layer; the domain never knows about status codes.
+> - Tell clients what is retryable (`429`, `503`) and what is not (`400`, `422`).
+> - Classic mistake: leaking stack traces or SQL errors, or making clients parse the message text.
+
 ## 1. Why it exists
 
 A booking API returns this when a seat is taken, when the database is down, and when the JSON is broken:
@@ -152,6 +159,42 @@ flowchart LR
 The repository translates driver errors it understands (a unique violation on the seat index means `ErrSeatTaken`) and wraps everything else unchanged. Anything the middleware does not recognise becomes a `500` whose body says nothing about the cause.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+One mapping function turns a domain error into Problem Details. The full version below adds the production concerns.
+
+```go
+package apierr
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+)
+
+var ErrNotFound = errors.New("not found")
+
+type Problem struct {
+	Type   string `json:"type"`
+	Title  string `json:"title"`
+	Status int    `json:"status"`
+	Code   string `json:"code"` // stable, clients branch on it
+}
+
+// WriteError is the one place a domain error becomes HTTP.
+func WriteError(w http.ResponseWriter, err error) {
+	p := Problem{Type: "about:blank", Title: "Internal error", Status: 500, Code: "internal"}
+	if errors.Is(err, ErrNotFound) {
+		p = Problem{Type: "about:blank", Title: "Not found", Status: 404, Code: "not_found"}
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(p.Status)
+	_ = json.NewEncoder(w).Encode(p)
+}
+```
+
+### Full version
 
 Three files in Go 1.24: a domain package with sentinel and typed errors, an `api` package that is the only place errors become HTTP, and its tests. The mapping uses `errors.Is` for sentinels and `errors.As` for typed errors, so wrapping with `%w` at each layer keeps working. It passes `go vet` and `go test -race`.
 

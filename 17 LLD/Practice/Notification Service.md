@@ -18,6 +18,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Business events (order placed, OTP requested) become one message per channel (email, SMS, push, WhatsApp). A worker pool claims an idempotency key, checks the user's preferences, renders a template, and sends through a provider adapter wrapped in a rate limiter and a failover chain. Only **retryable** failures (timeouts, 429, 5xx) are retried, with capped, jittered backoff; OTPs jump ahead of marketing in a priority lane; and shutdown drains the queue instead of dropping it.
 
+> [!abstract] Core idea
+> - Pipeline: business event, then one message per channel, then a queue, then a worker that claims an idempotency key (a unique ID per message, recorded once so a duplicate is skipped), checks preferences, renders the template and sends.
+> - Each provider sits behind one `Sender` interface (Adapter); failover and rate limiting wrap a `Sender` without changing the service (Decorator).
+> - The one rule: retry only retryable failures (network errors, 408, 429, 5xx) with capped, jittered backoff; any other 4xx is permanent.
+> - Classic mistakes: retrying an invalid phone number, rendering SMS with `html/template` (users see `&amp;`), and dropping queued messages on deploy.
+
 ## Problem statement
 
 ```text
@@ -28,7 +34,17 @@ each provider's rate limit. Adding a new channel or provider should be easy.
 Design the classes, APIs and DB schema, and code the send path.
 ```
 
-What it really tests: Factory and Adapter for many providers behind one interface, a worker pool on channels, idempotency under concurrent duplicates, rate limiting as a decorator, and **error classification**: the old version of this solution retried every error, so an invalid phone number burned four provider calls and quota for nothing.
+**Solving path**
+
+1. Clarify: channels, preferences, retry policy, duplicate rule, provider rate limits.
+2. Name the entities: `Notification`, `Channel`, `Template`, `UserPrefs`, `Sender`.
+3. Put each provider behind `Sender` with an adapter, and pick it with a factory.
+4. Build the worker pool on a channel: claim key, check prefs, render, send.
+5. Classify errors and retry only retryable ones with backoff.
+6. Add the priority lane, rate limiter and failover as wrappers.
+7. Test retry, permanent errors, duplicates and shutdown drain.
+
+What it really tests: Factory and Adapter for many providers behind one interface, a worker pool on channels, idempotency under concurrent duplicates, rate limiting as a decorator, and **error classification**: retrying every error would make an invalid phone number burn four provider calls and quota for nothing.
 
 ## Step 1: Clarify requirements
 
@@ -276,12 +292,17 @@ Not used: a Builder for `Notification` (six plain fields, a struct literal is cl
 
 ## Step 8: Core code
 
-> [!warning] What this version fixes
-> - **Permanent errors were retried.** `deliver()` retried every `Send` error. Now adapters run the provider's HTTP status through `classify`: network errors, 408, 429 and 5xx are retryable; any other 4xx is wrapped with `Permanent` and the loop stops after one call.
-> - **Backoff had no jitter and no cap.** Now `backoff` returns a full-jitter wait, uniform in `[0, min(maxDelay, base·2^attempt))`, so 1,000 workers that failed together do not retry together.
-> - **`text/template` rendered HTML email.** Email templates now use `html/template`, which escapes `<b>Tom & Jerry</b>` to `&lt;b&gt;Tom &amp; Jerry&lt;/b&gt;`; SMS stays plain text, where escaping would show `&amp;` to the user.
-> - **Workers dropped the queue on shutdown.** They exited on context cancel with messages still buffered. Now `Close` closes both lanes, workers drain them, and only a missed deadline cancels in-flight work.
-> - **staticcheck SA4000** flagged `!b.Allow() || !b.Allow() || b.Allow()` in a test; the three calls with side effects are now three named variables.
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `Channel`, `Priority`, `Notification`; `Permanent`, `IsPermanent`, `classify`; `Sender` and `SMSAdapter`; `SenderFactory`; `IdemStore` (`Claim`, `Release`); `PrefStore`; `Service` with `AddTemplate`, `Enqueue`, `Start`, `worker`, `Process`, `deliver` and `backoff`.
+>
+> **Talk through only (extensions):** `WhatsAppAdapter`, `FailoverSender`, `TokenBucket` + `RateLimitedSender`, the separate OTP lane, `Close` draining on deploy, `OrderListener`, the DB schema, and a durable queue instead of an in-memory channel.
+
+> [!warning] Design rules this code follows
+> - **Only retryable errors are retried.** Adapters run the provider's HTTP status through `classify`: network errors, 408, 429 and 5xx are retryable; any other 4xx is wrapped with `Permanent` and the loop stops after one call.
+> - **Backoff has jitter and a cap.** `backoff` returns a full-jitter wait, uniform in `[0, min(maxDelay, base·2^attempt))`, so 1,000 workers that failed together do not retry together.
+> - **HTML email uses `html/template`.** Email templates use `html/template`, which escapes `<b>Tom & Jerry</b>` to `&lt;b&gt;Tom &amp; Jerry&lt;/b&gt;`; SMS stays plain text, where escaping would show `&amp;` to the user.
+> - **Shutdown drains the queue.** Workers that exit on context cancel would drop buffered messages, so `Close` closes both lanes, workers drain them, and only a missed deadline cancels in-flight work.
+> - **Calls with side effects are not chained in one boolean expression.** staticcheck SA4000 flags `!b.Allow() || !b.Allow() || b.Allow()`, so the test stores the three calls in three named variables.
 
 Complete package, Go 1.24, standard library only:
 
@@ -779,7 +800,7 @@ sequenceDiagram
 | Test | Proves |
 | --- | --- |
 | `TestProcessRetryAndIdem` | two retryable failures then success; the same key again is `ErrDuplicate`; an opted-out channel is skipped |
-| `TestPermanentErrorNotRetried` | a 400 is called once and is permanent (the audit bug); 503, 408 and 429, then 200, is four calls and succeeds |
+| `TestPermanentErrorNotRetried` | a 400 is called once and is permanent; 503, 408 and 429, then 200, is four calls and succeeds |
 | `TestBackoffJitterAndCap` | 200 samples per attempt stay in `[0, min(1 s, 100 ms·2^n))`; attempt 1000 is still capped |
 | `TestEmailUsesHTMLTemplate` | the email body is HTML-escaped, the SMS body is not |
 | `TestFailover` | 503 at the primary fails over to the secondary; 400 at the primary does not |
@@ -884,7 +905,7 @@ func TestProcessRetryAndIdem(t *testing.T) {
 	}
 }
 
-// The audit bug: the old deliver() retried every error, including an invalid number.
+// A permanent error, such as an invalid number, must be sent once and never retried.
 func TestPermanentErrorNotRetried(t *testing.T) {
 	ctx := context.Background()
 	bad := &fakeSMS{statuses: []int{400}} // invalid number

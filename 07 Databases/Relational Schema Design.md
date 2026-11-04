@@ -1,7 +1,7 @@
 ---
 tags: [databases, data-modeling, postgres]
 level: basic
-status: draft
+status: reviewed
 prereqs: ["[[SQL Essentials]]"]
 related: ["[[Transactions and ACID]]", "[[Indexing Fundamentals]]", "[[Index Types and Index Design]]", "[[Zero-Downtime Schema Migrations]]", "[[Materialized Views and Denormalization]]", "[[Unique ID Generation]]", "[[NoSQL Data Modeling]]"]
 sources:
@@ -21,6 +21,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > Schema design decides which tables exist, which columns they hold, how they reference each other, and which rules the database itself enforces. A good relational schema stores each fact once (normalization), lets the database reject impossible data (constraints), and uses types that cannot lose money or time zones. You then denormalize on purpose, with a plan to keep the copies correct.
+
+> [!abstract] Core idea
+> - Store each fact once (normalize), then copy facts only on purpose with a plan to keep the copy correct.
+> - Let the database reject bad data: primary keys, foreign keys, `UNIQUE`, `CHECK`, `NOT NULL`.
+> - Use types that cannot lose information: integer minor units for money, `timestamptz` for time.
+> - Classic mistake: copying a client's email into every invoice row, then updating one copy and missing the rest.
 
 ## 1. Why it exists
 
@@ -120,7 +126,7 @@ flowchart TD
 - **1NF:** every cell holds one atomic value, with no repeating groups. A comma-separated list in a column (Karwin calls it *Jaywalking*) breaks it.
 - **2NF:** no column depends on only *part* of a composite key. `issue_date` depends on `invoice_no`, not on `(invoice_no, line_no)`.
 - **3NF:** no column depends on another non-key column. `client_name` follows from `client_email`, so it moves to `clients`.
-- **BCNF:** every determinant (a column set that fixes another column) is a candidate key. 3NF tables almost always satisfy it; the deep dive shows the rare case that does not.
+- **BCNF:** every determinant (a column set that fixes another column) is a candidate key. 3NF tables usually satisfy it too; the deep dive shows the rare case that does not.
 
 Not every repeated value is a violation. `invoice_items.unit_price_minor` looks like it duplicates a catalogue price, but it records *the price charged on this invoice*. If the catalogue price changes tomorrow, issued invoices must not. The same holds for `invoices.billing_address`, a snapshot taken when the invoice is sent.
 
@@ -178,13 +184,40 @@ RETURNING next_number - 1 AS number;
 
 Minor units differ by currency (ISO 4217): 2 decimals for INR and USD, 0 for JPY, 3 for KWD, so store the currency next to every amount.
 
-### Step 7: soft deletes and audit columns
+### Step 7: naming conventions
+
+- Use `snake_case`, plural table names (`invoices`) and singular column names, so no identifier needs quoting.
+- Name foreign keys `<parent>_id`, money columns `*_minor` (with a `currency` column beside them), instants `*_at` and calendar dates `*_date`.
+- Name constraints and indexes explicitly (`invoices_ws_status_due_idx`) so errors, monitoring by constraint name and migrations refer to stable names. Schema changes themselves are in [[Zero-Downtime Schema Migrations]].
+
+### Step 8: soft deletes and audit columns
 
 - **Soft delete:** `deleted_at timestamptz` instead of `DELETE`. Uniqueness must then ignore deleted rows, which a **partial unique index** does: `UNIQUE (workspace_id, lower(email)) WHERE deleted_at IS NULL`. The costs: every query must filter `deleted_at IS NULL`, foreign keys still point at "deleted" rows, the table keeps growing, and a legal erasure request still needs a real delete or anonymization. Moving the row to an archive table in the same transaction is often simpler.
 - **Audit columns:** `created_at` and `updated_at` on every mutable table, with `updated_at` set by a trigger so no code path forgets. `now()` returns the *transaction's* start time, so all rows changed in one transaction share it.
 - **Audit log:** an append-only `audit_logs` table written in the same transaction as the change. Its `(entity_type, entity_id)` pair is a polymorphic reference with no foreign key, on purpose: the log must outlive what it describes. Grant the application only `SELECT, INSERT` on it.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: one table per thing, a foreign key per relationship, and constraints for the rules.
+
+```sql
+CREATE TABLE clients (
+  id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL UNIQUE
+);
+CREATE TABLE invoices (
+  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  client_id    bigint NOT NULL REFERENCES clients(id),
+  total_minor  bigint NOT NULL CHECK (total_minor >= 0),  -- paise, never float
+  status       text   NOT NULL CHECK (status IN ('draft','sent','paid')),
+  issued_at    timestamptz
+);
+CREATE INDEX ON invoices (client_id);  -- Postgres does not index FKs for you
+```
+
+The full DDL below adds workspaces (tenants), tenant-safe composite keys, soft deletes, audit logs and row-level security.
 
 ### The InvoiceOps DDL (PostgreSQL 17)
 
@@ -301,7 +334,7 @@ CREATE INDEX audit_logs_ws_created_idx ON audit_logs (workspace_id, created_at D
 Design decisions worth reading twice:
 - **`workspace_id` on every tenant-owned table**, including children such as `invoice_items` and `payments`. Every query filters by it, row-level security can check it without a join, and sharding by workspace later needs it in every table.
 - **Composite foreign keys** such as `(workspace_id, client_id) → clients (workspace_id, id)` make "an invoice for another workspace's client" impossible to store, even with a bug in the code. The price is one extra unique index per parent table.
-- **Indexes on referencing columns.** Postgres does not create them automatically, and without one, deleting a parent scans the whole child table. Every foreign key above has a usable index. The DDL also covers the original InvoiceOps index checklist: unique `users(email)`, `workspace_members(user_id, workspace_id)`, `clients(workspace_id)`, `invoices(workspace_id, status)` and `(workspace_id, due_date)`, `payments(invoice_id)`, unique `webhook_events(provider, event_id)`, `audit_logs(workspace_id, created_at)`. Index design itself is in [[Indexing Fundamentals]].
+- **Indexes on referencing columns.** Postgres does not create them automatically, and without one, deleting a parent scans the whole child table. Every foreign key above has a usable index. The DDL also covers the InvoiceOps index checklist: unique `users(lower(email))`, `workspace_members(user_id)`, `clients(workspace_id)` (via the `UNIQUE (workspace_id, id)` index; the partial email index cannot serve it because it skips deleted rows), `invoices(workspace_id, status)` (the leading columns of `invoices_ws_status_due_idx`), `payments(invoice_id)`, unique `webhook_events(provider, event_id)` and `audit_logs(workspace_id, created_at)`. A separate `(workspace_id, due_date)` index is needed only if you list all invoices by due date across statuses, because `(workspace_id, status, due_date)` cannot return that order with one index scan. Index design itself is in [[Indexing Fundamentals]].
 - **`paid_minor` is a deliberate copy** of `sum(payments.amount_minor)`, kept so the list page needs no join. It is updated in the same transaction as each payment insert ([[Transactions and ACID]]) and checked nightly:
 
 ```sql
@@ -349,7 +382,7 @@ sequenceDiagram
     Note over Pool: the connection goes back with no tenant setting left
 ```
 
-RLS is a backstop, not a replacement for `WHERE workspace_id = $1` (which the indexes need anyway). Two traps: the table owner, superusers and roles with `BYPASSRLS` skip policies, so the app must log in as a separate role (or the table needs `FORCE ROW LEVEL SECURITY`); and a setting made with `is_local = false` survives on the pooled connection into the next request.
+RLS is a backstop, not a replacement for `WHERE workspace_id = $1` (which the indexes need anyway). Two traps: the table owner, superusers and roles with `BYPASSRLS` skip policies, so the app must log in as a separate role (or the table needs `FORCE ROW LEVEL SECURITY`); and a setting made with `is_local = false` survives on the pooled connection into the next request. Also, `current_setting('app.workspace_id')` raises an error if the setting was never defined in the session, and once a transaction-local value has ended it reads as an empty string, so `''::bigint` fails: the query errors instead of leaking rows, which is the safe failure, but every request must set the tenant first.
 
 ### Money in Go: integer minor units
 
@@ -465,7 +498,7 @@ Most products start shared and move their largest tenants out later. Including `
 
 ## 8. Deep dive
 
-- **A table in 3NF but not BCNF.** An agency assigns account managers: `account_managers(client_id, service, manager_id)`, with two rules: one manager per client per service, and each manager works in exactly one service. Dependencies: `(client_id, service) → manager_id` and `manager_id → service`. Candidate keys are `(client_id, service)` and `(client_id, manager_id)`, so every column is part of a key and 3NF holds. But `manager_id` determines `service` without being a key, which breaks BCNF: when Meera moves from design to development, every one of her rows must change. Decomposing into `managers(manager_id, service)` and `client_managers(client_id, manager_id)` fixes that, but "one manager per client per service" can no longer be a simple `UNIQUE`, because `service` now lives in another table. BCNF can cost dependency preservation; the usual fix keeps `service` in `client_managers` and guards it with a composite foreign key to `managers (manager_id, service)` plus `UNIQUE (client_id, service)`.
+- **A table in 3NF but not BCNF.** An agency assigns account managers: `account_managers(client_id, service, manager_id)`, with two rules: one manager per client per service, and each manager works in exactly one service. Dependencies: `(client_id, service) → manager_id` and `manager_id → service`. Candidate keys are `(client_id, service)` and `(client_id, manager_id)`, so every column is part of a key and 3NF holds. But `manager_id` determines `service` without being a key, which breaks BCNF: when Meera moves from design to development, every one of her rows must change. Decomposing into `managers(manager_id, service)` and `client_managers(client_id, manager_id)` fixes that, but "one manager per client per service" can no longer be a simple `UNIQUE`, because `service` now lives in another table. BCNF can cost dependency preservation; the usual fix keeps `service` in `client_managers` and guards it with a composite foreign key to `managers (manager_id, service)` plus `UNIQUE (client_id, service)`; that foreign key needs `UNIQUE (manager_id, service)` on `managers` as its target, even though `manager_id` alone is already the key.
 - **Composite foreign keys and NULL.** With the default `MATCH SIMPLE`, a foreign key is not checked if any of its columns is NULL, so `(workspace_id, parent_id)` with a NULL `parent_id` is a valid top-level client. That is also why `ON DELETE SET NULL (parent_id)` (PostgreSQL 15+) matters: plain `SET NULL` would try to null `workspace_id` too and hit its `NOT NULL`.
 - **Unique checks are immediate.** A non-deferrable `UNIQUE` is checked row by row, so renumbering line items with `UPDATE … SET line_no = line_no + 1` can fail midway. Declaring it `DEFERRABLE INITIALLY IMMEDIATE` checks at the end of the statement, as the SQL standard says, but it is slower, and a deferrable constraint cannot be an `ON CONFLICT` arbiter.
 - **Partitioning and sharding want the tenant in the key.** Postgres requires the partition key in every primary key and unique constraint of a partitioned table, and Citus requires the distribution column in them. A schema that already uses `(workspace_id, id)` everywhere can be partitioned or sharded by workspace without redesign; one that relies on a bare `id` primary key cannot.

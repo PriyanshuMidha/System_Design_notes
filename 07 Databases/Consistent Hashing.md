@@ -19,6 +19,12 @@ updated: 2026-11-01
 > [!summary] TL;DR
 > A way to spread keys across servers so that adding or removing one server moves only about `1/N` of the keys, instead of almost all of them. Servers and keys are hashed onto the same circle; each key belongs to the first server clockwise from it.
 
+> [!abstract] Core idea
+> - Servers and keys are hashed onto the same circle; a key belongs to the first server clockwise from it.
+> - Adding or removing a server moves only the keys on one arc, about `1/N` of them.
+> - Virtual nodes (many points per server) even out the load and spread a failed server's keys across all the others.
+> - Classic mistake: thinking it fixes hot keys. One very popular key still lands on one server.
+
 ## 1. Why it exists
 
 You have 4 cache servers and pick one per key with `server = hash(key) % 4`. Traffic grows, you add a 5th server, and the formula becomes `hash(key) % 5`.
@@ -97,6 +103,44 @@ flowchart LR
 If B dies, its three arcs pass to three successors (C#0, A#2 and C#2), so its load is shared by A and C instead of dumped on one server. A server with twice the capacity simply gets twice as many vnodes.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: a sorted slice of positions and a binary search. It assumes at least one server was added.
+
+```go
+package wb
+
+import (
+	"hash/crc32"
+	"slices"
+)
+
+type Ring struct {
+	points []uint32          // sorted positions on the circle
+	node   map[uint32]string // position -> server
+}
+
+func (r *Ring) Add(server string) {
+	p := crc32.ChecksumIEEE([]byte(server))
+	r.node[p] = server
+	r.points = append(r.points, p)
+	slices.Sort(r.points)
+}
+
+// Get returns the first server clockwise from the key's position.
+func (r *Ring) Get(key string) string {
+	h := crc32.ChecksumIEEE([]byte(key))
+	i, _ := slices.BinarySearch(r.points, h)
+	if i == len(r.points) {
+		i = 0 // wrap around the circle
+	}
+	return r.node[r.points[i]]
+}
+```
+
+The full version below adds production concerns: virtual nodes, removal, collision handling, replica lookup, locking, and tests.
+
 
 A Go ring with virtual nodes and replica lookup. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 

@@ -17,6 +17,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A logging library turns `log.Info("payment failed", F("order_id", "o1"))` into one line on one or more outputs. The design splits that call into small swappable steps: a **level filter** drops what nobody wants, a **formatter** turns the entry into text or JSON once, and **appenders** write the bytes to the console, a file or the network. Slow outputs sit behind an async appender that never blocks the request and flushes on shutdown, and a request ID set once in `context.Context` reaches every log line through `InfoCtx`.
 
+> [!abstract] Core idea
+> - One log call flows through a pipeline: level filter, then formatter (runs once), then one or more appenders (console, file, network).
+> - The filter runs first and is cheap (one atomic load), so disabled debug logs cost almost nothing.
+> - Slow outputs sit behind an async appender with a bounded buffer: when it is full, drop and count instead of blocking the request; flush on `Close`.
+> - Classic mistakes: building JSON from a `map` (keys come out sorted, not in call order) and letting goroutines write partial lines into one file without a lock.
+
 ## Problem statement
 
 ```text
@@ -25,6 +31,16 @@ structured fields, multiple output formats (text, JSON) and multiple destination
 (console, file, remote). Filtering by level must be possible at runtime.
 It must be safe to call from many goroutines and must not slow the request path.
 ```
+
+**Solving path**
+
+1. Clarify: levels, structured fields, formats, destinations, runtime level change, concurrency.
+2. Define `Level`, `Field` and `Entry`.
+3. Split the work into `Formatter` (entry to bytes) and `Appender` (bytes to a destination).
+4. Add a `LevelFilter` with an atomic level so it can change at runtime.
+5. Build `Logger` with `Log`, the level helpers and `With` for child loggers.
+6. Add the async appender, context fields and shutdown flush.
+7. Test filtering, both formats, field order and concurrent writes.
 
 What it really tests: splitting one call into small swappable steps (filter, format, write) behind clean interfaces, and handling concurrency and backpressure: torn lines, a slow sink, and flushing on shutdown.
 
@@ -208,11 +224,16 @@ Not used: a global singleton inside the library (build it in `main` and inject i
 
 ## Step 8: Core code
 
-> [!warning] What this version changes
-> - **JSON keeps field order.** The old formatter built a `map`, and `encoding/json` sorts map keys, so `request_id` could land anywhere. Fields are now encoded one by one: `time`, `level`, `msg`, then fields in the order they were added.
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `Level` + `String`, `Field` + `F`, `Entry`; `Formatter` + `TextFormatter`; `Appender` + `WriterAppender` (with its mutex); `Handler`, `LevelFilter`, `FormatHandler`; `Logger` with `New`, `Log`, `Info`, `Error`, `With` and `SetLevel`.
+>
+> **Talk through only (extensions):** `JSONFormatter` with ordered fields, `AsyncAppender` and its drop counter, `NewFileAppender` and rotation, context fields (`ContextWithFields`, `InfoCtx`), `Fatal`, `Close`, and the mapping to `log/slog`.
+
+> [!warning] Four details in this code
+> - **JSON keeps field order.** A formatter that builds a `map` loses the order, because `encoding/json` sorts map keys, so `request_id` could land anywhere. Fields are encoded one by one: `time`, `level`, `msg`, then fields in the order they were added.
 > - **Context fields.** `ContextWithFields` stores fields in the context, and `InfoCtx` / `LogCtx` add them between the logger's `With` fields and the call's own fields. `slices.Clip` makes every append copy, so sibling contexts never share a backing array.
 > - **`Enabled`.** `LogCtx` checks the level before building any slice; callers use it to skip expensive fields.
-> - **Shared level, documented.** `SetLevel` on a child changes the parent; the comment on `With` and a test now say so.
+> - **Shared level, documented.** `SetLevel` on a child changes the parent; the comment on `With` and a test document this.
 
 Complete package, Go 1.24, standard library only:
 
@@ -986,5 +1007,5 @@ The drawing has three sections: the `Logger` facade with the handler chain, the 
 ## Links
 
 - **Before this:** [[Chain of Responsibility and Pipelines]], [[Strategy and Template Method]], [[Decorator and Middleware]], [[Rate Limiter]]
-- **Next:** [[Concurrency for LLD]], [[Testing LLD Code]]
+- **Next:** [[File Search (Unix find)]], [[Concurrency for LLD]], [[Testing LLD Code]]
 - **Compare with:** [[Structured Logging]], [[Notification Service]]

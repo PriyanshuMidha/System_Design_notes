@@ -16,6 +16,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > The vending machine is the textbook State-pattern round: insert, select and cancel behave differently in idle, has-money, dispensing, out-of-stock and out-of-service. The money rules matter as much as the pattern: coins wait in escrow until the item drops, change is found with a bounded search over the real coin counts (greedy fails with a finite coin box), and a jam refunds everything.
 
+> [!abstract] Core idea
+> - The machine is in exactly one state (idle, has money, dispensing, out of stock, out of service), and each state decides what insert, select and cancel do.
+> - Inserted coins sit in escrow; they move into the coin box only after the item drops.
+> - The one rule: a failed sale never keeps the user's money; a jam or cancel refunds the whole escrow.
+> - Change comes from the real, finite coin counts, so it needs a bounded search, not greedy.
+> - Classic mistake: greedy change-making with a finite coin box, which refuses sales that are possible.
+
 ## Problem statement
 
 ```text
@@ -25,6 +32,15 @@ exact change unavailable, and a jammed dispenser.
 ```
 
 - The same button does different things per mode (the State pattern), and money must be safe: balance, coin box and stock change together, and a failed sale never keeps the user's money.
+
+### Solving path
+
+1. Clarify coins, notes, refund rules and what happens on a jam.
+2. List the states and draw the transition table (state x action).
+3. Write the `State` interface and one small type per state.
+4. Write `Machine` with escrow, coin box and stock behind one mutex.
+5. Write `makeChange` over the real coin counts, then `vend` with the jam refund.
+6. Test each transition, change-making with a finite box, and the jam path.
 
 ## Step 1: Clarify requirements
 
@@ -246,7 +262,13 @@ cmd/demo/main.go  -> builds slots and coin box, injects the real dispenser
 
 ## Step 8: Core code
 
-Two fixes over the classic version are worth saying out loud in the interview:
+> [!tip] What to code in a 60-minute round
+> Aim for about 150 lines in the room.
+> - **Write:** `Slot`, `Purchase`, the `Dispenser` interface, the `State` interface with `idleState`, `hasMoneyState` and `dispensingState`, and `Machine` with `NewMachine`, `addCoin`, `refundAll`, `makeChange`, `vend`, `InsertMoney`, `SelectProduct` and `Cancel`.
+> - **Add if time remains:** `outOfStockState`, `outOfServiceState`, `Restock` and `Repair`.
+> - **Talk only:** the repositories and SQL, the fleet backend with idempotent remote vends, and releasing the lock while the motor turns (say it, code it only if asked).
+
+Two design points are worth saying out loud in the interview:
 
 1. **Change-making is a bounded search, not greedy.** Greedy (largest coin first) is optimal for INR only when every coin is unlimited. A real box is finite: price Rs 40, paid Rs 100, box {Rs 50 x1, Rs 20 x3}. Greedy takes the 50, needs 10 more, has no 10, and refuses the sale, although 3 x Rs 20 works. `makeChange` is a DP over coin counts: `best[v]` is the fewest coins for value `v` using the denominations seen so far, each used at most `box + escrow` times, and `take[i][v]` lets it rebuild the coins. Values are counted in units of the denominations' GCD (Rs 1 = 100 paise for INR), so change of Rs 60 needs a table of only 61 cells (0 to 60).
 2. **`dispensingState` is real.** `hasMoneyState.Select` only validates and reserves a `sale`, then switches to dispensing. `vend` releases the mutex while the motor turns and re-locks to commit or refund, so the display shows "dispensing" and other calls get `ErrBusy` instead of blocking for seconds. Every invariant holds at the unlock point: the money is still in escrow and stock is untouched. `context.WithoutCancel` (Go 1.21+) keeps a caller who hangs up from aborting a motor that is already turning.
@@ -906,7 +928,7 @@ sequenceDiagram
 > So that a refund never depends on the box. Inserted coins stay in escrow until the dispenser confirms, which makes cancel and jam refunds always possible, and the change search can still use them.
 
 > [!question]- How can the dispensing state be observed if one mutex guards everything?
-> In the classic version it cannot: the lock is held across `Dispense`, so nobody sees the state. Here `vend` releases the lock while the motor turns and re-locks to commit. Safety comes from the state: dispensing rejects insert, select and cancel with `ErrBusy`.
+> If the lock is held across `Dispense`, nobody sees the state. So `vend` releases the lock while the motor turns and re-locks to commit. Safety comes from the state: dispensing rejects insert, select and cancel with `ErrBusy`.
 
 > [!question]- How does a fleet backend stop an app retry from vending twice?
 > A unique idempotency key on `sales` returns the first result to the retry, and `UPDATE slots SET qty = qty - 1 WHERE ... AND qty > 0` sells the last item to exactly one request.

@@ -20,6 +20,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > **Command** turns "do this" into a value that can be stored, queued, retried, logged and undone. In Go it is often just a closure, `func(ctx context.Context) error`; a struct with a type name and a JSON payload is used when the command must survive a restart. **Undo** comes from one of two places: inverse commands (each command knows how to reverse itself) or **Memento** snapshots (save the whole state before the change and restore it later).
 
+> [!abstract] Core idea
+> - A command is "do this" stored as a value, so it can be queued, retried, logged or undone later.
+> - In Go a closure is already a command; use a struct with a type name and JSON payload only when it must survive a restart.
+> - Undo uses either an inverse (`Undo()` on each command) or a memento (a snapshot of the state taken before the change).
+> - Classic mistakes: a new edit must clear the redo stack, and a snapshot must deep-copy slices and maps, not just copy the struct.
+
 ## 1. Why it exists
 
 Two problems that a direct function call cannot solve:
@@ -166,9 +172,73 @@ When an operation has no cheap inverse ("apply this template", "reformat the doc
 
 The one rule that matters in Go: **a snapshot must not share storage with the live object.** Assigning a struct copies its slice headers and map references, not their contents. `Save` therefore clones the slice and the map; `slices.Clone` and `maps.Clone` are shallow, which is deep enough here only because the elements are strings.
 
+### Whiteboard version
+
+The bare idea: commands with `Do`/`Undo` and a history with two stacks. The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import "fmt"
+
+// A command knows how to do itself and how to reverse itself.
+type Command interface {
+	Do()
+	Undo()
+}
+
+type AddLine struct {
+	doc  *[]string
+	line string
+}
+
+func (a AddLine) Do()   { *a.doc = append(*a.doc, a.line) }
+func (a AddLine) Undo() { *a.doc = (*a.doc)[:len(*a.doc)-1] }
+
+// History keeps two stacks; a new command clears redo.
+type History struct{ undo, redo []Command }
+
+func (h *History) Run(c Command) {
+	c.Do()
+	h.undo = append(h.undo, c)
+	h.redo = nil
+}
+
+func (h *History) Undo() {
+	if len(h.undo) == 0 {
+		return
+	}
+	c := h.undo[len(h.undo)-1]
+	h.undo = h.undo[:len(h.undo)-1]
+	c.Undo()
+	h.redo = append(h.redo, c)
+}
+
+func (h *History) Redo() {
+	if len(h.redo) == 0 {
+		return
+	}
+	c := h.redo[len(h.redo)-1]
+	h.redo = h.redo[:len(h.redo)-1]
+	c.Do()
+	h.undo = append(h.undo, c)
+}
+
+func main() {
+	var doc []string
+	var h History
+	h.Run(AddLine{&doc, "a"})
+	h.Run(AddLine{&doc, "b"})
+	h.Undo()
+	fmt.Println(doc) // [a]
+	h.Redo()
+	fmt.Println(doc) // [a b]
+}
+```
+
 ## 4. Worked example
 
-The code keeps the old notes' `CancelOrder` command and `Draft` memento, and adds the worker, the undo history and the caretaker.
+The code contains the `CancelOrder` command and the `Draft` memento, plus the worker, the undo history and the caretaker.
 
 ```go
 // main.go

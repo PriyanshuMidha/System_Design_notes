@@ -16,6 +16,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A request walks down an ordered list of small handlers (the **chain**). In classic **Chain of Responsibility**, each handler either handles the request and stops the chain, refuses it, or passes it to the next one, so the first handler that can deal with it wins. In a **pipeline**, every step must pass and any step can stop the request; most Go code (validation, HTTP middleware) is this second kind.
 
+> [!abstract] Core idea
+> - Both are an ordered list of small handlers that a request walks through.
+> - **Chain of Responsibility:** the first handler that can handle the request wins, and the rest never run.
+> - **Pipeline:** every step must pass; any step can stop the request (validation, HTTP middleware).
+> - Classic mistake: doing irreversible work (dispensing cash, charging a card) while the chain is still running. Plan the whole result first, then commit it.
+
 ## 1. Why it exists
 
 Take the checkout of a food-delivery app. Before the coupon `WELCOME50` is applied, five rules must hold: the cart is at least ₹500, it is the user's first order, the user has not used the coupon before, the city is eligible, and the payment method is allowed. The first version is one function with five nested `if` blocks. Then three problems show up:
@@ -106,6 +112,66 @@ flowchart LR
 ```
 
 The two cheap checks run first, so a ₹300 cart never reaches the remote store. The remote check has two different failure exits: "the coupon was used" is a validation result the user should see, while "the store did not answer" is an infrastructure error that the checkout must handle differently (retry, or fail open or closed by policy).
+
+### Whiteboard version
+
+The bare idea: a slice of functions walked in order, once as a pipeline and once as a first-wins chain. The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Cart struct{ Total, Items int }
+
+// Pipeline: every rule must pass; the first failure stops it.
+type Rule func(Cart) error
+
+func Validate(c Cart, rules ...Rule) error {
+	for _, r := range rules {
+		if err := r(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func minTotal(c Cart) error {
+	if c.Total < 500 {
+		return errors.New("total below 500")
+	}
+	return nil
+}
+
+func notEmpty(c Cart) error {
+	if c.Items == 0 {
+		return errors.New("cart is empty")
+	}
+	return nil
+}
+
+// Classic chain: the first handler that can handle it wins.
+type Handler func(amount int) (handledBy string, ok bool)
+
+func Approve(amount int, chain ...Handler) string {
+	for _, h := range chain {
+		if who, ok := h(amount); ok {
+			return who
+		}
+	}
+	return "nobody"
+}
+
+func main() {
+	fmt.Println(Validate(Cart{Total: 300, Items: 2}, notEmpty, minTotal)) // total below 500
+	lead := func(a int) (string, bool) { return "lead", a <= 1000 }
+	manager := func(a int) (string, bool) { return "manager", a <= 10000 }
+	fmt.Println(Approve(5000, lead, manager)) // manager
+}
+```
 
 ## 4. Worked example
 

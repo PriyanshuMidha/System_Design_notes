@@ -25,6 +25,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Do not stream big files through your API servers. The API **authorizes** the upload and hands the client a short-lived **presigned URL**; the client sends the bytes **straight to object storage** (S3); an event then tells a worker to validate and process the file, and a status column tracks it from `pending` to `ready`.
 
+> [!abstract] Core idea
+> - Do not stream large files through your API servers.
+> - The API authorizes and returns a short-lived **presigned URL** (a URL signed with your credentials that allows one upload for a few minutes).
+> - The client uploads straight to object storage; an event triggers a worker that validates and processes the file.
+> - A status column tracks each file from `pending` to `ready`; the server always chooses the storage key.
+> - Classic mistake: trusting the client's filename or declared content type.
+
 ## 1. Why it exists
 
 A user uploads a 500 MB video through `POST /v1/videos`, and the API server receives the bytes and forwards them to S3.
@@ -137,6 +144,45 @@ stateDiagram-v2
 Readers only ever see files in `ready`. A download endpoint that serves `pending` or `failed` files serves unvalidated bytes.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The API's whole job for a direct upload, with the storage SDK hidden behind an interface. The full version below adds the production concerns.
+
+```go
+package upload
+
+import "time"
+
+type Presigner interface {
+	PresignPut(key string, maxBytes int64, ttl time.Duration) (url string, err error)
+}
+
+type FileRow struct{ ID, Key, Status string }
+
+// StartUpload authorizes, records a pending row, and returns a presigned URL.
+// The client then PUTs the bytes straight to object storage.
+func StartUpload(p Presigner, userID, fileID string, size int64) (FileRow, string, error) {
+	if size > 100<<20 {
+		return FileRow{}, "", errTooBig
+	}
+	key := "tenants/" + userID + "/uploads/" + fileID // server picks the key
+	url, err := p.PresignPut(key, size, 15*time.Minute)
+	if err != nil {
+		return FileRow{}, "", err
+	}
+	return FileRow{ID: fileID, Key: key, Status: "pending"}, url, nil
+	// Later: an ObjectCreated event -> worker validates -> Status = "ready".
+}
+
+type uploadErr string
+
+func (e uploadErr) Error() string { return string(e) }
+
+const errTooBig = uploadErr("file too large")
+```
+
+### Full version
 
 **Small files through the API.** Avatars and CSV imports of a few MiB can go through the API if the handler bounds the body, ignores the client's filename and declared type, sniffs the real type from the first bytes, and stores under a key the server chooses. It compiles and passes `go vet` and `go test -race` on Go 1.24 (`crypto/rand.Text` needs Go 1.24).
 

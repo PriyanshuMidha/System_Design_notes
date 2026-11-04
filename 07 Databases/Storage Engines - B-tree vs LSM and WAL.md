@@ -1,7 +1,7 @@
 ---
 tags: [databases, storage-engines, wal, b-tree, lsm]
 level: intermediate
-status: draft
+status: reviewed
 prereqs: ["[[Indexing Fundamentals]]", "[[Transactions and ACID]]", "[[Page Cache, File Systems and fsync]]"]
 related: ["[[Isolation Levels and MVCC]]", "[[Backup, PITR and Disaster Recovery]]", "[[Replication]]", "[[Wide-Column Stores and Cassandra]]", "[[Bloom Filters and Probabilistic Data Structures]]", "[[Storage Devices - HDD, SSD, NVMe]]"]
 sources:
@@ -28,6 +28,13 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > A **storage engine** is the part of a database that lays rows out on disk and finds them again. **B-tree** engines (PostgreSQL, InnoDB) keep one sorted structure of fixed-size pages and edit pages in place. **LSM** engines (RocksDB, Cassandra) never edit a file: they write new sorted files and merge them in the background. Both survive crashes the same way: every change is first appended to a **write-ahead log (WAL)**, and a commit is acknowledged only after that log is flushed to disk with `fsync`.
+
+> [!abstract] Core idea
+> - Every change is appended to the write-ahead log (WAL) and flushed with `fsync` before the commit is acknowledged; data pages are written later.
+> - After a crash, the database replays the WAL to rebuild any page that had not reached disk.
+> - B-tree: one sorted tree of pages edited in place; good reads, random writes.
+> - LSM: buffer writes in memory, flush sorted immutable files, merge them in the background; cheap writes, reads check several files.
+> - Classic mistake: thinking COMMIT means the row is in the table file. It only means it is in the WAL.
 
 ## 1. Why it exists
 
@@ -189,6 +196,35 @@ The **RUM conjecture** (Athanassoulis et al., 2016) says an access method can mi
 | Space amp | Free space in pages, plus bloat from dead rows (PostgreSQL) | About 1.11× with a 10× fan-out, since about 90% of data sits in the last level (Dong et al., 2017) | A full merge may temporarily need as much free space again as the data being merged |
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The one rule of a WAL: log, flush, then change data.
+
+```go
+package wal
+
+import "os"
+
+type DB struct {
+	log  *os.File
+	data map[string]string // the "pages", flushed to disk later
+}
+
+// Put: append to the log, fsync, then change memory. Only then ack.
+func (db *DB) Put(k, v string) error {
+	if _, err := db.log.WriteString("SET " + k + " " + v + "\n"); err != nil {
+		return err
+	}
+	if err := db.log.Sync(); err != nil { // the commit point
+		return err
+	}
+	db.data[k] = v
+	return nil
+}
+```
+
+The full version below adds checksums so recovery can detect a torn record, replay, and a toy LSM tree with memtable, flush and merge.
 
 A toy WAL and a toy LSM tree in Go. Both compile and pass `go vet` and `go test -race` on Go 1.24.
 

@@ -1,7 +1,7 @@
 ---
 tags: [databases, partitioning, sharding, postgres, scalability]
 level: advanced
-status: draft
+status: reviewed
 prereqs: ["[[Replication]]", "[[Indexing Fundamentals]]", "[[Query Plans and EXPLAIN]]"]
 related: ["[[Consistent Hashing]]", "[[Hot Keys and Hot Partitions]]", "[[Distributed SQL]]", "[[Unique ID Generation]]", "[[Two-Phase Commit]]", "[[Saga Pattern]]", "[[Transactional Outbox and CDC]]", "[[Wide-Column Stores and Cassandra]]"]
 sources:
@@ -9,7 +9,7 @@ sources:
   - "Vitess docs, VReplication: Reshard and MoveTables workflows, VDiff, Vindexes (lookup vindexes)"
   - "Citus docs, distributed tables, co-location, reference tables, shard rebalancer"
   - "Notion engineering blog, Herding elephants: lessons learned from sharding Postgres at Notion (2021) and The Great Re-shard (2023)"
-  - "Instagram engineering blog, Sharding & IDs at Instagram (2011)"
+  - "Instagram engineering blog, Sharding & IDs at Instagram"
   - "Slack engineering blog, Scaling Datastores at Slack with Vitess (2020)"
   - "Figma blog, How Figma's databases team lived to tell the scale (2024)"
   - "AWS docs, DynamoDB: best practices for designing partition keys (per-partition throughput limits)"
@@ -21,6 +21,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > **Partitioning** splits one big table into smaller pieces by a key, inside one database. **Sharding** puts the pieces on different machines, so storage and writes can grow past one server. Both live or die by the key: a good key spreads the load and keeps each request on one piece; a bad one makes one shard hot, or forces every query to ask every shard.
+
+> [!abstract] Core idea
+> - Partitioning splits a table inside one database; sharding spreads the pieces across machines.
+> - Everything depends on the key: it should spread load evenly and keep each request on one piece.
+> - The rule: hash keys into many fixed logical shards, and keep a map from logical shard to database, so moving data is a map change.
+> - Classic mistakes: sharding by ranges of a growing ID (all new writes hit one shard) and routing with `hash(key) % servers` (adding a server moves almost every key).
 
 ## 1. Why it exists
 
@@ -94,7 +100,7 @@ CREATE TABLE invoices (
     workspace_id bigint NOT NULL,
     id           bigint NOT NULL,
     status       text   NOT NULL,
-    total_paise  bigint NOT NULL,
+    total_minor  bigint NOT NULL,
     PRIMARY KEY (workspace_id, id)
 ) PARTITION BY HASH (workspace_id);
 CREATE TABLE invoices_p0 PARTITION OF invoices FOR VALUES WITH (MODULUS 4, REMAINDER 0);
@@ -229,13 +235,13 @@ erDiagram
         bigint id PK
         bigint client_id FK
         text status
-        bigint total_paise
+        bigint total_minor
     }
     INVOICE_ITEM {
         bigint workspace_id PK "same shard key"
         bigint invoice_id PK
         int line_no PK
-        bigint amount_paise
+        bigint amount_minor
     }
     PAYMENT {
         bigint workspace_id PK "same shard key"
@@ -254,6 +260,35 @@ Joins and transactions inside a workspace stay on one shard. What does not fit, 
 - **Cross-workspace reports.** Send them to a warehouse fed by CDC, not to a fan-out over every shard.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: key, then a fixed logical shard, then a database from a map.
+
+```go
+package wb
+
+import "hash/fnv"
+
+const logicalShards = 1024 // fixed forever; only the map below changes
+
+// owner[ls] = physical database that holds logical shard ls.
+var owner [logicalShards]string
+
+func logicalShard(workspaceID string) int {
+	h := fnv.New32a()
+	h.Write([]byte(workspaceID))
+	return int(h.Sum32() % logicalShards)
+}
+
+// dbFor routes a request: key -> logical shard -> database.
+// Moving a shard to a new database is one map update, not a rehash.
+func dbFor(workspaceID string) string {
+	return owner[logicalShard(workspaceID)]
+}
+```
+
+The full version below adds production concerns: a versioned map, initial placement, freezing a shard during a move, and tests.
 
 ### A logical-shard router in Go
 
@@ -412,7 +447,8 @@ sequenceDiagram
 
 - Taking the snapshot at a known LSN and streaming from that same LSN means no change is missed and none is applied twice.
 - The freeze lasts only as long as the final drain, normally seconds (an estimate that depends on write rate). Clients see `ErrMoving` and retry, or a proxy buffers them.
-- The map version acts as a fence: a router holding version 17 must not write to db-3 after the flip. db-3 can reject writes for shards it no longer owns.
+- The map version acts as a fence: a router holding version 17 must not write to db-3 after the flip.
+- `Freeze` only stops *new* routing. A write that was routed to db-3 just before the freeze can still be in flight and land after the final drain, and the CDC stream would then miss it. So the source must enforce ownership itself: keep a small `shard_owner(logical_shard, version)` table on each database, have every write transaction check (or `SELECT ... FOR SHARE`) its shard's row and abort when the shard is marked moved, and mark it moved in the same step as the final drain. Late writes then fail with `ErrMoving` and are retried against the new owner instead of being lost.
 
 **Double writes** are the alternative: the application writes to both old and new, a backfill copies history, reads are compared, then switched. It needs no CDC, but a crash between the two writes leaves them different, so it also needs a reconciliation job. With CDC there is only one writer at any time, which is why most tools use it:
 
@@ -448,7 +484,7 @@ sequenceDiagram
 
 - **Real systems:**
 	- Notion shards PostgreSQL by workspace ID into 480 logical shards. 480 divides evenly over 32 hosts (15 each) and over 96 hosts (5 each), which made the re-shard a move of whole logical shards.
-	- Instagram's 2011 design keeps thousands of logical shards as PostgreSQL schemas on fewer physical servers, and puts the logical shard ID inside every 64-bit ID.
+	- Instagram's design keeps thousands of logical shards as PostgreSQL schemas on fewer physical servers, and puts the logical shard ID inside every 64-bit ID.
 	- Figma (2024) shards PostgreSQL behind DBProxy, its own Go query proxy that parses each query and picks the shard. Tables that share a shard key form a "colo", so joins inside a colo stay on one shard. It first shipped *logical* sharding (routing as if sharded, over PostgreSQL views) and split the data physically afterwards.
 	- Slack moved its MySQL fleet to Vitess. YouTube is where Vitess was built.
 	- Citus powers sharded PostgreSQL, including Azure Cosmos DB for PostgreSQL.

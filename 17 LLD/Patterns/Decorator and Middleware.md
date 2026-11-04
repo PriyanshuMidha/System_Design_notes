@@ -17,17 +17,23 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A **decorator** wraps an object and exposes the **same interface**, adding behaviour before or after it passes the call on: logging, auth, retries, caching, compression. In Go, HTTP **middleware** is the best-known decorator: a function of type `func(http.Handler) http.Handler`. The same idea wraps `io.Reader`/`io.Writer` streams, `http.RoundTripper` clients and repositories.
 
+> [!abstract] Core idea
+> - A decorator wraps something and exposes the same interface, adding work before or after passing the call on.
+> - Go HTTP middleware is `func(http.Handler) http.Handler`, so wrappers stack in any combination.
+> - The rule that matters: order is outside-in on the way in and inside-out on the way back, so `Logging(Auth(h))` runs Logging first.
+> - Classic mistake: putting business rules in middleware, or logging before the status code is known.
+
 ## 1. Why it exists
 
 An order API has 30 handlers. Each one needs panic recovery, a request ID, an access log line with status and latency, an auth check and a rate limit. Written inline, that is 5 concerns × 30 handlers = 150 copies of cross-cutting code, and each copy can drift: one handler forgets the auth check, another logs before the status is known.
 
 Decorators move each concern into one wrapper that has the same interface as what it wraps. A handler stays a handler, so wrappers stack in any combination: `Chain(createOrder, Recover, RequestID, Logging, Auth, RateLimit)`. Adding a concern edits one line of wiring, not 30 handlers.
 
-The old note had three bugs that this note fixes:
+Three things to get right, all shown below:
 
-- Its diagram showed "Request → Auth → Rate → Log → Handler" while its code built `Logging(Auth(final))`, with no rate limiter at all. Here the diagram and the code are the same chain.
-- Its logging middleware could not log the status code. Here a `ResponseWriter` wrapper captures status and bytes.
-- Its example called `http.ListenAndServe`, which blocks forever, so it had no output to check. Here everything runs through `httptest`.
+- The diagram and the code must describe the same chain, in the same order.
+- A logging middleware can only log the status code if a `ResponseWriter` wrapper captures status and bytes.
+- An example that calls `http.ListenAndServe` blocks forever and produces nothing to check; running the chain through `httptest` does.
 
 ## 2. Mental model
 
@@ -120,9 +126,50 @@ classDiagram
 
 `cachedRepo` writes `Get` (cache first) and `Save` (write, then invalidate). `List` is promoted from the embedded `ShowRepo` and passes straight through.
 
+### Whiteboard version
+
+Two middlewares wrap one handler; a request without an `Authorization` header is stopped by Auth and never reaches the handler. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// A middleware takes a handler and returns a handler of the same type.
+func Logging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("->", r.URL.Path) // before
+		next.ServeHTTP(w, r)
+		fmt.Println("<-", r.URL.Path) // after
+	})
+}
+
+func Auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return // stop: next is never called
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	hello := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
+	h := Logging(Auth(hello)) // Logging runs first, Auth second
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/orders", nil))
+	fmt.Println(rec.Code) // 401
+}
+```
+
 ## 4. Worked example
 
-One `package main` with the owner's `Logging` and `Auth` middleware (Logging now captures status and bytes; Auth now passes the user in the context), plus `Recover`, `RequestID`, `RateLimit`, a `Chain` helper, an `io.Writer` decorator, two `http.RoundTripper` decorators and an embedded repository decorator. `main` drives the handler chain with `httptest.NewRecorder`, so nothing listens on a port and the program ends. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with `Logging` and `Auth` middleware (Logging captures status and bytes; Auth passes the user in the context), plus `Recover`, `RequestID`, `RateLimit`, a `Chain` helper, an `io.Writer` decorator, two `http.RoundTripper` decorators and an embedded repository decorator. `main` drives the handler chain with `httptest.NewRecorder`, so nothing listens on a port and the program ends. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
 ```go
 package main
@@ -231,7 +278,7 @@ func RequestID(next http.Handler) http.Handler {
 	})
 }
 
-// Logging is the owner's middleware, now able to log the status and size.
+// Logging logs each request with its status and size.
 func Logging(log *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -248,7 +295,7 @@ func Logging(log *slog.Logger) Middleware {
 	}
 }
 
-// Auth is the owner's middleware; it now passes the user on in the context.
+// Auth checks the caller and passes the user on in the context.
 func Auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -720,7 +767,7 @@ Pure decorators always call `next`. Middleware that may stop the chain (Auth, Ra
 
 ## 6. Trade-offs and when not to use
 
-- **No business logic in middleware** (the owner's rule). "Orders over ₹10,000 need a second approval" belongs in the order service, where it is visible and tested with the order logic. Middleware is for cross-cutting concerns that apply to many endpoints in the same way.
+- **No business logic in middleware**. "Orders over ₹10,000 need a second approval" belongs in the order service, where it is visible and tested with the order logic. Middleware is for cross-cutting concerns that apply to many endpoints in the same way.
 - **One concern used by one handler** does not need middleware: call a function inside that handler.
 - **Deep stacks hide control flow.** Ten layers make "why did this request get a 403?" a debugging session. Keep the chain in one place (`Chain(...)` in `main` or the router setup) and log which layer rejected a request.
 - **Each layer costs a function call, and sometimes an allocation** (a wrapped writer, a derived context). That is small next to network I/O, but a context value lookup walks the chain of parent contexts, so do not stack dozens of `WithValue` layers.

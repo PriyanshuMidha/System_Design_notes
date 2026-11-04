@@ -16,6 +16,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A **Facade** gives callers one simple method, such as `Checkout`, over several lower-level services and calls them in the right order. A **Mediator** is different: several peer objects (*colleagues*) send events to one coordinator, and the coordinator decides which other colleague to call. A facade talks one way, down to its parts; a mediator talks both ways, between its colleagues. If it only simplifies a public API, call it Facade.
 
+> [!abstract] Core idea
+> - A **Facade** is one simple method (`Checkout`) over several services, calling them in the right order and undoing earlier steps if a later one fails.
+> - A **Mediator** is a coordinator that peer objects report to; it decides which other peer to call.
+> - The rule that matters: a facade talks one way (down to its parts); a mediator talks both ways (between its colleagues).
+> - Classic mistake: forgetting compensation, so a declined payment leaves stock reserved forever.
+
 ## 1. Why it exists
 
 **Facade.** Placing an order touches three services: reserve 2 units of milk in inventory, charge ₹136 through payments, create the order. If the HTTP handler, the mobile BFF and the admin tool each make those three calls themselves, each one must also get the order right and undo the earlier steps when a later one fails. One of them will forget: the payment is declined, the 2 reserved units are never released, and the product shows "out of stock" while 2 units sit in a dead reservation. A facade puts the sequence and its undo logic in one place, so every caller makes one call.
@@ -75,7 +81,7 @@ classDiagram
 
 **Facade steps (`CheckoutService.Checkout`):**
 
-1. Check the idempotency key. A finished key returns the stored outcome (the receipt, or the error of the first attempt); a key still running returns `ErrInProgress`.
+1. Check the idempotency key (a client-chosen ID that makes a retried request return the first result instead of running again; see [[Idempotency and Idempotency Keys]]). A finished key returns the stored outcome (the receipt, or the error of the first attempt); a key still running returns `ErrInProgress`.
 2. `Reserve` stock. On failure, nothing needs undoing.
 3. `Charge` the payment, passing the idempotency key down so a retried charge is not taken twice. On failure, `Release` the reservation.
 4. `Create` the order. On failure, `Refund` the payment and `Release` the reservation.
@@ -123,6 +129,49 @@ sequenceDiagram
     A->>T: Notify(AI101, Landed)
     Note over T: runway free, next in queue is 6E202
     T-->>B: ClearToLand()
+```
+
+### Whiteboard version
+
+Reserve, charge, and release the reservation when the charge fails. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Inventory struct{}
+
+func (Inventory) Reserve(sku string, n int) error { return nil }
+func (Inventory) Release(sku string, n int)       { fmt.Println("released", n, sku) }
+
+type Payments struct{}
+
+func (Payments) Charge(paise int64) error { return errors.New("card declined") }
+
+// Facade: one method that calls the parts in order and undoes on failure.
+type Checkout struct {
+	inv Inventory
+	pay Payments
+}
+
+func (c Checkout) PlaceOrder(sku string, n int, paise int64) error {
+	if err := c.inv.Reserve(sku, n); err != nil {
+		return err
+	}
+	if err := c.pay.Charge(paise); err != nil {
+		c.inv.Release(sku, n) // compensate the earlier step
+		return fmt.Errorf("checkout: %w", err)
+	}
+	return nil
+}
+
+func main() {
+	fmt.Println(Checkout{}.PlaceOrder("milk", 2, 13600))
+}
 ```
 
 ## 4. Worked example

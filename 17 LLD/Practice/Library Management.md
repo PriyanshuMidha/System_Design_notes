@@ -16,6 +16,13 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > The library round is about one modelling split and three rules. A `Book` is the catalog title you search and reserve; a `BookCopy` is the physical item you borrow, hold or lose. Borrowing the last copy must be atomic, a returned copy is held for the first member in a FIFO queue (and the hold expires after N days), and fines count the library's calendar days late through a swappable strategy.
 
+> [!abstract] Core idea
+> - A `Book` is the title you search and reserve; a `BookCopy` is the physical item you borrow.
+> - A copy is in one state: available, issued, held or lost.
+> - The one rule: borrowing the last copy is one atomic step, so exactly one member gets it.
+> - A returned copy is held for the first member in the FIFO reservation queue, and that hold expires after N days.
+> - Classic mistake: computing fines as `now.Sub(due) / 24h`, which charges nothing for 23 hours late; count calendar days instead.
+
 ## Problem statement
 
 ```text
@@ -25,6 +32,15 @@ and handle a member losing a copy.
 ```
 
 - It tests Book versus BookCopy (copy states available, issued, held, lost) and rules under concurrency: the borrow limit, the last copy going to exactly one member, a held copy reserved for one member, and a pluggable fine.
+
+### Solving path
+
+1. Clarify the borrow limit, loan length, fine rule, reservations and lost copies.
+2. Split `Book` (title) from `BookCopy` (physical item) and give the copy a status.
+3. Write `BorrowBook` and `ReturnBook` under one lock, with the borrow limit check.
+4. Add the reservation queue: a return holds the copy for the queue head.
+5. Add the fine strategy and hold expiry with an injected clock.
+6. Test the last-copy race, the queue order, fines across midnight, and hold expiry.
 
 ## Step 1: Clarify requirements
 
@@ -279,7 +295,13 @@ cmd/demo/main.go  -> builds Library with PerDayFine, an email Notifier, the libr
 
 ## Step 8: Core code
 
-Three changes over the classic solution, each with a test:
+> [!tip] What to code in a 60-minute round
+> Aim for about 150 lines in the room.
+> - **Write:** `CopyStatus`, `Book`, `BookCopy`, `Loan`, the `FineStrategy` interface with `PerDayFine`, and `Library` with `NewLibrary`, `AddBook`, `AddCopy`, `BorrowBook`, `ReturnBook`, `ReserveBook`, `holdOrShelve`, `calendarDaysLate` and `dequeue`.
+> - **Add if time remains:** `ExpireHolds`, `ReportLost` and `SearchBooks`.
+> - **Talk only:** the repositories and SQL schema, the `Notifier` implementations, and multi-branch libraries.
+
+Three rules worth stating, each with a test:
 
 1. **Fines count calendar days, not 24-hour periods.** `now.Sub(due) / 24h` charges nothing for a return 23 hours late and drifts across DST changes. `calendarDaysLate` compares the two dates in the library's `time.Location`, so "due on the 15th, back on the 16th" is one day late whatever the hour. State this policy in the interview.
 2. **A hold takes the member out of the queue.** If the queue head stayed queued while their copy was held, a second returned copy would be held for the same member and the next member would wait forever.

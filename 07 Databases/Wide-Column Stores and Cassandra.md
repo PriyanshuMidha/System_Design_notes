@@ -1,7 +1,7 @@
 ---
 tags: [databases, nosql, cassandra, wide-column, distributed-systems]
 level: advanced
-status: draft
+status: reviewed
 prereqs: ["[[NoSQL Data Modeling]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Consistent Hashing]]"]
 related: ["[[Quorums and Leaderless Replication]]", "[[Partitioning and Sharding]]", "[[Replication]]", "[[Time-Series and Columnar Storage]]", "[[Bloom Filters and Probabilistic Data Structures]]", "[[Failure Detection, Gossip and Membership]]", "[[Consensus - Raft and Paxos]]", "[[Hot Keys and Hot Partitions]]"]
 sources:
@@ -19,6 +19,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > A wide-column store such as Apache Cassandra groups rows into **partitions** and spreads them over a cluster by hashing a **partition key**; inside a partition, rows are kept sorted by **clustering columns**. You design one table per query, writes are cheap appends, and every request chooses how many replicas must answer: its **consistency level**.
+
+> [!abstract] Core idea
+> - The partition key decides which nodes hold the data; clustering columns decide the sort order inside the partition.
+> - Design one table per query, and accept duplicated data, because there are no joins.
+> - Each request picks a consistency level; `R + W > RF` makes a read see the latest acknowledged write.
+> - Classic mistakes: unbounded partitions (bucket by day), and deleting heavily without understanding tombstones (delete markers that must reach every replica before `gc_grace_seconds` ends).
 
 ## 1. Why it exists
 
@@ -162,6 +168,27 @@ IF NOT EXISTS;
 `IF NOT EXISTS` and `UPDATE … IF col = value` run Paxos among the partition's replicas. The classic implementation (Paxos v1) needs 4 round trips for a write and 3 for a read. Cassandra 4.1 added Paxos v2 (`paxos_variant: v2`, opt-in), which needs 2 round trips for a write and 1 or 2 for a read. Use LWTs only for compare-and-set (unique claims, state transitions), keep them off hot partitions, and do not mix LWT and plain writes on the same cells: plain writes bypass Paxos and break its guarantees.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: the primary key is written for one query.
+
+```sql
+-- Query: newest events of one workspace on one day
+CREATE TABLE events_by_workspace_day (
+  workspace_id text,
+  bucket_day   date,
+  created_at   timestamp,
+  event_id     uuid,
+  action       text,
+  PRIMARY KEY ((workspace_id, bucket_day), created_at, event_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, event_id ASC);
+
+SELECT * FROM events_by_workspace_day
+WHERE workspace_id = 'ws-7' AND bucket_day = '2026-11-03' LIMIT 50;
+```
+
+The full version below adds production concerns: one table per query, bounded partitions, and what happens to deleted rows.
 
 ### Designing InvoiceOps audit events query-first
 

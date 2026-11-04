@@ -1,7 +1,7 @@
 ---
 tags: [databases, replication, postgres, high-availability]
 level: intermediate
-status: draft
+status: reviewed
 prereqs: ["[[Transactions and ACID]]", "[[Storage Engines - B-tree vs LSM and WAL]]"]
 related: ["[[High Availability and Failover]]", "[[Quorums and Leaderless Replication]]", "[[Backup, PITR and Disaster Recovery]]", "[[Partitioning and Sharding]]", "[[Transactional Outbox and CDC]]", "[[Consistency Models]]", "[[CRDTs and Conflict Resolution]]", "[[Distributed SQL]]"]
 sources:
@@ -20,6 +20,12 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > Replication keeps copies of the same database on several servers. In the usual setup one **primary** takes all writes and streams its change log (the WAL) to **replicas**, which serve reads and can take over if the primary dies. The price is **replication lag**: a replica can be a little behind, so a read sent there may not see a write that just succeeded.
+
+> [!abstract] Core idea
+> - The primary writes a change log (the WAL); replicas replay it in order to keep their own copy.
+> - Replicas are usually a little behind (replication lag), so a read right after a write can return old data.
+> - The rule: a read that must see the user's own write goes to a replica that has replayed past that write, or to the primary.
+> - Classic mistakes: treating a replica as a backup (it replays deletes too), and adding replicas to scale writes (every replica still applies every write).
 
 ## 1. Why it exists
 
@@ -154,6 +160,34 @@ FROM pg_replication_slots;
 Set `max_slot_wal_keep_size` (PostgreSQL 13+). A slot that would retain more is invalidated (`wal_status = lost`), and that replica must be re-cloned. Losing a replica beats losing the primary.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: remember the WAL position (LSN) where the user's write ended, and read only from a replica that has replayed that far.
+
+```go
+package wb
+
+type LSN uint64
+
+type Replica struct {
+	Name     string
+	Replayed LSN // last WAL position this replica has applied
+}
+
+// pickForRead returns a replica that has replayed the user's last write
+// (token), or "primary" if none has caught up yet.
+func pickForRead(replicas []Replica, token LSN) string {
+	for _, r := range replicas {
+		if r.Replayed >= token {
+			return r.Name
+		}
+	}
+	return "primary"
+}
+```
+
+The full version below adds production concerns: LSN parsing, a background poller, round-robin, concurrency safety, and tests.
 
 ### The stale read
 
@@ -385,7 +419,8 @@ flowchart TB
 | Topology | How writes flow | Write conflicts | Use when | Cost |
 | --- | --- | --- | --- | --- |
 | Single-leader (PostgreSQL, MySQL, MongoDB replica sets) | All writes go to one node and stream out in one order | None | The default for OLTP | Write throughput of one node; needs failover |
-| Multi-leader (EDB Postgres Distributed, MySQL Group Replication in multi-primary mode, offline-first apps) | Each leader accepts writes and they exchange changes asynchronously | Yes: last-writer-wins, merge functions or CRDTs, see [[CRDTs and Conflict Resolution]] | Writes in several regions, or clients that work offline | Conflict handling in every table |
+| Multi-leader (EDB Postgres Distributed, offline-first apps) | Each leader accepts writes and they exchange changes asynchronously | Yes: last-writer-wins, merge functions or CRDTs, see [[CRDTs and Conflict Resolution]] | Writes in several regions, or clients that work offline | Conflict handling in every table |
+| Group replication (MySQL Group Replication, multi-primary mode) | Any member accepts writes, but every transaction is ordered through Paxos-based group communication and certified before commit | Detected at certification: the first committer wins and the later conflicting transaction is rolled back (no last-writer-wins, no CRDTs) | Write availability inside one data centre or region with consistent ordering | Commit latency of a group round trip; conflict errors the app must retry |
 | Leaderless (Cassandra, ScyllaDB, Riak) | Write to N replicas and wait for W; read from R | Concurrent writes resolved by timestamps or version vectors | High write availability with no failover step, see [[Quorums and Leaderless Replication]] | Weaker guarantees; needs read repair and anti-entropy |
 | Shared storage (Amazon Aurora) | The database ships redo log records to a replicated storage service | None | Managed cloud, fast replicas | Vendor-specific |
 

@@ -19,6 +19,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > When an order is packed, find a free delivery rider near the store, **hold** them with an atomic compare-and-set (`available → busy`), and send an offer that expires in 20 seconds. On reject or timeout, free the rider and offer the next one; when nobody is left, widen the radius, then book a third-party logistics company (3PL), then park the order in a retry queue. The core rule for the code: decide under the lock, make network calls with no lock held, then re-check.
 
+> [!abstract] Core idea
+> - A rider can carry one order at a time, so claim a rider with compare-and-set (CAS: change `available` to `busy` only if it is still `available`). Two orders can never both win.
+> - An offer has a deadline. Reject or timeout frees the rider and the next candidate gets the offer; when nobody is left, widen the radius, then book a 3PL, then park the order for retry.
+> - The one rule: decide under the lock, make network calls (DB claim, 3PL) with no lock held, then re-check under the lock before saving.
+> - Classic mistake: calling the 3PL while holding the service mutex, so one slow vendor call freezes every accept and reject in the city.
+
 ## Problem statement
 
 ```text
@@ -30,7 +36,17 @@ location until delivery. Design the classes, relationships, patterns and DB sche
 Code the core assign method and Accept / Reject with a timeout.
 ```
 
-What it really tests: a **race on a shared resource** (two orders must never get the same rider), a fallback chain with an external system behind an adapter, an offer state machine with deadlines, and **lock scope**: the old version of this solution called the 3PL while holding the service mutex, so one slow vendor call froze every accept and reject in the city.
+**Solving path**
+
+1. Clarify: radius (1 km), offer timeout (20 s), fallback order (wider radius, 3PL, retry queue).
+2. Name the entities: `Partner`, `Order`, `Offer`, `Assignment`.
+3. Build the `Fleet`: nearby search plus an atomic `TryClaim` (available to busy).
+4. Build the `Assigner`: rank candidates, claim the nearest, widen the radius, fall back to the 3PL adapter.
+5. Build the `OfferService` state machine: `Start`, `Accept`, `Reject`, `ExpireDue`.
+6. Fix the lock scope: decide, call, re-check.
+7. Test the race (two orders, one rider), expiry and the 3PL fallback.
+
+What it really tests: a **race on a shared resource** (two orders must never get the same rider), a fallback chain with an external system behind an adapter, an offer state machine with deadlines, and **lock scope**: calling the 3PL while holding the service mutex would let one slow vendor call freeze every accept and reject in the city.
 
 ## Step 1: Clarify requirements
 
@@ -342,8 +358,13 @@ Not used: a Singleton `Fleet` (it is injected, so each test builds a fresh one),
 
 ## Step 8: Core code
 
-> [!warning] The bug this version fixes
-> The old `nextOffer` ran `claimNearest` and then `bookThirdParty` → `CreateDelivery` while holding `OfferService.mu`, on the Start, Reject, ExpireDue and late-Accept paths. A 3PL call that takes 3 seconds therefore blocked every Accept and Reject for every order for 3 seconds. Now every external call (the fleet claim, which is a DB update in production, and the 3PL call) runs with no lock held, in three steps: **decide** under the lock (snapshot the order and its tried set), **call** outside it, **re-check** under the lock (is the order still `searching`?) before storing the result. If the order was cancelled meanwhile, the code undoes its work: it frees the claimed rider or cancels the 3PL trip. See [[Concurrency for LLD]] for the general rule.
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `Location`, `Partner`, `Order`, `Assignment`, `Candidate`; `Fleet` with `GoOnline`, `Nearby`, `TryClaim`, `Release`; `HaversineM`; `RankingStrategy` + `NearestFirst`; `Assigner.Assign` and `claimNearest`; `Offer`, `OfferStatus` and `OfferService` with `Start`, `Accept`, `Reject`, `ExpireDue` and `advance`.
+>
+> **Talk through only (extensions):** `ThirdPartyProvider` and `PorterAdapter`, `RetryParked` and the parked queue, `Cancel` with undo of a claimed rider or 3PL trip, stale-location filtering, Redis GEO, and batched matching.
+
+> [!warning] No network call under the mutex
+> If `claimNearest` and then `bookThirdParty` → `CreateDelivery` ran while holding `OfferService.mu` (on the Start, Reject, ExpireDue and late-Accept paths), a 3PL call that takes 3 seconds would block every Accept and Reject for every order for 3 seconds. So every external call (the fleet claim, which is a DB update in production, and the 3PL call) runs with no lock held, in three steps: **decide** under the lock (snapshot the order and its tried set), **call** outside it, **re-check** under the lock (is the order still `searching`?) before storing the result. If the order was cancelled meanwhile, the code undoes its work: it frees the claimed rider or cancels the 3PL trip. See [[Concurrency for LLD]] for the general rule.
 
 Complete package, Go 1.24, standard library only. `HaversineM` is the same function the [[Inventory Order Assignment (Dark Store)]] solution uses; in a real codebase both import it from one `geo` package instead of keeping two copies.
 
@@ -936,7 +957,7 @@ sequenceDiagram
 | `TestRejectReleasesRider` | the rider is held during the offer, freed after reject, and can take a different order |
 | `TestAllRejectParksThenRetry` | all reject and the 3PL is down → parked; a new rider comes online → `RetryParked` offers to them |
 | `TestConcurrentOffersHoldDistinctRiders` | 20 concurrent `Start`s, 3 riders: 3 pending offers on 3 different riders, 17 to the 3PL |
-| `TestNoLockHeldDuring3PLCall` | an `Accept` completes while another order is stuck inside a slow 3PL call (the audit bug) |
+| `TestNoLockHeldDuring3PLCall` | an `Accept` completes while another order is stuck inside a slow 3PL call (lock scope) |
 | `TestCancelDuring3PLCallUndoesBooking` | a cancel that lands during the 3PL call ends in `ErrOrderCancelled` and a `CancelTrip` |
 
 All pass with `go vet` and `go test -race` on Go 1.24.4 (measured: 88.8% statement coverage).
@@ -1207,8 +1228,8 @@ func TestConcurrentOffersHoldDistinctRiders(t *testing.T) {
 	}
 }
 
-// The audit bug: the old nextOffer called the 3PL while holding s.mu, so every
-// Accept and Reject in the city waited for one slow vendor call.
+// Lock scope: if the 3PL were called while holding s.mu, every Accept and
+// Reject in the city would wait for one slow vendor call.
 func TestNoLockHeldDuring3PLCall(t *testing.T) {
 	ctx := context.Background()
 	c := newClock()

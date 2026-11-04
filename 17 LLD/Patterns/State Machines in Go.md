@@ -17,6 +17,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A state machine says which **states** an object can be in (an order is `paid`, `packed`, `delivered`) and which **events** move it from one state to another. Anything not listed is refused. In Go you build it either as **data** (an enum plus a transition table) or as **behaviour** (the GoF State pattern: one type per state behind an interface). In production you also need guards, permissions, a compare-and-set save and an event for every transition.
 
+> [!abstract] Core idea
+> - List the legal moves as data: from-state + event gives to-state. Anything not in the table is refused.
+> - All status changes go through one function (`Next`/`Fire`); nobody writes `status = ...` directly.
+> - When saving, use **compare-and-set** (CAS: `UPDATE ... SET status = new WHERE id = $1 AND status = old`), so two concurrent requests cannot both move the same order.
+> - Classic mistake: reading the status, checking it in Go, then writing without the `AND status = old` condition. A concurrent request slips in between.
+
 ## 1. Why it exists
 
 An order service without a state machine has checks like `if o.Status == "paid" || o.Status == "packed"` scattered across 15 handlers. Sooner or later one is missing: a rider app marks a `paid` order `delivered` without packing, or a customer cancels an order that is already `out_for_delivery` and gets a refund for food they also receive.
@@ -126,6 +132,42 @@ classDiagram
 ```
 
 Each state embeds `rejectAll`, which refuses every input (`Insert`, `Select` and `Cancel` with that state's error, `Dispensed` with `ErrNotDispensing`), and overrides only the inputs it accepts. Only `hasMoney` accepts `Cancel`, which refunds the balance and returns to `idle`. A state changes the machine's state by assigning `m.state`, so the transitions live inside the state types.
+
+### Whiteboard version
+
+The bare idea: a transition table and one function that looks moves up in it. The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import "fmt"
+
+type State string
+type Event string
+
+// The whole machine is data: from-state -> event -> to-state.
+var transitions = map[State]map[Event]State{
+	"created": {"pay": "paid", "cancel": "cancelled"},
+	"paid":    {"pack": "packed", "cancel": "cancelled"},
+	"packed":  {"deliver": "delivered"},
+}
+
+// Next refuses anything the table does not list.
+func Next(s State, e Event) (State, error) {
+	to, ok := transitions[s][e]
+	if !ok {
+		return s, fmt.Errorf("cannot %s an order that is %s", e, s)
+	}
+	return to, nil
+}
+
+func main() {
+	s, _ := Next("created", "pay")
+	fmt.Println(s) // paid
+	_, err := Next("delivered", "cancel")
+	fmt.Println(err) // cannot cancel an order that is delivered
+}
+```
 
 ## 4. Worked example
 

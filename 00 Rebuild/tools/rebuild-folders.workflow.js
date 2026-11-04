@@ -135,20 +135,20 @@ Return the structured report.`
 async function runFolder(job) {
   log(`${job.folder}: ${job.groups.length} writer groups, ${job.groups.reduce((s, g) => s + g.notes.length, 0)} notes`)
   if (job.onlyFinalize) {
-    const fin = await agent(finalizerPrompt(job), { label: `finalize ${job.short}`, phase: 'Finalize', schema: FINAL_SCHEMA })
+    const fin = await agent(finalizerPrompt(job), { label: `finalize ${job.short}`, phase: 'Finalize', schema: FINAL_SCHEMA, ...(args.finalModel ? { model: args.finalModel } : {}) })
     return { folder: job.folder, groups: [], final: fin }
   }
   const groups = await pipeline(
     job.groups,
-    g => job.skipWrite ? Promise.resolve({ skipped: true }) : agent(writerPrompt(job, g), { label: `write ${job.short}/${g.id}`, phase: 'Write', schema: WRITE_SCHEMA }),
-    (w, g) => job.skipReview ? Promise.resolve({ group: g.id, write: w, review: null }) : agent(reviewerPrompt(job, g, w), { label: `review ${job.short}/${g.id}`, phase: 'Review', schema: REVIEW_SCHEMA })
+    g => job.skipWrite ? Promise.resolve({ skipped: true }) : agent(writerPrompt(job, g), { label: `write ${job.short}/${g.id}`, phase: 'Write', schema: WRITE_SCHEMA, ...(args.writerModel ? { model: args.writerModel } : {}) }),
+    (w, g) => job.skipReview ? Promise.resolve({ group: g.id, write: w, review: null }) : agent(reviewerPrompt(job, g, w), { label: `review ${job.short}/${g.id}`, phase: 'Review', schema: REVIEW_SCHEMA, ...(args.reviewerModel ? { model: args.reviewerModel } : {}) })
       .then(r => ({ group: g.id, write: w, review: r })),
   )
   if (job.noFinalize) {
     log(`${job.folder}: groups done (finalize later)`)
     return { folder: job.folder, groups, final: null }
   }
-  const fin = await agent(finalizerPrompt(job), { label: `finalize ${job.short}`, phase: 'Finalize', schema: FINAL_SCHEMA })
+  const fin = await agent(finalizerPrompt(job), { label: `finalize ${job.short}`, phase: 'Finalize', schema: FINAL_SCHEMA, ...(args.finalModel ? { model: args.finalModel } : {}) })
   log(`${job.folder}: finalized (${fin ? fin.notes_present + '/' + fin.notes_expected + ' notes' : 'finalizer failed'})`)
   return { folder: job.folder, groups, final: fin }
 }

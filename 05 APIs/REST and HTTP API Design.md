@@ -27,6 +27,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > REST is a way to design an API as a set of **resources** (things with URLs, like `/orders/42`) that clients read and change with the standard **HTTP methods** (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`), getting back standard **status codes**. Good REST design is mostly about naming resources well and using HTTP's built-in meaning (safe and idempotent methods, conditional requests, caching) instead of inventing your own.
 
+> [!abstract] Core idea
+> - Model the API as **resources** (nouns with URLs) and act on them with standard **HTTP methods**.
+> - Use HTTP's built-in meaning: `GET` is safe, `PUT` and `DELETE` are idempotent (repeatable with the same effect), status codes say what happened.
+> - An **ETag** is a version label: `If-None-Match` saves bandwidth (`304`), `If-Match` prevents lost updates (`412`).
+> - Classic mistake: verbs in URLs (`/createOrder`) and `200 OK` with an error inside the body.
+
 ## 1. Why it exists
 
 Imagine an API that grew without rules:
@@ -222,6 +228,48 @@ Creating 500 items with 500 requests costs 500 round trips. A bulk endpoint take
 - Partial success should still return `200` with per-item results; WebDAV's `207 Multi-Status` exists but is rarely used outside WebDAV.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+Optimistic concurrency in about 25 lines: the ETag is the version, and a `PUT` with a stale `If-Match` gets `412`. The full version below adds the production concerns.
+
+```go
+package rest
+
+import (
+	"fmt"
+	"net/http"
+	"sync"
+)
+
+var (
+	mu      sync.Mutex
+	seats   = 2
+	version = 1
+)
+
+func handle(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	tag := fmt.Sprintf(`"v%d"`, version)
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("ETag", tag)
+		fmt.Fprintf(w, `{"seats":%d}`, seats)
+	case http.MethodPut:
+		if r.Header.Get("If-Match") != tag {
+			w.WriteHeader(http.StatusPreconditionFailed) // 412: someone wrote first
+			return
+		}
+		seats, version = seats+1, version+1 // real code decodes the body
+		w.Header().Set("ETag", fmt.Sprintf(`"v%d"`, version))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+```
+
+### Full version
 
 Optimistic concurrency and cache revalidation in Go 1.24 with only the standard library. The `{id}` path patterns need Go 1.22 or later. An in-memory map stands in for the table; the lock makes the version check and the write one atomic step, exactly as the `UPDATE ... WHERE version = $4` statement does. It passes `go vet` and `go test -race`.
 

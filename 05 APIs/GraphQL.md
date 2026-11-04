@@ -20,6 +20,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > GraphQL is a query language for APIs. The server publishes a typed **schema**, and the client sends one **query** that names exactly the fields it wants, across related objects, in one request. Small functions called **resolvers** fetch each field from databases or other services, and the server returns JSON in the same shape as the query.
 
+> [!abstract] Core idea
+> - The server publishes a typed schema; the client asks for exactly the fields it needs in one query.
+> - Each field is filled by a resolver function, parent before child, and the response has the same shape as the query.
+> - Rule: batch child lookups with a DataLoader (collect keys, fetch once) or a list of N items causes N extra queries (N+1).
+> - Classic mistake: exposing the graph without depth/cost limits and per-field authorization.
+
 ## 1. Why it exists
 
 A game page shows a game's title, its reviews, and each reviewer's name. The data forms a graph: Game → Reviews → Authors.
@@ -209,6 +215,45 @@ The loader must be **created per request**. Its memo cache would otherwise serve
 
 ## 4. Worked example
 
+### Whiteboard version
+
+The bare idea behind a DataLoader: collect the keys requested while resolving a list, then fetch them in one batch query. The full version below adds per-request caching, a batching window, concurrency safety and tests.
+
+```go
+package main
+
+import "fmt"
+
+// loadUsers is the batch function: one query for many ids.
+func loadUsers(ids []int) map[int]string {
+	fmt.Println("SELECT ... WHERE id IN", ids) // runs once, not once per post
+	out := map[int]string{}
+	for _, id := range ids {
+		out[id] = fmt.Sprintf("user-%d", id)
+	}
+	return out
+}
+
+func main() {
+	posts := []struct{ ID, AuthorID int }{{1, 7}, {2, 9}, {3, 7}}
+	// Collect keys while resolving the list, then fetch them in one batch.
+	var keys []int
+	seen := map[int]bool{}
+	for _, p := range posts {
+		if !seen[p.AuthorID] {
+			seen[p.AuthorID] = true
+			keys = append(keys, p.AuthorID)
+		}
+	}
+	authors := loadUsers(keys)
+	for _, p := range posts {
+		fmt.Println(p.ID, authors[p.AuthorID])
+	}
+}
+```
+
+### Full version
+
 A minimal, generic DataLoader in Go 1.24 using only the standard library. It shows the mechanism that `github.com/vikstrous/dataloadgen` (the loader gqlgen's docs use) implements with more features. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
 ```go
@@ -374,7 +419,7 @@ func TestMissingKeyIsNotFound(t *testing.T) {
 | BFF ([[API Gateway and BFF]]) | One hand-written endpoint per screen | Few clients, stable screens | One endpoint to change per UI change |
 | Apollo Federation | Each team owns a subgraph; a router composes one supergraph | Many teams contributing to one graph | A router to run, schema composition checks in CI |
 
-The owner's original comparison, corrected:
+Side by side, topic by topic:
 
 | Topic | REST | GraphQL |
 | --- | --- | --- |
@@ -423,7 +468,7 @@ By long-standing convention, a server that answers with `application/json` retur
 
 - `path` says which field failed. `extensions.code` gives machines a stable code. The message is for humans.
 - **Non-null propagation:** had `customer` been declared `Customer!`, the server could not return `null` there. The null would bubble up to the nearest nullable parent and wipe out the whole `invoice`. Mark fields that depend on other services as nullable.
-- The GraphQL-over-HTTP specification (still a working draft in late 2026) adds the `application/graphql-response+json` media type, whose status codes carry meaning. A request error with no `data` at all gets a 4xx: 400 when the document cannot be parsed and, in the September 2026 draft, 422 when it fails validation. A result with partial `data` stays 2xx: older drafts said 200, and the September 2026 draft recommends a custom `294 Partial Success` code so that proxies can count partial failures. The draft is still changing, so check which revision your server and gateway follow.
+- The GraphQL-over-HTTP specification (still a working draft in late 2026) adds the `application/graphql-response+json` media type, whose status codes carry meaning. A request error with no `data` at all gets a 4xx: 400 when the document cannot be parsed and, in the September 2026 draft, 422 when it fails validation. A result with partial `data` stays 2xx: older drafts said 200, and recent drafts have discussed a dedicated partial-success status code so that proxies can count partial failures. The draft is still changing, so check which revision your server and gateway follow.
 - Monitoring must parse `errors`. An alert based only on HTTP status can report 100% success while a backend service is down.
 - For expected business failures (an invalid coupon), prefer a typed `userErrors` field in the mutation payload over the `errors` array.
 

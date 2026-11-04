@@ -27,6 +27,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An **API style** is the set of rules two programs use to talk: how a request is shaped, what travels over the wire, and who starts the conversation. Pick it by asking **who calls** (a browser, your own service, another company) and **which way data flows** (ask-and-answer, server push, streams, or events). REST is the default for public resource APIs; the others win in specific cases.
 
+> [!abstract] Core idea
+> - Start from the **caller** (browser, own service, partner company) and the **data flow** (ask-and-answer, server push, two-way stream, event).
+> - REST is the default for anything public and resource-shaped; pick something else only for a specific reason.
+> - gRPC fits internal service-to-service calls; GraphQL or a BFF (backend for frontend) fits many-screen mobile clients; SSE, WebSocket or webhooks fit push.
+> - Classic mistake: choosing a style because it is fashionable rather than because of who calls and which way data flows.
+
 ## 1. Why it exists
 
 A movie-ticket platform needs five kinds of communication at once:
@@ -147,6 +153,34 @@ flowchart LR
 ```
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The whole decision fits in one function. The full version below adds the production concerns.
+
+```go
+package choosing
+
+// Pick returns the default API style for a caller and a data-flow shape.
+func Pick(caller, flow string) string {
+	switch {
+	case flow == "server-push-one-way":
+		return "SSE"
+	case flow == "two-way-realtime":
+		return "WebSocket"
+	case flow == "event-to-partner":
+		return "Webhook (signed, retried)"
+	case caller == "internal-service":
+		return "gRPC"
+	case caller == "mobile-many-screens":
+		return "GraphQL or a BFF"
+	default: // browser or third party, request-response
+		return "REST"
+	}
+}
+```
+
+### Full version
 
 **Interview drill: "How would you expose seat booking for a movie-ticket platform?"** Walk each caller through the decision tree, then size the push channel.
 

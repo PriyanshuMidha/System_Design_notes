@@ -19,6 +19,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A **repository** is a collection-like interface for one kind of domain object ("get order 42", "list this user's orders", "reserve 2 units") that hides how the objects are stored, so the service code is the same over PostgreSQL and over an in-memory map. A **unit of work** groups the changes of one business operation, across several repositories, into one transaction: they all commit or none do.
 
+> [!abstract] Core idea
+> - A repository is a collection-like interface (`Get`, `Save`, `ListByUser`) for one kind of domain object; the service never sees SQL.
+> - Because it is an interface, tests use an in-memory version and production uses PostgreSQL.
+> - A unit of work runs the changes of one business operation, across several repositories, in **one transaction**: all commit or none do.
+> - Classic mistakes: a generic `Update(entity)` that hides what changed, and slow remote calls (payment provider) inside the transaction.
+
 ## 1. Why it exists
 
 A checkout service places an order in two steps: reserve stock, then create the order. The first version writes SQL inline in the HTTP handler. Four problems follow:
@@ -141,6 +147,60 @@ sequenceDiagram
 | Transaction in `ctx` | `WithTx` stores the `*sql.Tx` in the context; repositories use it when present | No signature changes | Hidden: a repository call with the wrong `ctx` silently runs outside the transaction |
 
 `WithTx` with a closure is the usual Go choice. It is a unit of work without change tracking: the closure is the unit, and the transaction is its boundary.
+
+### Whiteboard version
+
+The bare idea: a small interface, an in-memory implementation, and the shape of a unit of work. The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+type Order struct {
+	ID     int64
+	Status string
+}
+
+var ErrNotFound = errors.New("order not found")
+
+// The service depends on this interface, not on SQL.
+type OrderRepository interface {
+	Get(ctx context.Context, id int64) (Order, error)
+	Save(ctx context.Context, o Order) error
+}
+
+// memRepo is the test double; a pgRepo would run SQL instead.
+type memRepo struct{ rows map[int64]Order }
+
+func (r *memRepo) Get(_ context.Context, id int64) (Order, error) {
+	o, ok := r.rows[id]
+	if !ok {
+		return Order{}, ErrNotFound
+	}
+	return o, nil
+}
+
+func (r *memRepo) Save(_ context.Context, o Order) error { r.rows[o.ID] = o; return nil }
+
+// Unit of work: run fn in one transaction; commit if it returns nil.
+type UnitOfWork interface {
+	WithTx(ctx context.Context, fn func(orders OrderRepository) error) error
+}
+
+func main() {
+	var repo OrderRepository = &memRepo{rows: map[int64]Order{}}
+	ctx := context.Background()
+	_ = repo.Save(ctx, Order{ID: 42, Status: "paid"})
+	o, _ := repo.Get(ctx, 42)
+	_, err := repo.Get(ctx, 7)
+	fmt.Println(o.Status, errors.Is(err, ErrNotFound)) // paid true
+}
+```
 
 ## 4. Worked example
 
@@ -651,7 +711,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 
 ## 6. Trade-offs and when not to use
 
-- **Small CRUD with no business logic does not need it.** As the old note put it: for tiny scripts or simple CRUD with no business logic, a repository layer may be extra ceremony. Call sqlc-generated queries directly.
+- **Small CRUD with no business logic does not need it.** For tiny scripts or simple CRUD with no business logic, a repository layer may be extra ceremony. Call sqlc-generated queries directly.
 - **Avoid the generic god-interface.** A `Repository[T]` with `Save(T)` makes the read-modify-write pattern the easy path: `Get`, change a field, `Save`. Two concurrent requests then overwrite each other. Name the operations the domain needs instead (`Reserve`, `CompareAndSetStatus`).
 - **The abstraction leaks at the edges, and that is fine.** Isolation levels, locks and the cost of a query still matter. Do not pretend an in-memory map and PostgreSQL behave the same under concurrency; that is what the contract tests are for.
 - **Do not put business rules in repositories.** A repository that decides who may cancel an order cannot be reused, and the rule cannot be tested without storage. Keep storage invariants (`available >= 0`) in the database and the repository, and policy in the service.

@@ -18,6 +18,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > Composite lets you treat **one item and a group of items the same way**. A *leaf* (a product) and a *composite* (a category that holds products and other categories) implement one interface, so `CountProducts()` works on either, and the category answers by asking its children. Use it whenever your data is a tree: catalogs, folders, org charts, comment threads.
 
+> [!abstract] Core idea
+> - A leaf (one product) and a composite (a category) implement the **same interface**, so callers never check which one they hold.
+> - The composite answers by **looping over its children** and combining their answers; the recursion stops at leaves.
+> - The one rule: the tree must really be a tree. Guard against cycles and very deep input before recursing.
+> - Classic mistake: recomputing a whole subtree on every page view (for example product counts) instead of caching or precomputing it.
+
 ## 1. Why it exists
 
 A grocery catalog has 3 levels of categories and about 20,000 products (an estimate for a mid-size store). The home page needs "Dairy (124)", the admin needs the stock value of "Beverages", and search needs every product under "Fruits".
@@ -58,8 +64,8 @@ classDiagram
     }
     class Category {
         -name string
-        -parent Category
-        -children Node[]
+        -parent *Category
+        -children []Node
         +Add(child Node) error
     }
     Node <|.. Product : leaf
@@ -87,6 +93,43 @@ Step by step:
 3. **Guards in `Add`.** Walk up the parent pointers from the new parent: if you meet the child, adding it would close a cycle. Refuse a category that already has a parent (this is a tree, not a graph). Refuse the child if `depth(parent) + height(child)` exceeds `MaxDepth`.
 4. **Iterative traversal.** `All` walks the tree with an explicit stack and yields each node with its depth as a Go 1.23 iterator, so callers can `break` early. Swap the stack for a queue to get level order (breadth first).
 5. **Composites of errors.** `Validate` returns `errors.Join` of the children's errors, and `errors.Is` searches that error tree, so one call reports every bad product.
+
+### Whiteboard version
+
+The bare idea: one interface, a leaf that answers directly, and a group that sums its children. The full version in section 4 adds the production concerns.
+
+```go
+package main
+
+import "fmt"
+
+// Node is what leaves and groups share.
+type Node interface{ Count() int }
+
+type Product struct{ Name string }
+
+func (Product) Count() int { return 1 } // a leaf answers directly
+
+type Category struct {
+	Name     string
+	Children []Node
+}
+
+// A composite answers by asking its children.
+func (c *Category) Count() int {
+	n := 0
+	for _, ch := range c.Children {
+		n += ch.Count()
+	}
+	return n
+}
+
+func main() {
+	books := &Category{"Books", []Node{Product{"Go"}, Product{"SQL"}}}
+	root := &Category{"All", []Node{Product{"Pen"}, books}}
+	fmt.Println(root.Count(), books.Count()) // 3 2
+}
+```
 
 ## 4. Worked example
 

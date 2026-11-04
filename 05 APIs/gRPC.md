@@ -22,6 +22,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > gRPC lets one service call a function on another service as if it were local. You describe the functions and messages once in a `.proto` file (an **IDL**, an interface definition language). Tools generate typed client and server code for each language, and calls travel as compact protobuf bytes over **HTTP/2**, with deadlines, status codes and streaming built in.
 
+> [!abstract] Core idea
+> - You define services and messages in a `.proto` file; tools generate typed client and server code.
+> - Calls are protobuf bytes over HTTP/2, so many calls share one connection and streaming is built in.
+> - Rule: every call carries a deadline, and servers pass the remaining deadline on to the calls they make.
+> - Classic mistake: no deadline (calls hang forever) or retrying non-idempotent calls on every error code.
+
 ## 1. Why it exists
 
 An Orders service calls a Users service 2,000 times per second with JSON over HTTP/1.1 (an example load):
@@ -174,6 +180,45 @@ sequenceDiagram
 ```
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The bare idea from the caller's side: a generated method takes a `context` with a deadline and returns a typed result or a status error. The full version below shows the real bytes on the wire, the framing and the `grpc-timeout` header.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// A generated gRPC client method looks like this: context first, typed in and out.
+type UserClient interface {
+	GetUser(ctx context.Context, id int64) (string, error)
+}
+
+type fake struct{}
+
+func (fake) GetUser(ctx context.Context, id int64) (string, error) {
+	select {
+	case <-time.After(50 * time.Millisecond): // the remote call
+		return fmt.Sprintf("user-%d", id), nil
+	case <-ctx.Done(): // deadline hit: gRPC returns DEADLINE_EXCEEDED
+		return "", ctx.Err()
+	}
+}
+
+func main() {
+	var c UserClient = fake{}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel() // always set a deadline on every call
+	u, err := c.GetUser(ctx, 42)
+	fmt.Println(u, err, errors.Is(err, context.DeadlineExceeded))
+}
+```
 
 ### One unary call on the wire
 

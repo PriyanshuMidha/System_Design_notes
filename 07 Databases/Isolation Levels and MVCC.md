@@ -1,7 +1,7 @@
 ---
 tags: [databases, transactions, isolation, mvcc, postgresql, mysql]
 level: intermediate
-status: draft
+status: reviewed
 prereqs: ["[[Transactions and ACID]]", "[[Storage Engines - B-tree vs LSM and WAL]]"]
 related: ["[[Locking - Optimistic vs Pessimistic]]", "[[Consistency Models]]", "[[Replication]]", "[[Distributed SQL]]", "[[Timeouts, Retries and Backoff]]", "[[Transactions and the Repository Pattern]]"]
 sources:
@@ -24,9 +24,16 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > An **isolation level** is the promise a database makes about what one transaction can see of others running at the same time; weaker levels allow known bugs called **anomalies**. Most databases implement isolation with **MVCC** (multi-version concurrency control): a write creates a new version of the row, and each transaction reads from a consistent **snapshot**, so readers never block writers. PostgreSQL defaults to READ COMMITTED, MySQL InnoDB to REPEATABLE READ, and neither default stops every anomaly.
 
+> [!abstract] Core idea
+> - Isolation level = how much of other running transactions you can see; weaker levels allow named bugs (anomalies).
+> - MVCC: an update writes a new row version; each transaction reads from a snapshot, so readers never block writers.
+> - A version is visible if the transaction that created it committed before your snapshot and the one that deleted it did not.
+> - Classic mistake: assuming REPEATABLE READ stops every anomaly. Write skew still gets through; only SERIALIZABLE (with retries) or explicit locks stop it.
+> - Old versions stay until VACUUM; one long-open transaction blocks that cleanup everywhere.
+
 ## 1. Why it exists
 
-InvoiceOps lets a customer run up an open balance only up to a credit limit. Customer 7 has `credit_limit_cents = 100000` and 70,000 open. Two staff members create invoices for customer 7 at the same moment:
+InvoiceOps lets a customer run up an open balance only up to a credit limit. Customer 7 has `credit_limit_minor = 100000` and 70,000 open. Two staff members create invoices for customer 7 at the same moment:
 
 | Step | Session A (invoice of 25,000) | Session B (invoice of 20,000) |
 | --- | --- | --- |
@@ -63,8 +70,8 @@ Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocomm
 
 | Step | Session A | Session B |
 | --- | --- | --- |
-| 1 | `BEGIN; SELECT total_cents FROM invoices WHERE id = 42;` → 50000 | |
-| 2 | | `UPDATE invoices SET total_cents = 45000 WHERE id = 42;` |
+| 1 | `BEGIN; SELECT total_minor FROM invoices WHERE id = 42;` → 50000 | |
+| 2 | | `UPDATE invoices SET total_minor = 45000 WHERE id = 42;` |
 | 3 | same `SELECT` → 45000 | |
 
 **Phantom read:** the same query returns a different set of rows.
@@ -79,9 +86,9 @@ Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocomm
 
 | Step | Session A (monthly statement) | Session B (payment webhook) |
 | --- | --- | --- |
-| 1 | `BEGIN; SELECT amount_paid_cents FROM invoices WHERE id = 42;` → 0 | |
-| 2 | | `BEGIN; INSERT INTO payments (invoice_id, amount_cents) VALUES (42, 50000); UPDATE invoices SET amount_paid_cents = 50000 WHERE id = 42; COMMIT;` |
-| 3 | `SELECT sum(amount_cents) FROM payments WHERE invoice_id = 42;` → 50000 | |
+| 1 | `BEGIN; SELECT paid_minor FROM invoices WHERE id = 42;` → 0 | |
+| 2 | | `BEGIN; INSERT INTO payments (invoice_id, amount_minor) VALUES (42, 50000); UPDATE invoices SET paid_minor = 50000 WHERE id = 42; COMMIT;` |
+| 3 | `SELECT sum(amount_minor) FROM payments WHERE invoice_id = 42;` → 50000 | |
 
 A's statement says "paid 0" next to "payments 50,000".
 
@@ -89,10 +96,10 @@ A's statement says "paid 0" next to "payments 50,000".
 
 | Step | Session A (payment of 10,000) | Session B (payment of 20,000) |
 | --- | --- | --- |
-| 1 | `BEGIN; SELECT amount_paid_cents FROM invoices WHERE id = 42;` → 0 | |
-| 2 | | `BEGIN; SELECT amount_paid_cents FROM invoices WHERE id = 42;` → 0 |
-| 3 | `UPDATE invoices SET amount_paid_cents = 10000 WHERE id = 42; COMMIT;` | |
-| 4 | | `UPDATE invoices SET amount_paid_cents = 20000 WHERE id = 42; COMMIT;` |
+| 1 | `BEGIN; SELECT paid_minor FROM invoices WHERE id = 42;` → 0 | |
+| 2 | | `BEGIN; SELECT paid_minor FROM invoices WHERE id = 42;` → 0 |
+| 3 | `UPDATE invoices SET paid_minor = 10000 WHERE id = 42; COMMIT;` | |
+| 4 | | `UPDATE invoices SET paid_minor = 20000 WHERE id = 42; COMMIT;` |
 
 The invoice shows 20,000 paid instead of 30,000. The fixes (atomic updates, row locks, version columns) are in [[Locking - Optimistic vs Pessimistic]].
 
@@ -162,7 +169,7 @@ flowchart TD
 
 **READ COMMITTED vs REPEATABLE READ in PostgreSQL** is only a question of when the snapshot is taken, plus one rule for writes:
 
-- READ COMMITTED takes a new snapshot for every statement. If an `UPDATE`, `DELETE` or `SELECT … FOR UPDATE` finds its target row changed by a concurrent transaction, it waits for that transaction to finish (if it is still running) and, if it committed, re-evaluates its `WHERE` clause on the newest version. That is why `UPDATE invoices SET amount_paid_cents = amount_paid_cents + 10000 WHERE id = 42` never loses an update, while reading the value into Go and writing it back does.
+- READ COMMITTED takes a new snapshot for every statement. If an `UPDATE`, `DELETE` or `SELECT … FOR UPDATE` finds its target row changed by a concurrent transaction, it waits for that transaction to finish (if it is still running) and, if it committed, re-evaluates its `WHERE` clause on the newest version. That is why `UPDATE invoices SET paid_minor = paid_minor + 10000 WHERE id = 42` never loses an update, while reading the value into Go and writing it back does.
 - REPEATABLE READ keeps one snapshot. If the row you update, delete or lock was changed by a transaction that committed after your snapshot, you get `ERROR: could not serialize access due to concurrent update` (SQLSTATE 40001). The second writer loses, and your code must retry the whole transaction.
 
 ### SERIALIZABLE in PostgreSQL: SSI
@@ -226,6 +233,33 @@ InnoDB updates the row in place in the clustered index and copies the old versio
 - **Purge** threads discard undo records once no read view needs them. A long transaction makes the **history list length** grow, the InnoDB version of bloat.
 
 ## 4. Worked example
+
+### Whiteboard version
+
+The visibility rule in 15 lines. A snapshot remembers which transactions were finished when it was taken.
+
+```go
+package mvcc
+
+type Snap struct {
+	Xmin, Xmax uint32
+	Running    map[uint32]bool
+}
+
+// committedBefore: did xid finish before the snapshot was taken?
+// (Real PostgreSQL also checks the commit log for aborts.)
+func (s Snap) committedBefore(xid uint32) bool {
+	return xid != 0 && xid < s.Xmax && !s.Running[xid]
+}
+
+// Visible: created by a transaction my snapshot sees as done,
+// and not deleted by one it sees as done.
+func Visible(s Snap, xmin, xmax uint32) bool {
+	return s.committedBefore(xmin) && !s.committedBefore(xmax)
+}
+```
+
+The full version below adds the snapshot's own transaction, aborted transactions, a version chain and tests for each anomaly.
 
 **The visibility rule in Go.** A model of the decision PostgreSQL makes for every tuple. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -382,12 +416,12 @@ var ErrCreditLimit = errors.New("invoice would exceed the customer's credit limi
 // CreateInvoice inserts an invoice only if the customer's open balance stays
 // within the credit limit. Two concurrent calls cannot both pass the check:
 // SERIALIZABLE aborts one with 40001, and Serializable runs it again.
-func CreateInvoice(ctx context.Context, db Beginner, customerID, totalCents int64) error {
+func CreateInvoice(ctx context.Context, db Beginner, customerID, totalMinor int64) error {
 	return Serializable(ctx, db, 5, func(tx pgx.Tx) error {
 		var limit, open int64
 		err := tx.QueryRow(ctx, `
-			SELECT c.credit_limit_cents,
-			       coalesce(sum(i.total_cents - i.amount_paid_cents), 0)
+			SELECT c.credit_limit_minor,
+			       coalesce(sum(i.total_minor - i.paid_minor), 0)
 			FROM customers c
 			LEFT JOIN invoices i ON i.customer_id = c.id
 			     AND i.status IN ('sent', 'partially_paid', 'overdue')
@@ -396,12 +430,12 @@ func CreateInvoice(ctx context.Context, db Beginner, customerID, totalCents int6
 		if err != nil {
 			return fmt.Errorf("read open balance: %w", err)
 		}
-		if open+totalCents > limit {
+		if open+totalMinor > limit {
 			return ErrCreditLimit
 		}
 		_, err = tx.Exec(ctx, `
-			INSERT INTO invoices (customer_id, total_cents, status, due_date)
-			VALUES ($1, $2, 'sent', current_date + 30)`, customerID, totalCents)
+			INSERT INTO invoices (customer_id, total_minor, status, due_date)
+			VALUES ($1, $2, 'sent', current_date + 30)`, customerID, totalMinor)
 		if err != nil {
 			return fmt.Errorf("insert invoice: %w", err)
 		}
@@ -474,8 +508,8 @@ Defaults elsewhere, for interviews:
 | PostgreSQL | READ COMMITTED | REPEATABLE READ = snapshot isolation; SERIALIZABLE = SSI |
 | MySQL InnoDB | REPEATABLE READ | Snapshot for plain reads, next-key locks for locking reads |
 | Oracle | READ COMMITTED | Its SERIALIZABLE is snapshot isolation |
-| SQL Server | READ COMMITTED (locking) | `READ_COMMITTED_SNAPSHOT` switches it to row versioning; `SNAPSHOT` is snapshot isolation |
-| CockroachDB | SERIALIZABLE | READ COMMITTED is available since v23.2; see [[Distributed SQL]] |
+| SQL Server | READ COMMITTED (locking; Azure SQL Database turns on row versioning by default) | `READ_COMMITTED_SNAPSHOT` switches it to row versioning; `SNAPSHOT` is snapshot isolation |
+| CockroachDB | SERIALIZABLE | READ COMMITTED is generally available since v24.1 (preview in v23.2); see [[Distributed SQL]] |
 
 ## 6. Trade-offs and when not to use
 
@@ -510,7 +544,7 @@ Defaults elsewhere, for interviews:
 - **Read-only transactions are cheaper.** A `SERIALIZABLE READ ONLY DEFERRABLE` transaction waits for a "safe" snapshot, then runs with no SIRead locks and can never fail with 40001. It suits long reports.
 - **Even a read-only transaction can see a non-serializable state under snapshot isolation** (Fekete, O'Neil and O'Neil, 2004): a report can observe the effect of a later transaction but not of an earlier one it depends on. SSI accounts for read-only transactions too.
 - **MultiXacts.** When several transactions lock one row (for example `FOR SHARE`, or foreign-key checks), `xmax` holds a MultiXact ID that lists them. MultiXact IDs wrap around too and are frozen by VACUUM on their own schedule (`autovacuum_multixact_freeze_max_age`).
-- **HOT pruning.** Any backend reading a heap page can remove dead heap-only tuples on that page without waiting for VACUUM, if they are behind the xmin horizon. That keeps hot, frequently updated rows from bloating as fast.
+- **Page pruning (HOT pruning).** Any backend reading a heap page can prune it without waiting for VACUUM: dead tuple versions behind the xmin horizon have their space reclaimed. Heap-only tuples are removed completely; dead tuples that still have index entries are reduced to dead line pointers until VACUUM removes those index entries. That keeps hot, frequently updated rows from bloating as fast.
 - **VACUUM in PostgreSQL 17** stores dead-tuple IDs in a new, compact structure, which uses much less memory and is no longer silently capped at 1 GB.
 - **InnoDB secondary indexes** carry no version columns. When a secondary-index page was changed by a newer transaction, a consistent read must look the row up in the clustered index and walk undo to decide visibility, so long transactions make secondary-index reads slower too.
 

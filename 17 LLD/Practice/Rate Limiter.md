@@ -23,6 +23,12 @@ updated: 2026-11-02
 > [!summary] TL;DR
 > A rate limiter allows at most N requests per key (user, IP or API key) per unit of time and answers the rest with HTTP 429. Each algorithm (token bucket, GCRA, fixed window, sliding log, sliding counter) is a strategy behind one `Allow(ctx, key)` that returns a decision: allowed or not, how many requests remain, and **when to retry**. Per-key state lives in a map under a mutex, a janitor deletes idle keys so the map cannot grow forever, and with many app instances the state moves to Redis behind one atomic Lua script.
 
+> [!abstract] Core idea
+> - Each key keeps a little state (tokens and a timestamp). `Allow` reads it, refills by the time that passed, decides, and writes it back, all in one atomic step.
+> - Token bucket: refill `rate` tokens per second up to `capacity`; a request spends one token. GCRA (generic cell rate algorithm) gets the same result while storing only one timestamp per key, the theoretical arrival time (TAT).
+> - Always tell the client **when** to retry (`Retry-After`), and delete idle keys so memory stays bounded.
+> - Classic mistakes: `INCR` then `EXPIRE` as two Redis calls (a crash between them leaves a key that never expires), and a fixed window that lets 2N requests through around the window edge.
+
 ## Problem statement
 
 ```text
@@ -32,7 +38,17 @@ more than one algorithm, keep memory bounded when millions of IPs pass through, 
 explain how it works across many app instances and what happens when Redis is down.
 ```
 
-What it really tests: algorithm choice, the Strategy pattern, an atomic read-refill-check-decrement under a lock, testable time through an injected clock, and production judgment: headers, memory, multi-instance limits and fail-open versus fail-closed. The old version of this solution described a janitor but never coded it (so per-IP keys leaked memory), hard-coded `Retry-After: 1`, and claimed a per-bucket mutex while the code used one mutex per limiter; all three are fixed here.
+**Solving path**
+
+1. Clarify: key (user, IP or API key), limit and period, burst, response (429 + `Retry-After`).
+2. Define `Decision` and the `Limiter` interface with `Allow(ctx, key)`.
+3. Code the token bucket with an injected clock.
+4. Wrap it in HTTP middleware that sets the headers.
+5. Add `Sweep` and a janitor so idle keys are deleted.
+6. Discuss other algorithms, Redis with one Lua script, and fail-open versus fail-closed.
+7. Test with a fake clock: burst, refill, concurrency, sweep.
+
+What it really tests: algorithm choice, the Strategy pattern, an atomic read-refill-check-decrement under a lock, testable time through an injected clock, and production judgment: headers, memory, multi-instance limits and fail-open versus fail-closed. Three details interviewers probe: a janitor that really deletes idle keys (otherwise per-IP keys leak memory), a `Retry-After` computed by the algorithm instead of hard-coded, and an honest answer about lock granularity (this code uses one mutex per limiter).
 
 ## Step 1: Clarify requirements
 
@@ -263,10 +279,15 @@ Not used: a Singleton limiter (created in `main` and injected, so tests do not s
 
 ## Step 8: Core code
 
-> [!warning] What this version fixes
-> - **The janitor was described but not coded,** so every IP ever seen kept an entry. Now each limiter has `Sweep`, which deletes state that is equivalent to a fresh key, and `RunJanitor` calls it on a ticker. A deleted key behaves exactly as if it had been kept.
-> - **`Retry-After` was hard-coded to 1.** Now each algorithm computes it: token bucket `(1 − tokens) / rate`; GCRA `TAT − tolerance − now`; fixed window the time to the window end; sliding log the time until the oldest entry leaves; sliding counter by solving the weighted estimate. The middleware rounds up to whole seconds.
-> - **The text claimed a per-bucket mutex,** but the code used one limiter-wide mutex. The text now says what the code does.
+> [!tip] What to code in a 60-minute round
+> **Write in the room (about 150 lines):** `Clock` + `RealClock`, `Decision`, `Limiter`; `TokenBucket` with `NewTokenBucket`, `Allow` and `Sweep`; `Middleware` returning 429 with `Retry-After`; `ceilSeconds`; a `fakeClock` and one table test.
+>
+> **Talk through only (extensions):** `GCRA`, `FixedWindow`, `SlidingWindowLog`, `SlidingWindowCounter` (name the trade-offs from the comparison table), `RunJanitor`, `FailMode`, the Redis Lua version and per-policy configuration.
+
+> [!warning] Three details that are easy to get wrong
+> - **Idle keys must be deleted,** or every IP ever seen keeps an entry. Each limiter has `Sweep`, which deletes state that is equivalent to a fresh key, and `RunJanitor` calls it on a ticker. A deleted key behaves exactly as if it had been kept.
+> - **`Retry-After` is computed, not hard-coded.** Each algorithm computes it: token bucket `(1 − tokens) / rate`; GCRA `TAT − tolerance − now`; fixed window the time to the window end; sliding log the time until the oldest entry leaves; sliding counter by solving the weighted estimate. The middleware rounds up to whole seconds.
+> - **Lock granularity:** the code uses one mutex per limiter, not one per bucket. Per-key locks or sharded maps are an extension when one lock becomes a bottleneck.
 
 Complete package, Go 1.24, standard library only:
 
@@ -762,7 +783,7 @@ Use `x/time/rate` for client-side throttling (calling a vendor at 50 requests pe
 | `TestLimiters` (table, 5 algorithms) | allow and deny sequences, `Remaining` and the exact computed `RetryAfter` at each step, per-key isolation, empty key |
 | `TestInvalidConfig` | constructors reject zero limits, zero windows and a nil clock |
 | `TestConcurrentExactlyLimit` | 100 goroutines, limit 10: exactly 10 allowed for every algorithm |
-| `TestSweepDropsIdleKeys` | 1,000 one-off IPs are swept after 3 minutes; a key used just now survives (the audit bug) |
+| `TestSweepDropsIdleKeys` | 1,000 one-off IPs are swept after 3 minutes; a key used just now survives |
 | `TestRunJanitorStopsWithContext` | the janitor sweeps on its ticker and returns when the context ends |
 | `TestMiddleware` | 200 with `RateLimit-Remaining: 0`, then 429 with `Retry-After: 4` at 1 request per 4 s; fail open 200, fail closed 503; empty key 400 |
 | `TestCeilSeconds` | 1 ms rounds up to 1 s, 1.5 s to 2 s |
@@ -908,7 +929,7 @@ func TestConcurrentExactlyLimit(t *testing.T) {
 	}
 }
 
-// The audit bug: per-key maps never shrank. 1,000 one-off IPs must be swept,
+// Per-key maps must shrink: 1,000 one-off IPs must be swept,
 // and a key that is still limited must survive the sweep.
 func TestSweepDropsIdleKeys(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(0, 0)}

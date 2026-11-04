@@ -1,7 +1,7 @@
 ---
 tags: [databases, sql, postgres]
 level: basic
-status: draft
+status: reviewed
 prereqs: []
 related: ["[[Relational Schema Design]]", "[[Transactions and ACID]]", "[[Indexing Fundamentals]]", "[[Query Plans and EXPLAIN]]", "[[Database Access (database-sql, pgx, sqlc)]]"]
 sources:
@@ -22,6 +22,13 @@ updated: 2026-11-02
 
 > [!summary] TL;DR
 > SQL is how you ask a relational database for data. You describe **what** you want (which tables, how they connect, which rows, how to group and sort them) and the database decides **how** to fetch it. Most SQL bugs come from three places: `NULL`, which makes a condition "unknown" instead of true or false; joins that multiply rows; and forgetting the order in which a query's clauses apply.
+
+> [!abstract] Core idea
+> - You describe the result, not the steps; the planner picks how to fetch it.
+> - Clauses run in a fixed logical order: FROM/JOIN, WHERE, GROUP BY, HAVING, SELECT, ORDER BY, LIMIT. That is why WHERE cannot see a SELECT alias.
+> - `NULL` means unknown: `x = NULL` is never true, so use `IS NULL` and beware `NOT IN` over a column that can be NULL.
+> - Joins multiply rows: joining a one-to-many table before summing double-counts money.
+> - Values always go in as parameters (`$1`), never by string concatenation.
 
 ## 1. Why it exists
 
@@ -91,7 +98,7 @@ erDiagram
     workspaces ||--o{ invoices : owns
     clients |o--o{ clients : "parent of"
     clients ||--o{ invoices : "billed on"
-    invoices ||--|{ invoice_items : contains
+    invoices ||--o{ invoice_items : contains
     invoices ||--o{ payments : "settled by"
     invoices {
         bigint id PK
@@ -347,6 +354,22 @@ RETURNING merge_action(), c.id;
 
 ## 4. Worked example
 
+### Whiteboard version
+
+The whole collections question fits in one statement: join, filter, group, filter groups, sort.
+
+```sql
+SELECT c.name, SUM(i.total_minor - i.paid_minor) AS owed_minor
+FROM   invoices i
+JOIN   clients  c ON c.id = i.client_id
+WHERE  i.status = 'overdue'
+GROUP  BY c.name
+HAVING SUM(i.total_minor - i.paid_minor) > 0
+ORDER  BY owed_minor DESC;
+```
+
+The full version below adds tenant filters, lateness buckets, the traced execution order and a safe query builder in Go.
+
 ### The collections query, traced
 
 ```sql
@@ -522,7 +545,7 @@ The same question can often be written several ways. They differ in NULL behavio
 - **Why `NOT IN` is also slow.** Because of its NULL semantics, the planner cannot turn `NOT IN (subquery)` into an anti-join. It becomes a hashed SubPlan when the subquery result fits in `work_mem`, otherwise a plain SubPlan that rescans the subquery per outer row, which is quadratic. `NOT EXISTS` becomes a Hash or Merge Anti Join.
 - **ON CONFLICT under concurrency.** Postgres inserts *speculatively*: it probes the arbiter index, and if another transaction is inserting the same key it waits for that transaction to finish, then re-checks. In Read Committed the docs guarantee one of the two outcomes, insert or update. If the conflicting row comes from a transaction your snapshot cannot see, the `UPDATE` still applies to it, although no version of that row is visible to your statement.
 - **Upserts burn identity values.** The row to insert, including any `nextval`, is computed before the conflict is detected. A busy upsert path therefore leaves gaps in `id`. That is harmless for surrogate keys and a reason never to promise gapless numbers from a sequence.
-- **Window frames.** `ROWS` counts physical rows, `RANGE` groups peers by value (and allows `RANGE '7 days' PRECEDING` on dates), and `GROUPS` (PostgreSQL 11+) counts peer groups. `EXCLUDE CURRENT ROW` removes the row itself, for example for "average of the other invoices".
+- **Window frames.** `ROWS` counts physical rows, `RANGE` groups peers by value (and allows `RANGE INTERVAL '7 days' PRECEDING` on dates), and `GROUPS` (PostgreSQL 11+) counts peer groups. `EXCLUDE CURRENT ROW` removes the row itself, for example for "average of the other invoices".
 - **Logical order vs plan.** Inner joins commute, so the planner chooses the join order itself. `join_collapse_limit` (default 8) caps how many explicit `JOIN`s it reorders freely, and from `geqo_threshold` (default 12) relations it switches to a genetic search. Outer joins restrict reordering, which is one reason an innocent `LEFT JOIN` can change a plan.
 - **Three-valued logic in constraints.** Because `CHECK` passes on UNKNOWN, a constraint that must hold even when values are missing needs `NOT NULL` too, or an explicit `IS NOT NULL` inside the check.
 
