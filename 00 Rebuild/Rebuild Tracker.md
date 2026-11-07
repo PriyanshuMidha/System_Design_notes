@@ -15,59 +15,59 @@ updated: 2026-11-02
 
 - [x] **Home** · B · ✅ · from: START HERE - Advanced Backend SDE3 Path, Advancxe backend content table (nav part), SDE3 Backend Roadmap (+ Excalidraw)
 - [x] **Conventions** · B 🆕 · ✅ · from: NEW
-- [ ] **Progress** · - 🆕 · from: NEW
-- [ ] **Templates/Topic Note** · - 🆕 · from: NEW
-- [ ] **Templates/MOC** · - 🆕 · from: NEW
-- [ ] **README (repo root, GitHub landing page)** · - · from: README.md (today only the title "System_Design_notes")
+- [x] **Progress** · - 🆕 · from: NEW
+- [x] **Templates/Topic Note** · - 🆕 · from: NEW
+- [x] **Templates/MOC** · - 🆕 · from: NEW
+- [x] **README (repo root, GitHub landing page)** · - · from: README.md (today only the title "System_Design_notes")
 
 ## 01 CS Fundamentals · 27 notes
 
-- [ ] **01 CS Fundamentals MOC** · - · from: folder map, written last
-- [ ] **How a Computer Runs a Program** · B · from: NEW (fetch-decode-execute; compile, link, load; Go static binaries)
-- [ ] **Memory Hierarchy and CPU Caches** · B · from: Memory, type of cache (L1–L3 part), data structure/cache (image), SRAM (part)
-- [ ] **RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM** · B · from: RAM, SRAM, DRAM, DDR SDRAM, GDDRM SDRM
-- [ ] **ROM, Flash, Firmware and the Boot Process** · B · from: ROM, Firewares, BIOS
-- [ ] **Storage Devices - HDD, SSD, NVMe** · B · from: Storages, HDD
-- [ ] **Latency Numbers Every Engineer Should Know** · B · from: what is latency
-- [ ] **Number Representation and Text Encoding** · B 🆕 · from: NEW
-- [ ] **Processes, Threads and Context Switching** · I 🆕 · from: NEW
-- [ ] **System Calls and User vs Kernel Mode** · I 🆕 · from: NEW
-- [ ] **Virtual Memory, Paging and the TLB** · I · from: cache used for (TLB image), Memory (corrected)
-- [ ] **Process Memory Layout - Stack vs Heap** · I 🆕 · from: NEW (link to Go escape analysis)
-- [ ] **Page Cache, File Systems and fsync** · I · from: type of cache (page/inode cache part)
-- [ ] **CPU Scheduling** · I 🆕 · from: NEW
-- [ ] **Concurrency Primitives - Mutex, Semaphore, Atomics** · I 🆕 · from: NEW
-- [ ] **I-O Models - Blocking, epoll, io_uring and the Go Netpoller** · A 🆕 · from: NEW
-- [ ] **Complexity Analysis - Big-O and Amortized Cost** · B 🆕 · from: NEW
-- [ ] **Data Structures Overview and Big-O Cheat Sheet** · B · from: Data structure content table (overview image)
-- [ ] **Arrays and Dynamic Arrays (Go Slices)** · B · from: array
-- [ ] **Linked Lists** · B · from: List
-- [ ] **Stacks, Queues and Deques** · B · from: stack, queue
-- [ ] **Hash Tables and Go Maps** · I · from: hash table
-- [ ] **Trees, BSTs and Balanced Trees** · I · from: tree
-- [ ] **Heaps and Priority Queues** · I · from: heaps
-- [ ] **Graphs and Graph Algorithms** · I · from: graph
-- [ ] **Tries, Suffix Trees and Suffix Arrays** · A · from: sufux tree
-- [ ] **Union-Find and Skip Lists** · A 🆕 · from: NEW
-- [ ] **Sorting, Searching and Interview Patterns** · I 🆕 · from: NEW
+- [x] **01 CS Fundamentals MOC** · - · ✅ · from: folder map, written last
+- [x] **How a Computer Runs a Program** · B · ✅ · from: NEW (fetch-decode-execute; compile, link, load; Go static binaries)
+- [x] **Memory Hierarchy and CPU Caches** · B · ✅ · from: Memory, type of cache (L1–L3 part), data structure/cache (image), SRAM (part)
+- [x] **RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM** · B · ✅ · from: RAM, SRAM, DRAM, DDR SDRAM, GDDRM SDRM
+- [x] **ROM, Flash, Firmware and the Boot Process** · B · ✅ · from: ROM, Firewares, BIOS
+- [x] **Storage Devices - HDD, SSD, NVMe** · B · ✅ · from: Storages, HDD
+- [x] **Latency Numbers Every Engineer Should Know** · B · ✅ · from: what is latency
+- [x] **Number Representation and Text Encoding** · B 🆕 · ✅ · from: NEW
+- [x] **Processes, Threads and Context Switching** · I 🆕 · ✅ · from: NEW
+- [x] **System Calls and User vs Kernel Mode** · I 🆕 · ✅ · from: NEW
+- [x] **Virtual Memory, Paging and the TLB** · I · ✅ · from: cache used for (TLB image), Memory (corrected)
+- [x] **Process Memory Layout - Stack vs Heap** · I 🆕 · ✅ · from: NEW (link to Go escape analysis)
+- [x] **Page Cache, File Systems and fsync** · I · ✅ · from: type of cache (page/inode cache part)
+- [x] **CPU Scheduling** · I 🆕 · ✅ · from: NEW
+- [x] **Concurrency Primitives - Mutex, Semaphore, Atomics** · I 🆕 · ✅ · from: NEW
+- [x] **I-O Models - Blocking, epoll, io_uring and the Go Netpoller** · A 🆕 · ✅ · from: NEW
+- [x] **Complexity Analysis - Big-O and Amortized Cost** · B 🆕 · ✅ · from: NEW
+- [x] **Data Structures Overview and Big-O Cheat Sheet** · B · ✅ · from: Data structure content table (overview image)
+- [x] **Arrays and Dynamic Arrays (Go Slices)** · B · ✅ · from: array
+- [x] **Linked Lists** · B · ✅ · from: List
+- [x] **Stacks, Queues and Deques** · B · ✅ · from: stack, queue
+- [x] **Hash Tables and Go Maps** · I · ✅ · from: hash table
+- [x] **Trees, BSTs and Balanced Trees** · I · ✅ · from: tree
+- [x] **Heaps and Priority Queues** · I · ✅ · from: heaps
+- [x] **Graphs and Graph Algorithms** · I · ✅ · from: graph
+- [x] **Tries, Suffix Trees and Suffix Arrays** · A · ✅ · from: sufux tree
+- [x] **Union-Find and Skip Lists** · A 🆕 · ✅ · from: NEW
+- [x] **Sorting, Searching and Interview Patterns** · I 🆕 · ✅ · from: NEW
 
 ## 02 Networking & Web · 14 notes
 
-- [ ] **02 Networking & Web MOC** · - · from: folder map, written last
-- [ ] **How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP** · B 🆕 · from: NEW
-- [ ] **IP Addressing, Subnets, NAT and VPC Basics** · B 🆕 · from: NEW
-- [ ] **DNS - Resolution, Records and Caching** · B · from: work_DNS, whtat DNS (+ the DNS half of aws/Domain DNS HTTPS SSL TLS)
-- [ ] **TCP - Handshake, Reliability, Flow and Congestion Control** · I 🆕 · from: NEW
-- [ ] **UDP and QUIC** · I 🆕 · from: NEW
-- [ ] **HTTP Fundamentals - Methods, Status Codes, Headers, Cookies** · B 🆕 · from: NEW
-- [ ] **HTTP-1.1 vs HTTP-2 vs HTTP-3** · I 🆕 · from: NEW
-- [ ] **TLS and HTTPS** · I · from: Domain DNS HTTPS SSL TLS (+ Go HTTPS HTTP2 TLS Server concepts); its DNS part feeds the bbg DNS note; NEW (+ the TLS half of aws/Domain DNS HTTPS SSL TLS)
-- [ ] **HTTP Caching - Cache-Control, ETag, Conditional Requests** · I 🆕 · from: NEW
-- [ ] **CDN and Edge** · I · from: CDN, Global CDN and Edge (+ bbg `React Theory/CDN`); React/CDN (+ api design/CDN, api design/Global CDN and Edge, the CDN part of real_cache)
-- [ ] **Forward and Reverse Proxies - L4 vs L7** · I · from: Reverse Proxy vs Forward Proxy; other areas (api design/Reverse Proxy vs Forward Proxy, system design/Load Balancer)
-- [ ] **Nginx** · I · from: Nginx
-- [ ] **What Happens When You Type a URL** · I 🆕 · from: NEW (capstone: DNS → TCP → TLS → HTTP → CDN → render)
-- [ ] **Network Debugging Toolkit - dig, curl, ss, tcpdump** · A 🆕 · from: NEW
+- [x] **02 Networking & Web MOC** · - · ✅ · from: folder map, written last
+- [x] **How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP** · B 🆕 · ✅ · from: NEW
+- [x] **IP Addressing, Subnets, NAT and VPC Basics** · B 🆕 · ✅ · from: NEW
+- [x] **DNS - Resolution, Records and Caching** · B · ✅ · from: work_DNS, whtat DNS (+ the DNS half of aws/Domain DNS HTTPS SSL TLS)
+- [x] **TCP - Handshake, Reliability, Flow and Congestion Control** · I 🆕 · ✅ · from: NEW
+- [x] **UDP and QUIC** · I 🆕 · ✅ · from: NEW
+- [x] **HTTP Fundamentals - Methods, Status Codes, Headers, Cookies** · B 🆕 · ✅ · from: NEW
+- [x] **HTTP-1.1 vs HTTP-2 vs HTTP-3** · I 🆕 · ✅ · from: NEW
+- [x] **TLS and HTTPS** · I · ✅ · from: Domain DNS HTTPS SSL TLS (+ Go HTTPS HTTP2 TLS Server concepts); its DNS part feeds the bbg DNS note; NEW (+ the TLS half of aws/Domain DNS HTTPS SSL TLS)
+- [x] **HTTP Caching - Cache-Control, ETag, Conditional Requests** · I 🆕 · ✅ · from: NEW
+- [x] **CDN and Edge** · I · ✅ · from: CDN, Global CDN and Edge (+ bbg `React Theory/CDN`); React/CDN (+ api design/CDN, api design/Global CDN and Edge, the CDN part of real_cache)
+- [x] **Forward and Reverse Proxies - L4 vs L7** · I · ✅ · from: Reverse Proxy vs Forward Proxy; other areas (api design/Reverse Proxy vs Forward Proxy, system design/Load Balancer)
+- [x] **Nginx** · I · ✅ · from: Nginx
+- [x] **What Happens When You Type a URL** · I 🆕 · ✅ · from: NEW (capstone: DNS → TCP → TLS → HTTP → CDN → render)
+- [x] **Network Debugging Toolkit - dig, curl, ss, tcpdump** · A 🆕 · ✅ · from: NEW
 
 ## 03 Frontend · 12 notes
 
@@ -87,30 +87,30 @@ updated: 2026-11-02
 
 ## 04 Go Language · 23 notes
 
-- [ ] **04 Go Language MOC** · - · from: folder map, written last
-- [ ] **Go Toolchain, Tooling and Debugging** · B · from: Go Developer Tooling Git VSCode CLI, Go Source Code Reading Debugging, Go Language Basics (commands)
-- [ ] **Syntax, Types and Control Flow** · B · from: Go Language Basics
-- [ ] **Functions, Closures, Defer, Panic and Recover** · B · from: Go Deep Basics Functions Defer Panic Recover, Go Language Basics (functions, init)
-- [ ] **Arrays, Slices and Maps (with internals)** · B · from: Go Language Basics (collections, make/new, nil, range) + NEW internals section
-- [ ] **Strings, Bytes, Runes and Unicode** · B · from: Go Strings Runes Time Files, Go Language Basics (range over string)
-- [ ] **Structs, Methods and Embedding** · B · from: Go Types Structs Interfaces, Go Language Basics (custom types, aliases, tags)
-- [ ] **Pointers, Values and Escape Analysis** · I · from: Go Pointers Memory Values
-- [ ] **Interfaces** · I · from: Go Types Structs Interfaces, LLD `Error Handling and Interfaces in Go LLD` (Part 1)
-- [ ] **Error Handling** · I · from: Go Error Handling, LLD `Error Handling and Interfaces in Go LLD` (Part 2); Error Handling and Interfaces in Go LLD (errors half), merged with the Go-backend errors note (other reviewer)
-- [ ] **Packages, Modules and Dependency Management** · I · from: Go Project Structure and Modules (modules)
-- [ ] **Standard Library Essentials (time, io, files, encoding)** · I · from: Go Strings Runes Time Files (time, files), Go Language Basics (io packages), Go Bootcamp Course Coverage Map (topic list)
-- [ ] **Testing in Go** · I · from: Go Testing, LLD `Testing LLD Code in Go`
-- [ ] **Goroutines and Channels** · I · from: Go Concurrency Goroutines Channels
-- [ ] **select and Concurrency Patterns** · I · from: Go Concurrency Goroutines Channels, LLD `Concurrency in Go LLD` (worker pool), Go Worker Queues and Background Jobs (in-process pool)
-- [ ] **sync Primitives and Atomics** · I 🆕 · from: NEW (+ LLD `Concurrency in Go LLD` mutex and atomic code, LLD `Singleton Pattern in Go` sync.Once)
-- [ ] **Context Package** · I · from: Go Context Package
-- [ ] **Generics and Iterators** · I · from: Go Generics Reflection Runtime (generics)
-- [ ] **Memory Model and Data Races** · A 🆕 · from: NEW
-- [ ] **Reflection and unsafe** · A · from: Go Generics Reflection Runtime (reflection)
-- [ ] **Runtime - Goroutine Scheduler (GMP)** · A 🆕 · from: NEW (only topic names exist in Go Generics Reflection Runtime)
-- [ ] **Runtime - Memory Allocator and Garbage Collector** · A 🆕 · from: NEW
-- [ ] **Benchmarks, Profiling and Tracing** · I · from: Profiling (+ pprof part of Go Benchmarking wrk h2load ghz pprof); performance/Profiling, golang backend/Go Benchmarking wrk h2load ghz pprof (pprof half); Go Benchmarking wrk h2load ghz pprof (Go parts)
-- [ ] **Modern Go Feature Timeline (1.18-1.25)** · I 🆕 · from: NEW
+- [x] **04 Go Language MOC** · - · ✅ · from: folder map, written last
+- [x] **Go Toolchain, Tooling and Debugging** · B · ✅ · from: Go Developer Tooling Git VSCode CLI, Go Source Code Reading Debugging, Go Language Basics (commands)
+- [x] **Syntax, Types and Control Flow** · B · ✅ · from: Go Language Basics
+- [x] **Functions, Closures, Defer, Panic and Recover** · B · ✅ · from: Go Deep Basics Functions Defer Panic Recover, Go Language Basics (functions, init)
+- [x] **Arrays, Slices and Maps (with internals)** · B · ✅ · from: Go Language Basics (collections, make/new, nil, range) + NEW internals section
+- [x] **Strings, Bytes, Runes and Unicode** · B · ✅ · from: Go Strings Runes Time Files, Go Language Basics (range over string)
+- [x] **Structs, Methods and Embedding** · B · ✅ · from: Go Types Structs Interfaces, Go Language Basics (custom types, aliases, tags)
+- [x] **Pointers, Values and Escape Analysis** · I · ✅ · from: Go Pointers Memory Values
+- [x] **Interfaces** · I · ✅ · from: Go Types Structs Interfaces, LLD `Error Handling and Interfaces in Go LLD` (Part 1)
+- [x] **Error Handling** · I · ✅ · from: Go Error Handling, LLD `Error Handling and Interfaces in Go LLD` (Part 2); Error Handling and Interfaces in Go LLD (errors half), merged with the Go-backend errors note (other reviewer)
+- [x] **Packages, Modules and Dependency Management** · I · ✅ · from: Go Project Structure and Modules (modules)
+- [x] **Standard Library Essentials (time, io, files, encoding)** · I · ✅ · from: Go Strings Runes Time Files (time, files), Go Language Basics (io packages), Go Bootcamp Course Coverage Map (topic list)
+- [x] **Testing in Go** · I · ✅ · from: Go Testing, LLD `Testing LLD Code in Go`
+- [x] **Goroutines and Channels** · I · ✅ · from: Go Concurrency Goroutines Channels
+- [x] **select and Concurrency Patterns** · I · ✅ · from: Go Concurrency Goroutines Channels, LLD `Concurrency in Go LLD` (worker pool), Go Worker Queues and Background Jobs (in-process pool)
+- [x] **sync Primitives and Atomics** · I 🆕 · ✅ · from: NEW (+ LLD `Concurrency in Go LLD` mutex and atomic code, LLD `Singleton Pattern in Go` sync.Once)
+- [x] **Context Package** · I · ✅ · from: Go Context Package
+- [x] **Generics and Iterators** · I · ✅ · from: Go Generics Reflection Runtime (generics)
+- [x] **Memory Model and Data Races** · A 🆕 · ✅ · from: NEW
+- [x] **Reflection and unsafe** · A · ✅ · from: Go Generics Reflection Runtime (reflection)
+- [x] **Runtime - Goroutine Scheduler (GMP)** · A 🆕 · ✅ · from: NEW (only topic names exist in Go Generics Reflection Runtime)
+- [x] **Runtime - Memory Allocator and Garbage Collector** · A 🆕 · ✅ · from: NEW
+- [x] **Benchmarks, Profiling and Tracing** · I · ✅ · from: Profiling (+ pprof part of Go Benchmarking wrk h2load ghz pprof); performance/Profiling, golang backend/Go Benchmarking wrk h2load ghz pprof (pprof half); Go Benchmarking wrk h2load ghz pprof (Go parts)
+- [x] **Modern Go Feature Timeline (1.18-1.25)** · I 🆕 · ✅ · from: NEW
 
 ## 05 APIs · 15 notes
 
@@ -133,36 +133,36 @@ updated: 2026-11-02
 
 ## 06 Backend Engineering in Go · 29 notes
 
-- [ ] **06 Backend Engineering in Go MOC** · - · from: folder map, written last
-- [ ] **Backend Request Lifecycle and Layering** · B · from: Basic backend content table
-- [ ] **Service Project Layout and Wiring** · B · from: Go Project Structure and Modules (layout)
-- [ ] **Configuration and Secrets** · B · from: Go Configuration Environment
-- [ ] **HTTP Server Fundamentals (net-http)** · B · from: Go HTTP Server, Go REST API Coding (routing)
-- [ ] **Building REST Endpoints** · B · from: Go REST API Coding, Go Error Handling (HTTP table), LLD `Error Handling and Interfaces in Go LLD` (HTTPStatus)
-- [ ] **Request Decoding, Validation and DTOs** · I · from: Go JSON Validation DTOs
-- [ ] **Middleware** · I · from: Go Middleware, Go Deep Basics Functions Defer Panic Recover (recover middleware)
-- [ ] **OpenAPI-First Development in Go** · I · from: Go OpenAPI Documentation
-- [ ] **Database Access (database-sql, pgx, sqlc)** · I · from: Go Database SQL
-- [ ] **Transactions and the Repository Pattern** · I · from: Go Transactions and Repository Pattern, Go SQL NoSQL API Practice (exercise)
-- [ ] **Schema Migrations in Go Services** · I · from: Go Database Migrations
-- [ ] **Testing Go Services** · I · from: Go Testing (handler and repository parts), Go gRPC Testing Tools Postman grpcurl
-- [ ] **Authentication and Authorization in Go** · I · from: Go Auth JWT Sessions, Go Password Hashing (Go code)
-- [ ] **Calling External APIs** · I · from: Go API Client External Calls
-- [ ] **Redis in Go** · I · from: Go Redis Cache Queue Rate Limit
-- [ ] **Background Workers and Job Queues** · I · from: Go Worker Queues and Background Jobs
-- [ ] **Scheduled Jobs** · I · from: Go Cron Scheduled Jobs
-- [ ] **Receiving Webhooks Idempotently** · I · from: Go Webhooks Idempotency, Go Security for Backend (webhook steps)
-- [ ] **File Uploads and Object Storage** · I · from: Go File Uploads
-- [ ] **Observability in Go Services** · I · from: Go Logging Observability, Go OpenTelemetry Metrics Tracing
-- [ ] **Graceful Shutdown and Health Checks** · I · from: Go Graceful Shutdown
-- [ ] **TLS, HTTPS and HTTP2 in Go Servers** · I · from: Go HTTPS HTTP2 TLS Server
-- [ ] **Containerizing Go Services** · I · from: Go Deployment Docker
-- [ ] **Secure Coding for Go Services** · A · from: Go Security for Backend
-- [ ] **gRPC Services in Go** · I · from: Go gRPC Services, Go gRPC Deep Dive, Go gRPC TLS Metadata Deadlines, Go gRPC Testing Tools Postman grpcurl, Go Protoc Code Generation, Go Protobuf Validation
-- [ ] **gRPC Streaming in Go** · A · from: Go gRPC Streaming Patterns
-- [ ] **Serving REST and gRPC Together** · A · from: Go gRPC Gateway REST Combo API
-- [ ] **WebSockets and SSE in Go** · A · from: Go WebSocket Realtime
-- [ ] **Capstone - InvoiceOps** · A · from: InvoiceOps Golang Project Plan, Go Backend Coding Roadmap, Go Bootcamp Coding Checklist
+- [x] **06 Backend Engineering in Go MOC** · - · ✅ · from: folder map, written last
+- [x] **Backend Request Lifecycle and Layering** · B · ✅ · from: Basic backend content table
+- [x] **Service Project Layout and Wiring** · B · ✅ · from: Go Project Structure and Modules (layout)
+- [x] **Configuration and Secrets** · B · ✅ · from: Go Configuration Environment
+- [x] **HTTP Server Fundamentals (net-http)** · B · ✅ · from: Go HTTP Server, Go REST API Coding (routing)
+- [x] **Building REST Endpoints** · B · ✅ · from: Go REST API Coding, Go Error Handling (HTTP table), LLD `Error Handling and Interfaces in Go LLD` (HTTPStatus)
+- [x] **Request Decoding, Validation and DTOs** · I · ✅ · from: Go JSON Validation DTOs
+- [x] **Middleware** · I · ✅ · from: Go Middleware, Go Deep Basics Functions Defer Panic Recover (recover middleware)
+- [x] **OpenAPI-First Development in Go** · I · ✅ · from: Go OpenAPI Documentation
+- [x] **Database Access (database-sql, pgx, sqlc)** · I · ✅ · from: Go Database SQL
+- [x] **Transactions and the Repository Pattern** · I · ✅ · from: Go Transactions and Repository Pattern, Go SQL NoSQL API Practice (exercise)
+- [x] **Schema Migrations in Go Services** · I · ✅ · from: Go Database Migrations
+- [x] **Testing Go Services** · I · ✅ · from: Go Testing (handler and repository parts), Go gRPC Testing Tools Postman grpcurl
+- [x] **Authentication and Authorization in Go** · I · ✅ · from: Go Auth JWT Sessions, Go Password Hashing (Go code)
+- [x] **Calling External APIs** · I · ✅ · from: Go API Client External Calls
+- [x] **Redis in Go** · I · ✅ · from: Go Redis Cache Queue Rate Limit
+- [x] **Background Workers and Job Queues** · I · ✅ · from: Go Worker Queues and Background Jobs
+- [x] **Scheduled Jobs** · I · ✅ · from: Go Cron Scheduled Jobs
+- [x] **Receiving Webhooks Idempotently** · I · ✅ · from: Go Webhooks Idempotency, Go Security for Backend (webhook steps)
+- [x] **File Uploads and Object Storage** · I · ✅ · from: Go File Uploads
+- [x] **Observability in Go Services** · I · ✅ · from: Go Logging Observability, Go OpenTelemetry Metrics Tracing
+- [x] **Graceful Shutdown and Health Checks** · I · ✅ · from: Go Graceful Shutdown
+- [x] **TLS, HTTPS and HTTP2 in Go Servers** · I · ✅ · from: Go HTTPS HTTP2 TLS Server
+- [x] **Containerizing Go Services** · I · ✅ · from: Go Deployment Docker
+- [x] **Secure Coding for Go Services** · A · ✅ · from: Go Security for Backend
+- [x] **gRPC Services in Go** · I · ✅ · from: Go gRPC Services, Go gRPC Deep Dive, Go gRPC TLS Metadata Deadlines, Go gRPC Testing Tools Postman grpcurl, Go Protoc Code Generation, Go Protobuf Validation
+- [x] **gRPC Streaming in Go** · A · ✅ · from: Go gRPC Streaming Patterns
+- [x] **Serving REST and gRPC Together** · A · ✅ · from: Go gRPC Gateway REST Combo API
+- [x] **WebSockets and SSE in Go** · A · ✅ · from: Go WebSocket Realtime
+- [x] **Capstone - InvoiceOps** · A · ✅ · from: InvoiceOps Golang Project Plan, Go Backend Coding Roadmap, Go Bootcamp Coding Checklist
 
 ## 07 Databases · 23 notes
 
@@ -285,70 +285,70 @@ updated: 2026-11-02
 
 ## 12 Security & Auth · 12 notes
 
-- [ ] **12 Security & Auth MOC** · - · from: folder map, written last
-- [ ] **Authentication vs Authorization** · B · from: Authentication vs Authorization
-- [ ] **Password Storage and Login Security** · I · from: NEW; Go Password Hashing (the only password-hashing note in the vault)
-- [ ] **Sessions and Cookies** · I · from: Sessions and Cookies
-- [ ] **JWT - Structure, Validation and Pitfalls** · I · from: JWT (+ Go Auth JWT Sessions concepts)
-- [ ] **Access and Refresh Tokens** · I · from: Refresh Token and Access Token, Auth Security Content Table (checklist)
-- [ ] **CORS and Same-Origin Policy** · I · from: CORS; NEW (or put it in 12 Security)
-- [ ] **CSRF, XSS and Security Headers** · I 🆕 · from: NEW
-- [ ] **OWASP API Security Top 10** · I 🆕 · from: NEW
-- [ ] **Secrets Management** · I · from: Secrets Management
-- [ ] **OAuth 2.0 and OpenID Connect** · A · from: OAuth
-- [ ] **Service-to-Service Auth - API Keys, HMAC, mTLS** · A 🆕 · from: NEW
-- [ ] **API Abuse and Bot Protection** · A · from: API Abuse and Bot Protection
+- [x] **12 Security & Auth MOC** · - · ✅ · from: folder map, written last
+- [x] **Authentication vs Authorization** · B · ✅ · from: Authentication vs Authorization
+- [x] **Password Storage and Login Security** · I · ✅ · from: NEW; Go Password Hashing (the only password-hashing note in the vault)
+- [x] **Sessions and Cookies** · I · ✅ · from: Sessions and Cookies
+- [x] **JWT - Structure, Validation and Pitfalls** · I · ✅ · from: JWT (+ Go Auth JWT Sessions concepts)
+- [x] **Access and Refresh Tokens** · I · ✅ · from: Refresh Token and Access Token, Auth Security Content Table (checklist)
+- [x] **CORS and Same-Origin Policy** · I · ✅ · from: CORS; NEW (or put it in 12 Security)
+- [x] **CSRF, XSS and Security Headers** · I 🆕 · ✅ · from: NEW
+- [x] **OWASP API Security Top 10** · I 🆕 · ✅ · from: NEW
+- [x] **Secrets Management** · I · ✅ · from: Secrets Management
+- [x] **OAuth 2.0 and OpenID Connect** · A · ✅ · from: OAuth
+- [x] **Service-to-Service Auth - API Keys, HMAC, mTLS** · A 🆕 · ✅ · from: NEW
+- [x] **API Abuse and Bot Protection** · A · ✅ · from: API Abuse and Bot Protection
 
 ## 13 DevOps & Cloud · 29 notes
 
-- [ ] **13 DevOps & Cloud MOC** · - · from: folder map, written last
-- [ ] **Cloud Computing Basics** · B · from: Cloud computing
-- [ ] **Cloud Native and the 12-Factor App** · I · from: cloudnative, Pillars of Cloud Native, images from cloud native content table
-- [ ] **Docker/Docker 01 - Why Containers** · B · from: DOCKER WHY
-- [ ] **Docker/Docker 02 - Images, Layers and Containers** · B · from: Docker_Image_Container (+ layer part of how docker Works)
-- [ ] **Docker/Docker 03 - CLI Essentials** · B · from: DOCKER_CODE
-- [ ] **Docker/Docker 04 - Writing a Production Dockerfile for Go** · I · from: how to dockerize, Docker Multi-stage Build, Docker Content Table (checklist) (+ Go Deployment Docker)
-- [ ] **Docker/Docker 05 - Networking and Port Publishing** · I · from: Docker Network, Porting mapping
-- [ ] **Docker/Docker 06 - Volumes and Bind Mounts** · I · from: DOCKER Volums
-- [ ] **Docker/Docker 07 - Docker Compose for Local Development** · I · from: docker comnpose
-- [ ] **Docker/Docker 08 - How Docker Works Under the Hood** · A · from: how docker Works
-- [ ] **Docker/Docker 09 - Container Security and Hardening** · A · from: Docker Security Basics
-- [ ] **Delivery and Kubernetes/CI-CD Pipelines (GitHub Actions for Go)** · I · from: CI CD Pipeline
-- [ ] **Delivery and Kubernetes/Deployment Strategies - Rolling, Blue-Green, Canary** · I · from: Canary Deployment, Blue Green Deployment
-- [ ] **Delivery and Kubernetes/Feature Flags** · I · from: Feature Flags
-- [ ] **Delivery and Kubernetes/Rollback and Safe Migrations** · I/A · from: Rollback Strategy
-- [ ] **Delivery and Kubernetes/Kubernetes Fundamentals** · I · from: Kubernetes Basics
-- [ ] **Delivery and Kubernetes/Autoscaling** · I/A · from: Autoscaling
-- [ ] **AWS/AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)** · B 🆕 · from: NEW
-- [ ] **AWS/AWS 02 - IAM** · B/I · from: AWS IAM
-- [ ] **AWS/AWS 03 - VPC Networking** · I 🆕 · from: NEW
-- [ ] **AWS/AWS 04 - Compute Choices - EC2, ECS/Fargate, EKS, Lambda** · I 🆕 · from: NEW (+ AWS Deployment glossary)
-- [ ] **AWS/AWS 05 - ECS, Fargate and ECR** · I · from: ECR and ECS
-- [ ] **AWS/AWS 06 - Load Balancing (ALB vs NLB)** · I 🆕 · from: NEW
-- [ ] **AWS/AWS 07 - S3** · B/I · from: AWS S3
-- [ ] **AWS/AWS 08 - RDS and Aurora** · I · from: AWS RDS
-- [ ] **AWS/AWS 09 - Route 53 and ACM** · B · from: Domain DNS HTTPS SSL TLS (AWS part)
-- [ ] **AWS/AWS 10 - CloudWatch** · I · from: AWS CloudWatch
-- [ ] **AWS/Infrastructure as Code with Terraform** · I 🆕 · from: NEW
-- [ ] **AWS/Deploying a Go API on AWS (Reference Architecture)** · A · from: Production Architecture, AWS Deployment, Cloud Deployment Content Table
+- [x] **13 DevOps & Cloud MOC** · - · ✅ · from: folder map, written last
+- [x] **Cloud Computing Basics** · B · ✅ · from: Cloud computing
+- [x] **Cloud Native and the 12-Factor App** · I · ✅ · from: cloudnative, Pillars of Cloud Native, images from cloud native content table
+- [x] **Docker/Docker 01 - Why Containers** · B · ✅ · from: DOCKER WHY
+- [x] **Docker/Docker 02 - Images, Layers and Containers** · B · ✅ · from: Docker_Image_Container (+ layer part of how docker Works)
+- [x] **Docker/Docker 03 - CLI Essentials** · B · ✅ · from: DOCKER_CODE
+- [x] **Docker/Docker 04 - Writing a Production Dockerfile for Go** · I · ✅ · from: how to dockerize, Docker Multi-stage Build, Docker Content Table (checklist) (+ Go Deployment Docker)
+- [x] **Docker/Docker 05 - Networking and Port Publishing** · I · ✅ · from: Docker Network, Porting mapping
+- [x] **Docker/Docker 06 - Volumes and Bind Mounts** · I · ✅ · from: DOCKER Volums
+- [x] **Docker/Docker 07 - Docker Compose for Local Development** · I · ✅ · from: docker comnpose
+- [x] **Docker/Docker 08 - How Docker Works Under the Hood** · A · ✅ · from: how docker Works
+- [x] **Docker/Docker 09 - Container Security and Hardening** · A · ✅ · from: Docker Security Basics
+- [x] **Delivery and Kubernetes/CI-CD Pipelines (GitHub Actions for Go)** · I · ✅ · from: CI CD Pipeline
+- [x] **Delivery and Kubernetes/Deployment Strategies - Rolling, Blue-Green, Canary** · I · ✅ · from: Canary Deployment, Blue Green Deployment
+- [x] **Delivery and Kubernetes/Feature Flags** · I · ✅ · from: Feature Flags
+- [x] **Delivery and Kubernetes/Rollback and Safe Migrations** · I/A · ✅ · from: Rollback Strategy
+- [x] **Delivery and Kubernetes/Kubernetes Fundamentals** · I · ✅ · from: Kubernetes Basics
+- [x] **Delivery and Kubernetes/Autoscaling** · I/A · ✅ · from: Autoscaling
+- [x] **AWS/AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)** · B 🆕 · ✅ · from: NEW
+- [x] **AWS/AWS 02 - IAM** · B/I · ✅ · from: AWS IAM
+- [x] **AWS/AWS 03 - VPC Networking** · I 🆕 · ✅ · from: NEW
+- [x] **AWS/AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda** · I 🆕 · ✅ · from: NEW (+ AWS Deployment glossary)
+- [x] **AWS/AWS 05 - ECS, Fargate and ECR** · I · ✅ · from: ECR and ECS
+- [x] **AWS/AWS 06 - Load Balancing (ALB vs NLB)** · I 🆕 · ✅ · from: NEW
+- [x] **AWS/AWS 07 - S3** · B/I · ✅ · from: AWS S3
+- [x] **AWS/AWS 08 - RDS and Aurora** · I · ✅ · from: AWS RDS
+- [x] **AWS/AWS 09 - Route 53 and ACM** · B · ✅ · from: Domain DNS HTTPS SSL TLS (AWS part)
+- [x] **AWS/AWS 10 - CloudWatch** · I · ✅ · from: AWS CloudWatch
+- [x] **AWS/Infrastructure as Code with Terraform** · I 🆕 · ✅ · from: NEW
+- [x] **AWS/Deploying a Go API on AWS (Reference Architecture)** · A · ✅ · from: Production Architecture, AWS Deployment, Cloud Deployment Content Table
 
 ## 14 Observability & SRE · 14 notes
 
-- [ ] **14 Observability & SRE MOC** · - · from: folder map, written last
-- [ ] **Observability Fundamentals** · B · from: Logs Metrics Traces
-- [ ] **Structured Logging** · B · from: Logs Metrics Traces, golang backend/Go Logging Observability
-- [ ] **Metrics and Prometheus** · B · from: Logs Metrics Traces, Monitoring and Alerting (monitoring half), NEW
-- [ ] **Distributed Tracing with OpenTelemetry** · I · from: Logs Metrics Traces (OTel callout), golang backend/Go OpenTelemetry Metrics Tracing
-- [ ] **SLIs, SLOs, SLAs and Error Budgets** · I · from: SLO SLA SLI
-- [ ] **Alerting and On-Call** · I · from: Monitoring and Alerting
-- [ ] **Incident Response** · I · from: Incident Response, Production Debugging Content Table
-- [ ] **Production Debugging Playbook** · I · from: Production Debugging Playbook, Production Debugging Content Table, Latency Debugging ("questions to ask")
-- [ ] **Latency, Percentiles and Bottleneck Analysis** · I · from: Latency Debugging, performance/Bottleneck Analysis
-- [ ] **Postmortems and Root Cause Analysis** · I · from: Postmortems, Root Cause Analysis
-- [ ] **Debugging Database Performance** · A · from: Database Performance Debugging
-- [ ] **Debugging Memory Leaks and OOMs in Go** · A · from: Memory Leak Debugging
-- [ ] **Performance Engineering and Capacity Planning** · I · from: Bottleneck Analysis, Performance Engineering Content Table; performance/Performance Engineering Content Table, performance/Capacity Estimation (capacity-planning half; the back-of-envelope half goes to 11)
-- [ ] **Production Readiness Review** · A 🆕 · from: NEW
+- [x] **14 Observability & SRE MOC** · - · ✅ · from: folder map, written last
+- [x] **Observability Fundamentals** · B · ✅ · from: Logs Metrics Traces
+- [x] **Structured Logging** · B · ✅ · from: Logs Metrics Traces, golang backend/Go Logging Observability
+- [x] **Metrics and Prometheus** · B · ✅ · from: Logs Metrics Traces, Monitoring and Alerting (monitoring half), NEW
+- [x] **Distributed Tracing with OpenTelemetry** · I · ✅ · from: Logs Metrics Traces (OTel callout), golang backend/Go OpenTelemetry Metrics Tracing
+- [x] **SLIs, SLOs, SLAs and Error Budgets** · I · ✅ · from: SLO SLA SLI
+- [x] **Alerting and On-Call** · I · ✅ · from: Monitoring and Alerting
+- [x] **Incident Response** · I · ✅ · from: Incident Response, Production Debugging Content Table
+- [x] **Production Debugging Playbook** · I · ✅ · from: Production Debugging Playbook, Production Debugging Content Table, Latency Debugging ("questions to ask")
+- [x] **Latency, Percentiles and Bottleneck Analysis** · I · ✅ · from: Latency Debugging, performance/Bottleneck Analysis
+- [x] **Postmortems and Root Cause Analysis** · I · ✅ · from: Postmortems, Root Cause Analysis
+- [x] **Debugging Database Performance** · A · ✅ · from: Database Performance Debugging
+- [x] **Debugging Memory Leaks and OOMs in Go** · A · ✅ · from: Memory Leak Debugging
+- [x] **Performance Engineering and Capacity Planning** · I · ✅ · from: Bottleneck Analysis, Performance Engineering Content Table; performance/Performance Engineering Content Table, performance/Capacity Estimation (capacity-planning half; the back-of-envelope half goes to 11)
+- [x] **Production Readiness Review** · A 🆕 · ✅ · from: NEW
 
 ## 15 Testing · 10 notes
 
@@ -362,23 +362,23 @@ updated: 2026-11-02
 - [x] **Testing Async and Event-Driven Systems** · I 🆕 · ✅ · from: NEW
 - [x] **Load and Performance Testing** · I · ✅ · from: Load Testing, golang backend/Go Benchmarking wrk h2load ghz pprof (load-tool half); Go Benchmarking wrk h2load ghz pprof (wrk/h2load/ghz part)
 - [x] **Chaos Engineering** · A · ✅ · from: Chaos Testing
-- [ ] **Testing in CI/CD, Flaky Tests and Testing in Production** · A 🆕 · from: NEW
+- [x] **Testing in CI-CD, Flaky Tests and Testing in Production** · A 🆕 · from: NEW
 
-## 16 Software Architecture · 12 notes
+## 16 Software Architecture · 13 notes
 
-- [ ] **16 Software Architecture MOC** · - · from: folder map, written last
-- [ ] **Architecture Fundamentals - Coupling, Cohesion and Dependency Direction** · B · from: Architecture Patterns Content Table, NEW
-- [ ] **Inversion of Control - Library vs Framework** · B · from: lib_frame
-- [ ] **Monolith vs Microservices** · B · from: Monolith and Microservices (+ bbg `React/React Theory/mcroservise_monolith`); system design/Monolith and Microservices, bbg React/mcroservise_monolith (other reviewers); mcroservise_monolith (+ system design/Monolith and Microservices)
-- [ ] **Layered Architecture** · B · from: Layered Architecture
-- [ ] **Hexagonal Architecture (Ports and Adapters)** · I · from: Hexagonal Architecture, Architecture Patterns Content Table (InvoiceOps ports)
-- [ ] **Clean Architecture** · I · from: Clean Architecture (with an onion comparison)
-- [ ] **Architecture Decision Records** · I · from: Architecture Decision Records
-- [ ] **Domain-Driven Design - Strategic Design** · I · from: Domain Driven Design
-- [ ] **Domain-Driven Design - Tactical Patterns in Go** · A · from: Domain Driven Design
-- [ ] **Modular Monolith** · A 🆕 · from: NEW
-- [ ] **Strangler Fig Pattern and Legacy Migration** · A · from: Strangler Fig Pattern
-- [ ] **Documenting Architecture - C4 Diagrams and Fitness Functions** · A 🆕 · from: NEW
+- [x] **16 Software Architecture MOC** · - · ✅ · from: folder map, written last
+- [x] **Architecture Fundamentals - Coupling, Cohesion and Dependency Direction** · B · ✅ · from: Architecture Patterns Content Table, NEW
+- [x] **Inversion of Control - Library vs Framework** · B · ✅ · from: lib_frame
+- [x] **Monolith vs Microservices** · B · ✅ · from: Monolith and Microservices (+ bbg `React/React Theory/mcroservise_monolith`); system design/Monolith and Microservices, bbg React/mcroservise_monolith (other reviewers); mcroservise_monolith (+ system design/Monolith and Microservices)
+- [x] **Layered Architecture** · B · ✅ · from: Layered Architecture
+- [x] **Hexagonal Architecture (Ports and Adapters)** · I · ✅ · from: Hexagonal Architecture, Architecture Patterns Content Table (InvoiceOps ports)
+- [x] **Clean Architecture** · I · ✅ · from: Clean Architecture (with an onion comparison)
+- [x] **Architecture Decision Records** · I · ✅ · from: Architecture Decision Records
+- [x] **Domain-Driven Design - Strategic Design** · I · ✅ · from: Domain Driven Design
+- [x] **Domain-Driven Design - Tactical Patterns in Go** · A · ✅ · from: Domain Driven Design
+- [x] **Modular Monolith** · A 🆕 · ✅ · from: NEW
+- [x] **Strangler Fig Pattern and Legacy Migration** · A · ✅ · from: Strangler Fig Pattern
+- [x] **Documenting Architecture - C4 Diagrams and Fitness Functions** · A 🆕 · ✅ · from: NEW
 
 ## 17 LLD · 51 notes
 
@@ -435,29 +435,29 @@ updated: 2026-11-02
 - [x] **Practice/Digital Wallet and Ledger** · A 🆕 · ✅ · from: NEW
 - [x] **LLD Problem Cheat Sheet** · I · ✅ · from: LLD Question Bank with Answers (rewritten and brought in line with the full notes)
 
-## 18 AI Engineering · 20 notes
+## 18 AI Engineering · 21 notes
 
-- [ ] **18 AI Engineering MOC** · - · from: folder map, written last
-- [ ] **LLM Fundamentals** · B · from: LLM Fundamentals, Introduction to AI Engineering
-- [ ] **Calling LLM APIs from Go** · B 🆕 · from: NEW
-- [ ] **Prompt Engineering** · B · from: Prompt Engineering
-- [ ] **Structured Outputs and Tool Calling** · I 🆕 · from: NEW
-- [ ] **Embeddings** · I · from: Embedding Models
-- [ ] **Vector Databases and ANN Indexes** · I · from: Vector Database Architecture, Vector Databases
-- [ ] **Keyword, Semantic and Hybrid Search** · I · from: Semantic Search
-- [ ] **Document Ingestion and Chunking** · I · from: Document Processing
-- [ ] **RAG Pipeline** · I · from: RAG
-- [ ] **Advanced RAG Patterns** · A · from: RAG ("Advanced RAG patterns"), NEW (query rewriting/HyDE, routing, self-query filters, parent-child, contextual retrieval, GraphRAG, agentic and corrective RAG, long-context alternative)
-- [ ] **RAG Evaluation** · A 🆕 · from: NEW
-- [ ] **Case Study - Chat with PDFs and Websites** · I · from: AI Chat with PDFs and Websites
-- [ ] **AI Agents and Agentic Workflows** · A · from: AI Agents
-- [ ] **LangChain and LangGraph** · A · from: LangGraph, LangChain Fundamentals
-- [ ] **Model Context Protocol (MCP)** · A 🆕 · from: NEW
-- [ ] **LLM Evals in Production** · A · from: Production AI Best Practices (evals), NEW
-- [ ] **Guardrails and LLM Security** · A · from: Production AI Best Practices (guardrails), AI Agents (guardrails), NEW
-- [ ] **LLM Cost, Latency and Caching** · A 🆕 · from: NEW
-- [ ] **LLM Observability** · A 🆕 · from: NEW
-- [ ] **Production AI Checklist** · A · from: Production AI Best Practices
+- [x] **18 AI Engineering MOC** · - · ✅ · from: folder map, written last
+- [x] **LLM Fundamentals** · B · ✅ · from: LLM Fundamentals, Introduction to AI Engineering
+- [x] **Calling LLM APIs from Go** · B 🆕 · ✅ · from: NEW
+- [x] **Prompt Engineering** · B · ✅ · from: Prompt Engineering
+- [x] **Structured Outputs and Tool Calling** · I 🆕 · ✅ · from: NEW
+- [x] **Embeddings** · I · ✅ · from: Embedding Models
+- [x] **Vector Databases and ANN Indexes** · I · ✅ · from: Vector Database Architecture, Vector Databases
+- [x] **Keyword, Semantic and Hybrid Search** · I · ✅ · from: Semantic Search
+- [x] **Document Ingestion and Chunking** · I · ✅ · from: Document Processing
+- [x] **RAG Pipeline** · I · ✅ · from: RAG
+- [x] **Advanced RAG Patterns** · A · ✅ · from: RAG ("Advanced RAG patterns"), NEW (query rewriting/HyDE, routing, self-query filters, parent-child, contextual retrieval, GraphRAG, agentic and corrective RAG, long-context alternative)
+- [x] **RAG Evaluation** · A 🆕 · ✅ · from: NEW
+- [x] **Case Study - Chat with PDFs and Websites** · I · ✅ · from: AI Chat with PDFs and Websites
+- [x] **AI Agents and Agentic Workflows** · A · ✅ · from: AI Agents
+- [x] **LangChain and LangGraph** · A · ✅ · from: LangGraph, LangChain Fundamentals
+- [x] **Model Context Protocol (MCP)** · A 🆕 · ✅ · from: NEW
+- [x] **LLM Evals in Production** · A · ✅ · from: Production AI Best Practices (evals), NEW
+- [x] **Guardrails and LLM Security** · A · ✅ · from: Production AI Best Practices (guardrails), AI Agents (guardrails), NEW
+- [x] **LLM Cost, Latency and Caching** · A 🆕 · ✅ · from: NEW
+- [x] **LLM Observability** · A 🆕 · ✅ · from: NEW
+- [x] **Production AI Checklist** · A · ✅ · from: Production AI Best Practices
 
 ## 19 Interview & Career · 6 notes
 

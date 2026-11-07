@@ -1,0 +1,448 @@
+---
+tags: [networking, internet, dns]
+level: basic
+status: reviewed
+prereqs: ["[[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]"]
+related: ["[[IP Addressing, Subnets, NAT and VPC Basics]]", "[[CDN and Edge]]", "[[TLS and HTTPS]]", "[[Load Balancing]]"]
+sources:
+  - "RFC 1034/1035, Domain Names - Concepts and Facilities / Implementation and Specification"
+  - "RFC 2782, DNS SRV Resource Records"
+  - "RFC 6844/8659, CAA Resource Record"
+  - "RFC 2308, Negative Caching of DNS Queries"
+  - "RFC 8484, DNS Queries over HTTPS (DoH); RFC 7858, DNS over TLS (DoT)"
+  - "AWS Route 53 Developer Guide, Routing Policies"
+  - "Go standard library docs, package net (Resolver)"
+updated: 2026-11-06
+---
+
+# DNS - Resolution, Records and Caching
+
+> [!summary] TL;DR
+> DNS converts human-readable names like `example.com` into the IP addresses computers actually route traffic to. A **resolver** walks down the naming hierarchy — root, then top-level domain, then the domain's own **authoritative** nameservers — asking each one "who knows more," and caches the answer for as long as its **TTL** says it's valid.
+
+> [!abstract] Core idea
+> - A name is a hierarchy read right to left: `.` (root) → `.com` (TLD) → `example.com` (domain) → `www.example.com` (subdomain).
+> - A **recursive resolver** (your ISP's, 8.8.8.8, 1.1.1.1, or a VPC's built-in resolver) does the multi-step walk on your behalf; **authoritative** servers answer only for the zones they own.
+> - Records come in types: `A`/`AAAA` for addresses, `CNAME` for aliases, `MX` for mail, `TXT` for arbitrary text (often SPF/DKIM/DMARC), `NS`/`SOA` for delegation, `PTR` for reverse lookup, `SRV` for service location, `CAA` for certificate authority policy.
+> - Every answer carries a **TTL**; caches at every layer (browser, OS, resolver) honor it, which is what people mean by "DNS propagation" — there's no propagation, just waiting out old TTLs.
+> - DNS can also load-balance and fail over traffic by returning different answers to different clients (GeoDNS, health-checked routing), all before any HTTP request is even sent.
+
+## 1. Why it exists
+
+Computers route on numbers (IP addresses); people remember names. Without DNS, sharing a website means sharing `172.66.147.243` and hoping it never changes. Worse, one service might need to run across many machines, in many regions, or move to a new data center entirely — the IP changes constantly, but the name should not.
+
+DNS solves this by giving every name an **owner** (the zone's authoritative nameservers) who can change the underlying IP at any time, and a global **caching lookup system** so that change propagates to clients automatically, bounded only by how long clients already cached the old answer (the TTL). This is also why "DNS propagation" after a change isn't really propagation across the internet — the new answer is available at the authoritative server immediately; what takes time is every resolver and client that cached the *old* answer waiting out its TTL.
+
+### Whiteboard version
+
+```mermaid
+flowchart LR
+    U["You type example.com"] --> R["Resolver looks it up"]
+    R --> C{"Cached and<br/>not expired?"}
+    C -- yes --> A1["Return cached IP"]
+    C -- no --> W["Walk the hierarchy:<br/>root -> .com -> example.com"]
+    W --> A2["Return IP, cache it for TTL seconds"]
+```
+
+## 2. Mental model
+
+DNS is a **distributed, delegated phone book**. Nobody holds the whole book; instead, the root knows which smaller book covers `.com`, the `.com` book knows which even smaller book covers `example.com`, and only `example.com`'s own book (its authoritative nameservers) has the actual entry you want. A resolver's job is to follow that chain of referrals so you don't have to, and to remember the final answer for a while so it doesn't have to ask again immediately.
+
+## 3. How it works
+
+### Name hierarchy
+
+```mermaid
+flowchart TB
+    Root(["'.' (root)"])
+    COM["'.com' (TLD)"]
+    ORG["'.org' (TLD)"]
+    EX["'example.com' (second-level domain)"]
+    WWW["'www.example.com' (subdomain)"]
+    API["'api.example.com' (subdomain)"]
+    Root --> COM
+    Root --> ORG
+    COM --> EX
+    EX --> WWW
+    EX --> API
+```
+
+Every fully qualified domain name technically ends in an (usually hidden) trailing dot for the root: `example.com.`. Reading right to left: root, then TLD (`.com`), then the registered second-level domain (`example.com`), then any subdomains the owner creates (`www`, `api`).
+
+### Stub resolver, recursive resolver, and the recursive-vs-iterative split
+
+Your laptop's networking stack is a **stub resolver**: it doesn't know how to walk the hierarchy itself. It asks a **recursive resolver** — your ISP's, a public one like `8.8.8.8` (Google) or `1.1.1.1` (Cloudflare), or a cloud VPC's built-in resolver (e.g. AWS's `.2` address in each VPC subnet, `169.254.169.253` for EC2 instance metadata-based resolution) — to do the whole lookup and hand back a final answer.
+
+The recursive resolver does the actual walk using **iterative** queries: it asks the root "who handles `.com`," gets a **referral** (not the final answer, just "ask this other server"), asks the `.com` TLD server "who handles `example.com`," gets another referral, and finally asks `example.com`'s own authoritative server for the `A` record. The client's query to the recursive resolver is "recursive" (give me the final answer or an error, don't make me do the walk); the resolver's queries to root/TLD/authoritative servers are "iterative" (give me your best answer or a referral, I'll handle the rest).
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant OS as OS stub resolver
+    participant Rec as Recursive resolver (e.g. 1.1.1.1)
+    participant Root as Root server
+    participant TLD as .com TLD server
+    participant Auth as example.com authoritative server
+    Browser->>OS: resolve example.com
+    OS->>Rec: recursive query: example.com A?
+    Note over Rec: not cached - must walk the hierarchy
+    Rec->>Root: iterative query: example.com A?
+    Root-->>Rec: referral: ask the .com TLD servers
+    Rec->>TLD: iterative query: example.com A?
+    TLD-->>Rec: referral: ask example.com's authoritative servers
+    Rec->>Auth: iterative query: example.com A?
+    Auth-->>Rec: answer: A 172.66.147.243 (TTL 230s)
+    Note over Rec: cache the answer for 230s
+    Rec-->>OS: answer: 172.66.147.243
+    OS-->>Browser: 172.66.147.243
+```
+
+This redraws the hierarchy walk as a sequence: browser cache is checked first, then the OS/stub resolver cache, then the recursive resolver's cache; only a full miss at all three triggers the root → TLD → authoritative walk, and the fresh answer is cached going back up.
+
+### Caching layers, TTL, and negative caching
+
+A DNS answer is cached at several independent layers, each with its own lifetime bounded by the record's **TTL** (seconds):
+
+| Layer | Typical lifetime | Notes |
+| --- | --- | --- |
+| Browser DNS cache | Seconds to a couple of minutes, capped regardless of TTL | Chrome caches for up to 60s by default even if TTL is longer |
+| OS resolver (`systemd-resolved`, Windows DNS Client, macOS `mDNSResponder`) | Honors TTL | `/etc/hosts` entries bypass DNS entirely and never expire |
+| Recursive resolver (ISP, 8.8.8.8, 1.1.1.1, VPC resolver) | Honors TTL | Shared across every client using that resolver — the layer with the biggest real-world cache-hit impact |
+| Application-level cache (e.g. Go's `net.Resolver` wrapped manually) | Whatever you build | Go's standard library does **not** cache lookups itself — see the Go section below |
+
+Choosing a TTL is a trade-off: a **low TTL** (seconds to low minutes) means a DNS failover or IP change takes effect almost immediately everywhere, at the cost of far more queries hitting your authoritative servers. A **high TTL** (hours to a day) means better cache-hit rates and lower load, at the cost of a slow rollout when you do need to change the IP — which is why operators deliberately **lower the TTL before a planned migration** and raise it back afterward.
+
+**Negative caching** (RFC 2308) caches the *absence* of a record too: when a name doesn't exist (`NXDOMAIN`) or a record type doesn't exist for that name, the resolver caches that negative answer for the TTL given on the `SOA` record's minimum field, so repeatedly asking for a misspelled or not-yet-created name doesn't hammer the authoritative servers either.
+
+**Measured (dig 9.10.6, 2026-11-06), an NXDOMAIN response carries the zone's SOA in the authority section, which supplies the negative-caching TTL:**
+
+```text
+$ dig doesnotexist-xyz123.example.com A +noall +authority
+example.com.  1790  IN  SOA  elliott.ns.cloudflare.com. dns.cloudflare.com. 2418004112 10000 2400 604800 1800
+```
+
+The last field (`1800`) is the negative-cache TTL: resolvers hold onto "this name doesn't exist" for up to 1800 seconds.
+
+### Zones, delegation, and glue records
+
+A **zone** is the portion of the naming tree one set of nameservers is authoritative for. `example.com` is delegated from the `.com` zone via `NS` records naming `example.com`'s nameservers; `.com` itself is delegated from the root the same way. When a nameserver's own name is *inside* the zone it serves (e.g. `ns1.example.com` serving `example.com`), the parent zone must also publish a **glue record** — an `A`/`AAAA` record for `ns1.example.com` alongside the delegation — because resolving `ns1.example.com`'s address would otherwise require already knowing it, a circular dependency glue records exist specifically to break.
+
+### 13 root identities, anycast, and UDP/TCP
+
+There are only **13 root server names** (`a.root-servers.net` through `m.root-servers.net`), a limit baked into the original protocol's 512-byte UDP response size. But each of those 13 names is served from **hundreds of physical locations worldwide via anycast** — the same IP address announced via BGP from many places, with normal internet routing sending each query to the topologically nearest instance (see [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] for how anycast works at the routing layer). So "13 root servers" really means 13 *identities*, not 13 machines.
+
+DNS queries normally run over **UDP port 53** for speed (no handshake), falling back to **TCP port 53** when a response is too large for one UDP datagram (common for DNSSEC-signed responses, or a name with many records) or when a client asks for a zone transfer. **EDNS0** (RFC 6891) extends the original 512-byte UDP limit, letting a resolver advertise a larger buffer size (commonly 1232 or 4096 bytes) in its queries, so more responses fit in UDP without needing the TCP fallback.
+
+### Records
+
+| Type | Purpose | Example |
+| --- | --- | --- |
+| `A` | Maps a name to an IPv4 address | `example.com. 230 IN A 172.66.147.243` |
+| `AAAA` | Maps a name to an IPv6 address | `example.com. 230 IN AAAA 2606:4700:10::6814:179a` |
+| `CNAME` | Aliases one name to another (the resolver re-queries the target) | `www.github.com. 1024 IN CNAME github.com.` |
+| `MX` | Which mail server(s) handle mail for this domain, with a priority | `google.com. 300 IN MX 10 smtp.google.com.` |
+| `TXT` | Arbitrary text; commonly SPF/DKIM/DMARC or domain-ownership proof | `google.com. 300 IN TXT "google-site-verification=4ibFUgB-..."` |
+| `NS` | Delegates a zone to a set of authoritative nameservers | `example.com. 86130 IN NS elliott.ns.cloudflare.com.` |
+| `SOA` | One per zone: primary nameserver, admin contact, serial, refresh/retry/expire/minimum-TTL | `iana.org. 3600 IN SOA sns.dns.icann.org. noc.dns.icann.org. 2026110301 7200 3600 1209600 3600` |
+| `PTR` | Reverse lookup: IP back to a name, under the special `in-addr.arpa`/`ip6.arpa` zones | `8.8.8.8.in-addr.arpa. 76554 IN PTR dns.google.` |
+| `SRV` | Service location: priority, weight, port, and target host for a named service | `_caldavs._tcp.google.com. 2557 IN SRV 5 0 443 calendar.google.com.` |
+| `CAA` | Which Certificate Authorities may issue TLS certs for this domain | `google.com. 86400 IN CAA 0 issue "pki.goog"` |
+
+**Measured (dig 9.10.6, against the live DNS system, 2026-11-06)** — every row above is a real answer captured with `dig <name> <TYPE> +noall +answer`, not invented data.
+
+**CNAME rule at the zone apex:** a `CNAME` record cannot coexist with any other record type at the same name (RFC 1034 §3.6.2), and the **zone apex** (the bare domain, e.g. `example.com` itself, which must carry the zone's `SOA` and `NS` records) can never be a `CNAME`. This is why you can't `CNAME` a bare domain straight to a load balancer's hostname — the workaround is a provider-specific **ALIAS** record (Route 53's "Alias" target, Cloudflare's "CNAME flattening") that behaves like a CNAME to clients but is implemented inside the DNS provider so it can legally sit at the apex alongside `SOA`/`NS`.
+
+**SPF/DKIM/DMARC** are all published as `TXT` records, not a dedicated record type: SPF lists which servers may send mail as your domain (`v=spf1 include:_spf.google.com ~all`), DKIM publishes a public key under a selector subdomain for verifying a cryptographic mail signature, and DMARC (`_dmarc.example.com TXT`) tells receivers what to do when SPF/DKIM fail (quarantine, reject, or just report).
+
+### DNS-based load balancing, GeoDNS, and health-checked failover
+
+Because a resolver can return *different* answers to different queries, DNS itself becomes a crude load balancer and failover mechanism, entirely before any connection is attempted:
+
+- **Round-robin DNS**: return multiple `A`/`AAAA` records (as example.com does above) and let the client (or its OS) pick one, usually the first or a random one — simple, but a client can keep retrying a dead IP until its own cache expires.
+- **GeoDNS / latency-based routing**: the authoritative server inspects the querying resolver's location (approximated from its IP) and returns the IP of the nearest region or data center — this is how a single name like `example.com` can route users in Mumbai to a Mumbai data center and users in Dublin to a Dublin one.
+- **Health-checked failover** (e.g. AWS Route 53 health checks): the authoritative server actively probes each candidate endpoint and stops returning the IP of one that's failing health checks, automatically failing traffic over to a healthy region within the next TTL-bounded lookup.
+
+This is deliberately *not* the same thing as the load-balancing algorithms (round robin, least connections, consistent hashing) a proxy or load balancer runs per-request — those operate after a connection is already established to one IP; see [[Load Balancing]] for that layer. DNS-based routing only ever decides *which IP a client receives*, coarsely and bounded by caching, not which backend handles each individual request.
+
+### Kubernetes DNS
+
+Inside a Kubernetes cluster, **CoreDNS** is the cluster's internal DNS server, resolving service names like `my-svc.my-namespace.svc.cluster.local` to a Service's ClusterIP. Pods get a resolver config with `ndots:5` by default and a `search` list of domain suffixes (the namespace, `svc.cluster.local`, the cluster domain) — a bare name like `my-svc` tries each search suffix in turn (`my-svc.my-namespace.svc.cluster.local` first) before falling back to treating it as fully qualified. A name with 5 or more dots skips the search list entirely and is queried as-is, which is the usual culprit when a pod can resolve external names slowly (every search suffix is tried and fails before the final absolute lookup succeeds) — one real fix is appending a trailing dot to fully qualified external names in application config to force an absolute query immediately.
+
+### Security: DNSSEC, DoH/DoT, cache poisoning
+
+Plain DNS has no authentication: a resolver has no cryptographic way to know an answer wasn't forged by an on-path attacker or injected via a poisoned cache (classically, racing a forged response to arrive before the real authoritative answer, exploiting predictable query IDs or ports). **DNSSEC** fixes this by having zones cryptographically sign their records (`RRSIG`) with keys published as `DNSKEY` records, chained up to the root via `DS` records at each parent zone, so a validating resolver can verify an answer wasn't tampered with.
+
+**Measured (dig 9.10.6, 2026-11-06)**, a DNSSEC-signed answer for a real zone:
+
+```text
+$ dig cloudflare.com +dnssec A +noall +answer
+cloudflare.com.  116  IN  A      104.16.132.229
+cloudflare.com.  116  IN  A      104.16.133.229
+cloudflare.com.  111  IN  RRSIG  A 13 2 300 20261107192411 20261105172411 34505 cloudflare.com. EeoK3n2y...
+```
+
+DNSSEC authenticates answers but does not encrypt the query itself — anyone on the network path (an ISP, a coffee-shop Wi-Fi operator) can still see which domains you're resolving. **DoH** (DNS over HTTPS, RFC 8484) and **DoT** (DNS over TLS, RFC 7858) fix that by encrypting the query/response channel between the stub and recursive resolver, at the cost of resolvers needing TLS termination and some networks' middleboxes no longer being able to filter plain-text DNS.
+
+### Reading `dig` output and `+trace`
+
+```text
+$ dig example.com A +noall +answer
+example.com.  230  IN  A  172.66.147.243
+example.com.  230  IN  A  104.20.23.154
+```
+
+Columns, left to right: name, **TTL remaining in seconds**, class (`IN` = internet, effectively always), type, and the record's data. `dig +trace` repeats the resolver's own iterative walk visibly, starting at the root and printing each referral — useful for debugging "why is this name resolving to the wrong thing," since it shows exactly which nameserver answered at each level rather than trusting a possibly-stale cache.
+
+## 4. Worked example
+
+### Whiteboard version
+
+The bare idea: Go's resolver answers a query, but caches nothing — every call is a fresh network round trip unless you cache it yourself.
+
+```go
+addrs, err := net.DefaultResolver.LookupHost(context.Background(), "example.com")
+```
+
+The full version below wraps that call with a TTL-respecting cache, proving a second lookup inside the TTL window never touches the network again.
+
+```go
+// Package dnscache wraps net.Resolver with the TTL-aware caching that Go's
+// standard library deliberately does not provide: every call to
+// Resolver.LookupHost hits the resolver again, so an app that wants fewer
+// upstream queries caches the answer itself and honours the record's TTL.
+package dnscache
+
+import (
+	"context"
+	"net"
+	"sync"
+	"time"
+)
+
+// Resolver is the subset of *net.Resolver this package needs, so tests can
+// fake it without a real DNS query.
+type Resolver interface {
+	LookupHost(ctx context.Context, host string) ([]string, error)
+}
+
+type entry struct {
+	addrs   []string
+	expires time.Time
+}
+
+// CachingResolver caches LookupHost answers in memory for ttl, the way an
+// application-level resolver cache (or systemd-resolved) avoids re-querying
+// upstream for every connection within a record's lifetime.
+type CachingResolver struct {
+	Upstream Resolver
+	TTL      time.Duration
+	Now      func() time.Time // overridable for tests
+
+	mu    sync.Mutex
+	cache map[string]entry
+}
+
+// Lookup returns cached addresses if they have not expired, otherwise
+// queries Upstream and caches the result for TTL.
+func (c *CachingResolver) Lookup(ctx context.Context, host string) ([]string, bool, error) {
+	now := c.Now
+	if now == nil {
+		now = time.Now
+	}
+	c.mu.Lock()
+	if c.cache == nil {
+		c.cache = make(map[string]entry)
+	}
+	if e, ok := c.cache[host]; ok && now().Before(e.expires) {
+		c.mu.Unlock()
+		return e.addrs, true, nil // cache hit
+	}
+	c.mu.Unlock()
+
+	addrs, err := c.Upstream.LookupHost(ctx, host)
+	if err != nil {
+		return nil, false, err
+	}
+	c.mu.Lock()
+	c.cache[host] = entry{addrs: addrs, expires: now().Add(c.TTL)}
+	c.mu.Unlock()
+	return addrs, false, nil // cache miss, freshly queried
+}
+
+// fakeResolver is a stand-in for net.Resolver used in tests: it counts
+// calls so the test can assert the cache actually suppressed a query.
+type fakeResolver struct {
+	mu    sync.Mutex
+	calls int
+	addrs []string
+}
+
+func (f *fakeResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	return f.addrs, nil
+}
+
+// realResolverExample shows the production shape: a context-aware,
+// pure-Go resolver pointed at a specific DNS server (bypassing cgo /
+// /etc/resolv.conf), as described in the note's Go section.
+func realResolverExample() *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 3 * time.Second}
+			return d.DialContext(ctx, network, "1.1.1.1:53")
+		},
+	}
+}
+```
+
+```go
+func TestCacheHitSuppressesUpstreamQuery(t *testing.T) {
+	fake := &fakeResolver{addrs: []string{"93.184.216.34"}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c := &CachingResolver{
+		Upstream: fake,
+		TTL:      60 * time.Second,
+		Now:      func() time.Time { return now },
+	}
+
+	addrs, hit, err := c.Lookup(context.Background(), "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit {
+		t.Fatal("first lookup must be a cache miss")
+	}
+	if len(addrs) != 1 || addrs[0] != "93.184.216.34" {
+		t.Fatalf("addrs = %v, want [93.184.216.34]", addrs)
+	}
+
+	// Still inside the 60s TTL: must be served from cache.
+	now = now.Add(30 * time.Second)
+	_, hit, err = c.Lookup(context.Background(), "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hit {
+		t.Fatal("lookup within TTL should be a cache hit")
+	}
+	if fake.calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (cache should have suppressed the second query)", fake.calls)
+	}
+
+	// Past the TTL: must requery upstream.
+	now = now.Add(31 * time.Second) // 61s total elapsed > 60s TTL
+	_, hit, err = c.Lookup(context.Background(), "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit {
+		t.Fatal("lookup after TTL expiry should be a cache miss")
+	}
+	if fake.calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (TTL expiry should trigger a requery)", fake.calls)
+	}
+}
+
+func TestRealResolverExampleIsWellFormed(t *testing.T) {
+	r := realResolverExample()
+	if !r.PreferGo {
+		t.Fatal("expected PreferGo: true so the pure-Go resolver is used")
+	}
+	if r.Dial == nil {
+		t.Fatal("expected a custom Dial pointed at a specific DNS server")
+	}
+}
+```
+
+**Measured (Go 1.24.4, darwin/arm64, 2026-11-06):** `go test -race -v` output:
+
+```text
+=== RUN   TestCacheHitSuppressesUpstreamQuery
+--- PASS: TestCacheHitSuppressesUpstreamQuery (0.00s)
+=== RUN   TestRealResolverExampleIsWellFormed
+--- PASS: TestRealResolverExampleIsWellFormed (0.00s)
+PASS
+ok  	net03	1.754s
+```
+
+**Go resolver notes:** `net.DefaultResolver.LookupHost` makes a fresh query every call — the standard library intentionally does no caching, leaving TTL handling to the caller (as above) or to the OS resolver it delegates to. Go has **two resolver implementations**: a pure-Go one (parses `/etc/resolv.conf` and speaks DNS itself) and a cgo one (calls the OS's native resolver via libc). Go picks automatically based on `/etc/resolv.conf` and `GODEBUG=netdns=`, but setting `Resolver.PreferGo = true` forces the pure-Go path — useful in minimal containers without a working libc resolver, or when you need to point at a specific DNS server as shown in `realResolverExample` above, bypassing `/etc/resolv.conf` entirely.
+
+## 5. Variants and comparison
+
+| Approach | How it decides the answer | Use when | Cost |
+| --- | --- | --- | --- |
+| Round-robin DNS | Rotates through multiple `A`/`AAAA` records | Simple multi-homing, no real traffic awareness needed | Clients may retry a dead IP until TTL expiry |
+| GeoDNS / latency routing | Returns the nearest region's IP based on resolver location | Multi-region services wanting users routed to the closest data center | Coarse: routes by resolver's location, not the client's exact location |
+| Health-checked failover (Route 53 et al.) | Actively probes endpoints, withholds unhealthy ones | Automatic regional failover | Failover is bounded by TTL, not instant |
+| Anycast (same IP, many locations) | Routing layer (BGP), not DNS, picks the nearest instance | Root/TLD servers, large CDNs, needing failover faster than any TTL | Requires owning IP announcement infrastructure, not just a DNS zone |
+| Split-horizon DNS | Different answers for internal vs external queries | Internal services that should resolve privately, same name externally | Operational complexity: keeping two zones consistent |
+
+## 6. Trade-offs and when not to use
+
+- DNS-based routing only changes *which IP* a client gets, bounded by TTL and by clients/resolvers that ignore TTL and over-cache — it is not a substitute for an L4/L7 load balancer's per-request routing (see [[Load Balancing]], [[Forward and Reverse Proxies - L4 vs L7]]).
+- A very low TTL for fast failover means every cache layer re-queries constantly, raising load and latency on authoritative servers and on every client's own lookup path.
+- Split-horizon DNS and similar tricks add real operational complexity (keeping two answer sets in sync) for a benefit that's often better solved by proper network segmentation.
+- GeoDNS approximates a user's location from their resolver's IP, which is wrong for anyone using a VPN, a public DNS resolver far from them, or a corporate resolver serving a geographically spread-out company.
+
+## 7. In production
+
+- **Real systems:** every public website; AWS Route 53 (health checks, weighted/latency/geolocation routing policies, and ALIAS records at the zone apex); Cloudflare and Google Public DNS as widely used recursive resolvers; Kubernetes' CoreDNS for cluster-internal service discovery.
+- **Failure modes → fixes:**
+	- **Forgot to lower TTL before a migration** → the old IP stays cached (and receiving traffic) for up to the old TTL everywhere, including resolvers you don't control; plan TTL reductions a full TTL period ahead of any planned cutover.
+	- **CNAME at the apex** attempted directly → DNS providers reject it (or silently break) because `SOA`/`NS` must coexist there; use an ALIAS/flattened-CNAME record instead.
+	- **Cache poisoning / spoofed responses** → deploy DNSSEC validation, and prefer resolvers that randomize source ports and query IDs (a mitigation, not a fix, for the pre-DNSSEC class of attacks).
+	- **`ndots:5` slow external lookups in Kubernetes** → append a trailing dot to external FQDNs in config, or tune `ndots` per pod, to skip the search-suffix retries.
+	- **Negative caching masking a just-fixed record** → a client that already cached an `NXDOMAIN` keeps getting it until the `SOA` minimum TTL expires, even after you add the missing record — this is distinct from, and usually shorter-lived than, a stale positive answer.
+- **What to monitor:** query volume and error rate (`SERVFAIL`, `NXDOMAIN`) at your authoritative nameservers, DNSSEC validation failures, health-check status on any GeoDNS/failover policy, and resolver response time from each client region.
+
+## 8. Deep dive
+
+- **Why the recursive/iterative split matters for trust and load:** the stub resolver trusts its recursive resolver completely (it can't verify the walk itself), which is exactly the trust boundary DNSSEC validation and DoH/DoT both operate on — a malicious or compromised recursive resolver can lie to every client behind it, which is why some organizations run their own validating recursive resolver rather than trusting a third party blindly.
+- **EDNS0 and fragmentation risk:** advertising a large UDP buffer (4096 bytes) avoids the TCP fallback round trip, but large UDP DNS responses are also the classic vector for **DNS amplification attacks** (a spoofed source IP triggers a small query that returns a response many times larger, flooding the spoofed victim) — operators rate-limit and apply response-size policies specifically because of this.
+- **Anycast's interaction with TCP:** anycast works cleanly for UDP (each packet can independently route to the nearest instance), but a TCP connection must stay pinned to one instance for its lifetime; if BGP routes change mid-connection (a "anycast flap"), the TCP connection breaks even though the IP address never changed — root/TLD operators engineer their routing to avoid exactly this.
+- **Why Go deliberately doesn't cache:** the standard library's position is that caching is a policy decision (how long, how to handle rotation, how to handle failures) that belongs in the application or in the OS resolver it already delegates to by default — baking in one cache policy would be wrong for some callers and right for others, so `net/http`'s default transport also does not cache DNS answers across requests on its own.
+- **DNSSEC's chain of trust and its gaps:** validating a record means walking `RRSIG` → `DNSKEY` → parent zone's `DS` record all the way to a trust anchor for the root — but DNSSEC authenticates non-existence awkwardly too (via `NSEC`/`NSEC3` records that prove no record exists between two names), and a large share of recursive resolvers still don't validate by default, so DNSSEC protects a zone only as well as the weakest validating resolver in the path actually checks it.
+
+## 9. Interview questions
+
+> [!question]- What's the difference between a recursive and an authoritative DNS server?
+> A recursive resolver does the full lookup on a client's behalf, walking root → TLD → authoritative and caching the result; it owns no data itself. An authoritative server holds the actual records for the zones it's responsible for and answers only for those — it never does the walk for anyone else.
+
+> [!question]- Trap: "DNS propagation after a change can take up to 48 hours."
+> There's no propagation delay in the sense people mean — the authoritative server's new answer is available immediately. What takes time is every cache (browser, OS, recursive resolver) that already holds the *old* answer waiting out its TTL. Lowering the TTL well before a planned change is the fix; raising it back afterward reduces load once things settle.
+
+> [!question]- Why can't you put a CNAME record at the zone apex (the bare domain)?
+> A CNAME can't coexist with any other record type at the same name, but the apex must carry the zone's SOA and NS records. DNS providers work around this with a provider-specific ALIAS or "CNAME flattening" record that behaves like a CNAME to clients but is resolved internally by the provider, so it can legally sit alongside SOA/NS.
+
+> [!question]- How does negative caching work, and why does it matter?
+> A response saying a name or record type doesn't exist (NXDOMAIN, or NODATA) is cached too, using the TTL from the zone's SOA minimum field (carried in the authority section of the response). Without this, a typo'd or not-yet-created name would get re-queried against the authoritative servers on every single lookup.
+
+> [!question]- What's the practical difference between DNS-based load balancing and a load balancer's own routing algorithm?
+> DNS-based routing (round-robin, GeoDNS, health-checked failover) only decides which IP a client receives, and that decision is cached for up to the TTL — it happens before any connection exists. A load balancer's algorithm (round robin, least connections, consistent hashing) routes each individual request or connection in real time, after a client has already connected to one IP.
+
+> [!question]- Does Go's net.Resolver cache DNS answers between calls?
+> No — every call to LookupHost (or similar methods) triggers a fresh query. If you want TTL-respecting reuse, you wrap the resolver yourself (or rely on the OS resolver it may delegate to), because the standard library deliberately leaves caching policy to the caller.
+
+> [!question]- What problem do DoH and DoT solve that DNSSEC doesn't?
+> DNSSEC authenticates that an answer wasn't tampered with, but the query and response still travel in plain text, visible to anyone on the network path. DoH (over HTTPS) and DoT (over TLS) encrypt that channel between the stub and recursive resolver, protecting query privacy — a separate concern from answer integrity.
+
+## 10. Cheat sheet
+
+- Hierarchy: root `.` → TLD (`.com`) → second-level domain → subdomains; delegated via NS records at each level, with glue records breaking the self-referential case.
+- Stub resolver asks a recursive resolver (recursive query); the recursive resolver walks root/TLD/authoritative itself (iterative queries + referrals).
+- Record types to know cold: A, AAAA, CNAME, MX, TXT, NS, SOA, PTR, SRV, CAA.
+- CNAME can't sit at the zone apex or beside another record type; use ALIAS/flattening there instead.
+- TTL governs every cache layer; "propagation" is just TTL expiry, not something that spreads across the internet.
+- Negative caching (NXDOMAIN) uses the zone's SOA minimum TTL.
+- DNS-based load balancing (round-robin, GeoDNS, health-checked failover) picks an IP before any connection; it's not the same layer as a proxy's per-request load balancing.
+- Go's `net.Resolver` never caches on its own; wrap it if you need TTL-aware reuse.
+- DNSSEC authenticates answers; DoH/DoT encrypt the query channel — different problems, often both wanted.
+
+## Links
+
+- **Before this:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]], [[IP Addressing, Subnets, NAT and VPC Basics]]
+- **Next:** [[TLS and HTTPS]], [[CDN and Edge]]
+- **Compare with:** [[Load Balancing]] (per-request routing vs DNS's per-lookup routing), [[Forward and Reverse Proxies - L4 vs L7]]

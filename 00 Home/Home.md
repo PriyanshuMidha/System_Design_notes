@@ -114,6 +114,5 @@ flowchart LR
 
 The vault is being rebuilt folder by folder. [[Rebuild Tracker]] shows the progress, and [[Rebuild Plan]] explains why and how.
 
-- **Done:** 05 APIs, 07 Databases, 08 Caching & Redis, 09 Messaging & Async, 10 Distributed Systems & Resilience, 11 System Design, 17 LLD.
-- **Partially done:** 19 Interview & Career.
-- **Not yet started:** 00 Home, 01 CS Fundamentals, 02 Networking & Web, 03 Frontend, 04 Go Language, 06 Backend Engineering in Go, 12 Security & Auth, 13 DevOps & Cloud, 14 Observability & SRE, 15 Testing, 16 Software Architecture, 18 AI Engineering.
+- **Done:** every folder, 00 Home through 19 Interview & Career. Each note has passed an independent review, and every folder map is written.
+- **Legacy:** the old notes are retired, and git history keeps them. Only old screenshots remain in `advance backend/` and `bytes GO complete thimh/`.
