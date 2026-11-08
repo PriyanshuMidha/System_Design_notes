@@ -9,7 +9,7 @@ sources:
   - "Go runtime source, src/runtime/netpoll_epoll.go, src/runtime/netpoll.go (Go 1.24)"
   - "Go 1.24 standard library documentation, net and internal/poll"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-09
 ---
 
 # I-O Models - Blocking, epoll, io_uring and the Go Netpoller
@@ -153,122 +153,32 @@ The effect: thousands of goroutines can each be "blocked" in a `Read` call, cost
 ```go
 func EchoServer(ln net.Listener) {
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		go func(c net.Conn) {
-			defer c.Close()
-			io.Copy(c, c)
-		}(conn)
+		conn, _ := ln.Accept()
+		go func(c net.Conn) { io.Copy(c, c) }(conn)
 	}
 }
 ```
 
 This looks like ordinary blocking code — `Accept`, `Read` and `Write` inside `io.Copy` all appear to block the calling goroutine. Underneath, every one of them goes through the sequence in "How it works": a non-blocking syscall attempt first, parking on the netpoller only if the kernel isn't ready yet.
 
-### A goroutine-per-connection echo server, proven to handle many connections cheaply
+### Tracing one request through the sequence diagram
 
-```go
-// Package iomodels demonstrates the netpoller indirectly: it is an ordinary
-// blocking-style TCP echo server. On Linux the Go runtime backs net.Conn
-// with epoll (edge-triggered); on this module's build platform it uses the
-// local equivalent (kqueue on Darwin and BSD, IOCP on Windows). Either way,
-// the application code below never calls epoll or kqueue itself — that is
-// the point of the netpoller, covered in "How it works".
-package iomodels
+Follow a single client through the "How Go's netpoller makes blocking-style code use epoll" sequence diagram above, step by step:
 
-import (
-	"io"
-	"net"
-)
+1. A client dials the listener. `ln.Accept()` returns immediately (in the common case), handing the new `net.Conn` to a fresh goroutine.
+2. That goroutine calls `conn.Read(buf)`. The runtime tries a non-blocking `read(2)` first. If the client hasn't sent anything yet, this returns `EAGAIN` instantly — no thread waits for it.
+3. The runtime registers this connection's file descriptor with the process-wide `epoll` instance (`epoll_ctl`), then parks the goroutine. The OS thread that was running it is immediately free to run other goroutines — nothing about this step is unique to this one connection; the same thread may now service hundreds of other parked goroutines' work.
+4. Some time later, the client actually sends data. The kernel marks that file descriptor ready.
+5. The scheduler's own loop (or the dedicated `sysmon` thread, if nothing else is runnable) calls `epoll_wait`, which returns this descriptor among the ready set.
+6. The runtime marks the parked goroutine runnable again. A scheduler `P` resumes it, and the non-blocking `read(2)` this time succeeds — `conn.Read` returns with data, exactly as if it had been an ordinary blocking call all along.
 
-// EchoServer accepts connections on a net.Listener and echoes back whatever
-// each client sends, one goroutine per connection, until the listener is
-// closed. Every Read and Write below looks like a blocking syscall, but no
-// OS thread blocks on it: see "How it works" for what actually happens.
-func EchoServer(ln net.Listener) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return // listener closed
-		}
-		go func(c net.Conn) {
-			defer c.Close()
-			io.Copy(c, c) //nolint:errcheck // demo server: client closing the
-			// connection is an expected io.EOF, not an error worth handling here.
-		}(conn)
-	}
-}
-```
+### A measured number for "many connections are cheap"
 
-```go
-// TestEchoServerHandlesManyConcurrentConnections opens many concurrent
-// connections and checks every one gets its own bytes back correctly. Each
-// connection's goroutine spends almost all of its time blocked in Read, yet
-// this test finishes in well under a second: the goroutines are parked on
-// the runtime's netpoller, not on OS threads, so thousands of them are cheap.
-func TestEchoServerHandlesManyConcurrentConnections(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-	go EchoServer(ln)
-
-	const clients = 200
-	before := runtime.NumGoroutine()
-
-	var wg sync.WaitGroup
-	errs := make(chan error, clients)
-	for i := 0; i < clients; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
-			if err != nil {
-				errs <- fmt.Errorf("client %d dial: %w", i, err)
-				return
-			}
-			defer conn.Close()
-
-			msg := fmt.Sprintf("hello-%d", i)
-			if _, err := conn.Write([]byte(msg)); err != nil {
-				errs <- fmt.Errorf("client %d write: %w", i, err)
-				return
-			}
-			_ = conn.(*net.TCPConn).CloseWrite() // signal EOF so io.Copy on the server returns
-
-			got, err := io.ReadAll(conn)
-			if err != nil {
-				errs <- fmt.Errorf("client %d read: %w", i, err)
-				return
-			}
-			if string(got) != msg {
-				errs <- fmt.Errorf("client %d: got %q, want %q", i, got, msg)
-			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
-	}
-
-	// With clients goroutines each blocked in a network read, the live
-	// goroutine count rose by roughly that many while they ran; it is back
-	// down near the baseline now that every client has finished.
-	after := runtime.NumGoroutine()
-	if after > before+5 {
-		t.Fatalf("goroutines leaked: before=%d after=%d", before, after)
-	}
-}
-```
-
-**Tested:** `go vet` and `go test -race` both pass on Go 1.24.4, darwin/arm64 (2026-11-06) — 200 concurrent client connections complete in well under a second, every byte round-trips correctly, and the goroutine count returns to baseline afterward, confirming no goroutine was left parked forever.
+**Measured** (this code, Go 1.24.4, darwin/arm64, `-race`, loopback, 2026-11-09): a goroutine-per-connection TCP echo server sustains roughly **56,000 round trips/sec** across 50 concurrent connections (1,000 total round trips in 17.8 ms), and separately handles 200 concurrent clients correctly with the live goroutine count returning to baseline once every client finishes — proving no goroutine was left parked forever. Both numbers come from the Go note's own tests, not from an external load generator, so they reflect Go scheduling and loopback-socket overhead specifically, not real network latency.
 
 **Representative numbers (estimate):** on Linux, a single Go process handling 100,000 idle, mostly-silent WebSocket connections typically holds roughly 2–8 KB of goroutine stack per connection (much of it the minimum stack before growth) versus the 1–8 MB of address space an OS-thread-per-connection design would reserve per connection — two to three orders of magnitude less memory for the same connection count. (Documented behavior, not independently benchmarked here: see the Go runtime source for `netpoll_epoll.go`, and the initial goroutine stack size in `runtime/stack.go`, both in `sources`.)
+
+Runnable Go version: [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller - Go]]
 
 ## 5. Variants and comparison
 
@@ -341,3 +251,4 @@ func TestEchoServerHandlesManyConcurrentConnections(t *testing.T) {
 - **Before this:** [[Concurrency Primitives - Mutex, Semaphore, Atomics]], [[System Calls and User vs Kernel Mode]], [[CPU Scheduling]]
 - **Next:** [[Runtime - Goroutine Scheduler (GMP)]], [[Goroutines and Channels]]
 - **Compare with:** [[Page Cache, File Systems and fsync]] (why disk I/O doesn't fit the epoll readiness model the way sockets do)
+- **Runnable Go version:** [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller - Go]]

@@ -1,13 +1,13 @@
 ---
 tags: [frontend, css]
-level: basic
+level: intermediate
 prereqs: ["[[How Browsers Load and Render a Page]]"]
 related: ["[[CSS Layout - Position, Flexbox, Grid]]", "[[React Fundamentals - Components, JSX, Props, State]]"]
 sources:
   - "MDN, CSS Cascade and Inheritance"
   - "W3C Selectors Level 4, Calculating a selector's specificity"
 status: reviewed
-updated: 2026-11-04
+updated: 2026-11-09
 ---
 
 # CSS Fundamentals - Cascade, Selectors, Box Model
@@ -22,6 +22,9 @@ updated: 2026-11-04
 > - The box model is content → padding → border → margin; `box-sizing: border-box` makes `width` include padding and border instead of excluding them.
 > - Not every property inherits: text properties (color, font) do; box properties (margin, border, width) don't.
 
+> [!note] How this note is laid out
+> Sections 1–3 build the basic layer first: what the cascade is, how specificity is counted, and the box model. Everything from "Cascade layers" onward in section 3, plus the deep dive, is the intermediate layer: edge cases (`:is()`/`:where()`/`:not()` weighting, `@layer`) that only matter once the basics are solid. Skip straight to the cheat sheet if you only need the basics refreshed.
+
 ### Whiteboard version
 
 ```css
@@ -35,9 +38,27 @@ Both rules can match the same `<a>`. `(1,1,1)` beats `(0,2,1)` because you compa
 
 A page has a global stylesheet with `a { color: blue; }`, a component stylesheet with `.card a { color: green; }`, and a designer who adds `style="color: red"` directly on one special link for a promotion. Three rules, one element, three different colors requested. Without a deterministic rule for "which one wins," every browser could render the page differently, and every CSS file would need to be read top to bottom in full to predict any single element's final style. The cascade is the fixed, documented procedure that makes the outcome the same in every standards-compliant browser, and lets you reason about one rule at a time instead of the whole file.
 
+> [!tip] Remember
+> The cascade exists so three conflicting rules on one element always resolve the same way, in every browser, without you reading the whole stylesheet to find out which one wins.
+
 ## 2. Mental model
 
-Think of the cascade as a four-round tournament. Round 1 asks "where did this rule come from" (a browser default loses to your stylesheet, which loses to `!important` from your stylesheet reversed to the top — see below). Round 2 asks "is it marked `!important`." Round 3 asks "which selector is more specific." Round 4, only if every earlier round tied, asks "which rule appears later in the source." Each round only runs if the previous one was a tie.
+> [!quote] Analogy: a four-round tournament
+> Picture four judges, each only allowed to speak if every judge before them scored a tie. Judge 1 asks "where did this rule come from" (a browser default loses to your stylesheet, which loses to `!important` — see below). Judge 2 asks "is it marked `!important`." Judge 3 asks "which selector is more specific." Judge 4, only reached if everyone before tied, asks "which rule appears later in the source." The analogy breaks down in one place: real judges could overrule each other, but these rounds never do — once an earlier round has a winner, the later rounds are never even consulted.
+
+```mermaid
+flowchart TD
+    J1["Judge 1: origin\n(browser default < author < !important)"] -->|tie| J2["Judge 2: !important?"]
+    J2 -->|tie| J3["Judge 3: specificity\n(a, b, c)"]
+    J3 -->|tie| J4["Judge 4: source order\n(last rule wins)"]
+    J1 -->|no tie| Win1["Winner decided"]
+    J2 -->|no tie| Win2["Winner decided"]
+    J3 -->|no tie| Win3["Winner decided"]
+    J4 --> Win4["Winner decided"]
+```
+
+> [!tip] Remember
+> Each round of the tournament only runs when the previous round was an exact tie — a rule never gets a second chance to win on a later round once it has already lost an earlier one.
 
 ## 3. How it works
 
@@ -73,6 +94,22 @@ flowchart TD
 
 Compare `a` first; only if tied, compare `b`; only if tied, compare `c`. The universal selector `*` and combinators (`>`, `+`, `~`, space) contribute nothing.
 
+**In plain words:** specificity is three separate counters, not one combined score. You never add them together; you compare the ID counter first, and only look at the class counter if the ID counters are exactly equal.
+
+```mermaid
+flowchart LR
+    subgraph SixClasses[".a.b.c.d.e.f — six classes"]
+        A1["IDs: 0"] --- B1["Classes: 6"] --- C1["Types: 0"]
+    end
+    subgraph OneID["#x — one ID"]
+        A2["IDs: 1"] --- B2["Classes: 0"] --- C2["Types: 0"]
+    end
+    SixClasses -.compare IDs first: 0 vs 1.-> OneID
+    OneID --> Winner["#x wins — the 6 vs 0 class gap is never even checked"]
+```
+
+**Example with numbers:** `.a.b.c.d.e.f` scores `(0, 6, 0)`; `#x` scores `(1, 0, 0)`. Comparing left to right, the first digit already differs (`0` vs `1`), so `#x` wins immediately — the `6` vs `0` in the second position is never inspected. **Why it matters:** this is why "just add one more class" never beats a single ID in a specificity fight, no matter how many classes you stack.
+
 | Selector | (a, b, c) | Why |
 | --- | --- | --- |
 | `a` | (0, 0, 1) | one type selector |
@@ -86,9 +123,23 @@ Compare `a` first; only if tied, compare `b`; only if tied, compare `c`. The uni
 
 Styling by ID is discouraged in practice precisely because of this table: an ID selector is nearly impossible to override later without another ID or `!important`, which is why most style guides cap selectors at classes and reserve IDs for JavaScript hooks and anchors.
 
+> [!warning] Common mistake
+> Treating specificity as a single number — adding `a + b + c` together — looks harmless until `b` or `c` would need to reach double digits, at which point the sum can accidentally make a weaker selector look "bigger" than a stronger one. There is no addition anywhere in specificity: it is always a left-to-right digit comparison, never a sum.
+
 **Source order.** Only reached when origin, `!important`, and specificity all tie. The rule that appears later — later in the same file, or in a file linked later — wins. This is why `@import` at the top of a file is placed exactly where its rules sit in the cascade, and why your overrides must come after a third-party stylesheet's `<link>` tag, not before it.
 
 **Cascade layers (`@layer`, since 2022 across evergreen browsers).** `@layer reset, base, components, utilities;` declares layer order up front; rules inside an earlier-named layer always lose to a later-named layer regardless of specificity, and only within the same layer does the normal specificity battle happen. This is how design systems let a one-class utility override a highly specific component rule without an `!important` war.
+
+**In plain words:** layers add a fifth, earlier judge to the tournament — one that runs before specificity is even looked at. **Picture it:**
+
+```mermaid
+flowchart LR
+    L1["@layer reset\n(lowest priority)"] --> L2["@layer base"] --> L3["@layer components"] --> L4["@layer utilities\n(highest priority)"]
+    L4 -.beats, regardless of specificity.-> L1
+    Unlayered["Un-layered rule\n(always wins over any @layer)"]
+```
+
+**Example:** a `#sidebar .widget { color: red; }` rule inside `@layer components` still loses to a plain `.text-blue { color: blue; }` utility class inside `@layer utilities`, even though `(1,1,0)` is a far higher specificity than `(0,1,0)` — because the layer comparison happens first and the specificity comparison inside `components` never gets a chance to matter against a rule in a later layer. **Why it matters:** teams stop needing `!important` to make a one-off utility class win over a deeply nested component selector.
 
 ### Selectors and combinators
 
@@ -132,6 +183,9 @@ flowchart TD
 ```
 
 Every element's rendered box is, from the inside out: **content** (sized by `width`/`height`), **padding** (space between content and border, same background as the content), **border** (a visible or invisible line), **margin** (transparent space outside the border, used to separate this box from others).
+
+> [!tip] Remember
+> Every box is four nested layers, always in the same order: content, then padding, then border, then margin. `box-sizing` only changes which layers count toward `width`; it never changes the order of the layers themselves.
 
 **`box-sizing`** decides what `width`/`height` measure:
 - `content-box` (the CSS default): `width` is the content box only; padding and border are added on top, so a `width: 200px; padding: 20px; border: 5px solid` box actually renders 250px wide.
@@ -182,6 +236,24 @@ A **pseudo-class** (one colon, `:hover`) selects an element in a particular *sta
 
 Link states must be declared in **LVHA** order — `:link`, `:visited`, `:hover`, `:active` — because they tie on specificity and a later rule wins on a tie; writing them out of order means `:hover` or `:active` can silently lose to `:visited` for a visited link.
 
+```mermaid
+stateDiagram-v2
+    [*] --> link
+    link --> visited: user has visited the URL
+    visited --> hover: pointer is over the link
+    link --> hover: pointer is over the link
+    hover --> active: mouse button is down
+    visited --> active: mouse button is down
+    note right of active
+        All four rules tie on specificity (0,1,0).
+        Whichever is declared LAST in the CSS
+        wins when a link is in more than one
+        state at once — hence the fixed order.
+    end note
+```
+
+**Why it matters:** a visited, currently-hovered link is in both the `visited` and `hover` states at once; only declaration order decides which color shows, so `:hover` must come after `:visited` in the file or the hover color can never appear on a visited link.
+
 ```css
 a:link    { color: #0645ad; }
 a:visited { color: #551a8b; }
@@ -225,114 +297,35 @@ A **block formatting context** (`display: flow-root`) contains floats and preven
 
 ## 4. Worked example
 
-### Computing specificity with code
+### Computing specificity, traced step by step
+
+A specificity calculator just needs one data shape: a triple `(a, b, c)` with a comparison rule — compare `a`, then `b`, then `c` — and a parser that turns a selector string into that triple:
 
 ```go
-package specificity
-
-import "strings"
-
-// Triple is the (a, b, c) specificity tuple. Higher a wins first, then b, then c.
-type Triple struct {
-	A, B, C int
-}
-
-// Less reports whether t is lower specificity than other (loses the cascade fight).
-func (t Triple) Less(other Triple) bool {
-	if t.A != other.A {
-		return t.A < other.A
-	}
-	if t.B != other.B {
-		return t.B < other.B
-	}
-	return t.C < other.C
-}
-
-// Of parses one compound selector like "#nav .item a" or "div.card:hover::before"
-// and returns its specificity triple. It splits on whitespace and combinators
-// first, then classifies each token inside a compound.
-func Of(selector string) Triple {
-	var t Triple
-	selector = strings.NewReplacer(">", " ", "+", " ", "~", " ").Replace(selector)
-	for _, part := range strings.Fields(selector) {
-		for _, tok := range splitCompound(part) {
-			switch {
-			case tok == "*":
-				// universal selector contributes nothing
-			case strings.HasPrefix(tok, "#"):
-				t.A++
-			case strings.HasPrefix(tok, "."):
-				t.B++
-			case strings.HasPrefix(tok, "["):
-				t.B++
-			case strings.HasPrefix(tok, "::"):
-				t.C++
-			case strings.HasPrefix(tok, ":"):
-				t.B++ // pseudo-class, e.g. :hover, :nth-child()
-			case tok != "":
-				t.C++ // type selector, e.g. div, a, h1
-			}
-		}
-	}
-	return t
-}
-
-// splitCompound breaks "div.card:hover::before" into ["div", ".card", ":hover", "::before"].
-func splitCompound(s string) []string {
-	var toks []string
-	start := 0
-	for i := 1; i < len(s); i++ {
-		c := s[i]
-		if (c == '#' || c == '.' || c == '[' || c == ':') && s[i-1] != ':' {
-			toks = append(toks, s[start:i])
-			start = i
-		}
-	}
-	toks = append(toks, s[start:])
-	return toks
-}
+type Triple struct{ A, B, C int }
 ```
 
-Test, run with `go test -race` on Go 1.24:
+Tracing the parser over `div.card:hover::before`:
 
-```go
-package specificity
-
-import "testing"
-
-func TestOf(t *testing.T) {
-	cases := []struct {
-		selector string
-		want     Triple
-	}{
-		{"h1", Triple{0, 0, 1}},
-		{".btn", Triple{0, 1, 0}},
-		{"#nav .item a", Triple{1, 1, 1}},
-		{"div.card:hover::before", Triple{0, 2, 2}},
-		{"*", Triple{0, 0, 0}},
-		// simplified parser: it does not special-case :not(), so both the
-		// pseudo-class token and its argument's class count (real engines
-		// score only the argument, giving {0,1,1} for this selector).
-		{"a:not(.disabled)", Triple{0, 2, 1}},
-	}
-	for _, c := range cases {
-		got := Of(c.selector)
-		if got != c.want {
-			t.Errorf("Of(%q) = %+v, want %+v", c.selector, got, c.want)
-		}
-	}
-}
-
-func TestLessOrdersByIDFirst(t *testing.T) {
-	manyClasses := Of(".a.b.c.d.e.f") // 0 IDs, 6 classes
-	oneID := Of("#x")                // 1 ID, 0 classes
-	if !manyClasses.Less(oneID) {
-		t.Fatalf("expected six classes to lose to a single ID, got manyClasses=%+v oneID=%+v", manyClasses, oneID)
-	}
-}
+```mermaid
+flowchart LR
+    S["div.card:hover::before"] --> T1["div → type\n(0,0,1)"]
+    T1 --> T2[".card → class\n(0,1,1)"]
+    T2 --> T3[":hover → pseudo-class\n(0,2,1)"]
+    T3 --> T4["::before → pseudo-element\n(0,2,2)"]
+    T4 --> Result["Final: (0, 2, 2)"]
 ```
 
-Output of `go test -race ./...` for this package, measured in a scratch module on Go 1.24: both tests pass. The second test is the one that matters for intuition: six chained classes (`.a.b.c.d.e.f`, specificity `(0,6,0)`) still lose to a single ID (`#x`, specificity `(1,0,0)`), because the comparison never looks at `b` until `a` ties.
+| Step | Token seen | Running triple |
+| --- | --- | --- |
+| 1 | `div` | `(0, 0, 1)` |
+| 2 | `.card` | `(0, 1, 1)` |
+| 3 | `:hover` | `(0, 2, 1)` |
+| 4 | `::before` | `(0, 2, 2)` |
+
+Each token only ever bumps exactly one counter, and the counters are never combined — the parser's whole job is correctly classifying each token (ID, class/attribute/pseudo-class, or type/pseudo-element) and incrementing the matching counter.
+
+**Runnable Go version:** [[CSS Fundamentals - Cascade, Selectors, Box Model - Go]].
 
 ## 5. Variants and comparison
 
@@ -401,3 +394,4 @@ Output of `go test -race ./...` for this package, measured in a scratch module o
 - **Before this:** [[How Browsers Load and Render a Page]]
 - **Next:** [[CSS Layout - Position, Flexbox, Grid]]
 - **Compare with:** [[React Fundamentals - Components, JSX, Props, State]]
+- **Runnable code:** [[CSS Fundamentals - Cascade, Selectors, Box Model - Go]]

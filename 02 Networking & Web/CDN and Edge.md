@@ -3,14 +3,14 @@ tags: [networking, caching, cdn]
 level: intermediate
 status: reviewed
 prereqs: ["[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]", "[[DNS - Resolution, Records and Caching]]"]
-related: ["[[HTTP Caching - Cache-Control, ETag, Conditional Requests]]", "[[Forward and Reverse Proxies - L4 vs L7]]", "[[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]", "[[Load Balancing]]"]
+related: ["[[HTTP Caching - Cache-Control, ETag, Conditional Requests]]", "[[Forward and Reverse Proxies - L4 vs L7]]", "[[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]", "[[Load Balancing]]", "[[CDN and Edge - Go]]"]
 sources:
   - "MDN, HTTP caching"
   - "Cloudflare docs, How the Cloudflare global network works"
   - "Fastly docs, Request collapsing and shielding"
   - "AWS docs, Amazon CloudFront key concepts"
   - "RFC 9111, HTTP Caching"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # CDN and Edge
@@ -158,6 +158,20 @@ sequenceDiagram
 | Soft purge | Mark cached entries stale instead of deleting them, so the next request can still get `stale-while-revalidate` behavior while a fresh copy is fetched | Avoids a thundering-herd on the origin right after a purge |
 | Purge everything | Wipe the whole cache | Emergency only — this turns your entire traffic into origin traffic for a window, and is how a bad deploy becomes a bigger outage |
 
+**Picture it:** the four strategies trade off two things — how fast the change is consistent everywhere, and how much origin load the purge itself creates. A versioned URL is instant and free (the old URL is just abandoned); a full purge is instant but can overload the origin; tag-based and soft purge sit in between.
+
+```mermaid
+flowchart TD
+    Change["Content changed at origin"] --> Pick{"Invalidation strategy"}
+    Pick -->|"Versioned URL"| V["New URL, old one abandoned<br/>Consistency: instant · Origin load: none"]
+    Pick -->|"Tag / surrogate-key purge"| T["Purge only pages tagged with this object<br/>Consistency: seconds · Origin load: one fetch per purged page"]
+    Pick -->|"Soft purge"| S["Mark stale, serve stale-while-revalidate<br/>Consistency: seconds, briefly stale-tolerant · Origin load: one background fetch per page"]
+    Pick -->|"Purge everything"| P["Wipe entire cache<br/>Consistency: instant · Origin load: every PoP's next request, all at once"]
+```
+
+> [!tip] Remember
+> Versioned URLs need no purge at all; tag-based and soft purge trade a little staleness for low origin load; "purge everything" is the only one that can turn a routine deploy into an outage.
+
 ### Private content: never cache what shouldn't be shared
 
 - Never let a response carrying `Set-Cookie` get cached by a shared cache — most CDNs refuse this by default, but an explicit `private` or `no-store` on authenticated responses is the safer habit.
@@ -213,114 +227,23 @@ What stays at origin: anything that needs strongly consistent reads, writes with
 
 A product page's image gets requested by 1,000 users across 3 regions in one minute. With no CDN, the origin serves 1,000 full-size image responses. With a CDN: the first user in each region causes a miss (3 origin fetches total, one per region's shield); the other 997 requests are all hits. Origin traffic drops from 1,000 responses to 3.
 
-### Origin shield in Go: request collapsing
+### Tracing request collapsing step by step
 
-This is the mechanism a CDN's shield tier implements, shown in miniature: concurrent misses for the same key become one fetch.
+This is the mechanism a CDN's shield tier implements, shown in miniature: concurrent misses for the same key become one fetch. Walk through 100 edge requests arriving for the same expired key within a few milliseconds of each other:
 
-```go
-// Package shield implements request collapsing, the mechanism an origin
-// shield uses so that a mass cache expiry turns into one origin fetch
-// instead of one fetch per concurrent miss.
-package shield
+1. Request #1 arrives, finds no fetch already in progress for this key, and registers itself as "the one doing the fetch."
+2. Requests #2 through #100 arrive while #1's fetch is still running. Each one finds the registration from step 1 and simply waits for its result instead of starting its own.
+3. Request #1's fetch completes. Its result is handed to all 100 waiters at once, and the registration is removed.
+4. Request #101, arriving a moment later after the registration was removed, finds no fetch in progress — correctly treated as a brand-new miss, not an accidental 101st waiter on a stale result.
 
-import "sync"
+> [!warning] Common mistake
+> Holding a single lock for the *entire* fetch (not just the bookkeeping step) looks safer but is slower: it would force every other **key**, not just the same key, to wait its turn, removing the concurrency a shield exists to preserve. The lock should protect only "check and register," never the fetch itself.
 
-// Fetcher loads a value for key, as the origin would on a cache miss.
-type Fetcher func(key string) (value []byte, err error)
+**What happens if** step 4's cleanup ran *after* handing out the result instead of before? A request arriving in that narrow window would join a call that's already finished and about to be deleted — harmless here since it gets the same already-computed result, but it's the kind of ordering detail that turns into a real bug if the cleanup and the handoff are ever reordered carelessly.
 
-// Shield collapses concurrent misses on the same key into a single
-// in-flight call to fetch. Every caller waiting on that key gets the same
-// result; the next call after it finishes starts a fresh fetch.
-type Shield struct {
-	fetch func(key string) ([]byte, error)
+**Measured** (Go 1.24, `go test -race`, scratch module, 2026-11-09): a test asserting exactly 1 origin call for 100 concurrent requesters, and a second test confirming a *new* fetch happens once the in-flight call has finished (so collapsing doesn't last forever), both pass under the race detector.
 
-	mu       sync.Mutex
-	inFlight map[string]*call
-}
-
-type call struct {
-	done    chan struct{}
-	waiters int
-	value   []byte
-	err     error
-}
-
-func New(fetch Fetcher) *Shield {
-	return &Shield{fetch: fetch, inFlight: make(map[string]*call)}
-}
-
-// Get returns the cached-or-fetched value for key, and the number of
-// callers that shared this particular fetch (1 means no collapsing happened).
-func (s *Shield) Get(key string) (value []byte, shared int, err error) {
-	s.mu.Lock()
-	if c, ok := s.inFlight[key]; ok {
-		c.waiters++
-		shared := c.waiters
-		s.mu.Unlock()
-		<-c.done
-		return c.value, shared, c.err
-	}
-
-	c := &call{done: make(chan struct{}), waiters: 1}
-	s.inFlight[key] = c
-	s.mu.Unlock()
-
-	c.value, c.err = s.fetch(key)
-
-	s.mu.Lock()
-	delete(s.inFlight, key)
-	s.mu.Unlock()
-
-	close(c.done)
-	return c.value, c.waiters, c.err
-}
-```
-
-The test proves the promise directly: 100 concurrent misses on the same key produce exactly 1 origin call.
-
-```go
-func TestGetCollapsesConcurrentMisses(t *testing.T) {
-	var originCalls int64
-	block := make(chan struct{})
-
-	s := New(func(key string) ([]byte, error) {
-		atomic.AddInt64(&originCalls, 1)
-		<-block // hold the fetch open so all 100 callers arrive while it's in flight
-		return []byte("value-for-" + key), nil
-	})
-
-	const n = 100
-	var wg sync.WaitGroup
-	results := make([]string, n)
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func(i int) {
-			defer wg.Done()
-			v, _, err := s.Get("product:42")
-			if err != nil {
-				t.Errorf("Get: %v", err)
-				return
-			}
-			results[i] = string(v)
-		}(i)
-	}
-
-	time.Sleep(20 * time.Millisecond) // let all 100 goroutines join the in-flight call
-	close(block)
-	wg.Wait()
-
-	if got := atomic.LoadInt64(&originCalls); got != 1 {
-		t.Fatalf("origin was called %d times, want 1", got)
-	}
-	for i, v := range results {
-		if v != "value-for-product:42" {
-			t.Fatalf("result[%d] = %q, want value-for-product:42", i, v)
-		}
-	}
-}
-```
-
-**Measured** (Go 1.24, `go test -race`, this scratch module, 2026-11-06): both this test and a second one — confirming a *new* fetch happens once the in-flight call has finished, so collapsing doesn't last forever — pass under the race detector.
+Runnable Go version: [[CDN and Edge - Go]].
 
 ### Reading real cache headers
 
@@ -409,3 +332,4 @@ x-served-by: marketing-site
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[DNS - Resolution, Records and Caching]]
 - **Next:** [[Forward and Reverse Proxies - L4 vs L7]], [[What Happens When You Type a URL]]
 - **Compare with:** [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] (the browser/origin side of the same headers), [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]] (the general pattern this note's shield section is one instance of), [[Load Balancing]] (balancing within one origin fleet, not across the globe)
+- **Code:** [[CDN and Edge - Go]]

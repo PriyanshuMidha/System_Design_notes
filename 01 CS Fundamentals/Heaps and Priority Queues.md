@@ -3,12 +3,12 @@ tags: [cs-fundamentals, data-structures, heaps]
 level: intermediate
 status: reviewed
 prereqs: ["[[Arrays and Dynamic Arrays (Go Slices)]]", "[[Trees, BSTs and Balanced Trees]]"]
-related: ["[[Graphs and Graph Algorithms]]", "[[Scheduled Jobs - Cron to Durable Schedulers]]", "[[CPU Scheduling]]"]
+related: ["[[Graphs and Graph Algorithms]]", "[[Scheduled Jobs - Cron to Durable Schedulers]]", "[[CPU Scheduling]]", "[[Heaps and Priority Queues - Go]]"]
 sources:
   - "Cormen, Leiserson, Rivest, Stein, Introduction to Algorithms (3rd ed.), ch. 6"
   - "Go standard library docs, container/heap"
   - "Go runtime source, src/runtime/time.go (timer heap)"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Heaps and Priority Queues
@@ -24,22 +24,66 @@ updated: 2026-11-06
 
 ## 1. Why it exists
 
-Say a job scheduler holds 100,000 pending tasks, each with a deadline, and must always run whichever task is most urgent next — not the one that arrived first (that's a queue) and not any task picked at random. Keeping the list fully sorted would cost `O(n log n)` to build and `O(n)` per insert (shifting a sorted array) just to keep that order as new tasks arrive constantly.
+Say a job scheduler holds 100,000 pending tasks, each with a deadline, and must always run whichever task is most urgent next — not the one that arrived first (that's a queue, see [[Stacks, Queues and Deques]]) and not any task picked at random.
 
-A heap gives up full sorting and keeps only the single invariant the scheduler actually needs — "the root is always the most urgent" — which is far cheaper to maintain: `O(log n)` to insert a new task, `O(log n)` to remove the most urgent one, `O(1)` to peek at it. This is also exactly the data structure behind Dijkstra's and A\*'s "always process the closest/cheapest frontier node next" (see [[Graphs and Graph Algorithms]]).
+### 1.1 Why "keep it fully sorted" is too expensive
+
+**In plain words:** you might think "just keep the list sorted by urgency." The problem is that keeping a list sorted while things keep arriving is expensive — a new arrival has to be inserted in the middle, which means shifting everything after it.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    A["Sorted array\nO(n log n) to build\nO(n) per insert: shift elements"] --> Q{"Do we really need\nfull sorted order?"}
+    Q --> B["Heap\nO(log n) per insert\nkeeps only 'root is most urgent'"]
+```
+
+**Example:** inserting task 50,001 into a sorted array of 50,000 tasks means shifting, on average, 25,000 elements one slot over — just to keep the list ordered, even though the scheduler never asked "what's the 2nd most urgent task," only "what's the most urgent one."
+
+**Why it matters:** a **priority queue** (defined properly below) gives up the guarantee nobody was using — full order — and keeps only the one guarantee the scheduler actually needs. That's the entire reason it's cheaper.
+
+> [!tip] Remember
+> If you only ever ask "give me the most urgent item," paying to keep *everything* sorted is wasted work. A heap pays for exactly the guarantee you use.
+
+### 1.2 What a priority queue promises
+
+A heap gives up full sorting and keeps only the single invariant the scheduler actually needs — "the root is always the most urgent" — which is far cheaper to maintain: `O(log n)` to insert a new task, `O(log n)` to remove the most urgent one, `O(1)` to peek at it.
+
+This is also exactly the data structure behind Dijkstra's and A\*'s "always process the closest/cheapest frontier node next" (see [[Graphs and Graph Algorithms]]).
+
+> [!tip] Remember
+> A **priority queue** is the abstract promise ("give me the most urgent item"); a **heap** is the concrete array-based structure that delivers on it cheaply.
 
 ## 2. Mental model
 
-Think of a heap as a family tree of priorities, not values: a manager's priority is always at least as urgent as their direct reports' (for a min-heap, "urgent" means a small number). You can promise nothing about how a manager's priority compares to a *different* manager's reports — only the direct parent-child relationship is constrained. That weaker promise is exactly why building and maintaining a heap is cheaper than keeping everything fully sorted.
+**The hospital-triage-nurse analogy:** imagine a triage nurse managing patients in a waiting room. The nurse doesn't rank every patient against every other patient — that would take forever as new patients kept arriving. Instead, the nurse only promises: "the patient I call next is at least as urgent as anyone still waiting behind them." A manager's priority (in an org chart) works the same way: it's at least as urgent as their direct reports', but nothing is promised about how one manager's priority compares to a *different* manager's reports.
+
+**Where the analogy breaks down:** a heap's "parent/child" relationship is strict array-index math (`2i+1`, `2i+2`), not an org chart that grows organically — and unlike a hospital queue, a heap has no notion of "patients who are tied," only the relative order the comparison function defines.
+
+```mermaid
+flowchart TD
+    M["Manager (root): priority 1"] --> R1["Report A: priority 5"]
+    M --> R2["Report B: priority 3"]
+    R1 --> G1["Report A's report: priority 9"]
+    R1 --> G2["Report A's report: priority 7"]
+    note1["No promise between B (priority 3)\nand A's reports (9, 7) — only\ndirect parent/child is constrained"]
+```
+
+**Why it matters:** that weaker promise — only parent-vs-direct-child, nothing between unrelated branches — is exactly why building and maintaining a heap is cheaper than keeping everything fully sorted.
+
+> [!tip] Remember
+> A heap only constrains parent vs. its own children. Two "cousin" nodes can be in any order relative to each other.
 
 ## 3. How it works
 
-### Array layout of a complete binary tree
+### 3.1 Array layout of a complete binary tree
 
-A heap is a **complete binary tree**: every level is full except possibly the last, which fills left to right with no gaps. That completeness is what lets it live in a plain array with no pointers:
+**In plain words:** a heap is a **complete binary tree**: every level is full except possibly the last, which fills left to right with no gaps. That completeness — no holes anywhere except possibly at the very end — is what lets it live in a plain array with no pointers at all.
 
 - Node at index `i` has children at `2i+1` (left) and `2i+2` (right).
 - Node at index `i` has parent at `(i-1)/2` (integer division).
+
+**Picture it:**
 
 ```mermaid
 flowchart TD
@@ -58,15 +102,33 @@ flowchart TD
     end
 ```
 
-`[1]`'s children are at `2·1+1=3` (`80`) and `2·1+2=4` (`60`) — exactly matching the tree picture.
+**Example:** `[1]`'s children are at `2·1+1=3` (`80`) and `2·1+2=4` (`60`) — exactly matching the tree picture. No pointer was followed to find them; it's pure arithmetic on the index.
 
-### Push: append, then sift up
+**Why it matters:** no pointers means no per-node allocation and excellent cache locality — a heap of a million ints is one contiguous slice, not a million scattered allocations the way a pointer-based tree would be.
 
-Add the new element at the end of the array (the next open leaf slot), then compare it to its parent and swap upward as long as it's smaller (min-heap) than its parent. Cost: `O(log n)`, bounded by the tree's height.
+> [!warning] Common mistake
+> Assuming a heap is a binary search tree because both are "trees." A BST is ordered left-to-right (left subtree < node < right subtree); a heap only orders parent vs. child, with no left/right ordering promise at all. You cannot do an in-order traversal of a heap and get sorted output.
 
-### Pop: swap with the last element, then sift down
+### 3.2 Push: append, then sift up
 
-Swap the root (the element being removed) with the last element in the array, shrink the array by one, then repeatedly compare the new root to its smaller child and swap downward until the heap property holds again. Cost: `O(log n)`.
+**In plain words:** add the new element at the end of the array (the next open leaf slot), then compare it to its parent and swap upward as long as it's smaller (min-heap) than its parent.
+
+**Step by step:**
+1. Append the new value to the end of the array — it's now a valid leaf, just possibly in the wrong place.
+2. Compare it to its parent (`(i-1)/2`).
+3. If it's smaller than its parent (for a min-heap), swap them.
+4. Repeat from the new position until either the parent is smaller, or the element reaches the root.
+
+**Example:** inserting `5` into `[10, 20, 40, 80, 60, 85, 99]` appends it at index 7, whose parent is index 3 (`80`). `5 < 80`, so swap: now index 3 holds `5`, whose parent is index 1 (`20`). `5 < 20`, swap again: now index 1 holds `5`, whose parent is index 0 (`10`). `5 < 10`, swap once more — `5` reaches the root in 3 swaps, bounded by the tree's height (`log₂ 8 ≈ 3`).
+
+**Why it matters:** cost is `O(log n)`, bounded by the tree's height — doubling the number of elements adds only one more comparison, not twice the work.
+
+> [!tip] Remember
+> Push is "put it at the end, then let it bubble up to where it belongs" — never more swaps than the tree is tall.
+
+### 3.3 Pop: swap with the last element, then sift down
+
+**In plain words:** swap the root (the element being removed) with the last element in the array, shrink the array by one, then repeatedly compare the new root to its smaller child and swap downward until the heap property holds again.
 
 ```mermaid
 sequenceDiagram
@@ -86,13 +148,37 @@ sequenceDiagram
     Heap-->>Caller: result
 ```
 
-### Heapify: building a heap in O(n), not O(n log n)
+**Example:** popping the root `10` from `[10, 20, 40, 80, 60, 85, 99]`: move the last element (`99`) to index 0, shrink to `[99, 20, 40, 80, 60, 85]`. Compare `99` to its children `20` and `40` — smaller child is `20`, so swap: `[20, 99, 40, 80, 60, 85]`. Now `99` is at index 1, whose only child is `60` (index 4) — swap again: `[20, 60, 40, 80, 99, 85]`. `99` has no children now, so sifting stops. Final array satisfies the heap property again.
 
-Naively calling push `n` times costs `O(n log n)`. Instead, **heapify** starts from the last *non-leaf* node (`index = n/2 - 1`) and sifts each one down, working backward to the root. Because most nodes in a complete binary tree are near the bottom (where sift-down does almost no work), the total cost sums to `O(n)` — a classic amortized-analysis result, not an estimate.
+**Why it matters:** cost is `O(log n)`, same bound as push — the single element that moved to the root sinks down at most one level per comparison.
 
-### Heapsort
+> [!warning] Common mistake
+> Forgetting to compare against *both* children and picking the smaller one. Comparing against only the left child (or only the right) can leave the heap property violated on the side you skipped.
 
-Build a max-heap in place (`O(n)`), then repeatedly swap the root (the current maximum) with the last unsorted element and sift down the shrunken heap. This sorts in `O(n log n)` time with `O(1)` extra space — in place, unlike merge sort.
+> [!tip] Remember
+> Pop always removes the root; the array never develops a "hole" because the last element fills it before sifting begins.
+
+### 3.4 Heapify: building a heap in O(n), not O(n log n)
+
+**In plain words:** naively calling push `n` times costs `O(n log n)`. Instead, **heapify** starts from the last *non-leaf* node (`index = n/2 - 1`) and sifts each one down, working backward toward the root.
+
+**Why this is cheaper:** most nodes in a complete binary tree are near the bottom, where sift-down does almost no work (a leaf needs zero sift-down steps; a node one level up needs at most one). Summing the cost across every level of the tree converges to `O(n)` total — a classic amortized-analysis result, not an estimate (worked out fully in the deep dive).
+
+**What happens if you built a heap by pushing one element at a time instead?** It would still end up correct, just slower: `O(n log n)` instead of `O(n)`, because each of the `n` pushes individually costs up to `O(log n)`, and there's no way for those individual costs to "share" work the way heapify's bottom-up sift-downs do.
+
+> [!tip] Remember
+> Building from a known slice: always prefer heapify (`O(n)`) over `n` individual pushes (`O(n log n)`).
+
+### 3.5 Heapsort
+
+**In plain words:** build a max-heap in place (`O(n)`), then repeatedly swap the root (the current maximum) with the last unsorted element and sift down the shrunken heap.
+
+**Example:** with 5 elements, heapify costs `O(5)`, then 4 pop-like swaps each cost up to `O(log 5) ≈ 3` comparisons — the whole sort finishes in `O(n log n)` time using only `O(1)` extra space, because every swap happens within the original array.
+
+**Why it matters:** unlike merge sort, heapsort needs no second array — it sorts in place, which is why some standard-library sort implementations fall back to it as a worst-case guarantee (see the production section).
+
+> [!tip] Remember
+> Heapsort = build a max-heap, then "pop" repeatedly into the space the heap is vacating. Same `O(n log n)` as merge sort, but `O(1)` extra space instead of `O(n)`.
 
 ## 4. Worked example
 
@@ -101,8 +187,6 @@ Build a max-heap in place (`O(n)`), then repeatedly swap the root (the current m
 The bare mechanism: push and pop with sift-up/down, no heapify yet.
 
 ```go
-type MinHeap struct{ data []int }
-
 func (h *MinHeap) Push(v int) {
 	h.data = append(h.data, v)
 	i := len(h.data) - 1
@@ -113,229 +197,41 @@ func (h *MinHeap) Push(v int) {
 }
 ```
 
-The full version adds `Peek`, `Pop`, and `O(n)` heapify construction from an existing slice:
+That's the whole mechanism from §3.2, made literal: append, then swap upward while the parent is bigger. The runnable version adds `Peek`, `Pop`, and `O(n)` heapify construction from an existing slice.
 
-```go
-package pq
+### Tracing a size-K top-K scan
 
-// MinHeap is a binary min-heap stored in a slice.
-type MinHeap struct {
-	data []int
-}
+A common real use is scanning a huge stream and keeping only the `k` largest values seen so far, using a size-`k` **min**-heap (counter-intuitively, min — the smallest of the "keepers" sits at the root, ready to be evicted the moment something bigger shows up).
 
-// NewMinHeap builds a heap from nums in O(n) using bottom-up heapify.
-func NewMinHeap(nums []int) *MinHeap {
-	h := &MinHeap{data: append([]int(nil), nums...)}
-	for i := len(h.data)/2 - 1; i >= 0; i-- {
-		h.siftDown(i)
-	}
-	return h
-}
+1. Start with an empty min-heap and `k = 3`.
+2. Values arrive one at a time: `3, 1, 5, 12, 2, 11, 9, 7`.
+3. While the heap holds fewer than `k` elements, just push: after `3, 1, 5` the heap holds `{1, 3, 5}` (root `1`, the smallest of the three kept so far).
+4. Next value `12` arrives. Compare it to the root (`1`): `12 > 1`, so `12` beats the weakest kept value — replace the root with `12` and sift down. Heap is now `{3, 5, 12}` (root `3`).
+5. Next value `2` arrives. Compare to root `3`: `2 < 3`, so `2` is *not* one of the top 3 — discard it, heap unchanged.
+6. Continue through `11` (beats root `3` → heap becomes `{5, 11, 12}`) and `9` (beats root `5` → heap becomes `{9, 11, 12}`); `7` does not beat root `9` → discarded.
+7. Final heap `{9, 11, 12}` — exactly the 3 largest values in the stream, found in `O(n log k)` instead of sorting all 8 values in `O(n log n)`.
 
-func (h *MinHeap) Len() int { return len(h.data) }
-
-func (h *MinHeap) Peek() (int, bool) {
-	if len(h.data) == 0 {
-		return 0, false
-	}
-	return h.data[0], true
-}
-
-func (h *MinHeap) Push(v int) {
-	h.data = append(h.data, v)
-	h.siftUp(len(h.data) - 1)
-}
-
-func (h *MinHeap) Pop() (int, bool) {
-	n := len(h.data)
-	if n == 0 {
-		return 0, false
-	}
-	top := h.data[0]
-	h.data[0] = h.data[n-1]
-	h.data = h.data[:n-1]
-	if len(h.data) > 0 {
-		h.siftDown(0)
-	}
-	return top, true
-}
-
-func (h *MinHeap) siftUp(i int) {
-	for i > 0 {
-		parent := (i - 1) / 2
-		if h.data[parent] <= h.data[i] {
-			break
-		}
-		h.data[parent], h.data[i] = h.data[i], h.data[parent]
-		i = parent
-	}
-}
-
-func (h *MinHeap) siftDown(i int) {
-	n := len(h.data)
-	for {
-		left, right := 2*i+1, 2*i+2
-		smallest := i
-		if left < n && h.data[left] < h.data[smallest] {
-			smallest = left
-		}
-		if right < n && h.data[right] < h.data[smallest] {
-			smallest = right
-		}
-		if smallest == i {
-			return
-		}
-		h.data[i], h.data[smallest] = h.data[smallest], h.data[i]
-		i = smallest
-	}
-}
+```mermaid
+sequenceDiagram
+    participant Stream as Incoming values
+    participant Heap as size-3 min-heap
+    Stream->>Heap: 3, 1, 5 (heap not yet full: just push)
+    Note over Heap: {1, 3, 5}, root = 1
+    Stream->>Heap: 12 (compare to root 1)
+    Heap->>Heap: 12 > 1: replace root, sift down
+    Note over Heap: {3, 5, 12}, root = 3
+    Stream->>Heap: 2 (compare to root 3)
+    Heap-->>Stream: 2 < 3: discarded, heap unchanged
+    Stream->>Heap: 11, 9 (each beats the current root)
+    Note over Heap: final: {9, 11, 12}
 ```
 
-Test proving pop order is always ascending (the min-heap invariant actually works):
+**Measured** (Go 1.24.4, `go test -race`): `TopKLargest([]int{3,1,5,12,2,11,9,7}, 3)` returns `[9, 11, 12]`, matching the trace above and a `sort`-based reference answer in the same test.
 
-```go
-func TestMinHeapPushPopIsSorted(t *testing.T) {
-	h := NewMinHeap(nil)
-	for _, v := range []int{5, 3, 8, 1, 9, 2, 7} {
-		h.Push(v)
-	}
-	var got []int
-	for h.Len() > 0 {
-		v, _ := h.Pop()
-		got = append(got, v)
-	}
-	want := []int{1, 2, 3, 5, 7, 8, 9}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("pop order = %v; want %v", got, want)
-	}
-}
-```
+Runnable Go version: [[Heaps and Priority Queues - Go]]
 
-**Measured** (Go 1.24.4, `go test -race`): `NewMinHeap([]int{9,4,7,1,2})` (O(n) heapify) puts `1` at the root in a single call, confirmed by `Peek()`.
-
-### Go's `container/heap`: the standard interface
-
-Go's standard library doesn't ship a heap type directly — it ships `container/heap`, which turns *any* type satisfying a 5-method interface (`sort.Interface`'s `Len`/`Less`/`Swap`, plus `Push`/`Pop`) into a heap. This is the idiomatic way to build a priority queue in Go, used for scheduled-job queues and Dijkstra's frontier alike:
-
-```go
-package pq
-
-import "container/heap"
-
-// Task is one item in a priority queue of scheduled work: lower Priority
-// runs first — the same shape a job scheduler or timer heap uses.
-type Task struct {
-	Name     string
-	Priority int
-	index    int // maintained by heap.Interface for Fix/Remove
-}
-
-type TaskQueue []*Task
-
-func (q TaskQueue) Len() int           { return len(q) }
-func (q TaskQueue) Less(i, j int) bool { return q[i].Priority < q[j].Priority }
-func (q TaskQueue) Swap(i, j int) {
-	q[i], q[j] = q[j], q[i]
-	q[i].index = i
-	q[j].index = j
-}
-
-func (q *TaskQueue) Push(x any) {
-	t := x.(*Task)
-	t.index = len(*q)
-	*q = append(*q, t)
-}
-
-func (q *TaskQueue) Pop() any {
-	old := *q
-	n := len(old)
-	t := old[n-1]
-	old[n-1] = nil // avoid a memory leak: drop the pointer
-	*q = old[:n-1]
-	return t
-}
-
-// Reprioritize changes t's priority and restores heap order in O(log n)
-// via heap.Fix, instead of removing and re-pushing.
-func (q *TaskQueue) Reprioritize(t *Task, newPriority int) {
-	t.Priority = newPriority
-	heap.Fix(q, t.index)
-}
-```
-
-Test proving `heap.Fix` re-orders correctly after a priority changes mid-flight:
-
-```go
-func TestTaskQueueOrderAndFix(t *testing.T) {
-	q := &TaskQueue{}
-	heap.Init(q)
-	low := &Task{Name: "low", Priority: 10}
-	mid := &Task{Name: "mid", Priority: 5}
-	high := &Task{Name: "high", Priority: 1}
-	heap.Push(q, low)
-	heap.Push(q, mid)
-	heap.Push(q, high)
-
-	first := heap.Pop(q).(*Task)
-	if first.Name != "high" {
-		t.Fatalf("first popped = %s; want high", first.Name)
-	}
-	q.Reprioritize(mid, 0) // mid is now the most urgent
-	second := heap.Pop(q).(*Task)
-	if second.Name != "mid" {
-		t.Fatalf("second popped = %s; want mid after Reprioritize", second.Name)
-	}
-}
-```
-
-### Top-K with a size-K heap
-
-Finding the K largest of n items by sorting everything costs `O(n log n)`. Keeping a size-K **min**-heap instead — push while under K, otherwise compare the new value to the heap's current minimum and replace-and-sift if larger — costs `O(n log k)`, far cheaper when `k ≪ n`:
-
-```go
-func TopKLargest(nums []int, k int) []int {
-	h := &intMinHeap{}
-	heap.Init(h)
-	for _, v := range nums {
-		if h.Len() < k {
-			heap.Push(h, v)
-			continue
-		}
-		if v > (*h)[0] {
-			(*h)[0] = v
-			heap.Fix(h, 0)
-		}
-	}
-	// ... collect and sort the k-sized result for a stable answer
-}
-```
-
-Test: `TopKLargest([]int{3,1,5,12,2,11,9,7}, 3)` returns `[9, 11, 12]` — measured directly against a `sort`-based reference in the same test file.
-
-### K-way merge with a heap
-
-Merging `k` already-sorted lists (or log files, or sorted result pages from `k` shards) naively costs `O(n log k)` if done pairwise one list at a time, or worse if done badly. A min-heap makes it clean: seed the heap with the first element of each of the `k` lists (`O(k log k)`), then repeatedly pop the smallest, append it to the output, and push the next element from whichever list that value came from. Each of the `n` total elements is pushed and popped once, so the whole merge costs `O(n log k)` — the same shape as top-K, because both are "keep only the `k` currently-relevant candidates in a heap instead of looking at everything."
-
-### Running median with two heaps
-
-A classic interview problem: maintain the median of a stream of numbers as they arrive, one at a time. The trick is **two heaps**: a max-heap for the smaller half of the numbers seen so far, a min-heap for the larger half, kept balanced to within one element of each other. The median is then `O(1)` to read — it's the top of the larger heap, or the average of both tops if they're equal in size:
-
-```go
-func (m *MedianFinder) Add(v int) {
-	if m.lower.Len() == 0 || v <= m.lower[0] {
-		heap.Push(&m.lower, v)
-	} else {
-		heap.Push(&m.upper, v)
-	}
-	if m.lower.Len() > m.upper.Len()+1 {
-		heap.Push(&m.upper, heap.Pop(&m.lower))
-	} else if m.upper.Len() > m.lower.Len()+1 {
-		heap.Push(&m.lower, heap.Pop(&m.upper))
-	}
-}
-```
-
-Test: adding the stream `5, 15, 1, 3` produces medians `5, 10, 5, 4` after each step — matching hand computation (`{5}→5`, `{5,15}→10`, `{1,5,15}→5`, `{1,3,5,15}→4`), confirmed by `go test -race`.
+> [!tip] Remember
+> For "top k of a huge stream," a size-k heap costs `O(n log k)` — far cheaper than sorting everything (`O(n log n)`) once `k` is much smaller than `n`.
 
 ## 5. Variants and comparison
 
@@ -347,12 +243,26 @@ Test: adding the stream `5, 15, 1, 3` produces medians `5, 10, 5, 4` after each 
 | Balanced BST (as a priority queue) | O(log n) | O(log n) | O(log n) | O(log n) | You also need arbitrary search/ordering, not just min/max — see [[Trees, BSTs and Balanced Trees]] |
 | Fibonacci heap | O(1) amortized | O(1) amortized | O(log n) amortized | O(n) | Theoretical: improves Dijkstra's asymptotic bound, rarely used in practice due to large constants |
 
+```mermaid
+flowchart TD
+    Q{"Do you need the 2nd-smallest\nwithout popping the smallest first,\nor range queries?"}
+    Q -- yes --> BST["Balanced BST\nO(log n) for everything"]
+    Q -- no --> Q2{"Need O(1) decrease-key\nand only asymptotics matter?"}
+    Q2 -- yes, rare in practice --> FIB["Fibonacci heap"]
+    Q2 -- no --> Q3{"Writes are rare,\nrange queries frequent?"}
+    Q3 -- yes --> SA["Sorted array"]
+    Q3 -- no --> BH["Binary heap: the default\nO(log n) push/pop, O(1) peek"]
+```
+
 ## 6. Trade-offs and when not to use
 
 - A heap is **not fully sorted** — you can only cheaply extract the min (or max), not ask "what's the 2nd smallest?" without popping the first.
-- `O(n)` arbitrary search: if you need to frequently check "is X anywhere in here?" or update an arbitrary element's priority *without already holding its index*, a heap alone is the wrong structure — pair it with a hash map from key to heap index (as `TaskQueue.index` does above) if you need `Reprioritize`/`Remove` by key.
+- `O(n)` arbitrary search: if you need to frequently check "is X anywhere in here?" or update an arbitrary element's priority *without already holding its index*, a heap alone is the wrong structure — pair it with a hash map from key to heap index if you need `Reprioritize`/`Remove` by key (see the Go note for exactly this pattern).
 - For a small, fixed k (top-K problems), a size-k heap beats sorting everything; but if k is close to n, just sort.
 - Heap operations on pointer-heavy elements (not plain ints) still only move pointers during swaps, but comparison cost can dominate if `Less` is expensive — keep comparisons cheap.
+
+> [!warning] Common mistake
+> Reaching for a heap to answer "is X in this collection?" A heap gives you that only in `O(n)` — the same as an unsorted list. Use a hash table ([[Hash Tables and Go Maps]]) for membership checks, and a heap only for "what's the most/least urgent."
 
 ## 7. In production
 
@@ -367,15 +277,36 @@ Test: adding the stream `5, 15, 1, 3` produces medians `5, 10, 5, 4` after each 
 	- Unbounded growth of a job queue under sustained overload → bound queue size, shed or reprioritize lowest-priority work, and monitor queue depth.
 - **What to monitor:** queue depth (`Len()`), time an item spends in the queue before being popped (queueing delay), and for a job scheduler specifically, how often `Reprioritize`/`Fix` fires vs. plain push/pop.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Queued: Push onto the heap
+    Queued --> Queued: Reprioritize (heap.Fix)
+    Queued --> Popped: Pop (most urgent first)
+    Queued --> Stale: canceled while still queued
+    Stale --> Discarded: popped later, found invalid, skipped
+    Popped --> [*]
+    Discarded --> [*]
+```
+
 ## 8. Deep dive
 
 ### Why heapify is O(n), not O(n log n)
 
-A naive argument says "sift-down costs O(log n), and we call it n/2 times, so it's O(n log n)." That overcounts: sift-down's cost is bounded by a node's **height in the tree**, not the tree's overall height, and in a complete binary tree, half the nodes are leaves (height 0, no work), a quarter are at height 1, an eighth at height 2, and so on. Summing `(height) × (count of nodes at that height)` across all levels gives a series that converges to `O(n)` — the same style of amortized argument as dynamic array growth.
+A naive argument says "sift-down costs O(log n), and we call it n/2 times, so it's O(n log n)." That overcounts: sift-down's cost is bounded by a node's **height in the tree**, not the tree's overall height, and in a complete binary tree, half the nodes are leaves (height 0, no work), a quarter are at height 1, an eighth at height 2, and so on.
+
+| Height above leaves | Fraction of nodes at that height | Max sift-down work per node |
+|---|---|---|
+| 0 (leaves) | 1/2 | 0 |
+| 1 | 1/4 | 1 |
+| 2 | 1/8 | 2 |
+| 3 | 1/16 | 3 |
+| … | … | … |
+
+Summing `(height) × (fraction of nodes at that height) × n` across all levels gives a series that converges to `O(n)` total work — the same style of amortized argument as dynamic array growth in [[Arrays and Dynamic Arrays (Go Slices)]].
 
 ### Decrease-key and why plain `container/heap` doesn't give you one
 
-Dijkstra's classic textbook presentation calls for a "decrease-key" operation: when you find a cheaper path to a node already in the frontier, lower its priority in place. Go's `container/heap` doesn't expose that directly — you implement it yourself via `heap.Fix(h, index)` once you know the element's current index, which is why the `TaskQueue` example above tracks `index` as a field on each element, updated inside `Swap`. Without that index bookkeeping, "find this element to fix its priority" would cost `O(n)`, defeating the purpose.
+Dijkstra's classic textbook presentation calls for a "decrease-key" operation: when you find a cheaper path to a node already in the frontier, lower its priority in place. Go's `container/heap` doesn't expose that directly — you implement it yourself via `heap.Fix(h, index)` once you know the element's current index, which is why a task-queue implementation tracks `index` as a field on each element, updated inside `Swap` (see the Go note). Without that index bookkeeping, "find this element to fix its priority" would cost `O(n)`, defeating the purpose.
 
 ### Heap vs. heap memory
 
@@ -383,7 +314,7 @@ These names collide by historical accident, not by design: "heap" the data struc
 
 ### Classic practice problems
 
-**Kth largest element** (a size-k min-heap, same pattern as `TopKLargest` above, or `quickselect` for O(n) average without a heap); **top-K frequent elements** (hash map to count frequencies, then a size-k min-heap keyed by count); **meeting rooms II** (minimum rooms needed for overlapping intervals: a min-heap of end times — push a new meeting's end time, and if the earliest end time is ≤ the new meeting's start, pop it first, reusing that room); **task scheduler** (CPU task scheduling with a cooldown between identical tasks: a max-heap of remaining counts per task type, greedily running the most frequent task available each cycle).
+**Kth largest element** (a size-k min-heap, same pattern as the top-K trace above, or `quickselect` for O(n) average without a heap); **top-K frequent elements** (hash map to count frequencies, then a size-k min-heap keyed by count); **meeting rooms II** (minimum rooms needed for overlapping intervals: a min-heap of end times — push a new meeting's end time, and if the earliest end time is ≤ the new meeting's start, pop it first, reusing that room); **task scheduler** (CPU task scheduling with a cooldown between identical tasks: a max-heap of remaining counts per task type, greedily running the most frequent task available each cycle); **k-way merge** (merging `k` already-sorted lists: seed a min-heap with the first element of each list in `O(k log k)`, then repeatedly pop the smallest, append it to the output, and push the next element from whichever list it came from — the whole merge costs `O(n log k)`, the same shape as top-K because both keep only the `k` currently-relevant candidates in the heap); **running median of a stream** (two heaps — a max-heap for the smaller half of numbers seen, a min-heap for the larger half, rebalanced after every insert so their sizes never differ by more than one — the median is then `O(1)` to read, the top of the larger heap or the average of both tops if equal in size; see the Go note for a full runnable `MedianFinder`).
 
 ## 9. Interview questions
 
@@ -423,6 +354,7 @@ These names collide by historical accident, not by design: "heap" the data struc
 
 ## Links
 
+- **Go implementation:** [[Heaps and Priority Queues - Go]]
 - **Before this:** [[Arrays and Dynamic Arrays (Go Slices)]], [[Trees, BSTs and Balanced Trees]]
 - **Next:** [[Graphs and Graph Algorithms]], [[Scheduled Jobs - Cron to Durable Schedulers]]
 - **Compare with:** [[Trees, BSTs and Balanced Trees]] (full ordering vs. a heap's weaker parent/child-only guarantee)

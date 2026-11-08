@@ -8,7 +8,7 @@ sources:
   - "RFC 9110, HTTP Semantics (§13 Conditional Requests)"
   - "MDN Web Docs, HTTP Caching"
 status: reviewed
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # HTTP Caching - Cache-Control, ETag, Conditional Requests
@@ -43,26 +43,46 @@ The second response carries no body at all — just a status line and a couple o
 
 ## 1. Why it exists
 
-Without caching, every single page load re-fetches every CSS file, every image, every font and every JSON payload from the origin, even when nothing has changed since the last visit a few seconds ago. That means wasted bandwidth, wasted origin CPU and database load, and real latency the user feels on every navigation.
+Imagine a product page whose price rarely changes, but a thousand people load that page every minute. Without caching, every single one of those thousand loads re-fetches the same CSS, the same images, the same font, and the same price JSON from the origin server — even when nothing has changed since the visit a few seconds earlier. That is wasted bandwidth, wasted origin CPU and database load, and real latency the user feels on every navigation.
 
-HTTP caching solves this with two separate mechanisms that work at different times:
-- **Freshness** avoids the network round trip entirely for a window of time the server names up front (`max-age`).
+**HTTP caching** is the general name for the set of rules (defined mainly in RFC 9111) that let a client, proxy or CDN store a copy of a response and reuse it later instead of asking the origin again. It solves the problem with two separate mechanisms that work at different times:
+
+- **Freshness** avoids the network round trip entirely, for a window of time the server names up front (`max-age`).
 - **Validation** avoids re-sending the body once that window has passed, by letting the server answer "still the same" cheaply.
 
-A concrete example: an e-commerce product page's price JSON is 14 bytes. Served fresh from a CDN edge cache (`max-age=60`), 60 seconds of traffic costs the origin zero requests. After that, a conditional request with `If-None-Match` costs the origin a cheap hash comparison and a `304` with no body — versus re-sending the full response (and in a real page, the full HTML/CSS/JS bundle, which is usually many kilobytes, not 14 bytes) on every single request.
+A concrete example: an e-commerce product page's price JSON is 14 bytes. Served fresh from a CDN edge cache (`max-age=60`), 60 seconds of traffic costs the origin zero requests. After that, a conditional request with `If-None-Match` costs the origin a cheap hash comparison and a `304` with no body — versus re-sending the full response (and in a real page, the full HTML/CSS/JS bundle, usually many kilobytes, not 14 bytes) on every single request.
+
+> [!tip] Remember
+> Caching exists to avoid paying for the same answer twice: once by skipping the trip entirely, and once by skipping the resend when the trip is unavoidable.
 
 ## 2. Mental model
 
-Think of two separate questions a cache asks, in order:
+**In plain words:** think of a cache as a assistant sitting between you and a busy office. The assistant asks two questions, in order, every time you want something: "do I already have a recent-enough copy?" and, if not, "has it actually changed since I last checked?"
 
 1. **"Do I even need to ask the server?"** — governed by `Cache-Control`'s `max-age`/`s-maxage`. If the stored copy is still fresh, the cache answers from its own copy, no network call at all.
 2. **"Has it actually changed since I last checked?"** — governed by validators (`ETag`, `Last-Modified`). Once the copy is stale, the cache *must* ask, but it asks a cheap question ("is this fingerprint still current?") instead of re-downloading everything.
 
-`no-cache` and `no-store` sound similar but answer different questions entirely: `no-cache` says "you may keep a copy, but always check with me first" (skips straight to step 2 forever); `no-store` says "don't keep a copy at all" (neither step applies — there's nothing to check).
+```mermaid
+flowchart LR
+    q1["Question 1:\nIs my copy still fresh?"] -- yes --> a1["Answer from cache,\nzero network calls"]
+    q1 -- no --> q2["Question 2:\nHas it actually changed?"]
+    q2 -- "no (304)" --> a2["Keep serving stored body,\nreset freshness clock"]
+    q2 -- "yes (200)" --> a3["Replace stored copy\nwith the new body"]
+```
+
+> [!warning] Common mistake
+> `no-cache` and `no-store` sound like synonyms but answer different questions entirely. `no-cache` says "you may keep a copy, but always check with me first" — it skips straight to question 2, forever. `no-store` says "don't keep a copy at all" — neither question applies, because there is nothing to check.
+
+> [!tip] Remember
+> A cache always asks "can I skip the trip?" before it ever asks "can I skip the resend?" — freshness and validation are two separate gates, not one setting.
 
 ## 3. How it works
 
 ### Cache-Control directives
+
+**In plain words:** `Cache-Control` is a response header the origin sends that tells every cache along the way — the browser, a corporate proxy, a CDN edge — how long it may treat this exact response as current, and who is allowed to keep a copy at all.
+
+**Picture it:**
 
 ```mermaid
 flowchart TD
@@ -77,19 +97,35 @@ flowchart TD
     changed -- "200 with new body" --> replace["Replace stored copy, serve new body"]
 ```
 
-- **`max-age=N`:** fresh for `N` seconds from the response's own `Date`, for any cache (browser or shared).
-- **`s-maxage=N`:** overrides `max-age`, but only for *shared* caches (CDNs, corporate proxies) — lets an operator cache a response at the edge longer (or shorter) than browsers should privately.
-- **`no-cache`:** may store the response, but **must revalidate with the origin before reusing it**, every time. Despite the name, this does not forbid caching.
-- **`no-store`:** must not store any part of the request or response, anywhere. For truly sensitive responses (a one-time password, a payment form page).
-- **`private`:** only a single user's own browser cache may store this; shared caches (CDNs, proxies) must not — the right directive for a per-user response like "my account balance".
-- **`public`:** explicitly allows shared caches to store it even if the request had authentication (normally a reason shared caches would refuse to cache).
-- **`immutable`:** tells the browser this exact URL will never change its content, so skip revalidation entirely even on a user-initiated reload — meant for content-hashed filenames like `app.3f8a21.js`, never for a URL that gets reused with different content.
-- **`stale-while-revalidate=N`:** allows a cache to serve the stale copy immediately while it revalidates in the background for up to `N` seconds past expiry — trades strict freshness for a latency win; the user never waits on the revalidation request.
-- **`stale-if-error=N`:** allows serving the stale copy if the origin returns an error or is unreachable, for up to `N` seconds — a resilience mechanism, not a freshness one.
+**Example:** a response arrives with `Cache-Control: public, max-age=60`. A cache that first sees it at `t=0` can serve it from memory, with zero origin contact, for every request up to `t=60`. At `t=61` the copy is stale and the cache must at least ask.
+
+Here is what each directive actually promises:
+
+| Directive | What it means | Analogy |
+| --- | --- | --- |
+| `max-age=N` | Fresh for `N` seconds from the response's own `Date`, for any cache (browser or shared) | A "best before" date on a food label |
+| `s-maxage=N` | Overrides `max-age`, but only for *shared* caches (CDNs, corporate proxies) | A separate, longer shelf-life rule that applies only to the warehouse, not your home fridge |
+| `no-cache` | May store the response, but **must revalidate with the origin before reusing it**, every time | A librarian who keeps a copy on the desk but always phones ahead to check nothing changed before lending it |
+| `no-store` | Must not store any part of the request or response, anywhere | A message that self-destructs: nothing is ever written down |
+| `private` | Only a single user's own browser cache may store this; shared caches must not | A locker that only opens with your own key |
+| `public` | Explicitly allows shared caches to store it even if the request had authentication | A notice board anyone passing by may read |
+| `immutable` | This exact URL will never change its content, so skip revalidation entirely even on a user reload | A sealed, numbered edition that is never reprinted under the same number |
+| `stale-while-revalidate=N` | Serve the stale copy immediately while revalidating in the background for up to `N` seconds past expiry | Handing over yesterday's newspaper while someone runs to fetch today's |
+| `stale-if-error=N` | Serve the stale copy if the origin errors or is unreachable, for up to `N` seconds | Keeping yesterday's weather forecast handy in case today's station is down |
+
+`immutable` is meant for content-hashed filenames like `app.3f8a21.js` — a URL whose content can never legitimately change under that exact name — never for a URL that gets reused with different content over time.
+
+> [!warning] Common mistake
+> Thinking `no-cache` forbids caching. It does the opposite: it allows storing the response, it just forces a cheap revalidation check before every reuse. The directive that actually forbids storing anything is `no-store`.
+
+> [!tip] Remember
+> `max-age`/`s-maxage` answer "how long," `no-cache`/`no-store` answer "under what conditions at all," and `public`/`private` answer "who."
 
 ### ETag and conditional requests
 
-An **ETag** is an opaque fingerprint of the response body (any string the server chooses — a content hash, a version number, a database row's `updated_at` serialized). `Last-Modified` is a timestamp instead. Both let the client ask "has this changed since I last saw `X`?" without re-downloading the body:
+**In plain words:** once a cached copy goes stale, the cache does not have to re-download the whole thing blind. It can send back a short fingerprint of what it already has and ask the server "is this still current?" An **ETag** is that fingerprint: an opaque string the server chooses (a content hash, a version number, a database row's `updated_at` serialized). `Last-Modified` is the same idea using a timestamp instead of a fingerprint.
+
+**Picture it:**
 
 ```mermaid
 sequenceDiagram
@@ -108,17 +144,37 @@ sequenceDiagram
     end
 ```
 
-**`If-None-Match` takes priority over `If-Modified-Since`** (RFC 9110 §13.1.1) whenever both are present: ETags are exact (byte-for-byte), while `Last-Modified` only has one-second resolution and can't detect a change that round-trips back to the same content within the same second. A server should always prefer checking `If-None-Match` first if it sent an `ETag`.
+**Example:** a price JSON hashes to `"0f26d0f1409cfc3c"`. A client that already stored that exact tag sends `If-None-Match: "0f26d0f1409cfc3c"` on its next request. If the price has not changed, the hash is identical and the server can prove "nothing changed" without even reading the body it would otherwise have sent — it just compares two short strings.
+
+**`If-None-Match` takes priority over `If-Modified-Since`** (RFC 9110 §13.1.3) whenever both are present: ETags are exact (byte-for-byte), while `Last-Modified` only has one-second resolution and can't detect a change that round-trips back to the same content within the same second. A server should always prefer checking `If-None-Match` first if it sent an `ETag`.
+
+> [!warning] Common mistake
+> Embedding something that changes on every response — a timestamp, a per-process random value — inside the bytes an ETag hashes. That produces a new ETag on every single request even when nothing meaningful changed, which silently defeats the whole point of conditional requests: the server will never again answer `304`.
+
+> [!tip] Remember
+> An ETag is exact but costs a hash; `Last-Modified` is cheap but only as precise as one second. When both are present, exactness wins.
 
 ### Vary
 
-`Vary: Accept-Encoding` tells a shared cache that responses differ by the listed request header, so it must store a **separate cached entry per distinct value of that header** — a gzip-compressed response and an uncompressed one are not interchangeable, even for the identical URL. `Vary: Accept-Encoding` is safe and common. `Vary: Cookie` is a well-known anti-pattern: since cookies are often unique per user, it effectively makes the response uncacheable by any shared cache (a near-infinite number of possible cache keys), while still technically being "correct" — so caching stops helping at all.
+**In plain words:** some responses are not one single thing — the same URL might return gzip-compressed bytes to one client and plain bytes to another, depending on what the client asked for. `Vary` tells a shared cache which request header splits those into separate cache entries.
+
+**Example:** `Vary: Accept-Encoding` tells a CDN "store a separate copy per distinct value of the client's `Accept-Encoding` header" — a gzip-compressed response and an uncompressed one are not interchangeable, even for the identical URL, so the cache must keep both.
+
+```mermaid
+flowchart LR
+    url["Same URL: /app.js"] --> v1["Accept-Encoding: gzip\n→ cache entry #1 (compressed)"]
+    url --> v2["Accept-Encoding: identity\n→ cache entry #2 (uncompressed)"]
+```
+
+> [!warning] Common mistake
+> `Vary: Cookie` looks harmless but is a well-known anti-pattern: since cookies are often unique per user, it effectively creates one cache entry per visitor — a near-infinite number of possible cache keys — while still being technically "correct." The practical effect is that caching stops helping at all for that response.
+
+> [!tip] Remember
+> `Vary` is a correctness tool, not a performance one by itself — it only pays off when the header it names actually has few distinct values in practice.
 
 ## 4. Worked example
 
-### Whiteboard version
-
-A handler computes a hash of the current body as its ETag, and answers `304` whenever the client already has that exact hash.
+A handler computes a hash of the current body as its ETag, and answers `304` whenever the client already has that exact hash:
 
 ```go
 w.Header().Set("Cache-Control", "public, max-age=60, must-revalidate")
@@ -130,170 +186,16 @@ if r.Header.Get("If-None-Match") == etag {
 w.Write(body)
 ```
 
-The full version below is tested: it serves `Cache-Control`, `ETag`, `Last-Modified` and `Vary`, answers `304` on a matching `If-None-Match`, falls back to `If-Modified-Since`, and falls through to a full `200` when the validator doesn't match.
+Trace it step by step for one resource, `price.json`, over two requests:
 
-```go
-package cachedemo
+1. **Cold request.** No `If-None-Match` header arrives (the client has nothing stored yet). The handler computes the ETag, sets `Cache-Control`, `ETag`, `Last-Modified` and `Vary`, and writes a `200` with the full 14-byte body.
+2. **Client stores it.** The client remembers the body plus the `ETag` it received.
+3. **60+ seconds pass.** The cached copy's `max-age=60` window has expired; the client's cache now considers it stale and must revalidate before reusing it.
+4. **Conditional request.** The client sends `GET` again, this time with `If-None-Match: "0f26d0f1409cfc3c"`.
+5. **Server compares.** The handler recomputes the current ETag and compares it with the incoming `If-None-Match`. They match, so nothing changed.
+6. **`304` with no body.** The handler writes `304 Not Modified` and returns immediately — the 14-byte body is never written a second time.
 
-import (
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"net/http"
-	"time"
-)
-
-// Resource is a stand-in for a row fetched from a database: an ETag handler
-// hashes its current bytes and compares that hash with what the client
-// already has, instead of trusting a timestamp.
-type Resource struct {
-	Body         []byte
-	LastModified time.Time
-}
-
-func (r Resource) etag() string {
-	sum := sha256.Sum256(r.Body)
-	return `"` + hex.EncodeToString(sum[:8]) + `"`
-}
-
-// Handler serves Resource with Cache-Control, ETag, Last-Modified and
-// conditional-request (304) support. maxAge controls how long a shared or
-// private cache may reuse the response without revalidating.
-func Handler(get func() Resource, maxAge time.Duration) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
-		res := get()
-		etag := res.etag()
-
-		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d, must-revalidate", int(maxAge.Seconds())))
-		w.Header().Set("ETag", etag)
-		w.Header().Set("Last-Modified", res.LastModified.UTC().Format(http.TimeFormat))
-		w.Header().Set("Vary", "Accept-Encoding")
-
-		// If-None-Match takes priority over If-Modified-Since per RFC 9110 §13.1.1:
-		// strong validators are exact, timestamps only have second resolution.
-		if inm := req.Header.Get("If-None-Match"); inm != "" {
-			if inm == etag {
-				w.WriteHeader(http.StatusNotModified)
-				return
-			}
-		} else if ims := req.Header.Get("If-Modified-Since"); ims != "" {
-			if t, err := http.ParseTime(ims); err == nil && !res.LastModified.After(t) {
-				w.WriteHeader(http.StatusNotModified)
-				return
-			}
-		}
-
-		w.WriteHeader(http.StatusOK)
-		w.Write(res.Body)
-	}
-}
-```
-
-```go
-package cachedemo
-
-import (
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"testing"
-	"time"
-)
-
-func TestConditionalRequestReturns304(t *testing.T) {
-	res := Resource{Body: []byte(`{"price": 199}`), LastModified: time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)}
-	srv := httptest.NewServer(Handler(func() Resource { return res }, 60*time.Second))
-	defer srv.Close()
-	client := srv.Client()
-
-	// First request: a cold cache, must get a full 200 with validators.
-	resp1, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	body1, _ := io.ReadAll(resp1.Body)
-	resp1.Body.Close()
-	if resp1.StatusCode != http.StatusOK {
-		t.Fatalf("first request: got %d, want 200", resp1.StatusCode)
-	}
-	etag := resp1.Header.Get("ETag")
-	if etag == "" {
-		t.Fatal("first response carries no ETag")
-	}
-	if got := resp1.Header.Get("Cache-Control"); got != "public, max-age=60, must-revalidate" {
-		t.Fatalf("Cache-Control = %q", got)
-	}
-
-	// Second request: client replays the ETag it stored, server must answer
-	// 304 with no body instead of resending the 14-byte payload.
-	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
-	req.Header.Set("If-None-Match", etag)
-	resp2, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("conditional get: %v", err)
-	}
-	body2, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusNotModified {
-		t.Fatalf("conditional request: got %d, want 304", resp2.StatusCode)
-	}
-	if len(body2) != 0 {
-		t.Fatalf("304 response carried a body: %q", body2)
-	}
-
-	// A stale If-None-Match (resource changed) must fall through to 200.
-	req2, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
-	req2.Header.Set("If-None-Match", `"stale-value"`)
-	resp3, err := client.Do(req2)
-	if err != nil {
-		t.Fatalf("stale conditional get: %v", err)
-	}
-	resp3.Body.Close()
-	if resp3.StatusCode != http.StatusOK {
-		t.Fatalf("stale If-None-Match: got %d, want 200", resp3.StatusCode)
-	}
-
-	t.Logf("full body %d bytes, 304 body %d bytes, ETag %s", len(body1), len(body2), etag)
-}
-
-func TestLastModifiedFallback(t *testing.T) {
-	mod := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
-	res := Resource{Body: []byte("v1"), LastModified: mod}
-	srv := httptest.NewServer(Handler(func() Resource { return res }, 30*time.Second))
-	defer srv.Close()
-	client := srv.Client()
-
-	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
-	req.Header.Set("If-Modified-Since", mod.UTC().Format(http.TimeFormat))
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotModified {
-		t.Fatalf("got %d, want 304 via If-Modified-Since", resp.StatusCode)
-	}
-}
-```
-
-**Measured (Go 1.24.4, darwin/arm64, this machine, 2026-11-06):** `go vet` clean; `go test -race -v` → both tests pass. The full response body was 14 bytes; the `304` response body was 0 bytes — the entire saving of a conditional request.
-
-### Representative output: a real conditional request
-
-```text
-$ curl -v https://example.com/price.json 2>&1 | grep -iE "< (cache-control|etag|last-modified|HTTP)"
-< HTTP/1.1 200 OK
-< Cache-Control: public, max-age=60, must-revalidate
-< ETag: "0f26d0f1409cfc3c"
-< Last-Modified: Sun, 01 Nov 2026 10:00:00 GMT
-```
-
-```text
-$ curl -v -H 'If-None-Match: "0f26d0f1409cfc3c"' https://example.com/price.json 2>&1 | grep -iE "< HTTP|< etag"
-< HTTP/1.1 304 Not Modified
-< ETag: "0f26d0f1409cfc3c"
-```
-*(representative output (curl 8.x against a server implementing this note's Handler); the exact ETag value depends on the response body's hash.)*
+Runnable Go version: [[HTTP Caching - Cache-Control, ETag, Conditional Requests - Go]].
 
 ## 5. Variants and comparison
 
@@ -364,3 +266,4 @@ $ curl -v -H 'If-None-Match: "0f26d0f1409cfc3c"' https://example.com/price.json 
 - **Before this:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Next:** [[CDN and Edge]], [[Caching Fundamentals]]
 - **Compare with:** [[Cache Invalidation, TTL and Consistency]] (application/Redis-level caching instead of the HTTP contract covered here)
+- **Runnable code:** [[HTTP Caching - Cache-Control, ETag, Conditional Requests - Go]]

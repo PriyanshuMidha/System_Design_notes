@@ -1,16 +1,16 @@
 ---
 tags: [networking, udp, quic, transport-layer]
-level: intermediate
+level: advanced
 status: reviewed
 prereqs: ["[[TCP - Handshake, Reliability, Flow and Congestion Control]]"]
-related: ["[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]", "[[HTTP-1.1 vs HTTP-2 vs HTTP-3]]", "[[TLS and HTTPS]]", "[[DNS - Resolution, Records and Caching]]"]
+related: ["[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]", "[[HTTP-1.1 vs HTTP-2 vs HTTP-3]]", "[[TLS and HTTPS]]", "[[DNS - Resolution, Records and Caching]]", "[[UDP and QUIC - Go]]"]
 sources:
   - "RFC 768, User Datagram Protocol"
   - "RFC 9000, QUIC: A UDP-Based Multiplexed and Secure Transport"
   - "RFC 9001, Using TLS to Secure QUIC"
   - "RFC 9114, HTTP/3"
   - "Iyengar & Thomson (eds.), QUIC Working Group documents (IETF)"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # UDP and QUIC
@@ -26,11 +26,38 @@ updated: 2026-11-06
 
 ## 1. Why it exists
 
-TCP's guarantees aren't free: a 3-way handshake before any data moves, in-order delivery that stalls everything behind one lost packet, and congestion control tuned for a general-purpose byte stream. Some applications don't want any of that. A DNS query is one request and one small reply — paying for a handshake to send 40 bytes doubles the cost of every lookup. A live video or game-position update is time-sensitive and loss-tolerant: a frame that arrives late is worse than a frame that never arrives, so retransmitting a stale packet is actively the wrong behavior.
+Every guarantee TCP gives costs a round trip or a byte of bookkeeping somewhere. A 3-way handshake has to finish before any data moves. In-order delivery means one lost packet stalls everything behind it, even data the application could otherwise use right away. Congestion control is tuned for a general-purpose byte stream, not for a single small message.
 
-UDP (RFC 768, one of the oldest RFCs still in daily use) is what's left of IP once you add only port numbers and an optional checksum: a single datagram, fire and forget, no connection state anywhere. An application that wants reliability on top can build exactly the amount it needs — which is what QUIC does, and what DNS mostly doesn't (DNS just lives with occasional loss and retries at the resolver level, and falls back to TCP for large or sensitive responses).
+Some applications don't want to pay any of that. Picture two very different jobs:
 
-QUIC exists because HTTP/2 exposed a sharp limit of building multiplexing *inside* TCP: with many logical HTTP streams sharing one TCP connection, a single lost IP packet stalls literally all of them until it's retransmitted, because TCP's one ordered byte stream can't deliver stream 2's bytes to the application while it's still waiting on stream 1's missing segment. QUIC (RFC 9000, standardized 2021; carries HTTP/3 per RFC 9114) moves stream multiplexing below the reliability layer instead of above it, over UDP, so one stream's loss no longer blocks the others.
+- A **DNS query** sends one small request and gets one small reply. Paying for a handshake to move 40 bytes would double the cost of every single lookup, for a protocol that runs millions of times a second across the internet.
+- A **live video frame or a game position update** is time-sensitive and loss-tolerant. A frame that arrives late is worse than a frame that never arrives at all — retransmitting a stale packet is actively the wrong behavior, because by the time it lands, a newer frame has already made it obsolete.
+
+Both jobs want to skip TCP's guarantees entirely, or build only the exact piece they need. That's what **UDP** (User Datagram Protocol, RFC 768 — one of the oldest RFCs still in daily use) is for: it is what's left of IP once you add only port numbers and an optional checksum. One datagram, fire and forget, no connection state anywhere. An application that wants reliability on top can build exactly the amount it needs, which is what QUIC does — and what DNS mostly doesn't, since DNS just lives with occasional loss and retries at the resolver level, falling back to TCP only for large or sensitive responses.
+
+**QUIC** (Quick UDP Internet Connections, RFC 9000, standardized 2021, carries HTTP/3 per RFC 9114) exists for a different reason: HTTP/2 exposed a sharp limit of building multiplexing *inside* TCP. With many logical HTTP streams sharing one TCP connection, a single lost IP packet stalls literally all of them until it's retransmitted, because TCP's one ordered byte stream can't deliver stream 2's bytes to the application while it's still waiting on stream 1's missing segment. QUIC moves stream multiplexing below the reliability layer instead of above it, over UDP, so one stream's loss no longer blocks the others.
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client (TCP + handshake)
+    participant S1 as Server
+    participant C2 as Client (UDP, no handshake)
+    participant S2 as Server
+    Note over C1,S1: Sending one 40-byte DNS-sized query over a fresh TCP connection
+    C1->>S1: SYN
+    S1-->>C1: SYN-ACK
+    C1->>S1: ACK
+    C1->>S1: query (40 bytes)
+    S1-->>C1: reply
+    Note over C1,S1: 2 round trips before the answer arrives
+    Note over C2,S2: The same query over UDP
+    C2->>S2: query (40 bytes)
+    S2-->>C2: reply
+    Note over C2,S2: 1 round trip — no setup cost at all
+```
+
+> [!tip] Remember
+> UDP isn't "broken TCP" — it's TCP with every optional guarantee removed, so an application that doesn't need those guarantees doesn't pay for them.
 
 ## 2. Mental model
 
@@ -38,9 +65,15 @@ UDP is a postcard: you write an address and a message, drop it in the mailbox, a
 
 QUIC is what happens if you decide postcards aren't enough, but instead of switching to TCP's single registered-mail envelope, you put several independent registered-mail threads inside one envelope, each with its own sequence numbers and its own retransmission — so a lost page in thread 2 only reprints thread 2, not the whole letter.
 
+**Where the analogy breaks down:** real registered mail can't change delivery address mid-transit and still be recognized as the same letter. QUIC can: a phone switching from Wi-Fi to cellular keeps the same "envelope identity" (its Connection ID) even though the return address (its IP) changed underneath it. No postal analogy captures that part cleanly — it's closer to a courier recognizing your voice on a new phone number than to anything physical mail can do.
+
 ## 3. How it works
 
 ### UDP: a datagram, nothing more
+
+**In plain words:** a UDP sender just puts an address and a payload on the wire. There's no setup conversation first, and the receiver has no built-in way to tell the sender "got it" or "I'm ready." Every guarantee the application wants — knowing a reply didn't arrive, retrying, deduplicating a packet that showed up twice, reordering if order matters — is the application's own job.
+
+**Picture it:**
 
 ```mermaid
 sequenceDiagram
@@ -55,15 +88,30 @@ sequenceDiagram
     end
 ```
 
-There is no `Accept()` on the server side the way TCP has one — every incoming datagram just carries the sender's address with it, and the server can reply to any address at any time. The application is responsible for everything TCP would otherwise give it: knowing a reply didn't arrive (a timeout), retrying, deduplicating a packet that arrived twice, and reordering if that matters.
+There is no `Accept()` on the server side the way TCP has one — every incoming datagram just carries the sender's address with it, and the server can reply to any address at any time.
 
-**Common uses, by what they trade away:**
-- **DNS**: a lost query just times out and retries; a response over 512 bytes (without EDNS0) falls back to TCP. Latency matters more than guaranteed delivery for a single lookup.
-- **Video/voice calls (RTP/WebRTC)**: a dropped or late frame is discarded, not retransmitted — showing a stale frame late is worse than skipping it. Congestion response is handled by the application (adaptive bitrate), not the transport.
-- **Online games**: the latest position update matters, not every historical one; an old retransmitted position is actively wrong information by the time it would arrive.
-- **mDNS/SSDP and other discovery protocols**: broadcast/multicast only works without a connection to begin with.
+**Example — who actually uses it, and what each one trades away:**
+
+| Use case | What it trades away | Why that's the right trade |
+| --- | --- | --- |
+| DNS | Guaranteed delivery | A lost query just times out and retries; a response over 512 bytes (without EDNS0) falls back to TCP. Latency matters more than guaranteed delivery for a single lookup. |
+| Video/voice calls (RTP/WebRTC) | Retransmission | A dropped or late frame is discarded, not retransmitted — a stale frame arriving late is worse than one skipped. Congestion response is handled by the application (adaptive bitrate), not the transport. |
+| Online games | Ordering of old data | The latest position update matters, not every historical one; an old retransmitted position is actively wrong information by the time it would arrive. |
+| mDNS/SSDP discovery | A connection at all | Broadcast/multicast only works without a connection to begin with. |
+
+**Why it matters:** choosing UDP is a deliberate bet that your application can tolerate loss, or that it will build only the exact reliability it needs — never an accident of "we didn't bother with TCP."
+
+> [!warning] Common mistake
+> Assuming a UDP "connection" (`net.DialUDP` in Go, or a socket that looks connected) means the other side is reachable. `DialUDP` only remembers a destination address locally; it sends nothing on the wire. The first real signal that something is wrong is a timeout, not a connection error.
+
+> [!tip] Remember
+> UDP guarantees exactly one thing: here is a datagram with a checksum, addressed to a port. Everything else — ordering, retries, dedup — is the application's problem to solve or not solve.
 
 ### QUIC: reliable streams, multiplexed, over UDP
+
+**In plain words:** QUIC opens one connection over UDP, then lets the application open many independent **streams** inside it — think of a stream as its own mini ordered-and-reliable pipe. Each stream has its own sequence numbers and its own retransmission, so losing a packet on stream 1 never blocks stream 2 from being delivered to the application the moment it arrives.
+
+**Picture it:**
 
 ```mermaid
 flowchart TB
@@ -83,9 +131,15 @@ flowchart TB
     conn --> udp["UDP datagrams (each datagram can carry frames from several streams)"]
 ```
 
-Each stream gets its own sequence numbers and its own retransmission, so the application can read stream 2's data as soon as it arrives, even while stream 1 is still waiting on a retransmit — this is the direct fix for TCP+HTTP/2's head-of-line blocking.
+**Example:** a browser loading a page opens one stream for the HTML, another for the main stylesheet, another for a script. If the packet carrying part of the stylesheet's stream is lost, the script's stream keeps delivering bytes to the browser the instant they arrive — it never waits on the stylesheet's retransmit, the direct fix for TCP+HTTP/2's head-of-line blocking.
 
-**TLS 1.3 is not bolted on, it's structural.** QUIC's handshake *is* a TLS 1.3 handshake, carried in QUIC's own frames instead of as a separate stream of bytes: the cryptographic handshake and the transport handshake happen in the same round trip (RFC 9001). A fresh QUIC connection reaches a usable, encrypted state in **1-RTT**, versus TCP+TLS 1.3's two separate round trips (1 for the TCP handshake, 1 for TLS) before the first encrypted application byte moves. There is no such thing as unencrypted QUIC in practice — the spec has no cleartext mode for application data.
+**Why it matters:** this is the entire reason HTTP/3 exists. HTTP/2 already multiplexed logical streams, but on top of TCP's single ordered byte stream, so the fix had to move below TCP entirely — onto UDP.
+
+### QUIC's handshake: TLS 1.3 isn't bolted on, it's structural
+
+**In plain words:** instead of doing a transport handshake first and a security handshake second (what TCP + TLS does), QUIC carries the TLS 1.3 handshake messages inside its own first packets. The cryptographic handshake and the transport handshake happen in the very same round trip.
+
+**Picture it:**
 
 ```mermaid
 sequenceDiagram
@@ -96,231 +150,107 @@ sequenceDiagram
     S->>C: Initial + Handshake packets: ServerHello, cert, Finished
     C->>S: Handshake packet: Finished
     Note over C,S: connection usable for application data after 1 RTT
-    opt resuming a previous connection
-        C->>S: Initial packet with 0-RTT data + session ticket
-        Note over S: server can decrypt and act on this immediately
-        Note over C,S: risk: a replayed 0-RTT packet can be replayed by an<br/>attacker before the server confirms it's really talking to C
-    end
 ```
 
-**0-RTT resumption:** if the client has a session ticket from a prior connection (the same mechanism as TLS 1.3's 0-RTT), it can send application data in its very first flight, before any round trip completes. The documented cost is **replay**: a network attacker who captures that first flight can resend it, and the server has no way yet to tell a resent copy from the original — so 0-RTT data must be limited to operations safe to receive twice (an idempotent GET, not a payment submission).
+**Example:** a fresh QUIC connection reaches a usable, encrypted state in **1 round trip**. TCP + TLS 1.3 needs **2 separate round trips** — one to establish the TCP connection, a second for the TLS handshake — before the first encrypted application byte can move. There is no such thing as unencrypted QUIC in practice; the spec has no cleartext mode for application data.
 
-**Connection migration.** A QUIC connection is identified by a **Connection ID** the endpoints choose, not by the classic IP+port 4-tuple TCP uses. A phone that switches from Wi-Fi to cellular gets a new IP address, which would silently kill a TCP connection (the 4-tuple no longer matches any open socket) — QUIC instead recognizes the Connection ID in the first packet from the new address, validates the peer owns that connection (a path validation handshake), and keeps the connection running without the application noticing a drop.
+**Why it matters:** halving the handshake cost matters most on high-latency links (mobile networks), where one round trip can be 50–150 ms — a cost paid on every cold connection.
 
-**Loss recovery and congestion control** are reimplemented inside QUIC itself (not reused from the OS's TCP stack) using packet-number-based ACKs (every QUIC packet, even a retransmission, gets a fresh packet number, avoiding TCP's retransmission-ambiguity problem) and a pluggable congestion controller — most implementations ship a CUBIC- or BBR-like algorithm, same ideas as [[TCP - Handshake, Reliability, Flow and Congestion Control]], just running in userspace per connection instead of in the kernel per socket.
+> [!tip] Remember
+> QUIC's handshake is fast specifically because the transport and TLS handshakes were designed together, not because QUIC skips a security step TCP+TLS performs.
+
+### 0-RTT resumption, and the replay risk it carries
+
+**In plain words:** if the client has a session ticket left over from a previous connection to the same server, it can send actual application data in its very first flight — before any round trip with the server completes at all. The analogy is a regular customer who already has a loyalty card: they hand it over and start talking business immediately, instead of re-introducing themselves first.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant A as Attacker (on-path)
+    participant C as Client
+    participant S as Server
+    C->>S: Initial packet: 0-RTT data + session ticket
+    Note over S: server decrypts and can act on this immediately
+    A-->>S: attacker replays the captured 0-RTT packet later
+    Note over S: server cannot yet tell the replay from the original
+```
+
+**Example:** a client resuming a session sends a GET request for a product page as 0-RTT data. An on-path attacker who captured that first flight can resend the exact same encrypted packet later, and the server has no way yet to distinguish the resend from the original — so **0-RTT data must be limited to operations that are safe to receive more than once**, like an idempotent GET, never something like a payment submission.
+
+**Why it matters:** the speed gain is real, but it comes with a specific, documented security trade-off that the application layer — not QUIC itself — has to respect.
+
+> [!warning] Common mistake
+> Treating 0-RTT as "just a faster handshake with no downside." It removes a round trip, but the data it carries is replayable by anyone who captured the first flight. Attaching it to a non-idempotent action (like "charge this card") is a real vulnerability, not a theoretical one.
+
+### Connection migration: surviving a change of address mid-connection
+
+**In plain words:** TCP identifies a connection by its 4-tuple (source IP, source port, destination IP, destination port). Change the IP — say, a phone switching from Wi-Fi to cellular — and the 4-tuple no longer matches any open socket, so the connection dies silently from the OS's point of view. QUIC instead identifies a connection by a **Connection ID** the endpoints chose themselves, completely independent of IP and port.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant Ph as "Phone (Connection ID: CID-7)"
+    participant Wifi as "Wi-Fi network (old path)"
+    participant Cell as "Cellular network (new path)"
+    participant Srv as Server
+
+    Ph->>Srv: packets over Wi-Fi, carrying CID-7
+    Note over Ph: 1. Wi-Fi drops, phone gets a new cellular IP
+    Ph->>Srv: 2. next packet, now over cellular, still carrying CID-7
+    Note over Srv: 3. server recognizes CID-7 from a new address
+    Srv->>Ph: 4. path validation challenge (new path)
+    Ph->>Srv: 5. path validation response
+    Note over Srv: 6. peer confirmed — same connection, new path
+    Note over Ph,Srv: connection continues, application never saw a drop
+```
+
+**Step by step:**
+1. The phone's IP address changes when it switches networks; nothing about the QUIC connection's identity (its Connection ID) changes with it.
+2. The very next packet the phone sends carries the same Connection ID, just from a new source address.
+3. The server recognizes that Connection ID arriving from an address it hasn't seen before.
+4. Before trusting the new path, the server runs a **path validation** handshake — a small challenge-response — to confirm the same peer (not an attacker spoofing the address) really owns that connection.
+5. The phone responds correctly to the challenge.
+6. The server resumes sending on the new path, and the application on the phone never saw the connection drop.
+
+**Why it matters:** this is a genuine capability TCP structurally cannot offer, because TCP's connection identity *is* the 4-tuple — there is no equivalent "same connection, new address" concept to fall back on.
+
+> [!question]- What happens if the path validation fails?
+> The server treats it as it would any unrecognized packet — the migration attempt is rejected, and from the application's point of view the connection behaves as if it had to start over, the same outcome TCP would have had with no migration support at all.
 
 ## 4. Worked example
 
-A UDP echo exchange, and a QUIC connection carrying two independent streams, both over loopback. The QUIC code uses `github.com/quic-go/quic-go`; everything compiles and its tests pass with `go vet` and `go test -race` on Go 1.24.
+### Whiteboard version
 
-```go
-package udpquic
+One client, one connection, two streams, drawn as the fewest boxes that still show the point:
 
-import (
-	"net"
-	"time"
-)
-
-// EchoUDP reads one datagram and sends the same bytes back to whoever sent
-// it. Unlike TCP there is no Accept: every packet carries its sender's
-// address, and the server never learns a reply didn't arrive — only a
-// client-side timeout reveals that.
-func EchoUDP(conn *net.UDPConn) error {
-	buf := make([]byte, 1500) // a conservative Ethernet-safe datagram size
-	n, addr, err := conn.ReadFromUDP(buf)
-	if err != nil {
-		return err
-	}
-	_, err = conn.WriteToUDP(buf[:n], addr)
-	return err
-}
-
-// SendAndWaitUDP sends msg to addr and waits up to timeout for a reply.
-func SendAndWaitUDP(addr string, msg []byte, timeout time.Duration) ([]byte, error) {
-	raddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	if _, err := conn.Write(msg); err != nil {
-		return nil, err
-	}
-	conn.SetReadDeadline(time.Now().Add(timeout))
-	buf := make([]byte, 1500)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-	return buf[:n], nil
-}
+```mermaid
+flowchart LR
+    A[Client opens QUIC connection] --> B["1-RTT handshake (TLS 1.3 inside)"]
+    B --> C[Stream 1: large file]
+    B --> D[Stream 2: small request]
+    C -->|"packet lost, retransmit"| C
+    D -->|delivered immediately| E[App reads stream 2 data]
+    C -->|eventually delivered| F[App reads stream 1 data]
 ```
 
-```go
-package udpquic
+Stream 1's loss and retransmit never stop stream 2's bytes from reaching the application right away — that's the whole mechanism in one picture.
 
-import (
-	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
-	"io"
-	"math/big"
-	"time"
+### Tracing a QUIC exchange step by step
 
-	"github.com/quic-go/quic-go"
-)
+A UDP echo exchange, and a QUIC connection carrying two independent streams over loopback, trace like this:
 
-// selfSignedTLSConfig builds an in-memory TLS 1.3 certificate so the demo
-// needs no files on disk. QUIC always carries TLS 1.3 inside it; there is
-// no cleartext QUIC, unlike plain TCP.
-func selfSignedTLSConfig() (*tls.Config, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1)}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, err
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"demo-echo"}}, nil
-}
+1. The client sends a UDP datagram carrying a small query; there is no setup step before this.
+2. For the QUIC side, the client first completes the 1-RTT handshake described above — transport and TLS together.
+3. The client opens **stream A** and writes a large payload (64 KB in the measured run below).
+4. The client opens **stream B**, independently, and writes a small payload ("small, independent stream", 25 bytes).
+5. The server echoes each stream back on its own sequence space; a loss or delay on stream A's packets never holds up stream B's echo.
+6. Both replies arrive and are verified independently: stream A's reply is 64 KB, stream B's is the original 25-byte message, unchanged.
 
-// RunQUICEchoServer accepts one connection and, independently on every
-// stream the client opens, echoes back whatever it reads on that stream.
-// Each stream is served in its own goroutine, so one slow or lost stream
-// never blocks the others: this is QUIC's fix for TCP head-of-line blocking.
-func RunQUICEchoServer(ctx context.Context, ln *quic.Listener) error {
-	conn, err := ln.Accept(ctx)
-	if err != nil {
-		return err
-	}
-	for {
-		stream, err := conn.AcceptStream(ctx)
-		if err != nil {
-			return nil // connection closed: normal end of the demo
-		}
-		go func(s quic.Stream) {
-			defer s.Close()
-			io.Copy(s, s)
-		}(stream)
-	}
-}
+**Measured** on this machine (Go 1.24.4, darwin/arm64, `github.com/quic-go/quic-go` v0.48.2, loopback, `go test -race`, 2026-11-06): both the 64 KB stream and the 25-byte stream completed correctly inside a 5-second context, confirming that the large stream's extra packets never blocked the small stream's delivery — they're independent sequence spaces on the same connection.
 
-// OpenStreamAndEcho opens a new independent stream on conn, writes msg,
-// half-closes the write side so the server sees EOF, and reads the echo.
-func OpenStreamAndEcho(ctx context.Context, conn quic.Connection, msg []byte) ([]byte, error) {
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := stream.Write(msg); err != nil {
-		return nil, err
-	}
-	stream.Close() // half-close: "I'm done sending on this stream"
-
-	buf := make([]byte, len(msg))
-	if _, err := io.ReadFull(stream, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
-}
-
-// Listen starts a QUIC listener on a loopback UDP port with the demo's
-// self-signed TLS config.
-func Listen() (*quic.Listener, error) {
-	tlsConf, err := selfSignedTLSConfig()
-	if err != nil {
-		return nil, err
-	}
-	return quic.ListenAddr("127.0.0.1:0", tlsConf, &quic.Config{MaxIdleTimeout: 10 * time.Second})
-}
-
-// Dial opens a QUIC connection to addr. InsecureSkipVerify is used only
-// because the demo's certificate is self-signed and unknown to any CA;
-// real clients must verify the chain (see the TLS and HTTPS note).
-func Dial(ctx context.Context, addr string) (quic.Connection, error) {
-	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"demo-echo"}}
-	return quic.DialAddr(ctx, addr, tlsConf, nil)
-}
-```
-
-```go
-func TestUDPNoReplyTimesOut(t *testing.T) {
-	// Nothing is listening on this port: UDP gives no connection-refused
-	// signal the way a client expects a TCP RST; the request just never
-	// gets a reply, and the caller must time out on its own.
-	laddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	probe, _ := net.ListenUDP("udp", laddr)
-	addr := probe.LocalAddr().String()
-	probe.Close() // free the port; nothing will answer on it now
-
-	_, err := SendAndWaitUDP(addr, []byte("ping"), 300*time.Millisecond)
-	if err == nil {
-		t.Fatalf("expected a timeout, got a reply")
-	}
-}
-
-func TestQUICStreamsAreIndependent(t *testing.T) {
-	ln, err := Listen()
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); RunQUICEchoServer(ctx, ln) }()
-
-	conn, err := Dial(ctx, ln.Addr().String())
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer conn.CloseWithError(0, "done")
-
-	// Two streams on the same connection; one carries a much larger
-	// payload. Both complete: a "slow" stream never blocks the other.
-	var slowReply, fastReply []byte
-	var inner sync.WaitGroup
-	inner.Add(2)
-	go func() {
-		defer inner.Done()
-		slowReply, _ = OpenStreamAndEcho(ctx, conn, make([]byte, 64*1024))
-	}()
-	go func() {
-		defer inner.Done()
-		fastReply, _ = OpenStreamAndEcho(ctx, conn, []byte("small, independent stream"))
-	}()
-	inner.Wait()
-
-	if len(slowReply) != 64*1024 {
-		t.Fatalf("slow stream echoed %d bytes, want 65536", len(slowReply))
-	}
-	if string(fastReply) != "small, independent stream" {
-		t.Fatalf("fast stream = %q", fastReply)
-	}
-
-	conn.CloseWithError(0, "test done")
-	wg.Wait()
-}
-```
-
-**Measured** on this machine (Go 1.24.4, darwin/arm64, `github.com/quic-go/quic-go` v0.48.2, loopback, `go test -race`, 2026-11-06): both the 64KB stream and the 25-byte stream completed correctly inside a 5s context, confirming that the large stream's extra packets never blocked the small stream's delivery — they're independent sequence spaces on the same connection.
+Runnable Go version: [[UDP and QUIC - Go]].
 
 ## 5. Variants and comparison
 
@@ -338,6 +268,9 @@ func TestQUICStreamsAreIndependent(t *testing.T) {
 - 0-RTT's replay exposure means it's only safe for operations that are fine being executed twice — never attach it to a non-idempotent action.
 - Plain UDP with no reliability layer at all is the wrong choice the moment "is this delivered, in order, at least once" starts to matter even a little — at that point you're reimplementing a worse version of QUIC or TCP from scratch.
 
+> [!tip] Remember
+> Every trade-off here is the same shape: QUIC trades kernel-shared CPU efficiency and universal middlebox support for flexibility, speed, and per-stream independence.
+
 ## 7. In production
 
 - **Real systems:** HTTP/3 (QUIC) is served by Google, Cloudflare, Facebook/Meta, and most major CDNs as the default negotiated protocol for supporting browsers (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]); DNS runs over UDP/53 by default with TCP fallback for large or truncated responses; WebRTC (video calls) and most multiplayer game networking run their own protocols over UDP.
@@ -351,6 +284,23 @@ func TestQUICStreamsAreIndependent(t *testing.T) {
 
 - **Why QUIC can't just be "TCP but faster."** TCP's state machine, congestion control and retransmission all live in kernel code that changes on OS-release timescales. QUIC deliberately lives in userspace specifically so it can evolve as fast as application code ships — a new congestion controller or a bug fix deploys with the next binary release, not the next OS kernel update across billions of devices.
 - **Packet numbers vs TCP sequence numbers.** TCP sequence numbers describe bytes in the stream, so a retransmission reuses the *same* sequence number as the original — which creates the "retransmission ambiguity problem": an ACK for that sequence number can't tell the sender whether it acknowledges the original or the retransmit, which matters for RTT estimation. QUIC gives every packet, including every retransmission, a strictly increasing packet number, so an ACK for packet number N is unambiguous about exactly which transmission attempt it covers — cleaner RTT samples, among other benefits.
+
+  ```mermaid
+  flowchart LR
+      subgraph tcp["TCP: same sequence number reused on retransmit"]
+          direction LR
+          t1["seq=1000 (original, lost)"] -.->|"timeout, retransmit"| t2["seq=1000 (retransmit)"]
+          t2 --> t3["ACK for seq=1000 — original or retransmit? ambiguous"]
+      end
+      subgraph quic["QUIC: every attempt gets a new packet number"]
+          direction LR
+          q1["pkt #42 (original, lost)"] -.->|"timeout, retransmit"| q2["pkt #58 (retransmit, same data)"]
+          q2 --> q3["ACK for pkt #58 — unambiguously the retransmit"]
+      end
+  ```
+
+  **Why it matters:** this ambiguity is the reason TCP's RTT estimation has historically needed extra heuristics (Karn's algorithm) to avoid being fooled by a retransmitted segment's ACK; QUIC's design removes the ambiguity at the packet-numbering level instead of patching around it.
+- **Loss recovery and congestion control** are reimplemented inside QUIC itself (not reused from the OS's TCP stack) using these packet-number-based ACKs and a pluggable congestion controller — most implementations ship a CUBIC- or BBR-like algorithm, same ideas as [[TCP - Handshake, Reliability, Flow and Congestion Control]], just running in userspace per connection instead of in the kernel per socket.
 - **Multipath potential.** Because a QUIC connection is identified by a Connection ID rather than a 4-tuple, and path validation is already part of the spec for migration, QUIC is a more natural base than TCP for using multiple network paths (Wi-Fi and cellular at once) simultaneously, not just migrating between them — an active area of extension work, not yet universal.
 - **Why DNS mostly stays on UDP instead of moving to QUIC.** DNS-over-QUIC (DoQ, RFC 9250) exists and gives DNS privacy plus QUIC's fast resumption, but plain UDP DNS remains dominant because a typical query/response round trip is already one datagram each way — there's very little head-of-line blocking to fix when there's only one "stream" per query to begin with. QUIC earns its keep most clearly when many logical exchanges share one connection, which is HTTP's situation, not a single DNS lookup's.
 
@@ -374,13 +324,16 @@ func TestQUICStreamsAreIndependent(t *testing.T) {
 > [!question]- How does QUIC survive a client's IP address changing mid-connection?
 > The connection is identified by a Connection ID the endpoints chose at setup, not by the IP+port 4-tuple. When packets arrive from a new address carrying a known Connection ID, the server runs a path validation handshake to confirm the same peer owns it, then continues the connection on the new path — TCP has no equivalent because its connection identity *is* the 4-tuple.
 
+> [!question]- Why does QUIC give every packet, even a retransmission, a unique packet number instead of reusing TCP's sequence-number style?
+> Because reusing the same identifier for a retransmission (as TCP does with sequence numbers) makes an ACK for that identifier ambiguous — it could be acknowledging the original packet or the retransmit, which corrupts RTT measurement. A strictly increasing packet number per attempt makes every ACK unambiguous about which specific transmission it covers.
+
 ## 10. Cheat sheet
 
 - UDP: one datagram, no connection, no ordering, no retransmission, no congestion control — the application builds whatever it needs.
 - QUIC: reliable, ordered, congestion-controlled streams multiplexed over UDP, with TLS 1.3 structurally part of the handshake.
 - QUIC fixes head-of-line blocking by keeping streams independent below the reliability layer, unlike HTTP/2's streams sitting on one TCP byte stream.
 - 1-RTT handshake (vs TCP+TLS 1.3's 2-RTT); 0-RTT resumption is possible but replayable, so restrict it to idempotent requests.
-- Connection migration: identified by Connection ID, not IP:port, so a network change doesn't kill the connection.
+- Connection migration: identified by Connection ID, not IP:port, so a network change doesn't kill the connection; a path validation handshake confirms the peer before trusting the new path.
 - Packet numbers are always unique, even on retransmission — no TCP-style ACK ambiguity.
 - UDP use cases share one theme: loss tolerance or extreme latency sensitivity (DNS, live video/voice, games).
 - Some networks still rate-limit or block UDP; a QUIC client needs a working TCP fallback.
@@ -390,3 +343,4 @@ func TestQUICStreamsAreIndependent(t *testing.T) {
 - **Before this:** [[TCP - Handshake, Reliability, Flow and Congestion Control]]
 - **Next:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Compare with:** [[TLS and HTTPS]] (the handshake QUIC embeds), [[DNS - Resolution, Records and Caching]] (the best-known UDP-first protocol)
+- **Code:** [[UDP and QUIC - Go]]

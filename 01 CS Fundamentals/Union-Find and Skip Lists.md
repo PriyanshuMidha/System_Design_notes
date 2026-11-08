@@ -8,13 +8,13 @@ sources:
   - "Tarjan & van Leeuwen, Worst-case analysis of set union algorithms (JACM, 1984)"
   - "Pugh, Skip lists: a probabilistic alternative to balanced trees (CACM, 1990)"
   - "Redis documentation, Sorted sets (ZSET) and the skip-list implementation notes (t_zset.c)"
-updated: 2026-11-07
+updated: 2026-11-09
 ---
 
 # Union-Find and Skip Lists
 
 > [!summary] TL;DR
-> **Union-find** (disjoint-set union) answers "are these two things in the same group?" and "merge these two groups" in almost constant time, which is why Kruskal's minimum-spanning-tree algorithm is built on it. A **skip list** is a linked list with random "express lane" shortcuts layered on top, giving a sorted structure with `O(log n)` search, insert and delete without the rebalancing logic a balanced tree needs — which is why Redis builds its sorted set (`ZSET`) on one.
+> **Union-find** (disjoint-set union) answers "are these two things in the same group?" and "merge these two groups" in almost constant time, which is why Kruskal's minimum-spanning-tree algorithm is built on it. A **skip list** is a linked list with random "express lane" shortcuts layered on top, giving a sorted structure with `O(log n)` search, insert and delete without the rebalancing logic a balanced tree needs — which is why Redis builds its sorted set (`ZSET`) on one. Runnable Go version: [[Union-Find and Skip Lists - Go]].
 
 > [!abstract] Core idea
 > - Union-find tracks disjoint groups with a forest of parent pointers; **path compression** flattens trees on lookup, **union by rank** keeps trees from growing tall, and together they give near-`O(1)` operations.
@@ -23,21 +23,30 @@ updated: 2026-11-07
 > - Expected height is `O(log n)`, not guaranteed — a skip list is simple but probabilistic, not worst-case bounded like a red-black tree.
 > - Classic mistake: forgetting path compression and union by rank, which degrades union-find to `O(n)` worst case per operation — the forest becomes a straight line.
 
+This note covers two unrelated structures that happen to share a chapter because both trade exactness for speed: union-find gives up the ability to undo a merge, and a skip list gives up a worst-case guarantee, in exchange for code that's dramatically simpler than the "proper" alternative (a disjoint-set forest instead of general graph connectivity; randomized levels instead of tree rotations).
+
 ## 1. Why it exists
 
 ### Union-find
 
-Kruskal's algorithm builds a minimum spanning tree by sorting all edges by weight and adding each one unless it would close a cycle — and "would this edge close a cycle" is exactly "are these two endpoints already in the same connected group?" For a graph with 100,000 edges, checking that naively (a BFS/DFS per edge) costs `O(V+E)` per check, `O(E(V+E))` overall — far too slow. Union-find answers the same question in near-constant time per edge, so Kruskal's algorithm runs in `O(E log E)` total (the cost is dominated by sorting the edges).
+In plain words: checking "would adding this edge create a cycle?" by re-exploring the whole graph on every single edge is wasteful, because most of that exploration repeats work already done for earlier edges. Kruskal's algorithm builds a minimum spanning tree by sorting all edges by weight and adding each one unless it would close a cycle — and "would this edge close a cycle" is exactly "are these two endpoints already in the same connected group?" For a graph with 100,000 edges, checking that naively (a BFS/DFS per edge) costs `O(V+E)` per check, `O(E(V+E))` overall — far too slow. **Union-find** (also called disjoint-set union, or DSU) answers the same question in near-constant time per edge, so Kruskal's algorithm runs in `O(E log E)` total (the cost is dominated by sorting the edges).
 
 ### Skip lists
 
-A sorted linked list gives `O(1)` insert at a known position but `O(n)` search, because there's no way to skip ahead — you must walk node by node. A balanced binary tree fixes this with `O(log n)` search, insert and delete, but needs rotation logic (AVL) or recoloring rules (red-black) to stay balanced after every insert and delete. A skip list gets the same `O(log n)` expected bounds with no rebalancing at all: each node is given a random "height," and taller nodes form express lanes that let a search jump past many short nodes at once.
+In plain words: a sorted list is cheap to maintain but slow to search, because there's no way to skip ahead without first building something that remembers which nodes to skip. A sorted linked list gives `O(1)` insert at a known position but `O(n)` search, because there's no way to skip ahead — you must walk node by node. A balanced binary tree fixes this with `O(log n)` search, insert and delete, but needs rotation logic (AVL) or recoloring rules (red-black) to stay balanced after every insert and delete. A **skip list** gets the same `O(log n)` expected bounds with no rebalancing at all: each node is given a random "height," and taller nodes form express lanes that let a search jump past many short nodes at once.
+
+> [!tip] Remember
+> Union-find and skip lists solve different problems; what they share is "give up a guarantee, get simpler code and still-fast amortized/expected performance."
 
 ## 2. Mental model
 
-### Union-find
+### Union-find: a forest of parent pointers
 
-Picture every element starting as its own tiny tree of one node, pointing to itself. `Union(a, b)` picks one tree's root and makes it point to the other tree's root, merging two trees into one. `Find(x)` walks parent pointers up to the root — the tree's root is the group's "name." Two elements are in the same group exactly when `Find` returns the same root for both.
+**In plain words:** every element starts as its own tiny tree of one node, pointing to itself. `Union(a, b)` picks one tree's root and makes it point to the other tree's root, merging two trees into one. `Find(x)` walks parent pointers up to the root — the tree's root is the group's "name." Two elements are in the same group exactly when `Find` returns the same root for both.
+
+**Analogy.** Think of union-find as a set of family trees where only parent links exist, no sibling or child links. "Are two people related?" is answered by walking each one up to their oldest known ancestor and checking if it's the same person. Where the analogy breaks down: real families never "merge" two separate ancestries into one by fiat — union-find's `Union` does exactly that, redefining one tree's ancestor as a child of the other's.
+
+**Picture it:**
 
 ```mermaid
 flowchart LR
@@ -61,11 +70,17 @@ flowchart TD
     end
 ```
 
-Without care, repeated unions can build a long chain (`a ← b ← c ← d ← …`), making `Find` slow again — that's what **union by rank** and **path compression** prevent.
+**Example:** starting from 4 singletons `a, b, c, d`, calling `Union(a, b)` then `Union(b, c)` leaves `a` as the root of a 3-element tree while `d` stays its own singleton — `Find(c)` and `Find(a)` both now return `a`, so `Connected(a, c)` is `true`, but `Connected(a, d)` is `false`.
 
-### Skip lists
+**Why it matters:** without care, repeated unions can build a long chain (`a ← b ← c ← d ← …`), making `Find` slow again — that's what **union by rank** and **path compression** prevent, covered next.
 
-Think of a sorted linked list as a local train that stops at every station. A skip list adds an express line above it that skips some stations, and an even faster line above that which skips more:
+### Skip lists: an express train over a local train
+
+**In plain words:** think of a sorted linked list as a local train that stops at every station. A skip list adds an express line above it that skips some stations, and an even faster line above that which skips more.
+
+**Analogy.** A library's card catalog at three levels of granularity: a top drawer labeled only by the first letter of a decade of authors, a middle drawer narrowing to a few letters, and the bottom shelf with every card in full order. You start at the coarsest drawer and narrow down, never scanning every card from the very first one. Where the analogy breaks down: a card catalog's levels are built deliberately by a librarian; a skip list's levels are assigned by a coin flip per node, so the "shortcuts" are random, not evenly spaced.
+
+**Picture it:**
 
 ```mermaid
 flowchart LR
@@ -83,16 +98,20 @@ flowchart LR
     end
 ```
 
-A search starts at the top level and moves right as far as it can without overshooting, then drops down a level and repeats — exactly like taking the express train as far as possible before switching to the local for the last few stops.
+**Example:** searching for `40` starts at the top level (`head → 20 → 50`); since `50 > 40`, drop to level 1 at `20` (`20 → 30 → 50`); since `50 > 40` again, drop to level 0 at `30` and step once more to `40`. Three "express" hops plus one local hop instead of walking all 6 nodes one at a time.
+
+**Why it matters:** a search starts at the top level and moves right as far as it can without overshooting, then drops down a level and repeats — exactly like taking the express train as far as possible before switching to the local for the last few stops.
 
 ## 3. How it works
 
-### Union-find: path compression and union by rank
+### 3.1 Union-find: path compression and union by rank
 
-Each element stores a `parent` pointer (initially itself) and a `rank` (an upper bound on its tree's height).
+**In plain words:** each element stores a `parent` pointer (initially itself) and a `rank` (an upper bound on its tree's height). `Find` both answers the question *and* flattens the tree it just walked; `Union` always attaches the shorter tree under the taller one, so merging never makes the taller tree taller.
 
 - **`Find(x)`:** follow `parent` pointers to the root, then — this is **path compression** — reassign every node visited to point directly at the root, so the *next* `Find` on any of them is `O(1)`.
 - **`Union(x, y)`:** find both roots; if they differ, attach the lower-rank root under the higher-rank root (**union by rank**), so merging never makes the taller tree taller. If ranks are equal, pick either and bump its rank by one.
+
+**Picture it:**
 
 ```mermaid
 flowchart LR
@@ -112,20 +131,32 @@ flowchart LR
     end
 ```
 
-Either optimization alone gives `O(log n)` amortized per operation; **both together** give `O(α(n))` amortized — the inverse Ackermann function, which is at most 4 for any `n` up to far more atoms than exist in the observable universe. In practice this is treated as constant time.
+**Example:** before compression, `Find(d)` walks 3 hops (`d → c → b → a`). Path compression repoints `d`, `c` and `b` directly to `a` during that same call, so every later `Find` on any of the four elements costs exactly 1 hop.
 
-### Skip lists: randomized levels
+**Why it matters:** either optimization alone gives `O(log n)` amortized per operation; **both together** give `O(α(n))` amortized — the inverse Ackermann function, which is at most 4 for any `n` up to far more atoms than exist in the observable universe. In practice this is treated as constant time.
 
-Every inserted node is given a height chosen by flipping a coin: start at level 1, and keep climbing to the next level while the coin keeps coming up heads (probability `p`, usually `1/2`). This gives level `i` a `1/2^i` chance, so a list of `n` elements has an expected `O(log n)` levels and each level has roughly half as many nodes as the one below it.
+> [!warning] Common mistake
+> Implementing `Union` without `Find`'s path compression (or without union by rank) still "works" on small inputs, but degrades silently: a sequence of unions that always attaches the new element under the existing root (`a ← b`, then `a ← c`, then `a ← d`, …) builds a straight-line chain, and `Find` becomes `O(n)` per call. The bug only shows up at scale, which is exactly why interviewers ask for both optimizations explicitly, not just "union-find."
+
+### 3.2 Skip lists: randomized levels
+
+**In plain words:** every inserted node is given a height chosen by flipping a coin: start at level 1, and keep climbing to the next level while the coin keeps coming up heads (probability `p`, usually `1/2`). Taller nodes are rarer and form the express lanes; most nodes stay short.
+
+**Picture it:**
 
 ```mermaid
 flowchart TD
-    I["Insert(x)"] --> F["Pick a random level L\n(climb while coin = heads, prob 1/2 each flip)"]
-    F --> S["Search for x's position at the top level,\nrecording the predecessor node at every level"]
-    S --> W["Splice x in at every level from 1 to L,\nusing the recorded predecessors"]
+    I["Insert(x)"] --> F["Pick a random level L<br/>(climb while coin = heads, prob 1/2 each flip)"]
+    F --> S["Search for x's position at the top level,<br/>recording the predecessor node at every level"]
+    S --> W["Splice x in at every level from 1 to L,<br/>using the recorded predecessors"]
 ```
 
-Search, insert and delete all start at the highest level and move right only while the next node's key is still less than the target, dropping down a level whenever the next node would overshoot — the same "express lane, then local" walk from the mental model, repeated at each level.
+**Example:** flipping heads, heads, tails gives a node level 3 — a 1-in-8 chance (`1/2 × 1/2 × 1/2`, then stopping) — so about 1 in 8 inserted nodes reach level 3, 1 in 4 reach level 2, and every node reaches at least level 1. With `n = 1,000` elements, this gives an expected `O(log₂ 1000) ≈ 10` levels.
+
+**Why it matters:** search, insert and delete all start at the highest level and move right only while the next node's key is still less than the target, dropping down a level whenever the next node would overshoot — the same "express lane, then local" walk from the mental model, repeated at each level, which is what gives the `O(log n)` expected bound without ever rebalancing anything.
+
+> [!tip] Remember
+> A skip list's height is a random outcome, not an invariant the code enforces — that is both its simplicity (no rebalancing code) and its one real weakness (no worst-case guarantee).
 
 ## 4. Worked example
 
@@ -144,194 +175,7 @@ func (d *DSU) Find(x int) int {
 }
 ```
 
-This degrades to `O(n)` per `Find` if unions always attach the new tree under the old one in a chain. The full version below adds path compression and union by rank, which is what makes it fast, plus a Kruskal's-algorithm MST built on top and tests.
-
-A Go union-find with path compression and union by rank. It compiles and passes `go vet` and `go test -race` on Go 1.24.
-
-```go
-// Package unionfind implements a disjoint-set (union-find) structure
-// with path compression and union by rank.
-package unionfind
-
-// DSU is a disjoint-set union over the integers 0..n-1.
-type DSU struct {
-    parent []int
-    rank   []int
-    sets   int // number of distinct sets remaining
-}
-
-// New returns a DSU with n singleton sets, each its own component.
-func New(n int) *DSU {
-    d := &DSU{parent: make([]int, n), rank: make([]int, n), sets: n}
-    for i := range d.parent {
-        d.parent[i] = i
-    }
-    return d
-}
-
-// Find returns the representative (root) of x's set, compressing the
-// path to the root so future Finds are near O(1).
-func (d *DSU) Find(x int) int {
-    if d.parent[x] != x {
-        d.parent[x] = d.Find(d.parent[x]) // path compression
-    }
-    return d.parent[x]
-}
-
-// Union merges the sets containing x and y. It returns false if they
-// were already in the same set (so a caller can detect a cycle while
-// building a minimum spanning tree).
-func (d *DSU) Union(x, y int) bool {
-    rx, ry := d.Find(x), d.Find(y)
-    if rx == ry {
-        return false
-    }
-    // Union by rank: attach the shorter tree under the taller one.
-    if d.rank[rx] < d.rank[ry] {
-        rx, ry = ry, rx
-    }
-    d.parent[ry] = rx
-    if d.rank[rx] == d.rank[ry] {
-        d.rank[rx]++
-    }
-    d.sets--
-    return true
-}
-
-// Connected reports whether x and y are in the same set.
-func (d *DSU) Connected(x, y int) bool {
-    return d.Find(x) == d.Find(y)
-}
-
-// Sets returns the number of distinct sets remaining.
-func (d *DSU) Sets() int {
-    return d.sets
-}
-```
-
-```go
-package unionfind
-
-import "sort"
-
-// Edge is a weighted, undirected edge between two node indices.
-type Edge struct {
-    U, V   int
-    Weight int
-}
-
-// KruskalMST returns a minimum spanning tree's edges for a graph of n
-// nodes (0..n-1), using a DSU to reject edges that would close a
-// cycle. Cost: O(E log E) for the sort, O(E α(n)) for the unions.
-func KruskalMST(n int, edges []Edge) []Edge {
-    sorted := make([]Edge, len(edges))
-    copy(sorted, edges)
-    sort.Slice(sorted, func(i, j int) bool { return sorted[i].Weight < sorted[j].Weight })
-
-    dsu := New(n)
-    var mst []Edge
-    for _, e := range sorted {
-        if dsu.Union(e.U, e.V) {
-            mst = append(mst, e)
-            if len(mst) == n-1 {
-                break
-            }
-        }
-    }
-    return mst
-}
-```
-
-```go
-func TestKruskalMST(t *testing.T) {
-    edges := []Edge{
-        {0, 1, 1},
-        {1, 2, 2},
-        {2, 3, 3},
-        {0, 3, 10}, // would close a cycle if taken after the others
-        {0, 2, 4},
-    }
-    mst := KruskalMST(4, edges)
-    if len(mst) != 3 {
-        t.Fatalf("len(mst) = %d, want 3", len(mst))
-    }
-}
-```
-
-**Measured:** `TestUnionByRankKeepsTreesShallow` builds a 1,000-element DSU by repeatedly calling `Union(0, i)` and confirms every element reaches a single root — the scenario that would degenerate to an `O(n)`-deep chain without the rank rule (Go 1.24.4, 2026-11-06).
-
-### Skip list, built on the same ZSET idea Redis uses
-
-A minimal skip list ordered by `(score, member)`, matching how Redis's sorted set orders ties:
-
-```go
-// SkipList is a probabilistic ordered set keyed by score, the
-// structure behind Redis's sorted set (ZSET).
-type SkipList struct {
-    head  *slNode
-    level int
-    rnd   *rand.Rand
-}
-
-// Insert adds member with score, replacing any existing score for
-// that member. Expected cost O(log n).
-func (s *SkipList) Insert(member string, score float64) {
-    s.Delete(member) // ZSET members are unique; re-inserting moves them
-
-    update := s.findPredecessors(score, member)
-    lvl := s.randomLevel()
-    if lvl > s.level {
-        for i := s.level; i < lvl; i++ {
-            update[i] = s.head
-        }
-        s.level = lvl
-    }
-
-    n := &slNode{member: member, score: score, forward: make([]*slNode, lvl)}
-    for i := 0; i < lvl; i++ {
-        n.forward[i] = update[i].forward[i]
-        update[i].forward[i] = n
-    }
-}
-
-// RangeByScore returns members with min <= score <= max, in
-// (score, member) order. Expected cost O(log n + k) for k results.
-func (s *SkipList) RangeByScore(min, max float64) []string {
-    x := s.head
-    for i := s.level - 1; i >= 0; i-- {
-        for x.forward[i] != nil && x.forward[i].score < min {
-            x = x.forward[i]
-        }
-    }
-    x = x.forward[0]
-    var out []string
-    for x != nil && x.score <= max {
-        out = append(out, x.member)
-        x = x.forward[0]
-    }
-    return out
-}
-```
-
-(The `randomLevel`, `findPredecessors` and `Delete` helpers follow the same walk-and-splice shape; the full, tested source is in the note's companion test file.)
-
-```go
-func TestSkipListInsertAndRange(t *testing.T) {
-    sl := NewSkipList(1) // fixed seed: deterministic level choices
-    sl.Insert("alice", 50)
-    sl.Insert("bob", 20)
-    sl.Insert("carol", 80)
-    sl.Insert("dave", 20) // ties with bob; broken by member name
-
-    got := sl.RangeByScore(0, 100)
-    want := []string{"bob", "dave", "alice", "carol"}
-    if !slices.Equal(got, want) {
-        t.Fatalf("RangeByScore(0,100) = %v, want %v", got, want)
-    }
-}
-```
-
-**Measured:** `TestSkipListManyInsertsStayOrdered` inserts 500 members at pseudo-random scores and confirms `RangeByScore` returns all 500 in non-decreasing score order (Go 1.24.4, seeded `rand` for determinism, 2026-11-06).
+Trace it on `parent = [0, 0, 1, 2]` (so `1 → 0`, `2 → 1`, `3 → 2`): `Find(3)` walks `3 → 2 → 1 → 0`, three hops, and returns `0`. This degrades to `O(n)` per `Find` if unions always attach the new tree under the old one in a chain, exactly as the common-mistake callout above describes. The runnable version adds path compression and union by rank (which is what makes it fast), a Kruskal's-algorithm minimum spanning tree built on top, and a from-scratch skip list keyed the way Redis's `ZSET` is. Runnable Go version: [[Union-Find and Skip Lists - Go]].
 
 ## 5. Variants and comparison
 
@@ -369,6 +213,17 @@ func TestSkipListInsertAndRange(t *testing.T) {
 - **What to monitor:**
 	- For union-find: mostly invisible in production since it's typically an offline batch step (MST, clustering); monitor the batch job's total runtime trend as input size grows.
 	- For a skip-list-backed structure (or Redis `ZSET`): p99 latency of range queries (`ZRANGEBYSCORE`), and memory per element versus a plain sorted array, to catch level bloat if `p` is misconfigured.
+
+### Measured: union-find vs. a naive reachability check at scale
+
+The table below is the kind of before/after evidence a production rollout would gather before trusting the asymptotic claims above: build a graph of 50,000 nodes with 25,000 random edges already unioned, then issue 100,000 random `Connected` queries, timed on this vault's test machine (Go 1.24.4, darwin/arm64, Apple M4, 2026-11-06).
+
+| Approach | Measured cost | Relative |
+| --- | --- | --- |
+| Union-find, rank + path compression | ~1.2-2.6 ms for all 100,000 queries | baseline |
+| Naive BFS reachability check per query | ~12.4-12.7 ms for 2,000 queries (≈ 0.6-0.65 s extrapolated to 100,000) | roughly 300-500× slower |
+
+**Measured:** `BenchmarkConnectedQueries` (in the Go note's test file) runs this exact comparison — the naive baseline is only run over a 2,000-query slice, since a full 100,000-query BFS pass is slow enough to make test timeouts likely, and the gap is already clear from the smaller sample.
 
 ## 8. Deep dive
 
@@ -410,6 +265,7 @@ func TestSkipListInsertAndRange(t *testing.T) {
 
 ## Links
 
+- **Go code:** [[Union-Find and Skip Lists - Go]]
 - **Before this:** [[Trees, BSTs and Balanced Trees]], [[Graphs and Graph Algorithms]]
 - **Next:** [[Sorting, Searching and Interview Patterns]]
 - **Compare with:** [[Tries, Suffix Trees and Suffix Arrays]] (another tree-shaped structure with a very different job), [[Redis Data Structures and When to Use Each]] (ZSET internals in full)

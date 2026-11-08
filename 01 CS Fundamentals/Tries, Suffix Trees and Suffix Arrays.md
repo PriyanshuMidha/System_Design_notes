@@ -10,13 +10,13 @@ sources:
   - "Go standard library docs, package index/suffixarray"
   - "julienschmidt/httprouter README and source, radix-tree routing"
   - "go-chi/chi README and source, radix-tree routing"
-updated: 2026-11-07
+updated: 2026-11-09
 ---
 
 # Tries, Suffix Trees and Suffix Arrays
 
 > [!summary] TL;DR
-> A **trie** (prefix tree) stores strings one character per edge so every string sharing a prefix shares a path; it answers "does any word start with this?" in time proportional to the query, not the dictionary size. A **suffix tree** is a trie of every suffix of one text, so it answers "does this text contain this substring?" just as fast. A **suffix array** is the cheaper, flatter alternative: a sorted list of suffix start positions, built and queried with less memory.
+> A **trie** (prefix tree) stores strings one character per edge so every string sharing a prefix shares a path; it answers "does any word start with this?" in time proportional to the query, not the dictionary size. A **suffix tree** is a trie of every suffix of one text, so it answers "does this text contain this substring?" just as fast. A **suffix array** is the cheaper, flatter alternative: a sorted list of suffix start positions, built and queried with less memory. Runnable Go version: [[Tries, Suffix Trees and Suffix Arrays - Go]].
 
 > [!abstract] Core idea
 > - A trie spreads strings over a tree by shared prefix; a node's depth is how many characters matched so far.
@@ -25,27 +25,67 @@ updated: 2026-11-07
 > - Compressed (radix) tries collapse single-child chains into one edge; this is what Go HTTP routers and IP routing tables actually use.
 > - Classic mistake: reaching for a suffix tree/array when an inverted index (word → documents) is the right tool, or vice versa — they solve different search problems.
 
+This note covers two genuinely different questions, built from the same underlying trick (index characters instead of comparing whole strings). **Part A** (sections 3.1–3.2) is about tries — many short strings, "which ones share this prefix?" **Part B** (sections 3.3–3.4) is about suffix trees and arrays — one long text, "where does this substring occur?" Keep the two apart in your head: that split is itself the most common interview trap in this area.
+
 ## 1. Why it exists
 
-Say you're building a search box that suggests words as the user types, backed by a dictionary of 400,000 English words. A naive approach checks every word for the typed prefix: for a 5-character prefix, that's up to 400,000 string comparisons of up to 5 characters each per keystroke. A **trie** turns this into "walk 5 edges from the root," then return everything in the subtree below — `O(prefix length)` to locate the subtree, independent of how many words are stored.
+### Part A: the prefix problem
 
-Now take a different problem: given one large text (a 50 MB log file, a genome, a source-code repository), answer many queries of "does substring `S` occur, and where?" A naive scan is `O(n)` per query, over the whole text, every time. A **suffix tree** (or the leaner **suffix array**) preprocesses the text once — `O(n)` to `O(n log n)` — so each later substring query costs roughly `O(m)`, the length of the query, not the text.
+Say you're building a search box that suggests words as the user types, backed by a dictionary of 400,000 English words. In plain words: checking every single word against the typed prefix on every keystroke is far too slow once the dictionary is large. A naive approach checks every word for the typed prefix: for a 5-character prefix, that's up to 400,000 string comparisons of up to 5 characters each per keystroke. A **trie** (a tree where the path you walk spells out a prefix) turns this into "walk 5 edges from the root," then return everything in the subtree below — `O(prefix length)` to locate the subtree, independent of how many words are stored.
+
+> [!tip] Remember
+> A trie's cost depends on the query's length, never on how many strings are stored.
+
+### Part B: the substring problem
+
+Now take a different problem: given one large text (a 50 MB log file, a genome, a source-code repository), answer many queries of "does substring `S` occur, and where?" In plain words: scanning the whole text over and over for every query wastes the fact that the text never changes between queries. A naive scan is `O(n)` per query, over the whole text, every time. A **suffix tree** (or the leaner **suffix array**) preprocesses the text once — `O(n)` to `O(n log n)` — so each later substring query costs roughly `O(m)`, the length of the query, not the text.
 
 These are two different tools for two different questions — "which stored strings share this prefix?" versus "where in this one text does this substring occur?" — built from the same idea: index strings by their characters instead of comparing them whole.
 
+> [!warning] Common mistake
+> Treating "trie" and "suffix tree" as interchangeable because both are trees of characters. A trie indexes *many separate strings*; a suffix tree indexes *every suffix of one string*. Mixing them up in an interview is an immediate red flag.
+
 ## 2. Mental model
 
-A trie is a tree where **edges, not nodes, hold the letters**. Walking from the root spells out a prefix; a node marked "end of word" means some inserted string stops exactly there. Think of it as a dictionary sorted so aggressively that every shared prefix is stored only once, like a filing cabinet where "CAR", "CARD" and "CARE" share the same first three drawers and only split at the fourth letter.
+### Part A: tries, the filing-cabinet analogy
 
-A suffix tree is the same structure applied to one text's suffixes: insert `"banana$"`, `"anana$"`, `"nana$"`, …, `"a$"` into a trie (the `$` is a sentinel character lower than everything else, so no suffix is a prefix of another). Any substring of the original text is a prefix of at least one suffix, so "does this substring occur" becomes "is there a path spelling it out from the root" — exactly the trie question.
+A trie is a tree where **edges, not nodes, hold the letters**. Walking from the root spells out a prefix; a node marked "end of word" means some inserted string stops exactly there.
 
-A suffix array skips building the tree: it just lists the **starting positions of every suffix, sorted alphabetically**. Searching is then a binary search over that sorted list instead of a tree walk.
+**Analogy.** Think of a filing cabinet sorted so aggressively that every shared prefix is stored only once: "CAR", "CARD" and "CARE" share the same first three drawers and only split apart at the fourth letter. Opening a drawer one letter at a time is exactly a trie walk.
+
+Where the analogy breaks down: a real filing cabinet needs a human to decide how deep to split; a trie splits automatically, one character at a time, no matter how the strings happen to be alike or different.
+
+### Part B: suffix trees, the same cabinet applied to one text
+
+A suffix tree is the same structure applied to one text's suffixes: insert `"banana$"`, `"anana$"`, `"nana$"`, …, `"a$"` into a trie (the `$` is a sentinel character lower than everything else, so no suffix is a prefix of another). Any substring of the original text is a prefix of at least one suffix, so "does this substring occur" becomes "is there a path spelling it out from the root" — exactly the trie question, just asked of a cabinet built from one word's own leftovers instead of many separate words.
+
+A suffix array skips building the tree: it just lists the **starting positions of every suffix, sorted alphabetically**. Searching is then a binary search over that sorted list instead of a tree walk — like replacing the filing cabinet with a single alphabetized index card list that just points back at where each suffix starts.
+
+```mermaid
+flowchart TD
+    subgraph Trie["Part A: trie — many strings"]
+        direction LR
+        W1["go"] -.-> TR(("shared-prefix tree"))
+        W2["golang"] -.-> TR
+        W3["gopher"] -.-> TR
+    end
+    subgraph SuffixStructs["Part B: suffix structures — one text"]
+        direction LR
+        TXT["one text, e.g. banana"] -.->|"suffix tree"| ST(("trie of all suffixes"))
+        TXT -.->|"suffix array"| SA(("sorted suffix starts"))
+    end
+```
+
+> [!tip] Remember
+> Same mechanism (index by character), different input shape: many strings for a trie, one text's own suffixes for a suffix tree/array.
 
 ## 3. How it works
 
-### Tries
+### 3.1 Tries
 
-Each node holds a fixed-size or map-based array of children (one slot per possible next character) and an "end of word" flag.
+**In plain words:** each node holds one slot per possible next character, plus a flag for "a word ends here." Inserting a string walks (or creates) one child per character; searching does the identical walk and checks the flag.
+
+**Picture it:**
 
 ```mermaid
 flowchart TD
@@ -61,11 +101,15 @@ flowchart TD
     GOPHE -->|r| GOPHER(("gopher ✓"))
 ```
 
-Inserting `"go"`, `"golang"` and `"gopher"` builds exactly this shape: all three share the `g → o` path, then split. A ✓ marks where a complete word ends (`"go"` is itself a word, not just a prefix of the other two). Lookup and insertion both cost `O(L)`, the length of the string, regardless of how many other strings are stored — the dictionary's size never enters the cost.
+**Example:** inserting `"go"`, `"golang"` and `"gopher"` builds exactly this shape: all three share the `g → o` path, then split. A ✓ marks where a complete word ends (`"go"` is itself a word, not just a prefix of the other two). Walking `g → o → p → h → e → r` for `Search("gopher")` costs exactly 6 steps, whether the trie holds 3 words or 3 million.
 
-### Compressed (radix) tries
+**Why it matters:** lookup and insertion both cost `O(L)`, the length of the string, regardless of how many other strings are stored — the dictionary's size never enters the cost, which is why autocomplete stays instant as a dictionary grows.
 
-A plain trie wastes space on long chains of single-child nodes (an edge per character down a 20-character path with no branching). A **radix trie** (also called a Patricia trie) collapses each such chain into one edge holding the whole substring:
+### 3.2 Compressed (radix) tries
+
+**In plain words:** a plain trie wastes space on long chains of single-child nodes — an edge per character down a 20-character path with no branching. A **radix trie** (also called a Patricia trie) collapses each such chain into one edge holding the whole substring, so the tree has one node per *branch point*, not per character.
+
+**Picture it:**
 
 ```mermaid
 flowchart TD
@@ -76,11 +120,15 @@ flowchart TD
     R -->|"/health"| H(("/health ✓"))
 ```
 
-This is precisely how Go's popular HTTP routers work: `julienschmidt/httprouter` and `go-chi/chi` both route by walking a radix tree of path segments, matching static parts byte-for-byte and treating `:id`-style segments as wildcard edges. A route lookup costs `O(path length)`, not `O(number of routes)`, which is why these routers stay fast with thousands of registered routes. IP routing tables use the same trick (a radix trie over address bits) to find the longest prefix match for a destination IP in time proportional to the address length, not the table size.
+**Example:** this is precisely how Go's popular HTTP routers work: `julienschmidt/httprouter` and `go-chi/chi` both route by walking a radix tree of path segments, matching static parts byte-for-byte and treating `:id`-style segments as wildcard edges. Registering 5,000 routes and looking up `/users/42/posts` still costs roughly 3 edge comparisons (`/users/`, `:id`, `/posts`), not 5,000 string comparisons. IP routing tables use the same trick (a radix trie over address bits) to find the longest prefix match for a destination IP in time proportional to the address length, not the table size.
 
-### Suffix trees
+**Why it matters:** a route lookup costs `O(path length)`, not `O(number of routes)`, which is why these routers stay fast with thousands of registered routes.
 
-Build a trie of every suffix of `text + "$"`. For `"banana$"`:
+### 3.3 Suffix trees
+
+**In plain words:** build a trie, but instead of inserting many separate words, insert every suffix of one text. The tree that comes out answers "does this substring occur" by walking it from the root.
+
+**Picture it:**
 
 ```mermaid
 flowchart TD
@@ -89,23 +137,29 @@ flowchart TD
     R --> N(("n"))
     R --> D(("$"))
     A --> AN(("na"))
-    AN --> ANA(("na$ → suf 3"))
-    AN --> ANB(("$ → suf 1"))
-    B --> BA(("anana$ → suf 0"))
+    AN --> ANA(("na$ -> suf 3"))
+    AN --> ANB(("$ -> suf 1"))
+    B --> BA(("anana$ -> suf 0"))
     N --> NA(("na"))
-    NA --> NAA(("na$ → suf 2"))
-    NA --> NAB(("$ → suf 4"))
+    NA --> NAA(("na$ -> suf 2"))
+    NA --> NAB(("$ -> suf 4"))
     D --> DD(("suf 6"))
 ```
 
-(Edges are compressed like the radix trie above — real suffix trees never store one character per edge, or the tree would blow past linear size.) Any substring query, say "is `ana` in `banana`?", walks `a → n → a` from the root; reaching a node (not falling off the tree) means yes, and the leaves below that node are every position `ana` starts at.
+(Edges are compressed like the radix trie above — real suffix trees never store one character per edge, or the tree would blow past linear size.)
 
-- **Naive construction** inserts `n` suffixes of average length `n/2`, giving `O(n²)` time and space.
-- **Ukkonen's algorithm** builds the same tree online, left to right, in `O(n)` time using suffix links (shortcuts between nodes that let the algorithm avoid re-walking from the root) — the construction most production suffix trees use, when they use a suffix tree at all.
+**Example:** is `"ana"` a substring of `"banana"`? Walk `a → n → a` from the root; reaching a node (not falling off the tree) means yes, and the leaves below that node are every position `"ana"` starts at — positions 1 and 3, matching the two `ana$`/`anana$` leaves in the picture.
 
-### Suffix arrays (the practical alternative)
+**Why it matters:** once the tree is built, every substring query costs only the query's own length, no matter how large the underlying text is — crucial when the text is a 50 MB log file and you're going to ask thousands of queries against it.
 
-List every suffix's starting index, then sort the suffixes lexicographically and keep only the indices:
+> [!warning] Common mistake
+> Building a suffix tree by naive insertion (`n` suffixes of average length `n/2`) costs `O(n²)` time and space — fine for a textbook example, unusable for anything beyond a few thousand characters. **Ukkonen's algorithm** builds the same tree online, left to right, in `O(n)` time using suffix links (shortcuts between nodes that let the algorithm avoid re-walking from the root) — the construction most production suffix trees use, when they use a suffix tree at all. Don't claim "suffix trees are `O(n)` to build" without naming the algorithm that makes that true.
+
+### 3.4 Suffix arrays (the practical alternative)
+
+**In plain words:** instead of a tree of pointers, just list every suffix's starting index, sort the suffixes lexicographically, and keep only the sorted indices. Searching becomes a binary search over that list.
+
+**Picture it:**
 
 | Suffix (for reference) | Start index |
 | ----------------------- | ----------- |
@@ -117,15 +171,18 @@ List every suffix's starting index, then sort the suffixes lexicographically and
 | `na$`                    | 4           |
 | `nana$`                  | 2           |
 
-The suffix array is just the right column, in that order: `[6, 5, 3, 1, 0, 4, 2]`. Searching for substring `S` is a **binary search** over this array: `O(m log n)` comparisons, each up to `O(m)` characters, so `O(m log n)` total — slower per query than a suffix tree's `O(m)`, but close in practice and much lighter on memory, since it's one slice of integers instead of a tree of pointer-heavy nodes.
+**Example:** the suffix array is just the right column, in that order: `[6, 5, 3, 1, 0, 4, 2]`. Searching for substring `S` is a **binary search** over this array: `O(m log n)` comparisons, each up to `O(m)` characters, so `O(m log n)` total — slower per query than a suffix tree's `O(m)`, but close in practice and much lighter on memory, since it's one slice of integers instead of a tree of pointer-heavy nodes.
 
 ```mermaid
 flowchart LR
-    T["text + binary search\nO(m log n)"] --- SA["sorted suffix starts\n(an int slice)"]
-    ST["suffix tree walk\nO(m)"] --- STn["trie of suffixes\n(pointer-heavy nodes)"]
+    T["text + binary search<br/>O(m log n)"] --- SA["sorted suffix starts<br/>(an int slice)"]
+    ST["suffix tree walk<br/>O(m)"] --- STn["trie of suffixes<br/>(pointer-heavy nodes)"]
 ```
 
-Pairing the suffix array with an **LCP array** (longest common prefix between each adjacent pair of sorted suffixes) recovers most of what the tree gives you — repeated substrings show up as runs of large LCP values — while staying array-based. Building both in `O(n)` (the SA-IS algorithm, or `O(n log n)` with simpler doubling algorithms) is what libraries like Go's `index/suffixarray` actually do.
+**Why it matters:** pairing the suffix array with an **LCP array** (longest common prefix between each adjacent pair of sorted suffixes) recovers most of what the tree gives you — repeated substrings show up as runs of large LCP values — while staying array-based. Building both in `O(n)` (the SA-IS algorithm, or `O(n log n)` with simpler doubling algorithms) is what libraries like Go's `index/suffixarray` actually do, which is why most Go code never hand-rolls a suffix tree.
+
+> [!tip] Remember
+> A suffix array is the practical default: a flat, sorted slice of integers beats a pointer-heavy tree in memory almost every time the data sets are large.
 
 ## 4. Worked example
 
@@ -138,151 +195,11 @@ type node struct {
     children map[byte]*node
     end      bool
 }
-
-func insert(root *node, word string) {
-    n := root
-    for i := 0; i < len(word); i++ {
-        c := word[i]
-        if n.children[c] == nil {
-            n.children[c] = &node{children: map[byte]*node{}}
-        }
-        n = n.children[c]
-    }
-    n.end = true
-}
 ```
 
-The full version below fixes the one real inefficiency in that sketch — a `map[byte]*node` per node, which is slow and allocates heavily — by using a fixed `[26]*node` array for lowercase words, and adds prefix search (autocomplete) and tests.
+Trace inserting `"go"` then searching `"go"`: start at the root, create a child for `'g'`, move into it, create a child for `'o'`, move into it, mark `end = true`. Searching `"go"` repeats exactly the same two-step walk and finds `end == true` — a match. Searching `"gop"` walks `g`, `o`, then looks for a `'p'` child that doesn't exist and reports no match, having done only 3 character comparisons regardless of how many other words are stored.
 
-A Go trie over lowercase words. It compiles and passes `go vet` and `go test -race` on Go 1.24.
-
-```go
-// Package trie implements a basic trie (prefix tree) over lowercase
-// ASCII words, the kind used for autocomplete.
-package trie
-
-// node is one trie node. children is indexed by byte-26 for 'a'..'z';
-// a real implementation would use a map for a wider alphabet.
-type node struct {
-    children [26]*node
-    end      bool // true if a word ends at this node
-}
-
-// Trie is a prefix tree of lowercase words.
-type Trie struct {
-    root *node
-}
-
-// New returns an empty trie.
-func New() *Trie {
-    return &Trie{root: &node{}}
-}
-
-// Insert adds word to the trie in O(len(word)).
-func (t *Trie) Insert(word string) {
-    n := t.root
-    for i := 0; i < len(word); i++ {
-        c := word[i] - 'a'
-        if n.children[c] == nil {
-            n.children[c] = &node{}
-        }
-        n = n.children[c]
-    }
-    n.end = true
-}
-
-// Search reports whether word was inserted exactly.
-func (t *Trie) Search(word string) bool {
-    n := t.walk(word)
-    return n != nil && n.end
-}
-
-// StartsWith reports whether any inserted word has this prefix.
-func (t *Trie) StartsWith(prefix string) bool {
-    return t.walk(prefix) != nil
-}
-
-// walk follows s from the root and returns the node reached, or nil
-// if s is not a path in the trie.
-func (t *Trie) walk(s string) *node {
-    n := t.root
-    for i := 0; i < len(s); i++ {
-        c := s[i] - 'a'
-        if n.children[c] == nil {
-            return nil
-        }
-        n = n.children[c]
-    }
-    return n
-}
-
-// Autocomplete returns every inserted word that starts with prefix,
-// in the order a pre-order traversal visits them (so not sorted, but
-// deterministic for a fixed insert order). Cost: O(prefix) to find the
-// prefix node, then O(k) for k nodes in the matching subtree.
-func (t *Trie) Autocomplete(prefix string) []string {
-    start := t.walk(prefix)
-    if start == nil {
-        return nil
-    }
-    var out []string
-    var dfs func(n *node, path []byte)
-    dfs = func(n *node, path []byte) {
-        if n.end {
-            out = append(out, prefix+string(path))
-        }
-        for c := byte(0); c < 26; c++ {
-            if n.children[c] != nil {
-                dfs(n.children[c], append(path, 'a'+c))
-            }
-        }
-    }
-    dfs(start, nil)
-    return out
-}
-```
-
-```go
-func TestInsertSearch(t *testing.T) {
-    tr := New()
-    tr.Insert("go")
-    tr.Insert("gopher")
-    tr.Insert("golang")
-
-    if !tr.Search("go") {
-        t.Error("expected go to be found")
-    }
-    if tr.Search("gop") {
-        t.Error("gop was never inserted as a whole word")
-    }
-    if !tr.StartsWith("gop") {
-        t.Error("gop is a valid prefix (of gopher)")
-    }
-}
-```
-
-### Suffix array in the standard library
-
-Go ships a production-grade suffix array in `index/suffixarray`, so most Go code never hand-rolls one:
-
-```go
-package main
-
-import (
-    "fmt"
-    "index/suffixarray"
-)
-
-func main() {
-    index := suffixarray.New([]byte("banana"))
-    offsets := index.Lookup([]byte("ana"), -1) // -1 = all matches
-    fmt.Println(offsets)                       // measured output (Go 1.24.4): [3 1]
-}
-```
-
-`Lookup` deliberately returns an **unsorted** list (the doc comment says so explicitly) — don't assume the offsets come back in text order; sort them yourself if order matters. `FindAllIndex(re *regexp.Regexp, n int)` is the sibling method for regular-expression matches, and it *does* return a sorted, non-overlapping list of `[start, end)` pairs.
-
-**Measured:** on this vault's test machine (Go 1.24.4, darwin/arm64, 2026-11-06), running the snippet above confirms `Lookup([]byte("ana"), -1)` on `"banana"` returns the offsets `{3, 1}`, in that unsorted order — the same two positions as the manual suffix-array walkthrough above, just not sorted the way that table is — and `Lookup([]byte("xyz"), -1)` returns none.
+The runnable version fixes the one real inefficiency in that sketch — a `map[byte]*node` per node, which is slow and allocates heavily — by using a fixed `[26]*node` array for lowercase words, and adds prefix search (autocomplete), a production-grade suffix array from Go's standard library, and tests. Runnable Go version: [[Tries, Suffix Trees and Suffix Arrays - Go]].
 
 ## 5. Variants and comparison
 
@@ -372,6 +289,7 @@ func main() {
 
 ## Links
 
+- **Go code:** [[Tries, Suffix Trees and Suffix Arrays - Go]]
 - **Before this:** [[Trees, BSTs and Balanced Trees]], [[Arrays and Dynamic Arrays (Go Slices)]]
 - **Next:** [[Union-Find and Skip Lists]], [[Sorting, Searching and Interview Patterns]]
 - **Compare with:** [[Search Engines and Inverted Indexes]] (word → documents, not substrings of one text), [[Storage Engines - B-tree vs LSM and WAL]] (a different kind of tree, for sorted on-disk data)

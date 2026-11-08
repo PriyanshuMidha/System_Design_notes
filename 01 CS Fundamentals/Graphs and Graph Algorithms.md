@@ -3,11 +3,11 @@ tags: [cs-fundamentals, data-structures, graphs, algorithms]
 level: intermediate
 status: reviewed
 prereqs: ["[[Heaps and Priority Queues]]", "[[Stacks, Queues and Deques]]", "[[Hash Tables and Go Maps]]"]
-related: ["[[Union-Find and Skip Lists]]", "[[Runtime - Goroutine Scheduler (GMP)]]", "[[Load Balancing]]"]
+related: ["[[Union-Find and Skip Lists]]", "[[Runtime - Goroutine Scheduler (GMP)]]", "[[Load Balancing]]", "[[Graphs and Graph Algorithms - Go]]"]
 sources:
   - "Cormen, Leiserson, Rivest, Stein, Introduction to Algorithms (3rd ed.), ch. 22–24"
   - "Go standard library docs, container/heap"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Graphs and Graph Algorithms
@@ -25,27 +25,42 @@ updated: 2026-11-06
 
 Say you're building a package manager: package A depends on B and C, B depends on D, and you need to install everything in an order where every dependency comes before the package that needs it. Or you're building a road-routing service: given a map of intersections and road segments with drive times, find the fastest route between two points. Neither problem is a hierarchy (a tree) — a package can be depended on by many others, and a road network has cycles (you can get back to where you started). Both are graphs, and both have a standard, well-understood algorithm: topological sort for the first, Dijkstra's algorithm for the second.
 
+> [!tip] Remember
+> A tree is a special case of a graph (no cycles, exactly one path between any two vertices). Reach for graph algorithms the moment "depended on by many" or "can get back to where you started" is true of your data.
+
 ## 2. Mental model
 
 A graph is a map of "what connects to what." Picture a subway map: stations are vertices, the lines between them are edges. If the lines have direction (one-way streets), it's a **directed** graph; if they have travel times, it's **weighted**. Most of this note is "how do you walk this map systematically" (BFS/DFS) and "how do you walk it to answer a specific question" (shortest path, dependency order, is there a cycle).
+
+**Where the subway analogy breaks down:** a real subway map's lines don't change while you're riding it; several of the algorithms below (Dijkstra, cycle detection) depend on the graph being fixed while they run, which a live, constantly-updating network (like actual traffic conditions) technically isn't — routing services handle this by re-running the algorithm on a fresh snapshot rather than mutating state mid-traversal.
 
 ## 3. How it works
 
 ### Terms
 
-- **Vertex** (or node): one point in the graph. **Edge**: a connection between two vertices.
-- **Degree**: the number of edges touching a vertex (in-degree and out-degree separately, for directed graphs).
-- **Path**: a sequence of edges connecting a sequence of vertices. **Cycle**: a path that returns to its starting vertex.
-- **DAG** (directed acyclic graph): a directed graph with no cycles — the shape dependency graphs and build pipelines must have.
-- **Connected component**: a maximal set of vertices all reachable from each other (for undirected graphs).
+**In plain words:** five words cover almost every concept in this note; get comfortable with them before anything else.
+
+| Term | Plain meaning |
+| --- | --- |
+| **Vertex** (node) | One point in the graph |
+| **Edge** | A connection between two vertices |
+| **Degree** | How many edges touch a vertex (in-degree/out-degree separately, for directed graphs) |
+| **Path** | A sequence of edges connecting a sequence of vertices |
+| **Cycle** | A path that returns to its starting vertex |
+| **DAG** | A directed graph with no cycles — the shape dependency graphs must have |
+| **Connected component** | A maximal set of vertices all reachable from each other (undirected graphs) |
 
 ### Representations
+
+**In plain words:** a graph needs to answer "what does this vertex connect to?" — the three common representations trade off space against how fast that question is to answer.
 
 | Representation | Space | Edge lookup `(u,v)` | Iterate u's neighbors | Use when |
 |---|---|---|---|---|
 | Adjacency list (`map[int][]Edge` or `[][]int`) | O(V+E) | O(degree(u)) | O(degree(u)) — optimal | Sparse graphs (most real graphs): default choice |
 | Adjacency matrix (`[][]bool` or `[][]int` of weights) | O(V²) | O(1) | O(V) — wasteful if sparse | Dense graphs, or when O(1) edge lookup matters more than space |
 | Edge list (`[]Edge{U, V, Weight}`) | O(E) | O(E) — slow | O(E) — slow | Algorithms that only need to process every edge once, e.g. Kruskal's MST |
+
+**Picture it:**
 
 ```mermaid
 flowchart LR
@@ -65,11 +80,15 @@ flowchart LR
     end
 ```
 
-In Go, this is naturally `map[int][]Edge` where `Edge{To int; Weight int}` — the hash table from [[Hash Tables and Go Maps]] doing the "which vertices exist, and what do they point to" bookkeeping.
+**Example:** the graph above has 4 vertices and 4 edges, so its adjacency list uses `O(V+E) = O(8)` space; the equivalent matrix would reserve 16 cells (`4×4`), most of them unused `false`/zero entries.
+
+**Why it matters:** in Go, this is naturally `map[int][]Edge` where `Edge{To int; Weight int}` — the hash table from [[Hash Tables and Go Maps]] doing the "which vertices exist, and what do they point to" bookkeeping. Default to an adjacency list unless the graph is genuinely dense.
 
 ### BFS: breadth-first search
 
-Explore level by level using a **queue**: visit the start vertex, enqueue its neighbors, then repeatedly dequeue a vertex and enqueue any of *its* unvisited neighbors. The first time you reach any vertex, you've reached it by the shortest path **in edge count** (not weight) — this only holds for unweighted graphs.
+**In plain words:** explore level by level using a **queue** — visit the start vertex, enqueue its neighbors, then repeatedly dequeue a vertex and enqueue any of *its* unvisited neighbors. The first time you reach any vertex, you've reached it by the shortest path **in edge count** (not weight) — this only holds for unweighted graphs.
+
+**Picture it:**
 
 ```mermaid
 flowchart TD
@@ -79,19 +98,43 @@ flowchart TD
     S3 --> S4["pop 3, visit; no new neighbors<br/>queue: []"]
 ```
 
-Cost: `O(V+E)` — every vertex enqueued once, every edge examined once.
+**Example:** starting BFS at vertex 0 on a graph where `0→{1,2}`, `1→{3}`, `2→{3}` visits in the order `0, 1, 2, 3` — vertex 3 is reached at "distance 2" (two edges from 0), regardless of which of 1 or 2 reaches it first.
+
+**Why it matters:** cost is `O(V+E)` — every vertex enqueued once, every edge examined once — and the level-by-level order is exactly what guarantees "first visit = shortest edge count."
 
 ### DFS: depth-first search
 
-Explore as deep as possible before backtracking, using a **stack** — either the call stack (recursive) or an explicit stack (iterative, avoiding Go's goroutine stack limits on very deep graphs). DFS is the natural tool for cycle detection and topological sort because it naturally tracks "what's on the current path."
+**In plain words:** explore as deep as possible before backtracking, using a **stack** — either the call stack (recursive) or an explicit stack (iterative, avoiding Go's goroutine stack limits on very deep graphs).
+
+**Why it matters:** DFS is the natural tool for cycle detection and topological sort because it naturally tracks "what's on the current path," which the next two subsections depend on directly.
 
 ### Cycle detection (directed graphs): three-color DFS
 
-Mark every vertex **white** (unvisited), **gray** (on the current DFS path, not yet fully explored), or **black** (fully explored, including all its descendants). A cycle exists exactly when DFS encounters an edge to a **gray** vertex — a "back edge" to something still on the current path, not merely something visited earlier in a different branch.
+**In plain words:** mark every vertex **white** (unvisited), **gray** (on the current DFS path, not yet fully explored), or **black** (fully explored, including all its descendants). A cycle exists exactly when DFS encounters an edge to a **gray** vertex — a "back edge" to something still on the current path, not merely something visited earlier in a different branch.
+
+**Picture it:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> White: every vertex starts white
+    White --> Gray: DFS visits it (on current path)
+    Gray --> Black: DFS finishes exploring all its descendants
+    Gray --> Gray: edge to another gray vertex = CYCLE (back edge)
+    Black --> [*]
+```
+
+**Example:** DFS from vertex A reaches B (gray), then C (gray), then finds an edge `C → A`. A is still gray (it's an ancestor on the current path, not finished), so this is a cycle: `A → B → C → A`. If instead the edge were `C → D` where D was already black (fully explored on a separate earlier branch), that's not a cycle — D is just a shared descendant.
+
+**Why it matters:** "already visited" alone can't distinguish these two cases — only the three-color scheme can, which is exactly why directed cycle detection is conventionally taught with DFS rather than BFS (expanded in section 8).
+
+> [!warning] Common mistake
+> Treating any edge to an already-visited vertex as a cycle. An edge to a **black** vertex (fully explored, on a different branch) is completely normal in a DAG — only an edge to a **gray** vertex (still on the current path) is a cycle.
 
 ### Topological sort: Kahn's algorithm
 
-Only defined for a DAG. Repeatedly remove any vertex with **in-degree 0** (no remaining unprocessed dependency), append it to the output order, and decrement the in-degree of everything it pointed to. If every vertex gets removed, the output is a valid topological order; if some vertices remain stuck with in-degree > 0, the graph has a cycle and no valid order exists.
+**In plain words:** only defined for a DAG. Repeatedly remove any vertex with **in-degree 0** (no remaining unprocessed dependency), append it to the output order, and decrement the in-degree of everything it pointed to.
+
+**Picture it:**
 
 ```mermaid
 stateDiagram-v2
@@ -106,308 +149,71 @@ stateDiagram-v2
     CheckCycle --> [*]: order.length < V → cycle, no valid order
 ```
 
+**Example:** packages `A→B`, `A→C`, `B→D`, `C→D` start with in-degrees `A:0, B:1, C:1, D:2`. Remove A (in-degree 0), decrement B and C to 0 each, remove both, decrement D twice to 0, remove D. Output: `A, B, C, D` (or `A, C, B, D` — either is valid).
+
+**Why it matters:** if every vertex gets removed, the output is a valid topological order; if some vertices remain stuck with in-degree > 0, the graph has a cycle and no valid order exists — this is the mechanical cycle check Kahn's algorithm gives you for free, without a separate DFS pass.
+
 ### Dijkstra's algorithm: shortest paths with non-negative weights
 
-Maintain a `dist` map (shortest known distance to each vertex) and a min-heap frontier keyed by distance — exactly the [[Heaps and Priority Queues]] mechanism. Repeatedly pop the closest unvisited vertex, and for each of its edges, check if going through it gives a shorter path to the neighbor (**relaxation**); if so, update `dist` and push the neighbor. Requires non-negative weights because the algorithm commits to a vertex's shortest distance once popped — a later negative-weight edge could invalidate that commitment, which Bellman-Ford handles instead (at `O(VE)` instead of `O((V+E) log V)`).
+**In plain words:** maintain a `dist` map (shortest known distance to each vertex) and a min-heap frontier keyed by distance — exactly the [[Heaps and Priority Queues]] mechanism. Repeatedly pop the closest unvisited vertex, and for each of its edges, check if going through it gives a shorter path to the neighbor (**relaxation**); if so, update `dist` and push the neighbor.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant H as Min-heap frontier
+    participant D as dist map
+
+    Note over D: dist = {0: 0}
+    H->>H: pop (0, dist=0)
+    H->>D: relax edges from 0: dist[1]=1, dist[2]=4
+    H->>H: push (1, dist=1), (2, dist=4)
+    H->>H: pop (1, dist=1) — smallest in heap
+    H->>D: relax edge 1→3 (w2): dist[3]=3
+    H->>H: push (3, dist=3)
+    H->>H: pop (3, dist=3) — beats popping (2, dist=4) first
+    H->>D: relax edge 3→ nothing cheaper for 2
+    H->>H: pop (2, dist=4): dist[2] already final
+```
+
+**Example:** on the sample graph `0→1 (w1)`, `1→3 (w2)`, `0→2 (w4)`, `2→3 (w2)`, the path `0→1→3` (total weight 3) is found before the path `0→2→3` (total weight 6) is even finished relaxing — the heap always pops the globally closest unvisited vertex next, which is why 3 ends up with the cheaper distance.
+
+**Why it matters:** requires non-negative weights because the algorithm commits to a vertex's shortest distance once popped — a later negative-weight edge could invalidate that commitment, which Bellman-Ford handles instead (at `O(VE)` instead of `O((V+E) log V)`), as section 8 proves in detail.
+
+### Union-find and Kruskal's MST
+
+**In plain words:** a **minimum spanning tree (MST)** connects every vertex with the cheapest possible total edge weight and no cycles. **Kruskal's algorithm** sorts all edges by weight, then greedily adds each edge that connects two *different* components, skipping any edge that would close a cycle.
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    Sort["Sort all edges by weight ascending"] --> Pick["Take the next cheapest edge"]
+    Pick --> Check{"Find(u) == Find(v)?<br/>(already same component?)"}
+    Check -- "yes: would close a cycle" --> Skip["Skip this edge"]
+    Check -- "no: different components" --> Add["Add edge to MST;<br/>Union(u, v)"]
+    Skip --> More{"Edges left?"}
+    Add --> More
+    More -- yes --> Pick
+    More -- "no" --> Done["MST complete:<br/>V-1 edges, no cycles"]
+```
+
+**Example:** on a 4-vertex graph with edges of weight 1, 2, 3, 4, 5 (sorted), Kruskal keeps the weight-1 edge, the weight-2 edge, skips the weight-4 edge if it would close a cycle, keeps the next valid edge, and stops once `V-1 = 3` edges are chosen.
+
+**Why it matters:** that same-component check is exactly what **union-find** (disjoint-set union) answers in near-O(1): `Find(x)` returns x's component representative (with **path compression**, repointing every visited node straight at the root); `Union(x, y)` merges two components (attaching the shorter tree under the taller one, **union by rank**, to keep future `Find` calls fast). The full analysis of path compression's amortized cost, and the related ordered-structure problem skip lists solve, live in [[Union-Find and Skip Lists]].
 
 ## 4. Worked example
 
 ### Whiteboard version
 
-The bare mechanism: adjacency list plus BFS.
+The bare mechanism — adjacency list plus BFS — needs only the shape of the two core types to picture the rest of this note:
 
 ```go
 type Edge struct{ To, Weight int }
 type Graph struct{ adj map[int][]Edge }
-
-func BFS(g *Graph, start int) []int {
-	visited := map[int]bool{start: true}
-	queue := []int{start}
-	var order []int
-	for len(queue) > 0 {
-		u := queue[0]
-		queue = queue[1:]
-		order = append(order, u)
-		for _, e := range g.adj[u] {
-			if !visited[e.To] {
-				visited[e.To] = true
-				queue = append(queue, e.To)
-			}
-		}
-	}
-	return order
-}
 ```
 
-The full version below adds the graph type, DFS (both forms), cycle detection, topological sort, Dijkstra, and union-find + Kruskal's MST — tested on Go 1.24. On the sample graph `0→1 (w1)`, `1→3 (w2)`, `0→2 (w4)`, `2→3 (w2)`:
-
-```go
-package graph
-
-import "container/heap"
-
-type Edge struct {
-	To     int
-	Weight int
-}
-
-type Graph struct {
-	adj map[int][]Edge
-}
-
-func New() *Graph { return &Graph{adj: make(map[int][]Edge)} }
-
-func (g *Graph) AddEdge(u, v, weight int) {
-	g.adj[u] = append(g.adj[u], Edge{To: v, Weight: weight})
-	if _, ok := g.adj[v]; !ok {
-		g.adj[v] = nil
-	}
-}
-
-func BFS(g *Graph, start int) []int {
-	visited := map[int]bool{start: true}
-	queue := []int{start}
-	var order []int
-	for len(queue) > 0 {
-		u := queue[0]
-		queue = queue[1:]
-		order = append(order, u)
-		for _, e := range g.adj[u] {
-			if !visited[e.To] {
-				visited[e.To] = true
-				queue = append(queue, e.To)
-			}
-		}
-	}
-	return order
-}
-
-func DFSRecursive(g *Graph, start int) []int {
-	visited := map[int]bool{}
-	var order []int
-	var visit func(u int)
-	visit = func(u int) {
-		if visited[u] {
-			return
-		}
-		visited[u] = true
-		order = append(order, u)
-		for _, e := range g.adj[u] {
-			visit(e.To)
-		}
-	}
-	visit(start)
-	return order
-}
-
-const (
-	white = iota
-	gray
-	black
-)
-
-// HasCycle: three-color DFS. A gray -> gray edge is a back edge: a cycle.
-func HasCycle(g *Graph) bool {
-	colorOf := make(map[int]int)
-	var visit func(u int) bool
-	visit = func(u int) bool {
-		colorOf[u] = gray
-		for _, e := range g.adj[u] {
-			switch colorOf[e.To] {
-			case gray:
-				return true
-			case white:
-				if visit(e.To) {
-					return true
-				}
-			}
-		}
-		colorOf[u] = black
-		return false
-	}
-	for v := range g.adj {
-		if colorOf[v] == white {
-			if visit(v) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// TopoSort: Kahn's algorithm. ok=false means the graph has a cycle.
-func TopoSort(g *Graph) (order []int, ok bool) {
-	inDegree := make(map[int]int)
-	for v := range g.adj {
-		inDegree[v] = 0
-	}
-	for _, edges := range g.adj {
-		for _, e := range edges {
-			inDegree[e.To]++
-		}
-	}
-	var queue []int
-	for v, d := range inDegree {
-		if d == 0 {
-			queue = append(queue, v)
-		}
-	}
-	for len(queue) > 0 {
-		u := queue[0]
-		queue = queue[1:]
-		order = append(order, u)
-		for _, e := range g.adj[u] {
-			inDegree[e.To]--
-			if inDegree[e.To] == 0 {
-				queue = append(queue, e.To)
-			}
-		}
-	}
-	return order, len(order) == len(g.adj)
-}
-
-type pqItem struct {
-	vertex, dist int
-}
-type distHeap []pqItem
-
-func (h distHeap) Len() int           { return len(h) }
-func (h distHeap) Less(i, j int) bool { return h[i].dist < h[j].dist }
-func (h distHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *distHeap) Push(x any)        { *h = append(*h, x.(pqItem)) }
-func (h *distHeap) Pop() any {
-	old := *h
-	n := len(old)
-	v := old[n-1]
-	*h = old[:n-1]
-	return v
-}
-
-// Dijkstra: shortest distances from start. Requires non-negative weights.
-// O((V+E) log V) with a binary heap frontier.
-func Dijkstra(g *Graph, start int) map[int]int {
-	dist := map[int]int{start: 0}
-	h := &distHeap{{vertex: start, dist: 0}}
-	for h.Len() > 0 {
-		cur := heap.Pop(h).(pqItem)
-		if d, ok := dist[cur.vertex]; ok && cur.dist > d {
-			continue // a shorter path was already finalized
-		}
-		for _, e := range g.adj[cur.vertex] {
-			nd := cur.dist + e.Weight
-			if d, ok := dist[e.To]; !ok || nd < d {
-				dist[e.To] = nd
-				heap.Push(h, pqItem{vertex: e.To, dist: nd})
-			}
-		}
-	}
-	return dist
-}
-```
-
-Test proving Dijkstra picks the genuinely cheapest path, not just the fewest hops (`0→1→3` costs 3 and beats the 2-hop-but-pricier `0→2→3` at cost 6):
-
-```go
-func TestDijkstraShortestPaths(t *testing.T) {
-	g := buildSample() // 0->1(w1), 1->3(w2), 0->2(w4), 2->3(w2)
-	dist := Dijkstra(g, 0)
-	want := map[int]int{0: 0, 1: 1, 2: 4, 3: 3}
-	if !reflect.DeepEqual(dist, want) {
-		t.Fatalf("Dijkstra = %v; want %v", dist, want)
-	}
-}
-```
-
-**Measured** (Go 1.24.4, `go test -race`, this code): on the sample graph, `Dijkstra(g, 0)` returns `{0:0, 1:1, 2:4, 3:3}` — correctly preferring the 2-hop route through vertex 1 (total weight 3) over the 2-hop route through vertex 2 (total weight 6).
-
-### Union-find and Kruskal's MST
-
-A **minimum spanning tree (MST)** connects every vertex with the cheapest possible total edge weight and no cycles. **Kruskal's algorithm**: sort all edges by weight, then greedily add each edge that connects two *different* components, skipping any edge that would close a cycle (both endpoints already in the same component). That same-component check is exactly what **union-find** (disjoint-set union) answers in near-O(1): `Find(x)` returns x's component representative (with **path compression**, repointing every visited node straight at the root); `Union(x, y)` merges two components (attaching the shorter tree under the taller one, **union by rank**, to keep future `Find` calls fast). The full analysis of path compression's amortized cost, and the related ordered-structure problem skip lists solve, live in [[Union-Find and Skip Lists]] — here is the slice Kruskal needs (add `"sort"` to this file's imports for `KruskalMST` below):
-
-```go
-type UnionFind struct {
-	parent, rank []int
-}
-
-func NewUnionFind(n int) *UnionFind {
-	uf := &UnionFind{parent: make([]int, n), rank: make([]int, n)}
-	for i := range uf.parent {
-		uf.parent[i] = i
-	}
-	return uf
-}
-
-func (uf *UnionFind) Find(x int) int {
-	if uf.parent[x] != x {
-		uf.parent[x] = uf.Find(uf.parent[x]) // path compression
-	}
-	return uf.parent[x]
-}
-
-func (uf *UnionFind) Union(x, y int) bool {
-	rx, ry := uf.Find(x), uf.Find(y)
-	if rx == ry {
-		return false // already connected: this edge would close a cycle
-	}
-	switch {
-	case uf.rank[rx] < uf.rank[ry]:
-		uf.parent[rx] = ry
-	case uf.rank[rx] > uf.rank[ry]:
-		uf.parent[ry] = rx
-	default:
-		uf.parent[ry] = rx
-		uf.rank[rx]++
-	}
-	return true
-}
-
-// WEdge is a weighted, undirected edge between vertices U and V, the shape
-// Kruskal's algorithm works from (a flat edge list, not an adjacency list).
-type WEdge struct {
-	U, V, Weight int
-}
-
-// KruskalMST returns a minimum spanning tree's edges for an n-vertex
-// undirected graph given as a flat edge list: sort edges by weight, then
-// greedily keep any edge that connects two different union-find
-// components. O(E log E), dominated by the sort.
-func KruskalMST(n int, edges []WEdge) []WEdge {
-	sorted := append([]WEdge(nil), edges...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Weight < sorted[j].Weight })
-
-	uf := NewUnionFind(n)
-	var mst []WEdge
-	for _, e := range sorted {
-		if uf.Union(e.U, e.V) {
-			mst = append(mst, e)
-		}
-	}
-	return mst
-}
-```
-
-Test proving Kruskal's MST on a 4-vertex graph picks exactly the 3 cheapest non-cycle-closing edges (weights 1, 2, 3; total 6), skipping the pricier 4- and 5-weight edges:
-
-```go
-func TestKruskalMST(t *testing.T) {
-	edges := []WEdge{
-		{U: 0, V: 1, Weight: 1}, {U: 1, V: 2, Weight: 2},
-		{U: 0, V: 2, Weight: 4}, {U: 2, V: 3, Weight: 3},
-		{U: 1, V: 3, Weight: 5},
-	}
-	mst := KruskalMST(4, edges)
-	if len(mst) != 3 {
-		t.Fatalf("got %d edges; want 3 (n-1 for n=4)", len(mst))
-	}
-	total := 0
-	for _, e := range mst {
-		total += e.Weight
-	}
-	if total != 6 {
-		t.Fatalf("MST total weight = %d; want 6", total)
-	}
-}
-```
+Every algorithm above (BFS, DFS, cycle detection, topological sort, Dijkstra, Kruskal's MST with union-find) is implemented and tested against the sample graph `0→1 (w1)`, `1→3 (w2)`, `0→2 (w4)`, `2→3 (w2)` in the runnable version: [[Graphs and Graph Algorithms - Go]]. Tracing Dijkstra on that sample graph by hand is exactly the sequence diagram above; the Go tests assert the same result (`dist = {0:0, 1:1, 2:4, 3:3}`) under `go test -race`.
 
 ## 5. Variants and comparison
 
@@ -428,6 +234,9 @@ func TestKruskalMST(t *testing.T) {
 - Dijkstra breaks silently wrong (not a crash, just an incorrect answer) on negative edge weights, because it commits to a vertex's shortest distance as soon as it's popped from the heap. Use Bellman-Ford if negative weights are possible.
 - An adjacency matrix wastes `O(V²)` space on a sparse graph (most real-world graphs: a social network has far fewer friendships than `V²` possible pairs) — default to an adjacency list unless you specifically need `O(1)` edge-existence checks on a dense graph.
 - Topological sort and cycle detection are meaningless on an undirected graph in the directed sense described here — undirected cycle detection uses union-find instead (two endpoints of an edge already in the same component means a cycle).
+
+> [!warning] What happens if… you run Dijkstra on a graph with a negative edge?
+> It can return a distance that's too large for some vertex, silently, with no error or crash — because it already finalized that vertex's distance before the negative edge had a chance to offer a cheaper path through it. This is the single most common "my shortest-path code is wrong but I don't see why" bug in practice.
 
 ## 7. In production
 
@@ -498,3 +307,4 @@ BFS can detect cycles in an undirected graph (a visited neighbor that isn't your
 - **Before this:** [[Heaps and Priority Queues]], [[Stacks, Queues and Deques]], [[Hash Tables and Go Maps]]
 - **Next:** [[Union-Find and Skip Lists]], [[Runtime - Goroutine Scheduler (GMP)]]
 - **Compare with:** [[Trees, BSTs and Balanced Trees]] (a tree is a graph with no cycles and one path between any two vertices)
+- **Runnable code:** [[Graphs and Graph Algorithms - Go]]

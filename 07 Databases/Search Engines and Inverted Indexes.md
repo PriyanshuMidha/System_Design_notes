@@ -26,6 +26,7 @@ updated: 2026-11-03
 > - Elasticsearch/OpenSearch: index → primary and replica shards → Lucene segments; new documents become searchable after a refresh (1 s by default), not on write.
 > - Start with Postgres full-text search; add a search engine when relevance, fuzziness, facets or load demand it, and feed it through an outbox or CDC.
 
+
 ## 1. Why it exists
 
 InvoiceOps users want to type `acme overdue` and find invoices whose notes, client name or line items mention those words. The obvious SQL is:
@@ -47,7 +48,7 @@ A search engine fixes all three: it indexes terms once at write time, normalizes
 
 Think of the index at the back of a textbook. You do not read the whole book to find "photosynthesis"; you look the word up and get page numbers. An inverted index is that back-of-book index for every word of every document, with page numbers replaced by document ids.
 
-From the source note's example:
+An example:
 
 ```text
 "invoice" -> doc1, doc7, doc9
@@ -64,6 +65,7 @@ Terms used below:
 - **Postings list:** for one term, the sorted list of documents containing it, with optional term frequency and positions.
 - **Analyzer:** the pipeline that turns text into terms.
 - **Relevance score:** a number that orders matching documents.
+
 
 ## 3. How it works
 
@@ -122,7 +124,33 @@ flowchart LR
 - Each **postings list** is sorted by document id. AND queries intersect lists by walking them together, skipping ahead with skip data; OR queries merge them.
 - **Term frequency** (how often the term appears in that document) feeds ranking. **Positions** make phrase queries possible: `"overdue invoice"` matches only where `invoice` sits at the position right after `overdue`.
 
-### 3.3 Relevance: TF-IDF to BM25
+### 3.3 Query execution: AND, OR and phrases
+
+Looking up the terms is only the first step. The engine then combines the postings lists according to the query operator.
+
+| Operator | What the engine does | Cost grows with |
+| --- | --- | --- |
+| `a AND b` | Walk both sorted lists together; keep ids present in both; skip ahead over gaps | The shorter list, because skip data jumps over the longer one |
+| `a OR b` | Merge both lists and keep every id | The sum of both lists |
+| `"a b"` (phrase) | Intersect first, then check positions: `b` must be at the position right after `a` | The intersection, plus a position check per candidate |
+
+```mermaid
+sequenceDiagram
+    participant Q as Query "overdue invoice" (phrase)
+    participant D as Term dictionary
+    participant P as Postings with positions
+    Q->>D: look up "overdue" and "invoice" (after analysis)
+    D-->>Q: overdue: doc 1 (pos 0), doc 3 (pos 3)
+    D-->>Q: invoice: doc 1 (pos 1), doc 2 (pos 2), doc 3 (pos 4)
+    Q->>P: intersect doc ids: 1 and 3 survive, doc 2 has no "overdue"
+    Q->>P: doc 1: 0 + 1 = 1 is a position of "invoice", match
+    Q->>P: doc 3: 3 + 1 = 4 is a position of "invoice", match
+    Note over Q,P: Reversed phrase "invoice overdue" needs overdue at invoice + 1: no doc qualifies
+```
+
+Example with numbers: in the three-document collection above, `overdue AND invoice` returns docs 1 and 3 (2 results). The phrase `"overdue invoice"` also returns docs 1 and 3, because in both documents `invoice` sits exactly one position after `overdue`. The reversed phrase `"invoice overdue"` returns nothing.
+
+### 3.4 Relevance: TF-IDF to BM25
 
 Two intuitions:
 - **TF (term frequency):** a document that says `acme` five times is probably more about Acme than one that says it once.
@@ -143,9 +171,40 @@ avgdl = average document length        k1 = 1.2, b = 0.75 (Lucene defaults)
 - **`b` normalizes length:** with `b = 0.75`, a document twice the average length needs more matches to score the same.
 - The document's score is the sum over query terms. Since Lucene 8.0, Lucene's implementation omits the constant `(k1 + 1)` factor, which scales every score equally and does not change the order.
 
-Business ranking sits on top: **field boosts** (`client_name^3` so a name match beats a notes match), an **exact-match boost** (a `keyword` match on the full client name), and signals such as recency or status. In the source example, searching `acme` should put the client "Acme Ltd" above an old note that mentions acme once.
+Business ranking sits on top: **field boosts** (`client_name^3` so a name match beats a notes match), an **exact-match boost** (a `keyword` match on the full client name), and signals such as recency or status. For example, searching `acme` should put the client "Acme Ltd" above an old note that mentions acme once.
 
-### 3.4 Elasticsearch and OpenSearch architecture
+#### BM25 in one picture
+
+```mermaid
+flowchart TB
+    Q["query: overdue acme"] --> T1["term overdue"]
+    Q --> T2["term acme"]
+    T1 --> I1["IDF: how rare is the term in the whole index?"]
+    T1 --> F1["TF part: tf * (k1 + 1) / (tf + k1 * length factor)"]
+    T2 --> I2["IDF"]
+    T2 --> F2["TF part"]
+    F1 --> L["length factor = 1 - b + b * dl / avgdl"]
+    F2 --> L
+    I1 --> S1["term score = IDF * TF part"]
+    F1 --> S1
+    I2 --> S2["term score"]
+    F2 --> S2
+    S1 --> SUM["document score = sum of term scores"]
+    S2 --> SUM
+```
+
+`k1` and `b` act in different places, and a table makes their effect concrete. For a document of average length (`dl = avgdl`) the TF part is `tf * 2.2 / (tf + 1.2)`:
+
+| `tf` (occurrences) | TF part (`k1 = 1.2`) | Extra gain over the previous row |
+| --- | --- | --- |
+| 1 | 1.00 | |
+| 2 | 1.38 | +0.38 |
+| 5 | 1.77 | +0.39 over three more occurrences |
+| 10 | 1.96 | +0.19 over five more occurrences |
+
+The curve flattens toward `k1 + 1 = 2.2`, so ten mentions of `acme` score less than twice as much as one mention. That is saturation.
+
+### 3.5 Elasticsearch and OpenSearch architecture
 
 ```mermaid
 flowchart TB
@@ -171,7 +230,35 @@ flowchart TB
 - A **search** goes to one copy of every shard (scatter), each returns its top hits, and the coordinating node merges them (gather).
 - Each shard is a **Lucene index** made of **segments**.
 
-### 3.5 Segments, refresh, flush and merge
+#### One search across shards
+
+A search is a two-phase scatter and gather. The coordinating node sends the query to one copy of every shard, each shard returns only ids and scores of its local top hits, and the coordinator fetches the winning documents.
+
+```mermaid
+sequenceDiagram
+    participant U as Client
+    participant C as Coordinating node
+    participant S0 as Shard 0 copy
+    participant S1 as Shard 1 copy
+    participant S2 as Shard 2 copy
+    U->>C: search "acme overdue", size = 10
+    par query phase
+        C->>S0: run query, return top 10 (id, score)
+        C->>S1: run query, return top 10 (id, score)
+        C->>S2: run query, return top 10 (id, score)
+    end
+    S0-->>C: 10 hits
+    S1-->>C: 10 hits
+    S2-->>C: 10 hits
+    Note over C: merge 30 candidates, keep global top 10
+    C->>S1: fetch phase: get _source of the winners on this shard
+    C->>S0: fetch phase: get _source of the winners on this shard
+    C-->>U: 10 documents
+```
+
+With `from = 0, size = 10` and 3 shards the coordinator merges 30 candidates. With `from = 9990, size = 10` each shard must return 10,000 hits, which is the deep pagination cost described in section 7.
+
+### 3.6 Segments, refresh, flush and merge
 
 ```mermaid
 sequenceDiagram
@@ -199,261 +286,46 @@ sequenceDiagram
 - **Translog:** a write-ahead log of operations, so acknowledged writes survive a crash before the next Lucene commit (compare the WAL in [[Storage Engines - B-tree vs LSM and WAL]]; segments plus merges are an LSM-style design).
 - **Merge:** a background merge policy (Lucene's `TieredMergePolicy`) combines small segments into larger ones and physically drops deleted documents. Merges cost disk I/O and temporarily need extra disk space.
 
+#### Example: the life of one write
+
+Consider document `inv_812`. At `t = 0` it is indexed: it sits in the buffer and the translog, and a search for it finds nothing. At `t <= 1 s` the next refresh writes it into a small new segment and the same search finds it. Later a flush commits the segments to disk and trims the translog, and a background merge may fold its segment into a bigger one. If `inv_812` is updated at `t = 60 s`, the old copy is only marked deleted in its segment's live docs, and the new version goes into another segment; the old bytes disappear at the next merge that rewrites that segment.
+
 ## 4. Worked example
 
-### Whiteboard version
+This section traces the engine by hand on four tiny documents. No code is needed to follow it.
 
-```go
-package main
+### 4.1 Index four documents and run a query
 
-import (
-	"fmt"
-	"strings"
-)
+The four documents and what the analyzer produces (stop words dropped, plural `s` stripped):
 
-func main() {
-	docs := map[int]string{1: "overdue invoice acme", 2: "payment invoice", 3: "acme payment"}
-	index := map[string][]int{} // term -> postings (doc ids)
-	for id := 1; id <= len(docs); id++ {
-		for _, term := range strings.Fields(docs[id]) {
-			index[term] = append(index[term], id)
-		}
-	}
-	fmt.Println(index["acme"])    // [1 3]
-	fmt.Println(index["invoice"]) // [1 2]
-}
+| Doc | Text | Terms (position) | Length |
+| --- | --- | --- | --- |
+| 1 | Overdue invoice for Acme Ltd | overdue(0) invoice(1) acme(2) ltd(3) | 4 |
+| 2 | Payment received for invoice INV-102 | payment(0) received(1) invoice(2) inv(3) 102(4) | 5 |
+| 3 | Acme asked to split the overdue invoices into two payments | acme(0) asked(1) split(2) overdue(3) invoice(4) into(5) two(6) payment(7) | 8 |
+| 4 | Quarterly retainer, Globex | quarterly(0) retainer(1) globex(2) | 3 |
+
+The collection has `N = 4` documents and an average length `avgdl = (4 + 5 + 8 + 3) / 4 = 5`.
+
+```mermaid
+sequenceDiagram
+    participant Q as Query "overdue acme"
+    participant I as Inverted index
+    participant R as BM25 scorer
+    Q->>I: postings of overdue
+    I-->>Q: docs 1 and 3 (n = 2)
+    Q->>I: postings of acme
+    I-->>Q: docs 1 and 3 (n = 2)
+    Q->>R: IDF = ln(1 + (4 - 2 + 0.5) / (2 + 0.5)) = ln 2 = 0.693 for both terms
+    R->>R: doc 1, dl = 4: length factor 1 - 0.75 + 0.75 * 4/5 = 0.85
+    R->>R: term score = 0.693 * 2.2 / (1 + 1.2 * 0.85) = 0.755, two terms: 1.510
+    R->>R: doc 3, dl = 8: length factor 1.45, term score 0.557, two terms: 1.113
+    R-->>Q: doc 1 (1.510), then doc 3 (1.113)
 ```
-
-### 4.1 A small inverted index with BM25 and phrase search in Go
-
-The package below implements the analyzer, postings with positions, BM25 with Lucene's default parameters, and a phrase query. It is a teaching model: Lucene compresses postings, keeps position gaps where stop words were removed (this toy compacts them), and stores everything in segments.
-
-```go
-// Package search is a teaching-sized inverted index with BM25 ranking.
-package search
-
-import (
-	"math"
-	"sort"
-	"strings"
-	"unicode"
-)
-
-var stopWords = map[string]bool{"the": true, "a": true, "an": true, "for": true, "of": true, "and": true, "to": true}
-
-// Analyze is the analysis chain: tokenize on non-letters/digits,
-// lowercase, drop stop words, then a toy stemmer that strips a plural "s".
-func Analyze(text string) []string {
-	fields := strings.FieldsFunc(text, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
-	var terms []string
-	for _, f := range fields {
-		t := strings.ToLower(f)
-		if stopWords[t] {
-			continue
-		}
-		if len(t) > 3 && strings.HasSuffix(t, "s") && !strings.HasSuffix(t, "ss") {
-			t = t[:len(t)-1]
-		}
-		terms = append(terms, t)
-	}
-	return terms
-}
-
-// Posting records one document that contains a term and where.
-type Posting struct {
-	DocID     int
-	Positions []int
-}
-
-// Index maps term -> postings list sorted by DocID.
-type Index struct {
-	postings map[string][]Posting
-	docLen   map[int]int
-	totalLen int
-}
-
-func NewIndex() *Index {
-	return &Index{postings: map[string][]Posting{}, docLen: map[int]int{}}
-}
-
-// Add indexes one document. Doc IDs must be added in increasing order,
-// which keeps every postings list sorted (as Lucene's are).
-func (ix *Index) Add(docID int, text string) {
-	terms := Analyze(text)
-	ix.docLen[docID] = len(terms)
-	ix.totalLen += len(terms)
-	pos := map[string][]int{}
-	var order []string
-	for i, t := range terms {
-		if _, ok := pos[t]; !ok {
-			order = append(order, t)
-		}
-		pos[t] = append(pos[t], i)
-	}
-	for _, t := range order {
-		ix.postings[t] = append(ix.postings[t], Posting{DocID: docID, Positions: pos[t]})
-	}
-}
-
-// Postings returns the postings list of an already-analyzed term.
-func (ix *Index) Postings(term string) []Posting { return ix.postings[term] }
-
-// Hit is one ranked result.
-type Hit struct {
-	DocID int
-	Score float64
-}
-
-// BM25 parameters, the Lucene/Elasticsearch defaults.
-const (
-	k1 = 1.2
-	b  = 0.75
-)
-
-// Search scores every document that contains at least one query term
-// (OR semantics) with BM25 and returns hits, best first.
-func (ix *Index) Search(query string) []Hit {
-	n := float64(len(ix.docLen))
-	if n == 0 {
-		return nil
-	}
-	avgdl := float64(ix.totalLen) / n
-	scores := map[int]float64{}
-	for _, term := range Analyze(query) {
-		list := ix.postings[term]
-		if len(list) == 0 {
-			continue
-		}
-		df := float64(len(list))
-		idf := math.Log(1 + (n-df+0.5)/(df+0.5))
-		for _, p := range list {
-			tf := float64(len(p.Positions))
-			dl := float64(ix.docLen[p.DocID])
-			scores[p.DocID] += idf * tf * (k1 + 1) / (tf + k1*(1-b+b*dl/avgdl))
-		}
-	}
-	hits := make([]Hit, 0, len(scores))
-	for id, s := range scores {
-		hits = append(hits, Hit{DocID: id, Score: s})
-	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Score != hits[j].Score {
-			return hits[i].Score > hits[j].Score
-		}
-		return hits[i].DocID < hits[j].DocID
-	})
-	return hits
-}
-
-// Phrase returns docs where the analyzed query terms appear next to each
-// other, in order, using the positions stored in the postings.
-func (ix *Index) Phrase(query string) []int {
-	terms := Analyze(query)
-	if len(terms) == 0 {
-		return nil
-	}
-	var out []int
-	for _, first := range ix.postings[terms[0]] {
-		for _, start := range first.Positions {
-			if ix.followedBy(first.DocID, terms[1:], start) {
-				out = append(out, first.DocID)
-				break
-			}
-		}
-	}
-	return out
-}
-
-func (ix *Index) followedBy(doc int, rest []string, at int) bool {
-	for i, t := range rest {
-		found := false
-		for _, p := range ix.postings[t] {
-			if p.DocID != doc {
-				continue
-			}
-			for _, pos := range p.Positions {
-				if pos == at+i+1 {
-					found = true
-				}
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
-}
-```
-
-```go
-package search
-
-import (
-	"reflect"
-	"testing"
-)
-
-func build() *Index {
-	ix := NewIndex()
-	ix.Add(1, "Overdue invoice for Acme Ltd")
-	ix.Add(2, "Payment received for invoice INV-102")
-	ix.Add(3, "Acme asked to split the overdue invoices into two payments")
-	ix.Add(4, "Quarterly retainer, Globex")
-	return ix
-}
-
-func TestAnalyze(t *testing.T) {
-	got := Analyze("The OVERDUE Invoices, for Acme!")
-	want := []string{"overdue", "invoice", "acme"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-}
-
-func TestPostingsAreSortedWithPositions(t *testing.T) {
-	got := build().Postings("invoice")
-	want := []Posting{{1, []int{1}}, {2, []int{2}}, {3, []int{4}}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-}
-
-func TestBM25PrefersShortDocAndRareTerms(t *testing.T) {
-	hits := build().Search("overdue acme")
-	if len(hits) != 2 {
-		t.Fatalf("got %d hits, want 2", len(hits))
-	}
-	// Both docs contain both terms once; doc 1 is shorter, so it wins.
-	if hits[0].DocID != 1 || hits[1].DocID != 3 {
-		t.Fatalf("order = %v, want doc 1 then doc 3", hits)
-	}
-}
-
-func TestRareTermOutweighsCommonTerm(t *testing.T) {
-	hits := build().Search("invoice globex")
-	if hits[0].DocID != 4 {
-		t.Fatalf("top = %d, want doc 4: rare term globex beats common invoice", hits[0].DocID)
-	}
-}
-
-func TestPhraseUsesPositions(t *testing.T) {
-	ix := build()
-	if got := ix.Phrase("overdue invoice"); !reflect.DeepEqual(got, []int{1, 3}) {
-		t.Fatalf("phrase hits = %v, want [1 3]", got)
-	}
-	if got := ix.Phrase("invoice overdue"); got != nil {
-		t.Fatalf("reversed phrase hits = %v, want none", got)
-	}
-}
-```
-
-These pass under `go vet` and `go test -race` with Go 1.24.
 
 ### 4.2 The scores, measured
 
-Running `Search` on the four test documents (measured with a temporary `t.Logf` in the test, printed to 4 decimals):
+Running the Go implementation on these four documents (measured with a temporary `t.Logf` in the test, printed to 4 decimals):
 
 | Query | Doc | Doc length (terms) | Score |
 | --- | --- | --- | --- |
@@ -472,46 +344,31 @@ What the numbers show:
 
 Before running a search cluster, try Postgres. It has an analyzer (text search configurations such as `english`), an inverted index (GIN; the index type itself is covered in [[Index Types and Index Design]]) and ranking.
 
+```mermaid
+flowchart LR
+    N["notes text"] -->|"to_tsvector('english', ...)"| TV["tsvector: acme:1 overdue:2 invoic:3"]
+    TV -->|"setweight A to D"| W["weighted tsvector, stored column"]
+    W --> G[("GIN index: lexeme to row pointers")]
+    UQ["user input: acme overdue"] -->|"websearch_to_tsquery"| TQ["tsquery: acme AND overdue"]
+    TQ -->|"@@ match via the GIN index"| G
+    G --> RK["ts_rank orders the matches"]
+```
+
+The core of it is one generated `tsvector` column with a GIN index, queried like this:
+
 ```sql
-ALTER TABLE invoices
-  ADD COLUMN search tsvector GENERATED ALWAYS AS (
-    setweight(to_tsvector('english', coalesce(number, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(notes, '')), 'C')
-  ) STORED;
-
-CREATE INDEX invoices_search_gin ON invoices USING gin (search);
-
 SELECT id, number, ts_rank(search, q) AS rank
 FROM invoices, websearch_to_tsquery('english', 'acme overdue') AS q
 WHERE workspace_id = 42 AND search @@ q
-ORDER BY rank DESC
-LIMIT 20;
+ORDER BY rank DESC LIMIT 20;
 ```
 
 - `to_tsvector` analyzes text into stemmed terms with positions; `websearch_to_tsquery` parses user input with quotes and `-` like a web search box.
 - `@@` is the match operator; the GIN index makes it an index lookup.
 - `setweight` labels fields A–D so `ts_rank` can weight a match in `number` above one in `notes`.
-- For typo tolerance and substring search, the `pg_trgm` extension indexes 3-character sequences: `CREATE INDEX ON clients USING gin (name gin_trgm_ops);` speeds up `ILIKE '%acm%'` and `similarity()` lookups.
+- For typo tolerance and substring search, the `pg_trgm` extension indexes 3-character sequences and speeds up `ILIKE '%acm%'` and `similarity()` lookups.
 
-Representative output (PostgreSQL 17):
-
-```text
-Limit  (cost=412.33..412.38 rows=20 width=44) (actual time=2.811..2.817 rows=20 loops=1)
-  ->  Sort  (cost=412.33..412.61 rows=112 width=44) (actual time=2.809..2.813 rows=20 loops=1)
-        Sort Key: (ts_rank(invoices.search, q.q)) DESC
-        Sort Method: top-N heapsort  Memory: 27kB
-        ->  Bitmap Heap Scan on invoices  (cost=36.87..409.35 rows=112 width=44) (actual time=0.402..2.701 rows=131 loops=1)
-              Recheck Cond: (search @@ q.q)
-              Filter: (workspace_id = 42)
-              Rows Removed by Filter: 389
-              Heap Blocks: exact=498
-              ->  Bitmap Index Scan on invoices_search_gin  (cost=0.00..36.84 rows=520 width=0) (actual time=0.311..0.311 rows=520 loops=1)
-                    Index Cond: (search @@ q.q)
-Planning Time: 0.402 ms
-Execution Time: 2.874 ms
-```
-
-Limits: `ts_rank` uses term frequency and proximity but **no IDF**, so it is not BM25; there are no built-in facets, fuzzy matching beyond `pg_trgm`, or per-field analyzers at scale; and every search runs on the database you also write to.
+Limits: `ts_rank` uses term frequency and proximity but **no IDF**, so it is not BM25; there are no built-in facets, fuzzy matching beyond `pg_trgm`, or per-field analyzers at scale; and every search runs on the database you also write to. The full DDL, index creation and a representative `EXPLAIN ANALYZE` output (PostgreSQL 17) are in the Go note.
 
 ### 4.4 Keeping the search index in sync
 
@@ -535,6 +392,28 @@ Both are covered in [[Transactional Outbox and CDC]]. The indexer must handle th
 - **Deletes:** a deleted or soft-deleted invoice must become a delete in the index, also versioned.
 - **Rebuilds:** you must be able to re-index everything from the database at any time.
 
+
+#### Why external versioning matters
+
+Two updates of the same invoice can reach the indexer out of order, for example after a consumer retry. Without versions the older one can win.
+
+```mermaid
+sequenceDiagram
+    participant DB as Postgres
+    participant K as Kafka
+    participant IX as Indexer
+    participant ES as Elasticsearch
+    DB->>K: update A (updated_at 100), amount 5000
+    DB->>K: update B (updated_at 200), amount 5200
+    K->>IX: deliver B first (partition rebalance)
+    IX->>ES: index inv_812, version 200 (external)
+    ES-->>IX: stored, version is now 200
+    K->>IX: deliver A late
+    IX->>ES: index inv_812, version 100 (external)
+    ES-->>IX: 409 version conflict, 100 is not greater than 200
+    Note over ES: the newer document survives and the indexer treats 409 as success
+```
+
 ### 4.5 Zero-downtime reindex with aliases
 
 Changing an analyzer or a field type requires a new index. Applications query an **alias** (`invoices`) instead of a concrete index:
@@ -545,6 +424,22 @@ Changing an analyzer or a field type requires a new index. Applications query an
 4. Compare document counts and run sample queries.
 5. Atomically move the alias: one `_aliases` request removes `invoices → invoices_v3` and adds `invoices → invoices_v4`.
 6. Delete `invoices_v3` after a safe period.
+
+
+```mermaid
+stateDiagram-v2
+    [*] --> OldOnly: alias invoices points to invoices_v3
+    OldOnly --> DualWrite: create invoices_v4, indexer writes to v3 and v4
+    DualWrite --> Backfilled: backfill v4 from the database with external versions
+    Backfilled --> Verified: counts match, sample queries agree
+    Verified --> Swapped: one _aliases request moves the alias to v4
+    Swapped --> [*]: delete invoices_v3 after a safe period
+    Verified --> DualWrite: mismatch found, fix and backfill again
+```
+
+Because the alias move is one atomic request, searches see either the old index or the new one, never a mix.
+
+Runnable Go version: [[Search Engines and Inverted Indexes - Go]]
 
 ## 5. Variants and comparison
 
@@ -558,7 +453,7 @@ Changing an analyzer or a field type requires a new index. Applications query an
 | Vector search (kNN) | nearest neighbours of embeddings | "similar meaning" queries | embeddings pipeline; see [[Vector Databases and ANN Indexes]] |
 | Hybrid | BM25 and kNN results fused | both exact terms and meaning matter | two retrievals plus fusion; see [[Keyword, Semantic and Hybrid Search]] |
 
-The source note's search-type table, kept:
+Which tool fits which kind of search:
 
 | Search type | Example | Tool |
 | --- | --- | --- |
@@ -574,6 +469,21 @@ The source note's search-type table, kept:
 **When database search is enough:** filters are simple, data volume is moderate, search is exact, prefix or simple full text, and ranking is not complex.
 
 **When to add a search engine:** full-text relevance matters, fuzzy matching or autocomplete matters, you need facets or complex ranking, or search load should not hit the primary database.
+
+
+```mermaid
+flowchart TD
+    S["Users need text search"] --> A{"Exact or prefix lookup on one column?"}
+    A -->|yes| B["B-tree index, done"]
+    A -->|no| C{"Moderate data, simple ranking, load is fine on the database?"}
+    C -->|yes| D["Postgres tsvector + GIN, pg_trgm for fuzzy names"]
+    C -->|no| E{"Need facets, BM25 relevance, autocomplete or to offload the primary?"}
+    E -->|yes| F["Search engine fed by outbox or CDC"]
+    E -->|no| D
+    F --> G{"Need meaning, not only words?"}
+    G -->|yes| H["Add vector index, fuse ranks (hybrid)"]
+    G -->|no| I["Stay with BM25"]
+```
 
 Costs of a search engine:
 - **Eventual consistency:** a just-saved invoice is not searchable until the sync pipeline delivers it and the shard refreshes (seconds).
@@ -616,6 +526,22 @@ Common mistakes:
 
 **What to monitor.** Sync lag (seconds between the database commit and the document being searchable), indexing and search latency per shard, rejected thread pool tasks, segment count and merge time, JVM heap, disk watermarks, and the count difference between database and index.
 
+### Whiteboard version
+
+The whole idea in a few lines of Go: an inverted index is a map from term to a list of document ids.
+
+```go
+docs := map[int]string{1: "overdue invoice acme", 2: "payment invoice", 3: "acme payment"}
+index := map[string][]int{} // term -> postings (doc ids)
+for id := 1; id <= len(docs); id++ {
+	for _, term := range strings.Fields(docs[id]) {
+		index[term] = append(index[term], id)
+	}
+}
+fmt.Println(index["acme"])    // [1 3]
+fmt.Println(index["invoice"]) // [1 2]
+```
+
 ## 8. Deep dive
 
 **Postings compression and skipping.** Lucene stores postings in blocks of 128 document ids as deltas from the previous id, bit-packed. Skip data lets an AND query jump over blocks that cannot contain the next candidate, so intersecting a rare term with a common one costs about the length of the rare list. Top-k scoring additionally uses per-block maximum scores (block-max WAND) to skip blocks that cannot reach the current top-k.
@@ -629,6 +555,17 @@ Common mistakes:
 **Updates are expensive.** Because segments are immutable, an update rewrites the whole document. A counter that changes every second (view count) should not live in the main search document; keep it in the database or a separate small index and join at query time in the application.
 
 **Hybrid search fusion.** BM25 scores and vector similarities are on different scales, so engines combine *ranks* rather than scores with **reciprocal rank fusion**: `score(d) = Σ 1 / (k + rank_i(d))`, with `k = 60` as the common default. Vector index internals belong to [[Vector Databases and ANN Indexes]].
+
+```mermaid
+flowchart LR
+    subgraph blk["One postings block (128 doc ids)"]
+        raw["ids: 1000, 1003, 1004, 1020 ..."] --> dl["deltas: 1000, 3, 1, 16 ..."]
+        dl --> bp["bit-packed with the width of the largest delta"]
+    end
+    SK["skip data: max doc id per block"] --> blk
+    AND["AND query with candidate id 5000"] -->|"skip blocks whose max id is below 5000"| SK
+```
+
 
 ## 9. Interview questions
 
@@ -671,4 +608,5 @@ Common mistakes:
 
 - **Before this:** [[Indexing Fundamentals]], [[Index Types and Index Design]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Next:** [[Keyword, Semantic and Hybrid Search]], [[Vector Databases and ANN Indexes]], [[Transactional Outbox and CDC]]
+- **Implementation:** [[Search Engines and Inverted Indexes - Go]]
 - **Compare with:** [[Materialized Views and Denormalization]], [[Partitioning and Sharding]], [[Replication]]

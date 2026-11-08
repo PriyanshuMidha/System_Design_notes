@@ -1,6 +1,6 @@
 ---
 tags: [networking, internet, protocols]
-level: basic
+level: intermediate
 status: reviewed
 prereqs: []
 related: ["[[IP Addressing, Subnets, NAT and VPC Basics]]", "[[DNS - Resolution, Records and Caching]]", "[[TCP - Handshake, Reliability, Flow and Congestion Control]]"]
@@ -9,7 +9,7 @@ sources:
   - "RFC 1122, Requirements for Internet Hosts - Communication Layers"
   - "ISO/IEC 7498-1, OSI Basic Reference Model"
   - "Cisco, BGP Case Studies and RFC 4271 overview"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP
@@ -23,16 +23,25 @@ updated: 2026-11-06
 > - Routers only look at the IP layer and forward packet by packet; they don't track connections.
 > - OSI's 7 layers are a teaching model for talking about networks; the internet itself runs on the 4-layer TCP/IP model.
 > - A connection's identity on the wire is a **5-tuple**: protocol, source IP:port, destination IP:port.
+> - This note goes deeper than a first pass at networking: it also covers BGP route propagation between organizations and MTU/fragmentation, which is why it is tagged intermediate rather than basic.
 
 ## 1. Why it exists
 
-Say your laptop (`192.168.1.42`) wants to fetch a page from a server (`93.184.216.34`). There's no dedicated wire between the two — your laptop talks to a home router, which talks to your ISP, which talks to other ISPs, which eventually reach the network the server lives on. That path crosses machines owned by different companies, upgraded independently, some of them down for maintenance on any given day.
+Imagine your laptop (`192.168.1.42`) wants to fetch a page from a server (`93.184.216.34`). There is no dedicated wire running between the two machines. Your laptop talks to a home router, which talks to your ISP, which talks to other ISPs, which eventually reach the network the server lives on. That path crosses machines owned by different companies, upgraded independently, some of them down for maintenance on any given day.
 
-The internet's answer is to **not** reserve an end-to-end circuit (the way a phone call once did). Instead, every message is cut into packets of at most ~1500 bytes, each one labelled with where it's from and where it's going, and routers forward each packet independently using whatever path looks best *right now*. If a link goes down, the next packet can take a different route; the sender never needed to know the path in the first place.
+A phone call used to solve this by reserving a dedicated **circuit** for the whole call — a fixed slice of wire that only that call could use, sitting idle during every silent pause. The internet's designers rejected that idea. Instead:
 
-The cost of this design is that packets can arrive out of order, get duplicated, or get dropped — problems layers above IP (mainly TCP) exist to paper over. See [[TCP - Handshake, Reliability, Flow and Congestion Control]].
+1. Every message is cut into small **packets**, each at most roughly 1500 bytes.
+2. Each packet is independently labelled with where it came from and where it is going.
+3. Routers forward each packet using whatever path looks best *right now* — not a path agreed in advance.
+4. If a link goes down mid-conversation, the next packet can simply take a different route.
 
-### Whiteboard version
+> [!tip] Remember
+> No device — not your laptop, not any single router — ever knows the complete end-to-end path. Each router only needs to know the *next* hop.
+
+The price of this flexibility is that packets can arrive out of order, get duplicated, or get dropped outright. Those are exactly the problems that layers above IP — mainly TCP — exist to paper over. See [[TCP - Handshake, Reliability, Flow and Congestion Control]].
+
+### Picture it: one request leaving your laptop
 
 ```mermaid
 flowchart LR
@@ -42,23 +51,27 @@ flowchart LR
     D --> E(("onto the wire"))
 ```
 
-Each layer wraps the one above it in its own header. A router only ever opens the IP header; a switch only ever opens the Ethernet header.
+Each layer wraps the one above it in its own header. A router only ever opens the IP header; a switch only ever opens the Ethernet header. Neither one looks any deeper than it has to.
 
 ## 2. Mental model
 
-Think of a packet as a **nested envelope**. The innermost envelope is your actual data (an HTTP request). Each layer below puts that envelope inside a bigger one with its own "to/from" label:
+**Analogy — nested envelopes.** Picture your data as a letter. Before it goes anywhere, three people each put it inside a bigger envelope and write their own "to/from" on the outside:
 
-- The **Ethernet** envelope is addressed to the next physical device (a switch or router), by MAC address — it only has to get one hop.
-- The **IP** envelope is addressed end-to-end, by IP address — it survives the whole trip, hop after hop, while the Ethernet envelope around it gets thrown away and replaced at every hop.
-- The **TCP** (or UDP) envelope inside that adds a port number, so the destination machine knows which *program* should open it.
+- The **Ethernet** envelope is addressed to the next physical device (a switch or router) by **MAC address**. It only has to survive one hop — the next device tears it open and throws it away.
+- The **IP** envelope is addressed end-to-end, by **IP address**. It survives the *entire* trip, hop after hop, even though the Ethernet envelope around it gets replaced at every single hop.
+- The **TCP** (or UDP) envelope, innermost, adds a **port number** so the destination machine knows which *program* should open the letter.
 
-A router is a post office that reads only the IP envelope's address, decides the next office to forward it to, puts it in a new Ethernet envelope for that one hop, and sends it on. It never looks inside.
+A router, in this picture, is a post office that reads only the IP envelope's address, decides which office to forward it to next, puts it inside a brand-new Ethernet envelope for that one hop, and sends it on. It never opens the inner envelopes.
+
+Where the analogy breaks down: a real post office reads a letter once and is done; a router repeats this "read IP address, repackage, forward" cycle for millions of packets per second, and it discards and rebuilds the outer envelope at *every single hop* — nothing like paper mail.
 
 ## 3. How it works
 
 ### Encapsulation and decapsulation
 
-Sending data down the stack adds a header at each layer; receiving it strips a header at each layer, in the exact reverse order:
+**In plain words:** sending data down the stack means stacking a new header on top at each layer, like nesting dolls. Receiving it means popping dolls off one at a time, in the exact reverse order they were added.
+
+**Picture it:**
 
 ```mermaid
 flowchart TB
@@ -78,11 +91,21 @@ flowchart TB
     end
 ```
 
-Each layer's header carries a field that names the layer above it — EtherType (IPv4 vs IPv6 vs ARP), the IP protocol field (TCP=6, UDP=17, ICMP=1), and the TCP/UDP port — so decapsulation always knows which header comes next.
+**Example:** an HTTP GET request leaves your browser as plain bytes. TCP wraps it with a header naming port 443 and a sequence number. IP wraps that with a header naming your address and the server's address. Ethernet wraps that again with the MAC address of the very next device — your home router, not the server.
+
+**Why it matters:** each header carries a field that names what comes next — the Ethernet frame's EtherType (IPv4 vs IPv6 vs ARP), the IP header's protocol field (TCP=6, UDP=17, ICMP=1), and the destination port. Without those fields, decapsulation would have no way to know which header to strip next, and the receiving machine could not hand the data to the right program.
+
+> [!warning] Common mistake
+> Thinking a router "reads the request" or "sees the URL." A router at the IP layer never opens the TCP header, so it never sees a port number, and it absolutely never sees the HTTP request text inside. Only the two endpoints (and anything terminating TLS) ever see that.
+
+> [!tip] Remember
+> Encapsulation adds headers going out; decapsulation strips them in exact reverse order coming in — like unstacking nesting dolls from the outside in.
 
 ### OSI's 7 layers vs the internet's 4
 
-**OSI is a teaching model**: it was designed in the 1980s as a vendor-neutral reference, and no mainstream network stack implements all seven layers as separate, distinct protocols. The internet runs on the older, simpler **TCP/IP (Internet) model**, which the IETF actually standardized (RFC 1122). Most engineers describe real systems with a 4-or-5-layer view and borrow OSI's numbers only as shorthand ("L4 load balancer," "L7 firewall").
+**In plain words:** you'll often hear networking explained with "the 7 layers of OSI." That model is a *teaching reference* from the 1980s — no mainstream network stack actually implements all seven as separate, distinct protocols. What ships inside every real operating system is the simpler **TCP/IP (Internet) model**, standardized by the IETF in RFC 1122, with 4 layers.
+
+**Picture it:**
 
 | OSI layer | Name | What it does | TCP/IP equivalent |
 | --- | --- | --- | --- |
@@ -94,15 +117,30 @@ Each layer's header carries a field that names the layer above it — EtherType 
 | 2 | Data Link | MAC addresses, Ethernet frames, switches | Link |
 | 1 | Physical | Bits on copper, fiber, radio | Link |
 
-The practical reason this distinction matters: when someone says "L4 vs L7 proxy" (see [[Forward and Reverse Proxies - L4 vs L7]]), they mean "does it only see IP+port, or does it parse HTTP." OSI's layers 5–7 collapse into one "application" layer on the wire for almost everything you'll build.
+**Example:** OSI's layers 5, 6 and 7 (session, presentation, application) all collapse into one "Application" layer on the wire for almost anything you will build. There is no separate "session layer protocol" running between your browser and a web server — that idea exists only in the teaching diagram.
+
+**Why it matters:** when someone says "L4 load balancer" or "L7 firewall" (see [[Forward and Reverse Proxies - L4 vs L7]]), they are borrowing OSI's numbers as shorthand for "does it only see IP and port, or does it actually parse HTTP." Knowing which model is real and which is a teaching aid keeps you from drawing a fictitious "session layer" into a real system diagram.
+
+> [!warning] Common mistake
+> Describing a production system's layers using all 7 OSI numbers as if each were a distinct wire protocol. Use the 4-layer TCP/IP model for how things actually work, and OSI's numbers only as shorthand vocabulary.
+
+> [!tip] Remember
+> OSI is vocabulary; TCP/IP's 4 layers (Link, Internet, Transport, Application) is what actually runs.
 
 ### Routing and BGP, briefly
 
-A **router** holds a forwarding table: for a given destination IP, which outgoing interface (and next-hop router) to send it to. Inside one network (an Autonomous System, AS — e.g. one ISP), routers exchange routes with an **interior** protocol (OSPF, IS-IS) that finds shortest paths by link cost.
+**In plain words:** a **router** is a machine holding a forwarding table: for a given destination IP, which outgoing interface (and next-hop router) should this packet go to. Inside one organization's network — one **Autonomous System (AS)**, such as one ISP — routers exchange routes with an **interior** protocol (OSPF, IS-IS) that finds shortest paths by link cost.
 
-Between different organizations' networks, routers speak **BGP** (Border Gateway Protocol, RFC 4271): each AS announces which IP prefixes ("I can reach `93.184.216.0/24`") it can route to, and its neighbors propagate that announcement onward, each adding itself to an **AS-path**. A receiving router picks the route with the shortest AS-path (among other policy rules) and adds the prefix to its own table — with no central authority. This is why losing one undersea cable or one ISP peering point reroutes traffic rather than cutting the internet in half, and also why a bad BGP announcement (a misconfigured AS announcing routes it doesn't actually serve) can hijack and misdirect traffic for prefixes it has no business claiming.
+Between *different* organizations' networks, routers speak **BGP** (Border Gateway Protocol, RFC 4271). Think of BGP as a chain of word-of-mouth announcements: each AS tells its neighbors "I can reach this address block," and its neighbors repeat that announcement onward, each adding their own name to a running list called the **AS-path**.
 
-An illustrative route-propagation sequence (made-up AS numbers and prefix, not a captured real BGP session — real AS-path announcements involve many more hops and policy rules):
+**Step-by-step — how one route propagates:**
+
+1. The server's own ISP (AS 3) announces to its neighbor: "I can reach `93.184.216.0/24`. AS-path: [3]."
+2. A transit provider (AS 2) hears this, adds itself to the path, and re-announces: "reachable via me. AS-path: [2, 3]."
+3. Your ISP (AS 1) hears the transit provider's announcement and picks it — among any other candidate routes — by shortest AS-path (plus other policy rules), then installs it in its own forwarding table.
+4. From then on, your ISP forwards any packet addressed to that block toward the transit provider, one hop at a time, with no single router ever knowing the whole path.
+
+**Picture it** (made-up AS numbers and prefix, illustrating the shape of a real exchange rather than a captured session — real AS-path announcements involve many more hops and policy rules):
 
 ```mermaid
 sequenceDiagram
@@ -116,27 +154,87 @@ sequenceDiagram
     Transit->>Server-ISP: forwards it (one hop closer)
 ```
 
+**Why it matters:** this word-of-mouth design is exactly why losing one undersea cable or one ISP peering point reroutes traffic instead of cutting the internet in half — neighbors simply stop hearing a route and switch to the next-best one they know. It is also why a *bad* BGP announcement (a misconfigured AS claiming a prefix it has no business serving) can hijack and misdirect traffic: there is no central authority checking who is allowed to announce what.
+
+> [!warning] Common mistake
+> Assuming BGP verifies who is "allowed" to announce a prefix. It does not, by default — route-origin validation (RPKI) is a bolt-on fix layered on top of BGP, not something built into the original protocol.
+
+> [!tip] Remember
+> BGP is organizations announcing reachability to each other by word of mouth; the shortest AS-path (plus policy) wins, with no central authority checking who is telling the truth.
+
 ### MTU and fragmentation
 
-Ethernet frames carry at most **1500 bytes of payload** by default (the Maximum Transmission Unit, MTU). A packet larger than the MTU of a link it crosses must be split (fragmented) or, for TCP, never created oversized in the first place: TCP negotiates a Maximum Segment Size (MSS) at connection setup so each segment plus its IP/TCP headers fits in one Ethernet frame, avoiding fragmentation entirely. IP fragmentation still happens for UDP and ICMP traffic that doesn't do this negotiation, and it's expensive: if any one fragment is lost, the entire original packet must be resent. **Path MTU Discovery** sends packets with the "don't fragment" bit set and shrinks the guessed MTU whenever a router replies "too big"; this is why MTU-related outages (a VPN or tunnel header pushing you over 1500) show up as "everything works except big responses."
+**In plain words:** Ethernet frames carry at most **1500 bytes of payload** by default — this ceiling is called the **Maximum Transmission Unit (MTU)**. A packet larger than the MTU of any link it crosses must either be split up (fragmented) or, better, never be created oversized in the first place.
+
+**Picture it — what TCP does instead of fragmenting:**
+
+```mermaid
+flowchart LR
+    A["TCP connection setup"] --> B["negotiate MSS<br/>(Maximum Segment Size)"]
+    B --> C["every segment + IP/TCP headers<br/>fits inside one Ethernet frame"]
+    C --> D["no fragmentation needed for TCP traffic"]
+    E["UDP / ICMP<br/>(no MSS negotiation)"] --> F["oversized packet"]
+    F --> G["IP fragmentation:<br/>split into pieces"]
+    G --> H["lose ANY one piece<br/>-> resend the WHOLE original packet"]
+```
+
+**Example:** TCP negotiates a Maximum Segment Size (MSS) at connection setup, sized so each segment plus its IP/TCP headers fits inside one 1500-byte Ethernet frame — avoiding fragmentation entirely for TCP traffic. UDP and ICMP traffic has no such negotiation, so it can still get fragmented; if any single fragment of that split packet is lost, the *entire* original packet must be resent, not just the missing piece.
+
+**Why it matters:** **Path MTU Discovery** sends packets with the "don't fragment" bit set and shrinks its guess of the usable MTU whenever a router replies "too big." This is why MTU-related outages — commonly a VPN or tunnel header pushing an otherwise-fine packet over 1500 bytes — show up as "everything works except big responses," a confusing symptom that traces straight back to this one header field.
+
+> [!tip] Remember
+> TCP avoids fragmentation by negotiating segment size up front; UDP/ICMP can still be fragmented, and losing one fragment means resending the whole packet.
 
 ### Ports and sockets: the 5-tuple
 
-An IP address identifies a *host*. A **port** (0–65535) identifies a *program* on that host — a 16-bit number carried in the TCP or UDP header, not the IP header. Ports below 1024 are "well-known" by convention (80 = HTTP, 443 = HTTPS, 53 = DNS) and on Linux require root to bind.
+**In plain words:** an IP address identifies a *host* (one machine). A **port** — a number from 0 to 65535 — identifies a *program* running on that host. It lives in the TCP or UDP header, not the IP header, which is exactly why a router forwarding on the IP header alone never sees it. Ports below 1024 are "well-known" by convention (80 = HTTP, 443 = HTTPS, 53 = DNS) and on Linux require root privileges to bind.
 
-A **socket** is the OS handle for one end of a connection. The OS and the network identify a single TCP connection by its **5-tuple**:
+A **socket** is the operating system's handle for one end of a connection. The OS and the network together identify a single TCP connection by its **5-tuple**:
 
 ```text
 (protocol, source IP, source port, destination IP, destination port)
 ```
 
-Two browser tabs open to the same `https://example.com` get *different* 5-tuples — the server's IP and port (443) are identical, but the OS picks a different **ephemeral source port** (typically 32768–60999 on Linux) for each outgoing connection, so the server (and the kernel on both ends) can tell them apart. This is exactly what the Go demo below proves.
+**Example — why two browser tabs don't collide.** Open two tabs to `https://example.com`. Both get the *same* destination IP and the *same* destination port (443). What differs is the **source port**: the OS picks a different, free **ephemeral source port** (typically 32768–60999 on Linux) for each outgoing connection, so every 5-tuple is unique even though 4 of its 5 fields are identical between the two tabs.
+
+**Picture it:**
+
+| Field | Tab 1 | Tab 2 |
+| --- | --- | --- |
+| protocol | TCP | TCP |
+| source IP | 192.168.1.42 | 192.168.1.42 |
+| source port | 51001 | 51002 |
+| destination IP | 93.184.216.34 | 93.184.216.34 |
+| destination port | 443 | 443 |
+
+Only the source port differs, but that one field is enough: the kernel keys its socket lookup table on the *full* 5-tuple, so it can tell the two connections' incoming traffic apart and hand each one to the correct program thread.
+
+```mermaid
+flowchart TB
+    subgraph incoming["Incoming segments, both to port 443"]
+        P1["from 93.184.216.34:443<br/>to 192.168.1.42:51001"]
+        P2["from 93.184.216.34:443<br/>to 192.168.1.42:51002"]
+    end
+    K{"Kernel socket table<br/>keyed on full 5-tuple"}
+    S1["Socket for Tab 1<br/>(...51001...)"]
+    S2["Socket for Tab 2<br/>(...51002...)"]
+    P1 --> K --> S1
+    P2 --> K --> S2
+```
+
+The destination port (443) alone could not tell the kernel which tab's data this is — only the full 5-tuple, including the differing source port, can.
+
+> [!warning] Common mistake
+> Thinking a server "listening on port 443" can only handle one connection at a time, or that the port alone identifies a connection. The listening port identifies where *new* connections arrive; each *established* connection is identified by the full 5-tuple, which is how one port serves thousands of simultaneous clients.
+
+> [!tip] Remember
+> IP address → which host; port → which program; the 5-tuple is a connection's true, unique identity on the wire.
 
 ## 4. Worked example
 
 ### Whiteboard version
 
-The simplest possible socket program: one side listens, one side connects, and you can already see the 5-tuple appear.
+The simplest possible socket program already makes the 5-tuple visible: one side listens, one side connects, and each end sees a different pairing of addresses and ports.
 
 ```go
 ln, _ := net.Listen("tcp", "127.0.0.1:0") // OS picks a free port
@@ -144,100 +242,14 @@ conn, _ := net.Dial("tcp", ln.Addr().String())
 fmt.Println(conn.LocalAddr(), "->", conn.RemoteAddr())
 ```
 
-The full version below starts an echo server, connects a client, and asserts on both ends' 5-tuples.
+**Step-by-step trace of what happens:**
 
-```go
-// Package socket demonstrates the TCP 5-tuple (protocol, source IP, source
-// port, destination IP, destination port) that a kernel uses to route every
-// packet to the right socket.
-package socket
+1. `net.Listen` asks the OS for any free port on `127.0.0.1` and starts listening on it — this is the "well-known address" a client needs to find the server.
+2. `net.Dial` opens a new outbound connection to that address. The OS picks a free **ephemeral port** on the client side automatically — nothing in the code chose it.
+3. `conn.LocalAddr()` on the client side is `127.0.0.1:<ephemeral port>`; `conn.RemoteAddr()` is the listener's address.
+4. If you ran this program twice at once, both client connections would share the same destination IP and port, but each would get a *different* ephemeral source port — exactly the 5-tuple distinction from the mental model above.
 
-import (
-	"fmt"
-	"io"
-	"net"
-)
-
-// FiveTuple formats the connection identity the kernel keys its socket
-// table on: protocol + both endpoints.
-func FiveTuple(network string, conn net.Conn) string {
-	return fmt.Sprintf("%s %s -> %s", network, conn.LocalAddr(), conn.RemoteAddr())
-}
-
-// EchoServer accepts one connection on addr, echoes whatever it reads back
-// to the client, and reports the 5-tuple it saw over tuples before closing.
-// It stops after the first connection, which is all the demo needs.
-func EchoServer(ln net.Listener, tuples chan<- string) {
-	conn, err := ln.Accept()
-	if err != nil {
-		close(tuples)
-		return
-	}
-	defer conn.Close()
-	tuples <- FiveTuple("tcp", conn)
-	close(tuples)
-	_, _ = io.Copy(conn, conn) // echo: write back everything read, until EOF; error ignored, demo only
-}
-```
-
-The test opens two independent connections and confirms each gets its own ephemeral source port — the reason a server can serve thousands of clients on one listening port:
-
-```go
-func TestFiveTupleDiffersPerConnection(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-
-	tuples := make(chan string, 1)
-	go EchoServer(ln, tuples)
-
-	client, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer client.Close()
-
-	serverSide := <-tuples
-	clientSide := FiveTuple("tcp", client)
-
-	if !strings.Contains(serverSide, ln.Addr().String()) {
-		t.Fatalf("server tuple %q should end at the listener address %q", serverSide, ln.Addr())
-	}
-	clientLocalPort := client.LocalAddr().(*net.TCPAddr).Port
-	if clientLocalPort == 0 {
-		t.Fatalf("expected the OS to assign a nonzero ephemeral port, got %d", clientLocalPort)
-	}
-
-	if _, err := client.Write([]byte("ping")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	client.(*net.TCPConn).CloseWrite() // signal EOF so the server's io.Copy returns
-	buf := make([]byte, 4)
-	if _, err := io.ReadFull(client, buf); err != nil {
-		t.Fatalf("read echo: %v", err)
-	}
-	if string(buf) != "ping" {
-		t.Fatalf("echo = %q, want %q", buf, "ping")
-	}
-	t.Logf("server saw: %s", serverSide)
-	t.Logf("client saw: %s", clientSide)
-}
-```
-
-**Measured (Go 1.24.4, darwin/arm64, 2026-11-06):** `go test -race -v` output:
-
-```text
-=== RUN   TestFiveTupleDiffersPerConnection
-    socket_test.go:57: server saw: tcp 127.0.0.1:54664 -> 127.0.0.1:54665
-    socket_test.go:58: client saw: tcp 127.0.0.1:54665 -> 127.0.0.1:54664
---- PASS: TestFiveTupleDiffersPerConnection (0.00s)
-PASS
-ok  	net01	1.671s
-```
-
-The client's local port (`54665`) is exactly the server's remote port, and vice versa — the same socket pair described from each side, with the OS having picked `54665` as a free ephemeral port for the client without being asked.
+Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP - Go]]
 
 ## 5. Variants and comparison
 
@@ -310,3 +322,4 @@ The client's local port (`54665`) is exactly the server's remote port, and vice 
 - **Before this:** —
 - **Next:** [[IP Addressing, Subnets, NAT and VPC Basics]], [[TCP - Handshake, Reliability, Flow and Congestion Control]], [[DNS - Resolution, Records and Caching]]
 - **Compare with:** [[Forward and Reverse Proxies - L4 vs L7]] (where L4 vs L7 actually matters), [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] (how a program reads from a socket)
+- **Runnable code:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP - Go]]

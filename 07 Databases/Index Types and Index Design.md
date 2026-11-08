@@ -3,7 +3,7 @@ tags: [databases, indexing, postgresql, mysql, mongodb, performance]
 level: intermediate
 status: reviewed
 prereqs: ["[[Indexing Fundamentals]]", "[[Query Plans and EXPLAIN]]"]
-related: ["[[Isolation Levels and MVCC]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Zero-Downtime Schema Migrations]]", "[[Pagination, Filtering and Sorting]]", "[[Idempotency and Idempotency Keys]]", "[[Search Engines and Inverted Indexes]]", "[[Geospatial Indexing]]", "[[Vector Databases and ANN Indexes]]", "[[Debugging Database Performance]]"]
+related: ["[[Isolation Levels and MVCC]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Zero-Downtime Schema Migrations]]", "[[Pagination, Filtering and Sorting]]", "[[Idempotency and Idempotency Keys]]", "[[Search Engines and Inverted Indexes]]", "[[Geospatial Indexing]]", "[[Vector Databases and ANN Indexes]]", "[[Debugging Database Performance]]", "[[Index Types and Index Design - Go]]"]
 sources:
   - "PostgreSQL 17 docs, Chapter 11 Indexes (Index Types, Multicolumn Indexes, Indexes and ORDER BY, Partial Indexes, Indexes on Expressions, Index-Only Scans and Covering Indexes)"
   - "PostgreSQL 17 docs, GIN, GiST, BRIN chapters (BRIN pages_per_range default 128; gin_pending_list_limit default 4MB)"
@@ -14,7 +14,7 @@ sources:
   - "PostgreSQL 17 docs, pg_trgm, btree_gist, pgstattuple modules; Monitoring Statistics (pg_stat_user_indexes)"
   - "MySQL 8.0 Reference Manual, Skip Scan Range Access Method (8.0.13), Functional Key Parts (8.0.13), Invisible Indexes"
   - "MongoDB Manual, Index Types (compound, multikey, wildcard, TTL); The ESR (Equality, Sort, Range) Guideline"
-updated: 2026-11-03
+updated: 2026-11-07
 ---
 
 # Index Types and Index Design
@@ -91,6 +91,20 @@ This is the **ESR rule** (Equality, Sort, Range), named in the MongoDB docs and 
 
 Direction matters only for mixed sorts. An index on `(due_date DESC, id DESC)` can be read backwards to give `due_date ASC, id ASC`, but neither direction gives `due_date DESC, id ASC`.
 
+```mermaid
+flowchart LR
+    subgraph ESR["Key (workspace_id, status, due_date DESC, id DESC, amount_minor): E-S-R"]
+        direction TB
+        S1["due 10-30, amount 500,000: match"] --> S2["due 10-29, amount 90,000: rejected inside the index"] --> S3["due 10-28, amount 200,000: match"] --> S4["...stop after 20 matches"]
+    end
+    subgraph ERS["Key (workspace_id, status, amount_minor, due_date): E-R-S"]
+        direction TB
+        R1["amount 120,000, due 10-01"] --> R2["amount 200,000, due 10-28"] --> R3["amount 500,000, due 10-30"] --> R4["...read all 212 matches, then Sort by due_date"]
+    end
+```
+
+**Example with numbers.** For Query B in section 4.1, the E-S-R key reads entries in the order the page needs, so `LIMIT 20` stops early (0.118 ms in the representative plan). The E-R-S key returns entries ordered by amount, so all 212 matches are read and sorted (2.851 ms).
+
 ### 3.3 Index scan vs index-only scan
 
 ```mermaid
@@ -116,6 +130,61 @@ An **index-only scan** answers the query from the index alone. In PostgreSQL the
 | GIN | One element (JSON path/key, array item, lexeme, trigram) → sorted list of row pointers (*posting list*) | Look up each element, intersect posting lists, recheck rows |
 | GiST | A bounding predicate (range, box) per subtree; leaves hold values | Descend every subtree whose bound matches; may visit several branches |
 | BRIN | For each range of 128 table pages (default `pages_per_range`): min and max value | Scan the whole small BRIN, read only page ranges whose min/max could match, recheck rows |
+
+### 3.5 How GIN, GiST and BRIN find rows
+
+#### GIN: element to posting list
+
+A GIN entry maps one element to the sorted list of rows that contain it. A containment query looks up each element, intersects the lists, and rechecks the surviving rows.
+
+```mermaid
+flowchart LR
+    Q["metadata @> channel stripe AND retry true"] --> K1["lookup element<br/>channel=stripe"]
+    Q --> K2["lookup element<br/>retry=true"]
+    K1 --> P1["posting list: rows 3, 17, 42, 90"]
+    K2 --> P2["posting list: rows 17, 42, 55"]
+    P1 --> I["intersect: rows 17, 42"]
+    P2 --> I
+    I --> RC["fetch rows, recheck the condition"]
+```
+
+The row ids above are illustrative. One document with 40 keys adds 40 entries, which is why GIN writes are heavy.
+
+#### GiST: nested bounding predicates, used by exclusion constraints
+
+A GiST internal entry stores a predicate that covers everything below it (a bounding range or box). A search descends every subtree whose predicate could match. An exclusion constraint uses the same probe on every insert to look for a conflicting row.
+
+```mermaid
+sequenceDiagram
+    participant T as Transaction
+    participant G as GiST index on (room_id, during)
+    T->>G: insert room 7, 10:00-11:00
+    G->>G: probe for room_id = 7 AND during overlaps 10:00-11:00
+    alt an overlapping row exists, for example 10:30-11:30
+        G-->>T: error 23P01 exclusion_violation
+    else no overlap
+        G-->>T: entry added, insert succeeds
+    end
+```
+
+#### BRIN: min and max per block range
+
+BRIN stores one summary per range of table pages. A query reads the whole small BRIN, keeps the ranges whose min and max could contain the value, and scans only those page ranges.
+
+```mermaid
+flowchart TB
+    subgraph IDX["BRIN: one summary per 128 pages (illustrative values)"]
+        B1["pages 0-127<br/>min 01-01, max 01-09"]
+        B2["pages 128-255<br/>min 01-09, max 01-17"]
+        B3["pages 256-383<br/>min 01-17, max 01-25"]
+    end
+    Q["WHERE created_at = 01-12"] --> B2
+    B2 -->|"only this range can match"| SC["scan 128 pages, recheck each row"]
+    B1 -.->|"skipped"| X["not read"]
+    B3 -.->|"skipped"| X
+```
+
+This works only because rows were appended in time order. If dates were scattered, every range would have a min and max covering everything and nothing could be skipped.
 
 ## 4. Worked example
 
@@ -210,6 +279,13 @@ SELECT count(*) FROM invoices WHERE status = 'overdue';
 
 The leading column `workspace_id` is not constrained. Before PostgreSQL 18 the planner either reads the whole index or does a Seq Scan. PostgreSQL 18 added **B-tree skip scan**: when the skipped leading column has few distinct values, it performs one small descent per distinct `workspace_id` (2,000 descents here) instead of reading everything. MySQL has had the same idea since 8.0.13 (`Using index for skip scan` in `EXPLAIN`), with restrictions: one table, and the query must be answerable from the index. So "an index is useless if the query skips its first column" is no longer an absolute rule; it is still the right default, because skip scan is only cheap when the skipped column has few distinct values.
 
+```mermaid
+flowchart LR
+    Q["WHERE status = 'overdue'<br/>index (workspace_id, status, ...)"] --> A["pre PostgreSQL 18:<br/>read the whole index<br/>or Seq Scan"]
+    Q --> B["PostgreSQL 18 skip scan:<br/>one small descent per distinct workspace_id"]
+    B --> B1["seek (ws 1, overdue)"] --> B2["seek (ws 2, overdue)"] --> B3["... 2,000 seeks"]
+```
+
 ### 4.2 Covering index and Heap Fetches
 
 ```sql
@@ -232,6 +308,20 @@ Index Only Scan using invoices_open_due_idx on invoices  (actual time=0.029..0.1
 ```
 
 The partial predicate (`WHERE status IN (...)`) makes this index roughly a tenth of the size of a full one (open plus overdue rows are under 10% of the table). The planner uses it only when it can prove the query's `WHERE` implies the index's `WHERE`, so the query must say `status IN ('open','overdue')` or `status = 'overdue'`; a query parameter `status = $1` with a generic plan cannot be proven and will not use it.
+
+```mermaid
+flowchart LR
+    subgraph FULL["Full index (workspace_id, due_date, id): every invoice"]
+        F["10,000,000 entries"]
+    end
+    subgraph PART["Partial index WHERE status IN open, overdue"]
+        P["about 10% of the rows:<br/>paid and draft invoices are not indexed"]
+    end
+    FULL -->|"add the predicate"| PART
+    PART --> U{"does the query WHERE imply<br/>the index predicate?"}
+    U -->|"status = 'overdue' written as a constant"| Y["index can be used"]
+    U -->|"status = $1 under a generic plan"| N["cannot be proven: index ignored"]
+```
 
 ### 4.3 The other types, in InvoiceOps
 
@@ -274,155 +364,45 @@ Notes on each:
 - A second booking of room 7 for an overlapping time fails with SQLSTATE `23P01` (`exclusion_violation`), enforced by the database even under concurrent inserts, which an application-side "check then insert" cannot guarantee (see [[Locking - Optimistic vs Pessimistic]]).
 - For 2 billion audit rows (about 90 rows per 8 kB page, so about 22 M pages), BRIN keeps one min/max pair per 128 pages: roughly 175,000 summaries, a few MB at most. A B-tree on the same column would be roughly 40–50 GB. Both figures are estimates from page arithmetic, not measurements.
 
-### 4.4 Checking an index design in Go
+### 4.4 Checking an index design against a query
 
-Before shipping a migration, a code review can check each hot query against the proposed key. This helper encodes the leftmost-prefix rule (without skip scan) and the ESR order.
+Before shipping a migration, a code review can check each hot query against the proposed key. The check encodes the leftmost-prefix rule (without skip scan) and the ESR order.
 
-```go
-package idx
-
-// Col is one index key column or one ORDER BY column.
-type Col struct {
-	Name string
-	Desc bool
-}
-
-// Query is the shape of one query against a single table.
-type Query struct {
-	Equal []string // columns compared with = (or IN with one value)
-	Range string   // at most one column compared with <, >, BETWEEN; "" if none
-	Sort  []Col    // ORDER BY columns, in order
-}
-
-// Usage says how much of a B-tree index a query can use.
-type Usage struct {
-	SeekCols int  // leading index columns that narrow the scan
-	SortOK   bool // the index returns rows already in ORDER BY order
-}
-
-// ESR proposes a B-tree key for q: equality columns, then sort columns,
-// then the range column (unless it is already the first sort column).
-func ESR(q Query) []Col {
-	key := make([]Col, 0, len(q.Equal)+len(q.Sort)+1)
-	seen := map[string]bool{}
-	for _, c := range q.Equal {
-		if !seen[c] {
-			key = append(key, Col{Name: c})
-			seen[c] = true
-		}
-	}
-	for _, c := range q.Sort {
-		if !seen[c.Name] {
-			key = append(key, c)
-			seen[c.Name] = true
-		}
-	}
-	if q.Range != "" && !seen[q.Range] {
-		key = append(key, Col{Name: q.Range})
-	}
-	return key
-}
-
-// Analyze applies the leftmost-prefix rule (no skip scan).
-func Analyze(index []Col, q Query) Usage {
-	eq := map[string]bool{}
-	for _, c := range q.Equal {
-		eq[c] = true
-	}
-	var u Usage
-	i := 0
-	for i < len(index) && eq[index[i].Name] {
-		i++
-	}
-	u.SeekCols = i
-	if i < len(index) && q.Range != "" && index[i].Name == q.Range {
-		u.SeekCols++
-	}
-	u.SortOK = sortMatches(index[i:], q.Sort, eq)
-	return u
-}
-
-// sortMatches reports whether rest (the index after its equality prefix)
-// yields the ORDER BY. Sort columns pinned by equality can be ignored.
-// Directions must all match or all be flipped (a backward index scan).
-func sortMatches(rest, sort []Col, eq map[string]bool) bool {
-	var want []Col
-	for _, c := range sort {
-		if !eq[c.Name] {
-			want = append(want, c)
-		}
-	}
-	if len(want) > len(rest) {
-		return false
-	}
-	same, flipped := true, true
-	for k, c := range want {
-		if rest[k].Name != c.Name {
-			return false
-		}
-		if rest[k].Desc == c.Desc {
-			flipped = false
-		} else {
-			same = false
-		}
-	}
-	return same || flipped
-}
+```mermaid
+flowchart TD
+    S["index columns in order, query shape:<br/>equality set, one range column, ORDER BY list"] --> A["walk the index while the column is in the equality set<br/>SeekCols = number of columns walked"]
+    A --> B{"next index column is the range column?"}
+    B -->|"yes"| C["SeekCols + 1"]
+    B -->|"no"| D["SeekCols unchanged"]
+    C --> E["drop ORDER BY columns already pinned by equality"]
+    D --> E
+    E --> F{"remaining index columns match the remaining ORDER BY<br/>with all directions equal, or all flipped?"}
+    F -->|"yes"| G["SortOK = true: no Sort node"]
+    F -->|"no"| H["SortOK = false: a Sort is needed"]
 ```
 
-```go
-package idx
+The rules the check applies:
 
-import (
-	"reflect"
-	"testing"
-)
+- **Seek columns** are the leading index columns that appear in the equality set, plus the range column if it comes immediately after them.
+- **Sort is served** when the index columns after the equality prefix match the `ORDER BY` columns in order, and the directions are either all the same (a forward scan) or all opposite (a backward scan). Mixed directions fail.
+- **A column pinned by equality** can be dropped from `ORDER BY`, because every row in the run has the same value for it.
+- **The ESR proposal** orders equality columns first, then sort columns, then the range column unless it is already a sort column.
 
-// invoices(workspace_id, status, due_date DESC, id DESC)
-var listIdx = []Col{{Name: "workspace_id"}, {Name: "status"}, {Name: "due_date", Desc: true}, {Name: "id", Desc: true}}
+Test cases against the key `(workspace_id, status, due_date DESC, id DESC)`:
 
-func TestAnalyze(t *testing.T) {
-	cases := []struct {
-		name string
-		q    Query
-		want Usage
-	}{
-		{"list API", Query{Equal: []string{"workspace_id", "status"},
-			Sort: []Col{{Name: "due_date", Desc: true}, {Name: "id", Desc: true}}}, Usage{2, true}},
-		{"backward scan", Query{Equal: []string{"workspace_id", "status"},
-			Sort: []Col{{Name: "due_date"}, {Name: "id"}}}, Usage{2, true}},
-		{"mixed directions", Query{Equal: []string{"workspace_id", "status"},
-			Sort: []Col{{Name: "due_date"}, {Name: "id", Desc: true}}}, Usage{2, false}},
-		{"range on due_date", Query{Equal: []string{"workspace_id", "status"},
-			Range: "due_date"}, Usage{3, true}},
-		{"skips leading column", Query{Equal: []string{"status"}}, Usage{0, true}},
-		{"gap in prefix", Query{Equal: []string{"workspace_id"}, Range: "due_date"}, Usage{1, true}},
-		{"sort column pinned", Query{Equal: []string{"workspace_id", "status"},
-			Sort: []Col{{Name: "status"}, {Name: "due_date", Desc: true}}}, Usage{2, true}},
-	}
-	for _, c := range cases {
-		if got := Analyze(listIdx, c.q); got != c.want {
-			t.Errorf("%s: got %+v, want %+v", c.name, got, c.want)
-		}
-	}
-}
+| Case | Query | SeekCols | SortOK |
+| --- | --- | --- | --- |
+| list API | `workspace_id = ? AND status = ?`, order `due_date DESC, id DESC` | 2 | yes |
+| backward scan | same equality, order `due_date, id` | 2 | yes |
+| mixed directions | same equality, order `due_date, id DESC` | 2 | no |
+| range on due_date | same equality, range `due_date` | 3 | yes |
+| skips leading column | `status = ?` only | 0 | yes (nothing to sort) |
+| gap in prefix | `workspace_id = ?`, range `due_date` | 1 | yes |
+| sort column pinned | same equality, order `status, due_date DESC` | 2 | yes |
 
-func TestESR(t *testing.T) {
-	q := Query{Equal: []string{"workspace_id", "status"}, Range: "amount_minor",
-		Sort: []Col{{Name: "due_date", Desc: true}}}
-	want := []Col{{Name: "workspace_id"}, {Name: "status"}, {Name: "due_date", Desc: true}, {Name: "amount_minor"}}
-	got := ESR(q)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v", got)
-	}
-	u := Analyze(got, q)
-	if u.SeekCols != 2 || !u.SortOK {
-		t.Fatalf("ESR key should seek on 2 columns and serve the sort, got %+v", u)
-	}
-}
-```
+The ESR proposal for equality `workspace_id, status`, range `amount_minor`, order `due_date DESC` is `(workspace_id, status, due_date DESC, amount_minor)`, which seeks on 2 columns and serves the sort. The "gap in prefix" case is the classic mistake: `WHERE workspace_id = ? AND due_date > ?` on `(workspace_id, status, due_date)` seeks on one column only, and `due_date` becomes a filter over the whole workspace.
 
-Measured: `go vet` is clean and `go test -race` passes with Go 1.24.4. The "gap in prefix" case is the classic mistake: `WHERE workspace_id = ? AND due_date > ?` on `(workspace_id, status, due_date)` seeks on one column only, and `due_date` becomes a filter over the whole workspace.
+Runnable Go version: [[Index Types and Index Design - Go]]
 
 ## 5. Variants and comparison
 
@@ -553,3 +533,4 @@ ORDER BY pg_relation_size(s.indexrelid) DESC;
 - **Before this:** [[Indexing Fundamentals]], [[Query Plans and EXPLAIN]]
 - **Next:** [[N+1 Query Problem]], [[Zero-Downtime Schema Migrations]], [[Debugging Database Performance]]
 - **Compare with:** [[Search Engines and Inverted Indexes]], [[Geospatial Indexing]], [[Vector Databases and ANN Indexes]], [[Storage Engines - B-tree vs LSM and WAL]]
+- **Go implementation:** [[Index Types and Index Design - Go]]

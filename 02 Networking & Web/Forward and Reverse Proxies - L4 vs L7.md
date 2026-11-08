@@ -3,13 +3,13 @@ tags: [networking, proxies, load-balancing]
 level: intermediate
 status: reviewed
 prereqs: ["[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]", "[[TCP - Handshake, Reliability, Flow and Congestion Control]]"]
-related: ["[[TLS and HTTPS]]", "[[Load Balancing]]", "[[Nginx]]", "[[CDN and Edge]]", "[[API Gateway and BFF]]"]
+related: ["[[TLS and HTTPS]]", "[[Load Balancing]]", "[[Nginx]]", "[[CDN and Edge]]", "[[API Gateway and BFF]]", "[[Forward and Reverse Proxies - L4 vs L7 - Go]]"]
 sources:
   - "RFC 7230, HTTP/1.1 Message Syntax and Routing"
   - "RFC 7239, Forwarded HTTP Extension"
   - "HAProxy docs, PROXY protocol specification"
   - "Envoy docs, Architecture overview"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Forward and Reverse Proxies - L4 vs L7
@@ -121,29 +121,24 @@ A reverse proxy that terminates TLS and makes its own connection to the backend 
 - `X-Forwarded-For`: a comma-separated list, each hop appending the IP it saw the request arrive from.
 - `Forwarded` (RFC 7239): a standardized, structured alternative (`for=`, `proto=`, `host=`), less widely adopted than `X-Forwarded-For` in practice but less ambiguous.
 
-The trap: **a client can set `X-Forwarded-For` to anything it wants.** If the backend blindly trusts the left-most value as "the real client IP", an attacker self-reports a fake IP to bypass an IP allowlist or rate limit. The only sound rule is to trust exactly as many hops from the **right** as you have proxies you control, and discard or ignore everything further left — because only your own, known proxies append truthfully.
+The trap: **a client can set `X-Forwarded-For` to anything it wants.** If the backend blindly trusts the left-most value as "the real client IP", an attacker self-reports a fake IP to bypass an IP allowlist or rate limit.
 
-```go
-// TrustedClientIP returns the real client IP from X-Forwarded-For, trusting
-// only the last n hops added by our own known proxies. Everything to the
-// left of that is attacker-controlled and must never be used for
-// rate-limiting or access control.
-func TrustedClientIP(xff string, trustedHops int) string {
-	if xff == "" || trustedHops <= 0 {
-		return ""
-	}
-	parts := strings.Split(xff, ",")
-	for i := range parts {
-		parts[i] = strings.TrimSpace(parts[i])
-	}
-	if trustedHops > len(parts) {
-		trustedHops = len(parts)
-	}
-	return parts[len(parts)-trustedHops]
-}
+> [!warning] Common mistake
+> Trusting the left-most (or only) entry in `X-Forwarded-For` as "the real client IP." An attacker controls everything they send, including that header, so the left-most entry is exactly the value an attacker can forge freely.
+
+The only sound rule is to trust exactly as many hops from the **right** as you have proxies you control, and discard or ignore everything further left — because only your own, known proxies append truthfully:
+
+```mermaid
+flowchart LR
+    Atk["X-Forwarded-For header:<br/>attacker-spoofed, 203.0.113.9, 10.0.0.5"] --> Split["Split on commas"]
+    Split --> Count{"How many proxies<br/>do you actually control?"}
+    Count -->|"2 (your LB + this proxy)"| Trust["Trust the last 2 entries:<br/>203.0.113.9 is the real client,<br/>10.0.0.5 was appended by this hop"]
+    Count -->|"anything left of that"| Ignore["Ignore: attacker-controlled,<br/>never used for rate-limiting or access control"]
 ```
 
-If there's exactly one reverse proxy you control in front of the backend, `trustedHops` is 1: take the last entry, ignore everything before it. If the request also passed through an upstream CDN before your own reverse proxy, `trustedHops` is 2, and so on — this number is a fact about **your own infrastructure's topology**, never something inferred from the request.
+**Example:** with the header above and `trustedHops = 2`, the real client IP is `203.0.113.9` — the second-from-right entry, since `10.0.0.5` is this proxy's own append and `203.0.113.9` is the one appended by the proxy you trust just before it. `attacker-spoofed` is discarded outright.
+
+If there's exactly one reverse proxy you control in front of the backend, `trustedHops` is 1: take the last entry, ignore everything before it. If the request also passed through an upstream CDN before your own reverse proxy, `trustedHops` is 2, and so on — this number is a fact about **your own infrastructure's topology**, never something inferred from the request. The `TrustedClientIP` function implementing this rule, with its test, is in [[Forward and Reverse Proxies - L4 vs L7 - Go]].
 
 **PROXY protocol** (originated by HAProxy) solves a related but different problem: when an L4 proxy forwards a raw TCP connection, the backend sees the proxy's IP as the connection's source and has no HTTP headers to fall back on at all. PROXY protocol prepends a small, fixed-format header (the real source/destination IP and port) to the byte stream before the real payload, so even a non-HTTP backend (or an L4 hop in front of an L7 proxy) can learn the original client address.
 
@@ -172,7 +167,34 @@ Opening a new TCP (and TLS) connection per request to the backend wastes a hands
 
 ### Sidecars and service mesh
 
-In a microservice fleet, a **sidecar proxy** (most commonly Envoy) runs alongside every service instance, and all of that instance's inbound and outbound traffic passes through its own local sidecar instead of the application code talking to the network directly. A control plane configures every sidecar's routing, retries, timeouts, and mTLS certificates centrally — this is what a **service mesh** (Istio, Linkerd) is. It moves cross-cutting proxy concerns (retries, mTLS, observability) out of application code, at the cost of an extra network hop per call and real operational complexity.
+In a microservice fleet, a **sidecar proxy** (most commonly Envoy) runs alongside every service instance, and all of that instance's inbound and outbound traffic passes through its own local sidecar instead of the application code talking to the network directly.
+
+**In plain words:** instead of every service's own code having to implement retries, mTLS and metrics, each service gets a dedicated local proxy that does it on its behalf — the application just talks to `localhost`, and the sidecar handles the rest.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    subgraph ControlPlane["Control plane (Istio/Linkerd)"]
+        CP["Pushes routing, retry,<br/>timeout and mTLS config<br/>to every sidecar"]
+    end
+    subgraph PodA["Service A instance"]
+        AppA["Application code"] <-->|"localhost"| SideA["Sidecar (Envoy)"]
+    end
+    subgraph PodB["Service B instance"]
+        SideB["Sidecar (Envoy)"] <-->|"localhost"| AppB["Application code"]
+    end
+    SideA <-->|"mTLS, retries, load balancing<br/>— all handled by the sidecars"| SideB
+    CP -.-> SideA
+    CP -.-> SideB
+```
+
+**Example:** Service A's code calls `http://localhost:15001/orders`, believing it's talking directly to Service B. In reality its sidecar intercepts that call, establishes an mTLS connection to Service B's sidecar, retries on a transient failure according to the control plane's policy, and only then hands the request to Service B's own application code — none of which Service A's code had to implement itself.
+
+A control plane configures every sidecar's routing, retries, timeouts, and mTLS certificates centrally — this is what a **service mesh** (Istio, Linkerd) is. It moves cross-cutting proxy concerns (retries, mTLS, observability) out of application code, at the cost of an extra network hop per call and real operational complexity.
+
+> [!tip] Remember
+> A sidecar is just another reverse (and forward) proxy — one per instance instead of one in front of a whole fleet — configured centrally rather than per-service.
 
 ### Reverse proxy vs API gateway vs load balancer
 
@@ -192,163 +214,41 @@ A single piece of software (Nginx, Envoy) is often configured to do all three jo
 
 A client calls `https://api.example.com/orders/42`. The reverse proxy terminates TLS, matches `/orders/*`, and forwards a plaintext (or re-encrypted) request to one instance of the orders service, adding `X-Forwarded-For` and `X-Forwarded-Proto` so that service still knows the original client IP and that the original request was HTTPS.
 
-### A minimal Go reverse proxy, with its test
+### A minimal Go reverse proxy, traced step by step
 
-`net/http/httputil.ReverseProxy` does the actual forwarding; the code below adds the two things a bare `NewSingleHostReverseProxy` doesn't: a correct, appended `X-Forwarded-For`, and a `502` on backend failure instead of a silently dropped connection.
+`net/http/httputil.ReverseProxy` does the actual forwarding; the production code adds two things a bare `NewSingleHostReverseProxy` doesn't: a correct, appended `X-Forwarded-For`, and a `502` on backend failure instead of a silently dropped connection. Tracing one request through it:
 
-```go
-package proxy
+1. The proxy's `Director` function runs first, rewriting the request's scheme and host to match the origin, and appending the immediate peer's IP to `X-Forwarded-For` (never trusting an inbound value — it only ever appends).
+2. `httputil.ReverseProxy` dials the origin and forwards the (now-rewritten) request.
+3. If the origin responds normally, the response is copied back to the client unchanged.
+4. If the origin is unreachable, times out, or sends a malformed response, the custom `ErrorHandler` runs instead, logging the failure and writing `502 Bad Gateway` — the alternative, doing nothing, would let the client's connection hang or see Go's own default (less informative) error page.
 
-import (
-	"log/slog"
-	"net"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"strings"
-)
+> [!warning] Common mistake
+> Trusting whatever `X-Forwarded-For` the request already carries and simply overwriting it. The correct behavior is to *append*, keeping any prior hops, so a chain of proxies builds a full, auditable path — overwriting silently throws away every earlier hop's information.
 
-// NewReverseProxy builds a reverse proxy to a single upstream origin. It
-// rewrites the request to the origin's scheme and host, and appends this
-// hop's observed client IP to X-Forwarded-For (never trusting an inbound
-// value from an untrusted client).
-func NewReverseProxy(origin *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
-	proxy := httputil.NewSingleHostReverseProxy(origin)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant D as Director
+    participant RP as httputil.ReverseProxy
+    participant O as Origin
 
-	director := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		director(req)
-		req.Host = origin.Host // many origins route on Host; keep it in sync with the target
-		appendForwardedFor(req)
-	}
-
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.Error("proxy error", "err", err, "path", r.URL.Path)
-		w.WriteHeader(http.StatusBadGateway) // 502: we could not reach or read from the upstream
-	}
-
-	return proxy
-}
-
-// appendForwardedFor appends the immediate peer's IP to X-Forwarded-For.
-// Only a proxy we trust may add to this header; a client-supplied value
-// before us is kept, since an upstream trust boundary decides how many
-// hops to believe (see TrustedClientIP).
-func appendForwardedFor(req *http.Request) {
-	host, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		host = req.RemoteAddr
-	}
-	if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
-		req.Header.Set("X-Forwarded-For", prior+", "+host)
-	} else {
-		req.Header.Set("X-Forwarded-For", host)
-	}
-	if req.Header.Get("X-Forwarded-Proto") == "" {
-		req.Header.Set("X-Forwarded-Proto", "http")
-	}
-}
-
-// TrustedClientIP returns the real client IP from X-Forwarded-For, trusting
-// only the last n hops added by our own known proxies. Everything to the
-// left of that is attacker-controlled and must never be used for
-// rate-limiting or access control.
-func TrustedClientIP(xff string, trustedHops int) string {
-	if xff == "" || trustedHops <= 0 {
-		return ""
-	}
-	parts := strings.Split(xff, ",")
-	for i := range parts {
-		parts[i] = strings.TrimSpace(parts[i])
-	}
-	if trustedHops > len(parts) {
-		trustedHops = len(parts)
-	}
-	return parts[len(parts)-trustedHops]
-}
+    C->>D: incoming request
+    D->>D: rewrite scheme/host, append X-Forwarded-For
+    D->>RP: rewritten request
+    RP->>O: forward request
+    alt origin responds
+        O-->>RP: response
+        RP-->>C: response, unchanged
+    else origin unreachable or malformed
+        RP->>RP: ErrorHandler fires
+        RP-->>C: 502 Bad Gateway
+    end
 ```
 
-Two tests: one proves normal forwarding sets the right headers, the other proves an unreachable backend produces a clean `502` instead of a hang.
+**Measured** (Go 1.24, `go vet` and `go test -race`, scratch module, 2026-11-09): a test proving normal forwarding sets the right headers, a test proving an unreachable backend produces a clean `502` instead of a hang, and a test proving `TrustedClientIP` picks the right hop out of a forged header — all three pass.
 
-```go
-func TestReverseProxyForwardsAndSetsHeaders(t *testing.T) {
-	var gotHost, gotXFF, gotProto string
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHost = r.Host
-		gotXFF = r.Header.Get("X-Forwarded-For")
-		gotProto = r.Header.Get("X-Forwarded-Proto")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("hello from origin"))
-	}))
-	defer origin.Close()
-
-	originURL, err := url.Parse(origin.URL)
-	if err != nil {
-		t.Fatalf("parse origin url: %v", err)
-	}
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	rp := NewReverseProxy(originURL, logger)
-
-	front := httptest.NewServer(rp)
-	defer front.Close()
-
-	resp, err := http.Get(front.URL + "/widgets/7")
-	if err != nil {
-		t.Fatalf("do request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if !strings.Contains(string(body), "hello from origin") {
-		t.Fatalf("body = %q, want origin response", body)
-	}
-	if gotHost != originURL.Host {
-		t.Errorf("origin saw Host %q, want %q", gotHost, originURL.Host)
-	}
-	if gotXFF == "" {
-		t.Error("X-Forwarded-For was not set")
-	}
-	if gotProto != "http" {
-		t.Errorf("X-Forwarded-Proto = %q, want http", gotProto)
-	}
-}
-
-func TestReverseProxyReturns502OnUnreachableOrigin(t *testing.T) {
-	// A closed listener: nothing answers, so the proxy must report 502, not hang or 200.
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	deadURL, _ := url.Parse(dead.URL)
-	dead.Close() // close immediately so the address is refused
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	rp := NewReverseProxy(deadURL, logger)
-	front := httptest.NewServer(rp)
-	defer front.Close()
-
-	resp, err := http.Get(front.URL + "/")
-	if err != nil {
-		t.Fatalf("do request: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", resp.StatusCode)
-	}
-}
-
-func TestTrustedClientIPTrustsOnlyKnownHops(t *testing.T) {
-	// attacker, then two of our own proxies appending in order.
-	xff := "attacker-spoofed, 203.0.113.9, 10.0.0.5"
-	got := TrustedClientIP(xff, 2) // we trust the last 2 hops (our own LB and this proxy)
-	if got != "203.0.113.9" {
-		t.Fatalf("got %q, want 203.0.113.9", got)
-	}
-}
-```
-
-**Measured** (Go 1.24, `go vet` and `go test -race`, this scratch module, 2026-11-06): all three tests pass.
+Runnable Go version, with the full reverse proxy, `TrustedClientIP`, and all three tests: [[Forward and Reverse Proxies - L4 vs L7 - Go]].
 
 ### Sequence: a request, and a 504 when the backend is slow
 
@@ -438,3 +338,4 @@ sequenceDiagram
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[TCP - Handshake, Reliability, Flow and Congestion Control]]
 - **Next:** [[Nginx]], [[TLS and HTTPS]]
 - **Compare with:** [[Load Balancing]] (the algorithms that decide *which* backend instance, once a proxy decides to forward), [[API Gateway and BFF]] (the API-specific policy layer, often built on the same proxy software), [[CDN and Edge]] (a globally distributed reverse-proxy tier specialized for caching)
+- **Code:** [[Forward and Reverse Proxies - L4 vs L7 - Go]]

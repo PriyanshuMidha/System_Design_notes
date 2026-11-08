@@ -11,7 +11,7 @@ sources:
   - "pgx v5.8 source: QueryTracer, CollectRows, SendBatch, statement_cache_capacity default 512"
   - "GORM docs, Preloading (Preload vs Joins)"
   - "graphql/dataloader README (batching within one event-loop tick)"
-updated: 2026-11-02
+updated: 2026-11-07
 ---
 
 # N+1 Query Problem
@@ -61,7 +61,21 @@ N+1 hides wherever code that loads one related row runs inside a loop:
 - **GraphQL resolvers.** The `client` field resolver runs once per invoice in the result. See [[GraphQL]].
 - **Service calls.** One HTTP or gRPC call per item to another service: the same bug, with round trips of tens of milliseconds instead of about one.
 
-The difference on the wire:
+```mermaid
+flowchart LR
+    L["loop over the page of 50 rows"] --> A["repository call per row<br/>GetClient(ctx, id)"]
+    L --> B["ORM lazy load<br/>invoice.client"]
+    L --> C["GraphQL field resolver<br/>client(invoice)"]
+    L --> D["HTTP or gRPC call per item"]
+    A --> Q["1 query each: 50 round trips"]
+    B --> Q
+    C --> Q
+    D --> S["1 call each: 50 round trips of 10 to 20 ms"]
+```
+
+### The difference on the wire
+
+
 
 ```mermaid
 sequenceDiagram
@@ -81,7 +95,9 @@ sequenceDiagram
     DB-->>H: 7 rows, stitched to invoices in a Go map
 ```
 
-The batching steps in code:
+### The batching steps
+
+Collect the foreign keys, remove duplicates, fetch each chunk with one query and stitch the result by key:
 
 ```mermaid
 flowchart LR
@@ -133,95 +149,34 @@ func namesFast(invs []Invoice, clientsByIDs func([]int64) []Client) []string {
 }
 ```
 
-The full version below adds production concerns: workspace scoping, context, a missing-client check, and tests.
+The runnable version adds workspace scoping, context, a missing-client check, and tests.
 
-The repository interface and both versions of the list handler (Go 1.24, passes `go vet` and `go test -race`):
+### A page of 50 invoices, traced
 
-```go
-// Store is the repository the invoice-list handler depends on.
-type Store interface {
-	ListInvoices(ctx context.Context, ws int64, limit int) ([]Invoice, error)
-	GetClient(ctx context.Context, ws, id int64) (Client, error)
-	ClientsByIDs(ctx context.Context, ws int64, ids []int64) ([]Client, error)
-}
+The page has 50 invoices that share 7 distinct clients, and the chunk size is 1,000.
 
-// Row is one line of the invoice list page.
-type Row struct {
-	InvoiceID  int64
-	ClientName string
-	TotalMinor int64
-}
+| Step | Naive | Batched |
+| --- | --- | --- |
+| Load the page | 1 query | 1 query |
+| Fetch clients | 50 queries, one per invoice, 43 of them repeats | collect 50 client IDs, sort, remove duplicates: 7 IDs; 1 query with `id = ANY($2)` |
+| Total round trips | 51 | 2 |
+| At about 1 ms each (an estimate) | about 51 ms | about 2 ms |
 
-// ListNaive runs 1 query for the page plus 1 query per invoice: N+1.
-func ListNaive(ctx context.Context, s Store, ws int64, limit int) ([]Row, error) {
-	invs, err := s.ListInvoices(ctx, ws, limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]Row, 0, len(invs))
-	for _, inv := range invs {
-		c, err := s.GetClient(ctx, ws, inv.ClientID) // one round trip per row
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, Row{inv.ID, c.Name, inv.TotalMinor})
-	}
-	return out, nil
-}
-
-// ListBatched runs 1 query for the page plus 1 query per chunk of distinct
-// client IDs, so the query count no longer grows with the page size.
-func ListBatched(ctx context.Context, s Store, ws int64, limit, chunk int) ([]Row, error) {
-	invs, err := s.ListInvoices(ctx, ws, limit)
-	if err != nil {
-		return nil, err
-	}
-	ids := make([]int64, 0, len(invs))
-	for _, inv := range invs {
-		ids = append(ids, inv.ClientID)
-	}
-	slices.Sort(ids)
-	ids = slices.Compact(ids) // 50 invoices usually share far fewer clients
-
-	byID := make(map[int64]Client, len(ids))
-	for part := range slices.Chunk(ids, chunk) { // slices.Chunk: Go 1.23+
-		cs, err := s.ClientsByIDs(ctx, ws, part)
-		if err != nil {
-			return nil, err
-		}
-		for _, c := range cs {
-			byID[c.ID] = c
-		}
-	}
-
-	out := make([]Row, 0, len(invs))
-	for _, inv := range invs {
-		c, ok := byID[inv.ClientID]
-		if !ok { // a batch query silently omits missing IDs, so check
-			return nil, fmt.Errorf("invoice %d: client %d: %w", inv.ID, inv.ClientID, ErrNotFound)
-		}
-		out = append(out, Row{inv.ID, c.Name, inv.TotalMinor})
-	}
-	return out, nil
-}
+```mermaid
+flowchart TD
+    P["page: 50 invoices"] --> I["client_id list:<br/>7, 9, 7, 3, 9, 7 ... (50 values)"]
+    I --> U["sort and compact:<br/>3, 7, 9, 12, 15, 21, 30 (7 values)"]
+    U --> Q["1 query: WHERE workspace_id = $1<br/>AND id = ANY($2)"]
+    Q --> M["map of 7 clients"]
+    M --> W["walk the 50 invoices in page order,<br/>look each client up in the map"]
+    W --> C{"client missing<br/>from the map?"}
+    C -- yes --> E["return ErrNotFound"]
+    C -- no --> R["50 rows for the page"]
 ```
 
-The Postgres side of `ClientsByIDs` with pgx. The whole slice travels as **one** `bigint[]` parameter, and the `workspace_id` filter keeps a bad ID from reading another tenant's client:
+Two details matter. The batch query silently omits IDs that do not exist, so the stitching step must check for a missing client instead of printing a blank name. And with 50 distinct clients and a chunk size of 20, the batched version runs 1 + 3 queries: the count depends on the number of chunks, not on the page size.
 
-```go
-// ClientsByIDs is one round trip for any number of IDs: pgx sends the Go
-// slice as a single bigint[] parameter.
-func (s *PGStore) ClientsByIDs(ctx context.Context, ws int64, ids []int64) ([]Client, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, name FROM clients WHERE workspace_id = $1 AND id = ANY($2)`, ws, ids)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[Client]) // closes rows
-}
-```
-
-With sqlc, the same query is declared once and sqlc generates a method that takes `[]int64`. sqlc does not allow mixing `$n` and named parameters in one query, so both are named here:
+The pgx side sends the whole ID slice as one `bigint[]` parameter, and the `workspace_id` filter keeps a bad ID from reading another tenant's client. With sqlc, the same query is declared once and sqlc generates a method that takes `[]int64`. sqlc does not allow mixing `$n` and named parameters in one query, so both are named here:
 
 ```sql
 -- name: ClientsByIDs :many
@@ -229,44 +184,9 @@ SELECT id, name FROM clients
 WHERE workspace_id = @workspace_id AND id = ANY(@ids::bigint[]);
 ```
 
-The test that stops this bug from coming back counts queries against a fake store and checks that the count **does not grow with the page size**:
+The test that stops this bug from coming back counts queries against a fake store and checks that the count **does not grow with the page size**: for 1, 10 and 50 invoices the naive version costs 2, 11 and 51 queries, and the batched version always costs 2.
 
-```go
-// fakeStore is an in-memory Store that counts every "query" it serves.
-type fakeStore struct {
-	invoices []Invoice
-	clients  map[int64]Client
-	queries  atomic.Int64
-}
-
-func TestQueryCountDoesNotGrowWithPageSize(t *testing.T) {
-	ctx := context.Background()
-	for _, n := range []int{1, 10, 50} {
-		s := newFakeStore(n, 7) // n invoices spread over at most 7 clients
-
-		naive, err := ListNaive(ctx, s, 1, n)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got, want := s.queries.Swap(0), int64(1+n); got != want {
-			t.Errorf("naive, %d invoices: %d queries, want %d", n, got, want)
-		}
-
-		batched, err := ListBatched(ctx, s, 1, n, 1000)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := s.queries.Load(); got != 2 {
-			t.Errorf("batched, %d invoices: %d queries, want 2", n, got)
-		}
-		if !slices.Equal(naive, batched) {
-			t.Errorf("batched rows differ from naive rows")
-		}
-	}
-}
-```
-
-Each fake method does `f.queries.Add(1)` and answers from memory. Two more tests in the same module check that 50 distinct clients with `chunk = 20` cost 1 + 3 queries, and that a missing client returns `ErrNotFound` instead of a blank name.
+Runnable Go version: [[N+1 Query Problem - Go]]
 
 ## 5. Variants and comparison
 
@@ -281,15 +201,70 @@ Each fake method does `f.queries.Add(1)` and answers from memory. Two more tests
 | Batch endpoint | `POST /clients:batchGet` instead of N `GET /clients/{id}` | Cross-service N+1 | Another API to version |
 | Denormalize | Store `client_name` on the invoice | Read-heavy lists, or values that should be frozen anyway | Updates fan out; see [[Materialized Views and Denormalization]] |
 
+```mermaid
+flowchart TD
+    S["N+1 found: which fix?"] --> R{"relation shape?"}
+    R -- "many-to-one, same database" --> J["JOIN"]
+    R -- "one-to-many, same database" --> K{"nested JSON wanted<br/>in one trip?"}
+    K -- yes --> LT["JOIN LATERAL + json_agg"]
+    K -- no --> BA["batch = ANY per relation, stitch in a map"]
+    R -- "different service" --> BE["batch endpoint, cache, or read model"]
+    R -- "GraphQL resolvers" --> DL["per-request DataLoader"]
+    R -- "N different queries" --> PB["pgx.Batch pipelining"]
+```
+
+Pipelining removes round trips without merging the queries:
+
+```mermaid
+sequenceDiagram
+    participant H as Go handler
+    participant DB as PostgreSQL
+    Note over H,DB: Sequential: 3 round trips
+    H->>DB: query A
+    DB-->>H: result A
+    H->>DB: query B
+    DB-->>H: result B
+    H->>DB: query C
+    DB-->>H: result C
+    Note over H,DB: pgx.Batch: 1 round trip
+    H->>DB: A, B, C in one network write
+    DB-->>H: results A, B, C
+```
+
 The other ORMs follow the same split. Django has `select_related` (JOIN) and `prefetch_related` (separate query). Rails has `includes`, `preload` and `eager_load`, plus `strict_loading` to raise on lazy loads. Hibernate has `JOIN FETCH` and `@BatchSize`.
 
 ## 6. Trade-offs and when not to use
+
+```mermaid
+flowchart LR
+    subgraph one["One JOIN of both children"]
+        J["50 invoices x 10 items x 3 payments<br/>= 1,500 result rows"]
+    end
+    subgraph three["Three queries"]
+        A["50 invoices"] --- B["500 items"] --- C["150 payments"]
+        D["total 700 rows"]
+    end
+```
 
 - **JOIN with several 1:N relations multiplies rows.** 50 invoices × 10 line items × 3 payments in one JOIN return 1,500 rows. Three separate queries return 50 + 500 + 150 = 700.
 - **`LIMIT` applies to joined rows, not to parents.** Joining line items and then `LIMIT 50` gives 50 *items*. Page the parents first (subquery or CTE), then join or batch the children.
 - **Over-fetching.** `Preload` everything, or joining a wide `clients` row, moves bytes the page never shows.
 - **Huge ID lists.** An `IN ($1, …, $n)` list has a hard ceiling: the protocol's Bind message counts parameters in 16 bits, so 65,535 at most. `= ANY($1)` sends one array parameter, but a 100,000-element array is still a slow, memory-heavy query. Chunk it, or ask why one page needs 100,000 IDs.
 - **When N+1 is fine.** N is small and bounded (a detail page with 2 related rows), or each lookup hits an in-process cache.
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1 (holds a tx)
+    participant R2 as Request 2 (holds a tx)
+    participant P as Pool, size 2
+    R1->>P: BeginTx takes connection A
+    R2->>P: BeginTx takes connection B
+    R1->>P: fan-out goroutine asks for a second connection
+    R2->>P: fan-out goroutine asks for a second connection
+    Note over R1,P: pool empty: both wait for each other's transaction
+    P-->>R1: context deadline exceeded
+    P-->>R2: context deadline exceeded
+```
+
 - **Parallel goroutines are not a fix.** They cut latency but take up to N pool connections per request and leave the database load unchanged (see the trap question).
 
 ## 7. In production
@@ -318,31 +293,16 @@ Representative output (PostgreSQL 17):
 
 2,105,200 / 42,104 = 50 client lookups per list query, exactly the page size. Server time per lookup is 0.021 ms; the real cost is round trips, which `pg_stat_statements` cannot see.
 
-- **Detect it per request.** Count queries per request with a pgx tracer and log the count, or alert when it crosses a budget:
-
-```go
-type queryCountKey struct{}
-
-// WithQueryCount returns a context that counts the queries run with it.
-// Middleware calls it once per request and logs the total when it ends.
-func WithQueryCount(ctx context.Context) (context.Context, *atomic.Int64) {
-	n := new(atomic.Int64)
-	return context.WithValue(ctx, queryCountKey{}, n), n
-}
-
-// QueryCounter is a pgx.QueryTracer. Install it on the pool config:
-// cfg.ConnConfig.Tracer = QueryCounter{}
-type QueryCounter struct{}
-
-func (QueryCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
-	if n, ok := ctx.Value(queryCountKey{}).(*atomic.Int64); ok {
-		n.Add(1)
-	}
-	return ctx
-}
-
-func (QueryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+```mermaid
+flowchart LR
+    A["pg_stat_statements:<br/>sort by calls"] --> B["a cheap statement with<br/>millions of calls"]
+    B --> C{"calls / calls of the list query<br/>equals the page size?"}
+    C -- yes --> D["N+1 confirmed"]
+    C -- no --> E["a hot loop or a cache miss,<br/>look elsewhere"]
+    D --> F["find the route: per-request<br/>query count or trace staircase"]
 ```
+
+- **Detect it per request.** A pgx `QueryTracer` increments a counter stored in the request context. Middleware creates the counter once per request, logs the total when the request ends, and alerts when it crosses a budget. The code is in the Go note.
 
 - **Detect it in traces.** With a pgx OpenTelemetry tracer (for example `otelpgx`), an N+1 request shows a "staircase" of 50 identical sibling DB spans under one HTTP span. See [[Distributed Tracing with OpenTelemetry]].
 - **Failure modes → fixes:**
@@ -353,110 +313,24 @@ func (QueryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndD
 
 ## 8. Deep dive
 
-**How a DataLoader works without an event loop.** JavaScript's DataLoader batches every `load()` made in one event-loop tick. Go has no tick, so Go loaders collect keys for a short **wait window**, or until **maxBatch** keys arrive, then run one fetch. Every caller blocks on the result of the batch its key landed in. A per-request cache maps each key to its batch, so a key is never fetched twice:
+### How a DataLoader works without an event loop
 
-```go
-// Loader coalesces concurrent Load calls into one batch fetch, like GraphQL's
-// DataLoader. Create one per request: it caches every key it has seen, and
-// all its callers share that request's context.
-type Loader[K comparable, V any] struct {
-	fetch    func(ctx context.Context, keys []K) (map[K]V, error)
-	wait     time.Duration // how long a batch stays open for more keys
-	maxBatch int           // dispatch early once this many keys are queued
+JavaScript's DataLoader batches every `load()` made in one event-loop tick. Go has no tick, so Go loaders collect keys for a short **wait window**, or until **maxBatch** keys arrive, then run one fetch. Every caller blocks on the result of the batch its key landed in. A per-request cache maps each key to its batch, so a key is never fetched twice.
 
-	mu    sync.Mutex
-	open  *batch[K, V]       // the batch still collecting keys, if any
-	cache map[K]*batch[K, V] // key -> the batch that fetches it
-}
+The `Loader[K, V]` type holds the open batch, a per-request cache from key to batch, a wait window and a `maxBatch` limit. `Load` joins or starts a batch and blocks until it finishes; `dispatch` runs the fetch exactly once, whether the timer or a full batch triggered it.
 
-type batch[K comparable, V any] struct {
-	keys  []K
-	timer *time.Timer
-	once  sync.Once
-	done  chan struct{} // closed once vals and err are set
-	vals  map[K]V
-	err   error
-}
-
-func (l *Loader[K, V]) Load(ctx context.Context, key K) (V, error) {
-	var zero V
-	l.mu.Lock()
-	b, seen := l.cache[key]
-	if !seen {
-		if l.open == nil {
-			nb := &batch[K, V]{done: make(chan struct{})}
-			nb.timer = time.AfterFunc(l.wait, func() { l.dispatch(ctx, nb) })
-			l.open = nb
-		}
-		b = l.open
-		b.keys = append(b.keys, key)
-		l.cache[key] = b
-		if len(b.keys) >= l.maxBatch {
-			l.open = nil // full: the next new key starts another batch
-			go l.dispatch(ctx, b)
-		}
-	}
-	l.mu.Unlock()
-
-	select {
-	case <-b.done:
-	case <-ctx.Done():
-		return zero, ctx.Err()
-	}
-	if b.err != nil {
-		return zero, b.err
-	}
-	v, ok := b.vals[key]
-	if !ok {
-		return zero, fmt.Errorf("key %v: %w", key, ErrNotFound)
-	}
-	return v, nil
-}
-
-// dispatch runs the batch's fetch exactly once, whether the timer or a full
-// batch triggered it.
-func (l *Loader[K, V]) dispatch(ctx context.Context, b *batch[K, V]) {
-	l.mu.Lock()
-	if l.open == b {
-		l.open = nil
-	}
-	b.timer.Stop()
-	l.mu.Unlock()
-	b.once.Do(func() {
-		b.vals, b.err = l.fetch(ctx, b.keys)
-		close(b.done)
-	})
-}
+```mermaid
+stateDiagram-v2
+    [*] --> Open: first Load starts a batch and its timer
+    Open --> Open: more keys join, duplicates hit the cache
+    Open --> Dispatched: timer fires, or maxBatch keys queued
+    Dispatched --> Done: one fetch with all keys returns
+    Done --> [*]: every waiting Load gets its value
 ```
 
-Its test runs 300 concurrent resolver-style calls for 100 distinct clients. `maxBatch` is set to 100, so the batch fires as soon as the last key arrives and the test is deterministic. One caveat of this design: the batch runs with the context of the caller that opened it, so if that caller's context is cancelled, every caller in that batch gets the error. Inside one request all callers share the request context, which is another reason to keep one loader per request:
+Its test runs 300 concurrent resolver-style calls for 100 distinct clients. `maxBatch` is set to 100, so the batch fires as soon as the last key arrives and the test is deterministic: the expected result is 1 fetch for 100 keys. One caveat of this design: the batch runs with the context of the caller that opened it, so if that caller's context is cancelled, every caller in that batch gets the error. Inside one request all callers share the request context, which is another reason to keep one loader per request. The code and the test are in [[N+1 Query Problem - Go]].
 
-```go
-func TestLoaderCoalescesConcurrentLoads(t *testing.T) {
-	var calls, keys atomic.Int64
-	// maxBatch equals the number of distinct keys, so the batch fires as soon
-	// as all of them are queued; the one-hour wait never matters.
-	l := NewLoader(time.Hour, 100, clientFetcher(&calls, &keys))
-
-	var wg sync.WaitGroup
-	for i := range 300 { // 300 resolver calls for 100 distinct clients
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			id := int64(i%100 + 1)
-			if c, err := l.Load(context.Background(), id); err != nil || c.ID != id {
-				t.Errorf("Load(%d) = %v, %v", id, c, err)
-			}
-		}()
-	}
-	wg.Wait()
-	if calls.Load() != 1 || keys.Load() != 100 {
-		t.Fatalf("%d fetches for %d keys, want 1 fetch for 100 keys", calls.Load(), keys.Load())
-	}
-}
-```
-
-The GraphQL flow it enables:
+### The GraphQL flow it enables
 
 ```mermaid
 sequenceDiagram
@@ -474,7 +348,8 @@ sequenceDiagram
     L-->>R: each caller gets its client
 ```
 
-**Other internals worth knowing:**
+### Other internals worth knowing
+
 - **`= ANY` versus a literal `IN` list.** `id = ANY($1)` is one statement text whatever the list length. That means one `pg_stat_statements` row and one cached prepared statement. Building `IN ($1, …, $n)` makes a new statement for every `n`, which churns pgx's per-connection statement cache (512 entries by default). PostgreSQL 17 also made B-tree index scans for a set of values, such as an `IN` list, more efficient, with fewer repeated index descents.
 - **`ANY` ignores your order.** Rows come back in index or heap order. To keep the input order, join against the array: `JOIN unnest($1::bigint[]) WITH ORDINALITY AS u(id, pos) ON c.id = u.id ORDER BY u.pos`.
 - **Pipelining** removes round trips without merging queries. `pgx.Batch` sends all queued statements at once, and they run in one implicit transaction. Use it when the N queries really are different. It still costs N plans and N executions.
@@ -518,5 +393,6 @@ sequenceDiagram
 ## Links
 
 - **Before this:** [[SQL Essentials]], [[Indexing Fundamentals]]
+- **Runnable code:** [[N+1 Query Problem - Go]] (naive and batched list handlers, the pgx batch query, a query counter, a generic DataLoader, tests)
 - **Next:** [[Query Plans and EXPLAIN]], [[Connection Pooling]], [[Materialized Views and Denormalization]]
 - **Compare with:** [[GraphQL]] (wiring dataloaders into gqlgen), [[Database Access (database-sql, pgx, sqlc)]] (pgx and sqlc usage), [[Caching Patterns]] (when a cache is the better fix)

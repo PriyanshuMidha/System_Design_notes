@@ -32,6 +32,13 @@ Back to [[Home]].
 11. [[Service-to-Service Auth - API Keys, HMAC, mTLS]] · advanced. How machines prove identity when no user is present.
 12. [[API Abuse and Bot Protection]] · advanced. Layered defenses against scraping, bots and account takeover.
 
+### Security operations
+
+How to harden a website before launch, and what to do step by step if it gets hacked.
+
+- [[Website Security Hardening Checklist]]
+- [[Security Incident Response - When Your Website Is Hacked]]
+
 ## Concept map
 
 ```mermaid

@@ -1,6 +1,6 @@
 ---
 tags: [cs-fundamentals, computer-architecture, performance]
-level: basic
+level: intermediate
 status: reviewed
 prereqs: ["[[How a Computer Runs a Program]]"]
 related: ["[[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]", "[[Virtual Memory, Paging and the TLB]]", "[[Page Cache, File Systems and fsync]]", "[[Concurrency Primitives - Mutex, Semaphore, Atomics]]"]
@@ -9,7 +9,7 @@ sources:
   - "AMD Software Optimization Guide for the 'Zen 4' Microarchitecture"
   - "Hennessy & Patterson, Computer Architecture: A Quantitative Approach, 6th ed., ch. 2 (memory hierarchy, coherence)"
   - "Sun/Oracle MOESI/MESI protocol documentation; Culler, Singh & Gupta, Parallel Computer Architecture, ch. 5 (cache coherence)"
-updated: 2026-11-07
+updated: 2026-11-09
 ---
 
 # Memory Hierarchy and CPU Caches
@@ -25,61 +25,100 @@ updated: 2026-11-07
 
 ## 1. Why it exists
 
-A 2025-era server CPU core runs at roughly 3–4 GHz, so one clock cycle is about 0.25–0.33 ns. A single main-memory (DRAM) access takes on the order of 100 ns (documented, varies by platform — see the comparison table below). If every instruction that touched memory had to wait for DRAM, a core doing nothing but memory accesses would run at under 1% of its clock speed, no matter how fast its arithmetic units are.
+Imagine two co-workers: one sits at a desk with everything they need in arm's reach, the other has to walk to a warehouse across town for every single document. That is, roughly, the gap between a CPU register and main memory (**DRAM**). A 2025-era server core runs at 3–4 GHz, so one clock cycle is about 0.25–0.33 ns. A single DRAM access takes on the order of 100 ns. If every memory-touching instruction had to wait for DRAM, a core would spend over 99% of its time idle, no matter how fast its arithmetic units were.
 
-Concretely: a function that walks a 10-million-element linked list, where each node is a separate heap allocation scattered across memory, pays close to a full DRAM-latency cache miss per node (~100 ns documented each, see the comparison table), which is about **1 second** total just in memory stalls, no computation included. The same 10 million `int64` values packed into one contiguous slice stream through the cache hierarchy instead, at closer to a few nanoseconds per element thanks to spatial locality and hardware prefetching (see below) — at least an order of magnitude faster, and plausibly more, for identical "add up 10 million numbers" work; the exact ratio depends on the machine, so treat this as an illustration of the shape of the effect, not a benchmark result. The memory hierarchy, and knowing how to use it, is the difference.
+> [!warning] Common mistake
+> Assuming "the CPU is fast, so my program is fast." A CPU's raw instruction speed only matters if the data it operates on is already close by. A program that constantly waits on DRAM runs at DRAM's speed, not the CPU's clock speed — this is why data layout can matter as much as algorithm choice.
+
+### Why it matters: a concrete number
+
+A function that walks a 10-million-element linked list, where each node is a separate heap allocation scattered across memory, pays close to a full DRAM-latency cache miss per node (~100 ns each), which totals about **1 second** just in memory stalls — before any actual computation. The same 10 million `int64` values packed into one contiguous slice stream through the cache hierarchy instead, at closer to a few nanoseconds per element, thanks to spatial locality and hardware prefetching (both explained below) — at least an order of magnitude faster for identical work. The exact ratio depends on the machine, so treat this as an illustration of the shape of the effect, not a benchmark result.
+
+> [!tip] Remember
+> The memory hierarchy exists because DRAM is roughly 300× slower than a CPU cycle, and real programs touch the same data and nearby addresses repeatedly — that repetition is what a cache exploits.
 
 ## 2. Mental model
 
-Picture a programmer's desk (registers: a few items, instant access), a drawer at arm's reach (L1 cache: tens of kilobytes, barely slower than the desk), a filing cabinet across the room (L2 cache: roughly a megabyte, a short walk), a shared records room down the hall that the whole floor uses (L3 cache: tens of megabytes, shared across cores, a longer walk), and an archive warehouse across town (DRAM: gigabytes, a real trip). You never fetch "one byte" from the warehouse — you fetch a whole box (a 64-byte cache line) because if you need byte 100 of a file, you'll probably need byte 101 next.
+Picture a programmer's desk (registers: a few items, instant access), a drawer at arm's reach (L1 cache: tens of kilobytes, barely slower than the desk), a filing cabinet across the room (L2 cache: roughly a megabyte, a short walk), a shared records room down the hall that the whole floor uses (L3 cache: tens of megabytes, shared across cores, a longer walk), and an archive warehouse across town (DRAM: gigabytes, a real trip).
+
+You never fetch "one byte" from the warehouse — you fetch a whole box (a 64-byte **cache line**) because if you need byte 100 of a file, you'll probably need byte 101 next. The analogy breaks down in one place: unlike a human archive, the hardware automatically decides what to keep nearby based on what you recently touched, without being asked.
 
 ## 3. How it works
 
 ### The pyramid
 
+In plain words: each level of memory is about an order of magnitude bigger and an order of magnitude slower than the level above it. That ratio is deliberate — a cache only has to be a small fraction of the size of the level below it to absorb most of the traffic, because of locality (next section).
+
 ```mermaid
 flowchart TD
     REG["Registers\n~tens of bytes · ~0.3 ns (1 cycle)"]
-    L1["L1 cache (split I/D)\n~32–192 KB per core · ~1 ns (~4 cycles)"]
-    L2["L2 cache\n~1–2 MB per core · ~3–4 ns (~12 cycles)"]
-    L3["L3 cache (shared)\n~16–96+ MB, all cores · ~10–20 ns (~40 cycles)"]
-    DRAM["DRAM (main memory)\n~GBs · ~80–120 ns documented"]
-    DISK["SSD / NVMe\n~TBs · ~10–100 µs"]
+    L1["L1 cache (split I/D)\n~32-192 KB per core · ~1 ns (~4 cycles)"]
+    L2["L2 cache\n~1-2 MB per core · ~3-4 ns (~12 cycles)"]
+    L3["L3 cache (shared)\n~16-96+ MB, all cores · ~10-20 ns (~40 cycles)"]
+    DRAM["DRAM (main memory)\n~GBs · ~80-120 ns documented"]
+    DISK["SSD / NVMe\n~TBs · ~10-100 us"]
 
     REG --> L1 --> L2 --> L3 --> DRAM --> DISK
 ```
 
-Sizes and latencies are documented, approximate figures for a 2025-era server core (Intel/AMD x86-64 and Apple silicon all follow the same shape; exact numbers vary by SKU and are set by each vendor's optimization manual, listed in `sources`). Each level is roughly an order of magnitude bigger and an order of magnitude slower than the one above it — that ratio is what makes the hierarchy work: a cache only has to be a small fraction of the size of the level below it to absorb most of the traffic, because of locality (next).
+Sizes and latencies above are documented, approximate figures for a 2025-era server core (Intel/AMD x86-64 and Apple silicon all follow the same shape; exact numbers vary by SKU and are set by each vendor's optimization manual, listed in `sources`).
+
+**Example with numbers.** Summing 10 million `int64` values: at ~1 ns per element if the data streams through L1/L2 (contiguous slice), the loop costs about 10 ms. At ~100 ns per element if every access misses to DRAM (scattered linked list), the same loop costs about 1 second — a 100× difference from data layout alone, with the algorithm unchanged.
+
+> [!tip] Remember
+> Each hierarchy level is roughly 10× bigger and 10× slower than the one above — that ratio, combined with locality, is what makes a small cache able to absorb most of a program's memory traffic.
 
 ### Why caching works: locality
+
+In plain words: programs are not random. They tend to reuse things they just used, and they tend to reach for things sitting right next to what they just used.
 
 - **Temporal locality**: if an address was accessed recently, it's likely to be accessed again soon (a loop counter, a hot function's local variables).
 - **Spatial locality**: if an address was accessed, nearby addresses are likely to be accessed soon after (the next element of an array, the next field of a struct).
 
-Caches exploit both: temporal locality by keeping recently used lines around instead of evicting them immediately, spatial locality by fetching a whole 64-byte line around the requested address instead of one byte.
+```mermaid
+flowchart LR
+    subgraph Temporal["Temporal locality"]
+        T1["access x"] --> T2["access x again\n(soon after)"]
+    end
+    subgraph Spatial["Spatial locality"]
+        S1["access array[i]"] --> S2["access array[i+1]\n(soon after)"]
+    end
+```
+
+**Example.** A `for` loop that re-reads the same loop-counter variable a million times is temporal locality in action: after the first read, every later read is an L1 hit. A loop that walks `array[0], array[1], array[2], ...` is spatial locality: fetching `array[0]`'s 64-byte cache line also pulls in `array[1]` through `array[7]` (for 8-byte elements) for free.
+
+> [!tip] Remember
+> Caches exploit both forms of locality: temporal locality by keeping recently used lines around instead of evicting them immediately, spatial locality by fetching a whole 64-byte line around the requested address instead of one byte.
 
 ### Cache lines, hits, misses, associativity
+
+In plain words: when the CPU wants an address, it checks the fastest cache first and works its way down only on a miss, refilling each level it skips on the way back up.
 
 ```mermaid
 flowchart LR
     A["CPU core requests address X"] --> B{"Line containing X\nin L1?"}
     B -- "hit (~1 ns)" --> C["Return data from L1"]
     B -- "miss" --> D{"in L2?"}
-    D -- "hit (~3–4 ns)" --> E["Fill L1, return data"]
+    D -- "hit (~3-4 ns)" --> E["Fill L1, return data"]
     D -- "miss" --> F{"in L3?"}
-    F -- "hit (~10–20 ns)" --> G["Fill L2 and L1, return data"]
-    F -- "miss" --> H["Fetch 64-byte line from DRAM\n(~80–120 ns)"]
+    F -- "hit (~10-20 ns)" --> G["Fill L2 and L1, return data"]
+    F -- "miss" --> H["Fetch 64-byte line from DRAM\n(~80-120 ns)"]
     H --> I["Fill L3, L2, L1, return data"]
 ```
 
 A cache is organized as a grid of **sets**, and each set holds a small fixed number of lines (its **associativity** — e.g. "8-way set-associative" means each set holds 8 lines). An address maps to exactly one set (by its middle bits) but can occupy any of that set's 8 ways. On a miss that needs room, the cache picks a victim line to evict using a policy approximating least-recently-used.
 
+**Example.** An L1 miss that hits in L3 costs roughly 10–20 ns instead of 1 ns — a 10–20× slowdown for that one access, still 5–10× faster than going all the way to DRAM's 80–120 ns.
+
 - **Write-through**: a write updates the cache and immediately writes through to the next level too — simple, but every write costs a trip down the hierarchy.
 - **Write-back**: a write only updates the cache and marks the line **dirty**; it's written down to the next level only when evicted. Faster for repeated writes to the same line, but a sudden power loss (not an ordinary process crash, which leaves the hardware cache untouched) can lose dirty data that never made it past that cache — one reason durability-critical writes use explicit flushes rather than trusting the write-back path alone (see [[Page Cache, File Systems and fsync]]).
 
+> [!tip] Remember
+> A miss at one level refills every level above it on the way back, so a later access to the same address is fast again — the hierarchy "remembers" what it just fetched.
+
 ### Cache coherence: MESI
 
-On a multi-core CPU, each core has its own private L1/L2, so the same line of DRAM can be cached in several places at once. If core A and core B both cache the same line and one writes to it, the other must not keep reading its stale copy. **MESI** names four states a cache line can be in, per core:
+In plain words: on a multi-core CPU, each core has its own private L1/L2, so the same 64-byte line of DRAM can be cached in several places at once. If core A and core B both cache the same line and one writes to it, the other must not keep reading its now-stale copy. **MESI** names four states a cache line can be in, per core, that make this safe.
 
 ```mermaid
 stateDiagram-v2
@@ -98,102 +137,51 @@ stateDiagram-v2
 - **Shared**: multiple cores have read-only copies, all matching DRAM.
 - **Invalid**: this core's copy, if any, cannot be used.
 
-A write to a **Shared** line forces the writing core to broadcast an invalidate to every other core sharing it (over the inter-core interconnect) before the write can proceed — this is the mechanism, and the cost, behind false sharing (next).
+**Example.** Core A reads counter `x` (goes Exclusive on A). Core B then also reads `x` (both go Shared). Core A now writes `x` — this forces an invalidate broadcast to B before the write proceeds (Shared → Modified on A, Shared → Invalid on B). That broadcast is not free: it crosses the inter-core interconnect, and it happens on *every* such write, even if A and B were never logically sharing data — only a cache line.
+
+> [!warning] Common mistake
+> Assuming cache coherence is "the hardware's problem, it's always free." MESI keeps caches *correct*, but the invalidate broadcast on a Shared→Modified transition has a real, measurable cost. When that transition happens far more often than the program logically needs, it is called false sharing (next).
+
+> [!tip] Remember
+> MESI's whole job is to stop any core from reading a stale copy after another core writes — it does this by requiring ownership (Modified/Exclusive) before a write, or a broadcast invalidate if the line was Shared.
 
 ## 4. Worked example
 
 ### Whiteboard version
 
-Two goroutines each increment their own private `int64` counter, millions of times, with no shared state in the source code. If both counters happen to sit in the same 64-byte cache line, every increment by goroutine A invalidates goroutine B's cached copy of that line (per the MESI diagram above) and vice versa — even though neither goroutine ever reads or writes the other's counter. Separating the counters onto different cache lines removes the invalidation traffic entirely.
+Two goroutines each increment their own private `int64` counter, millions of times, with no shared state in the source code. If both counters happen to sit in the same 64-byte cache line, every increment by goroutine A invalidates goroutine B's cached copy of that line (per the MESI diagram above) and vice versa — even though neither goroutine ever reads or writes the other's counter. This is **false sharing**: two independent variables contending only because of where they happen to sit in memory. Separating the counters onto different cache lines removes the invalidation traffic entirely.
 
-### False sharing, measured in Go
-
-`Counters` packs 8 `int64` counters into one slice — adjacent elements share 64-byte cache lines. `PaddedCounters` pads each counter out to a full cache line so no two counters can ever share one:
-
-```go
-// Counters is the false-sharing layout: N plain int64 counters packed into
-// one slice. counters[0] and counters[1] are 8 bytes apart, so on a 64-byte
-// cache line they (and six more) share one line.
-type Counters struct {
-	n []int64
-}
-
-func NewCounters(n int) *Counters { return &Counters{n: make([]int64, n)} }
-
-func (c *Counters) Incr(i int, times int) {
-	for k := 0; k < times; k++ {
-		c.n[i]++
-	}
-}
-
-func (c *Counters) Get(i int) int64 { return c.n[i] }
-
-// paddedCounter is one int64 padded out to 64 bytes (one typical x86-64 and
-// Apple-silicon cache line), so each counter owns a whole line and no two
-// goroutines' counters ever share one.
-type paddedCounter struct {
-	v int64
-	_ [7]int64 // padding: 8 + 7*8 = 64 bytes
-}
-
-// PaddedCounters is the false-sharing fix: each counter lives alone on its
-// own cache line.
-type PaddedCounters struct {
-	c []paddedCounter
-}
-
-func NewPaddedCounters(n int) *PaddedCounters {
-	return &PaddedCounters{c: make([]paddedCounter, n)}
-}
-
-func (p *PaddedCounters) Incr(i int, times int) {
-	for k := 0; k < times; k++ {
-		p.c[i].v++
-	}
-}
-
-func (p *PaddedCounters) Get(i int) int64 { return p.c[i].v }
+```mermaid
+flowchart TD
+    subgraph before["Before: 8 counters packed in one 64-byte line"]
+        direction LR
+        C0["counter[0]"] --- C1["counter[1]"] --- C2["..."] --- C7["counter[7]"]
+    end
+    subgraph after["After: each counter padded to its own line"]
+        direction LR
+        P0["counter[0]\n(64 bytes)"] ~~~ P1["counter[1]\n(64 bytes)"] ~~~ P2["..."]
+    end
 ```
 
-The test proves both layouts are equally *correct* — false sharing is a performance bug, not a correctness bug — before the benchmark measures the performance difference:
+**Step by step, what happens with the packed layout:**
+1. Goroutine A increments `counters[0]`. Its core takes the line Exclusive, then Modified.
+2. Goroutine B, running on a different core, increments `counters[1]` — the *same* 64-byte line. B's core must invalidate A's copy first (Shared → Modified broadcast), even though A and B never touch each other's counter.
+3. A increments again. Now A must invalidate B's copy. The line ping-pongs between cores on every single increment from either side.
+4. With padding, each counter owns a whole line, so step 2 and 3 never need to invalidate anyone else's copy — each core keeps its own line Modified indefinitely.
 
-```go
-func TestCountersAreCorrect(t *testing.T) {
-	t.Run("unpadded", func(t *testing.T) {
-		c := NewCounters(goroutines)
-		var wg sync.WaitGroup
-		for i := 0; i < goroutines; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				c.Incr(i, iters)
-			}(i)
-		}
-		wg.Wait()
-		for i := 0; i < goroutines; i++ {
-			if got := c.Get(i); got != iters {
-				t.Fatalf("counter %d = %d, want %d", i, got, iters)
-			}
-		}
-	})
-	// padded case is symmetric — see the note's scratch module for the full file
-}
-```
+A runnable version of this experiment, with tests and a measured benchmark, is kept in the companion Go note: **[[Memory Hierarchy and CPU Caches - Go]]**.
 
-```text
-$ go vet ./falsesharing/...
-$ go test -race ./falsesharing/...
-ok  	cs1scratch/falsesharing	1.934s
-```
-
-**Measured:** `go test -bench . -benchtime=50x -count=5 -cpu 8 ./falsesharing/` on Go 1.24.4, darwin/arm64, Apple M4, 8 goroutines each doing 200,000 increments per benchmark iteration (2026-11-06):
+**Measured** (Go 1.24.4, darwin/arm64, Apple M4, 8 goroutines × 200,000 increments each, `-count=5 -cpu 8`, 2026-11-06):
 
 | Layout | Mean time per iteration (5 runs) | Relative |
 |---|---|---|
-| Unpadded (false sharing) | ~448 µs | 1.00× |
-| Padded (one cache line each) | ~411 µs | **0.92×** (≈9% faster) |
+| Unpadded (false sharing) | ~448 us | 1.00x |
+| Padded (one cache line each) | ~411 us | **0.92x** (about 9% faster) |
 
-The effect is real but modest here because Apple's performance cores share a large per-cluster L2 with fast core-to-core transfers. It is also noisy at this sample size: re-running the identical command several times on the same machine (same code, same `-count=5 -cpu 8`) produced padded-vs-unpadded gaps ranging from roughly 5% to over 25% faster run to run, with the first iteration in each run consistently the slowest (goroutine and scheduler warm-up, not the effect itself). Treat the ~9% figure as one representative sample, not a precise constant — the honest statement is "padded was reproducibly faster in every run, by a double-digit-percent amount that itself varies," not "padded is exactly 9% faster." The audit's guidance to also check "documented" numbers matters precisely because both the ratio and its stability are hardware-dependent — the same experiment on a multi-socket x86-64 server, where invalidations cross a slower inter-socket interconnect, documents a much larger and more consistent gap (do not assume the ratio above transfers to other hardware, or that it is this precise; always re-measure on the target machine with enough samples to see the variance).
+The effect is real but modest on this machine, and noisy at this sample size — repeated runs produced gaps ranging from roughly 5% to over 25% faster. Treat "padded was reproducibly faster, by a double-digit-percent amount that itself varies" as the honest takeaway, not "padded is exactly 9% faster." The same experiment on a multi-socket x86-64 server, where invalidations cross a slower inter-socket interconnect, documents a much larger and more consistent gap — always re-measure on the target machine with enough samples to see the variance.
+
+> [!tip] Remember
+> False sharing is a performance bug, not a correctness bug: both layouts compute the right answer, but the packed one pays invisible coherence traffic for data that was never logically shared.
 
 ## 5. Variants and comparison
 
@@ -207,7 +195,7 @@ The effect is real but modest here because Apple's performance cores share a lar
 ## 6. Trade-offs and when not to use
 
 - Bigger caches are slower per access (more sets/ways to search), which is exactly why the hierarchy has several small, fast levels instead of one big one.
-- Padding data to avoid false sharing wastes memory (7 unused `int64`s per counter above) — only worth it for genuinely hot, independently-written counters; padding every struct "just in case" bloats memory and can itself hurt cache utilization by spreading related data across more lines.
+- Padding data to avoid false sharing wastes memory (7 unused `int64`s per counter in the worked example) — only worth it for genuinely hot, independently-written counters; padding every struct "just in case" bloats memory and can itself hurt cache utilization by spreading related data across more lines.
 - Chasing cache-friendliness can fight readability (e.g. manually flattening a tree into an array). For code that isn't on a hot path, clarity wins; profile before restructuring data layout.
 
 ## 7. In production
@@ -223,9 +211,9 @@ The effect is real but modest here because Apple's performance cores share a lar
 
 - **Cache lines and false sharing, precisely.** A cache line is the hardware's unit of coherence, not just of transfer: MESI tracks state per *line*, not per *variable*. Two `int64` variables 8 bytes apart that fall in the same 64-byte line are, as far as the coherence protocol is concerned, one unit — a write to either one invalidates the whole line everywhere else it's cached, per the Modified/Shared/Exclusive/Invalid transitions above.
 - **Hardware prefetching.** Modern cores detect simple access patterns (e.g. "address N, then N+64, then N+128…") and speculatively fetch the next expected line before it's requested, which is a large part of why sequential array access is faster than its raw cache-miss count alone would predict, and why spatial locality matters even within a single core's own traffic.
-- **NUMA.** On multi-socket servers, DRAM is physically attached to one socket and is slower to reach from a core on a different socket ("remote" access) than from a core on the same socket ("local" access) — often 1.5–2× the latency, documented in vendor NUMA whitepapers. The OS scheduler and memory allocator try to keep a process's threads and memory on the same NUMA node; `numactl` on Linux lets an operator pin both explicitly.
+- **NUMA.** On multi-socket servers, DRAM is physically attached to one socket and is slower to reach from a core on a different socket ("remote" access) than from a core on the same socket ("local" access) — often 1.5–2x the latency, documented in vendor NUMA whitepapers. The OS scheduler and memory allocator try to keep a process's threads and memory on the same NUMA node; `numactl` on Linux lets an operator pin both explicitly.
 - **Associativity and thrashing.** A direct-mapped cache (1-way) can thrash badly if a program happens to access two hot addresses that map to the same set, even if the cache overall has plenty of free space; higher associativity (8-way, 12-way, common for modern L2/L3) makes that collision far less likely at the cost of more comparison hardware per lookup.
-- **Measuring instead of guessing.** `perf stat` on Linux and `go test -bench` with multiple `-cpu` values are the two tools that turn "this feels slow" into a number; always benchmark on hardware close to production, with enough repetitions to see the run-to-run spread, before and after a cache-layout change — as the measured table above shows, the size of an effect like false sharing is both hardware-dependent and noisy at small sample counts.
+- **Measuring instead of guessing.** `perf stat` on Linux and `go test -bench` with multiple `-cpu` values are the two tools that turn "this feels slow" into a number; always benchmark on hardware close to production, with enough repetitions to see the run-to-run spread, before and after a cache-layout change — effects like false sharing are both hardware-dependent and noisy at small sample counts.
 
 ## 9. Interview questions
 
@@ -260,9 +248,11 @@ The effect is real but modest here because Apple's performance cores share a lar
 - False sharing: independent hot variables on one cache line contend as if shared — pad or shard to fix it, measured here at roughly 5–25% faster across repeated runs on Apple M4 (noisy at small sample sizes), larger and more consistent on multi-socket x86-64.
 - Prefer contiguous data (slices) over pointer-chasing structures (linked lists, scattered trees) for hot paths.
 - Measure with `perf stat` or `go test -bench -cpu ...` before restructuring for cache behavior — effects are hardware-dependent.
+- Runnable Go version: [[Memory Hierarchy and CPU Caches - Go]].
 
 ## Links
 
 - **Before this:** [[How a Computer Runs a Program]]
 - **Next:** [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]], [[Virtual Memory, Paging and the TLB]]
 - **Compare with:** [[Page Cache, File Systems and fsync]] (OS-level file caching, a different mechanism), [[Concurrency Primitives - Mutex, Semaphore, Atomics]] (software coordination built on top of the hardware coherence this note describes)
+- **Go code:** [[Memory Hierarchy and CPU Caches - Go]]

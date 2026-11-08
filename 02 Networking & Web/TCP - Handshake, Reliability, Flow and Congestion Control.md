@@ -1,6 +1,6 @@
 ---
 tags: [networking, tcp, transport-layer]
-level: intermediate
+level: advanced
 status: reviewed
 prereqs: ["[[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]"]
 related: ["[[UDP and QUIC]]", "[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]", "[[TLS and HTTPS]]", "[[Forward and Reverse Proxies - L4 vs L7]]", "[[Network Debugging Toolkit - dig, curl, ss, tcpdump]]"]
@@ -10,7 +10,7 @@ sources:
   - "RFC 6298, Computing TCP's Retransmission Timer"
   - "RFC 9293, Transmission Control Protocol (STD 7, obsoletes RFC 793)"
   - "Cardwell et al., BBR: Congestion-Based Congestion Control (ACM Queue, 2016)"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # TCP - Handshake, Reliability, Flow and Congestion Control
@@ -42,6 +42,9 @@ Two windows ride alongside that tally:
 - The **congestion window** is the speaker reminding themselves "the room only tends to carry so many words per second before people start missing things" — it's about the *shared room's* capacity, discovered by trial and error.
 
 The sender may only have `min(receive window, congestion window)` bytes unacknowledged in flight at any time.
+
+> [!tip] Remember
+> Two separate limits gate every byte TCP sends: the **receive window** protects the listener's ears, the **congestion window** protects the shared room. The smaller of the two always wins.
 
 ## 3. How it works
 
@@ -115,6 +118,14 @@ A segment is retransmitted when either:
 - The **retransmission timer (RTO)** fires before its ACK arrives. RTO is computed from the measured round-trip time and its variance (RFC 6298: `RTO = SRTT + 4×RTTVAR`, with a minimum floor), not a fixed number — a cross-region connection with 150ms RTT needs a much longer RTO than one on a LAN.
 - **Three duplicate ACKs** arrive for the same byte (the receiver is saying "I keep getting new data but still only have up to byte X") — this triggers **fast retransmit** without waiting for the slower RTO timer.
 
+**Example, with numbers:** say the measured `SRTT` (smoothed round-trip time) is 40ms and `RTTVAR` (its mean deviation) is 10ms. RFC 6298's formula gives `RTO = 40 + 4×10 = 80ms`. If an ACK for a sent segment hasn't arrived within 80ms, the sender assumes it was lost and retransmits — without ever seeing a negative acknowledgment, because TCP has none; absence of an ACK within the deadline *is* the loss signal.
+
+> [!warning] Common mistake
+> Assuming TCP's ACK means "I received segment N specifically." A plain ACK is **cumulative** — "I have everything up through this byte" — so it says nothing about which specific segment just arrived. Only SACK (selective acknowledgment) reports specific non-contiguous ranges; without it, a sender re-learns the exact gap by watching duplicate ACKs pile up, not by being told directly.
+
+> [!tip] Remember
+> No ACK within the RTO window, or three duplicate ACKs for the same byte — both mean "retransmit," but fast retransmit (the second case) is faster because it doesn't wait for a timer.
+
 ### Flow control: the sliding window
 
 The receiver advertises a **window size** in every ACK: how many more bytes past the ACKed point it can currently buffer. The sender may have at most that many unacknowledged bytes in flight. As the receiver's application reads data out of its buffer, the window grows back (a "window update"); if the receiver's buffer fills (a slow consumer), the window shrinks toward zero, and at zero the sender must stop and periodically probe with a 1-byte **zero-window probe** until room reopens.
@@ -142,6 +153,22 @@ Flow control alone would let a sender on a fast LAN flood a congested link to a 
 
 **BBR** (Google, used inside Linux and GCP/YouTube paths) rejects "wait for a packet loss" entirely. Loss-based control treats every dropped packet as a congestion signal, which is a poor fit for networks where buffers are large (**bufferbloat**: packets queue for hundreds of milliseconds before anything drops) or where loss is just noise (lossy Wi-Fi, satellite links). BBR instead continuously models two numbers — the bottleneck's delivery rate and the path's minimum RTT — and paces `cwnd` and sending rate from that model, probing periodically for more bandwidth and for a lower RTT, rather than only backing off after loss.
 
+**Example, with numbers:** a Reno-style sender starts at `cwnd = 1` segment with `ssthresh = 64`. Each RTT in slow start doubles `cwnd`: 1 → 2 → 4 → 8 → 16 → 32 → 64. At `cwnd = 64` it has reached `ssthresh`, so the next RTT switches to congestion avoidance and only adds 1: `cwnd = 65`, then 66, then 67 — one additional segment's worth of data per round trip from then on, until a loss resets the cycle.
+
+```mermaid
+flowchart LR
+    A["cwnd=1<br/>(connection starts)"] -->|"RTT 1: ×2"| B["cwnd=2"]
+    B -->|"RTT 2: ×2"| C["cwnd=4"]
+    C -->|"..."| D["cwnd=64<br/>(crosses ssthresh)"]
+    D -->|"RTT: +1<br/>(congestion avoidance)"| E["cwnd=65"]
+    E -->|"+1 per RTT"| F["cwnd=66, 67, ..."]
+    F -->|"loss detected"| G["ssthresh = cwnd/2<br/>cwnd = 1 (Reno)"]
+    G -->|"restart"| A
+```
+
+> [!tip] Remember
+> Slow start grows exponentially because an unused connection knows nothing about the path yet; congestion avoidance grows linearly because the sender is now probing cautiously near a ceiling it half-remembers from last time (`ssthresh`).
+
 ### Nagle's algorithm and `TCP_NODELAY`
 
 Nagle's algorithm (RFC 896) batches small writes: if there's unacknowledged data already in flight, a new small write is held and coalesced with the next one instead of sent as its own tiny segment, trading a little latency for fewer, bigger packets. Combined with **delayed ACKs** (an ACK is held up to ~40–500ms hoping to piggyback on a reply) the two can stack to add real latency to small request/response exchanges — a known anti-pattern for latency-sensitive protocols. `conn.SetNoDelay(true)` (Go) or `setsockopt(TCP_NODELAY)` disables Nagle so small writes go out immediately; interactive and RPC-style protocols (HTTP, Redis, gRPC) typically want this.
@@ -158,183 +185,41 @@ TCP's ordering guarantee is also its cost: the receiving application cannot read
 
 ### Whiteboard version
 
-The bare mechanism — flow control's sliding window, with nothing else:
+The bare mechanism — flow control's sliding window, with nothing else: a `Window` that tracks `NextSeq` (next byte to send) and `UnackedAt` (oldest unACKed byte), and only allows sending up to `RecvWin - (NextSeq - UnackedAt)` more bytes. Every ACK moves `UnackedAt` forward and updates `RecvWin` to whatever the receiver just advertised.
 
 ```go
-package wb
-
-// Window models flow control only: how many unacknowledged bytes a
-// sender may have in flight, bounded by the receiver's advertised window.
-type Window struct {
-	NextSeq   int // next byte the sender will send
-	UnackedAt int // oldest byte not yet ACKed
-	RecvWin   int // bytes the receiver says it can still buffer
-}
-
-// CanSend reports how many more bytes may be sent right now.
-func (w *Window) CanSend() int {
-	inFlight := w.NextSeq - w.UnackedAt
-	room := w.RecvWin - inFlight
-	if room < 0 {
-		return 0
-	}
-	return room
-}
-
-func (w *Window) Send(n int) { w.NextSeq += n }
-
-// OnAck slides the window forward and applies the receiver's latest
-// advertised window size.
-func (w *Window) OnAck(ackSeq, newRecvWin int) {
-	w.UnackedAt = ackSeq
-	w.RecvWin = newRecvWin
-}
+func (w *Window) CanSend() int // room = RecvWin - bytes-in-flight, clamped at 0
 ```
 
-The full version below adds the congestion-control state machine (slow start, congestion avoidance, loss response) and a real TCP connection over loopback showing where `SetNoDelay` and keepalive attach. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+### Tracing a connection step by step
 
-```go
-package main
+Follow one connection from handshake through a lost segment and recovery, with concrete numbers:
 
-// Sender models the congestion-control state machine of a TCP sender:
-// slow start, congestion avoidance, and multiplicative-decrease on loss.
-// Units are MSS-sized segments (MSS = Maximum Segment Size, the largest
-// chunk of data one segment carries), matching RFC 5681's convention.
-type Sender struct {
-	Cwnd        float64 // congestion window, in segments
-	Ssthresh    float64 // slow-start threshold, in segments
-	InSlowStart bool
-}
+1. **Handshake.** Client sends `SYN seq=1000`. Server replies `SYN seq=5000, ack=1001`. Client sends `ACK ack=5001`. Both sides now agree: client's next byte is 1001, server's is 5001.
+2. **Slow start begins.** `cwnd = 1` segment (about 1,460 bytes at a 1,460-byte MSS). The client sends one segment and waits.
+3. **Growth.** Each ACK that arrives doubles `cwnd`: after 6 round trips, `cwnd = 64` segments (~93KB) — crossing `ssthresh`, which was initialized to 64.
+4. **Congestion avoidance.** From here, each RTT adds only 1 segment: `cwnd = 65, 66, 67…` — a much slower climb than slow start's doubling.
+5. **A segment is lost** at `cwnd = 70`. Three duplicate ACKs arrive (the receiver keeps re-ACKing the last good byte). Fast retransmit fires immediately, without waiting for the RTO timer.
+6. **Multiplicative decrease.** `ssthresh` is set to `70 / 2 = 35`; `cwnd` drops to 1 and slow start begins again, but this time it stops doubling at `ssthresh = 35` instead of 64 — the connection remembers roughly where the last loss happened.
 
-func NewSender() *Sender {
-	return &Sender{Cwnd: 1, Ssthresh: 64, InSlowStart: true}
-}
-
-// OnACK runs once per RTT's worth of ACKs (one simulated round trip).
-func (s *Sender) OnACK() {
-	if s.Cwnd < s.Ssthresh {
-		s.InSlowStart = true
-		s.Cwnd *= 2 // slow start: cwnd doubles each RTT
-	} else {
-		s.InSlowStart = false
-		s.Cwnd += 1 // congestion avoidance: +1 segment per RTT
-	}
-}
-
-// OnLoss reacts to a retransmission timeout or three duplicate ACKs.
-func (s *Sender) OnLoss() {
-	s.Ssthresh = s.Cwnd / 2
-	if s.Ssthresh < 2 {
-		s.Ssthresh = 2
-	}
-	s.Cwnd = 1 // Reno-style multiplicative decrease back to slow start
-	s.InSlowStart = true
-}
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C,S: 1. Handshake: ISNs exchanged
+    C->>S: SYN seq=1000
+    S->>C: SYN seq=5000, ack=1001
+    C->>S: ACK ack=5001
+    Note over C: 2-4. Slow start then congestion avoidance:<br/>cwnd 1 -> 64 (doubling) -> 70 (linear)
+    C->>S: data (cwnd segments in flight)
+    S-->>C: duplicate ACK ×3 (segment lost)
+    Note over C: 5-6. Fast retransmit:<br/>ssthresh=35, cwnd resets to 1
+    C->>S: retransmit the missing segment
 ```
 
-```go
-package main
+Runnable Go version: [[TCP - Handshake, Reliability, Flow and Congestion Control - Go]].
 
-import (
-	"io"
-	"net"
-	"time"
-)
-
-// Serve accepts exactly one connection, tunes it, and echoes back everything
-// it reads until the client closes its write side.
-func Serve(ln net.Listener) error {
-	conn, err := ln.Accept()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)                     // disable Nagle: send small writes immediately
-		tc.SetKeepAlive(true)                   // ask the OS to probe a silent peer
-		tc.SetKeepAlivePeriod(30 * time.Second) // first probe after 30s idle
-	}
-	_, err = io.Copy(conn, conn) // echo
-	return err
-}
-
-// DialAndRoundtrip opens a TCP connection (the 3-way handshake happens
-// inside Dial), writes msg, and returns the echoed bytes plus how long the
-// round trip took.
-func DialAndRoundtrip(addr string, msg []byte) ([]byte, time.Duration, error) {
-	start := time.Now()
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer conn.Close()
-
-	if _, err := conn.Write(msg); err != nil {
-		return nil, 0, err
-	}
-	buf := make([]byte, len(msg))
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, 0, err
-	}
-	return buf, time.Since(start), nil
-}
-```
-
-Tests covering all three mechanisms:
-
-```go
-func TestSlowStartThenCongestionAvoidance(t *testing.T) {
-	s := NewSender()
-	var cwnds []float64
-	for i := 0; i < 8; i++ {
-		cwnds = append(cwnds, s.Cwnd)
-		s.OnACK()
-	}
-	// Slow start doubles: 1, 2, 4, 8, 16, 32 (next would cross Ssthresh=64,
-	// so OnACK at i=5 flips into congestion avoidance: +1 from then on).
-	want := []float64{1, 2, 4, 8, 16, 32, 64, 65}
-	for i, w := range want {
-		if cwnds[i] != w {
-			t.Fatalf("cwnd[%d] = %v, want %v (trace: %v)", i, cwnds[i], w, cwnds)
-		}
-	}
-}
-
-func TestLossHalvesSsthreshAndResetsCwnd(t *testing.T) {
-	s := NewSender()
-	for i := 0; i < 6; i++ {
-		s.OnACK()
-	}
-	before := s.Cwnd // 64 (six RTTs of doubling from 1: 1,2,4,8,16,32,64)
-	s.OnLoss()
-	if s.Ssthresh != before/2 {
-		t.Fatalf("ssthresh = %v, want %v", s.Ssthresh, before/2)
-	}
-	if s.Cwnd != 1 {
-		t.Fatalf("cwnd after loss = %v, want 1", s.Cwnd)
-	}
-}
-
-func TestTCPHandshakeAndEcho(t *testing.T) {
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	defer ln.Close()
-	done := make(chan error, 1)
-	go func() { done <- Serve(ln) }()
-
-	msg := []byte("seq=1 ack=1 SYN,ACK")
-	got, rtt, err := DialAndRoundtrip(ln.Addr().String(), msg)
-	if err != nil {
-		t.Fatalf("DialAndRoundtrip: %v", err)
-	}
-	if string(got) != string(msg) {
-		t.Fatalf("echo = %q, want %q", got, msg)
-	}
-	t.Logf("loopback handshake + echo round trip: %v", rtt)
-}
-```
-
-**Measured** on this machine (Go 1.24.4, darwin/arm64, loopback, `go test -race`, 2026-11-06): a full connect + write + echo + read round trip over `127.0.0.1` took **329µs**. That single number already contains one full 3-way handshake (hidden inside `net.Dial`) plus one data round trip — on a real cross-region link the handshake alone would cost one RTT (tens of milliseconds) before any data moves at all.
+**Measured** on this machine (Go 1.24.4, darwin/arm64, loopback, `go test -race`, 2026-11-09): a full connect + write + echo + read round trip over `127.0.0.1` took **331µs**. That single number already contains one full 3-way handshake (hidden inside `net.Dial`) plus one data round trip — on a real cross-region link the handshake alone would cost one RTT (tens of milliseconds) before any data moves at all.
 
 **Representative output (Linux, `ss` from iproute2)** — inspecting an established connection's congestion-control state (illustrative values, not from a live capture):
 
@@ -425,3 +310,4 @@ Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segmen
 - **Before this:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]
 - **Next:** [[UDP and QUIC]], [[TLS and HTTPS]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Compare with:** [[Forward and Reverse Proxies - L4 vs L7]] (an L4 proxy operates at exactly this layer), [[Network Debugging Toolkit - dig, curl, ss, tcpdump]] (reading `ss`/`tcpdump` output for a real connection)
+- **Code:** [[TCP - Handshake, Reliability, Flow and Congestion Control - Go]]

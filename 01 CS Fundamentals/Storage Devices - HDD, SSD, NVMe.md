@@ -1,6 +1,6 @@
 ---
 tags: [cs-fundamentals, hardware, storage]
-level: basic
+level: intermediate
 status: reviewed
 prereqs: ["[[Memory Hierarchy and CPU Caches]]"]
 related: ["[[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]", "[[Page Cache, File Systems and fsync]]", "[[Latency Numbers Every Engineer Should Know]]", "[[Storage Engines - B-tree vs LSM and WAL]]"]
@@ -9,7 +9,7 @@ sources:
   - "NVM Express Base Specification (NVMe), nvmexpress.org"
   - "AWS EBS volume type documentation (gp3, io2), 2025"
   - "JEDEC and SNIA solid-state storage glossaries (NAND, FTL, TRIM, write amplification)"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Storage Devices - HDD, SSD, NVMe
@@ -26,23 +26,49 @@ updated: 2026-11-06
 
 ## 1. Why it exists
 
-A backend service writes an order to a database, a log line to disk, or a container image to a volume. All of it has to live somewhere after the process exits and the machine reboots — RAM is volatile (see [[Memory Hierarchy and CPU Caches]]). Storage devices are the non-volatile tier: slower than RAM by 3–5 orders of magnitude, but durable and far cheaper per byte.
+A backend service writes an order to a database, a log line to disk, or a container image to a volume. All of it has to live somewhere after the process exits and the machine reboots. RAM loses its contents the instant power is cut (see [[Memory Hierarchy and CPU Caches]]), so every system that needs to remember anything past a restart needs a **non-volatile** tier underneath RAM: slower by 3–5 orders of magnitude, but durable and far cheaper per byte.
 
-Concretely: a database doing 10,000 small random writes per second needs a device that can sustain 10,000 IOPS (input/output operations per second). An HDD tops out around 100–200 random IOPS — a 50–100× shortfall. An NVMe SSD sustains hundreds of thousands. Picking the wrong device class for the access pattern is one of the most common root causes of "the database is slow" incidents.
+Here is why the device you pick matters in practice, not just in theory. A database doing 10,000 small random writes per second needs a device that can sustain 10,000 **IOPS** (input/output operations per second — one read or write counts as one operation, regardless of how small). An HDD tops out around 100–200 random IOPS, a 50–100× shortfall. An NVMe SSD sustains hundreds of thousands. Picking the wrong device class for the access pattern is one of the most common root causes of "the database is slow" incidents — and it is a cause nobody can fix with better code, because the bottleneck is physical.
+
+> [!tip] Remember
+> Storage exists because RAM forgets. The device you choose is really a bet about your access pattern: sequential and cold data tolerates slow, cheap devices; random and hot data does not.
 
 ## 2. Mental model
 
-Think of an HDD as a record player: a physical arm (the head) has to move to the right groove (seek) and then wait for the right point on the spinning disk to arrive (rotational latency) before it can read. Moving the arm is the expensive part, so playing a whole side of a record (sequential read) is efficient, but jumping between tracks constantly (random access) is slow.
+### The record player and the whiteboard
 
-Think of an SSD as a whiteboard with a rule: you can write on a blank cell any time, but to erase you must wipe an entire large tile of cells at once, even if only one cell is now wrong. So the controller writes new data to a blank cell elsewhere, marks the old cell "stale", and only occasionally does it erase a tile — but when it does, it must first copy any still-valid cells on that tile to fresh ones. That copying is write amplification.
+**In plain words:** An HDD behaves like a record player. A physical arm (the **head**) has to swing to the right groove (**seek**) and then wait for the right point on the spinning disk to arrive (**rotational latency**) before it can read anything. An SSD behaves like a whiteboard with one annoying rule: you can write on any blank cell instantly, but to erase, you must wipe an entire large tile of cells at once — even if only one cell on that tile is wrong.
 
-NVMe is just the "API" between the CPU and the whiteboard: instead of one clerk taking one request at a time (SATA/AHCI), NVMe gives the CPU thousands of clerks who can each hold thousands of pending requests (deep, parallel queues), matching how parallel flash chips actually are internally.
+**Picture it:**
+
+```mermaid
+flowchart LR
+    subgraph HDD_Model["HDD: record player"]
+        direction TB
+        H1["Arm swings to the groove<br/>(seek)"] --> H2["Wait for the right spot<br/>to spin underneath<br/>(rotational latency)"] --> H3["Needle reads<br/>(transfer)"]
+    end
+    subgraph SSD_Model["SSD: ruled whiteboard"]
+        direction TB
+        S1["Write any blank cell<br/>instantly"] --> S2["To fix one cell,<br/>wipe the whole tile"] --> S3["Copy the tile's still-good<br/>cells elsewhere first"]
+    end
+```
+
+**Example:** Reading one byte from the middle of a record means moving the needle there first — slow, no matter how small the byte is. Reading one byte from a already-open page of the whiteboard costs almost nothing, but erasing is always tile-sized, never cell-sized.
+
+**Why it matters:** Every mechanical cost on an HDD (seek, rotation) is paid per *access*, not per *byte*, so batching accesses into one long sequential run is the single biggest lever you have. Every SSD cost (erase, copy-before-erase) is paid per *block*, not per *write*, so how full the drive is and how the writes are spread across it matter more than their size.
+
+NVMe does not change either whiteboard or record player — it only changes how many clerks are standing at the desk taking requests. A single clerk (SATA/AHCI, one queue) versus thousands of clerks each holding thousands of pending requests (NVMe) is purely about how many requests can be in flight at once, not about the storage medium underneath.
+
+> [!warning] Common mistake
+> Treating "SSD" and "NVMe" as synonyms. SSD describes the storage medium (NAND flash); NVMe describes the command protocol used to talk to it. A SATA SSD and an NVMe SSD can use identical flash chips — the difference is entirely in how many requests the CPU can have outstanding at once.
 
 ## 3. How it works
 
-### HDD mechanics
+### HDD mechanics: three costs, paid every random access
 
-A platter spins at a fixed rate (5,400–15,000 rpm); a head on an arm moves radially to the target track, then waits for the target sector to rotate underneath it.
+**In plain words:** A platter spins at a fixed rate. To read one sector, the head first moves to the right track, then waits for that exact sector to rotate underneath it, then transfers the bits. All three steps happen on every random read; only the last one happens on a sequential read that's already at the right track.
+
+**Picture it:**
 
 ```mermaid
 flowchart LR
@@ -52,32 +78,79 @@ flowchart LR
     end
 ```
 
-Average rotational latency is half a revolution: at 7,200 rpm (120 rev/s), one revolution takes 8.33 ms, so the average wait is **4.17 ms (documented: 60,000 / 7200 / 2 ms, from rotational speed)**. Add seek time (~5–10 ms, documented: Seagate Exos datasheets) and a single random read costs roughly 9–14 ms before any data moves. Sequential reads amortize seek and rotation across a whole track, reaching **150–250 MB/s sequential vs. 100–200 random IOPS (documented: enterprise HDD datasheets)** — this is why databases, Kafka, and WAL-based systems design around sequential writes whenever a spinning disk is in the picture (see [[Storage Engines - B-tree vs LSM and WAL]]).
+**Example:** Average rotational latency is half a revolution. At 7,200 rpm (120 revolutions/second), one revolution takes 8.33 ms, so the average wait for a random sector is **4.17 ms** (documented: 60,000 ms/min ÷ 7,200 rpm ÷ 2, from rotational speed). Add seek time (~5–10 ms, documented: Seagate Exos datasheets) and a single random read costs roughly **9–14 ms** before any data even starts moving. Sequential reads amortize seek and rotation across a whole track instead of paying them per sector, reaching **150–250 MB/s sequential vs. 100–200 random IOPS** (documented: enterprise HDD datasheets).
+
+**Why it matters:** This is the entire reason databases, Kafka, and WAL-based systems design around sequential writes whenever a spinning disk is anywhere in the picture (see [[Storage Engines - B-tree vs LSM and WAL]]) — a workload that reorders itself to be sequential can be 1,000× cheaper on an HDD than one that doesn't.
+
+> [!tip] Remember
+> On an HDD, cost is paid per *access* (seek + rotate), almost regardless of how much data that access transfers. Sequential access pays it once for many sectors; random access pays it every single time.
 
 ### SSD internals: pages, blocks, and the FTL
 
-NAND flash is organized into **pages** (4–16 KB, the smallest unit you can program/write) grouped into **erase blocks** (hundreds of pages, the smallest unit you can erase). You can write to a blank page directly, but you cannot rewrite a page in place — it must be erased first, and erasing only works a whole block at a time.
+**In plain words:** NAND flash is organized into **pages** (4–16 KB, the smallest unit you can write) grouped into **erase blocks** (hundreds of pages, the smallest unit you can erase). You can write a blank page directly, but you can never rewrite a page in place — it has to be erased first, and erasing only happens a whole block at a time. The **Flash Translation Layer (FTL)** — firmware living inside the SSD — hides this limitation from the OS entirely.
 
-The **Flash Translation Layer (FTL)**, firmware inside the SSD, hides this by never overwriting in place: every logical write goes to a fresh physical page, the old one is marked stale, and a background **garbage collector** reclaims whole blocks by copying any still-valid pages elsewhere and then erasing the block.
+**Picture it:**
 
 ```mermaid
 stateDiagram-v2
     [*] --> Free: block erased
     Free --> Valid: host writes a page
-    Valid --> Stale: host overwrites that LBA (new copy written elsewhere)
-    Stale --> Free: garbage collection erases the whole block\n(but Valid pages in it are copied out first)
-    Valid --> Free: garbage collection erases the block\n(this page's data copied to a new Free page first)
+    Valid --> Stale: host overwrites that LBA\n(new copy written elsewhere)
+    Stale --> Free: garbage collection erases\nthe whole block
+    Valid --> Free: garbage collection erases the block\n(this page's data copied to a Free page first)
 ```
 
-NAND cell types trade endurance and speed for density: **SLC** (1 bit/cell, fastest, most durable, most expensive) → **MLC** (2 bits) → **TLC** (3 bits, the mainstream choice in 2025 consumer and most enterprise drives) → **QLC** (4 bits, cheapest and densest, slower writes and lower endurance, used for read-heavy/archival SSDs).
+**Example:** Every logical write goes to a fresh physical page; the old physical copy, if there was one, is marked **stale** (dead weight, not yet reclaimed). A background **garbage collector** later picks a block, copies out any pages still marked **valid**, and only then erases the whole block — turning every page in it back to **free**.
 
-**Wear leveling** spreads writes evenly across blocks so no single block wears out first (each NAND block tolerates a finite number of erase cycles: roughly 1,000–3,000 for QLC up to 30,000–100,000 for SLC, documented: SNIA / vendor endurance specs). **TRIM** is the OS telling the SSD "these logical blocks are deleted, you don't need to preserve their data on your next GC pass" — without TRIM, the FTL would keep copying dead data forever, inflating write amplification.
+**Why it matters:** That copy-before-erase step is not optional bookkeeping — it is the entire reason flash write cost can exceed what the host asked for, and it is the mechanism the worked example below measures directly.
 
-**Over-provisioning** is spare physical capacity the FTL reserves beyond the advertised logical capacity. More spare capacity means the garbage collector almost always finds blocks with few live pages to reclaim; less spare capacity (a nearly-full drive) means it is forced to reclaim blocks full of live data, multiplying the number of physical writes per host write. This exact mechanism is simulated in the worked example below.
+### NAND cell types: a straight trade of density for speed and endurance
 
-### SATA/AHCI vs NVMe
+**In plain words:** A NAND cell can store more than one bit by distinguishing more voltage levels, but reading and writing more levels is slower and wears the cell out faster.
 
-SATA SSDs speak AHCI, designed in 2004 for spinning disks: one command queue, depth 32, and the protocol itself adds latency the drive doesn't need. **NVMe** (NVM Express) is a protocol built from scratch for flash, running over PCIe instead of SATA's cable, with **up to 64K queues of up to 64K commands each**, letting the OS spread I/O across many CPU cores with no single queue becoming a bottleneck. The result: SATA SSDs land around 500–550 MB/s (the SATA III link limit, documented) and ~80–100 µs latency (estimate — typical figure, not measured here); NVMe SSDs on PCIe 4.0/5.0 reach multiple GB/s and **20–100 µs latency (documented: NVMe Base Specification; vendor NVMe datasheets, 2025)**.
+**Picture it:**
+
+```mermaid
+flowchart LR
+    SLC["SLC — 1 bit/cell<br/>fastest, most durable, most $/GB"] --> MLC["MLC — 2 bits/cell"]
+    MLC --> TLC["TLC — 3 bits/cell<br/>mainstream 2025 choice"]
+    TLC --> QLC["QLC — 4 bits/cell<br/>cheapest, densest, slowest writes,<br/>lowest endurance"]
+```
+
+**Example:** A QLC block tolerates roughly 1,000–3,000 erase cycles before it wears out; an SLC block tolerates 30,000–100,000 (documented: SNIA / vendor endurance specs) — a 10–30× gap for the same silicon process, purely from how many voltage levels each cell has to distinguish.
+
+**Why it matters:** This is why archival, read-heavy SSDs use QLC (cheap, dense, endurance doesn't matter if you rarely rewrite) while write-heavy database SSDs use TLC or better.
+
+### Wear leveling, TRIM, and over-provisioning: the three levers that fight write amplification
+
+- **Wear leveling** spreads writes evenly across blocks so no single block wears out first, since each block tolerates only a finite number of erases.
+- **TRIM** is the OS telling the SSD "these logical blocks are deleted, don't bother preserving their data on your next garbage-collection pass." Without TRIM, the FTL keeps copying dead data forever, because it has no way to know the host stopped caring about it.
+- **Over-provisioning** is spare physical capacity the FTL reserves beyond the drive's advertised logical size. More spare capacity means the garbage collector almost always finds blocks that are mostly empty to reclaim; less spare capacity (a nearly-full drive) forces it to reclaim blocks still full of live data, multiplying the number of physical writes per host write.
+
+> [!tip] Remember
+> Over-provisioning is the one lever you control after purchase: keeping a drive below ~80–90% utilization is, mechanically, keeping the garbage collector's job easy.
+
+### SATA/AHCI vs NVMe: one clerk versus thousands
+
+**In plain words:** SATA SSDs speak **AHCI**, a protocol designed in 2004 for spinning disks — one command queue, depth 32. **NVMe** is a protocol built from scratch for flash, running over PCIe instead of a SATA cable, with up to 64K queues of up to 64K commands each.
+
+**Picture it:**
+
+```mermaid
+flowchart TB
+    subgraph SATA["SATA / AHCI"]
+        direction LR
+        CPU1["CPU cores"] --> Q1["1 queue, depth 32"] --> SSD1["SSD controller"]
+    end
+    subgraph NVMe_Proto["NVMe"]
+        direction LR
+        CPU2["CPU cores"] --> Q2["up to 64K queues,<br/>64K commands each"] --> SSD2["SSD controller<br/>(many parallel flash channels)"]
+    end
+```
+
+**Example:** SATA SSDs land around **500–550 MB/s** (the SATA III link limit, documented) and roughly 80–100 µs latency (an estimate, not measured on this machine); NVMe SSDs on PCIe 4.0/5.0 reach multiple GB/s and **20–100 µs latency** (documented: NVMe Base Specification; vendor NVMe datasheets, 2025).
+
+**Why it matters:** A single queue of depth 32 becomes the bottleneck long before the flash chips themselves run out of parallelism. NVMe's many deep queues let the OS spread I/O across CPU cores so that no single queue, and no single core, becomes the choke point — matching how parallel the flash itself actually is internally.
 
 ## 4. Worked example
 
@@ -89,254 +162,34 @@ IOPS, block size, and throughput are related by one identity:
 throughput = IOPS × block size
 ```
 
-A device rated at 100,000 random 4 KB IOPS can sustain about 400 MB/s of small random I/O — far below its sequential rating, because sequential transfers use much larger blocks per operation. When sizing storage for a service, always ask which number matters for the workload: a log shipper doing large sequential appends is throughput-bound; an OLTP database doing point lookups is IOPS-bound.
+A device rated at 100,000 random 4 KB IOPS can sustain about 400 MB/s of small random I/O — far below its sequential rating, because sequential transfers use much larger blocks per operation. When sizing storage for a service, always ask which number matters for the workload: a log shipper doing large sequential appends is **throughput-bound**; an OLTP database doing point lookups is **IOPS-bound**.
 
-### Simulating write amplification in Go
+### Tracing write amplification by hand
 
-The deep mechanism above — pages, blocks, garbage collection, over-provisioning — is small enough to simulate directly. This toy FTL uses a 4-page erase block, a log-structured write cursor, and a garbage collector that reclaims the block with the fewest live pages, copying survivors forward before erasing:
+Take a tiny toy drive: 10 erase blocks of 4 pages each (40 pages total). Walk a skewed random-write workload across it and watch the garbage collector work.
 
-```go
-// Package storage is a toy flash translation layer (FTL) that shows why a
-// skewed write pattern causes write amplification on an SSD, and how garbage
-// collection recovers space by copying still-live pages.
-package storage
+1. The host writes to LBA 7. The FTL finds a free page, marks it **valid**, and records LBA 7 → that physical page.
+2. The host writes to LBA 7 again. The *old* physical page is marked **stale** (it still holds data, but nobody will read it again); a brand-new physical page becomes the current copy.
+3. Free pages run low (the toy FTL's threshold is "one block's worth of free pages remaining"). The garbage collector picks the block with the fewest **valid** pages — cheapest to reclaim — and copies those valid pages to fresh locations elsewhere.
+4. Only after every valid page is safely copied out does the collector erase the whole block, turning every page in it back to **free**.
+5. Every page copied in step 3 is a **gcWrite** — a physical write the host never asked for. **Write amplification** is `(host writes + GC writes) / host writes`; a working set that is 80% of capacity leaves little slack for step 3 to find nearly-empty blocks, so it amplifies far more than a working set at 40%.
 
-// Toy geometry: 4 pages per erase block. Real SSDs use blocks of hundreds
-// of pages, but the mechanism (page writes, whole-block erase, garbage
-// collection copies live pages) is the same.
-const pagesPerBlock = 4
+```mermaid
+sequenceDiagram
+    participant Host
+    participant FTL
+    participant Block as Chosen block (GC target)
 
-type pageState int
-
-const (
-	free pageState = iota
-	valid
-	stale
-)
-
-type page struct {
-	state pageState
-	lba   int // logical block address this physical page holds, if valid
-}
-
-// FTL maps logical addresses to physical flash pages and tracks how many
-// extra page writes garbage collection caused (write amplification).
-type FTL struct {
-	blocks      [][]page    // blocks[block][pageInBlock]
-	mapTable    map[int]int // lba -> absolute physical page index
-	writeCursor int         // next free physical page to write, log-structured
-	hostWrites  int         // pages written because the host asked
-	gcWrites    int         // pages written by garbage collection (copies)
-	erases      int
-}
-
-// NewFTL builds an FTL with the given number of erase blocks.
-func NewFTL(numBlocks int) *FTL {
-	blocks := make([][]page, numBlocks)
-	for b := range blocks {
-		blocks[b] = make([]page, pagesPerBlock)
-	}
-	return &FTL{blocks: blocks, mapTable: make(map[int]int)}
-}
-
-func (f *FTL) total() int { return len(f.blocks) * pagesPerBlock }
-
-func (f *FTL) at(abs int) *page { return &f.blocks[abs/pagesPerBlock][abs%pagesPerBlock] }
-
-// Write performs a host write to a logical address. Flash cannot overwrite a
-// page in place, so the old physical copy (if any) is marked stale and the
-// new data goes to a fresh page.
-func (f *FTL) Write(lba int) {
-	if old, ok := f.mapTable[lba]; ok {
-		f.at(old).state = stale
-	}
-	abs := f.allocPage()
-	f.at(abs).state = valid
-	f.at(abs).lba = lba
-	f.mapTable[lba] = abs
-	f.hostWrites++
-}
-
-// allocPage returns a free physical page, running garbage collection first
-// if free space is low. Real SSDs reserve spare physical capacity (over-
-// provisioning) so GC always has somewhere to copy live pages; this toy FTL
-// reclaims a block as soon as free pages drop to one block's worth, for the
-// same reason.
-func (f *FTL) allocPage() int {
-	if f.freePages() <= pagesPerBlock {
-		f.garbageCollect()
-	}
-	for tries := 0; tries < f.total(); tries++ {
-		abs := f.writeCursor
-		f.writeCursor = (f.writeCursor + 1) % f.total()
-		if f.at(abs).state == free {
-			return abs
-		}
-	}
-	panic("no free page even after GC: raise over-provisioning (fewer logical LBAs for this capacity)")
-}
-
-func (f *FTL) freePages() int {
-	n := 0
-	for _, b := range f.blocks {
-		for _, p := range b {
-			if p.state == free {
-				n++
-			}
-		}
-	}
-	return n
-}
-
-// garbageCollect picks the block with the fewest valid pages, copies its
-// live pages forward (counted as gcWrites, not hostWrites), and erases it.
-// This copy-forward cost is exactly what "write amplification" measures.
-func (f *FTL) garbageCollect() {
-	best, bestLive := -1, pagesPerBlock+1
-	for b, pages := range f.blocks {
-		live := 0
-		for _, p := range pages {
-			if p.state == valid {
-				live++
-			}
-		}
-		if live < bestLive {
-			best, bestLive = b, live
-		}
-	}
-	// Collect the live LBAs first, then erase the whole block in one step.
-	// Erasing before copying (instead of copying page-by-page) means the
-	// block's own freed pages are legitimately available as copy targets,
-	// matching how a real FTL erases a block atomically before reusing it.
-	var liveLBAs []int
-	for i := range f.blocks[best] {
-		if f.blocks[best][i].state == valid {
-			liveLBAs = append(liveLBAs, f.blocks[best][i].lba)
-		}
-		f.blocks[best][i] = page{}
-	}
-	f.erases++
-	for _, lba := range liveLBAs {
-		newAbs := f.copyForward()
-		f.at(newAbs).state = valid
-		f.at(newAbs).lba = lba
-		f.mapTable[lba] = newAbs
-		f.gcWrites++
-	}
-}
-
-// copyForward returns the next free physical page for a GC copy, scanning
-// forward from the write cursor exactly like a fresh host write would.
-func (f *FTL) copyForward() int {
-	for i := 0; i < f.total(); i++ {
-		abs := f.writeCursor
-		f.writeCursor = (f.writeCursor + 1) % f.total()
-		if f.at(abs).state == free {
-			return abs
-		}
-	}
-	panic("no free page for GC copy: raise over-provisioning (fewer logical LBAs for this capacity)")
-}
-
-// WriteAmplification is total physical pages written per host page written.
-// 1.0 is ideal (sequential, never-overwritten workload); higher means GC is
-// copying live data repeatedly, which is what a skewed random workload does.
-func (f *FTL) WriteAmplification() float64 {
-	if f.hostWrites == 0 {
-		return 1
-	}
-	return float64(f.hostWrites+f.gcWrites) / float64(f.hostWrites)
-}
+    Host->>FTL: Write(lba)
+    FTL->>FTL: mark old physical copy stale (if any)
+    FTL->>FTL: write new copy to a free page
+    Note over FTL: free pages ≤ 1 block's worth
+    FTL->>Block: find valid pages still in this block
+    FTL->>Block: copy each valid page to a new free page (gcWrite)
+    FTL->>Block: erase the whole block (all pages become free)
 ```
 
-Test, passing under `go test -race` on Go 1.24.4:
-
-```go
-package storage
-
-import (
-	"math/rand"
-	"testing"
-)
-
-// Sequential, unique-LBA writes within capacity never trigger GC, so
-// amplification stays at the ideal 1.0.
-func TestSequentialWritesNoAmplification(t *testing.T) {
-	f := NewFTL(6) // 24 pages
-	for lba := 0; lba < 20; lba++ {
-		f.Write(lba)
-	}
-	if got := f.WriteAmplification(); got != 1.0 {
-		t.Fatalf("sequential fill: amplification = %.2f, want 1.00", got)
-	}
-}
-
-// writeRandom overwrites a working set of w distinct LBAs n times, in a
-// pseudo-random order (so rewrites interleave instead of trailing a clean
-// log), and returns the FTL afterwards.
-func writeRandom(capacityBlocks, w, n int, seed int64) *FTL {
-	f := NewFTL(capacityBlocks)
-	r := rand.New(rand.NewSource(seed))
-	for i := 0; i < n; i++ {
-		f.Write(r.Intn(w))
-	}
-	return f
-}
-
-// The core lesson: write amplification rises as the working set approaches
-// the drive's physical capacity, i.e. as over-provisioning (spare physical
-// pages) shrinks. A working set at 80% of capacity amplifies more than one
-// at 40%.
-func TestAmplificationRisesAsOverProvisioningShrinks(t *testing.T) {
-	const capacityPages = 40 // 10 blocks * 4 pages/block
-	lowFill := writeRandom(10, capacityPages*4/10, 2000, 1)  // 40% full
-	highFill := writeRandom(10, capacityPages*8/10, 2000, 1) // 80% full
-
-	lowAmp, highAmp := lowFill.WriteAmplification(), highFill.WriteAmplification()
-	if highAmp <= lowAmp {
-		t.Fatalf("80%% full amplification = %.2fx, want > 40%% full amplification = %.2fx", highAmp, lowAmp)
-	}
-	if lowAmp > 1.1 {
-		t.Fatalf("40%% full (plenty of over-provisioning) amplified to %.2fx, want close to 1.0", lowAmp)
-	}
-	t.Logf("40%% full: %.2fx, 80%% full: %.2fx", lowAmp, highAmp)
-}
-
-// Garbage collection must never lose or duplicate a live logical page: every
-// LBA ever written is still readable at its last written value after heavy
-// GC churn.
-func TestGCPreservesMapping(t *testing.T) {
-	f := NewFTL(10)
-	const w = 28
-	last := make(map[int]bool)
-	for i := 0; i < 5000; i++ {
-		lba := i % w
-		f.Write(lba)
-		last[lba] = true
-	}
-	if len(f.mapTable) != w {
-		t.Fatalf("mapTable has %d entries, want %d (one per LBA ever written)", len(f.mapTable), w)
-	}
-	for lba := range last {
-		abs, ok := f.mapTable[lba]
-		if !ok {
-			t.Fatalf("lba %d missing from map after GC churn", lba)
-		}
-		if f.at(abs).state != valid || f.at(abs).lba != lba {
-			t.Fatalf("lba %d: physical page %d is not a valid copy of it", lba, abs)
-		}
-	}
-}
-```
-
-**Measured** (this toy FTL, 10 blocks × 4 pages = 40-page capacity, 2,000 random writes, Go 1.24.4, 2026-11-06):
-
-| Working set as % of capacity | Write amplification |
-| --- | --- |
-| 40% full (60% spare/over-provisioned) | 1.06× |
-| 80% full (20% spare) | 2.70× |
-
-The lesson generalizes directly: real SSDs with more spare over-provisioned capacity sustain lower, steadier write amplification under random writes; a nearly-full drive under a random-write workload can amplify several times over, which is why databases that do heavy random writes are told to keep SSDs well below 100% utilization.
+Runnable Go version: [[Storage Devices - HDD, SSD, NVMe - Go]]
 
 ## 5. Variants and comparison
 
@@ -348,12 +201,43 @@ The lesson generalizes directly: real SSDs with more spare over-provisioned capa
 | EBS gp3 (network block) | Remote NVMe-backed volume over the network | ~1 ms+ (network hop added) | Baseline 125 MB/s / 3,000 IOPS, provisionable higher (documented: AWS EBS docs, 2025) | Pay for provisioned IOPS/throughput | Durable, detachable cloud block storage |
 | EBS io2 (network block) | Remote, replicated, higher durability tier | ~1 ms+ | Up to 256,000 IOPS per volume (documented: AWS EBS docs, 2025) | Highest block tier | Latency-sensitive databases needing guaranteed IOPS |
 
+### RAID: trading capacity for redundancy, and how that interacts with write cost
+
+**In plain words:** RAID combines several physical disks into one logical volume. The layout you pick decides both how much redundancy you get and how expensive each write becomes.
+
+**Picture it:**
+
+```mermaid
+flowchart TB
+    subgraph RAID0["RAID 0 (striping)"]
+        direction LR
+        W0["1 write"] --> D0a["Disk A"]
+        W0 --> D0b["Disk B"]
+    end
+    subgraph RAID1["RAID 1 (mirroring)"]
+        direction LR
+        W1["1 write"] --> D1a["Disk A"]
+        W1 --> D1b["Disk B (mirror copy)"]
+    end
+    subgraph RAID5["RAID 5 (parity)"]
+        direction LR
+        W5["1 write"] --> R1["read old data + old parity"] --> R2["write new data + new parity"]
+    end
+```
+
+**Example:** RAID 5 computes parity across stripes, so every write requires reading the old data and the old parity, then writing the new data and new parity — the **RAID 5 write penalty**: roughly 4 physical I/Os per logical write. RAID 10 (striped mirrors) just writes to two disks directly, with no parity math at all, at the cost of needing twice the raw capacity instead of one extra parity disk.
+
+**Why it matters:** For a random-write-heavy workload like an OLTP database, that 4-I/O penalty on RAID 5 is a real, measurable latency and throughput cost — which is why production databases usually choose RAID 10 despite its lower usable capacity.
+
+> [!tip] Remember
+> RAID 0 has zero redundancy and is not a backup strategy; RAID 1/10 trade capacity for simple, fast redundancy; RAID 5/6 trade write latency for cheaper redundancy.
+
 ## 6. Trade-offs and when not to use
 
-- NVMe is not simply "a fast SSD" — it is a different command protocol. A SATA SSD cannot be made NVMe-fast just by changing drivers; the queue depth limit is architectural.
-- Local NVMe instance storage (e.g. EC2 instance store) is often faster and cheaper per IOPS than network-attached EBS, but it is ephemeral: data is lost if the instance stops. Use it for scratch space or data you can rebuild, not the system of record.
+- NVMe is not simply "a fast SSD" — it is a different command protocol. A SATA SSD cannot be made NVMe-fast just by changing drivers; the queue depth limit is architectural, built into the hardware.
+- Local NVMe instance storage (e.g. EC2 instance store) is often faster and cheaper per IOPS than network-attached EBS, but it is ephemeral: data is lost if the instance stops. Use it for scratch space or data you can rebuild, never the system of record.
 - HDDs still win on raw $/GB for cold data accessed rarely and sequentially (backups, write-once logs, archival tiers like S3 Glacier's underlying media) — don't pay SSD prices for data nobody reads.
-- RAID 0 (striping) is not a backup: it has no redundancy and a single disk failure loses everything. RAID 1 (mirroring) and RAID 10 (striped mirrors) add redundancy at the cost of usable capacity; RAID 5/6 use parity instead, trading a slower, CPU-heavier write path for less capacity overhead.
+- RAID 0 (striping) is not a backup: it has no redundancy, and a single disk failure loses everything. RAID 1 (mirroring) and RAID 10 (striped mirrors) add redundancy at the cost of usable capacity; RAID 5/6 use parity instead, trading a slower, CPU-heavier write path for less capacity overhead.
 - Choosing per data type: a database's primary data and WAL benefit most from low-latency NVMe; application logs are sequential and can tolerate HDD or object storage; backups want the cheapest durable tier (often object storage, not block storage at all).
 
 ## 7. In production
@@ -376,9 +260,27 @@ The lesson generalizes directly: real SSDs with more spare over-provisioned capa
 
 ## 8. Deep dive
 
-- **Write amplification factor (WAF)** is formally `(host writes + GC writes) / host writes`. It is driven by three things: how full the drive is (less spare capacity → GC must reclaim blocks with more live data), how skewed the write pattern is (hot LBAs rewritten often vs. spread evenly), and whether TRIM is in use (deleted data the FTL doesn't know about gets uselessly copied forward).
-- **Power-loss protection**: enterprise SSDs include capacitors that hold enough charge to flush the device's internal write cache to NAND on sudden power loss. Consumer SSDs often lack this, meaning an `fsync` that the OS believes succeeded can still lose data if the device's own cache hadn't landed on flash yet — a real source of "the database said it committed, but the data is gone after a crash" bugs.
-- **The write path and why `fsync` matters**: an application `write()` typically lands in the OS page cache first (see [[Page Cache, File Systems and fsync]]), not the device. `fsync` forces that dirty data out through the block layer to the device, and a well-behaved device then flushes its own cache to persistent NAND/platter before acknowledging. Any layer that lies about having persisted data (a RAID controller with a non-battery-backed cache, a misconfigured cloud volume) breaks the durability guarantee a database relies on.
+- **Write amplification factor (WAF)** is formally `(host writes + GC writes) / host writes`. It is driven by three things: how full the drive is (less spare capacity means GC must reclaim blocks with more live data), how skewed the write pattern is (hot LBAs rewritten often vs. spread evenly), and whether TRIM is in use (deleted data the FTL doesn't know about gets uselessly copied forward).
+- **Power-loss protection:** enterprise SSDs include capacitors that hold enough charge to flush the device's internal write cache to NAND on sudden power loss. Consumer SSDs often lack this, meaning an `fsync` that the OS believes succeeded can still lose data if the device's own cache hadn't landed on flash yet — a real source of "the database said it committed, but the data is gone after a crash" bugs.
+- **The write path and why `fsync` matters:**
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant PageCache as OS page cache
+    participant Block as Block layer
+    participant Dev as Device's own cache
+    participant NAND as Persistent NAND/platter
+
+    App->>PageCache: write()
+    Note over PageCache: returns success here —<br/>data is NOT yet durable
+    App->>Block: fsync()
+    Block->>Dev: flush dirty pages to device
+    Dev->>NAND: device flushes its own cache
+    NAND-->>App: fsync returns once this completes
+```
+
+  An application `write()` typically lands in the OS page cache first (see [[Page Cache, File Systems and fsync]]), not the device. `fsync` forces that dirty data out through the block layer to the device, and a well-behaved device then flushes its own cache to persistent NAND/platter before acknowledging. Any layer that lies about having persisted data (a RAID controller with a non-battery-backed cache, a misconfigured cloud volume) breaks the durability guarantee a database relies on.
 - **Block vs. file vs. object storage** are different abstractions over the same physical devices: block storage (EBS) exposes raw addressable blocks that the OS formats with its own filesystem; file storage (EFS) exposes a shared hierarchical namespace over NFS; object storage (S3) exposes flat key → blob access over HTTP with no partial-update semantics — you replace a whole object, you don't seek into it and overwrite bytes.
 - **USB drives and SD cards** use the same NAND flash as SSDs but pair it with much simpler, cheaper controllers: thinner wear leveling, little or no over-provisioning, and no power-loss protection — which is why they are reliable for file transfer but a poor choice for a database or anything needing write durability guarantees under power loss.
 
@@ -421,3 +323,4 @@ The lesson generalizes directly: real SSDs with more spare over-provisioned capa
 - **Before this:** [[Memory Hierarchy and CPU Caches]]
 - **Next:** [[Page Cache, File Systems and fsync]], [[Latency Numbers Every Engineer Should Know]]
 - **Compare with:** [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]] (volatile, byte-addressable memory vs. non-volatile, block-addressable storage), [[Storage Engines - B-tree vs LSM and WAL]] (how databases lay data out on top of these devices)
+- **Runnable Go version:** [[Storage Devices - HDD, SSD, NVMe - Go]]

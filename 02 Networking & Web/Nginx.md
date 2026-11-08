@@ -1,6 +1,6 @@
 ---
 tags: [networking, proxies, web-server]
-level: intermediate
+level: advanced
 status: reviewed
 prereqs: ["[[Forward and Reverse Proxies - L4 vs L7]]", "[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]"]
 related: ["[[TLS and HTTPS]]", "[[Load Balancing]]", "[[Rate Limiting - Algorithms and Distributed Design]]", "[[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]"]
@@ -40,6 +40,11 @@ accept-ranges: bytes
 ## 2. Mental model
 
 Picture a restaurant with one head chef (the **master process**) who doesn't cook, and a handful of line cooks (**worker processes**). Each line cook doesn't wait idle for one order to fully finish before starting the next — they check on many dishes at once, moving to whichever one is ready for the next step (an event loop), instead of one cook per customer standing around while a dish simmers.
+
+**Where the analogy breaks down:** a real line cook can only physically stand at one station at a time, so the "many dishes at once" part is really "switching between dishes very fast, one at a time." An nginx worker does exactly that too — one OS thread, switching between ready sockets — so the analogy is accurate on that point. Where it breaks down is staffing: a restaurant can't usually hire a fractional cook, but `worker_processes auto` picks a whole number of workers equal to the CPU core count with no such constraint, and nginx can run with just one worker handling every connection if asked to.
+
+> [!tip] Remember
+> One **master** that never touches traffic, N **workers** that do all the work, each one juggling many connections by switching between whichever is ready next — never one worker per connection.
 
 ## 3. How it works
 
@@ -91,6 +96,22 @@ http {
 - `server` is one virtual host: it listens on a port and matches a `server_name` (or several), much like one tenant of the whole nginx instance.
 - `location` matches a request's URL path within a `server` and decides how to handle it: proxy it, serve a static file, redirect it, or something else.
 
+**In plain words:** think of the config as a filing system with three drawers nested inside each other. The outer drawer (`http`) holds settings every site in this nginx instance shares. Inside it, one folder per website (`server`) holds that site's own settings. Inside each folder, one index card per URL pattern (`location`) says exactly what to do when a request for that pattern arrives.
+
+```mermaid
+flowchart TB
+    http["http { }\nshared: logging, gzip, upstream blocks"] --> s1["server { listen 443; server_name api.example.com; }"]
+    http --> s2["server { listen 443; server_name admin.example.com; }"]
+    s1 --> l1["location /orders/ { proxy_pass ...; }"]
+    s1 --> l2["location /static/ { root ...; }"]
+    s2 --> l3["location / { ... } (a different site's own locations)"]
+```
+
+**Example, with numbers:** a request for `https://api.example.com/orders/42` picks exactly one path down this tree: nginx first finds the `server` block whose `server_name` matches `api.example.com` on port 443 (not `admin.example.com`'s block, even though both listen on the same port), and only then looks inside *that* `server` block's `location` blocks for one matching `/orders/42`.
+
+> [!tip] Remember
+> Settings flow one way only: outer to inner. A `location` can override something set in its `http` block, but an `http`-level setting silently applies to every `server` and `location` under it unless overridden.
+
 ### Location matching precedence (not "first match wins")
 
 Nginx does **not** scan `location` blocks top to bottom and stop at the first match. It applies a fixed precedence order regardless of where each block appears in the file:
@@ -115,6 +136,12 @@ flowchart TD
 ```
 
 A common bug: a `location ~* \.(jpg|png)$` regex block "wins" over a plain `location /images/` prefix block even though the prefix block appears first in the file and looks more specific — because any regex match outranks any plain prefix match once the plain-prefix search has completed, except when the plain-prefix match used `^~`.
+
+> [!warning] Common mistake
+> Assuming nginx reads `location` blocks top to bottom like an `if`/`else if` chain and stops at the first match. It doesn't. It always runs the fixed precedence order above regardless of file order — the only place file order matters at all is breaking a tie between two regex blocks, where the first one written wins.
+
+> [!tip] Remember
+> Exact match beats everything. After that, a `^~` prefix skips regex entirely. Otherwise, any matching regex beats any plain prefix, no matter how specific the prefix looks.
 
 ### Reverse proxy and upstream
 
@@ -221,9 +248,24 @@ server {
 }
 ```
 
-- `limit_req` implements a **leaky bucket**: requests drain at `rate` (here 10 per second per client IP); `burst` allows a short spike above that rate to queue instead of being rejected immediately, and `nodelay` serves burst requests immediately instead of artificially spacing them out to the steady rate (trading smoothness for lower latency on the burst). Without `nodelay`, queued burst requests are delayed to fit the steady rate rather than rejected. Once both the steady rate and the burst allowance are exceeded, nginx returns `503` by default.
+**In plain words:** imagine a bucket with a small hole in the bottom that lets water (requests) drain out at a fixed rate, no matter how fast water is poured in. Pour in faster than it drains, and the bucket fills; pour in faster still, and it overflows — those overflow requests are the ones nginx rejects.
+
+- `limit_req` implements this **leaky bucket**: requests drain at `rate` (here 10 per second per client IP); `burst` allows a short spike above that rate to queue instead of being rejected immediately, and `nodelay` serves burst requests immediately instead of artificially spacing them out to the steady rate (trading smoothness for lower latency on the burst). Without `nodelay`, queued burst requests are delayed to fit the steady rate rather than rejected. Once both the steady rate and the burst allowance are exceeded, nginx returns `503` by default.
 - `limit_conn` caps simultaneous **open connections** per key, independent of request rate — useful against a client opening many slow, long-lived connections rather than sending many fast requests.
 - The underlying algorithms, and how to make a rate limiter work correctly across many nginx instances rather than per-instance, are covered in [[Rate Limiting - Algorithms and Distributed Design]]; this note only covers nginx's own directives.
+
+```mermaid
+flowchart LR
+    In["Requests arrive\n(can burst faster than rate)"] --> Bucket{"Bucket holds up to\nburst=20 queued requests"}
+    Bucket -- "under rate + burst" --> Queue["Queued, then drained\nat rate=10r/s"]
+    Bucket -- "nodelay set" --> Fast["Served immediately\n(still counted against the bucket)"]
+    Bucket -- "over rate + burst" --> Reject["503 Service Unavailable"]
+```
+
+**Example, with numbers:** `rate=10r/s, burst=20, nodelay`. A client that suddenly sends 25 requests in the same instant gets the first 20 served immediately (the burst allowance, released without delay because of `nodelay`), and the remaining 5 rejected with `503` — none of the 20 are throttled to the 10/s steady rate, because `nodelay` is set; without it, those same 20 would be let through but spaced out to arrive no faster than 10 per second.
+
+> [!tip] Remember
+> `limit_req` paces *request rate* per key; `limit_conn` caps *simultaneous connections* per key. A client sending one request per minute over 50 open connections trips `limit_conn`, not `limit_req` — they defend against different attack shapes.
 
 ### WebSocket proxying
 

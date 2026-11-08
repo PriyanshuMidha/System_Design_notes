@@ -199,6 +199,21 @@ In a framework that supports them (Next.js App Router), components are Server Co
 
 ### Picking a strategy for a real app
 
+**In plain words:** There's no single "best" rendering strategy — the right choice depends on two questions for each page: does a search engine need to index it, and does its content change per-request or rarely? Answering those two questions in order narrows the choice to one of the four strategies almost every time.
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    Start["This page/route..."] --> Q1{"Needs SEO<br/>(search engines must index it)?"}
+    Q1 -- "No" --> CSR["CSR<br/>(logged-in dashboards, internal tools)"]
+    Q1 -- "Yes" --> Q2{"Does content change<br/>per request / per user?"}
+    Q2 -- "Yes, constantly" --> SSR["SSR<br/>(product checkout, personalized feed)"]
+    Q2 -- "Rarely, or never" --> Q3{"Too many pages<br/>to rebuild on every deploy?"}
+    Q3 -- "No, a normal site" --> SSG["SSG<br/>(marketing pages, docs, blog)"]
+    Q3 -- "Yes, a large catalog" --> ISR["ISR<br/>(50k+ product pages)"]
+```
+
 A storefront has: a marketing homepage, a product catalog of 50,000 items, a cart (per-user, changes constantly), and an account dashboard.
 
 - **Homepage** → SSG. Content changes maybe weekly; serve it from a CDN with no per-request render cost.
@@ -257,7 +272,35 @@ A user who only ever visits `/` never downloads `Catalog` or `Account`'s JavaScr
 
 ## 8. Deep dive
 
-- **Streaming SSR and Suspense on the server.** A framework can start sending HTML for the parts of a page that are ready, wrap a slow part in `<Suspense>`, and stream in its HTML (plus a script that slots it into place) once the data arrives — so a slow data source for a sidebar doesn't block the whole page's first byte.
+### Streaming SSR and Suspense on the server
+
+**In plain words:** Classic SSR has to finish rendering the *entire* page on the server before sending any of it — one slow data source (a sidebar widget calling a flaky third-party API) delays the whole response. Streaming SSR instead sends the page in pieces, as each piece becomes ready, like a restaurant bringing out appetizers while the kitchen still works on the main course instead of making the whole table wait for everything at once.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Server
+    participant SlowAPI as Slow data source (sidebar)
+    Server->>Browser: Chunk 1: page head, header and main content HTML
+    Note over Browser: Browser starts parsing<br/>and painting immediately
+    Server->>SlowAPI: fetch sidebar data (in parallel, already started)
+    Note over Server: Suspense fallback (skeleton)<br/>sent in place of the sidebar for now
+    SlowAPI-->>Server: data arrives (e.g. 800ms later)
+    Server->>Browser: Chunk 2: sidebar's real HTML<br/>+ inline script to swap it into place
+    Note over Browser: Sidebar skeleton replaced<br/>with real content, no full reload
+    Server->>Browser: Chunk 3: closing tags, page complete
+```
+
+**Example:** A product page's main content (title, price, add-to-cart) is ready in 50ms; its "customers also bought" sidebar depends on a recommendation service that takes 800ms. Streaming SSR sends the main content chunk almost immediately — the browser paints it right away — then streams the sidebar's HTML in a second chunk once the recommendation service responds, with a small inline script that slots it into the already-painted page.
+
+**Why it matters:** Without streaming, that one slow sidebar call would delay *time to first byte* for the entire page, even though 95% of the page had nothing to do with it. Streaming isolates the slow part behind its own `<Suspense>` boundary so it can't block anything outside itself.
+
+> [!tip] Remember
+> Streaming SSR sends ready chunks immediately and back-fills slow ones later — a slow widget no longer holds the whole page hostage.
+
+A framework can start sending HTML for the parts of a page that are ready, wrap a slow part in `<Suspense>`, and stream in its HTML (plus a script that slots it into place) once the data arrives — so a slow data source for a sidebar doesn't block the whole page's first byte.
 - **Selective/partial hydration.** Not every pixel of server-rendered HTML needs client-side JS attached. Astro's "islands" architecture hydrates only the components that are actually interactive (a like button) and leaves static markup (an article body) as plain HTML forever — a more aggressive version of what Server Components do at the framework level.
 - **Why `createBrowserRouter`/`createHashRouter` are functions, not components.** They build and return a router object (route tree, matching logic, history integration); that object is then handed to `<RouterProvider router={router}>`, which is the actual React component that subscribes to it and renders the matched route. Treating `createBrowserRouter(...)` itself as JSX (`<createBrowserRouter />`) is a category error — it was never a component.
 - **SEO and crawlers today.** Google's crawler does execute JavaScript for indexing, which softened CSR's historical SEO disadvantage, but render cost, inconsistent crawler behavior across search engines, and slower, later-indexed content still make SSR/SSG the safer default for anything that needs to rank reliably.

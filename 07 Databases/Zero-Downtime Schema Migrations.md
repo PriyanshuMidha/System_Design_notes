@@ -45,6 +45,23 @@ The second outage class is code: renaming `total` to `total_minor` in one step b
 
 ## 2. Mental model
 
+```mermaid
+flowchart LR
+    subgraph s1["State 1: expand"]
+        A1["old pods read and write total"] --- C1["table has total and total_minor"]
+    end
+    subgraph s2["State 2: dual write"]
+        A2["v2 pods write both, read total"] --- C2["backfill fills total_minor"]
+    end
+    subgraph s3["State 3: switch reads"]
+        A3["v3 pods read total_minor, write both"] --- C3["NOT NULL on total_minor"]
+    end
+    subgraph s4["State 4: contract"]
+        A4["v4 pods ignore total"] --- C4["DROP COLUMN total after the rollback window"]
+    end
+    s1 --> s2 --> s3 --> s4
+```
+
 Treat the schema like a public API with two clients at once: the app version that is running, and the one being rolled out. Every step must work for both.
 
 Changing a busy table is like repainting a road lane while traffic keeps moving. You open the new lane first, move the cars over, and only then close the old lane. And you never park a roller across all lanes, even for a second, at rush hour without a plan to back off.
@@ -63,6 +80,19 @@ flowchart LR
 ```
 
 `lock_timeout` turns a possible outage into a failed migration that can retry. The error is SQLSTATE `55P03` (`lock_not_available`).
+
+**Which lock does a DDL statement take, and does it block readers or writers?**
+
+```mermaid
+flowchart TD
+    Q["DDL on a busy table"] --> R{"ACCESS EXCLUSIVE?"}
+    R -->|"yes: ADD COLUMN, DROP COLUMN, RENAME, SET NOT NULL"| BR{"does it scan or rewrite the table?"}
+    BR -->|"no: catalog only"| OK1["safe with lock_timeout and retry"]
+    BR -->|"yes: type change, volatile default"| RW["unsafe: new column, backfill, swap"]
+    R -->|"no"| SH{"SHARE or SHARE ROW EXCLUSIVE?"}
+    SH -->|"yes: CREATE INDEX, ADD FOREIGN KEY"| WB["blocks writes: use CONCURRENTLY or NOT VALID"]
+    SH -->|"SHARE UPDATE EXCLUSIVE: VALIDATE, CONCURRENTLY"| OK2["reads and writes continue"]
+```
 
 **Lock levels of common DDL** (PostgreSQL 17, `ALTER TABLE` takes `ACCESS EXCLUSIVE` unless noted):
 
@@ -111,20 +141,22 @@ The bare idea for a column rename, one step per deploy:
 -- Deploy 1 (expand): add the new column; the app writes both columns
 SET lock_timeout = '2s';
 ALTER TABLE clients ADD COLUMN display_name text;
+```
 
+```sql
 -- Background job (migrate): copy old rows in small batches
 UPDATE clients SET display_name = name
 WHERE id BETWEEN 1 AND 10000 AND display_name IS NULL;
-
 -- Deploy 2: the app reads display_name only
+```
 
+```sql
 -- Deploy 3 (contract): remove the old column once no code uses it
 SET lock_timeout = '2s';
 ALTER TABLE clients DROP COLUMN name;
 ```
 
 The full version below adds production concerns: a type change on a 20-million-row table, dual writes, batched backfill, and adding `NOT NULL` without a long lock.
-
 
 **Goal:** move InvoiceOps money from `invoices.total numeric(12,2)` to `invoices.total_minor bigint NOT NULL` (integer paise), across 20 million rows, with no downtime.
 
@@ -166,93 +198,38 @@ WHERE  id >= $1 AND id < $2
 SELECT coalesce(max(replay_lag), interval '0') FROM pg_stat_replication;
 ```
 
-`replay_lag` turns NULL when a replica has caught up and the primary is idle, hence the `coalesce`. The job around it is throttled and resumable (Go 1.24; `go vet` and `go test -race` pass):
+`replay_lag` turns NULL when a replica has caught up and the primary is idle, hence the `coalesce`. The job around it is throttled and resumable. The loop does the following for each batch:
 
-```go
-// Store runs the SQL. Each BackfillRange call is its own short transaction.
-type Store interface {
-	MaxID(ctx context.Context) (int64, error)
-	BackfillRange(ctx context.Context, from, to int64) (rows int64, err error) // ids in [from, to)
-	ReplicaLag(ctx context.Context) (time.Duration, error)
-}
+1. Check the replica lag, and wait while it is above the limit.
+2. Run one short `UPDATE` for a range of ids in its own transaction.
+3. Pause, so vacuum and replicas keep up, and then move to the next range.
 
-type Config struct {
-	BatchSize int64         // ids per batch, e.g. 5_000
-	Pause     time.Duration // sleep after each batch so vacuum and replicas keep up
-	MaxLag    time.Duration // wait while any replica's replay lag is above this
-}
-
-// Run backfills ids from `from` up to MaxID and returns where to resume.
-// Rerunning a batch is harmless: the UPDATE skips rows already filled.
-func Run(ctx context.Context, s Store, cfg Config, from int64) (next int64, err error) {
-	maxID, err := s.MaxID(ctx)
-	if err != nil {
-		return from, err
-	}
-	for next = from; next <= maxID; next += cfg.BatchSize {
-		if err := ctx.Err(); err != nil {
-			return next, err // stopped between batches: nothing is half done
-		}
-		if err := waitForReplicas(ctx, s, cfg); err != nil {
-			return next, err
-		}
-		if _, err := s.BackfillRange(ctx, next, next+cfg.BatchSize); err != nil {
-			return next, fmt.Errorf("batch [%d, %d): %w", next, next+cfg.BatchSize, err)
-		}
-		if err := sleep(ctx, cfg.Pause); err != nil {
-			return next + cfg.BatchSize, err // this batch is committed
-		}
-	}
-	return next, nil
-}
-
-func waitForReplicas(ctx context.Context, s Store, cfg Config) error {
-	for {
-		lag, err := s.ReplicaLag(ctx)
-		if err != nil {
-			return err
-		}
-		if lag <= cfg.MaxLag {
-			return nil
-		}
-		if err := sleep(ctx, cfg.Pause); err != nil {
-			return err
-		}
-	}
-}
+```mermaid
+flowchart TD
+    S["next = from"] --> C{"next at or below MaxID?"}
+    C -->|"no"| DONE["done, return next"]
+    C -->|"yes"| X{"context cancelled?"}
+    X -->|"yes"| STOP["return next, nothing half done"]
+    X -->|"no"| LAG{"replica lag above MaxLag?"}
+    LAG -->|"yes"| W["sleep Pause"] --> LAG
+    LAG -->|"no"| B["UPDATE ids in next to next + batch, WHERE total_minor IS NULL"]
+    B --> P["sleep Pause"] --> N["next += batch"] --> C
 ```
 
-Rows inserted after `MaxID` was read come from v2 pods, which already write `total_minor`. The test interrupts the job, resumes it, and proves that every row was written exactly once:
+Rows inserted after `MaxID` was read come from v2 pods, which already write `total_minor`. Interrupting the job and resuming it from the returned id writes every row exactly once, because the `UPDATE` skips rows that are already filled. Time budget: 20 million rows at 5,000 per batch is 4,000 batches. At roughly 150 ms per batch plus a 50 ms pause, that is about 13 minutes (an estimate; measure on a production-size copy).
 
-```go
-func TestBackfillResumesWithoutRewritingRows(t *testing.T) {
-	s := newFakeStore(10_000)
-	ctx, cancel := context.WithCancel(context.Background())
-	s.onBatch = func(n int) {
-		if n == 3 {
-			cancel() // the deploy is interrupted after 3 batches
-		}
-	}
-	next, err := Run(ctx, s, cfg, 1)
-	if !errors.Is(err, context.Canceled) || next != 3001 {
-		t.Fatalf("first run: next=%d err=%v, want 3001 and context.Canceled", next, err)
-	}
+Runnable Go version: [[Zero-Downtime Schema Migrations - Go]]
 
-	s.onBatch = nil
-	if _, err := Run(context.Background(), s, cfg, next); err != nil {
-		t.Fatal(err)
-	}
-	for id, done := range s.filled {
-		if !done || s.writes[id] != 1 {
-			t.Fatalf("id %d: filled=%v writes=%d, want filled once", id, done, s.writes[id])
-		}
-	}
-}
+**Add NOT NULL without a long lock** (migration 0013). The four steps are:
+
+```mermaid
+flowchart LR
+    A["ADD CONSTRAINT CHECK NOT VALID<br/>brief lock, no scan, new writes checked"] --> B["VALIDATE CONSTRAINT<br/>scans, SHARE UPDATE EXCLUSIVE, traffic continues"]
+    B --> C["SET NOT NULL<br/>brief lock, scan skipped because the CHECK proves it"]
+    C --> D["DROP CONSTRAINT<br/>the CHECK is no longer needed"]
 ```
 
-A second test feeds replica lag readings of 5 s, 3 s and 0 s and checks that no batch runs until the lag drops below `MaxLag`. Time budget: 20 million rows at 5,000 per batch is 4,000 batches. At roughly 150 ms per batch plus a 50 ms pause, that is about 13 minutes (an estimate; measure on a production-size copy).
-
-**Add NOT NULL without a long lock** (migration 0013). Run each statement in **its own transaction**: separate migration files, or a tool mode that runs statements one at a time. Inside one transaction, the `ACCESS EXCLUSIVE` lock from the first statement would be held through the whole validation scan:
+Run each statement in **its own transaction**: separate migration files, or a tool mode that runs statements one at a time. Inside one transaction, the `ACCESS EXCLUSIVE` lock from the first statement would be held through the whole validation scan:
 
 ```sql
 SET lock_timeout = '2s';
@@ -375,6 +352,7 @@ The API queries are blocked by the **ALTER** (41388), not by the analytics query
 
 ## Links
 
+- **Runnable Go version:** [[Zero-Downtime Schema Migrations - Go]]
 - **Before this:** [[Relational Schema Design]], [[Transactions and ACID]], [[Locking - Optimistic vs Pessimistic]]
 - **Next:** [[Schema Migrations in Go Services]] (tool setup, embedding, CI), [[Rollback and Safe Migrations]] (deploy-side rollback), [[Index Types and Index Design]]
 - **Compare with:** [[API Versioning and Backward Compatibility]] (expand/contract for APIs), [[Event Schemas and Schema Registry]] (evolving event schemas), [[Deployment Strategies - Rolling, Blue-Green, Canary]]

@@ -1,6 +1,6 @@
 ---
 tags: [networking, security, tls, http]
-level: intermediate
+level: advanced
 prereqs: ["[[TCP - Handshake, Reliability, Flow and Congestion Control]]", "[[HTTP-1.1 vs HTTP-2 vs HTTP-3]]"]
 related: ["[[DNS - Resolution, Records and Caching]]", "[[Forward and Reverse Proxies - L4 vs L7]]", "[[Service-to-Service Auth - API Keys, HMAC, mTLS]]"]
 sources:
@@ -12,7 +12,7 @@ sources:
   - "RFC 6962, Certificate Transparency"
   - "Go crypto/tls package documentation (Go 1.24)"
 status: reviewed
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # TLS and HTTPS
@@ -57,6 +57,9 @@ flowchart LR
     inter -- signs --> leaf["Leaf cert: api.example.com\n(SAN: api.example.com, *.example.com)"]
     leaf -. "presented by server, verified by client walking back up" .-> root
 ```
+
+> [!tip] Remember
+> Key exchange and certificates solve two different problems. Key exchange (ECDHE) answers "can two strangers agree on a secret nobody else can compute?" Certificates answer "is the party on the other end who they claim to be?" HTTPS needs both; neither alone is enough.
 
 ## 3. How it works
 
@@ -121,6 +124,9 @@ Both ride inside the `ClientHello`, in plaintext (until TLS 1.3's Encrypted Clie
 ### Certificates: chain, SANs, validation levels
 
 - **Subject Alternative Name (SAN):** the actual list of hostnames (or `*.example.com` wildcard) a certificate is valid for. Browsers ignore the older `CN` (Common Name) field entirely; only SAN matters today.
+
+> [!warning] Common mistake
+> Assuming a certificate's `CN` (Common Name) field is what a browser checks for hostname matching. It isn't, hasn't been for years, and a certificate with a correct `CN` but a missing or mismatched SAN entry is rejected regardless. Always issue certificates with the right SAN list; never rely on `CN` for anything beyond a human-readable label in logs and tooling.
 - **Validation level:** DV (Domain Validation — proves control of the domain only, what ACME/Let's Encrypt issues), OV (Organization Validation — also checks the legal business), EV (Extended Validation — the old "green bar", largely abandoned because users never noticed the difference in practice).
 - **ACME (RFC 8555)** automates DV issuance and renewal: the CA gives the server a challenge (serve a specific file at a well-known URL, or publish a specific DNS TXT record), the server proves it, and the CA issues a short-lived certificate (90 days for Let's Encrypt) that an ACME client renews automatically well before expiry.
 - **OCSP stapling:** instead of the client separately querying the CA ("is this certificate revoked?"), the server fetches that proof ahead of time and attaches ("staples") it to the handshake — faster, and doesn't leak to the CA which sites a given client is visiting.
@@ -477,3 +483,4 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 - **Before this:** [[TCP - Handshake, Reliability, Flow and Congestion Control]], [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]
 - **Next:** [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[Forward and Reverse Proxies - L4 vs L7]]
 - **Compare with:** [[DNS - Resolution, Records and Caching]] (the DNS half of what domain setup involves), [[Service-to-Service Auth - API Keys, HMAC, mTLS]] (using a client certificate's identity for authorization, not the handshake mechanics covered here), [[TLS, HTTPS and HTTP2 in Go Servers]] (the fuller Go server configuration: autocert, hot cert reload, h2c)
+- **Code:** [[TLS and HTTPS - Go]]

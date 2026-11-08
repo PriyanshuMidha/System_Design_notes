@@ -147,7 +147,36 @@ The default argument to `createContext` is a fallback for "there is no Provider 
 
 ### Context's re-render cost
 
+**In plain words:** Context and a store like Redux solve a similar-sounding problem ("let a distant component read some shared state") in opposite ways when it comes to re-rendering. Context is like a single office-wide announcement over the PA system — everyone within earshot stops what they're doing to listen, even if the announcement wasn't relevant to them. A store with selectors is like each person subscribing only to the specific notice board they care about.
+
 Every component that calls `useContext(SomeContext)` re-renders whenever that Provider's `value` changes — by reference, not by deep comparison. Two common mistakes make this worse than it needs to be:
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    subgraph ctxBlast["Context: one value changes, ALL consumers re-render"]
+        direction LR
+        PV["Provider value changes<br/>{ user, theme }"] --> C1["UserMenu<br/>(reads user)<br/>re-renders"]
+        PV --> C2["ThemeToggle<br/>(reads theme)<br/>re-renders"]
+        PV --> C3["Breadcrumbs<br/>(reads user, but<br/>only for a log)<br/>re-renders anyway"]
+    end
+    subgraph storeBlast["Redux: one slice changes, only matching selectors re-render"]
+        direction LR
+        SS["Store: counter slice changes<br/>(settings slice untouched)"] --> S1["Counter<br/>selects state.counter<br/>re-renders"]
+        SS -.-> S2["SettingsPanel<br/>selects state.settings<br/>untouched, no re-render"]
+    end
+```
+
+**Example:** `AppContext` broadcasts `{ user, theme }`. `theme` changes from `"light"` to `"dark"`. Every component reading `useContext(AppContext)` — including `UserMenu`, which only ever reads `user` and never looks at `theme` — re-renders, because the *value object as a whole* got a new reference. In the Redux version, `SettingsPanel`'s `useSelector(s => s.settings)` simply isn't called again, because the `settings` slice of the store object didn't change.
+
+**Why it matters:** In a small app this difference is invisible. In a large one — a dashboard with many widgets reading one shared Context — a single frequently-changing field (a live search query, a websocket tick) dragged into that same Context object means *every* consumer re-renders on *every* tick, even widgets with nothing to do with that field.
+
+> [!warning] Common mistake
+> Putting a frequently-changing value (something that updates many times a second) into the same Context object as rarely-changing values (theme, locale). Split them, or the fast-changing field drags every consumer of the slow-changing ones along with it.
+
+> [!tip] Remember
+> Context broadcasts to everyone who's listening; a store with selectors only wakes up the listeners whose specific slice actually changed.
 
 ```jsx
 // Bad: a new object every render, so every consumer re-renders every time
@@ -240,6 +269,30 @@ function OrderList() {
 
 TanStack Query solves the same problem without requiring a Redux store at all.
 
+### Choosing between props, Context and a store
+
+**In plain words:** Most state-management confusion comes from reaching for a bigger tool than the problem needs. Asking three questions in order — who owns this state, how far does it need to travel, and does it change often — picks the right tool almost every time.
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    Start["This piece of state..."] --> Q1{"Does only one component<br/>(and maybe its direct children) use it?"}
+    Q1 -- "Yes" --> Local["useState in that component,<br/>pass down as props if needed"]
+    Q1 -- "No, several distant parts need it" --> Q2{"Does it change on<br/>every keystroke/frame,<br/>or is it read-mostly?"}
+    Q2 -- "Read-mostly<br/>(theme, locale, auth user)" --> Ctx["Context"]
+    Q2 -- "Changes often,<br/>or many unrelated consumers" --> Q3{"Is it data fetched<br/>from a server/API?"}
+    Q3 -- "Yes" --> Query["RTK Query / TanStack Query"]
+    Q3 -- "No, it's UI state" --> Store["Redux / Zustand<br/>(store with selectors)"]
+```
+
+**Example:** A shopping cart's item count needs to show up in the header, the cart page and a checkout summary — three distant, unrelated parts of the tree, and it changes often as items are added. That combination (distant + changes often) points at a store with selectors, not Context, so adding an item only re-renders the few components actually reading the cart slice.
+
+**Why it matters:** Picking Context for frequently-changing, widely-read state (like the cart example) silently makes every consumer re-render on every add-to-cart click — a performance bug that's invisible in development with a small cart and only shows up as the app grows.
+
+> [!tip] Remember
+> Default to props. Reach for Context only for widely-read, rarely-changing values. Reach for a store only when state is both widely-read *and* frequently-changing, or shared across genuinely unrelated parts of the app.
+
 ## 5. Variants and comparison
 
 | Option | How it works | Use when | Cost |
@@ -259,6 +312,32 @@ TanStack Query solves the same problem without requiring a Redux store at all.
 - A large Redux store for a small app is itself a cost: every contributor now has to learn the slice/action/selector convention to make a one-line change.
 
 ## 7. In production
+
+### Why a memoized Context value still looks "stale" when done wrong
+
+**In plain words:** A common bug report is "I updated the Context value, but my component still shows the old data." The cause is almost always that the *dependency list* passed to `useMemo` is missing the field that actually changed, so `useMemo` keeps returning its old cached object — the Provider re-rendered, but the `value` it handed out never actually changed reference.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant App as App (Provider)
+    participant Memo as "useMemo value cache (deps: [user])"
+    participant Consumer
+    App->>App: theme changes: "light" to "dark"
+    App->>Memo: re-render, ask for memoized value
+    Note over Memo: dependency list is [user] only --<br/>theme is NOT in the list
+    Memo-->>App: returns the SAME cached object<br/>(theme change not tracked)
+    App->>Consumer: Provider value reference unchanged
+    Note over Consumer: useContext sees no new reference,<br/>does not re-render -- shows stale theme
+```
+
+**Example:** `useMemo(() => ({ user, theme }), [user])` was written while `theme` didn't exist yet, and never updated when `theme` was added to the value object. Every `theme` change from then on is silently swallowed: the Provider itself re-renders fine, but the memoized `value` object it hands to `.Provider value={value}` keeps the old reference, so no consumer sees the change.
+
+**Why it matters:** This failure mode is quiet — no error, no warning, just "stale" UI — and it is specifically caused by the fix for *one* problem (re-render storms from a fresh object every render) creating a *different* problem (a dependency list that's gone out of sync with the object it's memoizing).
+
+> [!warning] Common mistake
+> Memoizing a Context value with `useMemo` and then adding a new field to that object later, without adding it to the dependency array too. The object is now memoized against the wrong inputs.
 
 - **Real systems:** Redux Toolkit is the default recommended Redux setup since 2019 and is standard in large React codebases (e-commerce carts, dashboards with many independent widgets reading shared data); Context is used in nearly every app for theme/locale/auth, rarely for frequently-changing data; TanStack Query and RTK Query are standard for server-state caching in production apps.
 - **Failure modes → fixes:**

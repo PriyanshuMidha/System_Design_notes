@@ -7,7 +7,7 @@ related: ["[[React Hooks]]", "[[React Rendering - Virtual DOM, Reconciliation, L
 sources:
   - "react.dev, Describing the UI"
   - "react.dev, React 19 release notes"
-updated: 2026-11-04
+updated: 2026-11-09
 ---
 
 # React Fundamentals - Components, JSX, Props, State
@@ -24,17 +24,35 @@ updated: 2026-11-04
 
 ## 1. Why it exists
 
-Before component frameworks, updating a page meant hand-written `document.getElementById(...).innerHTML = ...` calls scattered across the codebase: every place that could change the DOM had to remember every other place that depended on the same data. A shopping cart badge that should update after three different actions (add, remove, checkout) needed three manual DOM-update call sites, each one a chance to forget and leave the UI stale.
+Before component frameworks, updating a page meant hand-written `document.getElementById(...).innerHTML = ...` calls scattered across the codebase. Every place that could change the DOM had to remember every other place that depended on the same data.
 
-React's answer: describe the UI as a pure function of data — `UI = f(props, state)` — and let React figure out which DOM nodes actually need to change. You write what the page should look like for the *current* data; React re-runs the function on every relevant change and reconciles the difference (see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for how that diffing works).
+A shopping cart badge that should update after three different actions — add, remove, checkout — needed three separate manual DOM-update call sites. Each one was a chance to forget, and leave the badge showing a stale count.
+
+React's answer: describe the UI as a pure function of data, `UI = f(props, state)`, and let React figure out which DOM nodes actually need to change. You write what the page should look like for the *current* data. React re-runs the function on every relevant change and reconciles the difference (see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for how that diffing works).
+
+> [!tip] Remember
+> You describe the end result for the current data, not the sequence of DOM edits to get there — React works out the edits.
 
 ## 2. Mental model
 
-A component is a function. Think of it like a spreadsheet formula cell: give it inputs (props), and it deterministically produces an output (the UI description) — every time the inputs change, the formula is just re-evaluated, you never "patch" the old answer by hand.
+A component is a function. Think of it like a spreadsheet formula cell: give it inputs (props), and it deterministically produces an output (the UI description). Every time the inputs change, the formula is just re-evaluated — you never "patch" the old answer by hand.
+
+```mermaid
+flowchart LR
+    Props["props (A1, A2)"] --> Cell["=A1+A2 (the component function)"]
+    Cell --> Out["cell's displayed value (the UI)"]
+    Props -.->|"A1 changes"| Cell
+```
 
 - **Props** are the function's parameters — passed in by the parent, read-only.
 - **State** is a `let` variable that survives between calls to the same function, but one that only React is allowed to change, and only through its setter.
 - **JSX** is syntax that compiles to plain function calls (`React.createElement(...)` historically, the `jsx()` runtime import today) — it is not HTML, and the browser never sees it directly.
+
+> [!warning] Common mistake
+> Thinking of a component as something you "update" in place, the way you'd mutate a DOM element. A component re-*runs*, from scratch, every time — any value it needs across runs must live in state, a ref, or a prop, never in a plain local variable that resets every call.
+
+> [!tip] Remember
+> Component = pure function of `(props, state)`. If two renders get the same props and state, they produce the same JSX.
 
 ## 3. How it works
 
@@ -49,7 +67,9 @@ flowchart LR
     EV -- "schedules" --> C
 ```
 
-JSX compiles to function calls, not HTML:
+### JSX compiles to function calls, not HTML
+
+**In plain words:** the angle-bracket syntax you write (`<h1>Hello</h1>`) is not HTML the browser understands directly. A build step translates it into an ordinary JavaScript function call before any of it ships to the browser.
 
 ```jsx
 const greeting = <h1 className="title">Hello, {name}</h1>;
@@ -62,9 +82,16 @@ import { jsx as _jsx } from "react/jsx-runtime";
 const greeting = _jsx("h1", { className: "title", children: `Hello, ${name}` });
 ```
 
-That's why `class` becomes `className` (`class` is a reserved word in JS) and why you can put any JavaScript expression inside `{}` — it's just an argument to a function call, evaluated immediately when the component function runs.
+**Example:** `<h1 className="title">` becomes a call `_jsx("h1", { className: "title", ... })` — a plain function call with a string tag name and a plain object of attributes. Nothing about this is HTML; it's just syntax sugar that's easier to read than nested function calls.
+
+**Why it matters:** this is why `class` becomes `className` (`class` is a reserved word in JavaScript, so it can't be an object key the normal way without conflicting with the language) and why you can put any JavaScript expression inside `{}` — it's just an argument to a function call, evaluated immediately when the component function runs.
+
+> [!warning] Common mistake
+> Writing `<div class="box">` out of HTML habit. JSX attributes are JavaScript identifiers, not HTML attribute names — `class` → `className`, `for` → `htmlFor`, and event handlers are camelCase (`onclick` → `onClick`).
 
 ### Components as functions of props and state
+
+**In plain words:** a component receives one argument, an object of props, and returns JSX. The parent decides what goes in; the component can read it but never change it.
 
 ```jsx
 function Greeting({ name }) {       // props arrive as a single object, usually destructured
@@ -74,9 +101,23 @@ function Greeting({ name }) {       // props arrive as a single object, usually 
 <Greeting name="Asha" />            // parent passes a prop; Greeting cannot change it
 ```
 
-Props are **read-only** inside the child: `Greeting` must never do `name = "Bob"`. If a child needs to change something the parent owns, the parent passes a callback prop down, and the child calls that callback — the change still happens in the parent, which then re-renders with new props (see "Lifting state up" below).
+**Picture it:** props travel one way only, like water flowing downhill — parent to child, never the reverse:
+
+```mermaid
+flowchart TD
+    Parent["Cart (parent)"] -->|"props: {items, onAdd}"| Child["ProductList (child)"]
+    Child -.->|"cannot write back directly"| Parent
+    Child -->|"calls onAdd(item) — a function prop"| Parent
+```
+
+**Why it matters:** props are **read-only** inside the child — `Greeting` must never do `name = "Bob"`. If a child needs to change something the parent owns, the parent passes a callback prop down, and the child calls that callback. The change still happens in the parent, which then re-renders with new props (see "Lifting state up" below). This one-way flow is what makes a large component tree's data predictable: you can always find where a value changes by looking at who owns the state, not by searching the whole tree for mutations.
+
+> [!tip] Remember
+> Data flows down as props; changes flow up as function calls the parent handed down.
 
 ### Conditional and list rendering
+
+**In plain words:** JSX is just JavaScript, so showing or hiding something is a plain `if`/ternary, and rendering a list is just calling `.map()` and returning an array of elements.
 
 ```jsx
 function Status({ isLoggedIn }) {
@@ -94,7 +135,29 @@ function UserList({ users }) {
 }
 ```
 
-`key` must be stable and unique among siblings (a database id, not the array index) — see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for why an index key breaks state when the list is reordered or filtered.
+**Picture it:** `key` is how React matches an old render's list items to a new render's list items — by identity, not by position:
+
+```mermaid
+flowchart LR
+    subgraph Old["Render 1: [A, B, C]"]
+        A1["key=A"] --- B1["key=B"] --- C1["key=C"]
+    end
+    subgraph New["Render 2, B removed: [A, C]"]
+        A2["key=A"] --- C2["key=C"]
+    end
+    A1 -.->|"matched by key"| A2
+    C1 -.->|"matched by key: C keeps its own state"| C2
+    B1 -.->|"key=B gone: unmounted, not confused with C"| X["removed"]
+```
+
+**Example:** with a stable id as the key, removing item `B` from `[A, B, C]` leaves React able to see that `A` and `C` are the *same* items as before — any internal state they held (like a focused input) survives. If the key were the array *index* instead (`0, 1, 2`), after removing `B` the item now at index `1` (previously `C`, key `1`) is treated as "the same" element that used to be `B` at index `1` — and `C`'s state gets wrongly attached to what is now `C`'s row but was recognized as index `1`'s old identity.
+
+**Why it matters:** this is one of the most common React bugs in practice — a list that reorders or filters and an input loses focus, or shows the wrong row's typed text, because the key was the index instead of a real id.
+
+`key` must be stable and unique among siblings (a database id, not the array index) — see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for the full reconciliation mechanism this diagram summarizes.
+
+> [!tip] Remember
+> Use a real, stable id as `key`. The array index looks like it works until the list reorders, filters, or has an item removed from the middle.
 
 ### Optional chaining in JSX data access
 
@@ -107,9 +170,11 @@ function Profile({ user }) {
 }
 ```
 
+**What happens if** you write `user.address.city` without the `?.` guards, and `user` arrives as `null` on the first render before data loads? JavaScript throws immediately and the whole component crashes, which in React takes down the nearest error boundary — not just that one line. The `?.`/`??` combination is the cheapest guard against exactly this "data hasn't arrived yet" render.
+
 ### Code splitting with `lazy` and `Suspense`
 
-`React.lazy` defers loading a component's code until it's first rendered; `<Suspense fallback>` shows a placeholder while that code (or any promise the component reads with `use`) is still loading:
+**In plain words:** `React.lazy` defers downloading a component's code until the moment it's first rendered. `<Suspense fallback>` shows a placeholder while that code (or any promise the component reads with `use`) is still loading.
 
 ```jsx
 import { lazy, Suspense } from "react";
@@ -125,7 +190,7 @@ function App() {
 }
 ```
 
-This is what lets a bundler split a route's code into its own chunk (see "Tooling, briefly" below) instead of shipping the whole app up front. Note that only `lazy` components and promises read via `use` can trigger a `Suspense` fallback — passing an ordinary Promise down as a prop does not suspend anything by itself.
+**Why it matters:** this is what lets a bundler split a route's code into its own chunk (see "Tooling, briefly" below) instead of shipping the whole app up front. Only `lazy` components and promises read via `use` can trigger a `Suspense` fallback — passing an ordinary Promise down as a prop does not suspend anything by itself.
 
 ## 4. Worked example
 
@@ -143,6 +208,17 @@ function Counter() {
 ```
 
 Clicking the button calls `setCount`, which schedules a re-render; React re-runs `Counter`, `count` is now the new value, and the button's text updates. `Counter` never touches the DOM directly.
+
+### Tracing one click, step by step
+
+1. The page shows the button with text `0` — this is the result of the first render, where `count` was `0`.
+2. The user clicks the button. The browser fires a native click event.
+3. React's `onClick` handler runs: `() => setCount(count + 1)`, which calls `setCount(1)` (`count` was `0` in *this* render's closure).
+4. React does **not** update the DOM yet. It marks `Counter` as needing a re-render and schedules that work.
+5. React calls `Counter()` again. This time, `useState(0)` returns the *stored* value, `1`, not the initial `0` — the initial argument to `useState` is only used on the very first render.
+6. `Counter` returns new JSX: `<button>{1}</button>`.
+7. React compares this new JSX to the previous render's JSX, finds only the text content changed, and writes just that one text node to the real DOM.
+8. The button now visibly shows `1`.
 
 ### Controlled inputs and events
 
@@ -185,9 +261,11 @@ sequenceDiagram
     DOM-->>U: input shows the typed character
 ```
 
+**Why it matters:** because `value` is always set from state, React — not the browser — is the single source of truth for what the input shows. This is what makes it possible to validate, transform, or reject a keystroke before it ever appears (e.g. stripping non-digit characters from a phone number field).
+
 ### Lifting state up
 
-Two siblings that need to share data store it in their common parent instead of passing it directly between each other:
+**In plain words:** when two sibling components both need the same piece of data, that data moves up to their nearest common parent, which then passes it down to both as props.
 
 ```jsx
 function Cart() {
@@ -206,7 +284,12 @@ function Cart() {
 }
 ```
 
-`ProductList` and `CartBadge` never talk to each other directly; both are driven by `Cart`'s state. This is "lifting state up": when two components need the same data, move it to their nearest common ancestor and pass it down as props.
+**An analogy:** this is like two departments in a company that both need the same budget number — instead of each guessing or copying a number that can drift out of sync, the number lives with their shared manager, and both departments read it from the same source whenever they need it. The analogy breaks down because in React the "manager" (the parent component) is re-created on every render, not a long-lived object — only its *state* persists across those re-creations.
+
+`ProductList` and `CartBadge` never talk to each other directly; both are driven by `Cart`'s state.
+
+> [!tip] Remember
+> Two components need the same data → move it to their nearest common ancestor, then pass it down. Don't try to sync two separate pieces of state.
 
 ### Batched updates (React 18+)
 

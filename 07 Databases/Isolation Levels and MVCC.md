@@ -3,7 +3,7 @@ tags: [databases, transactions, isolation, mvcc, postgresql, mysql]
 level: intermediate
 status: reviewed
 prereqs: ["[[Transactions and ACID]]", "[[Storage Engines - B-tree vs LSM and WAL]]"]
-related: ["[[Locking - Optimistic vs Pessimistic]]", "[[Consistency Models]]", "[[Replication]]", "[[Distributed SQL]]", "[[Timeouts, Retries and Backoff]]", "[[Transactions and the Repository Pattern]]"]
+related: ["[[Isolation Levels and MVCC - Go]]", "[[Locking - Optimistic vs Pessimistic]]", "[[Consistency Models]]", "[[Replication]]", "[[Distributed SQL]]", "[[Timeouts, Retries and Backoff]]", "[[Transactions and the Repository Pattern]]"]
 sources:
   - "PostgreSQL 17 docs, Concurrency Control: Introduction, Transaction Isolation, Serialization Failure Handling"
   - "PostgreSQL 17 docs, Routine Vacuuming: Recovering Disk Space, Preventing Transaction ID Wraparound Failures"
@@ -16,7 +16,7 @@ sources:
   - "Cahill, Röhm, Fekete, Serializable Isolation for Snapshot Databases (SIGMOD 2008)"
   - "Ports and Grittner, Serializable Snapshot Isolation in PostgreSQL (VLDB 2012)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 7"
-updated: 2026-11-02
+updated: 2026-11-07
 ---
 
 # Isolation Levels and MVCC
@@ -42,13 +42,45 @@ InvoiceOps lets a customer run up an open balance only up to a credit limit. Cus
 | 3 | `INSERT` invoice, `COMMIT` | |
 | 4 | | `INSERT` invoice, `COMMIT` |
 
+```mermaid
+sequenceDiagram
+    participant A as Session A (25,000)
+    participant DB as invoices of customer 7
+    participant B as Session B (20,000)
+    A->>DB: SELECT open balance
+    DB-->>A: 70,000, so 95,000 fits under 100,000
+    B->>DB: SELECT open balance
+    DB-->>B: 70,000, so 90,000 fits under 100,000
+    A->>DB: INSERT invoice 25,000, COMMIT
+    B->>DB: INSERT invoice 20,000, COMMIT
+    Note over DB: open balance is 115,000, limit was 100,000
+```
+
 The open balance is now 115,000. Neither session did anything wrong on its own, and no row was written twice. At PostgreSQL's default level, and even at REPEATABLE READ, both commit. Running transactions one at a time would have rejected B. Isolation levels define how close to "one at a time" the database gets for you, and what you must add yourself.
 
 ## 2. Mental model
 
-- **Snapshots.** Each transaction reads from a photograph of the committed data. Other sessions keep changing the real rows, but your photograph does not change. The isolation level decides how often you take a new photograph: per statement (READ COMMITTED) or once per transaction (REPEATABLE READ).
-- **Versions, not overwrites.** An `UPDATE` does not erase the old row. It writes a new version and marks the old one as replaced, so older photographs can still find the version they need. Cleaning up versions nobody can see any more is a separate job (VACUUM in PostgreSQL, purge in InnoDB).
-- **What snapshots cannot see.** A snapshot shows you a consistent past, but your decision is applied to the present. When your write depends on something another transaction changed after your photograph, you get lost updates and write skew. Only SERIALIZABLE, or a lock you take yourself, catches that.
+### Snapshots: your own printout
+
+Each transaction reads from a photograph of the committed data. Other sessions keep changing the real rows, but your photograph does not change. The isolation level decides how often you take a new photograph: per statement (READ COMMITTED) or once per transaction (REPEATABLE READ).
+
+```mermaid
+flowchart LR
+    subgraph rc["READ COMMITTED: new photograph per statement"]
+        R1["statement 1 sees data as of t1"] --> R2["statement 2 sees data as of t2"] --> R3["statement 3 sees data as of t3"]
+    end
+    subgraph rr["REPEATABLE READ: one photograph per transaction"]
+        P1["statement 1 takes the snapshot at t1"] --> P2["statement 2 reuses it"] --> P3["statement 3 reuses it"]
+    end
+```
+
+### Versions, not overwrites
+
+An `UPDATE` does not erase the old row. It writes a new version and marks the old one as replaced, so older photographs can still find the version they need. Cleaning up versions nobody can see any more is a separate job (VACUUM in PostgreSQL, purge in InnoDB).
+
+### What snapshots cannot see
+
+A snapshot shows you a consistent past, but your decision is applied to the present. When your write depends on something another transaction changed after your photograph, you get lost updates and write skew. Only SERIALIZABLE, or a lock you take yourself, catches that.
 
 Analogy: everyone works from their own printout of a shared spreadsheet. Printouts never change under you, but two people can each check "total < limit" on their printout and each add a row.
 
@@ -56,9 +88,22 @@ Analogy: everyone works from their own printout of a shared spreadsheet. Printou
 
 ### The six anomalies
 
-Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocommit.
+Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocommit. A mapping from anomaly to the shortest fix:
 
-**Dirty read:** you see another transaction's uncommitted change.
+```mermaid
+flowchart TD
+    A["Which anomaly worries you?"] --> D1{"sees uncommitted data?"}
+    D1 -- "yes: dirty read" --> F1["any level above READ UNCOMMITTED, PostgreSQL never allows it"]
+    D1 -- "no" --> D2{"same row or query differs inside one transaction?"}
+    D2 -- "yes: non-repeatable read, phantom, read skew" --> F2["REPEATABLE READ: one snapshot"]
+    D2 -- "no" --> D3{"two read-modify-write cycles overlap on one row?"}
+    D3 -- "yes: lost update" --> F3["atomic UPDATE, row lock, version column, or REPEATABLE READ in PostgreSQL"]
+    D3 -- "no, different rows" --> F4["write skew: SERIALIZABLE, lock a parent row, or a constraint"]
+```
+
+#### Dirty read
+
+You see another transaction's uncommitted change.
 
 | Step | Session A | Session B |
 | --- | --- | --- |
@@ -66,7 +111,9 @@ Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocomm
 | 2 | | `SELECT status FROM invoices WHERE id = 42;` → `paid` |
 | 3 | `ROLLBACK;` | B emailed a receipt for a payment that never happened |
 
-**Non-repeatable read:** the same row read twice gives different values.
+#### Non-repeatable read
+
+The same row read twice gives different values.
 
 | Step | Session A | Session B |
 | --- | --- | --- |
@@ -74,7 +121,9 @@ Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocomm
 | 2 | | `UPDATE invoices SET total_minor = 45000 WHERE id = 42;` |
 | 3 | same `SELECT` → 45000 | |
 
-**Phantom read:** the same query returns a different set of rows.
+#### Phantom read
+
+The same query returns a different set of rows.
 
 | Step | Session A | Session B |
 | --- | --- | --- |
@@ -82,7 +131,9 @@ Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocomm
 | 2 | | inserts a fourth overdue invoice for customer 7 |
 | 3 | same `count(*)` → 4 | |
 
-**Read skew:** you see part of another transaction's effects.
+#### Read skew
+
+You see part of another transaction's effects.
 
 | Step | Session A (monthly statement) | Session B (payment webhook) |
 | --- | --- | --- |
@@ -92,7 +143,22 @@ Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocomm
 
 A's statement says "paid 0" next to "payments 50,000".
 
-**Lost update:** two read-modify-write cycles; one write silently overwrites the other.
+```mermaid
+sequenceDiagram
+    participant A as Session A (statement)
+    participant DB as invoice 42
+    participant B as Session B (webhook)
+    A->>DB: BEGIN, SELECT paid_minor
+    DB-->>A: 0
+    B->>DB: BEGIN, INSERT payment 50,000, UPDATE paid_minor = 50,000, COMMIT
+    A->>DB: SELECT sum of payments
+    DB-->>A: 50,000
+    Note over A: statement shows paid 0 next to payments 50,000
+```
+
+#### Lost update
+
+Two read-modify-write cycles; one write silently overwrites the other.
 
 | Step | Session A (payment of 10,000) | Session B (payment of 20,000) |
 | --- | --- | --- |
@@ -103,7 +169,35 @@ A's statement says "paid 0" next to "payments 50,000".
 
 The invoice shows 20,000 paid instead of 30,000. The fixes (atomic updates, row locks, version columns) are in [[Locking - Optimistic vs Pessimistic]].
 
-**Write skew:** the credit-limit story in section 1. Each transaction reads the same data, checks a rule, and writes a *different* row. No row is written twice, so no write-write conflict is ever detected.
+```mermaid
+sequenceDiagram
+    participant A as Session A (+10,000)
+    participant DB as invoice 42
+    participant B as Session B (+20,000)
+    A->>DB: SELECT paid_minor
+    DB-->>A: 0
+    B->>DB: SELECT paid_minor
+    DB-->>B: 0
+    A->>DB: UPDATE paid_minor = 10,000, COMMIT
+    B->>DB: UPDATE paid_minor = 20,000, COMMIT
+    Note over DB: 20,000 stored, A's 10,000 is lost
+```
+
+#### Write skew
+
+The credit-limit story in section 1. Each transaction reads the same data, checks a rule, and writes a *different* row. No row is written twice, so no write-write conflict is ever detected.
+
+```mermaid
+flowchart LR
+    subgraph shared["both transactions read the same rows"]
+        RD["open balance of customer 7 = 70,000"]
+    end
+    RD --> TA["Txn A: checks 95,000 <= 100,000, inserts invoice row X"]
+    RD --> TB["Txn B: checks 90,000 <= 100,000, inserts invoice row Y"]
+    TA --> W["X and Y are different rows: no write-write conflict is detected"]
+    TB --> W
+    W --> BAD["balance 115,000: the rule is broken"]
+```
 
 ### What each level prevents
 
@@ -115,6 +209,13 @@ The invoice shows 20,000 paid instead of 30,000. The fixes (atomic updates, row 
 | Read skew | **possible** | prevented | prevented | prevented for plain `SELECT` |
 | Lost update (read in app, then write) | **possible** | prevented: second writer gets 40001 | prevented | **possible** |
 | Write skew | **possible** | **possible** | prevented: one transaction gets 40001 | **possible** |
+
+```mermaid
+flowchart LR
+    RU["READ UNCOMMITTED: nothing ruled out by the standard"] --> RCm["READ COMMITTED: + no dirty reads"]
+    RCm --> RRm["REPEATABLE READ: + no non-repeatable reads, in PostgreSQL also no phantoms"]
+    RRm --> SZ["SERIALIZABLE: result equals some one-at-a-time order, + no write skew"]
+```
 
 The SQL standard defines four levels by which phenomena they rule out. What engines actually do differs:
 
@@ -152,7 +253,29 @@ Representative output (PostgreSQL 17):
   2 |    734 |      0 | (0,2)
 ```
 
+```mermaid
+flowchart LR
+    subgraph page["heap page 0 of invoices_demo"]
+        L1["slot 1: status sent, xmin 731, xmax 734, ctid (0,2)"]
+        L2["slot 2: status paid, xmin 734, xmax 0, ctid (0,2)"]
+    end
+    L1 -- "ctid points to the next version" --> L2
+    S1["snapshot taken before 734 committed"] --> L1
+    S2["snapshot taken after 734 committed"] --> L2
+```
+
+### Snapshots and the commit log
+
 A **snapshot** records which transactions count as finished. `SELECT pg_current_snapshot();` prints it as `xmin:xmax:xip_list`, for example `735:738:736`: every xid below 735 had finished, none at or above 738 had started, and 736 was still running. Whether a finished xid committed or aborted is kept in `pg_xact`, two bits per transaction. The first reader to look a status up caches it in the tuple as **hint bits**, which is why a plain `SELECT` can dirty pages (and, with data checksums or `wal_log_hints` on, write WAL).
+
+```mermaid
+flowchart LR
+    subgraph line["transaction id timeline for snapshot 735:738:736"]
+        A["xid below 735: finished"] --> B["735: finished"] --> C["736: still running, in xip_list"] --> D["737: finished"] --> E["738 and above: not started"]
+    end
+```
+
+### The visibility rule
 
 ```mermaid
 flowchart TD
@@ -167,16 +290,48 @@ flowchart TD
 
 "Committed before my snapshot" means: the xid is below the snapshot's `xmax`, not in its in-progress list, and marked committed in `pg_xact`.
 
-**READ COMMITTED vs REPEATABLE READ in PostgreSQL** is only a question of when the snapshot is taken, plus one rule for writes:
+| Version | xmin | xmax | Reading with snapshot `735:738:736` | Visible? |
+| --- | --- | --- | --- | --- |
+| A | 731 | 736 | 731 finished and committed; 736 is in the in-progress list, so the delete is not seen | yes |
+| B | 736 | 0 | 736 is in the in-progress list | no |
+| C | 737 | 0 | 737 finished and committed | yes |
+
+### READ COMMITTED vs REPEATABLE READ in PostgreSQL
+
+This is only a question of when the snapshot is taken, plus one rule for writes:
 
 - READ COMMITTED takes a new snapshot for every statement. If an `UPDATE`, `DELETE` or `SELECT … FOR UPDATE` finds its target row changed by a concurrent transaction, it waits for that transaction to finish (if it is still running) and, if it committed, re-evaluates its `WHERE` clause on the newest version. That is why `UPDATE invoices SET paid_minor = paid_minor + 10000 WHERE id = 42` never loses an update, while reading the value into Go and writing it back does.
 - REPEATABLE READ keeps one snapshot. If the row you update, delete or lock was changed by a transaction that committed after your snapshot, you get `ERROR: could not serialize access due to concurrent update` (SQLSTATE 40001). The second writer loses, and your code must retry the whole transaction.
+
+```mermaid
+sequenceDiagram
+    participant A as Txn A
+    participant DB as invoice 42
+    participant B as Txn B
+    A->>DB: UPDATE paid_minor = paid_minor + 10000 (row lock)
+    B->>DB: UPDATE paid_minor = paid_minor + 20000 (waits)
+    A->>DB: COMMIT, paid_minor = 10000
+    alt B at READ COMMITTED
+        DB-->>B: re-evaluates on the new version, 10000 + 20000 = 30000
+    else B at REPEATABLE READ
+        DB-->>B: ERROR 40001 could not serialize access due to concurrent update
+        Note over B: retry the whole transaction with a new snapshot
+    end
+```
 
 ### SERIALIZABLE in PostgreSQL: SSI
 
 Since 9.1, PostgreSQL's SERIALIZABLE runs transactions exactly like REPEATABLE READ and additionally tracks **read-write dependencies**. "T1 →rw T2" means T1 read something that the concurrent T2 then wrote: a row version, or a gap T2 inserted into. Readers record what they read as **SIRead locks** (shown as `SIReadLock` in `pg_locks`). These never block anyone; they only let the database notice conflicts.
 
 Every anomaly under snapshot isolation needs a "dangerous structure": two rw-dependencies in a row, T1 →rw T2 →rw T3, where T3 commits first (T1 and T3 may be the same transaction). PostgreSQL watches for that pattern and aborts one participant with 40001. That is cheap, but it also catches some harmless patterns (false positives), so retries are part of using SERIALIZABLE.
+
+```mermaid
+flowchart LR
+    T1["T1 (reads)"] -- "rw: T1 read what T2 wrote" --> T2["T2 (pivot)"]
+    T2 -- "rw: T2 read what T3 wrote" --> T3["T3 (commits first)"]
+    T3 -. "T1 and T3 may be the same transaction: a cycle" .-> T1
+    T2 --> AB["PostgreSQL aborts one of them with 40001"]
+```
 
 ```mermaid
 sequenceDiagram
@@ -218,13 +373,49 @@ stateDiagram-v2
     Removable --> [*]: VACUUM frees the slot and its index entries
 ```
 
-- **Bloat.** Dead tuples, and the index entries pointing at them, take space and slow scans until VACUUM runs. Autovacuum starts when dead tuples exceed `autovacuum_vacuum_threshold` (50) + `autovacuum_vacuum_scale_factor` (0.2) × rows, and since PostgreSQL 13 also after many inserts. Plain VACUUM makes space reusable inside the table but rarely shrinks the file; `VACUUM FULL` rewrites the table under an ACCESS EXCLUSIVE lock.
-- **The xmin horizon.** One transaction left open for hours ("idle in transaction"), a stale replication slot, or a replica with `hot_standby_feedback = on` running a long query holds the horizon back. Then no table in the database can be cleaned, however often VACUUM runs.
-- **XID wraparound.** Transaction IDs are 32 bits and compared in a circle: about 2 billion xids are "in the past" and 2 billion "in the future". VACUUM **freezes** old tuples so they count as older than every xid. When a table's oldest unfrozen xid gets older than `autovacuum_freeze_max_age` (200 million), an anti-wraparound autovacuum is forced, even with autovacuum disabled. If that cannot keep up, PostgreSQL warns once only 40 million xids remain, and finally refuses to start transactions that need a new xid until a VACUUM fixes it. That is an outage.
+#### Bloat
+
+Dead tuples, and the index entries pointing at them, take space and slow scans until VACUUM runs. Autovacuum starts when dead tuples exceed `autovacuum_vacuum_threshold` (50) + `autovacuum_vacuum_scale_factor` (0.2) × rows, and since PostgreSQL 13 also after many inserts. Plain VACUUM makes space reusable inside the table but rarely shrinks the file; `VACUUM FULL` rewrites the table under an ACCESS EXCLUSIVE lock.
+
+Example: a table with 1,000,000 rows triggers autovacuum after 50 + 0.2 × 1,000,000 = 200,050 dead tuples.
+
+#### The xmin horizon
+
+One transaction left open for hours ("idle in transaction"), a stale replication slot, or a replica with `hot_standby_feedback = on` running a long query holds the horizon back. Then no table in the database can be cleaned, however often VACUUM runs.
+
+```mermaid
+flowchart LR
+    subgraph timeline["dead versions by the xid that replaced them"]
+        D1["xid 100-199: dead"] --> D2["xid 200-299: dead"] --> D3["xid 300-399: dead"]
+    end
+    OLD["idle in transaction, snapshot xmin = 150"] --> H["horizon = 150"]
+    H --> CAN["VACUUM may remove: versions replaced before 150"]
+    H --> CANT["VACUUM must keep: everything replaced after 150, in every table"]
+```
+
+#### XID wraparound
+
+Transaction IDs are 32 bits and compared in a circle: about 2 billion xids are "in the past" and 2 billion "in the future". VACUUM **freezes** old tuples so they count as older than every xid. When a table's oldest unfrozen xid gets older than `autovacuum_freeze_max_age` (200 million), an anti-wraparound autovacuum is forced, even with autovacuum disabled. If that cannot keep up, PostgreSQL warns once only 40 million xids remain, and finally refuses to start transactions that need a new xid until a VACUUM fixes it. That is an outage.
+
+```mermaid
+flowchart LR
+    N["xid 0"] --> M["current xid: 2 billion xids behind are the past"]
+    M --> F["2 billion xids ahead look like the future"]
+    F --> N
+    G["200 million: forced anti-wraparound autovacuum"] --> W["40 million left: warnings"] --> S["0 left: refuses new xids until VACUUM runs"]
+```
 
 ### MVCC in InnoDB: undo logs and two kinds of read
 
 InnoDB updates the row in place in the clustered index and copies the old version into the **undo log**. Each row has hidden `DB_TRX_ID` (last writer) and `DB_ROLL_PTR` (pointer into undo) columns.
+
+```mermaid
+flowchart LR
+    CUR["clustered index row: status paid, DB_TRX_ID 734"] -- "DB_ROLL_PTR" --> U1["undo record: status sent, trx 731"]
+    U1 -- "older undo record" --> U2["undo record: earlier value"]
+    RV["consistent read with a read view older than 734"] --> CUR
+    RV -. "walks back through undo" .-> U1
+```
 
 - A **consistent read** (plain `SELECT`) builds the version its read view should see by following `DB_ROLL_PTR` back through undo records. At REPEATABLE READ the read view is created by the first consistent read of the transaction, or by `START TRANSACTION WITH CONSISTENT SNAPSHOT`.
 - A **locking read** (`SELECT … FOR UPDATE` / `FOR SHARE`), `UPDATE` and `DELETE` read the *latest committed* version. They lock the index records they scan, plus the gaps before them (**next-key locks**) at REPEATABLE READ, which blocks phantom inserts for locking reads.
@@ -232,262 +423,51 @@ InnoDB updates the row in place in the clustered index and copies the old versio
 - There is no "first updater wins" check, so the lost-update timeline above silently succeeds at InnoDB's default level.
 - **Purge** threads discard undo records once no read view needs them. A long transaction makes the **history list length** grow, the InnoDB version of bloat.
 
+| | PostgreSQL | InnoDB |
+| --- | --- | --- |
+| Where old versions live | in the table (heap), next to the new one | in the undo log, away from the table |
+| Cost of rollback | nearly free: versions just become invisible | real work: old values are copied back |
+| Cleanup | VACUUM, and page pruning | purge threads |
+| Symptom of a long transaction | table and index bloat, stuck xmin horizon | growing history list length |
+
 ## 4. Worked example
 
-### Whiteboard version
+The task: decide, for InvoiceOps, how to stop the credit-limit write skew, and see what each level does with the same two sessions. Customer 7 has a limit of 100,000 and 70,000 open; session A adds 25,000 and session B adds 20,000.
 
-The visibility rule in 15 lines. A snapshot remembers which transactions were finished when it was taken.
+### The bare idea
 
-```go
-package mvcc
+The visibility rule in plain steps. A snapshot remembers which transactions were finished when it was taken.
 
-type Snap struct {
-	Xmin, Xmax uint32
-	Running    map[uint32]bool
-}
+```text
+visible(version, snapshot) =
+    created_by_finished_committed_txn(version.xmin, snapshot)
+    AND NOT deleted_by_finished_committed_txn(version.xmax, snapshot)
 
-// committedBefore: did xid finish before the snapshot was taken?
-// (Real PostgreSQL also checks the commit log for aborts.)
-func (s Snap) committedBefore(xid uint32) bool {
-	return xid != 0 && xid < s.Xmax && !s.Running[xid]
-}
-
-// Visible: created by a transaction my snapshot sees as done,
-// and not deleted by one it sees as done.
-func Visible(s Snap, xmin, xmax uint32) bool {
-	return s.committedBefore(xmin) && !s.committedBefore(xmax)
-}
+finished_committed(xid) = xid below snapshot.xmax
+                          AND xid not in snapshot.in_progress_list
+                          AND the commit log says committed
 ```
 
-The full version below adds the snapshot's own transaction, aborted transactions, a version chain and tests for each anomaly.
+### Trace: the same two sessions at each level
 
-**The visibility rule in Go.** A model of the decision PostgreSQL makes for every tuple. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+| Level | A inserts 25,000 | B inserts 20,000 | Final open balance | Rule kept? |
+| --- | --- | --- | --- | --- |
+| READ COMMITTED | commits | commits | 115,000 | no |
+| REPEATABLE READ | commits | commits (no row written twice, so no 40001) | 115,000 | no |
+| SERIALIZABLE | commits | 40001; retry reads 95,000, 95,000 + 20,000 > 100,000, rejected | 95,000 | yes |
+| READ COMMITTED + `FOR UPDATE` on the customer row | commits | waits for A, then reads 95,000, rejected | 95,000 | yes |
 
-```go
-// Package mvcc models how PostgreSQL decides which row version a snapshot sees.
-// It ignores xid wraparound, command ids and row-lock-only xmax values.
-package mvcc
-
-// Snapshot has the shape pg_current_snapshot() prints: xmin:xmax:xip_list.
-type Snapshot struct {
-	Xmin uint32          // every xid below Xmin had finished
-	Xmax uint32          // no xid at or above Xmax had started
-	XIP  map[uint32]bool // xids in [Xmin, Xmax) that were still running
-}
-
-// Version is one physical row version (a heap tuple).
-type Version struct {
-	Xmin  uint32 // transaction that created this version
-	Xmax  uint32 // transaction that deleted or replaced it; 0 if none
-	Value string
-}
-
-// Committed answers "did this xid commit?" (PostgreSQL keeps that in pg_xact).
-type Committed func(xid uint32) bool
-
-// sees reports whether xid's work is part of the snapshot: the transaction
-// finished before the snapshot was taken, and it committed.
-func (s Snapshot) sees(xid uint32, committed Committed) bool {
-	if xid >= s.Xmax || s.XIP[xid] {
-		return false // started later, or still running at snapshot time
-	}
-	return committed(xid)
-}
-
-// Visible reports whether v is visible to transaction me reading with s.
-func Visible(v Version, s Snapshot, me uint32, committed Committed) bool {
-	created := v.Xmin == me || s.sees(v.Xmin, committed)
-	if !created {
-		return false
-	}
-	if v.Xmax == 0 {
-		return true
-	}
-	deleted := v.Xmax == me || s.sees(v.Xmax, committed)
-	return !deleted
-}
+```mermaid
+flowchart TD
+    S["Credit-limit check: read open balance, compare, insert invoice"] --> Q{"how do I protect it?"}
+    Q -- "SERIALIZABLE and retry" --> A1["second committer gets 40001, retry reads 95,000, rejects"]
+    Q -- "lock the customer row first" --> A2["writers queue on customers.id = 7, second sees 95,000, rejects"]
+    Q -- "constraint or one conditional UPDATE" --> A3["only if the rule fits one row, for example a running total column"]
 ```
 
-The test replays invoice 42's two versions under five situations. Every snapshot sees exactly one version, and the two middle cases are the whole difference between REPEATABLE READ and READ COMMITTED:
+The retrying wrapper that makes the first option correct is in [[Isolation Levels and MVCC - Go]], together with a runnable model of the visibility rule and the tests for each snapshot situation.
 
-```go
-// Invoice 42: xid 100 inserted it as "sent"; xid 105 updated it to "paid",
-// which stamped xmax=105 on the old version and inserted a new one.
-var chain = []Version{
-	{Xmin: 100, Xmax: 105, Value: "sent"},
-	{Xmin: 105, Xmax: 0, Value: "paid"},
-}
-
-func TestEachSnapshotSeesExactlyOneVersion(t *testing.T) {
-	// Taken by xid 104 while 103 and 105 were running.
-	during := Snapshot{Xmin: 103, Xmax: 106, XIP: map[uint32]bool{103: true, 105: true}}
-	// Taken by xid 105 itself: a snapshot never lists its own xid.
-	own := Snapshot{Xmin: 103, Xmax: 106, XIP: map[uint32]bool{103: true}}
-	// Taken by xid 107 after 105 had finished.
-	after := Snapshot{Xmin: 106, Xmax: 107}
-
-	only100 := func(xid uint32) bool { return xid == 100 } // 105 running or aborted
-	both := func(xid uint32) bool { return xid == 100 || xid == 105 }
-
-	cases := []struct {
-		name      string
-		snap      Snapshot
-		me        uint32
-		committed Committed
-		want      string
-	}{
-		{"read while 105 runs", during, 104, only100, "sent"},
-		{"same snapshot after 105 commits (REPEATABLE READ)", during, 104, both, "sent"},
-		{"fresh snapshot after 105 commits (READ COMMITTED)", after, 107, both, "paid"},
-		{"105 reads its own update", own, 105, only100, "paid"},
-		{"105 aborted: the old version stays visible", after, 107, only100, "sent"},
-	}
-	for _, c := range cases {
-		var seen []string
-		for _, v := range chain {
-			if Visible(v, c.snap, c.me, c.committed) {
-				seen = append(seen, v.Value)
-			}
-		}
-		if len(seen) != 1 || seen[0] != c.want {
-			t.Errorf("%s: saw %v, want [%s]", c.name, seen, c.want)
-		}
-	}
-}
-```
-
-**Retrying serialization failures.** SERIALIZABLE is only correct if the application retries. The helper below runs the *whole* transaction again on 40001 (serialization failure) or 40P01 (deadlock), with capped exponential backoff and full jitter ([[Timeouts, Retries and Backoff]]). It uses `github.com/jackc/pgx/v5`:
-
-```go
-// Package txretry runs a function in a SERIALIZABLE transaction and runs the
-// whole transaction again when PostgreSQL reports a serialization failure.
-package txretry
-
-import (
-	"context"
-	"errors"
-	"math/rand/v2"
-	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-)
-
-// Beginner is satisfied by *pgxpool.Pool and *pgx.Conn.
-type Beginner interface {
-	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
-}
-
-// Retryable reports whether running the whole transaction again can succeed.
-func Retryable(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
-	}
-	return pgErr.Code == "40001" || // serialization_failure
-		pgErr.Code == "40P01" // deadlock_detected
-}
-
-// Serializable runs fn in a SERIALIZABLE transaction, at most maxAttempts
-// times. fn may run more than once, so it must not have side effects outside
-// the transaction (no HTTP calls, no emails), and must wrap errors with %w.
-func Serializable(ctx context.Context, db Beginner, maxAttempts int, fn func(pgx.Tx) error) error {
-	backoff := 5 * time.Millisecond
-	for attempt := 1; ; attempt++ {
-		err := pgx.BeginTxFunc(ctx, db, pgx.TxOptions{IsoLevel: pgx.Serializable}, fn)
-		if err == nil || !Retryable(err) || attempt == maxAttempts {
-			return err
-		}
-		select { // full jitter: sleep a random time in [0, backoff)
-		case <-time.After(rand.N(backoff)):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		backoff = min(2*backoff, time.Second)
-	}
-}
-```
-
-The credit-limit check from section 1, made safe. It compiles and passes `go vet`; it was not run against a database here:
-
-```go
-var ErrCreditLimit = errors.New("invoice would exceed the customer's credit limit")
-
-// CreateInvoice inserts an invoice only if the customer's open balance stays
-// within the credit limit. Two concurrent calls cannot both pass the check:
-// SERIALIZABLE aborts one with 40001, and Serializable runs it again.
-func CreateInvoice(ctx context.Context, db Beginner, customerID, totalMinor int64) error {
-	return Serializable(ctx, db, 5, func(tx pgx.Tx) error {
-		var limit, open int64
-		err := tx.QueryRow(ctx, `
-			SELECT c.credit_limit_minor,
-			       coalesce(sum(i.total_minor - i.paid_minor), 0)
-			FROM customers c
-			LEFT JOIN invoices i ON i.customer_id = c.id
-			     AND i.status IN ('sent', 'partially_paid', 'overdue')
-			WHERE c.id = $1
-			GROUP BY c.id`, customerID).Scan(&limit, &open)
-		if err != nil {
-			return fmt.Errorf("read open balance: %w", err)
-		}
-		if open+totalMinor > limit {
-			return ErrCreditLimit
-		}
-		_, err = tx.Exec(ctx, `
-			INSERT INTO invoices (customer_id, total_minor, status, due_date)
-			VALUES ($1, $2, 'sent', current_date + 30)`, customerID, totalMinor)
-		if err != nil {
-			return fmt.Errorf("insert invoice: %w", err)
-		}
-		return nil
-	})
-}
-```
-
-The retry logic is tested without a database. A fake `BeginTx` hands out transactions whose `Commit` returns scripted errors; `pgx.BeginTxFunc` only ever calls `Commit` and `Rollback` on them:
-
-```go
-// fakeTx embeds a nil pgx.Tx: BeginTxFunc only calls Commit and Rollback.
-type fakeTx struct {
-	pgx.Tx
-	commitErr error
-}
-
-func (f *fakeTx) Commit(context.Context) error   { return f.commitErr }
-func (f *fakeTx) Rollback(context.Context) error { return pgx.ErrTxClosed }
-
-// fakeDB fails the first len(commitErrs) commits with the given errors.
-type fakeDB struct {
-	commitErrs []error
-	begins     int
-}
-
-func (d *fakeDB) BeginTx(ctx context.Context, _ pgx.TxOptions) (pgx.Tx, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err // like a real pool: no new transaction on a dead context
-	}
-	var err error
-	if d.begins < len(d.commitErrs) {
-		err = d.commitErrs[d.begins]
-	}
-	d.begins++
-	return &fakeTx{commitErr: err}, nil
-}
-
-var serializationFailure = &pgconn.PgError{Code: "40001",
-	Message: "could not serialize access due to read/write dependencies among transactions"}
-
-func TestRetriesSerializationFailuresUntilCommit(t *testing.T) {
-	db := &fakeDB{commitErrs: []error{serializationFailure, serializationFailure}}
-	runs := 0
-	err := Serializable(context.Background(), db, 5, func(pgx.Tx) error { runs++; return nil })
-	if err != nil || runs != 3 {
-		t.Fatalf("err=%v runs=%d; want success on the 3rd run", err, runs)
-	}
-}
-```
-
-Three more tests in the package check that it gives up after `maxAttempts` with the 40001 error, returns a `23505` unique violation after one run, and stops when the context is cancelled.
+Runnable Go version: [[Isolation Levels and MVCC - Go]]
 
 ## 5. Variants and comparison
 
@@ -511,6 +491,18 @@ Defaults elsewhere, for interviews:
 | SQL Server | READ COMMITTED (locking; Azure SQL Database turns on row versioning by default) | `READ_COMMITTED_SNAPSHOT` switches it to row versioning; `SNAPSHOT` is snapshot isolation |
 | CockroachDB | SERIALIZABLE | READ COMMITTED is generally available since v24.1 (preview in v23.2); see [[Distributed SQL]] |
 
+```mermaid
+flowchart TD
+    N["Which level for this code path?"] --> Q1{"single-row change that one UPDATE can express?"}
+    Q1 -- "yes" --> L1["READ COMMITTED + atomic conditional UPDATE"]
+    Q1 -- "no" --> Q2{"report or export that must see one consistent snapshot?"}
+    Q2 -- "yes" --> L2["REPEATABLE READ READ ONLY"]
+    Q2 -- "no" --> Q3{"invariant over many rows?"}
+    Q3 -- "yes, and a shared parent row exists" --> L3["lock the parent row FOR UPDATE"]
+    Q3 -- "yes, no shared parent" --> L4["SERIALIZABLE + retry"]
+    Q3 -- "no" --> L1
+```
+
 ## 6. Trade-offs and when not to use
 
 - **READ COMMITTED is fine for most single-statement work**, provided you write conditional updates instead of read-then-write in application code.
@@ -519,9 +511,15 @@ Defaults elsewhere, for interviews:
 - **Do not reach for SERIALIZABLE** when a single atomic `UPDATE`, a unique constraint or one row lock expresses the rule more cheaply and more visibly.
 - **Never put non-repeatable side effects inside a retried transaction**: charging a card, sending an email. Record the intent in the transaction and act after commit (see [[Transactional Outbox and CDC]]).
 
+| Level | Retries needed? | Blocks readers? | Allows write skew? | Typical cost |
+| --- | --- | --- | --- | --- |
+| READ COMMITTED | rarely (deadlocks) | no | yes | lowest |
+| REPEATABLE READ | yes, on 40001 | no | yes | one long-lived snapshot |
+| SERIALIZABLE | yes, on 40001, including false positives | no | no | SIRead lock memory, wasted retries |
+
 ## 7. In production
 
-- **Real systems:** InvoiceOps-style services typically run READ COMMITTED with conditional updates and row locks, and use SERIALIZABLE for the few invariants that span rows (credit limits, ledger balances), wrapped in the retry helper above.
+- **Real systems:** InvoiceOps-style services typically run READ COMMITTED with conditional updates and row locks, and use SERIALIZABLE for the few invariants that span rows (credit limits, ledger balances), wrapped in the retry helper in [[Isolation Levels and MVCC - Go]].
 - **Failure modes → fixes:**
 	- *An "idle in transaction" session holds the xmin horizon for hours* → set `idle_in_transaction_session_timeout` (for example 60 s) and `statement_timeout`; never hold a transaction open across an HTTP call.
 	- *A forgotten replication slot or `hot_standby_feedback` pins old versions* → monitor slot `xmin` and lag, drop dead slots.
@@ -537,6 +535,27 @@ Defaults elsewhere, for interviews:
 	- Your own counter of 40001 and 40P01 retries per endpoint.
 	- InnoDB: history list length (`SHOW ENGINE INNODB STATUS`).
 
+```mermaid
+flowchart TD
+    AL["alert: n_dead_tup growing, queries slowing"] --> Q1["check oldest backend_xmin in pg_stat_activity"]
+    Q1 --> C{"what holds the horizon?"}
+    C -- "idle in transaction" --> F1["terminate it, set idle_in_transaction_session_timeout"]
+    C -- "replication slot" --> F2["fix the lagging consumer or drop the slot"]
+    C -- "replica with hot_standby_feedback" --> F3["shorten replica queries or turn feedback off"]
+    C -- "prepared transaction" --> F4["COMMIT PREPARED or ROLLBACK PREPARED it"]
+```
+
+## Whiteboard version
+
+```text
+Level      snapshot       PostgreSQL gives            still possible
+RC         per statement  re-check WHERE on update    lost update (read in app), write skew
+RR         per txn        40001 on concurrent update  write skew
+SERIAL     per txn + SSI  40001 on danger structure   nothing, but you must retry
+visible = xmin committed-before-snapshot AND NOT (xmax committed-before-snapshot)
+Fix write skew: SERIALIZABLE + retry | lock parent row | constraint
+```
+
 ## 8. Deep dive
 
 - **Snapshot timing.** In PostgreSQL the REPEATABLE READ snapshot is taken by the first statement after `BEGIN`, not by `BEGIN` itself. `pg_export_snapshot()` plus `SET TRANSACTION SNAPSHOT` lets several sessions share one snapshot; `pg_dump -j` uses it for consistent parallel dumps.
@@ -547,6 +566,18 @@ Defaults elsewhere, for interviews:
 - **Page pruning (HOT pruning).** Any backend reading a heap page can prune it without waiting for VACUUM: dead tuple versions behind the xmin horizon have their space reclaimed. Heap-only tuples are removed completely; dead tuples that still have index entries are reduced to dead line pointers until VACUUM removes those index entries. That keeps hot, frequently updated rows from bloating as fast.
 - **VACUUM in PostgreSQL 17** stores dead-tuple IDs in a new, compact structure, which uses much less memory and is no longer silently capped at 1 GB.
 - **InnoDB secondary indexes** carry no version columns. When a secondary-index page was changed by a newer transaction, a consistent read must look the row up in the clustered index and walk undo to decide visibility, so long transactions make secondary-index reads slower too.
+
+```mermaid
+flowchart LR
+    subgraph before["page before pruning"]
+        B1["dead heap-only tuple"] --> B2["dead tuple with index entry"] --> B3["live tuple"]
+    end
+    subgraph after["after pruning by any reader"]
+        A1["heap-only tuple: space reclaimed"] --> A2["dead line pointer kept for the index entry"] --> A3["live tuple"]
+    end
+    before --> after
+    A2 -. "VACUUM removes the index entry, then the line pointer" .-> V["slot reusable"]
+```
 
 ## 9. Interview questions
 
@@ -583,6 +614,7 @@ Defaults elsewhere, for interviews:
 
 ## Links
 
+- **Implementation:** [[Isolation Levels and MVCC - Go]]
 - **Before this:** [[Transactions and ACID]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Next:** [[Locking - Optimistic vs Pessimistic]], [[Replication]], [[Transactions and the Repository Pattern]]
 - **Compare with:** [[Consistency Models]] (linearizability is about single objects in distributed systems; serializability is about transactions), [[Distributed SQL]] (serializable transactions across nodes)

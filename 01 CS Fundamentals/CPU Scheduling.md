@@ -10,7 +10,7 @@ sources:
   - "Go 1.25 release notes, runtime: container-aware GOMAXPROCS"
   - "Silberschatz, Galvin & Gagne, Operating System Concepts, ch. 5 (CPU Scheduling)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-09
 ---
 
 # CPU Scheduling
@@ -27,21 +27,74 @@ updated: 2026-11-07
 
 ## 1. Why it exists
 
-A typical server has 8 or 16 CPU cores. A single moderately busy Go service can easily have hundreds of OS threads blocked or runnable at once (the Go runtime starts one OS thread per blocked syscall, plus `GOMAXPROCS` threads for running goroutines — see [[Runtime - Goroutine Scheduler (GMP)]]). The OS has far more runnable work than it has cores to run it on.
+### More runnable work than cores
 
-The kernel must decide, many thousands of times per second, which thread runs on which core next, and for how long, before being preempted to let someone else have a turn. Get this wrong and symptoms show up directly in your service's latency: a request-handling thread that's ready to run but sits in the run queue for 20ms behind lower-priority background work adds 20ms to that request's tail latency, with no code change anywhere near your request handler.
+**In plain words:** Every server has a fixed, small number of CPU cores — 8, 16, maybe 64. But the operating system usually has far more things that *want* to run than it has cores to run them on.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    subgraph cores["8 cores"]
+        direction LR
+        C1["core 1"]
+        C2["core 2"]
+        C3["..."]
+        C8["core 8"]
+    end
+    subgraph runnable["hundreds of runnable threads"]
+        direction LR
+        T1["T1"]
+        T2["T2"]
+        T3["..."]
+        Tn["T300"]
+    end
+    runnable -.wait for a free core.-> cores
+```
+
+**Example:** A single moderately busy Go service can easily have hundreds of OS threads blocked or runnable at once — the Go runtime starts one OS thread per blocked syscall, plus `GOMAXPROCS` threads for running goroutines (see [[Runtime - Goroutine Scheduler (GMP)]]). The kernel must decide, many thousands of times per second, which thread runs on which core next, and for how long, before being preempted to let someone else have a turn.
+
+**Why it matters:** Get this wrong and symptoms show up directly in your service's latency. A request-handling thread that's ready to run but sits in the run queue for 20 ms behind lower-priority background work adds 20 ms to that request's tail latency — with no code change anywhere near your request handler. The scheduler is invisible infrastructure until it isn't.
+
+> [!tip] Remember
+> The scheduler exists because there is always more runnable work than cores; its whole job is deciding the order, fairly and without starving anyone.
 
 ## 2. Mental model
 
-Picture every runnable thread sitting in a queue at the door of a small number of identical interview rooms (the cores). The **scheduler** is the receptionist deciding who goes in next and how long their interview slot is. A **context switch** is the receptionist stopping one candidate mid-sentence, saving exactly where they were, and calling in the next — the CPU registers, program counter and memory-mapping state (covered as part of a context switch in [[Processes, Threads and Context Switching]]) are what gets saved and restored.
+### The receptionist analogy
 
-The receptionist's policy is the scheduling algorithm. "First one who arrived" (FCFS) is simple but lets a long-winded candidate block everyone behind them. "Everyone gets exactly 10 minutes, then back of the line" (round robin) is fair but wastes time on all the candidates who only needed 30 seconds. Linux's actual policy, CFS/EEVDF, is closer to: "whoever has had the least total interview time so far, relative to how much they deserve, goes next" — nobody ever gets a fixed slice; everyone's running tally is compared continuously.
+**In plain words:** Picture every runnable thread sitting in a queue at the door of a small number of identical interview rooms (the cores). The **scheduler** is the receptionist deciding who goes in next and how long their interview slot is.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    Q["Queue of candidates<br/>(runnable threads)"] --> R["Receptionist<br/>(scheduler)"]
+    R --> Room1["Interview room 1<br/>(core 1)"]
+    R --> Room2["Interview room 2<br/>(core 2)"]
+```
+
+**Example:** A **context switch** is the receptionist stopping one candidate mid-sentence, saving exactly where they were, and calling in the next — the CPU registers, program counter and memory-mapping state (covered as part of a context switch in [[Processes, Threads and Context Switching]]) are what gets saved and restored.
+
+**Why it matters:** The receptionist's *policy* is the scheduling algorithm, and different policies produce wildly different experiences for the people waiting. "First one who arrived" (FCFS) is simple but lets a long-winded candidate block everyone behind them. "Everyone gets exactly 10 minutes, then back of the line" (round robin) is fair but wastes time on candidates who only needed 30 seconds.
+
+**Where the analogy breaks down:** Linux's actual default policy, CFS/EEVDF, has no fixed interview length at all — it's closer to "whoever has had the least total interview time so far, relative to how much they deserve, goes next," continuously recalculated rather than assigned in advance.
 
 ## 3. How it works
 
-### Whiteboard version
+### Whiteboard version: round robin vs. FCFS
 
-Three processes arrive at once needing 10, 5 and 8 ticks of CPU time. Round robin with a quantum of 4 interleaves them instead of running each to completion:
+**In plain words:** The easiest way to see why scheduling policy matters is to run the same three jobs under two different policies and compare when each one finishes.
+
+**Step by step (round robin, quantum = 4):** Three processes arrive at once needing 10, 5 and 8 ticks of CPU time.
+
+1. P1 runs for 4 ticks (its quantum), has 6 left, goes to the back of the queue.
+2. P2 runs for 4 ticks, has 1 left, goes to the back.
+3. P3 runs for 4 ticks, has 4 left, goes to the back.
+4. P1 runs its remaining... no — P1 gets another 4-tick turn, down to 2 left.
+5. P2 runs its last 1 tick and finishes at tick 17.
+6. P3 runs its remaining 4 ticks and finishes at tick 21.
+7. P1 runs its last 2 ticks and finishes at tick 23.
 
 ```mermaid
 flowchart LR
@@ -51,7 +104,7 @@ flowchart LR
     end
 ```
 
-Compare with first-come-first-served, which runs each to completion in arrival order — P2 and P3 wait behind the whole of P1's burst even though they're each much shorter (the **convoy effect**):
+**Example, compared:** First-come-first-served runs each to completion in arrival order instead of interleaving — P2 and P3 wait behind the *whole* of P1's burst even though they're each much shorter:
 
 ```mermaid
 flowchart LR
@@ -61,7 +114,12 @@ flowchart LR
     end
 ```
 
-### Classic algorithms
+**Why it matters:** Under FCFS, P2 — which only needed 5 ticks — doesn't finish until tick 15, purely because it arrived behind a longer job. This is called the **convoy effect**: a condition where one long job delays every short job queued behind it, even though interleaving them would have let the short jobs finish almost immediately.
+
+> [!warning] Common mistake
+> Assuming "finishes last" means "ran longest." In the FCFS trace above, P3 finishes at the same tick (23) under both policies — it's P2 that suffers under FCFS, purely from being stuck behind P1 in the queue.
+
+### Classic algorithms, compared
 
 | Algorithm | Rule | Problem it has |
 | --- | --- | --- |
@@ -71,11 +129,22 @@ flowchart LR
 | Priority scheduling | Highest-priority runnable job runs next | Low-priority jobs can starve forever without aging |
 | Multi-level feedback queue (MLFQ) | Multiple RR queues at different priorities; a job that uses its whole quantum drops a priority level, one that yields early stays or rises | Tunable but complex; most real schedulers (including old Linux, Windows) are a variant of this |
 
-MLFQ's insight is the one that matters in practice: a thread that keeps using its *entire* time slice is probably CPU-bound batch work, so demote it; a thread that gives up the CPU early (because it's waiting on I/O or a lock) is probably interactive or latency-sensitive, so keep it at high priority. This is exactly the profile of a typical backend request handler: mostly waiting on the database or network, briefly bursting CPU — which is why such threads tend to stay responsive even under a loaded MLFQ-style scheduler without any special tuning.
+**Why it matters:** MLFQ's insight is the one that matters in practice: a thread that keeps using its *entire* time slice is probably CPU-bound batch work, so demote it; a thread that gives up the CPU early (because it's waiting on I/O or a lock) is probably interactive or latency-sensitive, so keep it at high priority. This is exactly the profile of a typical backend request handler: mostly waiting on the database or network, briefly bursting CPU — which is why such threads tend to stay responsive even under a loaded MLFQ-style scheduler without any special tuning.
 
-### Linux: CFS and EEVDF
+> [!tip] Remember
+> Every classic algorithm trades fairness, throughput and responsiveness against each other differently; there is no free lunch, only a choice of which trade-off suits the workload.
 
-Linux abandoned fixed time slices and priority queues for its default scheduling class (`SCHED_OTHER`) starting with the **Completely Fair Scheduler (CFS)**, introduced in kernel 2.6.23. CFS tracks each runnable thread's **virtual runtime (`vruntime`)** — roughly, CPU time consumed, scaled by the inverse of its priority (`nice` value) — and keeps all runnable threads in a red-black tree ordered by `vruntime`. The scheduler always picks the leftmost node: whoever has the *least* virtual runtime so far, i.e. whoever has been waiting relatively the longest.
+### Linux: CFS and EEVDF, step by step
+
+**In plain words:** Linux abandoned fixed time slices and priority queues for its default scheduling class (`SCHED_OTHER`) starting with the **Completely Fair Scheduler (CFS)**, introduced in kernel 2.6.23. Its core idea is simple once stated: always run whoever has used the *least* CPU time so far, relative to their fair share.
+
+**Step by step, what CFS does on every scheduling decision:**
+
+1. Track each runnable thread's **virtual runtime (`vruntime`)** — roughly, CPU time consumed, scaled by the inverse of its priority (`nice` value).
+2. Keep all runnable threads in a red-black tree, ordered by `vruntime`.
+3. Pick the leftmost node in the tree: whoever has the lowest `vruntime`, i.e. has been waiting relatively the longest.
+4. Let that thread run. Its `vruntime` increases as it runs.
+5. Re-insert it into the tree at its new (higher) position, and repeat from step 3.
 
 ```mermaid
 flowchart TD
@@ -87,13 +156,36 @@ flowchart TD
     T1 -- "runs, vruntime increases" --> Resort["re-insert at new position"]
 ```
 
-Since kernel **6.6** (2023), Linux's default scheduling class is **EEVDF** (Earliest Eligible Virtual Deadline First), which replaces CFS. EEVDF keeps the same virtual-time fairness idea but also tracks a virtual deadline per thread and picks the thread with the earliest deadline among those that are "eligible" (haven't used more than their fair share yet). This fixes a known CFS weakness: CFS could let a thread that has been sleeping accumulate an unfair burst of CPU time once it woke up ("sleeper fairness" gaming); EEVDF bounds how far ahead or behind a thread's virtual time can drift, giving more predictable latency for both batch and interactive threads without separate heuristics for each.
+**Example, with numbers:** Three equal-priority threads, A, B and C, all start at `vruntime = 0`. Assume one tick of running adds 1 to a thread's `vruntime` (equal weight, the simplest case):
+
+| Tick | Scheduler picks | Reasoning | vruntime after (A, B, C) |
+| --- | --- | --- | --- |
+| 1 | A | all tied at 0, A wins the tie-break | (1, 0, 0) |
+| 2 | B | B is now the lowest (0) | (1, 1, 0) |
+| 3 | C | C is now the lowest (0) | (1, 1, 1) |
+| 4 | A | all tied again at 1, A wins the tie-break | (2, 1, 1) |
+| 5 | B | B is lowest (1) | (2, 2, 1) |
+| 6 | C | C is lowest (1) | (2, 2, 2) |
+
+Runnable Go version of this exact trace: [[CPU Scheduling - Go]].
+
+**Why it matters:** Nobody ever gets a fixed slice; everyone's running tally is compared continuously, which is what makes CFS "fair" in a much stronger sense than round robin's "everyone gets 4 ticks regardless of how busy they've already been."
+
+**What happens if** two threads have different priorities (`nice` values)? A higher-priority thread's `vruntime` increases *more slowly* per tick of real time (it's scaled by the inverse of its weight), so it looks "behind" more often and gets picked more frequently — nice values bias the comparison, they don't change the comparison rule itself.
+
+Since kernel **6.6** (2023), Linux's default scheduling class is **EEVDF** (Earliest Eligible Virtual Deadline First), which replaces CFS. EEVDF keeps the same virtual-time fairness idea but also tracks a virtual deadline per thread and picks the thread with the earliest deadline among those that are "eligible" (haven't used more than their fair share yet).
+
+> [!warning] Common mistake
+> Assuming CFS was purely fair in every sense. CFS could let a thread that has been sleeping accumulate an unfair burst of CPU time once it woke up ("sleeper fairness" gaming), because a long-sleeping thread's `vruntime` stays low while everyone else's climbs. EEVDF bounds how far ahead or behind a thread's virtual time can drift, closing this gap.
+
+> [!tip] Remember
+> CFS/EEVDF replace "everyone gets a fixed slice" with "everyone's accumulated virtual time is compared continuously, and the furthest-behind thread always goes next."
 
 ### cgroups CPU quotas and throttling
 
-A **cgroup** (control group) is a kernel mechanism for grouping processes and bounding the resources that group can use — CPU, memory, I/O. Container runtimes (Docker, Kubernetes) set a container's CPU limit by writing to its cgroup's CPU controller. cgroup v2 expresses a CPU limit in `cpu.max`, as `"<quota> <period>"` in microseconds — e.g. `"200000 100000"` means 200ms of CPU time per 100ms period, i.e. a limit of 2 full cores' worth of time, regardless of how many cores the host actually has.
+**In plain words:** A **cgroup** (control group) is a kernel mechanism for grouping processes and bounding the resources that group can use — CPU, memory, I/O. Container runtimes (Docker, Kubernetes) set a container's CPU limit by writing to its cgroup's CPU controller.
 
-If a container's threads try to use more CPU time than its quota allows within a period, the kernel **throttles** it: those threads simply don't get scheduled again until the next period starts, even if cores are sitting idle. This shows up as a request that was running fine suddenly stalling for tens of milliseconds, then resuming — because it hit its quota mid-request and had to wait out the rest of the period.
+**Picture it:**
 
 ```mermaid
 sequenceDiagram
@@ -109,220 +201,38 @@ sequenceDiagram
     K-->>C: budget refilled, threads run again
 ```
 
-This is where **`GOMAXPROCS`** matters directly: by default Go sets `GOMAXPROCS` to `runtime.NumCPU()`, the number of *logical* CPUs the host machine (or VM) has — not the container's quota. A container limited to 2 CPUs on a 64-core host would, before this was fixed, run with `GOMAXPROCS=64`: the Go scheduler would happily spin up far more OS threads than the cgroup quota can ever actually run concurrently, each one getting throttled constantly and fighting over the same 2-core budget, which inflates scheduling latency and GC pause coordination overhead. Projects like `uber-go/automaxprocs` existed specifically to read the cgroup quota at startup and call `runtime.GOMAXPROCS()` with the right number.
+**Example:** cgroup v2 expresses a CPU limit in `cpu.max`, as `"<quota> <period>"` in microseconds — e.g. `"200000 100000"` means 200 ms of CPU time per 100 ms period, i.e. a limit of 2 full cores' worth of time, regardless of how many cores the host actually has. If a container's threads try to use more CPU time than its quota allows within a period, the kernel **throttles** it: those threads simply don't get scheduled again until the next period starts, even if cores are sitting idle.
+
+**Why it matters:** This shows up as a request that was running fine suddenly stalling for tens of milliseconds, then resuming — because it hit its quota mid-request and had to wait out the rest of the period. From the outside, nothing in application logs explains it.
+
+### GOMAXPROCS and the quota mismatch
+
+**In plain words:** `GOMAXPROCS` tells the Go runtime how many OS threads to use for running goroutines simultaneously. By default it's set to `runtime.NumCPU()` — the number of *logical* CPUs the **host** machine has, not the container's cgroup quota.
+
+**What happens if** a container is limited to 2 CPUs on a 64-core host, before this mismatch was fixed? `GOMAXPROCS` defaults to 64. The Go scheduler happily spins up far more OS threads than the cgroup quota can ever actually run concurrently, each one getting throttled constantly and fighting over the same 2-core budget — inflating scheduling latency and GC pause coordination overhead. Projects like `uber-go/automaxprocs` existed specifically to read the cgroup quota at startup and call `runtime.GOMAXPROCS()` with the right number.
 
 **Documented (Go 1.25 release notes):** starting with Go 1.25, the runtime itself reads the container's cgroup CPU quota on Linux and sets a container-aware default for `GOMAXPROCS`, updating it automatically if the quota changes at runtime (e.g. a Kubernetes vertical autoscaler adjusting limits). This makes a dedicated `automaxprocs`-style call unnecessary on Go 1.25+ for the common case, though explicitly setting `GOMAXPROCS` is still correct when you want a value different from the quota (for example, deliberately bursting above a soft limit).
 
+> [!tip] Remember
+> `GOMAXPROCS` defaulting to the *host's* CPU count, not the *container's* quota, is a classic source of mystery latency in containerized Go services — Go 1.25+ fixes the default, but it's worth checking which version a service is actually running on.
+
 ## 4. Worked example
 
-### Whiteboard version
+Three processes (P1=10, P2=5, P3=8) under round robin with quantum 4, traced tick by tick:
 
-```go
-func RoundRobin(procs []Proc, quantum int) map[string]int {
-	completion := make(map[string]int, len(procs))
-	queue := append([]Proc(nil), procs...)
-	clock := 0
-	for len(queue) > 0 {
-		p := queue[0]
-		queue = queue[1:]
-		run := min(p.Burst, quantum)
-		clock += run
-		p.Burst -= run
-		if p.Burst == 0 {
-			completion[p.Name] = clock
-		} else {
-			queue = append(queue, p)
-		}
-	}
-	return completion
-}
+```mermaid
+flowchart LR
+    t0["t=0: P1 runs 4<br/>P1 has 6 left"] --> t4["t=4: P2 runs 4<br/>P2 has 1 left"]
+    t4 --> t8["t=8: P3 runs 4<br/>P3 has 4 left"]
+    t8 --> t12["t=12: P1 runs 4<br/>P1 has 2 left"]
+    t12 --> t16["t=16: P2 runs 1<br/>P2 done @17"]
+    t16 --> t17["t=17: P3 runs 4<br/>P3 done @21"]
+    t17 --> t21["t=21: P1 runs 2<br/>P1 done @23"]
 ```
 
-### Full simulators: round robin, FCFS, and reading a cgroup quota
+The completion times — P1 at 23, P2 at 17, P3 at 21 — are exactly what the "step by step" trace in section 3 walked through by hand. Compare them against FCFS's completion times (10, 15, 23): round robin trades a slightly later finish for P1 and P3 for a dramatically earlier finish for P2, which is the entire point of preemption.
 
-```go
-package cpusched
-
-import (
-	"bufio"
-	"fmt"
-	"os"
-	"strconv"
-	"strings"
-)
-
-// CPUQuota reads a cgroup v2 cpu.max file (format "<quota> <period>", or
-// "max <period>" for no limit) and returns the number of whole CPUs that
-// quota allows, rounded up. Go 1.25+ does this same arithmetic on Linux to
-// pick a container-aware default for GOMAXPROCS.
-func CPUQuota(path string) (cpus int, unlimited bool, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, false, err
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	if !sc.Scan() {
-		return 0, false, fmt.Errorf("cpu.max: empty file")
-	}
-	fields := strings.Fields(sc.Text())
-	if len(fields) != 2 {
-		return 0, false, fmt.Errorf("cpu.max: malformed line %q", sc.Text())
-	}
-	if fields[0] == "max" {
-		return 0, true, nil
-	}
-
-	quota, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil {
-		return 0, false, fmt.Errorf("cpu.max: bad quota: %w", err)
-	}
-	period, err := strconv.ParseFloat(fields[1], 64)
-	if err != nil {
-		return 0, false, fmt.Errorf("cpu.max: bad period: %w", err)
-	}
-
-	cpus = int(quota / period)
-	if frac := quota/period - float64(cpus); frac > 1e-9 {
-		cpus++ // round up: a 1.5-CPU quota needs 2 OS threads to ever use it all
-	}
-	if cpus < 1 {
-		cpus = 1
-	}
-	return cpus, false, nil
-}
-
-// Proc is one runnable unit in the scheduling simulations below. Burst is
-// the remaining CPU time it needs, in abstract ticks.
-type Proc struct {
-	Name  string
-	Burst int
-}
-
-// RoundRobin simulates non-preemptive-arrival, preemptive-execution
-// round-robin scheduling with a fixed quantum (what Linux's O(1) scheduler
-// and early CFS approximate with time slices). It returns each process's
-// completion time. All processes are assumed to arrive at time 0 and are
-// queued in FCFS order on ties, like a single run queue.
-func RoundRobin(procs []Proc, quantum int) map[string]int {
-	completion := make(map[string]int, len(procs))
-	queue := make([]Proc, len(procs))
-	copy(queue, procs)
-
-	clock := 0
-	for len(queue) > 0 {
-		p := queue[0]
-		queue = queue[1:]
-
-		run := p.Burst
-		if run > quantum {
-			run = quantum
-		}
-		clock += run
-		p.Burst -= run
-
-		if p.Burst == 0 {
-			completion[p.Name] = clock
-		} else {
-			queue = append(queue, p)
-		}
-	}
-	return completion
-}
-
-// FCFS simulates first-come-first-served scheduling: each process runs to
-// completion in arrival order, with no preemption.
-func FCFS(procs []Proc) map[string]int {
-	completion := make(map[string]int, len(procs))
-	clock := 0
-	for _, p := range procs {
-		clock += p.Burst
-		completion[p.Name] = clock
-	}
-	return completion
-}
-```
-
-```go
-// TestRoundRobinMatchesHandTrace checks RR against a trace worked out by
-// hand: P1(10) P2(5) P3(8), quantum 4, all arriving at time 0.
-//
-//	t=0  P1 runs 4   -> P1=6,  queue [P2 P3 P1]
-//	t=4  P2 runs 4   -> P2=1,  queue [P3 P1 P2]
-//	t=8  P3 runs 4   -> P3=4,  queue [P1 P2 P3]
-//	t=12 P1 runs 4   -> P1=2,  queue [P2 P3 P1]
-//	t=16 P2 runs 1   -> done at t=17
-//	t=17 P3 runs 4   -> done at t=21
-//	t=21 P1 runs 2   -> done at t=23
-func TestRoundRobinMatchesHandTrace(t *testing.T) {
-	procs := []Proc{{"P1", 10}, {"P2", 5}, {"P3", 8}}
-	got := RoundRobin(procs, 4)
-	want := map[string]int{"P1": 23, "P2": 17, "P3": 21}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-}
-
-// TestFCFSConvoyEffect shows the classic convoy problem: one long process
-// first makes every later process wait for the whole of its burst, which RR
-// avoids by capping any single run to the quantum.
-func TestFCFSConvoyEffect(t *testing.T) {
-	procs := []Proc{{"long", 100}, {"short", 1}}
-	fcfs := FCFS(procs)
-	rr := RoundRobin(procs, 4)
-	if fcfs["short"] <= rr["short"] {
-		t.Fatalf("FCFS short completion %d should be worse than RR's %d", fcfs["short"], rr["short"])
-	}
-}
-
-// TestFCFSRunsInOrder checks that FCFS completion times are simply the
-// cumulative sum of burst times in arrival order.
-func TestFCFSRunsInOrder(t *testing.T) {
-	procs := []Proc{{"P1", 3}, {"P2", 2}, {"P3", 7}}
-	got := FCFS(procs)
-	want := map[string]int{"P1": 3, "P2": 5, "P3": 12}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-}
-
-// TestCPUQuota checks the cgroup v2 cpu.max parsing and rounding: an exact
-// quota, a quota that needs rounding up, and the unlimited ("max") case.
-func TestCPUQuota(t *testing.T) {
-	cases := []struct {
-		name      string
-		line      string
-		wantCPUs  int
-		wantUnlim bool
-	}{
-		{"exact-one", "100000 100000", 1, false},
-		{"rounds-up", "150000 100000", 2, false},
-		{"unlimited", "max 100000", 0, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "cpu.max")
-			if err := os.WriteFile(path, []byte(tc.line+"\n"), 0o644); err != nil {
-				t.Fatalf("WriteFile: %v", err)
-			}
-			cpus, unlimited, err := CPUQuota(path)
-			if err != nil {
-				t.Fatalf("CPUQuota: %v", err)
-			}
-			if unlimited != tc.wantUnlim {
-				t.Fatalf("unlimited = %v, want %v", unlimited, tc.wantUnlim)
-			}
-			if !tc.wantUnlim && cpus != tc.wantCPUs {
-				t.Fatalf("cpus = %d, want %d", cpus, tc.wantCPUs)
-			}
-		})
-	}
-}
-```
-
-**Tested:** `go vet` and `go test -race` both pass on Go 1.24.4, darwin/arm64 (2026-11-06) — 4 tests including `TestCPUQuota` (table test over `"100000 100000"` → 1 CPU, `"150000 100000"` → rounds up to 2, `"max 100000"` → unlimited) and `TestFCFSRunsInOrder`.
+Runnable Go version of both simulators, plus the cgroup quota parser and the vruntime trace: [[CPU Scheduling - Go]].
 
 ## 5. Variants and comparison
 
@@ -342,6 +252,9 @@ func TestCPUQuota(t *testing.T) {
 - cgroup CPU quotas trade predictable multi-tenant isolation for throttling latency spikes; a workload that's bursty rather than steady-state often needs a higher `cpu.max` burst allowance or `cpu.weight`-based soft limits instead of a hard quota.
 - Tuning `nice`/priority rarely helps a backend service in practice — the actual bottleneck is almost always I/O wait (database, network) or lock contention, not CPU scheduling order. Profile before assuming the scheduler is the problem.
 
+> [!tip] Remember
+> A "faster scheduler" is almost never the fix for a slow backend service — check I/O wait and lock contention first.
+
 ## 7. In production
 
 - **Real systems:** every Linux server you deploy a Go service on uses CFS (kernel < 6.6) or EEVDF (6.6+) by default; Kubernetes sets `cpu.max` from a Pod's CPU `limits`, and CPU `requests` translate into `cpu.weight` (relative share) rather than a hard cap.
@@ -351,14 +264,26 @@ func TestCPUQuota(t *testing.T) {
 	- A batch job degrades an interactive service's latency on the same host → `nice` the batch job down, or put it in its own cgroup with a lower `cpu.weight`.
 - **What to monitor:** `cpu.stat`'s `nr_throttled` / `throttled_usec` per container, run-queue length (`/proc/loadavg`'s load average, or `vmstat`'s `r` column), context-switch rate (`vmstat`'s `cs` column), and `GOMAXPROCS` vs the actual quota.
 
-## 8. Deep dive
+## 8. Whiteboard version
+
+If someone asks you to explain CPU scheduling at a whiteboard with no code:
+
+1. Draw a short queue of boxes labelled P1, P2, P3 with burst times written inside (10, 5, 8).
+2. Draw one box labelled "core."
+3. For FCFS: draw an arrow from P1 straight to the core for its full burst, then P2, then P3 — one long, uninterrupted run each.
+4. For round robin: draw the same three boxes, but chop each burst into 4-tick segments and interleave the arrows — P1(4), P2(4), P3(4), P1(4), P2(1), P3(4), P1(2).
+5. Point at how much later P2 finishes under FCFS (tick 15) than under round robin (tick 17) — wait, actually point out P2 finishes *earlier* under round robin relative to how long it had to wait behind P1's full burst; the real teaching moment is P3, which finishes at tick 23 under *both*, showing the convoy effect specifically delays the *short* job stuck behind a long one, not every job uniformly.
+
+That hand-drawn comparison is the entire convoy-effect argument; CFS replaces step 4's fixed 4-tick segments with "always pick whoever has the lowest accumulated virtual runtime," which the vruntime trace table in section 3 works out by hand.
+
+## 9. Deep dive
 
 - **Why EEVDF over CFS.** CFS's fairness was purely about accumulated `vruntime`; a thread that slept for a long time came back with a low `vruntime` and could legitimately "catch up" by hogging the CPU for a while, which hurts latency-sensitive neighbors even though it's technically fair over a long enough window. EEVDF bounds eligibility by a virtual deadline computed from a requested slice length, so a thread can't bank an unbounded amount of catch-up credit; this gives more predictable tail latency for everything else running alongside it.
 - **Context switch cost is not just the switch.** Saving/restoring registers is cheap (sub-microsecond); the real cost is **cache and TLB pollution** — the new thread starts with cold L1/L2 caches and a cold TLB (see [[Memory Hierarchy and CPU Caches]] and [[Virtual Memory, Paging and the TLB]]), so its first several memory accesses are slow even though the switch "finished" instantly.
 - **CPU pinning and `cpuset` cgroups.** For the lowest, most predictable latency, some systems (HFT, some database engines) pin specific threads to specific cores via `cpuset` and isolate those cores from the rest of the scheduler (`isolcpus`/`nohz_full`), trading flexibility for eliminating scheduling jitter entirely on the hot path.
 - **The relationship to Go's own scheduler.** Everything above is the OS scheduler deciding which *OS thread* runs on which core. Go additionally schedules *goroutines* onto a smaller number of OS threads itself (the GMP model), which is a cooperative, userspace scheduling layer sitting on top of this one — see [[Runtime - Goroutine Scheduler (GMP)]] for how that works and why it exists even though the OS already schedules threads.
 
-## 9. Interview questions
+## 10. Interview questions
 
 > [!question]- Why did Linux move away from fixed time-slice scheduling?
 > Fixed time slices force a trade-off: too long hurts interactive responsiveness, too short wastes time on context switches, and the right value depends on the workload. CFS (and now EEVDF) instead track each thread's accumulated virtual runtime and always run whoever is relatively furthest behind, which adapts automatically without a tunable slice length.
@@ -379,7 +304,10 @@ func TestCPUQuota(t *testing.T) {
 > [!question]- Does a faster CPU scheduler make your API faster?
 > Rarely, for a typical backend service. Most request latency is spent waiting on I/O (database queries, downstream HTTP calls — see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]), not waiting in the OS run queue for a CPU core. Scheduling only becomes the bottleneck under CPU saturation, heavy context-switch churn, or cgroup throttling — profile first.
 
-## 10. Cheat sheet
+> [!question]- In the vruntime worked example, why does thread A run first on tick 1 if all three threads are tied at vruntime 0?
+> CFS (and EEVDF) need a deterministic tie-break when multiple threads have equal virtual runtime; which thread wins a tie is an implementation detail (insertion order in the tree, in this simplified model), not a fairness guarantee about who "deserves" to go first. The fairness guarantee is about the *long-run* distribution of CPU time, not about who wins any single tie.
+
+## 11. Cheat sheet
 
 - The scheduler decides which runnable thread gets a core, and for how long; more runnable work than cores means something always waits.
 - FCFS: simple, convoy effect. Round robin: fair, needs quantum tuning. MLFQ: demotes CPU-hogs, protects I/O-bound threads.
@@ -395,3 +323,4 @@ func TestCPUQuota(t *testing.T) {
 - **Before this:** [[Processes, Threads and Context Switching]]
 - **Next:** [[Concurrency Primitives - Mutex, Semaphore, Atomics]], [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]
 - **Compare with:** [[Runtime - Goroutine Scheduler (GMP)]] (a cooperative scheduler built on top of OS threads, not a replacement for this)
+- **Runnable code:** [[CPU Scheduling - Go]]

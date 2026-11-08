@@ -8,7 +8,7 @@ sources:
   - "HTML Standard: timers (setTimeout/setInterval), the event loop"
   - "MDN Web Docs: Event bubbling and capturing, IntersectionObserver, MutationObserver"
 status: reviewed
-updated: 2026-11-04
+updated: 2026-11-09
 ---
 
 # DOM, Events and Timers
@@ -101,9 +101,45 @@ document.querySelector("#images").addEventListener("click", (e) => {
 });
 ```
 
-This single listener keeps working even if images are added to `#images` later — a per-image listener would need re-attaching every time. For a listener that only reads the event and never calls `preventDefault`, mark it `{ passive: true }` so the browser doesn't have to wait for your handler before scrolling — this matters most for `touchstart`/`wheel` listeners that can otherwise visibly delay scroll. Always `removeEventListener` a listener you no longer need (same function reference required), especially on elements you remove from the DOM, to avoid pinning them in memory.
+This single listener keeps working even if images are added to `#images` later — a per-image listener would need re-attaching every time. For a listener that only reads the event and never calls `preventDefault`, mark it `{ passive: true }` so the browser doesn't have to wait for your handler before scrolling — this matters most for `touchstart`/`wheel` listeners that can otherwise visibly delay scroll.
+
+> [!warning] Common mistake
+> Attaching a listener and forgetting to remove it. `removeEventListener` needs the exact same function reference you passed to `addEventListener` — an inline arrow function can never be removed, because a new function value is created every time you write it. A listener left on an element you then remove from the DOM keeps that element (and anything it closes over) pinned in memory until the page unloads.
+
+### Cleaning up listeners in bulk with AbortController
+
+**In plain words:** calling `removeEventListener` once per listener works, but it means keeping a reference to every single handler you ever attached. An **`AbortController`** is a single off-switch you hand to as many listeners as you like; calling it once removes all of them, with no list of function references to track.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    AC["new AbortController()"] -->|"{ signal: ac.signal }"| L1["Listener 1"]
+    AC -->|"{ signal: ac.signal }"| L2["Listener 2"]
+    AC -->|"{ signal: ac.signal }"| L3["Listener 3"]
+    Call["ac.abort()"] -.removes all three at once.-> L1
+    Call -.-> L2
+    Call -.-> L3
+```
+
+**Example:**
+
+```js
+const ac = new AbortController();
+btn.addEventListener("click", onClick, { signal: ac.signal });
+window.addEventListener("resize", onResize, { signal: ac.signal });
+// later, e.g. when a component unmounts:
+ac.abort(); // both listeners above are gone — no stored function references needed
+```
+
+**Why it matters:** this is now the standard cleanup pattern for any component that attaches more than one or two listeners — one `ac.abort()` replaces a whole list of paired `addEventListener`/`removeEventListener` calls and can't be forgotten for just one of them, because there's only one call to make.
+
+> [!tip] Remember
+> One listener you no longer need → `removeEventListener` with the same function reference. Several listeners that should all go away together → one shared `AbortController`, aborted once.
 
 ### Timers and the event loop
+
+**In plain words:** `setTimeout` and `setInterval` don't run code immediately, and they don't guarantee an exact delay either — they only promise "no sooner than this many milliseconds," and the browser still has to be free to actually run the callback when that time is up.
 
 ```js
 const timeoutId = setTimeout(sayHello, 2000);   // runs sayHello ONCE, no sooner than ~2000ms from now
@@ -113,7 +149,9 @@ const intervalId = setInterval(sayDate, 1000, "hi"); // runs sayDate roughly eve
 clearInterval(intervalId);                            // the only way it stops: must be called explicitly
 ```
 
-`setInterval` does not run once — it keeps firing every interval, forever, until `clearInterval` is called. A timer's delay is a floor, not an exact schedule: the callback is placed on the **task queue** only after the delay elapses, and it still has to wait for the call stack to be empty and for any already-queued task ahead of it to finish.
+`setInterval` does not run once — it keeps firing every interval, forever, until `clearInterval` is called.
+
+**Picture it — what actually happens between "the delay elapses" and "your code runs":**
 
 ```mermaid
 sequenceDiagram
@@ -129,7 +167,23 @@ sequenceDiagram
     Note over Stack: run fn, only once the stack is clear
 ```
 
-Two details that are easy to get wrong: nested timers (`setTimeout` calling itself, or a `setInterval` beyond 5 levels deep in some engines) are clamped to a minimum delay around 4ms even if you ask for less; and a timer callback that throws does not stop a `setInterval`'s future firings — each tick is independent. `requestAnimationFrame(fn)` is a different primitive for animation: it runs `fn` once, right before the browser's next repaint, synced to the display's refresh rate, rather than on a fixed millisecond delay.
+**Step by step, what the diagram shows:**
+1. `setTimeout(fn, 1000)` hands `fn` to the browser's own timer facility, not to JavaScript — the call returns immediately.
+2. The rest of your synchronous code keeps running; the timer is counting down in parallel, not blocking anything.
+3. Once at least 1000ms have passed, the browser moves `fn` onto the **task queue** — this is a queue position, not an execution.
+4. The event loop only pulls a task off that queue and runs it when the call stack is completely empty, and only after it (so a slow synchronous script, or a task already ahead in the queue, delays `fn` further).
+
+**Example:** a page running a synchronous loop that takes 1500ms will make a `setTimeout(fn, 1000)` scheduled just before that loop started fire at roughly 1500ms, not 1000ms — the delay is a floor the browser cannot run earlier than, never a promise it will run exactly on time.
+
+**Why it matters:** code that assumes `setTimeout(fn, 0)` runs "right now" will be surprised the first time a busy page delays it by hundreds of milliseconds — the fix is to never depend on exact timer timing for correctness, only for approximate scheduling.
+
+> [!warning] Common mistake
+> Two more details that are easy to get wrong: nested timers (`setTimeout` calling itself, or a `setInterval` beyond 5 levels deep in some engines) are clamped to a minimum delay around 4ms even if you ask for less; and a timer callback that throws does not stop a `setInterval`'s future firings — each tick is independent, so one bad tick never cancels the rest.
+
+`requestAnimationFrame(fn)` is a different primitive for animation: it runs `fn` once, right before the browser's next repaint, synced to the display's refresh rate, rather than on a fixed millisecond delay.
+
+> [!tip] Remember
+> A timer's delay is always a minimum, never a guarantee — the callback still waits in line for the call stack to clear and for its turn on the task queue.
 
 ## 4. Worked example
 
@@ -158,65 +212,26 @@ setTimeout(() => clearInterval(id), 1700); // stop the interval after about 3 ti
 
 ### Go comparison: `time.Timer` vs `time.Ticker`
 
-Go's standard library draws exactly this same one-shot-vs-repeating line, and the parallel makes `setInterval` easy to remember: a `Timer` is `setTimeout`, a `Ticker` is `setInterval`, and `Ticker.Stop()` is `clearInterval`. Tested on Go 1.24:
+Go's standard library draws exactly this same one-shot-vs-repeating line, and the parallel makes `setInterval` easy to remember: a `Timer` is `setTimeout`, a `Ticker` is `setInterval`, and `Ticker.Stop()` is `clearInterval`. Both sides share the same rule traced above: the delay is a minimum, never a guarantee.
 
-```go
-// Package timers mirrors the one-shot vs repeating distinction between
-// JavaScript's setTimeout/setInterval using Go's time.Timer/time.Ticker.
-package timers
+| JavaScript | Go | Fires |
+| --- | --- | --- |
+| `setTimeout(fn, d)` | `time.After(d)` / `time.NewTimer(d)` | once, no sooner than `d` |
+| `setInterval(fn, d)` | `time.NewTicker(d)` | repeatedly every `d`, until stopped |
+| `clearInterval(id)` | `Ticker.Stop()` | stops future firings |
 
-import "time"
+**Runnable Go version:** [[DOM, Events and Timers - Go]].
 
-// AfterOnce fires exactly once after at least d, like setTimeout(fn, d).
-// The delay is a minimum, not a guarantee: a busy scheduler can run it later.
-func AfterOnce(d time.Duration) <-chan time.Time {
-	return time.After(d)
-}
+**Picture it — which primitive to reach for:**
 
-// RepeatingTicks starts a ticker that fires every d until stop is closed,
-// like setInterval(fn, d) running until clearInterval(id). The caller must
-// call Ticker.Stop (the Go equivalent of clearInterval) to release it.
-func RepeatingTicks(d time.Duration, n int) []time.Time {
-	t := time.NewTicker(d)
-	defer t.Stop() // equivalent to clearInterval: never leak the ticker
-	ticks := make([]time.Time, 0, n)
-	for i := 0; i < n; i++ {
-		ticks = append(ticks, <-t.C)
-	}
-	return ticks
-}
+```mermaid
+flowchart TD
+    Q{What do you need to react to?} -->|"an element entering/leaving the viewport"| IO["IntersectionObserver"]
+    Q -->|"a DOM node's attributes/children changing"| MO["MutationObserver"]
+    Q -->|"one visual update per repaint, e.g. animation"| RAF["requestAnimationFrame"]
+    Q -->|"run once, after a delay"| ST["setTimeout"]
+    Q -->|"run repeatedly, every N ms, until stopped"| SI["setInterval"]
 ```
-
-```go
-package timers
-
-import (
-	"testing"
-	"time"
-)
-
-func TestAfterOnceFiresAtLeastOnce(t *testing.T) {
-	start := time.Now()
-	<-AfterOnce(10 * time.Millisecond)
-	if elapsed := time.Since(start); elapsed < 10*time.Millisecond {
-		t.Fatalf("fired after %v, want >= 10ms (a minimum delay, not a guarantee)", elapsed)
-	}
-}
-
-func TestRepeatingTicksFiresMultipleTimes(t *testing.T) {
-	ticks := RepeatingTicks(5*time.Millisecond, 3)
-	if len(ticks) != 3 {
-		t.Fatalf("got %d ticks, want 3 (a ticker repeats, it is not one-shot)", len(ticks))
-	}
-	for i := 1; i < len(ticks); i++ {
-		if !ticks[i].After(ticks[i-1]) {
-			t.Fatalf("tick %d did not come after tick %d", i, i-1)
-		}
-	}
-}
-```
-
-**Measured:** `go vet ./...` reports no issues and `go test -race ./...` passes both tests (Go 1.24.4, darwin/arm64, 2026-11-04). `TestAfterOnceFiresAtLeastOnce` directly demonstrates the "minimum delay, not guaranteed" rule: it asserts the elapsed time is `>=` the requested delay, never `==`.
 
 ## 5. Variants and comparison
 
@@ -227,6 +242,7 @@ func TestRepeatingTicksFiresMultipleTimes(t *testing.T) {
 | `requestAnimationFrame` | Fires once per repaint, synced to refresh rate | Animation, anything that changes visual state every frame | Pauses automatically in a background tab |
 | `MutationObserver` | Callback fires when watched DOM nodes/attributes change | Reacting to DOM changes made by other code (widgets, extensions) | Batched, asynchronous — not instant |
 | `IntersectionObserver` | Callback fires when an element crosses a viewport threshold | Lazy-loading images, infinite scroll, "seen" tracking | Cheaper than scroll-event polling; still asynchronous |
+| `AbortController` + `{ signal }` | One `abort()` call removes every listener registered with that signal | Removing several listeners together, e.g. on component teardown | Needs a listener-registration API that accepts `signal` (most DOM APIs do) |
 
 ## 6. Trade-offs and when not to use
 
@@ -274,6 +290,9 @@ func TestRepeatingTicksFiresMultipleTimes(t *testing.T) {
 > [!question]- How would you detect when an element scrolls into view, without a scroll listener?
 > Use an `IntersectionObserver`, giving it the element and a callback that fires when it crosses a visibility threshold. It's asynchronous and batched by the browser, so it doesn't run on every scroll pixel the way a manual scroll-event handler computing `getBoundingClientRect()` would, which is far cheaper for things like lazy-loading images.
 
+> [!question]- You attached five listeners in a component and need to remove all of them when it unmounts. What's the cleanest way?
+> Create one `AbortController`, pass its `signal` to every `addEventListener` call (`{ signal: ac.signal }`), and call `ac.abort()` once on teardown. That removes all five listeners in one call, instead of storing five separate function references and calling `removeEventListener` on each — and it can't accidentally miss one.
+
 ## 10. Cheat sheet
 
 - The DOM is a live in-memory tree built from HTML text once; HTML itself isn't consulted again after parsing.
@@ -283,9 +302,11 @@ func TestRepeatingTicksFiresMultipleTimes(t *testing.T) {
 - All timer delays are a floor, not a guarantee — the callback still waits for the call stack and microtask queue.
 - `textContent` is always safe; `innerHTML` is an XSS risk with untrusted input.
 - Prefer `IntersectionObserver`/`MutationObserver` over polling the DOM in a loop.
+- Share one `AbortController` across several listeners that should all be removed together; one `abort()` replaces a list of paired `removeEventListener` calls.
 
 ## Links
 
 - **Before this:** [[JavaScript Core - Types, Scope, Hoisting, Closures, this]], [[JavaScript Objects, Arrays and Iteration]]
 - **Next:** [[JavaScript Async - Event Loop, Promises, async-await]], [[React Fundamentals - Components, JSX, Props, State]]
 - **Compare with:** [[How Browsers Load and Render a Page]] (where the initial DOM tree comes from before any of this runs)
+- **Runnable code:** [[DOM, Events and Timers - Go]]

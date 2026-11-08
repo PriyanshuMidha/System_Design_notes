@@ -90,6 +90,8 @@ flowchart TB
 
 The row number is the glue: value 42 in `amount_minor` belongs to the same row as value 42 in `event_type`. Rebuilding a full row costs one read per column, which is why column stores are poor at "fetch one invoice".
 
+Example with numbers: a heap page of 8 KB holds about 68 rows of 120 bytes. Summing `amount_minor` over those 68 rows touches the whole page. In a column file the same 68 amounts are 68 × 8 bytes = 544 bytes, and after compression often far less, so one 8 KB block holds the amounts of thousands of rows.
+
 ### Why columns compress well
 
 All values in a column share a type and usually a narrow range, and if the table is sorted, neighbours are often equal or close. Each column picks an encoding that fits its shape:
@@ -105,9 +107,68 @@ All values in a column share a type and usually a narrow range, and if the table
 
 ClickHouse exposes these directly as column codecs (`Delta`, `DoubleDelta`, `Gorilla`, `T64`, `LZ4`, `ZSTD`) and as the `LowCardinality(String)` type, which is dictionary encoding.
 
+#### Delta-of-delta on timestamps
+
+A scrape every 15 seconds produces timestamps that grow by the same amount every time. Storing the difference of the differences turns them into zeros.
+
+```mermaid
+flowchart LR
+    A["timestamps (s): 0, 15, 30, 45, 61"] --> B["deltas: -, 15, 15, 15, 16"]
+    B --> C["delta of delta: -, -, 0, 0, 1"]
+    C --> D["stored: first value 0, first delta 15, then 0, 0, 1"]
+    D --> E["each 0 costs 1 byte as a varint, or about 1 bit in Gorilla's bit buckets"]
+```
+
+Example with numbers: 1,000 raw 8-byte timestamps take 8,000 bytes. With a 15 s cadence and one 1 s jitter every 100 samples, the delta-of-delta form takes about 1,027 bytes (measured in the Go note), roughly 1 byte per sample.
+
+#### Gorilla XOR on float values
+
+Gauges such as CPU load change slowly, so consecutive values share their sign, exponent and high mantissa bits. XOR of two such values has long runs of zeros at both ends, and only the middle bits need storing.
+
+```mermaid
+flowchart TD
+    V["next value XOR previous value"] --> Z{"result is 0?"}
+    Z -->|"yes: same value"| C0["write control bit 0 (1 bit total)"]
+    Z -->|no| W{"meaningful bits fit inside the previous window of leading and trailing zeros?"}
+    W -->|yes| C10["write 10, then only the bits of the old window"]
+    W -->|no| C11["write 11, then 5 bits leading zeros, 6 bits length, then the bits"]
+```
+
+| Series | Raw | Gorilla | Why |
+| --- | --- | --- | --- |
+| 500 constant floats | 4,000 B | 75 B | Every XOR is 0, so each value costs 1 bit |
+| 500 floats counting up by 3 | 4,000 B | 704 B | Few mantissa bits change each step |
+| 500 random floats in [20, 21) | 4,000 B | 3,133 B | Noise fills the low mantissa bits, so almost nothing can be removed |
+
+These sizes are measured with the Go implementation in the Go note.
+
+#### Run-length encoding and the sort key
+
+RLE stores each run of equal values once with a count. It only helps when equal values are adjacent, so the sort key decides how well it works.
+
+| Column order | Content | Runs |
+| --- | --- | --- |
+| As inserted | paid, paid, paid, open, open, void, paid | 4 runs |
+| Sorted | open, open, paid, paid, paid, paid, void | 3 runs |
+
+In a table sorted by `(workspace_id, occurred_at)`, the `workspace_id` column becomes long runs and compresses to almost nothing, while the unsorted `invoice_id` does not.
+
 ### Vectorized execution
 
 A row-at-a-time engine (PostgreSQL's executor, for example) calls a function per row per operator. A **vectorized** engine runs each operator over a batch of thousands of values from one column at once. The inner loop is a plain array walk the CPU can pipeline and turn into SIMD (single instruction, multiple data) instructions, and the per-row overhead of function calls and branching disappears. ClickHouse, DuckDB, Snowflake and BigQuery all execute this way.
+
+```mermaid
+flowchart LR
+    subgraph rowwise["Row at a time"]
+        direction TB
+        R1["for each row: call filter, call add, call next"] --> R2["function call and branch per value"]
+    end
+    subgraph vec["Vectorized"]
+        direction TB
+        V1["load a batch of 4,096 amount values"] --> V2["compare type column to 'paid' into a bit mask"]
+        V2 --> V3["add masked amounts in a tight array loop (SIMD)"]
+    end
+```
 
 ### Skipping data: sparse indexes, min/max and partitions
 
@@ -116,6 +177,16 @@ Column stores rarely use B-tree indexes on every row. They keep small summaries 
 - **Partition pruning.** The table is split by month or day; a query for last week never opens older partitions.
 - **Sparse primary index.** ClickHouse sorts each data part by the `ORDER BY` key and stores the key of only the first row of every **granule** of 8,192 rows (the default `index_granularity`). A lookup binary-searches these marks and reads only the matching granules.
 - **Min/max (zone map) statistics.** Parquet stores min and max per column chunk and page; PostgreSQL's BRIN index stores min and max per range of 128 heap pages by default. Both work only when the column is correlated with physical order, which time columns usually are.
+
+```mermaid
+flowchart TB
+    Q["WHERE workspace_id = 7 AND occurred_at >= 2026-11-01"] --> PP["1. partition pruning: open only the 202611 partition"]
+    PP --> SI["2. sparse index: binary search the per-granule marks (about 17 steps for 122,070 granules)"]
+    SI --> G["3. read only the matching granules of the needed columns"]
+    G --> MM["4. inside each block, min/max statistics skip blocks that cannot match"]
+```
+
+Example with numbers: 1 billion rows with `index_granularity = 8192` give about 122,070 marks (1,000,000,000 / 8,192). The sparse index holds one key per mark, which is small enough to stay in memory, and a lookup reads only the granules whose range can contain workspace 7.
 
 ### Time-series ingestion and retention
 
@@ -130,40 +201,29 @@ flowchart LR
 
 The shape is the same across Prometheus, TimescaleDB and ClickHouse: write to a log and a memory buffer, flush immutable compressed blocks per time window, merge small blocks into big ones in the background, and expire data by dropping whole blocks. This is the LSM idea from [[Storage Engines - B-tree vs LSM and WAL]], specialised for time order.
 
-## 4. Worked example
+Retention is where this design pays off. Deleting 90-day-old rows from a row store writes dead tuples, WAL and vacuum work proportional to the data. Dropping a block or partition removes a directory and costs a metadata change.
 
-### Whiteboard version
-
-The whole idea in a few lines of Go: a row store is a slice of structs, a column store is a struct of slices, and an aggregate touches only one slice.
-
-```go
-// Row store: each event is stored together.
-type EventRow struct {
-	ID, WorkspaceID int64
-	Type            string
-	OccurredAt      int64
-	AmountMinor     int64
-	// ...15 more fields read by every scan
-}
-
-// Column store: each field is stored together.
-type EventColumns struct {
-	Type        []string // dictionary + RLE
-	OccurredAt  []int64  // delta-of-delta
-	AmountMinor []int64  // integer codec + ZSTD
-}
-
-func paidTotal(c EventColumns) (sum int64) {
-	for i, t := range c.Type { // touches 2 of 20 columns
-		if t == "paid" {
-			sum += c.AmountMinor[i]
-		}
-	}
-	return sum
-}
+```mermaid
+flowchart LR
+    subgraph t1["Tier 1: raw, 15 days"]
+        a["every sample or event"]
+    end
+    subgraph t2["Tier 2: 5-minute rollups, 1 year"]
+        b["buckets of 5 minutes"]
+    end
+    subgraph t3["Tier 3: hourly or daily rollups, 5 years"]
+        c["buckets of 1 hour or 1 day"]
+    end
+    subgraph t4["Tier 4: archive"]
+        d["Parquet on object storage"]
+    end
+    a -->|"downsample"| b -->|"downsample"| c
+    a -->|"export"| d
 ```
 
-### InvoiceOps analytics store in ClickHouse
+## 4. Worked example
+
+### 4.1 InvoiceOps analytics store in ClickHouse
 
 The OLTP database stays PostgreSQL. Invoice events flow through CDC (change data capture, reading the database's WAL as a stream of changes) into Kafka and on into ClickHouse:
 
@@ -177,20 +237,13 @@ flowchart LR
     s3 --> adhoc["ad hoc queries: Trino, Athena, DuckDB"]
 ```
 
-The raw table, sorted so that one workspace's events in time order sit together:
+The raw table is sorted so that one workspace's events in time order sit together. The parts of its definition that matter:
 
 ```sql
--- ClickHouse SQL
-CREATE TABLE invoice_events_raw
-(
-    workspace_id  UInt64,
-    invoice_id    UInt64,
-    event_type    LowCardinality(String),      -- dictionary encoded
-    currency      LowCardinality(String),
-    amount_minor  Int64,
-    occurred_at   DateTime64(3) CODEC(DoubleDelta, ZSTD),
-    event_id      UUID                          -- for deduplication
-)
+-- ClickHouse SQL (excerpt)
+event_type    LowCardinality(String),                 -- dictionary encoded
+occurred_at   DateTime64(3) CODEC(DoubleDelta, ZSTD),
+event_id      UUID                                    -- for deduplication
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(occurred_at)
 ORDER BY (workspace_id, occurred_at, event_id)
@@ -204,34 +257,13 @@ TTL toDateTime(occurred_at) + INTERVAL 15 DAY DELETE;
 The rollup, fed by a materialized view. In ClickHouse a materialized view is an **insert trigger**: each block inserted into the source table is run through the view's `SELECT`, and the result is inserted into the target table. It never re-reads old data.
 
 ```sql
--- ClickHouse SQL
-CREATE TABLE revenue_daily
-(
-    workspace_id UInt64,
-    day          Date,
-    currency     LowCardinality(String),
-    paid_minor   AggregateFunction(sum, Int64),
-    invoices     AggregateFunction(uniq, UInt64)
-)
-ENGINE = AggregatingMergeTree
-ORDER BY (workspace_id, day, currency);
-
-CREATE MATERIALIZED VIEW revenue_daily_mv TO revenue_daily AS
-SELECT workspace_id,
-       toDate(occurred_at)    AS day,
-       currency,
+-- ClickHouse SQL (excerpt of the view)
+SELECT workspace_id, toDate(occurred_at) AS day, currency,
        sumState(amount_minor) AS paid_minor,
        uniqState(invoice_id)  AS invoices
 FROM invoice_events_raw
 WHERE event_type = 'paid'
 GROUP BY workspace_id, day, currency;
-
--- Reading merges the partial states:
-SELECT day, currency, sumMerge(paid_minor) AS paid_minor, uniqMerge(invoices) AS invoices
-FROM revenue_daily
-WHERE workspace_id = 7 AND day >= today() - 90
-GROUP BY day, currency
-ORDER BY day;
 ```
 
 The `-State` functions store partial aggregates; the `-Merge` functions combine them at read time. Two inserts for the same day produce two partial rows until a background merge combines them, so reads must always `GROUP BY` again.
@@ -246,401 +278,45 @@ Sizes for this design, as **estimates** for 1 billion events a year (2.7 million
 
 The dashboard query now reads a few thousand rollup rows instead of scanning a year of events.
 
-### The same idea at modest volume: PostgreSQL partitioning and BRIN
+The full `CREATE TABLE`, rollup table, materialized view and read query are in the Go note.
+
+### 4.2 The same idea at modest volume: PostgreSQL partitioning and BRIN
 
 At tens of millions of rows a separate store is often not worth running. PostgreSQL 17 handles time-ordered data well with declarative partitioning and a BRIN index (block range index: a tiny index that stores min and max per range of heap pages):
 
 ```sql
-CREATE TABLE invoice_events (
-    id            bigint GENERATED ALWAYS AS IDENTITY,
-    workspace_id  bigint      NOT NULL,
-    invoice_id    bigint      NOT NULL,
-    event_type    text        NOT NULL,
-    amount_minor  bigint      NOT NULL,
-    occurred_at   timestamptz NOT NULL,
-    PRIMARY KEY (id, occurred_at)            -- must include the partition key
-) PARTITION BY RANGE (occurred_at);
-
-CREATE TABLE invoice_events_2026_10 PARTITION OF invoice_events
-    FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
 CREATE TABLE invoice_events_2026_11 PARTITION OF invoice_events
     FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
-
--- A few dozen KB per partition instead of a B-tree of hundreds of MB.
 CREATE INDEX ON invoice_events USING brin (occurred_at);
--- Per-workspace lookups still need a B-tree.
-CREATE INDEX ON invoice_events (workspace_id, occurred_at);
-
 -- Retention without row-by-row deletes:
 ALTER TABLE invoice_events DETACH PARTITION invoice_events_2026_10 CONCURRENTLY;
 DROP TABLE invoice_events_2026_10;
+```
 
--- Rollup refreshed by a job every 5 minutes:
-CREATE TABLE daily_revenue_by_workspace (
-    workspace_id bigint NOT NULL,
-    day          date   NOT NULL,
-    paid_minor   bigint NOT NULL,
-    PRIMARY KEY (workspace_id, day)
-);
+The parent table is `PARTITION BY RANGE (occurred_at)`, and its primary key must include the partition key. A BRIN index costs a few dozen KB per partition instead of a B-tree of hundreds of MB. Per-workspace lookups still need a B-tree on `(workspace_id, occurred_at)`, and a small rollup table maintained by a job serves the dashboard.
+
+```mermaid
+flowchart TB
+    P["invoice_events (partitioned by occurred_at)"] --> P1["2026_09: not touched"]
+    P --> P2["2026_10: not touched"]
+    P --> P3["2026_11: scanned"]
+    P3 --> B["BRIN: min/max per 128 pages, skip page ranges outside the week"]
+    P2 -.->|"retention: DETACH then DROP"| X["gone, no dead tuples"]
 ```
 
 A query on one week of November reads only the November partition (partition pruning) and only the BRIN-matching page ranges inside it. Details of BRIN are in [[Index Types and Index Design]], and the trade-offs of partition keys in [[Partitioning and Sharding]].
 
-### Compression encoders in Go
+### 4.3 Compression traced by hand
 
-The code below implements the three encodings a time-series store relies on: delta-of-delta timestamps (with zigzag varints, a simpler cousin of Gorilla's bit-bucket scheme), Gorilla XOR floats, and run-length encoding. It is tested and benchmarked by the size checks in the tests.
+For a feel of the numbers, here is one small column of each kind, encoded by the three encodings described above.
 
-```go
-// Package colenc shows three column encodings used by columnar and
-// time-series stores: delta-of-delta for timestamps, Gorilla XOR for
-// float values, and run-length encoding for low-cardinality strings.
-package colenc
+| Column | Raw values | Encoded form | Result |
+| --- | --- | --- | --- |
+| Timestamps (s) | 0, 15, 30, 45, 61 | 0, 15, then 0, 0, 1 | Four small integers after the first value |
+| Floats | 0.25, 0.25, 0.25, 0.25 | first value, then bits 0, 0, 0 | 3 bits after the first 64-bit value |
+| `event_type` | paid, paid, paid, open, open, void, paid | (paid, 3), (open, 2), (void, 1), (paid, 1) | 4 runs for 7 values |
 
-import (
-	"encoding/binary"
-	"errors"
-	"math"
-	"math/bits"
-)
-
-// ---------- Delta-of-delta timestamps (zigzag varints) ----------
-
-// EncodeTimestamps stores the first timestamp, the first delta, then only
-// the change in delta. Regular scrapes give a delta-of-delta of 0 = 1 byte.
-func EncodeTimestamps(ts []int64) []byte {
-	out := binary.AppendUvarint(nil, uint64(len(ts)))
-	var prev, prevDelta int64
-	for i, t := range ts {
-		switch i {
-		case 0:
-			out = binary.AppendVarint(out, t)
-		case 1:
-			prevDelta = t - prev
-			out = binary.AppendVarint(out, prevDelta)
-		default:
-			d := t - prev
-			out = binary.AppendVarint(out, d-prevDelta)
-			prevDelta = d
-		}
-		prev = t
-	}
-	return out
-}
-
-var errCorrupt = errors.New("colenc: corrupt input")
-
-// DecodeTimestamps reverses EncodeTimestamps.
-func DecodeTimestamps(b []byte) ([]int64, error) {
-	n, k := binary.Uvarint(b)
-	if k <= 0 {
-		return nil, errCorrupt
-	}
-	b = b[k:]
-	ts := make([]int64, 0, n)
-	var prev, delta int64
-	for i := uint64(0); i < n; i++ {
-		v, k := binary.Varint(b)
-		if k <= 0 {
-			return nil, errCorrupt
-		}
-		b = b[k:]
-		switch i {
-		case 0:
-			prev = v
-		case 1:
-			delta = v
-			prev += delta
-		default:
-			delta += v
-			prev += delta
-		}
-		ts = append(ts, prev)
-	}
-	return ts, nil
-}
-
-// ---------- Gorilla XOR floats ----------
-
-type bitWriter struct {
-	buf   []byte
-	nbits uint // bits used in the last byte (0 = need a new byte)
-}
-
-func (w *bitWriter) writeBits(v uint64, n uint) {
-	for n > 0 {
-		if w.nbits == 0 {
-			w.buf = append(w.buf, 0)
-			w.nbits = 8
-		}
-		take := min(n, w.nbits)
-		// top `take` bits of the remaining n bits of v
-		chunk := byte((v >> (n - take)) & (1<<take - 1))
-		w.buf[len(w.buf)-1] |= chunk << (w.nbits - take)
-		w.nbits -= take
-		n -= take
-	}
-}
-
-type bitReader struct {
-	buf []byte
-	pos uint // absolute bit position
-}
-
-func (r *bitReader) readBits(n uint) (uint64, error) {
-	var v uint64
-	for i := uint(0); i < n; i++ {
-		byteIdx := r.pos / 8
-		if int(byteIdx) >= len(r.buf) {
-			return 0, errCorrupt
-		}
-		bit := (r.buf[byteIdx] >> (7 - r.pos%8)) & 1
-		v = v<<1 | uint64(bit)
-		r.pos++
-	}
-	return v, nil
-}
-
-// EncodeFloats implements the value half of Facebook's Gorilla encoding.
-// Each value is XORed with the previous one; identical values cost 1 bit.
-func EncodeFloats(vals []float64) []byte {
-	w := &bitWriter{}
-	w.writeBits(uint64(len(vals)), 32)
-	if len(vals) == 0 {
-		return w.buf
-	}
-	prev := math.Float64bits(vals[0])
-	w.writeBits(prev, 64)
-	prevLead, prevTrail := uint(65), uint(0) // 65 = no window yet
-	for _, f := range vals[1:] {
-		cur := math.Float64bits(f)
-		x := cur ^ prev
-		prev = cur
-		if x == 0 {
-			w.writeBits(0, 1) // '0': same value
-			continue
-		}
-		lead := uint(bits.LeadingZeros64(x))
-		trail := uint(bits.TrailingZeros64(x))
-		if lead > 31 {
-			lead = 31 // the leading count has only 5 bits
-		}
-		if prevLead != 65 && lead >= prevLead && trail >= prevTrail {
-			// '10': reuse the previous window of meaningful bits
-			w.writeBits(0b10, 2)
-			w.writeBits(x>>prevTrail, 64-prevLead-prevTrail)
-			continue
-		}
-		// '11': new window = 5 bits leading, 6 bits length, then the bits
-		sig := 64 - lead - trail
-		w.writeBits(0b11, 2)
-		w.writeBits(uint64(lead), 5)
-		w.writeBits(uint64(sig&63), 6) // 64 is stored as 0
-		w.writeBits(x>>trail, sig)
-		prevLead, prevTrail = lead, trail
-	}
-	return w.buf
-}
-
-// DecodeFloats reverses EncodeFloats.
-func DecodeFloats(b []byte) ([]float64, error) {
-	r := &bitReader{buf: b}
-	n, err := r.readBits(32)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]float64, 0, n)
-	if n == 0 {
-		return out, nil
-	}
-	prev, err := r.readBits(64)
-	if err != nil {
-		return nil, err
-	}
-	out = append(out, math.Float64frombits(prev))
-	var lead, trail uint
-	for i := uint64(1); i < n; i++ {
-		ctrl, err := r.readBits(1)
-		if err != nil {
-			return nil, err
-		}
-		if ctrl == 1 {
-			newWin, err := r.readBits(1)
-			if err != nil {
-				return nil, err
-			}
-			if newWin == 1 {
-				l, err := r.readBits(5)
-				if err != nil {
-					return nil, err
-				}
-				s, err := r.readBits(6)
-				if err != nil {
-					return nil, err
-				}
-				if s == 0 {
-					s = 64
-				}
-				lead, trail = uint(l), 64-uint(l)-uint(s)
-			}
-			m, err := r.readBits(64 - lead - trail)
-			if err != nil {
-				return nil, err
-			}
-			prev ^= m << trail
-		}
-		out = append(out, math.Float64frombits(prev))
-	}
-	return out, nil
-}
-
-// ---------- Run-length encoding ----------
-
-// Run is one value repeated Count times.
-type Run struct {
-	Value string
-	Count int
-}
-
-// EncodeRLE collapses consecutive equal values. It works best on a column
-// that is sorted or clustered, which is why the sort key matters.
-func EncodeRLE(col []string) []Run {
-	var runs []Run
-	for _, v := range col {
-		if n := len(runs); n > 0 && runs[n-1].Value == v {
-			runs[n-1].Count++
-			continue
-		}
-		runs = append(runs, Run{Value: v, Count: 1})
-	}
-	return runs
-}
-
-// DecodeRLE expands runs back into a column.
-func DecodeRLE(runs []Run) []string {
-	var col []string
-	for _, r := range runs {
-		for range r.Count {
-			col = append(col, r.Value)
-		}
-	}
-	return col
-}
-```
-
-```go
-package colenc
-
-import (
-	"math"
-	"math/rand/v2"
-	"slices"
-	"testing"
-)
-
-// 1,000 samples scraped every 15 s, with an occasional 1 s jitter.
-func sampleTimestamps() []int64 {
-	ts := make([]int64, 1000)
-	t := int64(1_767_225_600_000) // 2026-01-01T00:00:00Z in ms
-	for i := range ts {
-		ts[i] = t
-		t += 15_000
-		if i%100 == 99 {
-			t += 1_000
-		}
-	}
-	return ts
-}
-
-func TestTimestampsRoundTripAndSize(t *testing.T) {
-	ts := sampleTimestamps()
-	enc := EncodeTimestamps(ts)
-	got, err := DecodeTimestamps(enc)
-	if err != nil || !slices.Equal(got, ts) {
-		t.Fatalf("round trip failed: err=%v", err)
-	}
-	raw := len(ts) * 8
-	t.Logf("timestamps: raw %d B, delta-of-delta %d B (%.2f B/sample)",
-		raw, len(enc), float64(len(enc))/float64(len(ts)))
-	if len(enc) > raw/6 {
-		t.Fatalf("expected > 6x compression, got %d B", len(enc))
-	}
-}
-
-func TestFloatsRoundTrip(t *testing.T) {
-	r := rand.New(rand.NewPCG(1, 2))
-	cases := map[string][]float64{
-		"empty":    {},
-		"single":   {42.5},
-		"constant": slices.Repeat([]float64{0.25}, 500),
-		"counter":  counter(500),
-		"noisy":    noisy(r, 500),
-		"specials": {0, -0.0, math.Inf(1), math.Inf(-1), math.MaxFloat64, math.SmallestNonzeroFloat64, 1},
-	}
-	for name, vals := range cases {
-		enc := EncodeFloats(vals)
-		got, err := DecodeFloats(enc)
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if len(got) != len(vals) {
-			t.Fatalf("%s: len %d want %d", name, len(got), len(vals))
-		}
-		for i := range vals {
-			if math.Float64bits(got[i]) != math.Float64bits(vals[i]) {
-				t.Fatalf("%s[%d]: got %v want %v", name, i, got[i], vals[i])
-			}
-		}
-		if len(vals) > 1 {
-			t.Logf("floats %-8s raw %5d B, gorilla %5d B (%.2f bits/value)",
-				name, len(vals)*8, len(enc), float64(len(enc)*8)/float64(len(vals)))
-		}
-	}
-}
-
-func TestConstantSeriesCostsOneBitPerValue(t *testing.T) {
-	enc := EncodeFloats(slices.Repeat([]float64{0.25}, 1001))
-	// 32-bit count + 64-bit first value + 1,000 one-bit entries = 1,096 bits = 137 bytes.
-	if len(enc) != 137 {
-		t.Fatalf("got %d bytes, want 137", len(enc))
-	}
-}
-
-func TestRLE(t *testing.T) {
-	col := []string{"paid", "paid", "paid", "open", "open", "void", "paid"}
-	runs := EncodeRLE(col)
-	want := []Run{{"paid", 3}, {"open", 2}, {"void", 1}, {"paid", 1}}
-	if !slices.Equal(runs, want) {
-		t.Fatalf("runs = %v", runs)
-	}
-	if !slices.Equal(DecodeRLE(runs), col) {
-		t.Fatal("decode mismatch")
-	}
-	// Sorting the column first turns 4 runs into 3.
-	sorted := slices.Clone(col)
-	slices.Sort(sorted)
-	if n := len(EncodeRLE(sorted)); n != 3 {
-		t.Fatalf("sorted runs = %d, want 3", n)
-	}
-}
-
-func counter(n int) []float64 {
-	v := make([]float64, n)
-	for i := range v {
-		v[i] = float64(1000 + i*3)
-	}
-	return v
-}
-
-func noisy(r *rand.Rand, n int) []float64 {
-	v := make([]float64, n)
-	for i := range v {
-		v[i] = 20 + r.Float64()
-	}
-	return v
-}
-```
-
-Measured with `go test -race -v` (Go 1.24.4, darwin/arm64), on the test data above:
+Measured with the Go implementation (`go test -race -v`, Go 1.24.4, darwin/arm64):
 
 | Column | Raw | Encoded | Per value |
 | --- | --- | --- | --- |
@@ -650,6 +326,8 @@ Measured with `go test -race -v` (Go 1.24.4, darwin/arm64), on the test data abo
 | 500 random floats in [20, 21) | 4,000 B | 3,133 B | 50.13 bits |
 
 The last row is the lesson: Gorilla works because real gauges change slowly. Random noise in the low mantissa bits leaves almost nothing to remove. The Gorilla paper reports an average of 1.37 bytes per (timestamp, value) pair on Facebook's production data, which is documented, not measured here.
+
+Runnable Go version: [[Time-Series and Columnar Storage - Go]]
 
 ## 5. Variants and comparison
 
@@ -753,6 +431,23 @@ Audit logs follow compliance rules, not this table; keep them as required and ne
 
 **What to monitor:** pipeline lag (Kafka consumer lag, CDC replication slot lag), parts per partition and merge backlog in ClickHouse, active series and head memory in Prometheus (`prometheus_tsdb_head_series`), bytes scanned per query in the warehouse, and the difference between OLTP totals and analytics totals for one sample day.
 
+### Whiteboard version
+
+The whole idea in a few lines of Go: a row store keeps each event together, a column store keeps each field together, and an aggregate touches only the slices it needs. The full row and column types, the encoders and the benchmarks are in [[Time-Series and Columnar Storage - Go]].
+
+```go
+type EventColumns struct {
+	Type        []string
+	AmountMinor []int64
+}
+func paidTotal(c EventColumns) (sum int64) {
+	for i, t := range c.Type { // 2 of 20 columns
+		if t == "paid" { sum += c.AmountMinor[i] }
+	}
+	return sum
+}
+```
+
 ## 8. Deep dive
 
 ### ClickHouse MergeTree internals
@@ -783,36 +478,42 @@ sequenceDiagram
 
 A **hypertable** looks like one table but is split into **chunks**, each an ordinary PostgreSQL table covering one time interval (7 days by default; tune so recent chunks and their indexes fit in memory).
 
+```mermaid
+flowchart TB
+    H["hypertable invoice_events"] --> C1["chunk: day 1 (compressed, segmentby workspace_id)"]
+    H --> C2["chunk: day 2 (compressed)"]
+    H --> C3["chunk: day 3 (row store, recent)"]
+    CA["continuous aggregate revenue_hourly"] -.->|"refreshes only changed buckets"| C3
+    RP["retention policy 90 days"] -.->|"drops whole chunks"| C1
+```
+
 ```sql
--- PostgreSQL 17 with the TimescaleDB extension (by_range() needs TimescaleDB 2.13 or later)
+-- PostgreSQL 17 with TimescaleDB (by_range() needs 2.13 or later)
 SELECT create_hypertable('invoice_events', by_range('occurred_at', INTERVAL '1 day'));
-
-ALTER TABLE invoice_events SET (
-    timescaledb.compress,
+ALTER TABLE invoice_events SET (timescaledb.compress,
     timescaledb.compress_segmentby = 'workspace_id',
-    timescaledb.compress_orderby   = 'occurred_at DESC'
-);
+    timescaledb.compress_orderby   = 'occurred_at DESC');
 SELECT add_compression_policy('invoice_events', INTERVAL '7 days');
-
-CREATE MATERIALIZED VIEW revenue_hourly
-WITH (timescaledb.continuous) AS
-SELECT workspace_id, time_bucket(INTERVAL '1 hour', occurred_at) AS bucket,
-       sum(amount_minor) AS paid_minor
-FROM invoice_events
-WHERE event_type = 'paid'
-GROUP BY workspace_id, bucket;
-
-SELECT add_continuous_aggregate_policy('revenue_hourly',
-    start_offset => INTERVAL '3 days', end_offset => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '15 minutes');
 SELECT add_retention_policy('invoice_events', INTERVAL '90 days');
 ```
+
+The continuous aggregate definition and its refresh policy are in the Go note.
 
 - **Compression** rewrites a chunk into columnar form: rows are grouped by the `segmentby` column, and each group stores each column as one compressed array of up to 1,000 values. Filters on `workspace_id` stay cheap.
 - A **continuous aggregate** is a materialized view that refreshes only the time buckets that changed, within the window the policy names.
 - The retention policy drops whole chunks, which is a metadata operation, not a delete.
 
 ### Prometheus TSDB
+
+```mermaid
+flowchart LR
+    S["sample for a series"] --> H["head block in memory: chunks of up to 120 samples per series"]
+    S --> WL["WAL on disk"]
+    H -->|"every 2 h"| B1["block dir: chunks, index, tombstones"]
+    B1 -->|"compaction"| B2["bigger block"]
+    B2 -->|"older than retention (15 d default)"| DEL["directory deleted"]
+    IDX["inverted index: label=value to series ids"] --- B1
+```
 
 - Each **series** is identified by its metric name and full label set. An inverted index maps each `label=value` pair to the list of series ids, so `{route="/invoices"}` is a postings-list intersection.
 - New samples go to the **head block** in memory, with a write-ahead log on disk for crash recovery. Each series' samples are packed into chunks of up to 120 samples using delta-of-delta timestamps and XOR values, the Gorilla scheme above.
@@ -822,11 +523,28 @@ SELECT add_retention_policy('invoice_events', INTERVAL '90 days');
 
 ### Lakehouse files
 
+```mermaid
+flowchart TB
+    T["Iceberg table: metadata, snapshots, manifests"] --> F1["Parquet file"]
+    T --> F2["Parquet file"]
+    F1 --> RG["row group (about 128 MB)"]
+    RG --> CC1["column chunk: occurred_at"]
+    RG --> CC2["column chunk: amount_minor"]
+    CC2 --> PG["pages with encoding and min/max statistics"]
+```
+
 **Parquet** stores a file as **row groups** (often 128 MB), each holding one **column chunk** per column, split into **pages** with their own encodings and min/max statistics. Engines prune by row group statistics. A **table format** such as Apache Iceberg or Delta Lake adds a metadata layer over many Parquet files: snapshots for time travel, atomic commits, schema evolution and hidden partitioning. Many engines (Spark, Trino, Athena, Snowflake, DuckDB) can read the same table, so raw history is stored once at object-storage prices.
 
 ### Late and out-of-order data
 
 Time partitioning assumes data arrives roughly on time. A mobile client that syncs a day late writes into an old partition: Prometheus rejects samples older than the head window unless out-of-order ingestion is enabled (experimental since v2.39, enabled with `out_of_order_time_window`); ClickHouse accepts them but creates small parts in old partitions; TimescaleDB may have to decompress a compressed chunk. Decide how late is acceptable and route anything later to a correction path.
+
+```mermaid
+flowchart TD
+    E["event arrives with occurred_at in the past"] --> Q{"within the accepted lateness window?"}
+    Q -->|yes| A["write normally: ClickHouse makes a small part in the old partition, Prometheus needs out_of_order_time_window, Timescale may decompress a chunk"]
+    Q -->|no| R["route to a correction path: separate table or batch fix, then re-run affected rollups"]
+```
 
 ## 9. Interview questions
 
@@ -868,5 +586,6 @@ Time partitioning assumes data arrives roughly on time. A mobile client that syn
 ## Links
 
 - **Before this:** [[Storage Engines - B-tree vs LSM and WAL]], [[Partitioning and Sharding]], [[Index Types and Index Design]]
+- **Implementation:** [[Time-Series and Columnar Storage - Go]]
 - **Next:** [[Distributed SQL]], [[Materialized Views and Denormalization]], [[Transactional Outbox and CDC]]
 - **Compare with:** [[Wide-Column Stores and Cassandra]] (wide rows, not columnar files), [[Metrics and Prometheus]] (the metrics side in depth), [[Case Study - Metrics and Logging Platform]]

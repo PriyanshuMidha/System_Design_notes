@@ -20,14 +20,14 @@ updated: 2026-11-02
 ### Browser and CSS foundations
 
 1. [[How Browsers Load and Render a Page]] · basic. The pipeline (HTML→DOM, CSS→CSSOM→render tree→layout→paint) everything else in this folder assumes.
-2. [[CSS Fundamentals - Cascade, Selectors, Box Model]] · basic. How a browser picks a winning style and sizes every box on the page.
+2. [[CSS Fundamentals - Cascade, Selectors, Box Model]] · basic. How a browser picks a winning style and sizes every box on the page. · Go code: [[CSS Fundamentals - Cascade, Selectors, Box Model - Go]]
 3. [[CSS Layout - Position, Flexbox, Grid]] · basic. Taking elements out of normal flow, and arranging them along one or two axes.
 
 ### JavaScript core
 
-4. [[JavaScript Core - Types, Scope, Hoisting, Closures, this]] · basic. Primitives vs. references, `var`/`let`/`const`, closures, and how `this` is actually resolved.
-5. [[JavaScript Objects, Arrays and Iteration]] · basic. The two general-purpose data shapes and the loops/methods (`map`/`filter`/`reduce`) that move data through them.
-6. [[DOM, Events and Timers]] · basic. The live tree JavaScript mutates, how events bubble, and the two timer primitives.
+4. [[JavaScript Core - Types, Scope, Hoisting, Closures, this]] · basic. Primitives vs. references, `var`/`let`/`const`, closures, and how `this` is actually resolved. · Go code: [[JavaScript Core - Types, Scope, Hoisting, Closures, this - Go]]
+5. [[JavaScript Objects, Arrays and Iteration]] · basic. The two general-purpose data shapes and the loops/methods (`map`/`filter`/`reduce`) that move data through them. · Go code: [[JavaScript Objects, Arrays and Iteration - Go]]
+6. [[DOM, Events and Timers]] · basic. The live tree JavaScript mutates, how events bubble, and the two timer primitives. · Go code: [[DOM, Events and Timers - Go]]
 7. [[JavaScript Async - Event Loop, Promises, async-await]] · intermediate. Why the event loop never blocks, and how Promises/`async`/`await` schedule "later."
 
 ### React

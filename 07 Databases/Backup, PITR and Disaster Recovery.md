@@ -46,6 +46,19 @@ The cost of not having it is concrete. The newest copy without PITR might be las
 
 ## 2. Mental model
 
+```mermaid
+flowchart LR
+    W["write to primary"] --> R1["replica 1: applies in 40 ms"]
+    W --> R2["replica 2: applies in 40 ms"]
+    W --> WA["WAL archive in object storage"]
+    BAD["bad UPDATE at 14:42:00"] --> R1
+    BAD --> R2
+    BAD --> WA
+    WA --> PITR["PITR: base backup + WAL up to 14:41:59, bad UPDATE not replayed"]
+```
+
+The diagram shows why a replica cannot undo a mistake: it applies the bad statement as faithfully as any other. Only the archive, which can be replayed to a chosen stopping point, can.
+
 Think of the database as a ledger book and the WAL as the carbon copies of every page written since the ledger was photocopied.
 
 - The **base backup** is the photocopy of the whole ledger, taken at night.
@@ -71,6 +84,16 @@ Two numbers frame every decision:
 | PITR | No: a dump is one moment | Yes, with WAL archiving |
 | Typical use | Small DBs, upgrades, one-table restores, dev copies | Production recovery |
 
+```mermaid
+flowchart TD
+    Q["What do you need to recover?"] --> A{"one table, one tenant or a major-version upgrade?"}
+    A -->|"yes, small database"| D["logical: pg_dump / pg_restore"]
+    A -->|"no, whole cluster fast"| B{"need any second, not just backup time?"}
+    B -->|"yes"| P["physical base backup + WAL archive, PITR"]
+    B -->|"no, coarse rollback"| S["volume snapshot"]
+    P --> M["a restore to a side server, then copy the damaged rows back"]
+```
+
 `pg_dump -Fc` (custom format) or `-Fd -j 8` (directory format, 8 parallel jobs) produces dumps that `pg_restore` can restore in parallel or partially, for example only `-t invoices`.
 
 ### 3.2 Base backup plus WAL archive
@@ -90,6 +113,25 @@ flowchart LR
     R2 --> T
 ```
 
+### The restore procedure
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant NS as New server
+    participant Arc as WAL archive
+    Op->>NS: copy newest base backup finished before target
+    Op->>NS: set restore_command, recovery_target_time, create recovery.signal
+    Op->>NS: pg_ctl start
+    loop each missing WAL segment
+        NS->>Arc: restore_command fetches segment
+        Arc-->>NS: segment bytes
+        NS->>NS: replay records in order
+    end
+    NS->>NS: first commit after target reached, stop and pause
+    Op->>NS: verify data, then pg_wal_replay_resume() or promote
+```
+
 The restore:
 1. Copy the newest base backup that **finished before** the target time to a new server.
 2. Set `restore_command` (how to fetch archived WAL) and `recovery_target_time = '2026-11-03 14:41:59+05:30'`, and create the file `recovery.signal` (PostgreSQL 12+).
@@ -100,9 +142,28 @@ The restore:
 
 ### 3.3 Where RPO comes from
 
+```mermaid
+flowchart LR
+    subgraph arch["archived, safe off-host"]
+        S1["segment 41 (full)"] --- S2["segment 42 (full)"]
+    end
+    subgraph cur["current segment 43, partly filled"]
+        S3["at risk: lost if the server dies now"]
+    end
+    S2 --> S3
+    S3 -->|"archive_timeout = 60s forces a switch"| S4["segment 43 closed early and archived"]
+```
+
 With WAL archiving, the data at risk is whatever sits in the current, not yet archived segment. On a quiet database a 16 MB segment can take hours to fill, so `archive_timeout = 60s` forces a switch to a new segment at least every 60 seconds, bounding RPO to about a minute plus the upload time. Tools such as `pg_receivewal`, pgBackRest and Barman can also stream WAL continuously, as a replica does, for an RPO of seconds.
 
 ### 3.4 Disaster recovery tiers
+
+| Tier | What runs in the DR region | Typical RPO | Typical RTO | Relative cost |
+| --- | --- | --- | --- | --- |
+| Backup and restore | Only stored backups | Hours | Hours to a day | $ |
+| Pilot light | A replica database, app servers off | Seconds to minutes | Tens of minutes | $$ |
+| Warm standby | Scaled-down full stack | Seconds | Minutes | $$$ |
+| Multi-site active/active | Full stack serving traffic | Near zero | Near zero | $$$$ |
 
 ```mermaid
 flowchart LR
@@ -123,13 +184,17 @@ These four tiers and their typical RPO/RTO ranges follow the AWS whitepaper *Dis
 -- archive_mode = on
 -- archive_command = 'pgbackrest --stanza=invoiceops archive-push %p'
 -- archive_timeout = 60s
+```
 
+```sql
 -- On a NEW server after restoring last night's base backup:
 -- restore_command = 'pgbackrest --stanza=invoiceops archive-get %f "%p"'
 -- recovery_target_time = '2026-11-03 14:41:59+05:30'
 -- recovery_target_action = 'pause'
 -- touch $PGDATA/recovery.signal ; pg_ctl start
+```
 
+```sql
 -- Paused at the target: verify, then copy the good rows back
 SELECT count(*) FILTER (WHERE status = 'void') AS voided,
        sum(amount_due_minor)                   AS due_minor
@@ -162,174 +227,39 @@ What fixes it:
 3. For a bad `UPDATE` on one table, you do not need to replace production at all: restore to a side server, then copy back only the affected rows (section 4.4).
 4. A **delayed replica** (section 8) already sits one hour in the past.
 
-### 4.3 Checking that PITR is possible, in Go
+### 4.3 Checking that PITR is possible
 
 A backup catalog check that runs every few minutes answers one question: "If we needed to restore to time T, which backup would we use, and is the WAL chain unbroken?" The LSN (log sequence number) is the byte position in the WAL stream.
 
-```go
-package pitr
+The check works like this:
 
-import (
-	"errors"
-	"fmt"
-	"sort"
-	"time"
-)
+1. Take only backups that finished before the target time, newest first.
+2. Walk the archived WAL segments from the backup's start LSN. Each segment must begin exactly where the previous one ended.
+3. Stop at the first segment whose last commit is at or after the target.
+4. If a gap appears, try the next older backup. If no backup has an unbroken chain, PITR to that target is impossible.
 
-// BaseBackup is one physical backup. Restoring it needs WAL from StartLSN;
-// it is consistent once WAL has been replayed past EndLSN (written at EndTime).
-type BaseBackup struct {
-	Label            string
-	StartLSN, EndLSN uint64
-	EndTime          time.Time
-}
-
-// Segment is one archived WAL file: bytes [StartLSN, EndLSN) and the commit
-// timestamps of the first and last transactions it contains.
-type Segment struct {
-	StartLSN, EndLSN    uint64
-	FirstTime, LastTime time.Time
-}
-
-// Plan is what a restore to a target time needs.
-type Plan struct {
-	Backup   BaseBackup
-	Segments []Segment
-}
-
-var ErrNoBackup = errors.New("no base backup finished before the target")
-
-// PlanRestore picks the newest backup that finished before target and checks
-// that archived WAL runs without gaps from its StartLSN until a segment whose
-// last commit is at or after target. A gap means PITR to target is impossible.
-func PlanRestore(backups []BaseBackup, wal []Segment, target time.Time) (Plan, error) {
-	sort.Slice(backups, func(i, j int) bool { return backups[i].EndTime.After(backups[j].EndTime) })
-	sort.Slice(wal, func(i, j int) bool { return wal[i].StartLSN < wal[j].StartLSN })
-
-	var lastErr error = ErrNoBackup
-	for _, b := range backups {
-		if b.EndTime.After(target) {
-			continue
-		}
-		segs, err := chain(wal, b, target)
-		if err == nil {
-			return Plan{Backup: b, Segments: segs}, nil
-		}
-		lastErr = err // an older backup may still have an unbroken chain
-	}
-	return Plan{}, lastErr
-}
-
-func chain(wal []Segment, b BaseBackup, target time.Time) ([]Segment, error) {
-	next := b.StartLSN
-	var out []Segment
-	for _, s := range wal {
-		if s.EndLSN <= next {
-			continue // fully before what we need
-		}
-		if s.StartLSN > next {
-			return nil, fmt.Errorf("backup %s: WAL gap at LSN %X", b.Label, next)
-		}
-		out = append(out, s)
-		next = s.EndLSN
-		if next > b.EndLSN && !s.LastTime.Before(target) {
-			return out, nil
-		}
-	}
-	return nil, fmt.Errorf("backup %s: archive ends at LSN %X before target", b.Label, next)
-}
-
-// RestoreTime estimates RTO for the database step: copy the base backup,
-// then replay WAL. Rates are bytes per second.
-func RestoreTime(backupBytes, copyRate, walBytes, replayRate float64) time.Duration {
-	secs := backupBytes/copyRate + walBytes/replayRate
-	return time.Duration(secs * float64(time.Second))
-}
+```mermaid
+flowchart TD
+    T["target 14:41:59"] --> P["backups finished before target, newest first"]
+    P --> C{"WAL chain from this backup's start LSN unbroken up to target?"}
+    C -->|"yes"| OK["plan = this backup + its segments"]
+    C -->|"gap at LSN"| N{"older backup left?"}
+    N -->|"yes"| C
+    N -->|"no"| F["error: PITR to target impossible"]
 ```
 
-```go
-package pitr
+Example: nightly backup at 01:30 and midday backup at 12:20, hourly WAL segments, segment 5 lost. A target of 14:00 uses the midday backup (its chain is intact). A target of 08:00 needs the nightly backup, whose chain crosses the missing segment, so the check reports a WAL gap. One lost segment silently removes hours of the PITR window.
 
-import (
-	"errors"
-	"strings"
-	"testing"
-	"time"
-)
-
-const seg = 16 << 20 // 16 MB WAL segments
-
-var day = time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
-
-// hourly segments from LSN 0, one segment per hour starting at midnight
-func walHours(n int) []Segment {
-	var w []Segment
-	for i := 0; i < n; i++ {
-		t := day.Add(time.Duration(i) * time.Hour)
-		w = append(w, Segment{uint64(i) * seg, uint64(i+1) * seg, t, t.Add(59 * time.Minute)})
-	}
-	return w
-}
-
-var backups = []BaseBackup{
-	{"nightly-01h", 1 * seg, 2*seg + 100, day.Add(1*time.Hour + 30*time.Minute)},
-	{"midday-12h", 12 * seg, 13*seg + 100, day.Add(12*time.Hour + 20*time.Minute)},
-}
-
-func TestPicksNewestBackupBeforeTarget(t *testing.T) {
-	target := day.Add(14*time.Hour + 41*time.Minute + 59*time.Second) // 14:41:59
-	p, err := PlanRestore(backups, walHours(24), target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.Backup.Label != "midday-12h" || len(p.Segments) != 3 { // segments 12, 13, 14
-		t.Fatalf("got %s with %d segments", p.Backup.Label, len(p.Segments))
-	}
-}
-
-func TestTargetBeforeMiddayUsesNightly(t *testing.T) {
-	target := day.Add(12*time.Hour + 5*time.Minute) // midday backup not finished yet
-	p, err := PlanRestore(backups, walHours(24), target)
-	if err != nil || p.Backup.Label != "nightly-01h" || len(p.Segments) != 12 {
-		t.Fatalf("got %+v, %v", p.Backup, err)
-	}
-}
-
-func TestGapFallsBackOrFails(t *testing.T) {
-	w := walHours(24)
-	w = append(w[:5], w[6:]...) // segment 5 lost: nightly chain is broken
-	target := day.Add(14 * time.Hour)
-	if p, err := PlanRestore(backups, w, target); err != nil || p.Backup.Label != "midday-12h" {
-		t.Fatalf("midday chain is intact, got %v", err)
-	}
-	_, err := PlanRestore(backups, w, day.Add(8*time.Hour))
-	if err == nil || !strings.Contains(err.Error(), "WAL gap") {
-		t.Fatalf("want WAL gap error, got %v", err)
-	}
-}
-
-func TestNoBackupAndArchiveTooShort(t *testing.T) {
-	if _, err := PlanRestore(backups, walHours(24), day.Add(time.Hour)); !errors.Is(err, ErrNoBackup) {
-		t.Fatalf("want ErrNoBackup, got %v", err)
-	}
-	_, err := PlanRestore(backups, walHours(14), day.Add(20*time.Hour))
-	if err == nil || !strings.Contains(err.Error(), "before target") {
-		t.Fatalf("want short-archive error, got %v", err)
-	}
-}
-
-func TestRestoreTime(t *testing.T) {
-	// 2 TB at 200 MB/s, plus 40 GB of WAL replayed at 20 MB/s
-	got := RestoreTime(2e12, 200e6, 40e9, 20e6)
-	if got != 12000*time.Second { // 10,000 s + 2,000 s = 3h20m
-		t.Fatalf("got %v", got)
-	}
-}
-```
-
-Measured: `go vet` is clean and `go test -race` passes with Go 1.24.4. The `TestRestoreTime` case is the 2 TB example with a smaller, 40 GB WAL replay: 10,000 s + 2,000 s = 3 h 20 min. `TestGapFallsBackOrFails` shows the important behaviour: one lost WAL segment silently removes hours of the PITR window, and only an older-or-newer backup with an unbroken chain can help.
+Runnable Go version: [[Backup, PITR and Disaster Recovery - Go]]
 
 ### 4.4 Partial restore of one tenant
+
+```mermaid
+flowchart LR
+    BK["base backup + WAL"] --> SS["side server restored to 11:14:59"]
+    SS -->|"COPY rows for workspace 42"| CSV["ws42_clients.csv"]
+    CSV -->|"temp table, INSERT where id missing"| PROD["production primary keeps everyone else's work since 11:15"]
+```
 
 Workspace 42's admin deletes 300 clients by mistake at 11:15. Nobody else is affected, so restoring the whole database would destroy everyone else's work since 11:15.
 
@@ -337,7 +267,9 @@ Workspace 42's admin deletes 300 clients by mistake at 11:15. Nobody else is aff
 -- On the side server restored to 11:14:59, export only that tenant's rows
 COPY (SELECT * FROM clients WHERE workspace_id = 42)
   TO '/tmp/ws42_clients.csv' WITH (FORMAT csv, HEADER);
+```
 
+```sql
 -- On production, inside one transaction, re-insert only missing rows
 BEGIN;
 CREATE TEMP TABLE restored_clients (LIKE clients INCLUDING DEFAULTS);
@@ -417,7 +349,23 @@ The drill produces measured RTO and RPO each week. If the measured restore time 
 ## 8. Deep dive
 
 - **Delayed replica.** A standby with `recovery_min_apply_delay = '1h'` receives WAL immediately but applies each commit only after one hour. If a bad deploy is caught within the hour, pause replay (`pg_wal_replay_pause()`), then set `recovery_target_time` to just before the mistake and restart the standby (recovery target settings take effect only at server start) so it replays up to that point, and read the good data in minutes, without copying terabytes.
+```mermaid
+flowchart LR
+    subgraph t1["Delayed replica applies 1 hour late"]
+        W1["14:00 WAL received"] --> W2["15:00 WAL applied"]
+    end
+    BAD["14:42 bad deploy"] --> NOTE["caught at 14:50: replica has applied only up to 13:50"]
+    NOTE --> PAUSE["pg_wal_replay_pause, set recovery_target_time 14:41:59, restart, read good data in minutes"]
+```
+
 - **Timelines.** When a recovered server is promoted, PostgreSQL starts a new **timeline** (a new history branch, visible in WAL file names like `00000002…`). This lets you do PITR several times from the same archive without overwriting the original history; `recovery_target_timeline = 'latest'` (the default since PostgreSQL 12) follows the newest branch.
+```mermaid
+flowchart LR
+    A["timeline 1: base backup to bad UPDATE at 14:42"] --> B["PITR to 14:41:59, promote"]
+    B --> C["timeline 2: new history continues, WAL files 00000002..."]
+    A -.->|"original archive kept, can recover again"| D["second PITR to 14:30 gives timeline 3"]
+```
+
 - **Inclusive targets.** `recovery_target_inclusive = on` (default) stops *after* the transaction committed exactly at the target time. For "stop before the bad transaction", use its transaction ID with `recovery_target_xid` and `recovery_target_inclusive = off`, or the LSN from `pg_waldump`.
 - **Checksums and verification.** Data checksums (`initdb --data-checksums`, or `pg_checksums --enable` offline) detect torn or corrupted pages; PostgreSQL 18 enables them by default for new clusters. `pg_verifybackup` checks a base backup against its manifest; the `amcheck` extension verifies B-tree index invariants after a restore.
 - **Backups and sharding.** With many shards, "restore to 14:41:59" must happen on every shard to the same point, or cross-shard references break. Use the same target time everywhere, and accept that clocks differ slightly; for strict consistency, record a cross-shard restore point with `pg_create_restore_point()` on every shard at the same moment.
@@ -459,6 +407,7 @@ The drill produces measured RTO and RPO each week. If the measured restore time 
 
 ## Links
 
+- **Runnable Go version:** [[Backup, PITR and Disaster Recovery - Go]]
 - **Before this:** [[Storage Engines - B-tree vs LSM and WAL]], [[Replication]]
 - **Next:** [[High Availability and Failover]], [[Multi-Region Architecture]], [[Incident Response]]
 - **Compare with:** [[Zero-Downtime Schema Migrations]], [[Partitioning and Sharding]], [[Transactional Outbox and CDC]]

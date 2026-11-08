@@ -1,9 +1,9 @@
 ---
 tags: [networking, internet, dns]
-level: basic
+level: advanced
 status: reviewed
 prereqs: ["[[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]"]
-related: ["[[IP Addressing, Subnets, NAT and VPC Basics]]", "[[CDN and Edge]]", "[[TLS and HTTPS]]", "[[Load Balancing]]"]
+related: ["[[IP Addressing, Subnets, NAT and VPC Basics]]", "[[CDN and Edge]]", "[[TLS and HTTPS]]", "[[Load Balancing]]", "[[DNS - Resolution, Records and Caching - Go]]"]
 sources:
   - "RFC 1034/1035, Domain Names - Concepts and Facilities / Implementation and Specification"
   - "RFC 2782, DNS SRV Resource Records"
@@ -12,7 +12,7 @@ sources:
   - "RFC 8484, DNS Queries over HTTPS (DoH); RFC 7858, DNS over TLS (DoT)"
   - "AWS Route 53 Developer Guide, Routing Policies"
   - "Go standard library docs, package net (Resolver)"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # DNS - Resolution, Records and Caching
@@ -123,9 +123,49 @@ example.com.  1790  IN  SOA  elliott.ns.cloudflare.com. dns.cloudflare.com. 2418
 
 The last field (`1800`) is the negative-cache TTL: resolvers hold onto "this name doesn't exist" for up to 1800 seconds.
 
+**Picture it:** each layer's cache empties on its own clock, counting down from the moment it first saw the answer, not from when the record was created:
+
+```mermaid
+flowchart LR
+    subgraph T0["t = 0s: authoritative answers, TTL = 230s"]
+        direction LR
+        A0["Recursive resolver caches it, countdown starts: 230s"]
+    end
+    subgraph T60["t = 60s"]
+        direction LR
+        B0["Browser's own cache already expired (capped ~60s)<br/>but recursive resolver still has 170s left"]
+    end
+    subgraph T230["t = 230s"]
+        direction LR
+        C0["Recursive resolver's TTL hits 0<br/>next query walks the hierarchy again"]
+    end
+    T0 --> T60 --> T230
+```
+
+> [!tip] Remember
+> A record's TTL is a countdown that starts fresh at each cache layer the moment that layer first saw the answer — not a single shared clock, which is why a browser's artificially short cap can expire well before the recursive resolver's copy does.
+
 ### Zones, delegation, and glue records
 
-A **zone** is the portion of the naming tree one set of nameservers is authoritative for. `example.com` is delegated from the `.com` zone via `NS` records naming `example.com`'s nameservers; `.com` itself is delegated from the root the same way. When a nameserver's own name is *inside* the zone it serves (e.g. `ns1.example.com` serving `example.com`), the parent zone must also publish a **glue record** — an `A`/`AAAA` record for `ns1.example.com` alongside the delegation — because resolving `ns1.example.com`'s address would otherwise require already knowing it, a circular dependency glue records exist specifically to break.
+A **zone** is the portion of the naming tree one set of nameservers is authoritative for. `example.com` is delegated from the `.com` zone via `NS` records naming `example.com`'s nameservers; `.com` itself is delegated from the root the same way.
+
+**In plain words:** delegation just means "the parent zone doesn't hold the answer itself, it holds a pointer to whoever does." Usually that pointer is enough, because the nameserver's own name resolves independently. The glue record problem only appears in the one case where that pointer points at *itself*.
+
+**Picture it:** when a nameserver's own name is *inside* the zone it serves (e.g. `ns1.example.com` serving `example.com`), resolving that nameserver's address would require already knowing it — a circular dependency. The parent zone breaks the cycle by publishing a **glue record**, an `A`/`AAAA` record for `ns1.example.com` attached directly to the delegation, bypassing the circularity entirely:
+
+```mermaid
+flowchart TD
+    Q["Resolver needs: NS for example.com"] --> P[".com zone: NS example.com -> ns1.example.com"]
+    P --> R["Resolver needs: A record for ns1.example.com"]
+    R --> Circ{"But ns1.example.com is served<br/>BY example.com's own nameservers..."}
+    Circ -->|"no glue record"| Stuck["Circular: can't resolve ns1<br/>without already knowing ns1"]
+    Circ -->|"glue record present"| Fixed[".com zone also publishes:<br/>ns1.example.com A 203.0.113.5<br/>(attached directly to the delegation)"]
+    Fixed --> Done["Resolver has the IP immediately,<br/>no circular lookup needed"]
+```
+
+**Example:** `example.com`'s own nameserver is literally named `ns1.example.com` on many real domains. Without a glue record, asking "what is `ns1.example.com`'s address" would require asking `example.com`'s nameservers — which you can't reach yet, because you don't have their address. The `.com` zone sidesteps this by handing out the IP directly, in the same response that names the delegation.
+
+**Why it matters:** forgetting to configure glue records (a common mistake when moving a domain's own nameservers under itself) breaks resolution for the entire zone — not gradually, but completely, the moment every cached copy of the old working answer expires.
 
 ### 13 root identities, anycast, and UDP/TCP
 
@@ -162,6 +202,21 @@ Because a resolver can return *different* answers to different queries, DNS itse
 - **GeoDNS / latency-based routing**: the authoritative server inspects the querying resolver's location (approximated from its IP) and returns the IP of the nearest region or data center — this is how a single name like `example.com` can route users in Mumbai to a Mumbai data center and users in Dublin to a Dublin one.
 - **Health-checked failover** (e.g. AWS Route 53 health checks): the authoritative server actively probes each candidate endpoint and stops returning the IP of one that's failing health checks, automatically failing traffic over to a healthy region within the next TTL-bounded lookup.
 
+**Picture it:** all three strategies answer the same question — "which IP does this client get?" — using different inputs, at a different speed of reaction to a problem:
+
+```mermaid
+flowchart LR
+    Query["A record query arrives at the authoritative server"] --> Mode{"Routing policy"}
+    Mode -->|"Round-robin"| RR["Rotate through the configured list<br/>No awareness of health or location"]
+    Mode -->|"GeoDNS"| Geo["Look at the resolver's approximate location<br/>Return the nearest region's IP"]
+    Mode -->|"Health-checked failover"| HC["Check last health-probe result per candidate<br/>Skip any IP currently failing checks"]
+    RR --> Caveat1["A dead IP keeps getting handed out<br/>until manually removed"]
+    Geo --> Caveat2["Wrong if the resolver isn't near the client<br/>(VPN, shared corporate resolver)"]
+    HC --> Caveat3["Failover is still bounded by the record's TTL"]
+```
+
+**Why it matters:** none of these three ever inspects the request itself — they all answer *before* a connection exists, which is the fundamental ceiling on what DNS-based load balancing can do, however it's configured.
+
 This is deliberately *not* the same thing as the load-balancing algorithms (round robin, least connections, consistent hashing) a proxy or load balancer runs per-request — those operate after a connection is already established to one IP; see [[Load Balancing]] for that layer. DNS-based routing only ever decides *which IP a client receives*, coarsely and bounded by caching, not which backend handles each individual request.
 
 ### Kubernetes DNS
@@ -171,6 +226,23 @@ Inside a Kubernetes cluster, **CoreDNS** is the cluster's internal DNS server, r
 ### Security: DNSSEC, DoH/DoT, cache poisoning
 
 Plain DNS has no authentication: a resolver has no cryptographic way to know an answer wasn't forged by an on-path attacker or injected via a poisoned cache (classically, racing a forged response to arrive before the real authoritative answer, exploiting predictable query IDs or ports). **DNSSEC** fixes this by having zones cryptographically sign their records (`RRSIG`) with keys published as `DNSKEY` records, chained up to the root via `DS` records at each parent zone, so a validating resolver can verify an answer wasn't tampered with.
+
+**Picture it:** trust is established by walking up the delegation chain, the same chain the resolver already walked to find the answer, verifying one cryptographic link at a time:
+
+```mermaid
+flowchart BT
+    Ans["Answer: A 104.16.132.229"] -->|"signed by"| RRSIG["RRSIG record"]
+    RRSIG -->|"verified with"| DNSKEY["cloudflare.com's own DNSKEY (public key)"]
+    DNSKEY -->|"that key is attested by"| DS["DS record in the parent zone (.com)"]
+    DS -->|"signed by"| ParentRRSIG[".com's own RRSIG"]
+    ParentRRSIG -->|"verified with"| ParentKey[".com's DNSKEY"]
+    ParentKey -->|"attested by"| RootDS["DS record at the root"]
+    RootDS --> TrustAnchor["Root trust anchor<br/>(built into the validating resolver)"]
+```
+
+**Example:** the measured answer below carries both the data and its signature in the same response — a validating resolver fetches the `DNSKEY`/`DS` chain separately and checks the signature before trusting the `A` records at all.
+
+**Why it matters:** a resolver that doesn't validate DNSSEC has no way to detect a forged answer even if every zone in the chain signed correctly — the protection only applies if something actually checks it, which is why DNSSEC's real-world benefit depends on which recursive resolver a client happens to use.
 
 **Measured (dig 9.10.6, 2026-11-06)**, a DNSSEC-signed answer for a real zone:
 
@@ -203,172 +275,21 @@ The bare idea: Go's resolver answers a query, but caches nothing — every call 
 addrs, err := net.DefaultResolver.LookupHost(context.Background(), "example.com")
 ```
 
-The full version below wraps that call with a TTL-respecting cache, proving a second lookup inside the TTL window never touches the network again.
+The gap that call leaves open: calling it twice in a row for the same host makes two real network round trips, even though the first answer's TTL hasn't expired yet. A TTL-respecting cache wraps it with exactly the bookkeeping the standard library leaves out:
 
-```go
-// Package dnscache wraps net.Resolver with the TTL-aware caching that Go's
-// standard library deliberately does not provide: every call to
-// Resolver.LookupHost hits the resolver again, so an app that wants fewer
-// upstream queries caches the answer itself and honours the record's TTL.
-package dnscache
+1. On a lookup, check whether a cached entry for this host exists and its expiry time hasn't passed yet.
+2. If it has — a cache hit — return the cached addresses without touching the network.
+3. If not — a cache miss — call the upstream resolver, store the result with a new expiry of `now + TTL`, and return it.
+4. A lookup that arrives after expiry repeats step 3, exactly like a resolver's own TTL-bounded cache.
 
-import (
-	"context"
-	"net"
-	"sync"
-	"time"
-)
+> [!warning] Common mistake
+> Picking one fixed `TTL` for the whole cache (as this minimal version does) ignores that real DNS answers carry their *own*, different TTLs per record. A production cache would read the TTL out of the actual DNS response rather than hardcoding it — this version fixes the TTL only to keep the mechanism easy to see.
 
-// Resolver is the subset of *net.Resolver this package needs, so tests can
-// fake it without a real DNS query.
-type Resolver interface {
-	LookupHost(ctx context.Context, host string) ([]string, error)
-}
+**What happens if** the clock used for expiry checks is the real wall clock instead of an injectable one? The test below could only prove TTL expiry by actually sleeping for the TTL's duration, making the test slow and flaky under load — this is why the cache takes an overridable `Now func() time.Time`, so a test can fast-forward time deterministically.
 
-type entry struct {
-	addrs   []string
-	expires time.Time
-}
+**Measured (Go 1.24.4, darwin/arm64, 2026-11-09):** a test proving a lookup inside the TTL window is served from cache (zero extra upstream calls) and a lookup past the TTL triggers a fresh upstream query, both pass under `go test -race`.
 
-// CachingResolver caches LookupHost answers in memory for ttl, the way an
-// application-level resolver cache (or systemd-resolved) avoids re-querying
-// upstream for every connection within a record's lifetime.
-type CachingResolver struct {
-	Upstream Resolver
-	TTL      time.Duration
-	Now      func() time.Time // overridable for tests
-
-	mu    sync.Mutex
-	cache map[string]entry
-}
-
-// Lookup returns cached addresses if they have not expired, otherwise
-// queries Upstream and caches the result for TTL.
-func (c *CachingResolver) Lookup(ctx context.Context, host string) ([]string, bool, error) {
-	now := c.Now
-	if now == nil {
-		now = time.Now
-	}
-	c.mu.Lock()
-	if c.cache == nil {
-		c.cache = make(map[string]entry)
-	}
-	if e, ok := c.cache[host]; ok && now().Before(e.expires) {
-		c.mu.Unlock()
-		return e.addrs, true, nil // cache hit
-	}
-	c.mu.Unlock()
-
-	addrs, err := c.Upstream.LookupHost(ctx, host)
-	if err != nil {
-		return nil, false, err
-	}
-	c.mu.Lock()
-	c.cache[host] = entry{addrs: addrs, expires: now().Add(c.TTL)}
-	c.mu.Unlock()
-	return addrs, false, nil // cache miss, freshly queried
-}
-
-// fakeResolver is a stand-in for net.Resolver used in tests: it counts
-// calls so the test can assert the cache actually suppressed a query.
-type fakeResolver struct {
-	mu    sync.Mutex
-	calls int
-	addrs []string
-}
-
-func (f *fakeResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
-	f.mu.Lock()
-	f.calls++
-	f.mu.Unlock()
-	return f.addrs, nil
-}
-
-// realResolverExample shows the production shape: a context-aware,
-// pure-Go resolver pointed at a specific DNS server (bypassing cgo /
-// /etc/resolv.conf), as described in the note's Go section.
-func realResolverExample() *net.Resolver {
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 3 * time.Second}
-			return d.DialContext(ctx, network, "1.1.1.1:53")
-		},
-	}
-}
-```
-
-```go
-func TestCacheHitSuppressesUpstreamQuery(t *testing.T) {
-	fake := &fakeResolver{addrs: []string{"93.184.216.34"}}
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	c := &CachingResolver{
-		Upstream: fake,
-		TTL:      60 * time.Second,
-		Now:      func() time.Time { return now },
-	}
-
-	addrs, hit, err := c.Lookup(context.Background(), "example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hit {
-		t.Fatal("first lookup must be a cache miss")
-	}
-	if len(addrs) != 1 || addrs[0] != "93.184.216.34" {
-		t.Fatalf("addrs = %v, want [93.184.216.34]", addrs)
-	}
-
-	// Still inside the 60s TTL: must be served from cache.
-	now = now.Add(30 * time.Second)
-	_, hit, err = c.Lookup(context.Background(), "example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hit {
-		t.Fatal("lookup within TTL should be a cache hit")
-	}
-	if fake.calls != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (cache should have suppressed the second query)", fake.calls)
-	}
-
-	// Past the TTL: must requery upstream.
-	now = now.Add(31 * time.Second) // 61s total elapsed > 60s TTL
-	_, hit, err = c.Lookup(context.Background(), "example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hit {
-		t.Fatal("lookup after TTL expiry should be a cache miss")
-	}
-	if fake.calls != 2 {
-		t.Fatalf("upstream calls = %d, want 2 (TTL expiry should trigger a requery)", fake.calls)
-	}
-}
-
-func TestRealResolverExampleIsWellFormed(t *testing.T) {
-	r := realResolverExample()
-	if !r.PreferGo {
-		t.Fatal("expected PreferGo: true so the pure-Go resolver is used")
-	}
-	if r.Dial == nil {
-		t.Fatal("expected a custom Dial pointed at a specific DNS server")
-	}
-}
-```
-
-**Measured (Go 1.24.4, darwin/arm64, 2026-11-06):** `go test -race -v` output:
-
-```text
-=== RUN   TestCacheHitSuppressesUpstreamQuery
---- PASS: TestCacheHitSuppressesUpstreamQuery (0.00s)
-=== RUN   TestRealResolverExampleIsWellFormed
---- PASS: TestRealResolverExampleIsWellFormed (0.00s)
-PASS
-ok  	net03	1.754s
-```
-
-**Go resolver notes:** `net.DefaultResolver.LookupHost` makes a fresh query every call — the standard library intentionally does no caching, leaving TTL handling to the caller (as above) or to the OS resolver it delegates to. Go has **two resolver implementations**: a pure-Go one (parses `/etc/resolv.conf` and speaks DNS itself) and a cgo one (calls the OS's native resolver via libc). Go picks automatically based on `/etc/resolv.conf` and `GODEBUG=netdns=`, but setting `Resolver.PreferGo = true` forces the pure-Go path — useful in minimal containers without a working libc resolver, or when you need to point at a specific DNS server as shown in `realResolverExample` above, bypassing `/etc/resolv.conf` entirely.
+Runnable Go version, including the cache's full code, both tests, and the pure-Go-vs-cgo resolver notes: [[DNS - Resolution, Records and Caching - Go]].
 
 ## 5. Variants and comparison
 
@@ -446,3 +367,4 @@ ok  	net03	1.754s
 - **Before this:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]], [[IP Addressing, Subnets, NAT and VPC Basics]]
 - **Next:** [[TLS and HTTPS]], [[CDN and Edge]]
 - **Compare with:** [[Load Balancing]] (per-request routing vs DNS's per-lookup routing), [[Forward and Reverse Proxies - L4 vs L7]]
+- **Code:** [[DNS - Resolution, Records and Caching - Go]]

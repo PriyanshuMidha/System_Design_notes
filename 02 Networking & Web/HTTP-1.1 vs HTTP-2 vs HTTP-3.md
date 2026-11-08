@@ -11,7 +11,7 @@ sources:
   - "RFC 9204, QPACK"
   - "RFC 9000, QUIC"
 status: reviewed
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # HTTP-1.1 vs HTTP-2 vs HTTP-3
@@ -41,6 +41,24 @@ That gap is the entire reason HTTP/2 exists: one connection, many requests in fl
 Browsers load a page that references dozens of resources: HTML, CSS, several JS bundles, a dozen images, a font. Under HTTP/1.1 a single TCP connection serves requests strictly one at a time — RFC 9112 allows pipelining several requests back to back, but responses must still come back in the same order, so one slow response blocks every response queued behind it. No major browser ever enabled pipelining because a single slow or buggy response (or an intermediary that mishandled it) stalled the whole queue; that history is why pipelining is widely considered a failed feature today.
 
 The workaround browsers actually shipped was to open 6 TCP connections per host and spread requests across them. That buys parallelism but at a cost: 6x the TCP and TLS handshakes, 6x the congestion-control state starting from scratch, and 6 connections all fighting the same bottleneck link.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    client["Browser"] -- "conn 1" --> req1["GET /index.html"]
+    client -- "conn 2" --> req2["GET /app.js"]
+    client -- "conn 3" --> req3["GET /style.css"]
+    client -- "conn 4" --> req4["GET /logo.png"]
+    client -- "conn 5" --> req5["GET /font.woff2"]
+    client -- "conn 6" --> req6["GET /hero.jpg"]
+    req1 & req2 & req3 & req4 & req5 & req6 --> origin["Same origin server"]
+```
+
+**Example:** a page with 30 resources, loaded over 6 connections, still needs 5 round trips per connection on average (30 ÷ 6) — each connection serializes its own share, so parallelism tops out at "however many sockets the browser is willing to open," typically capped at 6 per host specifically to avoid overwhelming the server and the shared network link.
+
+> [!warning] Common mistake
+> Thinking more connections is a free lunch. Each extra connection repeats the TCP handshake (1 RTT) and, over HTTPS, the TLS handshake (1–2 more RTTs) before a single byte of the actual resource arrives — six connections pay that setup cost six times over.
 
 **Measured on this machine:** 6 requests against a handler that sleeps 50ms, through one HTTP/1.1 connection (`http.Transport{MaxConnsPerHost: 1}`) versus one multiplexed HTTP/2 connection — see the Go test in Section 4. HTTP/1.1 took 311ms (serial: 6 × 50ms), HTTP/2 took 62ms (parallel: ~50ms plus per-stream overhead).
 
@@ -130,99 +148,71 @@ sequenceDiagram
 
 QUIC also folds the TLS 1.3 handshake into its own handshake (see [[TLS and HTTPS]]) so a new connection needs only 1-RTT (0-RTT on a resumed connection), and it migrates connections across network changes using a connection ID instead of the IP/port 4-tuple TCP relies on — useful when a phone switches from Wi-Fi to cellular mid-request.
 
+**In plain words:** TCP and TLS used to be two separate handshakes, stacked one after the other — first agree on a reliable byte stream, then agree on encryption keys on top of it. QUIC negotiates both at once, because it was designed after TLS 1.3 existed and could fold the two together from the start.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C,S: TCP + TLS 1.3 (HTTP/1.1, HTTP/2): 2 round trips before data
+    C->>S: TCP SYN
+    S-->>C: TCP SYN-ACK
+    C->>S: TCP ACK + TLS ClientHello
+    S-->>C: TLS ServerHello, Finished
+    C->>S: TLS Finished + first HTTP request
+    Note over C,S: QUIC (HTTP/3), new connection: 1 round trip before data
+    C->>S: QUIC Initial (handshake + TLS ClientHello combined)
+    S-->>C: QUIC Handshake done, TLS ServerHello
+    C->>S: First HTTP/3 request
+    Note over C,S: QUIC, resumed connection: 0-RTT
+    C->>S: QUIC Initial + first HTTP/3 request (sent immediately)
+```
+
+**Example:** on a connection with 50ms round-trip time to the server, a fresh HTTP/2 connection pays roughly 100ms (2 RTT) before the first request byte even leaves the client; a fresh HTTP/3 connection pays about 50ms (1 RTT); a resumed HTTP/3 connection (0-RTT) pays close to 0ms of handshake delay, sending the request in the very first packet.
+
+> [!tip] Remember
+> Fewer round trips before the first request is not a minor optimization — on a high-latency mobile link, the handshake can be a larger fraction of page-load time than the actual data transfer.
+
 Because QUIC has no TCP-style header compression state to rebuild per connection, HTTP/3 uses **QPACK (RFC 9204)** instead of HPACK. QPACK's dynamic table updates travel on a dedicated, unidirectional stream rather than inline with the headers, specifically so that a lost packet updating the table doesn't block headers on unrelated streams from being decoded — HPACK's inline, strictly-ordered table updates would have reintroduced head-of-line blocking at the compression layer.
+
+### Spotting TCP-level head-of-line blocking in production
+
+**In plain words:** section 3's claim — "one lost TCP segment stalls every HTTP/2 stream on that connection" — is invisible at the HTTP layer: the application only sees requests that are slow, not *why*. Proving it is TCP-level HOL blocking, rather than a slow handler or a slow database, needs a transport-layer signal, not an HTTP-layer one.
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    sym["Symptom: several HTTP/2 stream\nlatencies spike at the same instant"] --> check{"Check ss -ti or TCP_INFO\non that connection"}
+    check -- "retransmits present,\nsame timestamp" --> holconfirm["TCP-level HOL blocking:\none lost segment stalled every stream"]
+    check -- "no retransmits,\nhandlers were just slow" --> apphandler["Application-layer slowness,\nnot a transport problem"]
+```
+
+**Example:** `ss -ti` (Linux) on a live connection prints a `retrans:a/b` field per socket — `a` retransmits in the current loss recovery episode, `b` total since the socket opened — alongside `rtt` and `unacked`. If a handful of HTTP/2 streams on the *same* TCP connection all show their response latency jump at the same moment while `ss -ti` shows a nonzero `retrans` count on exactly that connection, that correlation is the signature of TCP-level HOL blocking. Go's `net.Conn` exposes the same underlying socket via `(*net.TCPConn).SyscallConn()` and a raw `getsockopt(TCP_INFO)` call if you need this from inside an application rather than from the command line.
+
+> [!warning] Common mistake
+> Watching only HTTP-level metrics (request latency, error rate) and concluding "HTTP/2 multiplexing isn't working" when the real cause is a TCP retransmission storm underneath it. The fix in that case is not a code change to the HTTP layer at all — it's either accepting the trade-off or moving to HTTP/3, which removes the shared TCP byte stream entirely.
+
+> [!tip] Remember
+> The HTTP layer cannot see TCP-level HOL blocking directly — correlate simultaneous stream stalls with a nonzero retransmit counter on that one connection (`ss -ti`'s `retrans` field, or `TCP_INFO`'s `tcpi_lost`/`tcpi_retransmits`) to tell it apart from ordinary application slowness.
 
 ## 4. Worked example
 
-### Whiteboard version
+The only thing that actually changes between protocols, as far as `net/http` is concerned, is which `http.RoundTripper` the client uses and what the server negotiates over TLS (ALPN, see [[TLS and HTTPS]]). The application code (handlers, `http.ResponseWriter`) is identical — which is itself worth noticing: the protocol upgrade is a transport-layer decision, not something application code has to branch on.
 
-The only thing that actually changes between protocols, as far as `net/http` is concerned, is which `http.RoundTripper` the client uses and what the server negotiates over TLS (ALPN, see [[TLS and HTTPS]]). The application code (handlers, `http.ResponseWriter`) is identical.
+Trace the proof step by step, for one handler that sleeps 50ms before replying, fired 6 times concurrently:
 
-### Go: proving multiplexing with `net/http`
+1. **Baseline expectation.** If 6 requests truly run one at a time, the batch should take about 6 × 50ms = 300ms. If they truly run at once, the batch should take about 50ms plus a little overhead.
+2. **HTTP/2 path.** A test server is started with HTTP/2 enabled over TLS (ALPN negotiates `h2`). All 6 requests go out concurrently on the client's one negotiated connection.
+3. **HTTP/1.1 path.** A second test server is started as plain HTTP/1.1, with the client's transport explicitly capped to one TCP connection per host — recreating exactly the single-connection scenario this note's theory describes.
+4. **Measure both batches' wall-clock time** and compare them against the two baselines from step 1.
+5. **Result:** the HTTP/1.1 batch lands close to the 300ms serial ideal; the HTTP/2 batch lands close to the 50ms parallel ideal — the entire multiplexing claim, proven as a passing test rather than asserted in prose.
 
-Go's `net/http` server and client both support HTTP/2 automatically over TLS since Go 1.6 (via ALPN negotiating `h2`); `net/http/httptest.Server` exposes an `EnableHTTP2` field (Go 1.21+) to turn this on for tests without a real certificate.
+Runnable Go version, with the full test code, line-by-line explanation and measured output: [[HTTP-1.1 vs HTTP-2 vs HTTP-3 - Go]].
 
-```go
-package http2demo
-
-import (
-	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"sync"
-	"testing"
-	"time"
-)
-
-// measureConcurrency fires n concurrent GETs through client at server and
-// returns the wall-clock time for all of them to finish. Each request makes
-// the handler sleep for delay before replying, so serialized requests take
-// n*delay and multiplexed/parallel requests take about delay.
-func measureConcurrency(t *testing.T, client *http.Client, url string, n int, delay time.Duration) time.Duration {
-	t.Helper()
-	var wg sync.WaitGroup
-	start := time.Now()
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			resp, err := client.Get(url)
-			if err != nil {
-				t.Errorf("get: %v", err)
-				return
-			}
-			resp.Body.Close()
-		}()
-	}
-	wg.Wait()
-	return time.Since(start)
-}
-
-func TestH1SingleConnVsH2Multiplexing(t *testing.T) {
-	const n = 6
-	const delay = 50 * time.Millisecond
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(delay)
-		fmt.Fprintf(w, "proto=%s", r.Proto)
-	})
-
-	// HTTP/2 server (ALPN negotiates h2 over TLS). httptest enables it when
-	// EnableHTTP2 is set (Go 1.21+).
-	h2srv := httptest.NewUnstartedServer(handler)
-	h2srv.EnableHTTP2 = true
-	h2srv.StartTLS()
-	defer h2srv.Close()
-	h2Client := h2srv.Client()
-
-	h2Elapsed := measureConcurrency(t, h2Client, h2srv.URL, n, delay)
-
-	// HTTP/1.1 server, client capped to one TCP connection per host: this is
-	// what one HTTP/1.1 connection looks like once its request queue is full,
-	// the "head-of-line blocking" this note describes.
-	h1srv := httptest.NewServer(handler)
-	defer h1srv.Close()
-	h1Client := &http.Client{Transport: &http.Transport{MaxConnsPerHost: 1}}
-
-	h1Elapsed := measureConcurrency(t, h1Client, h1srv.URL, n, delay)
-
-	t.Logf("measured on this machine: %d requests x %v handler delay", n, delay)
-	t.Logf("HTTP/1.1, 1 connection: %v (ideal serial = %v)", h1Elapsed, time.Duration(n)*delay)
-	t.Logf("HTTP/2, 1 connection, multiplexed: %v (ideal parallel = %v)", h2Elapsed, delay)
-
-	// HTTP/2 must finish far closer to the parallel ideal than to the serial one.
-	if h2Elapsed >= time.Duration(n)*delay/2 {
-		t.Fatalf("HTTP/2 took %v, expected well under %v (multiplexing should parallelize streams on one connection)", h2Elapsed, time.Duration(n)*delay/2)
-	}
-	if h1Elapsed < time.Duration(n)*delay*7/10 {
-		t.Fatalf("HTTP/1.1 single-connection took %v, expected close to the serial ideal %v", h1Elapsed, time.Duration(n)*delay)
-	}
-}
-```
-
-**Measured (Go 1.24.4, darwin/arm64, this machine, 2026-11-06):** `go test -race -v` → HTTP/1.1 single connection **311.6ms** for 6 requests (ideal serial 300ms); HTTP/2 multiplexed **62.2ms** (ideal parallel 50ms). `go vet` is clean and the test passes under `-race`.
-
-HTTP/3 needs a QUIC implementation (`golang.org/x/net/http3` or `quic-go`); the standard library's `net/http` does not speak QUIC as of Go 1.24, so an HTTP/3 server or client in Go means adding that module — representative, not demonstrated here to keep this note's dependencies to the standard library.
+HTTP/3 needs a QUIC implementation (`golang.org/x/net/http3` or `quic-go`); the standard library's `net/http` does not speak QUIC as of Go 1.24, so an HTTP/3 server or client in Go means adding that module — representative, not demonstrated here to keep the Go note's dependencies to the standard library.
 
 ### Representative output: what a real negotiation looks like
 
@@ -310,3 +300,4 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
 - **Before this:** [[TCP - Handshake, Reliability, Flow and Congestion Control]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[UDP and QUIC]]
 - **Next:** [[TLS and HTTPS]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]]
 - **Compare with:** [[gRPC]] (built on HTTP/2 framing for multiplexed RPC streams), [[Network Debugging Toolkit - dig, curl, ss, tcpdump]] (inspecting which protocol a real connection negotiated)
+- **Runnable code:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3 - Go]]

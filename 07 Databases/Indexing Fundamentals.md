@@ -3,7 +3,7 @@ tags: [databases, indexing, b-tree, postgresql, mysql]
 level: basic
 status: reviewed
 prereqs: ["[[SQL Essentials]]"]
-related: ["[[Index Types and Index Design]]", "[[Query Plans and EXPLAIN]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Transactions and ACID]]", "[[Isolation Levels and MVCC]]", "[[Zero-Downtime Schema Migrations]]", "[[Relational Schema Design]]"]
+related: ["[[Index Types and Index Design]]", "[[Query Plans and EXPLAIN]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Transactions and ACID]]", "[[Isolation Levels and MVCC]]", "[[Zero-Downtime Schema Migrations]]", "[[Relational Schema Design]]", "[[Indexing Fundamentals - Go]]"]
 sources:
   - "PostgreSQL 17 docs, Indexes: Introduction, Multicolumn Indexes, Indexes and ORDER BY, Unique Indexes, Index-Only Scans and Covering Indexes, Examining Index Usage"
   - "PostgreSQL 17 docs, B-Tree Indexes: Behavior, Implementation (Lehman and Yao, deduplication)"
@@ -13,7 +13,7 @@ sources:
   - "MySQL 8.0 Reference Manual, Clustered and Secondary Indexes; InnoDB page size (16 KB default); Skip Scan Range Access Method (8.0.13)"
   - "Lehman and Yao, Efficient Locking for Concurrent Operations on B-Trees (ACM TODS, 1981)"
   - "RFC 9562, Universally Unique IDentifiers (UUIDv7)"
-updated: 2026-11-03
+updated: 2026-11-07
 ---
 
 # Indexing Fundamentals
@@ -91,7 +91,7 @@ flowchart TD
 - **Leaf pages** hold every key in sorted order with a pointer to the row, and each leaf links to its neighbours. A range query (`BETWEEN`, `>`, `ORDER BY … LIMIT`) finds the first leaf and then walks sideways.
 - **Lookup cost** is the tree height: `O(log n)` page reads with a very large base, versus `O(n)` pages for a full scan.
 
-Tree height for a given fan-out (computed by the tested `Height` function in section 4):
+Tree height for a given fan-out (computed by the `Height` function in [[Indexing Fundamentals - Go]]):
 
 | Rows | Fan-out 300 | Fan-out 500 |
 | --- | --- | --- |
@@ -100,6 +100,19 @@ Tree height for a given fan-out (computed by the tested `Height` function in sec
 | 100,000,000 | 4 levels | 3 levels |
 
 The root and internal pages of a busy index are almost always cached in memory, so a point lookup usually costs one or two actual reads from disk at most.
+
+### Fan-out and tree height, step by step
+
+Each level multiplies the number of reachable leaf entries by the fan-out. With a fan-out of 300, the capacity grows like this:
+
+```mermaid
+flowchart LR
+    L1["1 level<br/>root is the leaf<br/>up to 300 keys"] -->|"x 300"| L2["2 levels<br/>up to 90,000 keys"]
+    L2 -->|"x 300"| L3["3 levels<br/>up to 27,000,000 keys"]
+    L3 -->|"x 300"| L4["4 levels<br/>up to 8,100,000,000 keys"]
+```
+
+**Example with numbers.** 100,000,000 invoices exceed 300^3 = 27 million, so they need 4 levels at fan-out 300. A better fan-out of 500 gives 500^3 = 125 million, so 3 levels are enough. A point lookup therefore reads 3 or 4 index pages, and the top levels stay cached because every lookup passes through them.
 
 ### Seq scan versus index scan
 
@@ -218,151 +231,36 @@ There is no `Sort` node: the index already returns entries for `(7, 'overdue')` 
 
 `CREATE INDEX CONCURRENTLY` builds the index without blocking writes. It scans the table twice, takes longer than a plain `CREATE INDEX`, cannot run inside a transaction block, and leaves an `INVALID` index behind if it fails (drop it and retry). Rollout rules are in [[Zero-Downtime Schema Migrations]].
 
-### Why column order matters: the leftmost-prefix rule in Go
+### Why column order matters: the leftmost-prefix rule
 
-A composite index is one sorted list ordered by the first column, then the second within ties, and so on, like a phone book sorted by surname and then first name. You can binary-search for a surname, or a surname plus first name. You cannot binary-search for a first name alone, because people called "Asha" are scattered across every surname.
+A composite index is one sorted list ordered by the first column, then the second within ties, and so on, like a phone book sorted by surname and then first name. You can binary-search for a surname, or for a surname plus first name. You cannot binary-search for a first name alone, because people called "Asha" are scattered across every surname.
 
-The code below models the leaf level of `(workspace_id, status, due_date)` as a sorted slice and counts how many entries each query must examine:
-
-```go
-package idx
-
-import (
-	"cmp"
-	"slices"
-	"sort"
-)
-
-// Entry is one index entry for (workspace_id, status, due_date) plus the row id.
-type Entry struct {
-	WorkspaceID int64
-	Status      string
-	DueDate     string // YYYY-MM-DD sorts correctly as text
-	RowID       int64
-}
-
-func compare(a, b Entry) int {
-	return cmp.Or(
-		cmp.Compare(a.WorkspaceID, b.WorkspaceID),
-		cmp.Compare(a.Status, b.Status),
-		cmp.Compare(a.DueDate, b.DueDate),
-		cmp.Compare(a.RowID, b.RowID),
-	)
-}
-
-// Composite is a sorted slice: the leaf level of a B-tree, flattened.
-type Composite struct{ entries []Entry }
-
-func Build(es []Entry) *Composite {
-	s := slices.Clone(es)
-	slices.SortFunc(s, compare)
-	return &Composite{entries: s}
-}
-
-// SeekPrefix finds rows with WorkspaceID = ws AND Status = st using two binary
-// searches, because both columns form a LEFTMOST prefix of the sort order.
-// It returns the matching row ids and how many entries it examined.
-func (c *Composite) SeekPrefix(ws int64, st string) (ids []int64, examined int) {
-	key := func(e Entry) int {
-		examined++
-		return cmp.Or(cmp.Compare(e.WorkspaceID, ws), cmp.Compare(e.Status, st))
-	}
-	lo := sort.Search(len(c.entries), func(i int) bool { return key(c.entries[i]) >= 0 })
-	hi := sort.Search(len(c.entries), func(i int) bool { return key(c.entries[i]) > 0 })
-	for _, e := range c.entries[lo:hi] {
-		ids = append(ids, e.RowID)
-	}
-	return ids, examined
-}
-
-// ScanStatus finds rows with Status = st alone. Status is NOT a leftmost
-// prefix, so matching entries are scattered and every entry must be examined.
-func (c *Composite) ScanStatus(st string) (ids []int64, examined int) {
-	for _, e := range c.entries {
-		examined++
-		if e.Status == st {
-			ids = append(ids, e.RowID)
-		}
-	}
-	return ids, examined
-}
-
-// Height returns the number of B+tree levels needed to hold rows entries
-// when each page holds fanout entries: the smallest h with fanout^h >= rows.
-func Height(rows, fanout int64) int {
-	h, capacity := 1, fanout
-	for capacity < rows {
-		capacity *= fanout
-		h++
-	}
-	return h
-}
+```mermaid
+flowchart TB
+    subgraph SORTED["Leaf level of (workspace_id, status, due_date), in sort order"]
+        direction TB
+        E1["ws 6 | paid | ..."]
+        E2["ws 7 | draft | ..."]
+        E3["ws 7 | open | ..."]
+        E4["ws 7 | overdue | 2026-10-02"]
+        E5["ws 7 | overdue | 2026-10-09"]
+        E6["ws 7 | paid | ..."]
+        E7["ws 8 | draft | ..."]
+        E8["ws 8 | overdue | 2026-09-30"]
+        E1 --> E2 --> E3 --> E4 --> E5 --> E6 --> E7 --> E8
+    end
+    Q1["ws = 7 AND status = 'overdue'<br/>one contiguous run: E4, E5<br/>two binary searches"] -.-> E4
+    Q2["status = 'overdue' alone<br/>matches E4, E5 and E8, scattered<br/>every entry must be examined"] -.-> E8
 ```
 
-The test builds 10,000 entries (100 workspaces × 100 invoices, 4 statuses):
+The matching entries for a leftmost prefix always form one contiguous run, so the database finds the start and the end with binary search and reads only the run. For a column that is not a prefix, the matches are scattered through the whole list.
 
-```go
-package idx
+**Example with numbers.** In the Go model, the index holds 10,000 entries (100 workspaces, 100 invoices each, 4 statuses, so 25 entries per workspace and status). The query `workspace_id = 42 AND status = 'overdue'` runs two binary searches, about 2 x log2(10,000) = 28 comparisons in theory. Measured with `go test -race -v` (Go 1.24.4), it examined **26 of 10,000** entries and found 25 rows. The query `status = 'overdue'` alone examined **all 10,000** entries to find 2,500 rows.
 
-import (
-	"fmt"
-	"testing"
-)
+### Choosing the column order
 
-func sample() []Entry {
-	statuses := []string{"draft", "open", "overdue", "paid"}
-	var es []Entry
-	id := int64(1)
-	for ws := int64(1); ws <= 100; ws++ {
-		for i := 0; i < 100; i++ {
-			es = append(es, Entry{ws, statuses[i%4], fmt.Sprintf("2026-%02d-%02d", i%12+1, i%28+1), id})
-			id++
-		}
-	}
-	return es // 10,000 entries, 25 per (workspace, status)
-}
+Put columns compared with `=` first, then the column you sort by, then a column compared with a range (`<`, `BETWEEN`). For a multi-tenant app, `workspace_id` is almost always first, because every query filters on it. The full design method (the equality–sort–range rule and its exceptions) is in [[Index Types and Index Design]].
 
-func TestSeekPrefixUsesBinarySearch(t *testing.T) {
-	c := Build(sample())
-	ids, examined := c.SeekPrefix(42, "overdue")
-	if len(ids) != 25 {
-		t.Fatalf("got %d rows, want 25", len(ids))
-	}
-	t.Logf("examined %d of %d entries", examined, len(c.entries))
-	if examined > 30 { // two binary searches over 10,000 entries: about 2 * log2(10000) = 28
-		t.Fatalf("examined %d entries, want <= 30", examined)
-	}
-}
-
-func TestStatusAloneMustScan(t *testing.T) {
-	c := Build(sample())
-	ids, examined := c.ScanStatus("overdue")
-	if len(ids) != 2500 || examined != 10000 {
-		t.Fatalf("rows=%d examined=%d", len(ids), examined)
-	}
-}
-
-func TestHeight(t *testing.T) {
-	cases := []struct {
-		rows, fanout int64
-		want         int
-	}{
-		{1, 300, 1},
-		{300, 300, 1},
-		{301, 300, 2},
-		{90_000, 300, 2},
-		{100_000_000, 300, 4}, // 300^3 = 27M < 100M <= 300^4
-		{100_000_000, 500, 3}, // 500^3 = 125M
-	}
-	for _, c := range cases {
-		if got := Height(c.rows, c.fanout); got != c.want {
-			t.Errorf("Height(%d,%d)=%d want %d", c.rows, c.fanout, got, c.want)
-		}
-	}
-}
-```
-
-Measured with `go test -race -v` (Go 1.24.4): the leftmost-prefix lookup examined **26 of 10,000** entries; the status-only query examined **all 10,000**. All three tests pass.
 
 **Choosing the column order.** Put columns compared with `=` first, then the column you sort by, then a column compared with a range (`<`, `BETWEEN`). For a multi-tenant app, `workspace_id` is almost always first, because every query filters on it. The full design method (the equality–sort–range rule and its exceptions) is in [[Index Types and Index Design]].
 
@@ -377,9 +275,27 @@ CREATE INDEX CONCURRENTLY idx_invoices_list
 
 `INCLUDE` adds payload columns to the leaf entries without making them part of the sort key. There is one PostgreSQL caveat: the index does not know whether a row version is visible to your transaction (see [[Isolation Levels and MVCC]]), so for each entry it checks the **visibility map**, a small per-table bitmap of pages whose rows are all visible to everyone. If the page is not marked all-visible, it must visit the heap anyway; `EXPLAIN ANALYZE` reports these visits as `Heap Fetches`. Recently vacuumed tables get close to zero heap fetches. In InnoDB, a secondary index that includes all needed columns is "covering" and skips the second (primary-key) tree walk.
 
+```mermaid
+sequenceDiagram
+    participant Q as Query
+    participant I as Index leaf entry
+    participant V as Visibility map
+    participant H as Heap page
+    Q->>I: read entry (7, overdue, due_date) with number, total_minor
+    I->>V: is the heap page of this entry all-visible?
+    alt page marked all-visible
+        V-->>Q: yes, return values from the index entry
+    else page not all-visible (recent updates, VACUUM behind)
+        V->>H: no, visit the heap page
+        H-->>Q: check row visibility, then return (counted as Heap Fetches)
+    end
+```
+
 ### Unique indexes are constraints
 
 `PRIMARY KEY` and `UNIQUE` are enforced with a unique B-tree: before inserting, the database descends the tree to check that the key is absent. That is why `UNIQUE (workspace_id, number)` both prevents duplicate invoice numbers per workspace and speeds up lookups by number. PostgreSQL does **not** create an index for a foreign key automatically; add one on `invoices.customer_id` yourself if you join or delete by it, or every `DELETE FROM customers` scans `invoices`.
+
+Runnable Go version: [[Indexing Fundamentals - Go]]
 
 ## 5. Variants and comparison
 
@@ -429,13 +345,54 @@ Index *types* beyond the B-tree (hash, GIN, GiST, BRIN) and special forms (parti
 
 ## 8. Deep dive
 
-- **Why B-trees and not binary trees or hash tables.** A binary tree has fan-out 2, so 100 million keys need about 27 levels, each a separate page read. A B+tree packs hundreds of keys per page to cut that to 3–4. Hash indexes give `O(1)` equality lookups but no order, so they cannot serve ranges or `ORDER BY`.
-- **Page splits.** When a leaf page is full, it splits into two half-full pages and a new separator goes into the parent. Sequential keys (identity, UUIDv7) always append to the rightmost leaf, which PostgreSQL optimizes; random keys split pages all over the tree and leave them about half to three-quarters full.
-- **HOT updates in PostgreSQL.** An update writes a new row version. If no indexed column changed and the new version fits on the same heap page, PostgreSQL makes it a **heap-only tuple** (HOT): the indexes keep pointing at the old item, which links to the new version, so no index is touched. Indexing a frequently updated column such as `updated_at` disables HOT for those updates; leaving free space per page with `fillfactor` (for example `90`) makes HOT more likely.
+### Why B-trees and not binary trees or hash tables
+
+A binary tree has fan-out 2, so 100 million keys need about 27 levels, each a separate page read. A B+tree packs hundreds of keys per page to cut that to 3–4. Hash indexes give `O(1)` equality lookups but no order, so they cannot serve ranges or `ORDER BY`.
+
+### Page splits
+
+When a leaf page is full, it splits into two half-full pages and a new separator goes into the parent.
+
+```mermaid
+flowchart LR
+    subgraph BEFORE["Before: leaf is full (4 entries shown for illustration)"]
+        B1["10 | 20 | 30 | 40"]
+    end
+    subgraph AFTER["After inserting key 25"]
+        P["parent gains separator 30"]
+        A1["10 | 20 | 25"]
+        A2["30 | 40"]
+        P --> A1
+        P --> A2
+    end
+    BEFORE -->|"split into two half-full pages"| AFTER
+```
+
+Sequential keys (identity, UUIDv7) always append to the rightmost leaf, which PostgreSQL optimizes. Random keys split pages all over the tree and leave them about half to three-quarters full.
+
+### HOT updates in PostgreSQL
+
+An update writes a new row version. If no indexed column changed and the new version fits on the same heap page, PostgreSQL makes it a **heap-only tuple** (HOT): the indexes keep pointing at the old item, which links to the new version, so no index is touched.
+
+```mermaid
+flowchart LR
+    subgraph HOT["HOT update: indexed columns unchanged, room on the page"]
+        X1["index entry<br/>id 501"] --> I1["heap page 812, item 1<br/>old version (redirect)"]
+        I1 --> I2["heap page 812, item 2<br/>new version"]
+    end
+    subgraph NH["Non-HOT: indexed column changed, or page full"]
+        X2["old index entry<br/>id 501"] --> J1["page 812, item 1<br/>dead version"]
+        X3["NEW entry in every index"] --> J2["page 977, item 3<br/>new version"]
+    end
+```
+
+Indexing a frequently updated column such as `updated_at` disables HOT for those updates. Leaving free space per page with `fillfactor` (for example `90`) makes HOT more likely.
+
+### Other details
+
 - **Descending and NULL order.** A B-tree can be scanned in both directions, so `(workspace_id, created_at)` also serves `ORDER BY created_at DESC` for one workspace. Mixed directions (`ORDER BY a ASC, b DESC`) need an index declared that way.
 - **Index size versus working set.** Only the part of an index that queries actually touch needs to be in memory. With time-ordered keys, that is the recent right-hand edge; with random keys, it is the whole index, which is the real cost of UUIDv4 at scale.
 - **Correlation.** PostgreSQL's statistics record how well a column's order matches the physical row order. A highly correlated column (such as `created_at` on an append-only table) makes index range scans read mostly sequential heap pages, so the planner keeps using the index for larger fractions of the table than it would for an uncorrelated column.
-
 ## 9. Interview questions
 
 > [!question]- How does a B-tree index make a lookup fast, and how many page reads does it take?
@@ -475,3 +432,4 @@ Index *types* beyond the B-tree (hash, GIN, GiST, BRIN) and special forms (parti
 - **Before this:** [[SQL Essentials]], [[Relational Schema Design]]
 - **Next:** [[Query Plans and EXPLAIN]], [[Index Types and Index Design]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Compare with:** [[Search Engines and Inverted Indexes]] (inverted index for text instead of a sorted tree), [[Hash Tables and Go Maps]] (O(1) equality lookup without order)
+- **Go implementation:** [[Indexing Fundamentals - Go]]

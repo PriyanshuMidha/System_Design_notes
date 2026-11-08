@@ -21,7 +21,7 @@ sources:
   - "Lu et al., WiscKey: Separating Keys from Values in SSD-conscious Storage (FAST 2016)"
   - "Go source, internal/poll/fd_fsync_darwin.go (File.Sync uses F_FULLFSYNC on macOS)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 3"
-updated: 2026-11-02
+updated: 2026-11-07
 ---
 
 # Storage Engines - B-tree vs LSM and WAL
@@ -69,6 +69,18 @@ Analogy: an accountant's **journal and ledger**. Every transaction is first writ
 ### Pages and the buffer pool
 
 A PostgreSQL page has a 24-byte header, an array of 4-byte line pointers growing forward, row versions (tuples) growing backward from the end, and free space in between. The header records the **LSN** (log sequence number, a byte position in the WAL) of the last WAL record that changed the page. Recovery uses it to skip changes the page already has.
+
+```mermaid
+flowchart LR
+    subgraph page["One 8,192-byte PostgreSQL page"]
+        direction LR
+        H["header, 24 bytes<br/>holds the page LSN"] --> LP["line pointers 1, 2, 3 ...<br/>4 bytes each, grow forward"]
+        LP --> FS["free space"]
+        FS --> TU["tuples 3, 2, 1<br/>grow backward from the end"]
+    end
+```
+
+Example with numbers: if each row version takes about 100 bytes, every row costs 104 bytes (100 plus its 4-byte line pointer). The 8,168 bytes after the header hold about 78 rows. Changing one of them dirties the whole 8 kB page (an estimate by arithmetic, ignoring tuple-header detail).
 
 | | PostgreSQL 17 | MySQL 8.0 InnoDB |
 | --- | --- | --- |
@@ -130,6 +142,32 @@ sequenceDiagram
     BP->>DF: checkpointer or background writer writes page 7
 ```
 
+### Group commit
+
+One `fsync` makes every record written before it durable, so commits that arrive while a flush is running can share the next one.
+
+```mermaid
+sequenceDiagram
+    participant A as Session A
+    participant B as Session B
+    participant C as Session C
+    participant W as WAL buffers
+    participant D as pg_wal on disk
+    A->>W: commit record at 0/5D3A218
+    A->>D: write and fsync up to 0/5D3A218
+    B->>W: commit record at 0/5D3A290 (while A is flushing)
+    C->>W: commit record at 0/5D3A2F8 (while A is flushing)
+    D-->>A: flushed
+    B->>D: write and fsync up to 0/5D3A2F8
+    Note over B,C: one flush now covers both B and C
+    D-->>B: flushed
+    D-->>C: flushed, C never issued its own fsync
+```
+
+With a flush costing about 3.8 ms (measured above), three sessions that commit inside one flush pay about 7.6 ms in total instead of 11.4 ms, and under load the saving grows with the number of waiters.
+
+### Durability settings
+
 - **PostgreSQL:** the WAL lives in 16 MB segment files in `pg_wal`. One flush covers every record written so far, so commits that arrive together share it (**group commit**). The same WAL stream feeds [[Replication]] and point-in-time recovery ([[Backup, PITR and Disaster Recovery]]).
 	- `synchronous_commit = off` acknowledges before the flush. A crash can lose the last commits (at most about three times `wal_writer_delay`, 600 ms by default) but never corrupts data. It can be set per transaction, for example for analytics events but not payments.
 	- `commit_delay` (default 0) makes the flushing backend wait briefly so more commits join the flush.
@@ -140,6 +178,16 @@ sequenceDiagram
 ### Checkpoints and torn pages
 
 A **checkpoint** writes every dirty page to the data files, then writes a checkpoint record to the WAL. Recovery starts from the last checkpoint's REDO point, so WAL before it can be recycled.
+
+```mermaid
+flowchart LR
+    C1["checkpoint 1<br/>REDO point at LSN 100"] --> F["first change to page 7:<br/>WAL holds a full 8 kB image of page 7"]
+    F --> S["later changes to page 7:<br/>small records, about 50 bytes each"]
+    S --> X["power cut while page 7 is<br/>being written: torn page"]
+    X --> R["recovery replays from LSN 100:<br/>the full image overwrites the torn page,<br/>then the small records apply"]
+```
+
+Example: after checkpoint 1, a hot page changes 5 times before the next checkpoint. With `full_page_writes = on` the WAL carries one 8,192-byte image plus 4 small records of about 50 bytes each, about 8.4 kB in total (an estimate), instead of 5 small records. That is why WAL volume spikes right after each checkpoint.
 
 - PostgreSQL starts one every `checkpoint_timeout` (default 5 min), or earlier when the WAL would otherwise grow past `max_wal_size` (default 1 GB). `checkpoint_completion_target = 0.9` spreads the writes over 90% of the interval to avoid an I/O spike.
 - **Torn pages.** The OS and disk only promise atomic writes of smaller units (often 4 kB), so an 8 kB page can be half-written by a crash. Replaying a small change record onto a torn page cannot repair it.
@@ -153,11 +201,29 @@ A **checkpoint** writes every dirty page to the data files, then writes a checkp
 3. Stop at the first record with a bad CRC or a missing next segment: that is the end of the WAL.
 4. There is **no undo pass**. A transaction without a commit record counts as aborted; its row versions stay invisible and VACUUM removes them later. InnoDB, which updates rows in place, must also roll back unfinished transactions from the undo log, which it does in the background after startup.
 
+```mermaid
+flowchart TD
+    A["start after a crash"] --> B["read pg_control:<br/>last checkpoint and its REDO point"]
+    B --> C["read the next WAL record"]
+    C --> D{"valid: CRC ok<br/>and segment present?"}
+    D -- no --> Z["end of WAL: recovery complete"]
+    D -- yes --> E{"full-page image?"}
+    E -- yes --> F["overwrite the page with the image"]
+    E -- no --> G{"page LSN older<br/>than the record?"}
+    G -- yes --> H["apply the record to the page"]
+    G -- no --> I["skip: the page already has it"]
+    F --> C
+    H --> C
+    I --> C
+```
+
 This is ARIES-style "redo history, then undo the losers", minus the undo step that PostgreSQL's multi-version heap does not need.
 
 ### LSM trees
 
-An LSM engine turns every write into a sequential append:
+An LSM engine turns every write into a sequential append.
+
+### LSM write and read paths
 
 ```mermaid
 flowchart LR
@@ -178,8 +244,32 @@ flowchart LR
 - **Write.** Append to the WAL, insert into the **memtable** (a skiplist in LevelDB and RocksDB, see [[Union-Find and Skip Lists]]), acknowledge. When the memtable fills (RocksDB `write_buffer_size`, default 64 MB) it becomes immutable, a fresh one takes writes, and a background thread **flushes** it as an **SSTable** (sorted string table): sorted data blocks (4 KB by default in RocksDB), an index block, a bloom filter and a footer. Once flushed, that memtable's WAL can be deleted.
 - **Read.** Check the memtable, then immutable memtables, then every L0 file newest first (their key ranges overlap), then at most one file per lower level (their ranges do not overlap). The first version found wins.
 - **Bloom filters.** Each SSTable carries a [[Bloom Filters and Probabilistic Data Structures|bloom filter]]. About 10 bits per key gives roughly a 1% false-positive rate, so a lookup for an absent key touches almost no data blocks. Range scans cannot use them: they must merge an iterator from every level.
+### Deletes and compaction
+
 - **Delete.** Write a **tombstone**. The old value is only physically removed when compaction carries the tombstone past every older version.
 - **Compaction** merges SSTables, drops overwritten versions and expired tombstones, and keeps reads bounded. **Leveled** compaction (RocksDB default, LevelDB, Cassandra LCS) keeps one sorted run per level, each about 10 times larger than the last (RocksDB L1 target 256 MB). **Size-tiered** (Cassandra STCS, RocksDB "universal") merges files of similar size.
+
+Example with numbers (leveled, using RocksDB defaults): four 64 MB L0 files each overlap L1's key range, and L1 holds 256 MB. Compaction reads the 4 × 64 MB plus the overlapping part of L1 and writes a new sorted L1. Merging 256 MB of new data into, say, 256 MB of existing L1 data writes about 512 MB for 256 MB of user data, so this single step already has a write amplification of about 2 (an estimate from the model); the data is then rewritten again when L1 spills into L2.
+
+```mermaid
+flowchart LR
+    subgraph before["Before compaction"]
+        L0a["L0 file 1<br/>64 MB, keys a to z"]
+        L0b["L0 file 2<br/>64 MB, keys a to z"]
+        L0c["L0 file 3<br/>64 MB, keys a to z"]
+        L0d["L0 file 4<br/>64 MB, keys a to z"]
+        L1a["L1: sorted run, 256 MB,<br/>files a-f, g-m, n-s, t-z"]
+    end
+    subgraph after["After compaction"]
+        L1b["L1: one new sorted run<br/>overwritten versions and<br/>expired tombstones gone"]
+    end
+    L0a --> M{"merge"}
+    L0b --> M
+    L0c --> M
+    L0d --> M
+    L1a --> M
+    M --> L1b
+```
 
 ### Read, write and space amplification
 
@@ -199,7 +289,7 @@ The **RUM conjecture** (Athanassoulis et al., 2016) says an access method can mi
 
 ### Whiteboard version
 
-The one rule of a WAL: log, flush, then change data.
+The one rule of a WAL: log, flush, then change data. The snippet is deliberately the smallest version of the idea.
 
 ```go
 package wal
@@ -224,266 +314,40 @@ func (db *DB) Put(k, v string) error {
 }
 ```
 
-The full version below adds checksums so recovery can detect a torn record, replay, and a toy LSM tree with memtable, flush and merge.
+The runnable version adds checksums so recovery can detect a torn record, replay, and a toy LSM tree with memtable, flush and merge.
 
-A toy WAL and a toy LSM tree in Go. Both compile and pass `go vet` and `go test -race` on Go 1.24.
+### A WAL commit and a crash, traced
 
-**The WAL.** Each record carries a CRC-32C and a length, so recovery can tell a complete record from a torn one and stop there, as PostgreSQL does at the end of its WAL.
+InvoiceOps appends three payment records, each with its own `fsync`, and the power fails halfway through the fourth.
 
-```go
-package kv
-
-import (
-	"bufio"
-	"encoding/binary"
-	"hash/crc32"
-	"io"
-	"os"
-)
-
-var crcTable = crc32.MakeTable(crc32.Castagnoli)
-
-// Record is one logged change.
-type Record struct{ Key, Value string }
-
-// WAL is an append-only log. Each record is framed as
-// crc32c(payload) | len(payload) | payload, so a torn write is detectable.
-type WAL struct{ f *os.File }
-
-func encode(r Record) []byte {
-	p := binary.AppendUvarint(nil, uint64(len(r.Key)))
-	p = append(append(p, r.Key...), r.Value...)
-	frame := binary.LittleEndian.AppendUint32(nil, crc32.Checksum(p, crcTable))
-	frame = binary.LittleEndian.AppendUint32(frame, uint32(len(p)))
-	return append(frame, p...)
-}
-
-// OpenWAL replays every intact record through apply, in order, then cuts off
-// a torn or corrupt tail left by a crash so new appends start on a clean edge.
-func OpenWAL(path string, apply func(Record)) (*WAL, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	r := bufio.NewReader(f)
-	var good int64 // offset just past the last intact record
-	for {
-		var hdr [8]byte
-		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			break // clean end of the log, or a torn header
-		}
-		n := binary.LittleEndian.Uint32(hdr[4:])
-		if n > 1<<20 {
-			break // a length this large can only be garbage
-		}
-		p := make([]byte, n)
-		if _, err := io.ReadFull(r, p); err != nil {
-			break // torn payload
-		}
-		if crc32.Checksum(p, crcTable) != binary.LittleEndian.Uint32(hdr[:4]) {
-			break // corrupt: nothing after this point can be trusted
-		}
-		klen, w := binary.Uvarint(p)
-		if w <= 0 || klen > uint64(len(p)-w) {
-			break
-		}
-		k := w + int(klen)
-		apply(Record{Key: string(p[w:k]), Value: string(p[k:])})
-		good += 8 + int64(n)
-	}
-	if _, err = f.Seek(good, io.SeekStart); err == nil {
-		err = f.Truncate(good)
-	}
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	return &WAL{f: f}, nil
-}
-
-// Append writes the records with one write call. With sync it also fsyncs,
-// so one Append of many records is one durable "group commit".
-func (w *WAL) Append(sync bool, recs ...Record) error {
-	var buf []byte
-	for _, r := range recs {
-		buf = append(buf, encode(r)...)
-	}
-	if _, err := w.f.Write(buf); err != nil {
-		return err
-	}
-	if sync {
-		return w.f.Sync()
-	}
-	return nil
-}
-
-func (w *WAL) Close() error { return w.f.Close() }
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant W as Toy WAL file
+    participant R as Recovery on restart
+    App->>W: append inv:0, fsync
+    App->>W: append inv:1, fsync
+    App->>W: append inv:2, fsync
+    App->>W: start appending inv:3
+    Note over W: crash after about half of the record
+    R->>W: read record 1: length and CRC match
+    R->>W: read record 2 and 3: match
+    R->>W: read record 4: payload shorter than its length
+    R->>W: truncate the file to the end of record 3
+    App->>W: append inv:4 starts on a clean edge
 ```
 
-The test simulates a crash halfway through writing the fourth record:
+Each record is framed as a CRC-32C, a length and a payload. Recovery stops at the first record whose length or CRC does not match, cuts the file there, and so the three acknowledged commits survive while the half-written fourth is dropped. It was never acknowledged, so nothing is lost.
 
-```go
-func replay(t *testing.T, path string) (*WAL, []Record) {
-	t.Helper()
-	var got []Record
-	w, err := OpenWAL(path, func(r Record) { got = append(got, r) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	return w, got
-}
+### Compaction policy, measured
 
-func TestWALDropsTornTailAndKeepsCommittedRecords(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wal")
-	w, _ := replay(t, path)
-	for i := range 3 {
-		if err := w.Append(true, Record{Key: "inv:" + strconv.Itoa(i), Value: "paid"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	w.Close()
+The toy LSM tree buffers 1,000 keys per memtable and merges everything into one run once there are more than `maxRuns` runs. It writes 100,000 invoice keys and looks up one absent key every 100 writes, with no bloom filters, so every run is searched.
 
-	// Simulate a crash in the middle of writing a 4th record.
-	torn := encode(Record{Key: "inv:3", Value: "paid"})
-	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
-	f.Write(torn[:len(torn)/2])
-	f.Close()
-
-	w, got := replay(t, path)
-	if len(got) != 3 || got[2].Key != "inv:2" {
-		t.Fatalf("recovered %v, want the 3 complete records", got)
-	}
-	// The torn bytes are gone, so the next append starts on a clean edge.
-	if err := w.Append(true, Record{Key: "inv:4", Value: "sent"}); err != nil {
-		t.Fatal(err)
-	}
-	w.Close()
-	_, got = replay(t, path)
-	if len(got) != 4 || got[3].Key != "inv:4" {
-		t.Fatalf("after re-append got %v", got)
-	}
-}
-```
-
-**The LSM tree.** Runs are in-memory sorted slices standing in for SSTable files, and the WAL is left out to keep it short. The one compaction policy is "merge everything into one run once there are more than `maxRuns` runs", which is enough to show the trade-off.
-
-```go
-package kv
-
-import (
-	"maps"
-	"slices"
-	"strings"
-)
-
-type entry struct {
-	key, value string
-	tombstone  bool
-}
-
-func byKey(a, b entry) int { return strings.Compare(a.key, b.key) }
-
-// Tree is a toy LSM tree. Each run stands in for one immutable SSTable file.
-type Tree struct {
-	mem       map[string]entry // memtable (real engines use a skiplist)
-	memLimit  int              // flush when the memtable holds this many keys
-	runs      [][]entry        // sorted runs, newest first
-	maxRuns   int              // merge all runs into one when there are more
-	UserBytes int              // bytes the application wrote
-	DiskBytes int              // bytes written to runs by flushes and compactions
-	Probes    int              // runs searched by Get (read amplification)
-}
-
-func NewTree(memLimit, maxRuns int) *Tree {
-	return &Tree{mem: map[string]entry{}, memLimit: memLimit, maxRuns: maxRuns}
-}
-
-func (t *Tree) Put(k, v string) { t.write(entry{key: k, value: v}) }
-func (t *Tree) Delete(k string) { t.write(entry{key: k, tombstone: true}) }
-
-func (t *Tree) write(e entry) {
-	t.UserBytes += len(e.key) + len(e.value)
-	t.mem[e.key] = e // a real engine appends to its WAL first
-	if len(t.mem) >= t.memLimit {
-		t.flush()
-	}
-}
-
-// flush writes the memtable out as a new sorted run.
-func (t *Tree) flush() {
-	run := slices.SortedFunc(maps.Values(t.mem), byKey)
-	t.runs = append([][]entry{run}, t.runs...)
-	t.DiskBytes += size(run)
-	t.mem = map[string]entry{}
-	if len(t.runs) > t.maxRuns {
-		t.compact()
-	}
-}
-
-// compact merges every run into one, keeping only the newest version of each
-// key. Tombstones are dropped because no older run is left for them to hide.
-func (t *Tree) compact() {
-	newest := map[string]entry{}
-	for i := len(t.runs) - 1; i >= 0; i-- { // oldest first; newer runs overwrite
-		for _, e := range t.runs[i] {
-			newest[e.key] = e
-		}
-	}
-	merged := slices.DeleteFunc(slices.Collect(maps.Values(newest)),
-		func(e entry) bool { return e.tombstone })
-	slices.SortFunc(merged, byKey)
-	t.runs = [][]entry{merged}
-	t.DiskBytes += size(merged)
-}
-
-// Get checks the memtable, then each run from newest to oldest.
-// The first version found wins, even if it is a tombstone.
-func (t *Tree) Get(k string) (string, bool) {
-	if e, ok := t.mem[k]; ok {
-		return e.value, !e.tombstone
-	}
-	for _, run := range t.runs {
-		t.Probes++
-		i, found := slices.BinarySearchFunc(run, k,
-			func(e entry, k string) int { return strings.Compare(e.key, k) })
-		if found {
-			return run[i].value, !run[i].tombstone
-		}
-	}
-	return "", false
-}
-
-func size(run []entry) (n int) {
-	for _, e := range run {
-		n += len(e.key) + len(e.value)
-	}
-	return n
-}
-```
-
-The measuring test writes 100,000 invoice keys with a 1,000-key memtable and looks up one absent key every 100 writes (no bloom filters, so every run is searched):
-
-```go
-// Fewer runs means fewer probes per read but more rewriting.
-func TestCompactionTradeoff(t *testing.T) {
-	prevWA, prevProbes := 1e9, -1.0
-	for _, maxRuns := range []int{1, 4, 16} {
-		tr := NewTree(1_000, maxRuns)
-		for i := range 100_000 {
-			tr.Put(fmt.Sprintf("inv:%07d", i), "status=sent;total=125000")
-			if i%100 == 99 { // an absent key: every run must be searched
-				tr.Get(fmt.Sprintf("missing:%d", i))
-			}
-		}
-		wa := float64(tr.DiskBytes) / float64(tr.UserBytes)
-		probes := float64(tr.Probes) / 1_000
-		t.Logf("maxRuns=%-2d write amp=%5.1f  runs probed per miss=%4.1f", maxRuns, wa, probes)
-		if wa >= prevWA || probes <= prevProbes {
-			t.Fatalf("expected write amp to fall and probes to rise as maxRuns grows")
-		}
-		prevWA, prevProbes = wa, probes
-	}
-}
+```mermaid
+flowchart LR
+    A["maxRuns = 1<br/>always one run"] -->|"write amp 51.5x<br/>1.0 runs probed per miss"| B["cheapest reads,<br/>most rewriting"]
+    C["maxRuns = 4"] -->|"write amp 13.2x<br/>2.5 runs probed per miss"| D["in between"]
+    E["maxRuns = 16"] -->|"write amp 4.4x<br/>8.2 runs probed per miss"| F["cheapest writes,<br/>most read work"]
 ```
 
 **Measured** (`go test -race -v`, Go 1.24, 2026-11-02):
@@ -495,6 +359,8 @@ func TestCompactionTradeoff(t *testing.T) {
 | 16 | 4.4× | 8.2 | Tiered: cheapest writes, most read work |
 
 Two lessons. Merging everything into one run rewrites the whole dataset again and again, so its write amplification grows with the data; that is why real engines merge level by level or tier by tier. And there is no free setting: every write saved is paid back in read work, and in real engines in space as well.
+
+Runnable Go version: [[Storage Engines - B-tree vs LSM and WAL - Go]]
 
 ## 5. Variants and comparison
 
@@ -516,6 +382,19 @@ Who uses what:
 - **MongoDB WiredTiger:** B-tree with a journal (its WAL) and periodic checkpoints.
 
 ## 6. Trade-offs and when not to use
+
+```mermaid
+flowchart TD
+    Q["What limits the system?"] --> W{"sustained writes beyond<br/>what one B-tree node absorbs?"}
+    W -- yes --> P{"mostly point lookups<br/>and append-style data?"}
+    P -- yes --> L["LSM engine<br/>RocksDB, Cassandra"]
+    P -- no --> T["Shard a B-tree engine first,<br/>then reconsider"]
+    W -- no --> R{"range scans, joins and<br/>predictable latency matter?"}
+    R -- yes --> B["B+tree engine<br/>PostgreSQL, InnoDB"]
+    R -- no --> S{"disk space or flash wear<br/>the bottleneck?"}
+    S -- yes --> L
+    S -- no --> B
+```
 
 - **Pick a B+tree engine** (in practice: PostgreSQL or MySQL) for general OLTP. Reads touch a bounded number of pages, range scans are cheap, and the tooling is mature. Most InvoiceOps-sized systems never need anything else.
 - **Pick an LSM engine** when sustained write volume is the bottleneck (event ingestion, time series, large key-value workloads) or when storage efficiency matters: no half-empty pages, and SSTables compress well.
@@ -594,5 +473,6 @@ Who uses what:
 ## Links
 
 - **Before this:** [[Indexing Fundamentals]], [[Transactions and ACID]], [[Page Cache, File Systems and fsync]]
+- **Runnable code:** [[Storage Engines - B-tree vs LSM and WAL - Go]] (toy WAL with checksums, toy LSM tree, tests and benchmarks)
 - **Next:** [[Isolation Levels and MVCC]], [[Replication]], [[Backup, PITR and Disaster Recovery]]
 - **Compare with:** [[Wide-Column Stores and Cassandra]] (an LSM engine in a distributed database), [[Time-Series and Columnar Storage]] (column layouts for analytics), [[Case Study - Key-Value Store]]

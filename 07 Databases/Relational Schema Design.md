@@ -14,7 +14,7 @@ sources:
   - "ISO 4217 currency codes and minor units"
   - "Karwin, SQL Antipatterns (Pragmatic Bookshelf, 2010): Jaywalking, EAV, Polymorphic Associations"
   - "pkg.go.dev, github.com/google/uuid (NewV7 since v1.5.0)"
-updated: 2026-11-02
+updated: 2026-11-07
 ---
 
 # Relational Schema Design
@@ -144,6 +144,16 @@ Not every repeated value is a violation. `invoice_items.unit_price_minor` looks 
 
 Use `GENERATED ALWAYS AS IDENTITY` (SQL standard, PostgreSQL 10+) rather than the older `serial`. If ids are created outside the database or exposed publicly, use UUIDv7: `uuid.NewV7()` from `github.com/google/uuid` (v1.5.0+), or `uuidv7()` built in since PostgreSQL 18. The measured effect of random keys on a B-tree is in [[Indexing Fundamentals]]; ID generation at scale is in [[Unique ID Generation]].
 
+```mermaid
+flowchart TD
+    Q{"Where is the id created?"} -->|"only by the database"| B{"Exposed in URLs or APIs?"}
+    Q -->|"anywhere: app, mobile, offline"| V{"Hot, large table?"}
+    B -->|"no"| BI["bigint identity: 8 bytes, ordered"]
+    B -->|"yes"| BI2["bigint identity + authorization check on every read,<br/>or a public UUID column beside it"]
+    V -->|"yes"| V7["UUIDv7: 16 bytes, time-ordered,<br/>inserts append to the right of the index"]
+    V -->|"no, small table"| V4["UUIDv4 is acceptable:<br/>random inserts are cheap on small indexes"]
+```
+
 **Invoice numbers are not ids.** Accountants expect them gapless and sequential per workspace, and sequences cannot promise that: a `nextval` is never returned after a rollback. Allocate them from a counter row in the same transaction that sends the invoice; the row lock serializes numbering per workspace, which is fine at invoice rates.
 
 ```sql
@@ -158,6 +168,19 @@ WHERE workspace_id = 42
 RETURNING next_number - 1 AS number;
 ```
 
+```mermaid
+sequenceDiagram
+    participant A as Tx A: send invoice
+    participant R as invoice_counters row, workspace 42
+    participant B as Tx B: send invoice
+    A->>R: UPDATE ... RETURNING (takes the row lock)
+    R-->>A: number 7
+    B->>R: UPDATE ... RETURNING (waits for A)
+    A->>A: COMMIT: lock released
+    R-->>B: number 8
+    Note over A,B: if A had rolled back, the counter would still say 7<br/>and B would get 7: no gap
+```
+
 ### Step 5: constraints are invariants
 
 | Rule                                         | Constraint                                                          |
@@ -168,6 +191,32 @@ RETURNING next_number - 1 AS number;
 | invoice numbers are unique per workspace     | `UNIQUE (workspace_id, number)`                                     |
 | an invoice's client is in the same workspace | composite FK `(workspace_id, client_id) → clients (workspace_id, id)` |
 | a provider event is processed once           | `PRIMARY KEY (provider, event_id)` on `webhook_events`              |
+
+A composite foreign key is what makes the "same workspace" rule enforceable. Workspace 1 owns client 10 and workspace 2 owns client 20; an invoice written for workspace 1 cannot point at client 20.
+
+```mermaid
+flowchart LR
+    subgraph clients["clients, UNIQUE (workspace_id, id)"]
+        direction TB
+        c1["(1, 10) Acme Corp"]
+        c2["(2, 20) Zenith Ltd"]
+    end
+    subgraph invoices["invoices, FK (workspace_id, client_id)"]
+        direction TB
+        i1["workspace 1, client 10: accepted"]
+        i2["workspace 1, client 20: pair (1, 20) not found,<br/>error 23503"]
+    end
+    i1 --> c1
+    i2 -.->|"no such parent row"| c2
+```
+
+```mermaid
+flowchart LR
+    D["DELETE a parent row"] --> R{"ON DELETE action<br/>on the child foreign key"}
+    R -->|"NO ACTION / RESTRICT"| X["error 23503 if children exist<br/>client with invoices: delete refused"]
+    R -->|"CASCADE"| C["children deleted too<br/>invoice_items die with their invoice"]
+    R -->|"SET NULL (parent_id)"| N["child kept, link cleared<br/>subsidiary becomes a top-level client"]
+```
 
 **`ON DELETE` choices:** `NO ACTION` / `RESTRICT` (the default family) refuse to delete a client that still has invoices, which is what financial history needs. `CASCADE` suits pure children: line items die with their invoice. `SET NULL` suits optional links: deleting a parent client turns subsidiaries into top-level clients.
 
@@ -193,6 +242,13 @@ Minor units differ by currency (ISO 4217): 2 decimals for INR and USD, 0 for JPY
 ### Step 8: soft deletes and audit columns
 
 - **Soft delete:** `deleted_at timestamptz` instead of `DELETE`. Uniqueness must then ignore deleted rows, which a **partial unique index** does: `UNIQUE (workspace_id, lower(email)) WHERE deleted_at IS NULL`. The costs: every query must filter `deleted_at IS NULL`, foreign keys still point at "deleted" rows, the table keeps growing, and a legal erasure request still needs a real delete or anonymization. Moving the row to an archive table in the same transaction is often simpler.
+```mermaid
+flowchart TD
+    E["Client re-added with email bob@x.com"] --> Q{"Is there a live row<br/>(deleted_at IS NULL) with lower(email) in this workspace?"}
+    Q -->|"no: the old row has deleted_at set,<br/>so the partial index skips it"| OK["insert succeeds"]
+    Q -->|"yes"| DUP["error 23505 unique_violation"]
+```
+
 - **Audit columns:** `created_at` and `updated_at` on every mutable table, with `updated_at` set by a trigger so no code path forgets. `now()` returns the *transaction's* start time, so all rows changed in one transaction share it.
 - **Audit log:** an append-only `audit_logs` table written in the same transaction as the change. Its `(entity_type, entity_id)` pair is a polymorphic reference with no foreign key, on purpose: the log must outlive what it describes. Grant the application only `SELECT, INSERT` on it.
 
@@ -207,6 +263,9 @@ CREATE TABLE clients (
   id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   email text NOT NULL UNIQUE
 );
+```
+
+```sql
 CREATE TABLE invoices (
   id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   client_id    bigint NOT NULL REFERENCES clients(id),
@@ -219,117 +278,21 @@ CREATE INDEX ON invoices (client_id);  -- Postgres does not index FKs for you
 
 The full DDL below adds workspaces (tenants), tenant-safe composite keys, soft deletes, audit logs and row-level security.
 
-### The InvoiceOps DDL (PostgreSQL 17)
+### The InvoiceOps schema (PostgreSQL 17)
 
-```sql
-CREATE TABLE users (
-  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  email         text NOT NULL,
-  password_hash text NOT NULL,
-  created_at    timestamptz NOT NULL DEFAULT now()
-);
-CREATE UNIQUE INDEX users_email_uidx ON users (lower(email));
+The complete DDL (about 100 lines) is in [[Relational Schema Design - Go]]. In dependency order, these are the tables and the main rules each one carries:
 
-CREATE TABLE workspaces (
-  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  name       text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE workspace_members (                    -- M:N users <-> workspaces
-  workspace_id bigint NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
-  user_id      bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-  role         text NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
-  created_at   timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (workspace_id, user_id)
-);
-CREATE INDEX workspace_members_user_idx ON workspace_members (user_id);
-
-CREATE TABLE clients (
-  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  workspace_id bigint NOT NULL REFERENCES workspaces (id),
-  parent_id    bigint,
-  name         text NOT NULL,
-  email        text,
-  created_at   timestamptz NOT NULL DEFAULT now(),
-  updated_at   timestamptz NOT NULL DEFAULT now(),
-  deleted_at   timestamptz,
-  UNIQUE (workspace_id, id),                         -- target for tenant-safe foreign keys
-  FOREIGN KEY (workspace_id, parent_id) REFERENCES clients (workspace_id, id)
-    ON DELETE SET NULL (parent_id)                   -- PostgreSQL 15+: keep workspace_id
-);
-CREATE UNIQUE INDEX clients_ws_email_uidx ON clients (workspace_id, lower(email))
-  WHERE deleted_at IS NULL;
-CREATE INDEX clients_parent_idx ON clients (parent_id);
-
-CREATE TABLE invoices (
-  id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  workspace_id    bigint NOT NULL REFERENCES workspaces (id),
-  client_id       bigint NOT NULL,
-  number          text NOT NULL,
-  status          text NOT NULL DEFAULT 'draft'
-                  CHECK (status IN ('draft', 'sent', 'partially_paid', 'paid', 'overdue', 'cancelled')),
-  currency        char(3) NOT NULL DEFAULT 'INR',
-  total_minor     bigint NOT NULL DEFAULT 0 CHECK (total_minor >= 0),
-  paid_minor      bigint NOT NULL DEFAULT 0 CHECK (paid_minor >= 0),
-  billing_address jsonb,                             -- snapshot taken when the invoice is sent
-  custom_fields   jsonb NOT NULL DEFAULT '{}',
-  issue_date      date,
-  due_date        date,
-  created_at      timestamptz NOT NULL DEFAULT now(),
-  updated_at      timestamptz NOT NULL DEFAULT now(),
-  CHECK (due_date >= issue_date),
-  UNIQUE (workspace_id, number),
-  UNIQUE (workspace_id, id),
-  FOREIGN KEY (workspace_id, client_id) REFERENCES clients (workspace_id, id)
-);
-CREATE INDEX invoices_ws_status_due_idx ON invoices (workspace_id, status, due_date);
-CREATE INDEX invoices_ws_client_idx ON invoices (workspace_id, client_id);
-
-CREATE TABLE invoice_items (
-  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  workspace_id     bigint NOT NULL,
-  invoice_id       bigint NOT NULL,
-  line_no          int NOT NULL CHECK (line_no > 0),
-  description      text NOT NULL,
-  quantity         int NOT NULL CHECK (quantity > 0),
-  unit_price_minor bigint NOT NULL CHECK (unit_price_minor >= 0),  -- price charged, not catalogue price
-  UNIQUE (invoice_id, line_no),
-  FOREIGN KEY (workspace_id, invoice_id) REFERENCES invoices (workspace_id, id) ON DELETE CASCADE
-);
-
-CREATE TABLE payments (
-  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  workspace_id bigint NOT NULL,
-  invoice_id   bigint NOT NULL,
-  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
-  provider     text NOT NULL,
-  provider_ref text NOT NULL,
-  paid_at      timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (provider, provider_ref),
-  FOREIGN KEY (workspace_id, invoice_id) REFERENCES invoices (workspace_id, id)
-);
-CREATE INDEX payments_invoice_idx ON payments (invoice_id);
-
-CREATE TABLE webhook_events (
-  provider    text NOT NULL,
-  event_id    text NOT NULL,
-  received_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (provider, event_id)
-);
-
-CREATE TABLE audit_logs (
-  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  workspace_id  bigint NOT NULL,                     -- no FK: the log outlives what it describes
-  actor_user_id bigint,
-  action        text NOT NULL,
-  entity_type   text NOT NULL,
-  entity_id     bigint NOT NULL,
-  details       jsonb NOT NULL DEFAULT '{}',
-  created_at    timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX audit_logs_ws_created_idx ON audit_logs (workspace_id, created_at DESC);
-```
+| Table | Primary key | Notable rules |
+| --- | --- | --- |
+| `users` | `id` | unique index on `lower(email)` |
+| `workspaces` | `id` | `CHECK (char_length(name) BETWEEN 1 AND 200)` |
+| `workspace_members` | `(workspace_id, user_id)` | role `CHECK`; `ON DELETE CASCADE` both ways; index on `user_id` |
+| `clients` | `id`, plus `UNIQUE (workspace_id, id)` | composite self-reference for `parent_id` with `ON DELETE SET NULL (parent_id)`; partial unique email index for live rows; `deleted_at` |
+| `invoices` | `id`, plus `UNIQUE (workspace_id, id)` | composite FK to `clients`; status `CHECK`; `UNIQUE (workspace_id, number)`; `billing_address` and `custom_fields` as `jsonb`; `CHECK (due_date >= issue_date)` |
+| `invoice_items` | `id`, `UNIQUE (invoice_id, line_no)` | composite FK to `invoices` with `ON DELETE CASCADE`; `quantity > 0` |
+| `payments` | `id`, `UNIQUE (provider, provider_ref)` | composite FK to `invoices`; `amount_minor > 0` |
+| `webhook_events` | `(provider, event_id)` | no foreign keys; a redelivered event hits the primary key |
+| `audit_logs` | `id` | no foreign key on purpose; index `(workspace_id, created_at DESC)` |
 
 Design decisions worth reading twice:
 - **`workspace_id` on every tenant-owned table**, including children such as `invoice_items` and `payments`. Every query filters by it, row-level security can check it without a join, and sharding by workspace later needs it in every table.
@@ -345,23 +308,16 @@ GROUP BY i.id
 HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 ```
 
-**Triggers for `updated_at`**, and tenant isolation with row-level security (RLS):
+**Triggers for `updated_at`**, and tenant isolation with row-level security (RLS). The SQL is in [[Relational Schema Design - Go]]; the two statements that matter are short:
 
 ```sql
-CREATE FUNCTION set_updated_at() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-  NEW.updated_at := now();
-  RETURN NEW;
-END;
-$$;
-
 CREATE TRIGGER invoices_set_updated_at
 BEFORE UPDATE ON invoices
-FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();   -- the function sets NEW.updated_at := now()
+```
 
+```sql
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
-
 CREATE POLICY tenant_isolation ON invoices
   USING (workspace_id = current_setting('app.workspace_id')::bigint)
   WITH CHECK (workspace_id = current_setting('app.workspace_id')::bigint);
@@ -386,68 +342,22 @@ RLS is a backstop, not a replacement for `WHERE workspace_id = $1` (which the in
 
 ### Money in Go: integer minor units
 
-The Go side must keep the same discipline as the columns. This passes `go vet` and `go test -race` on Go 1.24:
+The Go side must keep the same discipline as the columns: an `Amount` is an `int64` of minor units, with `Split` and `Percent` helpers whose rounding rules are written down. The code and tests are in [[Relational Schema Design - Go]].
 
-```go
-package money
+**Measured** (`go test -v`, Go 1.24.4): `float64: 0.99999999999999989  int64: 100 paise`. Ten payments of ₹0.10 do not make ₹1.00 in floating point.
 
-// Amount is money in integer minor units: paise for INR, cents for USD.
-// The currency lives next to it (a currency column, or a Currency field).
-type Amount int64
-
-// Split divides a into n parts that differ by at most one minor unit and add
-// up to exactly a, for example an invoice paid in three instalments.
-func Split(a Amount, n int) []Amount {
-	if n <= 0 {
-		panic("money: Split needs n > 0")
-	}
-	base, rem := a/Amount(n), a%Amount(n) // rem has the sign of a
-	step := Amount(1)
-	if rem < 0 {
-		rem, step = -rem, -1
-	}
-	parts := make([]Amount, n)
-	for i := range parts {
-		parts[i] = base
-		if Amount(i) < rem {
-			parts[i] += step // the first |rem| parts carry the leftover units
-		}
-	}
-	return parts
-}
-
-// Percent returns a × bps / 10,000, rounded half away from zero. bps is in
-// basis points: 1800 = 18%. a × bps must fit in int64 (|a| up to ~9.2e14
-// minor units at 100%), which covers any invoice.
-func Percent(a Amount, bps int64) Amount {
-	p := int64(a) * bps
-	q, r := p/10_000, p%10_000
-	switch {
-	case r >= 5_000:
-		q++
-	case r <= -5_000:
-		q--
-	}
-	return Amount(q)
-}
+```mermaid
+flowchart LR
+    F["float64: 0.10 added ten times"] --> F2["0.99999999999999989: not equal to 1.00"]
+    I["int64: 10 paise added ten times"] --> I2["100 paise: exactly Rs 1.00"]
+    S["Split(100000, 3)"] --> S1["base 33333, remainder 1"] --> S2["[33334, 33333, 33333]: sums to 100000"]
 ```
 
-```go
-func TestFloatDriftsIntegersDoNot(t *testing.T) {
-	var rupees float64 // ₹0.10 as a float
-	var paise Amount   // ₹0.10 as 10 paise
-	for range 10 {
-		rupees += 0.10
-		paise += 10
-	}
-	if rupees == 1.0 || paise != 100 {
-		t.Fatalf("rupees = %v, paise = %d", rupees, paise)
-	}
-	t.Logf("float64: %.17f  int64: %d paise", rupees, paise)
-}
-```
+- `Split(100000, 3)` returns `[33334 33333 33333]`; every split, including negative credit notes, sums back exactly with parts at most one unit apart.
+- 18% of ₹19.99 is 360 paise (359.82 rounded).
+- Pick one rounding rule, write it down, and apply it in one place.
 
-**Measured** (`go test -v`, Go 1.24.4): `float64: 0.99999999999999989  int64: 100 paise`. Ten payments of ₹0.10 do not make ₹1.00 in floating point. Other tests check that `Split(100000, 3)` returns `[33334 33333 33333]` and that every split, including negative credit notes, sums back exactly; and that 18% of ₹19.99 is 360 paise (359.82 rounded). Pick one rounding rule, write it down, and apply it in one place.
+Runnable Go version: [[Relational Schema Design - Go]]
 
 ## 5. Variants and comparison
 
@@ -459,6 +369,13 @@ Multi-tenancy, the decision InvoiceOps makes once and lives with:
 | Schema per tenant                          | one Postgres schema per tenant, chosen with `search_path`         | tens to hundreds of mid-size tenants needing light per-tenant customization | every migration runs N times; catalog and backup tooling slow down as schemas multiply   |
 | Database per tenant                        | a database (or cluster) per tenant                                | a few large or regulated tenants: separate keys, restores, regions | N connection pools, N upgrades; cross-tenant reporting needs a pipeline                       |
 | Shared tables, sharded by tenant           | the shared design spread over nodes by `workspace_id` (for example Citus) | the shared design outgrew one primary                     | every unique key and foreign key must include the tenant id                                           |
+
+```mermaid
+flowchart LR
+    S1["Shared tables<br/>one database, workspace_id on every row"] -->|"a tenant needs its own schema"| S2["Schema per tenant<br/>search_path picks the schema"]
+    S1 -->|"one huge or regulated tenant"| S3["Database per tenant<br/>own keys, restore, region"]
+    S1 -->|"one primary is not enough"| S4["Sharded by workspace_id<br/>Citus, every key includes the tenant"]
+```
 
 Most products start shared and move their largest tenants out later. Including `workspace_id` in every key from day one keeps that move open.
 
@@ -544,5 +461,6 @@ Most products start shared and move their largest tenants out later. Including `
 ## Links
 
 - **Before this:** [[SQL Essentials]], [[SQL vs NoSQL]]
+- **Code:** [[Relational Schema Design - Go]] (full DDL, trigger and RLS, the `money` package with tests)
 - **Next:** [[Transactions and ACID]], [[Indexing Fundamentals]], [[Zero-Downtime Schema Migrations]]
 - **Compare with:** [[NoSQL Data Modeling]] (modelling for access patterns instead of normalization), [[Materialized Views and Denormalization]] (planned copies for reads), [[Unique ID Generation]] (ids at scale)

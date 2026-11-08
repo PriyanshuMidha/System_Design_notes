@@ -103,24 +103,58 @@ def lint(path, existing, planned, legacy):
             if re.search(rf'(?<![a-z]){re.escape(b)}(?![a-z])', strip_code(text).lower()):
                 fails.append(f'banned/boilerplate phrase: "{b}"')
         return fails, warns
-    for s in (PRACTICE_SECTIONS if practice else REQUIRED_SECTIONS):
-        if not any(h == s or h.startswith(s + ':') or h.startswith(s + ' ') or (h.startswith(s) and not s[-1].isdigit())
-                   for h in headings):
-            fails.append(f'missing section "{s}"')
-    if not practice:
-        for s in DEPTH5_SECTIONS:
-            if not any(h.startswith(s) for h in headings):
-                warns.append(f'no "{s}" section (needed for depth 5 unless truly not applicable)')
-
+    # `type: implementation` is the code half of a split topic ("<Theory title> - Go").
+    impl = bool(fm and re.search(r'^type:\s*implementation\s*$', fm.group(1), re.M))
     mermaid = text.count('```mermaid')
-    if mermaid == 0:
-        fails.append('no mermaid diagram')
-    elif mermaid == 1:
-        warns.append('only one diagram')
+    if impl:
+        theory = title[:-5] if title.endswith(' - Go') else None
+        if not theory:
+            fails.append('implementation note title must end with " - Go"')
+        elif f'[[{theory}' not in strip_code(text):
+            fails.append(f'implementation note must link its theory note [[{theory}]]')
+        if not any(h.startswith('links') for h in headings):
+            fails.append('missing section "links"')
+        if not re.search(r'^```(?!mermaid)\w+', text, re.M):
+            fails.append('implementation note has no code block')
+        # Top-level code blocks only; a folded `> [!example]- Full file` copy is exempt.
+        blocks, code_lines, start = [], 0, None
+        for i, l in enumerate(lines):
+            if l.startswith('```'):
+                if start is None:
+                    start = i if not l.startswith('```mermaid') else -1
+                else:
+                    if start >= 0:
+                        blocks.append(i - start - 1)
+                        code_lines += i - start + 1
+                    start = None
+        if lines and code_lines * 2 > len(lines):
+            fails.append(f'implementation note is {100 * code_lines // len(lines)}% code (needs >= 50% explanation)')
+        long = [b for b in blocks if b > 30]
+        if long:
+            fails.append(f'{len(long)} code block(s) over 30 lines (split them and explain each piece)')
+    else:
+        for s in (PRACTICE_SECTIONS if practice else REQUIRED_SECTIONS):
+            if not any(h == s or h.startswith(s + ':') or h.startswith(s + ' ') or (h.startswith(s) and not s[-1].isdigit())
+                       for h in headings):
+                fails.append(f'missing section "{s}"')
+        if not practice:
+            for s in DEPTH5_SECTIONS:
+                if not any(h.startswith(s) for h in headings):
+                    warns.append(f'no "{s}" section (needed for depth 5 unless truly not applicable)')
 
-    q = len(re.findall(r'^> \[!question\]', text, re.M))
-    if q < 4:
-        fails.append(f'only {q} interview questions (need >= 4)')
+        split = os.path.exists(os.path.join(os.path.dirname(path), f'{title} - Go.md'))
+        if mermaid == 0:
+            fails.append('no mermaid diagram')
+        elif split and mermaid < 5:
+            fails.append(f'theory note has {mermaid} diagrams (split theory notes need >= 5)')
+        elif mermaid == 1:
+            warns.append('only one diagram')
+        if split and f'[[{title} - Go' not in strip_code(text):
+            fails.append(f'theory note must link its implementation note [[{title} - Go]]')
+
+        q = len(re.findall(r'^> \[!question\]', text, re.M))
+        if q < 4:
+            fails.append(f'only {q} interview questions (need >= 4)')
 
     low = strip_code(text).lower()
     for b in BANNED:

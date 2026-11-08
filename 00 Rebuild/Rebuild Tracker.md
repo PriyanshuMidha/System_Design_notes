@@ -282,6 +282,38 @@ updated: 2026-11-02
 - [x] **Case Study - Video Streaming** · A 🆕 · ✅ · from: NEW
 - [x] **Case Study - Distributed Message Queue** · A 🆕 · ✅ · from: NEW
 - [x] **Case Study - Ad Click Aggregation** · A 🆕 · ✅ · from: NEW
+- [x] **HLD Decision Guides/HLD Round - Complete Step-by-Step Guide** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/HLD Round - Full Worked Mock (Food Delivery App)** · A 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Choosing a Database - Decision Guide** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Kafka vs RabbitMQ vs SQS - Choosing a Message Broker** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Choosing a Caching Strategy - Decision Guide** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Choosing an API and Communication Style - Decision Guide** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Choosing Consistency, Replication and Partitioning - Decision Guide** · A 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Choosing Storage for Files, Search and Analytics - Decision Guide** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Choosing Compute, Scaling and Deployment - Decision Guide** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/Choosing Load Balancers, Gateways and Service Mesh - Decision Guide** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Decision Guides/HLD Trade-offs Master Cheat Sheet** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **HLD Concepts/Fan-out on Write vs Fan-out on Read** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **HLD Concepts/Batch Processing and Data Pipelines** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **HLD Concepts/Coordination and Configuration Services** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **HLD Concepts/Multi-Tenancy and Cell-Based Architecture** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **HLD Concepts/Security, Privacy and Compliance in HLD** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **HLD Concepts/Cost-Aware System Design** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **HLD Decision Guides/Batch vs Stream - Lambda vs Kappa - Decision Guide** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **HLD Decision Guides/Staff-Level HLD Signals and Company Rubrics** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Distributed Cache** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Photo Sharing (Instagram)** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Collaborative Document Editor** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Hotel Reservation** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Stock Exchange** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Digital Wallet and Ledger** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Email Service** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Maps and Navigation** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Online Judge** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Live Comments and Reactions** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Distributed Counter (Likes and Views)** · I 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Social Graph and Friend Recommendations** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
+- [x] **Case Study - Flash Sale and E-commerce Checkout** · A 🆕 · ✅ · from: NEW (HLD gap analysis 2026-11-09)
 
 ## 12 Security & Auth · 12 notes
 
@@ -298,6 +330,8 @@ updated: 2026-11-02
 - [x] **OAuth 2.0 and OpenID Connect** · A · ✅ · from: OAuth
 - [x] **Service-to-Service Auth - API Keys, HMAC, mTLS** · A 🆕 · ✅ · from: NEW
 - [x] **API Abuse and Bot Protection** · A · ✅ · from: API Abuse and Bot Protection
+- [x] **Security Incident Response - When Your Website Is Hacked** · A 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Website Security Hardening Checklist** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
 
 ## 13 DevOps & Cloud · 29 notes
 
@@ -349,6 +383,19 @@ updated: 2026-11-02
 - [x] **Debugging Memory Leaks and OOMs in Go** · A · ✅ · from: Memory Leak Debugging
 - [x] **Performance Engineering and Capacity Planning** · I · ✅ · from: Bottleneck Analysis, Performance Engineering Content Table; performance/Performance Engineering Content Table, performance/Capacity Estimation (capacity-planning half; the back-of-envelope half goes to 11)
 - [x] **Production Readiness Review** · A 🆕 · ✅ · from: NEW
+- [x] **Incident Playbooks/Playbook - High Latency** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Error Rate Spike (5xx)** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Database Overload and Connection Exhaustion** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Memory Leak and OOMKilled** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - CPU Saturation** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Queue and Kafka Consumer Lag** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Cache Outage and Stampede** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Bad Deploy and Rollback** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Disk Full and Log Floods** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Third-Party Dependency Outage** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - TLS Certificate and DNS Failures** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Traffic Spike and DDoS** · I 🆕 · ✅ · from: NEW (owner request 2026-11-09)
+- [x] **Incident Playbooks/Playbook - Data Inconsistency and Duplicate Processing** · A 🆕 · ✅ · from: NEW (owner request 2026-11-09)
 
 ## 15 Testing · 10 notes
 

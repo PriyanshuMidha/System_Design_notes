@@ -19,20 +19,20 @@ updated: 2026-11-02
 
 Back to [[Home]].
 
-1. [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] · basic. The layer model and the packet's journey that every later note assumes.
-2. [[IP Addressing, Subnets, NAT and VPC Basics]] · basic. How addresses, CIDR blocks and NAT shape the networks your services live in.
-3. [[DNS - Resolution, Records and Caching]] · basic. How a name becomes an IP address, and why stale records cause outages.
-4. [[TCP - Handshake, Reliability, Flow and Congestion Control]] · intermediate. The reliable byte stream underneath most of the web, and where its latency comes from.
-5. [[UDP and QUIC]] · intermediate. Why a connectionless datagram protocol became the base of HTTP/3.
-6. [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]] · basic. The request and response vocabulary every backend engineer uses daily.
-7. [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] · intermediate. How each version fixed the previous one's head-of-line blocking.
-8. [[TLS and HTTPS]] · intermediate. The handshake, the cryptography and the certificate chain that make HTTPS trustworthy.
-9. [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] · intermediate. The headers that decide whether a response is reused, revalidated or refetched.
-10. [[CDN and Edge]] · intermediate. Moving content and logic close to users, and how to invalidate it safely.
-11. [[Forward and Reverse Proxies - L4 vs L7]] · intermediate. What a proxy can see and do at the transport layer versus the application layer.
+1. [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] · basic. The layer model and the packet's journey that every later note assumes. · Go code: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP - Go]]
+2. [[IP Addressing, Subnets, NAT and VPC Basics]] · basic. How addresses, CIDR blocks and NAT shape the networks your services live in. · Go code: [[IP Addressing, Subnets, NAT and VPC Basics - Go]]
+3. [[DNS - Resolution, Records and Caching]] · basic. How a name becomes an IP address, and why stale records cause outages. · Go code: [[DNS - Resolution, Records and Caching - Go]]
+4. [[TCP - Handshake, Reliability, Flow and Congestion Control]] · intermediate. The reliable byte stream underneath most of the web, and where its latency comes from. · Go code: [[TCP - Handshake, Reliability, Flow and Congestion Control - Go]]
+5. [[UDP and QUIC]] · intermediate. Why a connectionless datagram protocol became the base of HTTP/3. · Go code: [[UDP and QUIC - Go]]
+6. [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]] · basic. The request and response vocabulary every backend engineer uses daily. · Go code: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies - Go]]
+7. [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] · intermediate. How each version fixed the previous one's head-of-line blocking. · Go code: [[HTTP-1.1 vs HTTP-2 vs HTTP-3 - Go]]
+8. [[TLS and HTTPS]] · intermediate. The handshake, the cryptography and the certificate chain that make HTTPS trustworthy. · Go code: [[TLS and HTTPS - Go]]
+9. [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] · intermediate. The headers that decide whether a response is reused, revalidated or refetched. · Go code: [[HTTP Caching - Cache-Control, ETag, Conditional Requests - Go]]
+10. [[CDN and Edge]] · intermediate. Moving content and logic close to users, and how to invalidate it safely. · Go code: [[CDN and Edge - Go]]
+11. [[Forward and Reverse Proxies - L4 vs L7]] · intermediate. What a proxy can see and do at the transport layer versus the application layer. · Go code: [[Forward and Reverse Proxies - L4 vs L7 - Go]]
 12. [[Nginx]] · intermediate. The most common reverse proxy, configured for TLS, upstreams and rate limits.
-13. [[What Happens When You Type a URL]] · intermediate. The classic interview question that ties every earlier note together.
-14. [[Network Debugging Toolkit - dig, curl, ss, tcpdump]] · advanced. The commands that turn a vague "network issue" into a specific cause.
+13. [[What Happens When You Type a URL]] · intermediate. The classic interview question that ties every earlier note together. · Go code: [[What Happens When You Type a URL - Go]]
+14. [[Network Debugging Toolkit - dig, curl, ss, tcpdump]] · advanced. The commands that turn a vague "network issue" into a specific cause. · Go code: [[Network Debugging Toolkit - dig, curl, ss, tcpdump - Go]]
 
 ## Concept map
 

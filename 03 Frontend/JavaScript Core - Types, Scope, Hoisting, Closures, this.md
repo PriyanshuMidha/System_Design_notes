@@ -1,13 +1,13 @@
 ---
 tags: [frontend, javascript, language-fundamentals]
-level: basic
+level: intermediate
 prereqs: []
-related: ["[[JavaScript Objects, Arrays and Iteration]]", "[[DOM, Events and Timers]]", "[[Syntax, Types and Control Flow]]"]
+related: ["[[JavaScript Core - Types, Scope, Hoisting, Closures, this - Go]]", "[[JavaScript Objects, Arrays and Iteration]]", "[[DOM, Events and Timers]]", "[[Syntax, Types and Control Flow]]"]
 sources:
   - "ECMA-262 (ECMAScript Language Specification), sections on Let and Const Declarations, Lexical Environments"
   - "MDN Web Docs: Closures, this, Hoisting"
 status: reviewed
-updated: 2026-11-04
+updated: 2026-11-09
 ---
 
 # JavaScript Core - Types, Scope, Hoisting, Closures, this
@@ -59,6 +59,24 @@ JavaScript has exactly 7 primitive types plus `object` (which covers arrays and 
 | `bigint` | `10n` | Arbitrary-precision integers, suffixed with `n` |
 
 There is no separate "default values" heading to memorize — `undefined` is simply what an uninitialized `let`/`var` holds, and the other types have no implicit default; you must assign them.
+
+**In plain words:** a primitive variable is a box that holds its value directly; a reference variable (object, array, function) is a box that holds an address pointing somewhere else in memory. Copying the first box copies the value inside it; copying the second box copies the address, so both boxes now point at the same thing.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    subgraph Primitive["Primitive: let b = a"]
+        A1["a: 5"]
+        B1["b: 5 (own copy)"]
+    end
+    subgraph Reference["Reference: const arr2 = arr1"]
+        A2["arr1 (box holding an address)"] --> H["heap: [1,2,3,4]"]
+        B2["arr2 (box holding the SAME address)"] --> H
+    end
+```
+
+**Analogy:** a primitive is like writing a number on your own sticky note — changing your note doesn't touch anyone else's. A reference is like two people holding the same locker key — whoever opens the locker and rearranges what's inside, both people see the new arrangement, because there's only ever one locker.
 
 Assignment and function arguments **copy the value** for primitives and **copy the reference** for objects/arrays/functions:
 
@@ -115,6 +133,25 @@ const addTwo = (n) => n + 2;
 ```
 
 This is the single most common misreading of hoisting: people say "`let`/`const` are not hoisted", but they are — they just aren't initialized, so touching them early is a hard error instead of an `undefined`. `var`'s function scope is also a common bug source: a `var` declared inside an `if` block leaks into the whole function, while `let`/`const` stay confined to the block.
+
+**Picture it — the same scope, read top to bottom, for each keyword:**
+
+```mermaid
+flowchart TD
+    subgraph varFlow["var x"]
+        direction TB
+        v1["top of scope: x exists, = undefined"] --> v2["console.log(x): undefined"] --> v3["var x = 5 runs"] --> v4["console.log(x): 5"]
+    end
+    subgraph letFlow["let y (temporal dead zone)"]
+        direction TB
+        l1["top of scope: y exists, UNINITIALIZED"] --> l2["console.log(y): ReferenceError (TDZ)"] --> l3["let y = 5 runs: TDZ ends"] --> l4["console.log(y): 5"]
+    end
+```
+
+**Example:** a function with 20 lines before a `let total = 0;` declaration has a TDZ spanning all 20 lines — any accidental read of `total` in those lines throws immediately at that line, during development, instead of silently computing with `undefined` and producing a wrong number much later.
+
+> [!tip] Remember
+> Hoisted ≠ initialized. `var` is hoisted *and* pre-filled with `undefined`. `let`/`const` are hoisted but left empty (the TDZ) until their line actually runs.
 
 Assigning to a name with no declaration at all (`accountCity = "Jaipur"`) silently creates an **implicit global** in sloppy mode — it becomes a property of the global object, reachable from anywhere, and is a frequent source of bugs that only show up once two unrelated files happen to use the same name. **Strict mode** (`"use strict"`, automatic inside ES modules and `class` bodies) turns that same line into a `ReferenceError` instead, which is why "declare before you assign" is enforced rather than just recommended in modern code.
 
@@ -216,97 +253,30 @@ for (let j = 0; j < 3; j++) {
 }
 ```
 
-Go's `for` loop had the identical bug until **Go 1.22**, which changed loop variables to be per-iteration by default — the same fix `let` gives JavaScript. The Go code below demonstrates both the closure mechanism and that per-iteration capture, tested on Go 1.24:
+Go's `for` loop had the identical bug until **Go 1.22**, which changed loop variables to be per-iteration by default — the same fix `let` gives JavaScript.
 
-```go
-package closures
+> [!tip] Remember
+> `var` in a loop shares one variable across every closure created in that loop; `let` (and, since Go 1.22, Go's own `for`) gives each iteration its own copy.
 
-// NewCounter returns a closure that captures count by reference.
-// Each call increments the SAME count variable, just like a JS closure
-// returned from a function that captures an outer let/const.
-func NewCounter() func() int {
-	count := 0
-	return func() int {
-		count++
-		return count
-	}
-}
+**Picture it:**
 
-// CapturePerIteration mirrors the "closures in a loop" fix: since Go 1.22
-// (and always true for JS `let`), each loop iteration gets its own copy of i,
-// so every returned closure remembers a different value.
-func CapturePerIteration() []func() int {
-	var fns []func() int
-	for i := 0; i < 3; i++ {
-		fns = append(fns, func() int { return i })
-	}
-	return fns
-}
-
-// Primitive-like value: a struct copy is independent, like a JS primitive
-// assignment (number, string, boolean) copies the value.
-type Point struct{ X, Y int }
-
-func MovePrimitiveLike(p Point) Point {
-	p.X += 10 // mutates the copy only
-	return p
-}
-
-// Reference-like value: a slice header is copied, but it shares the
-// underlying array, like a JS object/array assignment copies the reference.
-func MoveReferenceLike(s []int) {
-	if len(s) > 0 {
-		s[0] += 10 // mutates the shared backing array
-	}
-}
+```mermaid
+flowchart LR
+    subgraph Var["var i (shared)"]
+        direction TB
+        V1["iteration 1: writes i=1"] --> V2["iteration 2: writes i=2"] --> V3["iteration 3: writes i=3"]
+        V3 --> VC["all 3 closures read the SAME i: 3, 3, 3"]
+    end
+    subgraph Let["let j (per-iteration)"]
+        direction TB
+        L1["iteration 1: own j=0"]
+        L2["iteration 2: own j=1"]
+        L3["iteration 3: own j=2"]
+        L1 --> C1["closure 1 reads its own j: 0"]
+        L2 --> C2["closure 2 reads its own j: 1"]
+        L3 --> C3["closure 3 reads its own j: 2"]
+    end
 ```
-
-```go
-package closures
-
-import "testing"
-
-func TestNewCounterCapturesByReference(t *testing.T) {
-	c := NewCounter()
-	if got := c(); got != 1 {
-		t.Fatalf("got %d, want 1", got)
-	}
-	if got := c(); got != 2 {
-		t.Fatalf("got %d, want 2 (same captured count)", got)
-	}
-}
-
-func TestCapturePerIteration(t *testing.T) {
-	fns := CapturePerIteration()
-	want := []int{0, 1, 2}
-	for i, f := range fns {
-		if got := f(); got != want[i] {
-			t.Fatalf("fns[%d]() = %d, want %d", i, got, want[i])
-		}
-	}
-}
-
-func TestPrimitiveLikeCopyIsIndependent(t *testing.T) {
-	original := Point{X: 1, Y: 1}
-	moved := MovePrimitiveLike(original)
-	if original.X != 1 {
-		t.Fatalf("original.X = %d, want 1 (copy must not mutate original)", original.X)
-	}
-	if moved.X != 11 {
-		t.Fatalf("moved.X = %d, want 11", moved.X)
-	}
-}
-
-func TestReferenceLikeSharesBackingArray(t *testing.T) {
-	original := []int{1, 2, 3}
-	MoveReferenceLike(original)
-	if original[0] != 11 {
-		t.Fatalf("original[0] = %d, want 11 (slices share backing storage)", original[0])
-	}
-}
-```
-
-**Measured:** `go vet ./...` reports no issues and `go test -race ./...` passes all 4 tests (Go 1.24.4, darwin/arm64, 2026-11-04).
 
 ### Functions and `this`
 
@@ -364,6 +334,8 @@ bound();             // "Hitesh" — explicit binding wins
 
 The owner's original mistake to avoid: `console.log(jsUser.greet())` logs `undefined` directly after printing `"Hitesh"` — not because `greet` failed, but because `greet` has no `return` statement, so it implicitly returns `undefined`, and `console.log` then prints that `undefined`.
 
+Runnable Go version: [[JavaScript Core - Types, Scope, Hoisting, Closures, this - Go]].
+
 ## 5. Variants and comparison
 
 | Option | How it works | Use when | Cost |
@@ -393,6 +365,17 @@ The owner's original mistake to avoid: `console.log(jsUser.greet())` logs `undef
 ## 8. Deep dive
 
 - **Prototype chain.** Every object has an internal link (`[[Prototype]]`, exposed as `Object.getPrototypeOf(obj)`) to another object, forming a chain that ends at `Object.prototype` and then `null`. Property lookup walks this chain just like scope lookup walks the scope chain. `class` syntax is sugar over this: `class Dog {}` creates a constructor function whose `.prototype` instances delegate to.
+
+  **Picture it:**
+
+  ```mermaid
+  flowchart LR
+      D["instance: a Dog, has own property 'name'"] -- "internal Prototype link" --> DP["Dog.prototype: has 'bark()'"]
+      DP -- "internal Prototype link" --> OP["Object.prototype: has 'toString()', 'hasOwnProperty()'"]
+      OP -- "internal Prototype link" --> N["null: chain ends here"]
+  ```
+
+  **Example:** reading `myDog.name` finds it immediately on the instance (no walk needed). Reading `myDog.bark()` doesn't find `bark` on the instance, so the engine walks up to `Dog.prototype` and finds it there. Reading `myDog.toString()` walks two links up, past `Dog.prototype`, to `Object.prototype` — exactly the same kind of outward walk a scope-chain lookup does for a variable name, just over objects instead of scopes.
 - **Autoboxing.** `"a".toUpperCase()` works even though strings are primitives, because the engine temporarily wraps the primitive in a `String` object, calls the method, and discards the wrapper.
 - **Number precision.** `number` is IEEE-754 double precision. Integers are exact up to `2^53 − 1` (`Number.MAX_SAFE_INTEGER`); beyond that, distinct integers can compare equal. `0.1 + 0.2 !== 0.3` for the same reason — neither value has an exact binary float representation.
 - **GC and closures.** A closure keeps its entire enclosing lexical environment alive as long as the closure itself is reachable, not just the variables it references — V8 does scope-analysis optimizations to shrink this in common cases, but a closure captured inside a long-lived event listener is a classic memory-leak source.
@@ -437,3 +420,4 @@ The owner's original mistake to avoid: `console.log(jsUser.greet())` logs `undef
 - **Before this:** [[How Browsers Load and Render a Page]]
 - **Next:** [[JavaScript Objects, Arrays and Iteration]], [[JavaScript Async - Event Loop, Promises, async-await]]
 - **Compare with:** [[Syntax, Types and Control Flow]] (Go's static typing and fixed zero values vs JS's dynamic typing and `undefined`)
+- **Go code:** [[JavaScript Core - Types, Scope, Hoisting, Closures, this - Go]]

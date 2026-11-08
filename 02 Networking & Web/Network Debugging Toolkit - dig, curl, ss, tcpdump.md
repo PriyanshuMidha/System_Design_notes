@@ -8,7 +8,7 @@ sources:
   - "dig(1), curl(1), openssl(1), ss(8), tcpdump(1), traceroute(8), nc(1) manual pages"
   - "RFC 1035, Domain Names - Implementation and Specification"
   - "RFC 793 / RFC 9293, Transmission Control Protocol"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Network Debugging Toolkit - dig, curl, ss, tcpdump
@@ -166,6 +166,24 @@ Address: 172.66.147.243
 
 `dig +trace example.com` walks the delegation chain itself — root → `.com` TLD servers → the zone's authoritative nameservers — which is the tool for "DNS resolves wrong in this environment but not in another," since it bypasses your resolver's cache and shows exactly which server answered each step.
 
+**Picture it — what `+trace` actually asks, one server at a time:**
+
+```mermaid
+sequenceDiagram
+    participant You as dig +trace
+    participant Root as Root server
+    participant TLD as .com TLD server
+    participant Auth as example.com authoritative
+    You->>Root: who handles .com?
+    Root-->>You: ask the .com TLD servers (a.gtld-servers.net, ...)
+    You->>TLD: who handles example.com?
+    TLD-->>You: ask example.com's own nameservers
+    You->>Auth: A record for example.com?
+    Auth-->>You: 172.66.147.243 (authoritative answer)
+```
+
+Each hop is a separate query your own machine sends — your normal resolver never gets a chance to serve a cached answer, which is exactly why `+trace` catches a stale cache or a bad delegation that an ordinary `dig example.com` would hide.
+
 ### HTTP and timing: `curl -v` and `curl -w`
 
 **Measured** (`curl 8.x`, 2026-11-06, live request, TLS certificate details redacted since they depend on the network's TLS configuration — see [[TLS and HTTPS]] for what each handshake message means):
@@ -203,6 +221,18 @@ dns:0.002563s connect:0.003054s tls:0.180100s ttfb:0.231865s total:0.232011s
 ```
 
 These numbers are cumulative from the start of the request, not per-phase: subtract consecutive fields to get each phase's cost (TLS alone here: `0.180100 - 0.003054 ≈ 177 ms`).
+
+**Picture it — the same four numbers as a timeline, cumulative versus per-phase:**
+
+```mermaid
+flowchart LR
+    S(("start, t=0")) --> A["DNS resolved<br/>t=0.0026s"]
+    A --> B["TCP connected<br/>t=0.0031s<br/>(DNS cost: ~0.5ms)"]
+    B --> C["TLS done<br/>t=0.1801s<br/>(TLS cost: ~177ms)"]
+    C --> D["first byte (TTFB)<br/>t=0.2319s<br/>(server think-time: ~51ms)"]
+```
+
+**Why it matters:** reading the raw `curl -w` output as four isolated numbers hides where the time actually went; turning it into a timeline like this makes the dominant cost (TLS, here) visually obvious instead of requiring mental subtraction.
 
 **Measured** (`curl --resolve`, forcing a specific IP without touching system DNS — the standard way to test "does the new server work" before changing a DNS record, or to test one node behind a load balancer directly):
 
@@ -298,208 +328,22 @@ nc: connectx to 127.0.0.1 port 1 (tcp) failed: Connection refused
 
 ### Writing the same check as a Go health probe
 
-`nc -zv` is a manual, one-shot version of the TCP health check a load balancer or orchestrator runs continuously. Writing it in Go makes the three outcomes `nc` shows informally (open, refused, timed out) into values a program can act on:
+**In plain words:** `nc -zv` is a manual, one-shot version of the TCP health check a load balancer or orchestrator runs continuously. A small Go program turns the three outcomes `nc` shows informally — open, refused, timed out — into typed values a program can branch on, log, or alert on.
 
-```go
-// Package netdebug implements, in a few dozen lines, the same connectivity
-// check `nc -zv host port` performs: open a TCP connection, classify the
-// outcome, and report how long it took. It backs the Go example in
-// "Network Debugging Toolkit".
-package netdebug
+**Picture it — one dial, classified into the outcomes a human reads off `nc`/`ss`/`tcpdump`:**
 
-import (
-	"context"
-	"errors"
-	"fmt"
-	"net"
-	"syscall"
-	"time"
-)
-
-// Outcome classifies why a TCP connect attempt succeeded or failed, mirroring
-// the distinctions that matter when reading `nc -zv` or a failed `curl`:
-// a timeout (nothing answered, usually a firewall drop), a refusal (something
-// answered with RST, usually no listener on that port), or any other error.
-type Outcome int
-
-const (
-	Open Outcome = iota
-	Timeout
-	Refused
-	OtherError
-)
-
-func (o Outcome) String() string {
-	switch o {
-	case Open:
-		return "open"
-	case Timeout:
-		return "timeout"
-	case Refused:
-		return "refused"
-	default:
-		return "error"
-	}
-}
-
-// Result is one connectivity check.
-type Result struct {
-	Target  string
-	Outcome Outcome
-	Elapsed time.Duration
-	Err     error
-}
-
-// CheckTCP dials addr (host:port) with the given timeout and classifies the
-// result the way a reverse-proxy health check or `nc -zv` would.
-func CheckTCP(ctx context.Context, addr string, timeout time.Duration) Result {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	start := time.Now()
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	elapsed := time.Since(start)
-
-	if err == nil {
-		conn.Close()
-		return Result{Target: addr, Outcome: Open, Elapsed: elapsed}
-	}
-
-	return Result{Target: addr, Outcome: classify(err), Elapsed: elapsed, Err: err}
-}
-
-// classify turns a dial error into the same open/refused/timeout buckets a
-// human reads off `ss -tan` or a tcpdump capture of the three-way handshake:
-// a RST while SYNing is ECONNREFUSED, a dropped SYN with no reply at all
-// surfaces as a context deadline, everything else is bucketed as OtherError.
-func classify(err error) Outcome {
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return Timeout
-	}
-	if errors.Is(err, syscall.ECONNREFUSED) {
-		return Refused
-	}
-	return OtherError
-}
-
-// Report formats a Result the way a debugging playbook entry would show it.
-func Report(r Result) string {
-	if r.Err != nil {
-		return fmt.Sprintf("%-22s %-8s %6s  (%v)", r.Target, r.Outcome, r.Elapsed.Round(time.Millisecond), r.Err)
-	}
-	return fmt.Sprintf("%-22s %-8s %6s", r.Target, r.Outcome, r.Elapsed.Round(time.Millisecond))
-}
+```mermaid
+flowchart LR
+    D["DialContext(addr, timeout)"] --> R{What came back?}
+    R -->|"no error"| O["Open"]
+    R -->|"net.Error.Timeout() == true"| T["Timeout<br/>(firewall drop, dead route)"]
+    R -->|"errors.Is(err, ECONNREFUSED)"| F["Refused<br/>(nothing listening)"]
+    R -->|"anything else"| E["OtherError"]
 ```
 
-Tests covering the two outcomes that are reliable to reproduce locally (an open listener, and a refused port where nothing listens), plus the error classifier directly so the timeout branch is exercised without depending on a real network black hole:
+**Why it matters:** the same three buckets this diagram shows are exactly the ones `ss -tan` and a `tcpdump` capture surface too — `Refused` is the kernel answering a SYN with an RST, `Timeout` is a SYN that got no reply at all. Having a program classify a health check into these same buckets (rather than a bare boolean "up/down") is what lets an on-call dashboard already say "this looks like a firewall problem" before a human runs `nc` by hand.
 
-```go
-package netdebug
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"net"
-	"syscall"
-	"testing"
-	"time"
-)
-
-// TestCheckTCPOpen dials a listener we control and expects Open.
-func TestCheckTCPOpen(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
-
-	r := CheckTCP(context.Background(), ln.Addr().String(), time.Second)
-	if r.Outcome != Open {
-		t.Fatalf("Outcome = %v, want Open (err=%v)", r.Outcome, r.Err)
-	}
-	if r.Err != nil {
-		t.Errorf("Err = %v, want nil on success", r.Err)
-	}
-}
-
-// TestCheckTCPRefused dials a port nothing is listening on. On loopback this
-// returns ECONNREFUSED immediately (the kernel answers the SYN with an RST),
-// which is exactly the "connection refused" a human sees from `nc -zv`.
-func TestCheckTCPRefused(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	ln.Close() // free the port immediately; nothing will be listening on it
-
-	r := CheckTCP(context.Background(), addr, time.Second)
-	if r.Outcome != Refused {
-		t.Fatalf("Outcome = %v, want Refused (err=%v)", r.Outcome, r.Err)
-	}
-}
-
-// fakeTimeoutErr implements net.Error with Timeout() == true, used to drive
-// classify's timeout branch without depending on a real black-hole network
-// address, which sandboxes and CI runners don't reliably provide.
-type fakeTimeoutErr struct{}
-
-func (fakeTimeoutErr) Error() string   { return "i/o timeout" }
-func (fakeTimeoutErr) Timeout() bool   { return true }
-func (fakeTimeoutErr) Temporary() bool { return true }
-
-func TestClassify(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want Outcome
-	}{
-		{"timeout", fakeTimeoutErr{}, Timeout},
-		{"refused", fmt.Errorf("dial: %w", syscall.ECONNREFUSED), Refused},
-		{"other", errors.New("some other failure"), OtherError},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := classify(c.err); got != c.want {
-				t.Errorf("classify(%v) = %v, want %v", c.err, got, c.want)
-			}
-		})
-	}
-}
-
-func TestReportFormatting(t *testing.T) {
-	r := Result{Target: "127.0.0.1:9999", Outcome: Refused, Elapsed: 2 * time.Millisecond}
-	out := Report(r)
-	if out == "" {
-		t.Fatal("Report returned empty string")
-	}
-}
-```
-
-**Measured** (Go 1.24.4, darwin/arm64, 2026-11-06, `go test -race -v`):
-
-```text
---- PASS: TestCheckTCPOpen (0.00s)
---- PASS: TestCheckTCPRefused (0.00s)
---- PASS: TestClassify (0.00s)
-    --- PASS: TestClassify/timeout (0.00s)
-    --- PASS: TestClassify/refused (0.00s)
-    --- PASS: TestClassify/other (0.00s)
---- PASS: TestReportFormatting (0.00s)
-PASS
-```
+Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implementation and all four tests: [[Network Debugging Toolkit - dig, curl, ss, tcpdump - Go]]
 
 ## 5. Variants and comparison
 
@@ -577,3 +421,4 @@ PASS
 - **Before this:** [[What Happens When You Type a URL]], [[DNS - Resolution, Records and Caching]], [[TCP - Handshake, Reliability, Flow and Congestion Control]], [[TLS and HTTPS]]
 - **Next:** [[Forward and Reverse Proxies - L4 vs L7]]
 - **Compare with:** [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] (what a Go server's socket handling looks like from the kernel's side), [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
+- **Runnable code:** [[Network Debugging Toolkit - dig, curl, ss, tcpdump - Go]]

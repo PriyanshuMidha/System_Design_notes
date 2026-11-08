@@ -1,6 +1,6 @@
 ---
 tags: [networking, http, web]
-level: basic
+level: intermediate
 status: reviewed
 prereqs: ["[[TCP - Handshake, Reliability, Flow and Congestion Control]]"]
 related: ["[[REST and HTTP API Design]]", "[[HTTP-1.1 vs HTTP-2 vs HTTP-3]]", "[[HTTP Caching - Cache-Control, ETag, Conditional Requests]]", "[[Sessions and Cookies]]", "[[Idempotency and Idempotency Keys]]"]
@@ -9,7 +9,7 @@ sources:
   - "RFC 9111, HTTP Caching"
   - "RFC 6265bis (draft), HTTP State Management Mechanism (Set-Cookie attributes)"
   - "MDN Web Docs, HTTP response status codes"
-updated: 2026-11-07
+updated: 2026-11-09
 ---
 
 # HTTP Fundamentals - Methods, Status Codes, Headers, Cookies
@@ -23,40 +23,61 @@ updated: 2026-11-07
 > - Status codes group into five classes; the two codes people confuse most are 401 vs 403 and 400 vs 422.
 > - Classic mistake: assuming the HTTP/1.1 "connection" you write code against still means one TCP connection per request — keep-alive and multiplexing both change that picture.
 
+### Whiteboard version
+
+```mermaid
+flowchart LR
+    client["Client"] -- "GET /orders/42\n(method + path + headers)" --> server["Server"]
+    server -- "200 OK\n(status + headers + body)" --> client
+```
+
+One request, one response, nothing remembered in between — that last part ("nothing remembered") is the single idea everything else in this note builds on.
+
 ## 1. Why it exists
 
-Before HTTP, every service that wanted to serve documents over a network invented its own protocol: its own way to ask for a resource, its own way to signal success or failure, its own framing. HTTP (originally defined in RFC 1945, now specified across RFC 9110–9114) standardized that exchange into a single, text-readable shape that any client and any server can speak regardless of what they're written in — a browser from 1996 and a Go server written today still agree on what `GET /index.html HTTP/1.1` means.
+Imagine every website invented its own private way of asking for a page and its own private way of saying "found it" or "not found" — a browser built for one site couldn't talk to any other. Before **HTTP** (HyperText Transfer Protocol — a shared, text-readable request/response vocabulary any client and any server can speak regardless of what they're written in), every service that wanted to serve documents over a network invented its own protocol: its own way to ask for a resource, its own way to signal success or failure, its own framing.
 
-Concretely: an API client calling `POST /orders` needs a way to say *what kind of operation this is* (create something) and the server needs a way to say *what happened* (created, 201; rejected, 400; server broke, 500) without the client having to parse a custom error format for every different backend. Methods and status codes are that shared vocabulary.
+HTTP (originally defined in RFC 1945, now specified across RFC 9110–9114) standardized that exchange into one shape. A browser from 1996 and a Go server written today still agree on what `GET /index.html HTTP/1.1` means.
+
+**Example:** an API client calling `POST /orders` needs a way to say *what kind of operation this is* (create something) and the server needs a way to say *what happened* (created, `201`; rejected, `400`; server broke, `500`) without the client having to parse a custom error format for every different backend. Methods and status codes are that shared vocabulary.
+
+> [!tip] Remember
+> HTTP's whole job is to be a vocabulary every client and server already agree on, so nobody has to invent their own.
 
 ## 2. Mental model
 
-A request is a short, structured letter: the first line says what you want and from where (`GET /orders/42`), a block of headers gives context (who you are, what formats you accept, whether you have a cached copy already), and an optional body carries data for the server to act on. A response mirrors the shape back: a status line says what happened, headers give metadata about the reply, and an optional body carries the result.
+**In plain words:** a request is a short, structured letter. The first line says what you want and from where (`GET /orders/42`), a block of headers gives context (who you are, what formats you accept, whether you have a cached copy already), and an optional body carries data for the server to act on. A response mirrors the shape back: a status line says what happened, headers give metadata about the reply, and an optional body carries the result.
 
-Statelessness is part of the model, not an accident: the server doesn't remember you sent a request a minute ago. Anything that needs to persist across requests — login state, a shopping cart — has to ride along in every request, usually via a cookie or a token, because the protocol itself has no memory.
-
-## 3. How it works
-
-### Request and response anatomy
+**Analogy:** think of it like sending a letter to a post office counter and getting a receipt back. You write what you want on the front (the request line), attach any supporting notes (headers), maybe include a form to fill out (the body). The clerk hands back a receipt stating what happened (status line), any stamps or notices (response headers), and maybe the item you asked for (response body). Where the analogy breaks down: the clerk has no memory of you from your last visit — **statelessness** is part of the HTTP model, not an accident. Anything that needs to persist across requests — login state, a shopping cart — has to ride along in every request, usually via a cookie or a token, because the protocol itself remembers nothing between them.
 
 ```mermaid
 flowchart TB
-    subgraph req["Request"]
+    subgraph req["Request = one short letter"]
         direction TB
-        rl["Request line: POST /orders HTTP/1.1"]
-        rh["Headers: Host, Content-Type, Content-Length, Authorization, Cookie..."]
-        rb["Body (optional): JSON payload"]
+        rl["Request line: what + where"]
+        rh["Headers: context"]
+        rb["Body (optional): data to act on"]
         rl --> rh --> rb
     end
-    subgraph resp["Response"]
+    subgraph resp["Response = the receipt"]
         direction TB
-        sl["Status line: HTTP/1.1 201 Created"]
-        sh["Headers: Content-Type, Location, Set-Cookie, Cache-Control..."]
-        sb["Body (optional): JSON representation of the created order"]
+        sl["Status line: what happened"]
+        sh["Headers: metadata"]
+        sb["Body (optional): the result"]
         sl --> sh --> sb
     end
     req -. "sent over an open TCP (or QUIC) connection" .-> resp
 ```
+
+> [!warning] Common mistake
+> Assuming the server "remembers" a previous request because the connection stayed open (keep-alive). The TCP connection may persist, but HTTP itself carries no memory across requests — the server only knows what this exact request tells it, plus whatever a cookie or token happens to carry along.
+
+> [!tip] Remember
+> Every request must be understandable entirely on its own — that's what "stateless" buys the system: any server in a pool can answer any request.
+
+## 3. How it works
+
+### Request and response anatomy
 
 A **measured** request/response exchange against a local Go `net/http` server (Go 1.24, `curl` 8.7.1, loopback, 2026-11-06):
 
@@ -81,7 +102,19 @@ $ curl -v http://127.0.0.1:8099/items/1
 
 ### Methods: safe and idempotent are two different properties
 
-**Safe** means a method must never change server state — a crawler, a prefetcher, or a browser's back button can call it freely. **Idempotent** means calling it N times has the same effect on server state as calling it once (though the *response* can still legitimately differ, e.g. a second `DELETE` of an already-gone resource still returns success-shaped semantics even if the first returned 200 and the second 404 or 204 depending on API design).
+**In plain words:** two separate promises hide behind every HTTP method's name. **Safe** means a method must never change server state — a crawler, a prefetcher, or a browser's back button can call it freely. **Idempotent** means calling it N times has the same effect on server state as calling it once (though the *response* can still legitimately differ — a second `DELETE` of an already-gone resource still ends with it gone, even if the first call returned `200` and the second `404` or `204` depending on API design).
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    m["A method"] --> safe{"Safe?\n(never changes state)"}
+    safe -- yes --> idem1{"Idempotent?"}
+    safe -- no --> idem2{"Idempotent?"}
+    idem1 -- yes --> cell1["GET, HEAD, OPTIONS\nfree to retry, cache, prefetch"]
+    idem2 -- yes --> cell2["PUT, DELETE\nchanges state once, repeats are harmless"]
+    idem2 -- no --> cell3["POST, usually PATCH\nretry risks duplicating the effect"]
+```
 
 | Method | Safe | Idempotent | What it means |
 | --- | --- | --- | --- |
@@ -93,19 +126,33 @@ $ curl -v http://127.0.0.1:8099/items/1
 | `POST` | No | No | Create or trigger a side effect; retrying can create a duplicate |
 | `PATCH` | No | No (usually) | Partially modify a resource; a relative patch (`increment += 1`) is not idempotent even though the request body looks identical each time |
 
-The trap hides in `PATCH`: a patch document like `{"status": "shipped"}` is idempotent (setting the same value twice is harmless), but one like `{"$inc": {"stock": -1}}` is not — the method name doesn't decide idempotency, the *semantics of the operation* do. This is exactly why non-idempotent operations that must tolerate client retries (payment creation, order placement) need an explicit idempotency key rather than relying on the HTTP method alone — see [[Idempotency and Idempotency Keys]].
+**Example:** the trap hides in `PATCH`. A patch document like `{"status": "shipped"}` is idempotent — setting the same value twice is harmless. But `{"$inc": {"stock": -1}}` is not — sending it twice decrements stock twice. The method name doesn't decide idempotency; the *semantics of the operation* do.
+
+> [!warning] Common mistake
+> Assuming idempotent means "the response is identical every time." It only means the *end state* is the same. A second `DELETE /items/42` can legitimately return `404` instead of repeating the first call's `204` — the item being gone either way is what makes it idempotent.
+
+This is exactly why non-idempotent operations that must tolerate client retries (payment creation, order placement) need an explicit idempotency key rather than relying on the HTTP method alone — see [[Idempotency and Idempotency Keys]].
+
+> [!tip] Remember
+> Safe and idempotent are two separate questions. `GET` is both; `PUT`/`DELETE` are idempotent but not safe; `POST` is neither.
 
 ### Status codes: five classes, and the pairs people confuse
 
+**In plain words:** every HTTP response's status code falls into one of five families, numbered by their first digit. Knowing the family tells you who should act next.
+
 ```mermaid
 flowchart LR
-    c1["1xx Informational<br/>request received, continue"]
-    c2["2xx Success<br/>request was received, understood, accepted"]
-    c3["3xx Redirection<br/>further action needed to complete the request"]
-    c4["4xx Client Error<br/>the request is wrong"]
-    c5["5xx Server Error<br/>the server failed on a request that looked fine"]
+    c1["1xx Informational\nrequest received, continue"]
+    c2["2xx Success\nrequest was received, understood, accepted"]
+    c3["3xx Redirection\nfurther action needed to complete the request"]
+    c4["4xx Client Error\nthe request is wrong"]
+    c5["5xx Server Error\nthe server failed on a request that looked fine"]
     c1 --- c2 --- c3 --- c4 --- c5
 ```
+
+**Example:** a `201 Created` (2xx) means the server did what was asked and here is the new thing; a `404 Not Found` (4xx) means the client asked for something that doesn't exist; a `500 Internal Server Error` (5xx) means the client did nothing wrong, the server broke.
+
+The two pairs people mix up most:
 
 | Code | Means | Commonly confused with |
 | --- | --- | --- |
@@ -118,10 +165,15 @@ flowchart LR
 | `503 Service Unavailable` | The server (or upstream) is temporarily unable to handle requests — overloaded or in maintenance | `502`/`504`: 503 often comes with a `Retry-After` header; the server itself is saying "not now" |
 | `504 Gateway Timeout` | A proxy/gateway gave up waiting for the upstream to respond at all | `502`/`503`: 504 means no response arrived in time, not that an invalid one arrived |
 
-> [!warning] Interview trap
-> `401` vs `403` is not about whether the user is "logged in" in casual terms — it's about whether the *request itself* carries valid credentials. A perfectly logged-in user hitting an admin-only endpoint with their normal user token gets `403`, not `401`, because their credentials are valid, just insufficient.
+> [!warning] Common mistake
+> Treating `401` vs `403` as "logged in or not" in casual terms — it's really about whether the *request itself* carries valid credentials. A perfectly logged-in user hitting an admin-only endpoint with their normal user token gets `403`, not `401`, because their credentials are valid, just insufficient.
+
+> [!tip] Remember
+> 401 = "I don't know who you are." 403 = "I know exactly who you are, and the answer is still no."
 
 ### Headers: the handful that do the most work
+
+**In plain words:** headers are key-value metadata riding alongside the request line or status line. A handful of them show up in almost every real system.
 
 | Header | Direction | Purpose |
 | --- | --- | --- |
@@ -136,7 +188,7 @@ flowchart LR
 
 ### Conditional requests: avoiding a resend you don't need
 
-A server can tag a representation with an `ETag` (a hash of its content). A client that already has a copy sends `If-None-Match: <etag>` on its next `GET`; if nothing changed, the server replies `304 Not Modified` with **no body at all**, saving the full transfer.
+**In plain words:** a server can tag a representation with an **ETag** — a hash of its content. A client that already has a copy sends `If-None-Match: <etag>` on its next `GET`; if nothing changed, the server replies `304 Not Modified` with **no body at all**, saving the full transfer.
 
 ```mermaid
 sequenceDiagram
@@ -153,9 +205,14 @@ sequenceDiagram
     end
 ```
 
+**Example:** a 2KB JSON representation gets fetched once (`200`, full body), then checked again a minute later. If nothing changed, the second response is a few bytes of headers and nothing else — the full detail of this mechanism, including `Cache-Control` and the precedence between validators, lives in [[HTTP Caching - Cache-Control, ETag, Conditional Requests]].
+
+> [!tip] Remember
+> A `304` is the server proving "nothing changed" cheaply — it is caching working correctly, not a failure.
+
 ### Cookies: how state survives a stateless protocol
 
-A cookie is just a header the server asks the client to store and resend. Its attributes decide how exposed it is:
+**In plain words:** a cookie is just a header the server asks the client to store and resend on every later request. Its attributes decide how exposed it is.
 
 | Attribute | What it controls | Why it matters |
 | --- | --- | --- |
@@ -165,228 +222,50 @@ A cookie is just a header the server asks the client to store and resend. Its at
 | `Domain` | Which hosts the cookie is sent to | Too broad a domain leaks the cookie to unrelated subdomains |
 | `Path` | Which URL paths the cookie is sent on | Scopes a cookie to, say, `/admin` instead of the whole site |
 
+**Example:** a session cookie set with `Secure; HttpOnly; SameSite=Strict; Path=/` is sent back by the browser on every request to the same site, over HTTPS only, invisible to any JavaScript running on the page, and never attached to a request that originated from another site.
+
+> [!warning] Common mistake
+> Setting only `HttpOnly` and assuming the cookie is now safe. `HttpOnly` blocks JavaScript from reading it; it does nothing against the cookie being sniffed on plain HTTP (that needs `Secure`) or against it riding along on a forged cross-site request (that needs `SameSite`). The three attributes block three different attacks.
+
 Full CSRF/XSS defenses and CORS belong to [[CSRF, XSS and Security Headers]] and [[CORS and Same-Origin Policy]] — this note only covers the cookie attributes themselves.
+
+> [!tip] Remember
+> `Secure` stops eavesdropping, `HttpOnly` stops script theft, `SameSite` stops forged cross-site requests — all three, not any one of them alone.
 
 ### Keep-alive: one request does not need one new TCP connection
 
-HTTP/1.0 opened a fresh TCP connection per request. HTTP/1.1 defaults to `Connection: keep-alive`, reusing the same TCP connection for several sequential requests — avoiding a fresh handshake (and, under TLS, a fresh TLS handshake) every time. This is still head-of-line-blocked at the HTTP/1.1 level: requests on one connection are still answered one at a time unless the client opens multiple connections, which is why browsers historically capped and then parallelized connections per host, and why HTTP/2 multiplexing (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]) exists.
+**In plain words:** HTTP/1.0 opened a fresh TCP connection per request. HTTP/1.1 defaults to `Connection: keep-alive`, reusing the same TCP connection for several sequential requests — avoiding a fresh handshake (and, under TLS, a fresh TLS handshake) every time.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C,S: HTTP/1.0 style: new connection per request
+    C->>S: TCP handshake, GET /a, response, close
+    C->>S: TCP handshake, GET /b, response, close
+    Note over C,S: HTTP/1.1 keep-alive: one connection, several requests
+    C->>S: TCP handshake (once)
+    C->>S: GET /a, response
+    C->>S: GET /b, response
+```
+
+This is still head-of-line-blocked at the HTTP/1.1 level: requests on one connection are still answered one at a time unless the client opens multiple connections, which is why browsers historically capped and then parallelized connections per host, and why HTTP/2 multiplexing (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]) exists.
+
+> [!tip] Remember
+> Keep-alive saves handshakes, not ordering — one connection still answers one request at a time until HTTP/2.
 
 ## 4. Worked example
 
-A Go `net/http` server demonstrating idempotency by method, a conditional `GET` returning `304`, and cookie attributes. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+A Go `net/http` server trace, step by step, for one `PUT` sent twice to the same resource:
 
-```go
-package httpdemo
+1. **First `PUT /items/42`** with body `{"Body":"v1"}` arrives. The store has no entry for `42` yet.
+2. **Handler writes it.** The store now holds `items["42"] = "v1"`.
+3. **Handler responds `201 Created`**, because the resource did not exist before this call.
+4. **Same `PUT /items/42`** with the identical body arrives again — simulating a client retry after a timeout.
+5. **Handler writes the same value again.** The store still holds exactly `items["42"] = "v1"` — unchanged from step 2.
+6. **Handler responds `200 OK`** this time, because the resource already existed — but critically, the *stored state* after both calls is identical. That is what "idempotent" means in practice, traced through actual state.
 
-import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"sync"
-	"sync/atomic"
-)
-
-// Store is a tiny in-memory resource store used to demonstrate method
-// semantics: GET is safe, PUT and DELETE are idempotent, POST is not.
-type Store struct {
-	mu      sync.Mutex
-	items   map[string]string
-	nextID  int64
-	created atomic.Int64 // counts how many times POST actually created something
-}
-
-func NewStore() *Store {
-	return &Store{items: make(map[string]string)}
-}
-
-func etag(body string) string {
-	sum := sha256.Sum256([]byte(body))
-	return `"` + hex.EncodeToString(sum[:8]) + `"`
-}
-
-// HandleGet is safe: it never changes state, so it may be cached, retried
-// and prefetched freely. It also implements conditional GET: if the
-// client's If-None-Match matches the current ETag, it replies 304 Not
-// Modified with no body instead of resending unchanged bytes.
-func (s *Store) HandleGet(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	s.mu.Lock()
-	body, ok := s.items[id]
-	s.mu.Unlock()
-	if !ok {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	tag := etag(body)
-	w.Header().Set("ETag", tag)
-	w.Header().Set("Cache-Control", "max-age=60")
-	if r.Header.Get("If-None-Match") == tag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"id": id, "body": body})
-}
-
-// HandlePut is idempotent: setting the same body twice leaves the exact
-// same state as setting it once.
-func (s *Store) HandlePut(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var req struct{ Body string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	s.mu.Lock()
-	_, existed := s.items[id]
-	s.items[id] = req.Body
-	s.mu.Unlock()
-	if existed {
-		w.WriteHeader(http.StatusOK)
-	} else {
-		w.WriteHeader(http.StatusCreated)
-	}
-}
-
-// HandlePost is NOT idempotent: every successful call appends a brand new
-// resource with a new ID, so retrying a POST after a timeout can create a
-// duplicate.
-func (s *Store) HandlePost(w http.ResponseWriter, r *http.Request) {
-	var req struct{ Body string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	s.mu.Lock()
-	s.nextID++
-	id := fmt.Sprintf("%d", s.nextID)
-	s.items[id] = req.Body
-	s.mu.Unlock()
-	s.created.Add(1)
-	w.Header().Set("Location", "/items/"+id)
-	w.WriteHeader(http.StatusCreated)
-}
-
-// HandleDelete is idempotent: deleting an already-deleted resource still
-// ends with it gone, so it returns 204 whether or not it existed.
-func (s *Store) HandleDelete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	s.mu.Lock()
-	delete(s.items, id)
-	s.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// SetSessionCookie shows the attributes a session cookie needs in
-// production: Secure (HTTPS only), HttpOnly (no JS access, blunts XSS
-// cookie theft), SameSite=Strict (not sent on cross-site requests, blunts
-// CSRF), and a scoping Path.
-func SetSessionCookie(w http.ResponseWriter, sessionID string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session_id",
-		Value:    sessionID,
-		Path:     "/",
-		MaxAge:   3600,
-		Secure:   true,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
-}
-```
-
-Tests covering method semantics and conditional requests:
-
-```go
-func newMux(s *Store) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /items/{id}", s.HandleGet)
-	mux.HandleFunc("PUT /items/{id}", s.HandlePut)
-	mux.HandleFunc("DELETE /items/{id}", s.HandleDelete)
-	mux.HandleFunc("POST /items", s.HandlePost)
-	return mux
-}
-
-func TestPUTIsIdempotent(t *testing.T) {
-	s := NewStore()
-	mux := newMux(s)
-
-	req := httptest.NewRequest(http.MethodPut, "/items/42", strings.NewReader(`{"Body":"v1"}`))
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("first PUT: got %d, want 201", rec.Code)
-	}
-
-	// Same PUT again: state after is identical, so the response is 200,
-	// not another 201.
-	req2 := httptest.NewRequest(http.MethodPut, "/items/42", strings.NewReader(`{"Body":"v1"}`))
-	rec2 := httptest.NewRecorder()
-	mux.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("second PUT: got %d, want 200", rec2.Code)
-	}
-	if got := s.items["42"]; got != "v1" {
-		t.Fatalf("stored body = %q, want v1", got)
-	}
-}
-
-func TestPOSTIsNotIdempotent(t *testing.T) {
-	s := NewStore()
-	mux := newMux(s)
-	for i := 0; i < 3; i++ {
-		req := httptest.NewRequest(http.MethodPost, "/items", strings.NewReader(`{"Body":"dup"}`))
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("POST %d: got %d, want 201", i, rec.Code)
-		}
-	}
-	// Three "identical" POSTs, as a client retry-on-timeout would send,
-	// created three distinct resources — exactly the non-idempotent risk
-	// idempotency keys exist to close.
-	if got := s.created.Load(); got != 3 {
-		t.Fatalf("created = %d, want 3 distinct resources", got)
-	}
-}
-
-func TestConditionalGETReturns304(t *testing.T) {
-	s := NewStore()
-	s.items["1"] = "hello"
-	mux := newMux(s)
-
-	req1 := httptest.NewRequest(http.MethodGet, "/items/1", nil)
-	rec1 := httptest.NewRecorder()
-	mux.ServeHTTP(rec1, req1)
-	tag := rec1.Header().Get("ETag")
-
-	req2 := httptest.NewRequest(http.MethodGet, "/items/1", nil)
-	req2.Header.Set("If-None-Match", tag)
-	rec2 := httptest.NewRecorder()
-	mux.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusNotModified {
-		t.Fatalf("conditional GET: got %d, want 304", rec2.Code)
-	}
-	if rec2.Body.Len() != 0 {
-		t.Fatalf("304 response should have no body, got %d bytes", rec2.Body.Len())
-	}
-}
-
-func TestSessionCookieAttributes(t *testing.T) {
-	rec := httptest.NewRecorder()
-	SetSessionCookie(rec, "abc123")
-	c := rec.Result().Cookies()[0]
-	if !c.Secure || !c.HttpOnly {
-		t.Fatalf("cookie must be Secure and HttpOnly, got Secure=%v HttpOnly=%v", c.Secure, c.HttpOnly)
-	}
-	if c.SameSite != http.SameSiteStrictMode {
-		t.Fatalf("SameSite = %v, want Strict", c.SameSite)
-	}
-}
-```
-
-**Measured** on this machine (Go 1.24.4, darwin/arm64, `go test -race`, 2026-11-06): all five tests pass — two PUTs to the same resource produce 201 then 200 with identical stored state, three POSTs create three distinct resources, a repeated conditional GET returns 304 with a zero-length body, and the session cookie carries `Secure`, `HttpOnly` and `SameSite=Strict`.
+Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies - Go]].
 
 ## 5. Variants and comparison
 
@@ -461,3 +340,4 @@ func TestSessionCookieAttributes(t *testing.T) {
 - **Before this:** [[TCP - Handshake, Reliability, Flow and Congestion Control]]
 - **Next:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[REST and HTTP API Design]]
 - **Compare with:** [[Sessions and Cookies]] (cookies as a session mechanism, in depth), [[Idempotency and Idempotency Keys]] (handling non-idempotent retries), [[CORS and Same-Origin Policy]] and [[CSRF, XSS and Security Headers]] (the security side of cookies and headers)
+- **Runnable code:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies - Go]]

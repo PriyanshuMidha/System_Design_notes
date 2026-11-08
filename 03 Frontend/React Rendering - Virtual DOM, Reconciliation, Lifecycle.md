@@ -52,11 +52,38 @@ A component re-renders (its function runs again) for three reasons: its own stat
 
 ## 2. Mental model
 
-Think of three trees, not two:
+### Three trees, not two
+
+**In plain words:** People say "the virtual DOM" as if it were one thing, but React actually juggles three separate trees on every update, and mixing them up is the single most common source of confusion about how rendering works.
 
 - **React elements** — the plain objects `{ type: 'button', props: { children: '1' } }` that `<button>1</button>` compiles to. Cheap to create, thrown away every render.
 - **Fiber tree** — React's internal, persistent representation of your component tree (since React 16). Each fiber node remembers hooks state, the DOM node it owns, and its effects. This is what people loosely call "the virtual DOM" today.
 - **Real DOM** — what the browser actually renders.
+
+**Picture it:**
+
+```mermaid
+flowchart TB
+    subgraph E["React elements (new, every render)"]
+        E1["{ type: 'button', props: { children: '1' } }"]
+    end
+    subgraph F["Fiber tree (persistent, updated in place)"]
+        F1["Fiber node<br/>hooks state, DOM ref, effects"]
+    end
+    subgraph D["Real DOM (what the browser paints)"]
+        D1["&lt;button&gt;1&lt;/button&gt;"]
+    end
+    E -- "diff against" --> F
+    F -- "minimal mutation list" --> D
+    F -. "fiber node owns a pointer<br/>to its DOM node" .-> D1
+```
+
+**Example:** Click the counter button once. React calls `Counter()` and gets a brand-new element object (thrown away as soon as it's compared). It diffs that element against the **existing** fiber for this button, finds the text child changed, patches that one fiber's `memoizedProps`, and schedules exactly one DOM text-node update. The element object from this render never touches the DOM directly — the fiber tree is the thing the DOM mutation gets computed from.
+
+**Why it matters:** When people say "React re-renders the whole tree," they mean step one (new element tree, cheap, all JS). The expensive step — touching the real DOM — only happens where the fiber-tree diff found an actual difference. Confusing "re-render" (function call) with "DOM write" (fiber committed a change) is why "my component re-renders constantly" and "my page is slow" are two different bugs with two different fixes.
+
+> [!tip] Remember
+> Every render makes a new element tree (cheap); React diffs it against the **fiber tree** (persistent) to find the minimal set of real DOM writes.
 
 Every render produces a fresh element tree. React diffs it against the fiber tree from last time, updates the fiber tree in place where it can, and emits a minimal list of DOM mutations.
 
@@ -74,14 +101,56 @@ The **render phase** is pure: React calls your component functions, computes wha
 
 ### Diffing heuristics
 
-React does not do a general tree-diff (that is `O(n³)` for arbitrary trees). It uses two cheap heuristics instead, bringing the cost down to `O(n)`:
+**In plain words:** Comparing two arbitrary trees node-for-node to find the smallest edit is a genuinely expensive problem to solve exactly (`O(n³)` for arbitrary trees). React doesn't try to be exact — it uses two cheap rules of thumb that are right almost all the time, which brings the cost down to `O(n)`.
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    Start["Comparing old fiber vs new element<br/>at the same position"] --> Q1{"Same element type?<br/>(e.g. div vs div)"}
+    Q1 -- "No" --> Unmount["Unmount old subtree entirely<br/>(state lost)<br/>Mount a brand-new subtree"]
+    Q1 -- "Yes" --> Q2{"Does the list have<br/>stable keys?"}
+    Q2 -- "No" --> ByIndex["Match children by position (index)<br/>— brittle on reorder"]
+    Q2 -- "Yes" --> ByKey["Match children by key<br/>— survives reorder/insert/delete"]
+```
+
+**Example:** A `<div><Spinner/></div>` becomes `<span><Spinner/></span>` after a state change. Even though `<Spinner/>` itself didn't change, React sees `div → span` (different type) at that position and throws away the *entire* old subtree, including the mounted `Spinner`'s state — then mounts a fresh `span` and a fresh `Spinner` from scratch.
+
+**Why it matters:** This is why wrapping an already-working component in a new parent element — even one that looks purely cosmetic, like adding a `<div>` around something that already renders fine — can silently reset a child's internal state (an open accordion snapping shut, a form's typed text vanishing) with no error anywhere.
+
+> [!warning] Common mistake
+> Assuming a cosmetic wrapper element is "free." Changing `<A><X/></A>` to `<B><X/></B>` (different type at the same position) remounts `X`, even if `X` itself is unchanged — the heuristic only looks at type, not at what's "really" different from a human's point of view.
 
 1. **Different element type at the same position → throw away the old subtree and mount a new one.** A `<div>` that becomes a `<span>` unmounts everything inside the old `<div>` (losing its state) and mounts fresh.
 2. **Same type → update it in place**, and recurse into children by comparing them positionally — unless they have `key`s.
 
 ### Why list items need `key`
 
+**In plain words:** Think of a classroom seating chart. If the teacher only tracks "whoever is in seat 3," and a new student is seated in seat 1, everyone from seat 1 onward gets relabeled with the wrong name — the chart didn't track *people*, it tracked *seats*. Matching list children by index has the same bug: it tracks position, not identity.
+
 Without keys, React matches old and new children **by index**. Insert a new first item into `[A, B, C]` and, index-by-index, React sees "position 0 changed from A to NEW, position 1 changed from B to A, position 2 changed from C to B, position 3 is new (C)" — every existing DOM node gets patched with another item's data, and any per-item state (an open `<details>`, an uncontrolled `<input>`'s cursor) ends up attached to the wrong row.
+
+**Picture it:**
+
+```mermaid
+flowchart TD
+    subgraph before["Before: list is [A, B, C]"]
+        direction LR
+        P0["pos 0: A"] --- P1["pos 1: B"] --- P2["pos 2: C"]
+    end
+    subgraph noKey["Insert NEW at front, matched by INDEX"]
+        direction LR
+        N0["pos 0: NEW<br/>(patched from A's node)"] --- N1["pos 1: A<br/>(patched from B's node)"] --- N2["pos 2: B<br/>(patched from C's node)"] --- N3["pos 3: C<br/>(new mount)"]
+    end
+    subgraph withKey["Insert NEW at front, matched by KEY"]
+        direction LR
+        K0["key=new: NEW<br/>(new mount)"] --- K1["key=a: A<br/>(untouched node, just moved)"] --- K2["key=b: B<br/>(untouched node, just moved)"] --- K3["key=c: C<br/>(untouched node, just moved)"]
+    end
+    before --> noKey
+    before --> withKey
+```
+
+**Why it matters:** Three nodes get needlessly patched with another row's data when matching by index, versus zero patches (just one real mount) when matching by a stable key — and any state attached to those DOM nodes (focus, scroll position inside a row, an uncontrolled input's cursor) moves to the wrong row in the index case.
 
 ```jsx
 // Bad: index as key reintroduces the index problem key was meant to fix

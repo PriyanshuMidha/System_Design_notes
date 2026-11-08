@@ -3,7 +3,7 @@ tags: [databases, transactions, acid, postgresql, go]
 level: basic
 status: reviewed
 prereqs: ["[[SQL Essentials]]"]
-related: ["[[Isolation Levels and MVCC]]", "[[Locking - Optimistic vs Pessimistic]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Transactions and the Repository Pattern]]", "[[Database Access (database-sql, pgx, sqlc)]]", "[[Transactional Outbox and CDC]]", "[[Saga Pattern]]", "[[Timeouts, Retries and Backoff]]"]
+related: ["[[Transactions and ACID - Go]]", "[[Isolation Levels and MVCC]]", "[[Locking - Optimistic vs Pessimistic]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Transactions and the Repository Pattern]]", "[[Database Access (database-sql, pgx, sqlc)]]", "[[Transactional Outbox and CDC]]", "[[Saga Pattern]]", "[[Timeouts, Retries and Backoff]]"]
 sources:
   - "PostgreSQL 17 docs, Tutorial: Transactions (BEGIN, COMMIT, ROLLBACK, SAVEPOINT)"
   - "PostgreSQL 17 docs, Reliability and the Write-Ahead Log: WAL Introduction, Asynchronous Commit, WAL Configuration (commit_delay, synchronous_commit, wal_writer_delay)"
@@ -14,7 +14,7 @@ sources:
   - "Go standard library docs, database/sql: DB.BeginTx, Tx.Commit, Tx.Rollback, TxOptions"
   - "Härder and Reuter, Principles of Transaction-Oriented Database Recovery (ACM Computing Surveys, 1983)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 7"
-updated: 2026-11-03
+updated: 2026-11-07
 ---
 
 # Transactions and ACID
@@ -38,17 +38,46 @@ InvoiceOps (the running example in these notes: a multi-tenant invoicing SaaS) r
 3. Update the invoice: `paid_minor = paid_minor + 50000`, `status = 'paid'`.
 4. Write an audit log row.
 
+### Problem 1: a crash halfway
+
 Without a transaction, each statement is saved on its own. If the process crashes after step 2, the payment exists but the invoice still says `open`, so the customer receives an overdue reminder for an invoice they already paid. If the provider retries the webhook, step 1 may now say "already seen" and the invoice is never fixed.
+
+```mermaid
+flowchart LR
+    S1["1 webhook event saved"] --> S2["2 payment row saved"]
+    S2 --> X["process crashes here"]
+    X -.-> S3["3 invoice update never runs"]
+    X -.-> S4["4 audit row never written"]
+    S2 --> R["Result: payment exists, invoice still open, retry skipped as 'already seen'"]
+```
 
 With a transaction, the four writes become one unit. A crash at any point before `COMMIT` leaves the database exactly as it was before step 1, and the retry simply runs the whole thing again.
 
-The second reason is concurrency. If two customers try to buy the last unit of a product at the same moment, two transactions run side by side. Section 4 shows that a transaction alone does **not** stop both of them from succeeding; you also need the right SQL.
+| Crash point | Without a transaction | With a transaction |
+| --- | --- | --- |
+| After step 1 | Event recorded, nothing else: the retry is skipped | Nothing saved, retry runs all four steps |
+| After step 2 | Payment recorded, invoice still `open`: wrong reminder email | Nothing saved, retry runs all four steps |
+| After step 3 | Audit row missing | Nothing saved, retry runs all four steps |
+| After `COMMIT` | Not applicable | All four saved, retry is deduplicated by step 1 |
+
+### Problem 2: concurrency
+
+If two customers try to buy the last unit of a product at the same moment, two transactions run side by side. Section 4 shows that a transaction alone does **not** stop both of them from succeeding; you also need the right SQL.
 
 ## 2. Mental model
 
 Think of a transaction as a **shopping basket at a checkout**. You put items in one by one (statements), but nothing is yours until you pay (`COMMIT`). If your card is declined or you walk away (`ROLLBACK`, error, crash), every item goes back on the shelf. Nobody ever leaves with half a basket.
 
-The four letters, in plain words:
+```mermaid
+flowchart LR
+    B["BEGIN: empty basket"] --> I1["INSERT payment: item in basket"]
+    I1 --> I2["UPDATE invoice: item in basket"]
+    I2 --> D{"pay or walk away?"}
+    D -- "COMMIT" --> SH["everything leaves the shop together"]
+    D -- "ROLLBACK, error, crash" --> RS["everything goes back on the shelf"]
+```
+
+### The four letters, in plain words
 
 | Letter | Plain meaning | Who provides it | Mechanism (PostgreSQL 17) |
 | --- | --- | --- | --- |
@@ -57,7 +86,7 @@ The four letters, in plain words:
 | **I**solation | Concurrent transactions do not see or break each other's half-done work | Database, to the degree of the **isolation level** | MVCC snapshots and row locks; see [[Isolation Levels and MVCC]] |
 | **D**urability | Once `COMMIT` returns, the change survives a crash or power loss | Database plus honest hardware | The WAL record is flushed to disk (`fsync`) before `COMMIT` returns |
 
-Two warnings about the letters:
+### Two warnings about the letters
 
 - **C in ACID is not the C in CAP.** ACID consistency means "your invariants hold". CAP consistency means linearizability, a distributed-systems property. Same word, different ideas.
 - **The database cannot know your business rules unless you write them down.** "An invoice's `paid_minor` never exceeds `total_minor`" is only enforced if you add `CHECK (paid_minor <= total_minor)` or always check it in the same transaction.
@@ -65,6 +94,8 @@ Two warnings about the letters:
 ## 3. How it works
 
 ### The lifecycle of one transaction
+
+One idea: a transaction is always in exactly one of a few states, and only `COMMIT` from the active state makes work permanent.
 
 ```mermaid
 stateDiagram-v2
@@ -85,7 +116,11 @@ stateDiagram-v2
 - **Committed.** All changes become visible to others at once and are durable.
 - **Rolled back.** All changes are discarded.
 
+Example: in InvoiceOps the webhook transaction runs `INSERT INTO payments`, which fails with `23505 unique_violation` because the payment already exists. The transaction moves to Failed; the following `UPDATE invoices` returns `25P02` without running. Only `ROLLBACK` clears it.
+
 ### Commit and rollback, step by step
+
+One idea: before `COMMIT` the changes exist only as uncommitted row versions, so a rollback is a bookkeeping change, not an undo of data.
 
 ```mermaid
 sequenceDiagram
@@ -109,18 +144,84 @@ sequenceDiagram
     end
 ```
 
-What each letter relies on:
+### Atomicity: invisible until committed
 
-- **Durability: the write-ahead log.** The **WAL** (write-ahead log) is an append-only file of change records. The rule is "log first, data pages later": before `COMMIT` returns, PostgreSQL flushes the WAL up to the commit record with `fsync` (a system call that forces data out of the OS cache onto the disk). The changed data pages can stay in memory; after a crash, PostgreSQL replays the WAL to rebuild them. Details live in [[Storage Engines - B-tree vs LSM and WAL]].
-- **Atomicity: invisible until committed.** PostgreSQL writes each new row version as a new tuple in the table (the old version stays until VACUUM) and stamps them with the creating transaction ID (`xmin`). Readers check that ID against the commit log. An aborted transaction's versions are skipped and later cleaned up by VACUUM, so rollback is nearly free. InnoDB instead writes old values to an **undo log** and copies them back on rollback, so rolling back a large transaction in MySQL does real work and can take a long time.
-- **Consistency: constraints checked inside the transaction.** A `CHECK`, `UNIQUE` or foreign-key violation raises an error and the transaction cannot commit. Constraints declared `DEFERRABLE INITIALLY DEFERRED` are checked at `COMMIT` instead of per statement.
-- **Isolation: snapshots and locks.** Each statement (READ COMMITTED) or each transaction (REPEATABLE READ and SERIALIZABLE) reads from a snapshot; writers take row locks. Which anomalies remain possible depends on the level: see [[Isolation Levels and MVCC]] and [[Locking - Optimistic vs Pessimistic]].
+PostgreSQL writes each new row version as a new tuple in the table (the old version stays until VACUUM) and stamps it with the creating transaction ID (`xmin`). Readers check that ID against the commit log. An aborted transaction's versions are skipped and later cleaned up by VACUUM, so rollback is nearly free.
+
+```mermaid
+flowchart TD
+    subgraph heap["invoices heap page"]
+        V1["version A: paid_minor 0, xmin 700, xmax 9001"]
+        V2["version B: paid_minor 50000, xmin 9001, xmax 0"]
+    end
+    Q["another session reads invoice 501"] --> L{"commit log: did txn 9001 commit?"}
+    L -- "not yet, or aborted" --> V1
+    L -- "committed" --> V2
+```
+
+Example numbers: transaction 9001 updates invoice 501 from `paid_minor = 0` to `50000`. While 9001 is open, every other session reads version A. If 9001 rolls back, version B is dead and version A is still the answer; nothing was copied back. InnoDB works the other way: it writes old values to an **undo log** and copies them back on rollback, so rolling back a large transaction in MySQL does real work and can take a long time.
+
+### Durability: the write-ahead log
+
+The **WAL** (write-ahead log) is an append-only file of change records. The rule is "log first, data pages later": before `COMMIT` returns, PostgreSQL flushes the WAL up to the commit record with `fsync` (a system call that forces data out of the OS cache onto the disk). The changed data pages can stay in memory; after a crash, PostgreSQL replays the WAL to rebuild them. Details live in [[Storage Engines - B-tree vs LSM and WAL]].
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Backend
+    participant M as Shared buffers (memory)
+    participant W as WAL file
+    participant D as Data files
+    C->>B: COMMIT
+    B->>M: data page changed, still dirty
+    B->>W: append change records and commit record
+    B->>W: fsync
+    W-->>B: on disk
+    B-->>C: COMMIT ok
+    Note over M,D: checkpoint writes dirty pages to data files later
+    Note over W,D: crash before the checkpoint: replay WAL to rebuild the pages
+```
+
+Example: the commit record for transaction 9001 is flushed at 10:00:00.001. The server loses power at 10:00:00.050 before the dirty invoice page reached the data file. On restart PostgreSQL replays the WAL, finds 9001's commit record, and reconstructs `paid_minor = 50000`. The client had already received `COMMIT ok`, so the promise holds.
+
+### Consistency: constraints inside the transaction
+
+A `CHECK`, `UNIQUE` or foreign-key violation raises an error and the transaction cannot commit. Constraints declared `DEFERRABLE INITIALLY DEFERRED` are checked at `COMMIT` instead of per statement.
+
+| Constraint | Example rule | Violation | SQLSTATE |
+| --- | --- | --- | --- |
+| `CHECK` | `stock >= 0` | `UPDATE … SET stock = stock - 1` when stock is 0 | `23514` |
+| `UNIQUE` | `(provider, provider_event_id)` | the same webhook inserted twice | `23505` |
+| Foreign key | `payments.invoice_id` references `invoices.id` | payment for invoice 99999 | `23503` |
+
+### Isolation: snapshots and locks
+
+Each statement (READ COMMITTED) or each transaction (REPEATABLE READ and SERIALIZABLE) reads from a snapshot; writers take row locks. Which anomalies remain possible depends on the level: see [[Isolation Levels and MVCC]] and [[Locking - Optimistic vs Pessimistic]].
 
 ### Autocommit
 
 If you send a statement without `BEGIN`, PostgreSQL wraps it in its own one-statement transaction and commits it immediately. This is **autocommit**. It is why a single `UPDATE` is always atomic, and also why two separate statements are **not** atomic together.
 
 In Go, every call on `*sql.DB` (`db.ExecContext`, `db.QueryContext`) is autocommit, and the pool may send consecutive calls on **different connections**. So `db.Exec("BEGIN")` followed by `db.Exec("UPDATE …")` is a bug: the `BEGIN` may stay open on one connection while the `UPDATE` autocommits on another. Always use `db.BeginTx`, which pins one connection until `Commit` or `Rollback`.
+
+```mermaid
+sequenceDiagram
+    participant G as Go code
+    participant P as sql.DB pool
+    participant C1 as connection 1
+    participant C2 as connection 2
+    G->>P: db.Exec("BEGIN")
+    P->>C1: BEGIN
+    Note over C1: transaction open, nobody will commit it
+    G->>P: db.Exec("UPDATE invoices ...")
+    P->>C2: UPDATE (autocommit)
+    Note over C2: change is committed immediately, outside any transaction
+    G->>P: db.Exec("ROLLBACK")
+    P->>C2: ROLLBACK
+    Note over C2: nothing to roll back, the UPDATE stays
+```
+
+Example: with a pool of 10 connections, three `db.Exec` calls in a row can land on three different connections. The `ROLLBACK` in the diagram does nothing, while connection 1 keeps holding its open transaction and its locks until the pool closes it.
 
 ### Savepoints
 
@@ -137,40 +238,54 @@ RELEASE SAVEPOINT try_coupon;  -- forget the savepoint, keep the work before it
 COMMIT;                         -- invoice 501 is saved without the coupon
 ```
 
-In PostgreSQL, rolling back to a savepoint is the only way to recover from an error without losing the whole transaction. Some drivers and ORMs use savepoints to implement "nested transactions". Each savepoint creates a subtransaction, and thousands of them in one transaction can slow PostgreSQL down (see section 8).
-
-## 4. Worked example
-
-The task: InvoiceOps sells add-on products (for example, 100 printed cheque books) with a limited `stock`. Two customers try to buy the **last unit** at the same moment. Exactly one must succeed.
-
-```sql
-CREATE TABLE products (
-    id          bigint PRIMARY KEY,
-    name        text   NOT NULL,
-    price_minor bigint NOT NULL CHECK (price_minor >= 0),
-    stock       int    NOT NULL CHECK (stock >= 0)   -- safety net: never negative
-);
-INSERT INTO products VALUES (1, 'Cheque book (50 leaves)', 25000, 1);
+```mermaid
+stateDiagram-v2
+    [*] --> InvoiceInserted: INSERT invoice 501
+    InvoiceInserted --> SavepointSet: SAVEPOINT try_coupon
+    SavepointSet --> CouponApplied: UPDATE coupons succeeds
+    SavepointSet --> Failed: UPDATE coupons violates CHECK
+    Failed --> SavepointSet: ROLLBACK TO SAVEPOINT try_coupon
+    CouponApplied --> Committed: COMMIT, invoice with coupon
+    SavepointSet --> Committed: RELEASE and COMMIT, invoice without coupon
+    Committed --> [*]
 ```
 
-### Whiteboard version
+In PostgreSQL, rolling back to a savepoint is the only way to recover from an error without losing the whole transaction. Some drivers and ORMs use savepoints to implement "nested transactions". Each savepoint creates a subtransaction, and thousands of them in one transaction can slow PostgreSQL down (see section 8).
 
-The bare idea. The wrong way reads, decides in the app, then writes. The right way puts the check inside the write:
+### Retrying: what to do on 40001 and 40P01
+
+Two SQLSTATE codes mean "nothing was saved, try again": `40001` (`serialization_failure`, raised by REPEATABLE READ and SERIALIZABLE) and `40P01` (`deadlock_detected`). The transaction is already aborted, so retrying only the failing statement is useless. The fix is to run the **whole** function again from `BEGIN`, with a small capped backoff.
+
+```mermaid
+flowchart TD
+    A["run the whole transaction"] --> R{"result"}
+    R -- "committed" --> OK["done"]
+    R -- "40001 or 40P01" --> T{"attempts left?"}
+    T -- "yes" --> W["wait with backoff, then run the whole transaction again"] --> A
+    T -- "no" --> F["return a wrapped error"]
+    R -- "any other error" --> E["roll back, return the error as is"]
+```
+
+Example: attempt 1 hits `40001`, waits 10 ms, attempt 2 hits `40001`, waits 20 ms, attempt 3 commits. A business error such as "out of stock" is returned at once, because running it again gives the same answer. The helper that does this is in [[Transactions and ACID - Go]].
+
+## 4. Worked example: the last unit of stock
+
+The task: InvoiceOps sells add-on products (for example, 100 printed cheque books) with a limited `stock`. Two customers try to buy the **last unit** at the same moment. Exactly one must succeed. The table has `stock int NOT NULL CHECK (stock >= 0)` as a safety net so stock can never go negative, and product 1 has `stock = 1` and `price_minor = 25000`.
+
+### The bare idea in SQL
+
+The wrong way reads, decides in the app, then writes. The right way puts the check inside the write:
 
 ```sql
 -- WRONG at READ COMMITTED: both transactions read stock = 1, both "decide" to sell
-BEGIN;
 SELECT stock FROM products WHERE id = 1;          -- both see 1
 UPDATE products SET stock = 0 WHERE id = 1;       -- both write 0: two sales, one unit
-COMMIT;
+```
 
+```sql
 -- RIGHT: the condition is evaluated on the latest committed row, under a row lock
-BEGIN;
-UPDATE products SET stock = stock - 1
-WHERE id = 1 AND stock > 0;                       -- winner: UPDATE 1, loser: UPDATE 0
--- app: if rows affected = 0 then ROLLBACK and answer "sold out"
-INSERT INTO order_lines (order_id, product_id, unit_price_minor) VALUES (88, 1, 25000);
-COMMIT;
+UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock > 0;
+-- winner: UPDATE 1, loser: UPDATE 0, so ROLLBACK and answer "sold out"
 ```
 
 ### Why the naive version oversells
@@ -191,6 +306,17 @@ sequenceDiagram
     DB-->>B: lock granted, UPDATE 1
     B->>DB: COMMIT
     Note over A,B: two orders, one unit: oversold
+```
+
+### Why the conditional UPDATE is safe
+
+The key PostgreSQL behaviour: at READ COMMITTED, when an `UPDATE` waits for another transaction's row lock and that transaction commits, PostgreSQL re-evaluates the `WHERE` clause against the **newly committed** row version before updating it. That re-check is what makes the conditional `UPDATE` safe.
+
+```mermaid
+sequenceDiagram
+    participant A as Txn A (customer 1)
+    participant DB as products id=1
+    participant B as Txn B (customer 2)
     Note over A,B: Conditional UPDATE (READ COMMITTED)
     A->>DB: UPDATE SET stock = stock - 1 WHERE stock > 0
     DB-->>A: UPDATE 1 (row lock held)
@@ -199,8 +325,6 @@ sequenceDiagram
     DB-->>B: re-checks WHERE on new version: stock > 0 is false, UPDATE 0
     B->>DB: ROLLBACK, return "sold out"
 ```
-
-The key PostgreSQL behaviour: at READ COMMITTED, when an `UPDATE` waits for another transaction's row lock and that transaction commits, PostgreSQL re-evaluates the `WHERE` clause against the **newly committed** row version before updating it. That re-check is what makes the conditional `UPDATE` safe.
 
 The `CHECK (stock >= 0)` constraint is a second safety net. Even if some code path runs `SET stock = stock - 1` without the condition, the second buyer's update would fail with `23514 check_violation` instead of storing `-1`.
 
@@ -213,272 +337,42 @@ The `CHECK (stock >= 0)` constraint is a second safety net. Even if some code pa
 | Unique constraint | `UNIQUE (event_id, seat_no)` on a `tickets` table, then `INSERT` | `23505 unique_violation` | Each unit has an identity (seat 14B, invoice number) |
 | SERIALIZABLE + retry | Naive read-then-write, run at `ISOLATION LEVEL SERIALIZABLE` | `40001 serialization_failure`; retry, then reads 0 | Complex invariants across many rows that are hard to express as one statement |
 
+```mermaid
+flowchart TD
+    Q["Two buyers, one unit. How do I protect it?"] --> Q1{"Does one statement express the rule?"}
+    Q1 -- "yes, a counter" --> C1["conditional UPDATE ... WHERE stock > 0"]
+    Q1 -- "no" --> Q2{"Does each unit have an identity?"}
+    Q2 -- "yes: seat 14B, invoice no." --> C2["UNIQUE constraint, INSERT, catch 23505"]
+    Q2 -- "no" --> Q3{"Is the rule across one row you can lock?"}
+    Q3 -- "yes" --> C3["SELECT ... FOR UPDATE, decide, UPDATE"]
+    Q3 -- "no, many rows" --> C4["SERIALIZABLE, retry on 40001"]
+```
+
 Locks and the choice between waiting and retrying are covered in [[Locking - Optimistic vs Pessimistic]].
 
-### The same thing in Go
-
-The repository function. It must run inside a transaction because the order line insert that follows belongs to the same unit:
-
-```go
-package txn
-
-import (
-	"context"
-	"database/sql"
-	"errors"
-)
-
-var ErrOutOfStock = errors.New("out of stock")
-
-// ReserveUnit takes one unit of stock with a conditional UPDATE.
-// The WHERE clause re-checks stock > 0 on the latest committed row,
-// so two buyers of the last unit cannot both succeed.
-func ReserveUnit(ctx context.Context, tx *sql.Tx, productID int64) error {
-	res, err := tx.ExecContext(ctx,
-		`UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0`, productID)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrOutOfStock
-	}
-	return nil
-}
-```
-
-A reusable transaction helper. It begins, runs your function, commits, rolls back on any error or panic, and retries the **whole** transaction on serialization failures (`40001`) and deadlocks (`40P01`), because those errors mean "nothing was saved, try again":
-
-```go
-package txn
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"time"
-)
-
-// Tx is the part of *sql.Tx (or pgx.Tx adapted) that the helper needs.
-type Tx interface {
-	Commit() error
-	Rollback() error
-}
-
-// sqlStater is implemented by *pgconn.PgError (pgx) and lets us read the SQLSTATE.
-type sqlStater interface{ SQLState() string }
-
-// Retryable reports whether the whole transaction may be retried safely:
-// 40001 = serialization_failure, 40P01 = deadlock_detected.
-func Retryable(err error) bool {
-	var s sqlStater
-	if errors.As(err, &s) {
-		switch s.SQLState() {
-		case "40001", "40P01":
-			return true
-		}
-	}
-	return false
-}
-
-// InTx begins a transaction, runs fn, and commits. Any error or panic rolls back.
-// Retryable failures re-run the WHOLE transaction up to attempts times with backoff.
-func InTx[T Tx](ctx context.Context, attempts int, begin func(context.Context) (T, error), fn func(T) error) error {
-	var err error
-	backoff := 10 * time.Millisecond
-	for i := 0; i < attempts; i++ {
-		if err = runOnce(ctx, begin, fn); err == nil || !Retryable(err) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-		backoff *= 2
-	}
-	return fmt.Errorf("transaction failed after %d attempts: %w", attempts, err)
-}
-
-func runOnce[T Tx](ctx context.Context, begin func(context.Context) (T, error), fn func(T) error) (err error) {
-	tx, err := begin(ctx)
-	if err != nil {
-		return err
-	}
-	// Rollback after a successful Commit is a no-op that returns an error we ignore.
-	defer func() {
-		if p := recover(); p != nil {
-			_ = tx.Rollback()
-			panic(p)
-		}
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-	if err = fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-```
-
-Calling it with `database/sql`. The `begin` function pins one pooled connection for the whole transaction:
-
-```go
-package txn
-
-import (
-	"context"
-	"database/sql"
-)
-
-// BuyOne reserves one unit and records the order line in a single transaction.
-func BuyOne(ctx context.Context, db *sql.DB, orderID, productID, priceMinor int64) error {
-	begin := func(ctx context.Context) (*sql.Tx, error) {
-		return db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	}
-	return InTx(ctx, 3, begin, func(tx *sql.Tx) error {
-		if err := ReserveUnit(ctx, tx, productID); err != nil {
-			return err // ErrOutOfStock: not retryable, rolled back, returned as is
-		}
-		_, err := tx.ExecContext(ctx,
-			`INSERT INTO order_lines (order_id, product_id, unit_price_minor) VALUES ($1, $2, $3)`,
-			orderID, productID, priceMinor)
-		return err
-	})
-}
-```
-
-Three Go rules this code follows:
-
-- **`defer` rollback.** Every exit path (early `return`, error, panic) ends the transaction. The plain idiom without a helper is `tx, err := db.BeginTx(ctx, nil)`, then `defer tx.Rollback()`, then `return tx.Commit()`; after a successful commit the deferred `Rollback` returns `sql.ErrTxDone`, which is harmless.
-- **Pass `tx`, not `db`.** Every statement that belongs to the unit must go through the same `*sql.Tx`. A repository method that quietly uses `db` runs outside the transaction. How to structure this across repositories is the subject of [[Transactions and the Repository Pattern]].
-- **The context controls the transaction.** If `ctx` is cancelled before commit, `database/sql` rolls the transaction back.
-
-The tests run against a fake transaction, so they need no database:
-
-```go
-package txn
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"testing"
-)
-
-type pgErr struct{ code string }
-
-func (e *pgErr) Error() string    { return "pg error " + e.code }
-func (e *pgErr) SQLState() string { return e.code }
-
-type fakeTx struct{ committed, rolledBack bool }
-
-func (f *fakeTx) Commit() error   { f.committed = true; return nil }
-func (f *fakeTx) Rollback() error { f.rolledBack = true; return nil }
-
-func TestRetryable(t *testing.T) {
-	cases := map[string]struct {
-		err  error
-		want bool
-	}{
-		"serialization": {&pgErr{"40001"}, true},
-		"deadlock":      {fmt.Errorf("wrapped: %w", &pgErr{"40P01"}), true},
-		"unique":        {&pgErr{"23505"}, false},
-		"plain":         {errors.New("boom"), false},
-	}
-	for name, c := range cases {
-		if got := Retryable(c.err); got != c.want {
-			t.Errorf("%s: got %v want %v", name, got, c.want)
-		}
-	}
-}
-
-func TestInTxCommitsOnSuccess(t *testing.T) {
-	var tx *fakeTx
-	begin := func(context.Context) (*fakeTx, error) { tx = &fakeTx{}; return tx, nil }
-	if err := InTx(context.Background(), 3, begin, func(*fakeTx) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if !tx.committed || tx.rolledBack {
-		t.Fatalf("want commit only, got %+v", tx)
-	}
-}
-
-func TestInTxRollsBackOnError(t *testing.T) {
-	var tx *fakeTx
-	begin := func(context.Context) (*fakeTx, error) { tx = &fakeTx{}; return tx, nil }
-	want := errors.New("out of stock")
-	err := InTx(context.Background(), 3, begin, func(*fakeTx) error { return want })
-	if !errors.Is(err, want) || tx.committed || !tx.rolledBack {
-		t.Fatalf("err=%v tx=%+v", err, tx)
-	}
-}
-
-func TestInTxRetriesWholeTransaction(t *testing.T) {
-	var begins int
-	begin := func(context.Context) (*fakeTx, error) { begins++; return &fakeTx{}, nil }
-	err := InTx(context.Background(), 3, begin, func(*fakeTx) error {
-		if begins < 3 {
-			return &pgErr{"40001"}
-		}
-		return nil
-	})
-	if err != nil || begins != 3 {
-		t.Fatalf("err=%v begins=%d", err, begins)
-	}
-}
-
-func TestInTxGivesUp(t *testing.T) {
-	begin := func(context.Context) (*fakeTx, error) { return &fakeTx{}, nil }
-	err := InTx(context.Background(), 2, begin, func(*fakeTx) error { return &pgErr{"40P01"} })
-	if !Retryable(err) {
-		t.Fatalf("want wrapped retryable error, got %v", err)
-	}
-}
-
-func TestInTxRollsBackOnPanic(t *testing.T) {
-	tx := &fakeTx{}
-	begin := func(context.Context) (*fakeTx, error) { return tx, nil }
-	defer func() {
-		if recover() == nil || !tx.rolledBack {
-			t.Fatalf("want panic re-raised after rollback, tx=%+v", tx)
-		}
-	}()
-	_ = InTx(context.Background(), 1, begin, func(*fakeTx) error { panic("bug") })
-}
-```
-
-All six tests pass under `go test -race` with Go 1.24.4 (measured in a scratch module). The pgx v5 driver also ships `pgx.BeginFunc`, which handles commit and rollback the same way but does not retry.
+Runnable Go version: [[Transactions and ACID - Go]]
 
 ### Choosing the boundary: the payment webhook
 
-The rule: **one transaction per business fact that must be all-or-nothing, and nothing slow inside it.**
+The rule: **one transaction per business fact that must be all-or-nothing, and nothing slow inside it.** The webhook transaction does four things, in this order:
 
-```sql
-BEGIN;
--- 1. dedupe: a redelivered webhook hits the unique key and inserts nothing
-INSERT INTO webhook_events (provider, provider_event_id, received_at)
-VALUES ('razorpay', 'evt_9KQ2', now())
-ON CONFLICT (provider, provider_event_id) DO NOTHING;
--- app: if 0 rows inserted, ROLLBACK and return 200 (already processed)
+| Step | Statement | Why it is inside the transaction |
+| --- | --- | --- |
+| 1. Dedupe | `INSERT INTO webhook_events … ON CONFLICT (provider, provider_event_id) DO NOTHING`; if 0 rows inserted, `ROLLBACK` and return 200 | A redelivered webhook hits the unique key and inserts nothing |
+| 2. Record the payment | `INSERT INTO payments (invoice_id, workspace_id, amount_minor, provider_ref)` with 50000 | Must exist exactly when step 3 happened |
+| 3. Update the invoice | `UPDATE invoices SET paid_minor = paid_minor + 50000, status = CASE … END` | `CHECK (paid_minor <= total_minor)` guards overpayment |
+| 4. Audit | `INSERT INTO audit_log …` | The audit row must exist exactly when the payment does |
 
--- 2. record the payment
-INSERT INTO payments (invoice_id, workspace_id, amount_minor, provider_ref)
-VALUES (501, 7, 50000, 'pay_77A');
+The full SQL is in [[Transactions and ACID - Go]].
 
--- 3. update the invoice; the CHECK (paid_minor <= total_minor) guards overpayment
-UPDATE invoices
-SET paid_minor = paid_minor + 50000,
-    status = CASE WHEN paid_minor + 50000 = total_minor THEN 'paid' ELSE status END
-WHERE id = 501 AND workspace_id = 7;
-
--- 4. audit
-INSERT INTO audit_log (workspace_id, entity, entity_id, action) VALUES (7, 'invoice', 501, 'payment_applied');
-COMMIT;
+```mermaid
+flowchart LR
+    W["webhook arrives"] --> TX
+    subgraph TX["one transaction: BEGIN ... COMMIT"]
+        D["1 dedupe insert"] --> P["2 insert payment"] --> U["3 update invoice"] --> AU["4 audit row"] --> OB["5 outbox row: send email"]
+    end
+    TX -- "after COMMIT" --> WK["worker reads outbox, sends email"]
+    D -. "0 rows: already processed" .-> OUT["ROLLBACK, return 200"]
 ```
 
 Sending the "payment received" email is **not** inside this transaction. An SMTP call can take seconds, the transaction would hold the invoice row lock and a pooled connection the whole time, and if the commit then failed the email would already be sent. Instead, insert an outbox row in the same transaction and let a worker send the email: see [[Transactional Outbox and CDC]]. Why the dedupe step matters is covered in [[Idempotency and Idempotency Keys]].
@@ -494,6 +388,19 @@ Sending the "payment received" email is **not** inside this transaction. An SMTP
 | Savepoints | Partial rollback inside a transaction | Optional steps, recovering from an expected error | Subtransaction overhead in PostgreSQL |
 | Saga or outbox (no ACID across services) | Eventual consistency with compensations | Work spans services or databases | Compensation logic, visible intermediate states |
 
+```mermaid
+flowchart TD
+    N["What do I need?"] --> A{"one statement?"}
+    A -- "yes" --> AC["autocommit"]
+    A -- "no" --> B{"one database?"}
+    B -- "no" --> SG["outbox + saga"]
+    B -- "yes" --> C{"reads must be one consistent snapshot?"}
+    C -- "yes" --> RR["REPEATABLE READ (read only for reports)"]
+    C -- "no" --> D{"invariant across many rows?"}
+    D -- "yes" --> SE["SERIALIZABLE + retry"]
+    D -- "no" --> RC["READ COMMITTED + conditional UPDATE"]
+```
+
 Isolation levels are explained in full in [[Isolation Levels and MVCC]]. Cross-database atomicity is covered in [[Two-Phase Commit]] and [[Saga Pattern]].
 
 ## 6. Trade-offs and when not to use
@@ -504,6 +411,20 @@ Isolation levels are explained in full in [[Isolation Levels and MVCC]]. Cross-d
 - **Large batch jobs should commit in chunks.** Updating 50 million rows in one transaction holds locks for the whole run, bloats the table, and a failure at 99% loses everything. Commit every few thousand rows and make the job resumable.
 - **Transactions do not span services.** A `*sql.Tx` covers one connection to one database. Two services, or PostgreSQL plus Kafka, need the outbox pattern or a saga.
 - **Higher isolation is not free.** SERIALIZABLE avoids whole classes of bugs but turns contention into retries. Use it where the invariant is hard to express in one statement, not everywhere.
+
+```mermaid
+flowchart LR
+    subgraph short["short transaction: 5 ms"]
+        S1["lock row"] --> S2["write"] --> S3["commit, lock freed"]
+    end
+    subgraph long["transaction wrapping an HTTP call: 3 s"]
+        L1["lock row"] --> L2["wait for remote service"] --> L3["commit, lock freed"]
+    end
+    short --> T1["about 200 requests per second can use this row"]
+    long --> T2["about 0.3 requests per second can use this row"]
+```
+
+The throughput figures are arithmetic (1 / lock time), not benchmarks: a row locked for 5 ms allows at most about 200 writers per second, a row locked for 3 s allows about one every 3 s.
 
 ## 7. In production
 
@@ -520,6 +441,26 @@ Isolation levels are explained in full in [[Isolation Levels and MVCC]]. Cross-d
 	- `pg_stat_database.xact_rollback` relative to `xact_commit`, and `deadlocks`.
 	- Application metrics for `40001` and `40P01` retries.
 
+```mermaid
+flowchart TD
+    M["alert: idle in transaction older than 30 s"] --> Q["SELECT pid, now() - xact_start, query FROM pg_stat_activity WHERE state = 'idle in transaction'"]
+    Q --> C{"who holds it?"}
+    C -- "app bug: HTTP call or missing commit" --> F1["fix the code path, add idle_in_transaction_session_timeout"]
+    C -- "crashed client, connection still open" --> F2["pg_terminate_backend(pid), then fix timeouts"]
+```
+
+## Whiteboard version
+
+If you have two minutes at a whiteboard, draw this:
+
+```text
+BEGIN --> stmt --> stmt --> COMMIT   (all visible, durable)
+                      \--> ROLLBACK  (none visible)
+A: aborted row versions are invisible    D: WAL fsync before COMMIT returns
+C: constraints + your invariants         I: snapshot + row locks, level-dependent
+Oversell fix: UPDATE ... WHERE stock > 0, check rows affected
+```
+
 ## 8. Deep dive
 
 - **Commit latency is an `fsync`.** With the default `synchronous_commit = on`, each commit waits for its WAL flush. On local NVMe with power-loss protection that is typically well under a millisecond; on network-attached cloud volumes it is often around 1–5 ms (estimates; measure your disk with `pg_test_fsync`). PostgreSQL batches concurrent commits into one flush (**group commit**); `commit_delay` can widen that window.
@@ -529,6 +470,18 @@ Isolation levels are explained in full in [[Isolation Levels and MVCC]]. Cross-d
 - **Subtransactions.** Each `SAVEPOINT` (and each PL/pgSQL `EXCEPTION` block) creates a subtransaction. PostgreSQL caches up to 64 subtransaction IDs per backend; beyond that, visibility checks must consult `pg_subtrans` and throughput can collapse under concurrency. Avoid loops that create a savepoint per row.
 - **Transaction ID wraparound.** PostgreSQL transaction IDs are 32-bit. VACUUM must "freeze" old rows before IDs wrap around; a transaction left open for days blocks this. See [[Isolation Levels and MVCC]].
 - **Read-only transactions still matter.** `BEGIN READ ONLY` (Go: `TxOptions{ReadOnly: true}`) documents intent, lets a REPEATABLE READ export see one snapshot across many queries, and with `SERIALIZABLE READ ONLY DEFERRABLE` runs without any risk of serialization failure.
+
+```mermaid
+flowchart LR
+    subgraph fast["synchronous_commit = on"]
+        F1["commit record written"] --> F2["fsync 1-5 ms (estimate)"] --> F3["ack to client"]
+    end
+    subgraph async["synchronous_commit = off"]
+        A1["commit record written"] --> A2["ack to client at once"]
+        A1 -.-> A3["WAL writer flushes within about 600 ms"]
+    end
+    A3 -.-> L["crash before the flush: last commits lost, database not corrupted"]
+```
 
 ## 9. Interview questions
 
@@ -569,6 +522,7 @@ Isolation levels are explained in full in [[Isolation Levels and MVCC]]. Cross-d
 
 ## Links
 
+- **Implementation:** [[Transactions and ACID - Go]]
 - **Before this:** [[SQL Essentials]], [[Relational Schema Design]]
 - **Next:** [[Isolation Levels and MVCC]], [[Locking - Optimistic vs Pessimistic]], [[Transactions and the Repository Pattern]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Compare with:** [[Transactional Outbox and CDC]] and [[Saga Pattern]] (consistency across services without ACID), [[Two-Phase Commit]] (atomic commit across databases)

@@ -3,7 +3,7 @@ tags: [databases, performance, query-planning, postgresql, mysql]
 level: intermediate
 status: reviewed
 prereqs: ["[[SQL Essentials]]", "[[Indexing Fundamentals]]"]
-related: ["[[Index Types and Index Design]]", "[[N+1 Query Problem]]", "[[Debugging Database Performance]]", "[[Pagination, Filtering and Sorting]]", "[[Connection Pooling]]", "[[Isolation Levels and MVCC]]", "[[Storage Engines - B-tree vs LSM and WAL]]"]
+related: ["[[Index Types and Index Design]]", "[[N+1 Query Problem]]", "[[Debugging Database Performance]]", "[[Pagination, Filtering and Sorting]]", "[[Connection Pooling]]", "[[Isolation Levels and MVCC]]", "[[Storage Engines - B-tree vs LSM and WAL]]", "[[Query Plans and EXPLAIN - Go]]"]
 sources:
   - "PostgreSQL 17 docs, Using EXPLAIN (EXPLAIN Basics, EXPLAIN ANALYZE, Caveats)"
   - "PostgreSQL 17 docs, EXPLAIN command (ANALYZE, BUFFERS, SERIALIZE, MEMORY, FORMAT JSON options)"
@@ -13,7 +13,7 @@ sources:
   - "PostgreSQL 17 docs, pg_stat_statements and auto_explain modules; log_min_duration_statement"
   - "PostgreSQL 18 release notes (BUFFERS included by default with EXPLAIN ANALYZE)"
   - "MySQL 8.0 Reference Manual, EXPLAIN Output Format; EXPLAIN ANALYZE (8.0.18) and FORMAT=TREE (8.0.16)"
-updated: 2026-11-03
+updated: 2026-11-07
 ---
 
 # Query Plans and EXPLAIN
@@ -90,6 +90,17 @@ SELECT attname, n_distinct, most_common_vals, most_common_freqs
  WHERE tablename = 'invoices' AND attname IN ('status', 'workspace_id');
 ```
 
+```mermaid
+flowchart LR
+    C1["status = 'overdue'"] --> M["look up 'overdue' in most_common_vals<br/>frequency 0.04"]
+    C2["workspace_id = 42"] --> D["not a common value:<br/>1 / n_distinct"]
+    M --> MUL["multiply selectivities<br/>(assumes the columns are independent)"]
+    D --> MUL
+    MUL --> E["estimated rows =<br/>table rows x combined selectivity"]
+```
+
+**Example with numbers.** `status = 'overdue'` has frequency 0.04 in `most_common_freqs`, so on 1,200,000 rows the estimate is 1,200,000 x 0.04 = 48,000 rows. Add a second condition with selectivity 0.01 and the combined estimate becomes 48,000 x 0.01 = 480 rows. If the two columns are really correlated, the true number can be far from 480; that is the cause of Plan 3 below.
+
 ### 3.3 The cost model
 
 **Cost** is an abstract unit, not milliseconds. By default one sequential 8 kB page read costs `seq_page_cost = 1.0`, a random page read `random_page_cost = 4.0`, processing one row `cpu_tuple_cost = 0.01`, one index entry `cpu_index_tuple_cost = 0.005`, and one operator such as `=` `cpu_operator_cost = 0.0025`.
@@ -97,6 +108,21 @@ SELECT attname, n_distinct, most_common_vals, most_common_freqs
 Worked: a sequential scan of `invoices` (30,000 pages, 1,200,000 rows) with two `=` conditions costs
 30,000 × 1.0 + 1,200,000 × 0.01 + 1,200,000 × 2 × 0.0025 = 30,000 + 12,000 + 6,000 = **48,000**.
 An index scan pays 4.0 per heap page it touches but touches few pages; the planner compares the totals. On SSDs many teams lower `random_page_cost` to about 1.1 so index scans are not over-priced; treat that as a tuning choice to measure, not a rule.
+
+```mermaid
+flowchart TB
+    subgraph SEQ["Seq Scan candidate"]
+        S1["30,000 pages x 1.0 = 30,000"] --> ST["+ 12,000 + 6,000 = 48,000"]
+        S2["1,200,000 rows x 0.01 = 12,000"] --> ST
+        S3["1,200,000 rows x 2 operators x 0.0025 = 6,000"] --> ST
+    end
+    subgraph IDX["Index Scan candidate"]
+        I1["few index pages x 1.0"] --> IT["total depends on rows matched"]
+        I2["each heap page touched x 4.0 (random)"] --> IT
+    end
+    ST --> CMP{"cheaper estimated total wins"}
+    IT --> CMP
+```
 
 ### 3.4 Reading a plan
 
@@ -256,6 +282,17 @@ Execution Time: 415.882 ms
 
 The planner expected **12** invoices and got **48,211**, about 4,000 times more. Where 12 came from: the statistics were gathered before workspace 77 imported its history, so `workspace_id = 77` was estimated at 1 in ~1,000 workspaces (1,200 rows), and `currency = 'INR'` at 1% of rows. Multiplying, as if the columns were independent, gives 1,200 × 0.01 = 12. In reality workspace 77 is a large Indian customer, so every one of its invoices is INR.
 
+```mermaid
+flowchart LR
+    subgraph EST["What the planner believed (stale statistics)"]
+        E1["workspace 77: 1 in about 1,000 workspaces<br/>= 1,200 rows"] --> E2["currency = 'INR': 1%"] --> E3["1,200 x 0.01 = 12 rows"] --> E4["Nested Loop: 12 index probes into clients"]
+    end
+    subgraph REAL["What happened"]
+        R1["workspace 77 imported its history"] --> R2["every invoice is INR"] --> R3["48,211 rows"] --> R4["48,211 probes, 192,790 buffer hits"]
+    end
+    E3 -.->|"about 4,000 times too small"| R3
+```
+
 For 12 outer rows, a nested loop with 12 primary-key lookups is the best plan. For 48,211 it means 48,211 separate index probes (192,790 buffer hits on `clients` alone). Two fixes, one per wrong guess:
 
 ```sql
@@ -287,122 +324,25 @@ Execution Time: 61.207 ms
 
 Estimate 47,900 vs actual 48,211: within 1%. The planner now reads the table pages in order through a bitmap and joins with one hash table. `Batches: 1` means the hash fit in `work_mem`.
 
-### Finding misestimates in Go
+### Finding misestimates mechanically
 
-For large plans, scanning by eye is error prone. `EXPLAIN (ANALYZE, FORMAT JSON)` returns the same tree as JSON, and a small helper can flag every node whose estimate is off by 10× or more. Both sides are compared per loop, as PostgreSQL reports them.
+For large plans, scanning by eye is error prone. `EXPLAIN (ANALYZE, FORMAT JSON)` returns the same tree as JSON, and a small program can walk it and flag every node whose estimate is off by 10x or more. Both sides are compared per loop, exactly as PostgreSQL reports them, and a value of 0 is treated as 1 to avoid dividing by zero. The factor is `max(planned / actual, actual / planned)`, so over- and under-estimates count the same.
 
-```go
-package plans
-
-import (
-	"encoding/json"
-	"fmt"
-)
-
-// Node is the part of one EXPLAIN (ANALYZE, FORMAT JSON) plan node we need.
-type Node struct {
-	NodeType     string  `json:"Node Type"`
-	RelationName string  `json:"Relation Name"`
-	PlanRows     float64 `json:"Plan Rows"`
-	ActualRows   float64 `json:"Actual Rows"`  // average per loop
-	ActualLoops  float64 `json:"Actual Loops"`
-	Plans        []Node  `json:"Plans"`
-}
-
-// Finding is one node whose row estimate was off by at least the factor.
-type Finding struct {
-	Node   string
-	Plan   float64
-	Actual float64
-	Factor float64 // >= 1, how many times off in either direction
-}
-
-func (f Finding) String() string {
-	return fmt.Sprintf("%s: planned %.0f rows, got %.0f (%.0fx off)", f.Node, f.Plan, f.Actual, f.Factor)
-}
-
-// Misestimates walks the plan and returns nodes whose estimate and actual
-// row counts differ by at least minFactor. Both sides are per loop, as
-// PostgreSQL reports them; a 0 is treated as 1 to avoid dividing by zero.
-func Misestimates(explainJSON []byte, minFactor float64) ([]Finding, error) {
-	var doc []struct {
-		Plan Node `json:"Plan"`
-	}
-	if err := json.Unmarshal(explainJSON, &doc); err != nil {
-		return nil, err
-	}
-	if len(doc) == 0 {
-		return nil, fmt.Errorf("empty EXPLAIN output")
-	}
-	var out []Finding
-	var walk func(n Node)
-	walk = func(n Node) {
-		p, a := max(n.PlanRows, 1), max(n.ActualRows, 1)
-		f := max(p/a, a/p)
-		if f >= minFactor {
-			name := n.NodeType
-			if n.RelationName != "" {
-				name += " on " + n.RelationName
-			}
-			out = append(out, Finding{Node: name, Plan: n.PlanRows, Actual: n.ActualRows, Factor: f})
-		}
-		for _, c := range n.Plans {
-			walk(c)
-		}
-	}
-	walk(doc[0].Plan)
-	return out, nil
-}
+```mermaid
+flowchart TD
+    NL["Nested Loop<br/>planned 12, actual 48,211<br/>factor about 4,018: FLAGGED"] --> A["Index Scan on invoices<br/>planned 12, actual 48,211<br/>factor about 4,018: FLAGGED"]
+    NL --> B["Index Scan on clients<br/>planned 1, actual 1 per loop, loops 48,211<br/>factor 1: not flagged"]
 ```
 
-```go
-package plans
+The helper correctly ignores the `clients` lookup (1 planned, 1 actual per loop), even though it ran 48,211 times: the misestimate lives in the outer node, which is where the fix belongs. The test cases cover the three behaviours:
 
-import "testing"
+| Case | Input | Result |
+| --- | --- | --- |
+| Join plan above, threshold 10 | planned 12 vs actual 48,211 on two nodes | 2 findings, the invoices node with factor of at least 4,000 |
+| Underestimate and zero | planned 5,000, actual 0 | 1 finding with factor 5,000 |
+| Bad input | empty array `[]`, truncated JSON | an error in both cases |
 
-// Trimmed from representative output (PostgreSQL 17), FORMAT JSON.
-const sample = `[{"Plan": {
-  "Node Type": "Nested Loop", "Plan Rows": 12, "Actual Rows": 48211, "Actual Loops": 1,
-  "Plans": [
-    {"Node Type": "Index Scan", "Relation Name": "invoices",
-     "Plan Rows": 12, "Actual Rows": 48211, "Actual Loops": 1},
-    {"Node Type": "Index Scan", "Relation Name": "clients",
-     "Plan Rows": 1, "Actual Rows": 1, "Actual Loops": 48211}
-  ]}}]`
-
-func TestMisestimates(t *testing.T) {
-	got, err := Misestimates([]byte(sample), 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("want 2 findings, got %v", got)
-	}
-	if got[1].Node != "Index Scan on invoices" || got[1].Factor < 4000 {
-		t.Fatalf("unexpected finding %v", got[1])
-	}
-}
-
-func TestUnderestimateAndZero(t *testing.T) {
-	js := `[{"Plan": {"Node Type": "Seq Scan", "Relation Name": "payments",
-	  "Plan Rows": 5000, "Actual Rows": 0, "Actual Loops": 1}}]`
-	got, err := Misestimates([]byte(js), 10)
-	if err != nil || len(got) != 1 || got[0].Factor != 5000 {
-		t.Fatalf("got %v, %v", got, err)
-	}
-}
-
-func TestBadInput(t *testing.T) {
-	if _, err := Misestimates([]byte(`[]`), 10); err == nil {
-		t.Fatal("want error for empty output")
-	}
-	if _, err := Misestimates([]byte(`{`), 10); err == nil {
-		t.Fatal("want JSON error")
-	}
-}
-```
-
-Measured: `go vet` is clean and `go test -race` passes with Go 1.24.4. The helper correctly ignores the `clients` lookup (1 planned, 1 actual per loop), even though it ran 48,211 times: the misestimate lives in the outer node, which is where the fix belongs.
+Runnable Go version: [[Query Plans and EXPLAIN - Go]]
 
 ## 5. Variants and comparison
 
@@ -413,6 +353,27 @@ Measured: `go vet` is clean and `go test -race` passes with Go 1.24.4. The helpe
 | Nested Loop | for each outer row, probe the inner side (ideally by index) | outer side small (tens to low thousands); inner indexed on the join key | inner work × outer rows; catastrophic if the outer is underestimated |
 | Hash Join | build a hash table on the smaller input, stream the larger one | large inputs, equality join, no useful order | memory up to `work_mem` × `hash_mem_multiplier` (2.0 by default) before spilling into batches |
 | Merge Join | walk two sorted inputs in step | both inputs already sorted (indexes) or very large; also supports some range joins | needs sorted input; adding two big sorts often loses to a hash join |
+
+```mermaid
+sequenceDiagram
+    participant O as Outer rows
+    participant I as Inner side
+    Note over O,I: Nested Loop
+    loop for each outer row
+        O->>I: probe by join key (index lookup)
+        I-->>O: matching rows
+    end
+    Note over O,I: Hash Join
+    I->>I: build hash table from the smaller input (all of it first)
+    loop for each row of the larger input
+        O->>I: hash the key, look in the table
+        I-->>O: matches
+    end
+    Note over O,I: Merge Join
+    O->>I: advance both sorted inputs in step, emit equal keys
+```
+
+**Example with numbers.** In Plan 3, the nested loop performs 48,211 probes (one per outer row) and takes 415.9 ms, while the hash join builds one hash table of 40,210 client rows in about 10 ms and finishes the whole query in 61.2 ms.
 
 ### Tools for seeing plans
 
@@ -464,6 +425,18 @@ Sort by `total_exec_time`, not `mean_exec_time`: a 2 ms query called 5 million t
 	- `Index Only Scan` with `Heap Fetches` close to the row count → the visibility map is stale; tune autovacuum on that table.
 - **What to monitor:** top-10 `pg_stat_statements` by total time, week over week; `temp_blks_written` (spills); `auto_explain` logs over a threshold such as 500 ms; `n_mod_since_analyze` in `pg_stat_user_tables` for tables whose statistics are going stale. The step-by-step incident workflow lives in [[Debugging Database Performance]].
 
+
+```mermaid
+stateDiagram-v2
+    [*] --> Prepared: PREPARE or driver prepares the statement
+    Prepared --> Custom: executions 1 to 5, planned with the real parameter values
+    Custom --> Compare: after five executions
+    Compare --> Generic: generic plan is not costlier than the average custom plan
+    Compare --> Custom: generic plan looks worse
+    Generic --> Custom: plan_cache_mode = force_custom_plan
+```
+
+With skewed data the generic plan is priced for the average parameter value, so it can suit most tenants and hurt the biggest one.
 The decision path for one slow query:
 
 ```mermaid
@@ -536,3 +509,4 @@ flowchart TD
 - **Before this:** [[SQL Essentials]], [[Indexing Fundamentals]]
 - **Next:** [[Index Types and Index Design]], [[Debugging Database Performance]], [[Locking - Optimistic vs Pessimistic]]
 - **Compare with:** [[N+1 Query Problem]], [[Pagination, Filtering and Sorting]], [[Connection Pooling]]
+- **Go implementation:** [[Query Plans and EXPLAIN - Go]]

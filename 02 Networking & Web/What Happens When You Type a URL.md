@@ -3,7 +3,7 @@ tags: [networking, http, capstone]
 level: intermediate
 status: reviewed
 prereqs: ["[[DNS - Resolution, Records and Caching]]", "[[TCP - Handshake, Reliability, Flow and Congestion Control]]", "[[TLS and HTTPS]]", "[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]", "[[HTTP Caching - Cache-Control, ETag, Conditional Requests]]"]
-related: ["[[Network Debugging Toolkit - dig, curl, ss, tcpdump]]", "[[How Browsers Load and Render a Page]]", "[[CDN and Edge]]", "[[Forward and Reverse Proxies - L4 vs L7]]", "[[Load Balancing]]", "[[Connection Pooling]]"]
+related: ["[[Network Debugging Toolkit - dig, curl, ss, tcpdump]]", "[[How Browsers Load and Render a Page]]", "[[CDN and Edge]]", "[[Forward and Reverse Proxies - L4 vs L7]]", "[[Load Balancing]]", "[[Connection Pooling]]", "[[What Happens When You Type a URL - Go]]"]
 sources:
   - "RFC 1035, Domain Names - Implementation and Specification"
   - "RFC 9293, Transmission Control Protocol (TCP)"
@@ -11,7 +11,7 @@ sources:
   - "RFC 9114, HTTP/3"
   - "RFC 9111, HTTP Caching"
   - "curl(1) and dig(1) manuals"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # What Happens When You Type a URL
@@ -42,13 +42,18 @@ flowchart LR
     I --> H --> G --> F --> E2[HTTP response] --> J[Render]
 ```
 
-Every box after this is one of those nine steps, with its own note; this note's job is only the order, the timing, and the handoffs between them.
+Every box after this is one of those nine steps, with its own explanation below; this note's job is only the order, the timing, and the handoffs between them.
 
 ## 1. Why it exists
 
-A single page load for a shopping cart touches a browser cache, a DNS resolver, a CDN, a reverse proxy, an application server and a database — six systems owned by different teams or companies. Nobody designed "load a URL" as one system; it works because each layer has a narrow contract with the one above and below it (DNS resolves a name to an address and nothing else; TCP delivers bytes reliably and nothing else; TLS adds confidentiality and nothing else). Understanding the full chain is what separates "the page is slow" from "the TLS handshake to the origin is adding 180 ms because the CDN cache is missing" — the second sentence names the box to fix.
+A single page load for a shopping cart touches a browser cache, a DNS resolver, a CDN, a reverse proxy, an application server and a database — six systems owned by different teams or companies. Nobody designed "load a URL" as one system; it works because each layer has a narrow contract with the one above and below it (DNS resolves a name to an address and nothing else; TCP delivers bytes reliably and nothing else; TLS adds confidentiality and nothing else).
 
-**Concrete scenario.** A user in Mumbai requests `https://shop.example.com/cart` for the first time this session (cold browser cache, cold TLS session, cold CDN edge cache for this exact URL since it's personalized). The origin's app servers and primary database sit in `us-east-1`, 220 ms round-trip away. A CDN with an edge PoP in Mumbai fronts the origin.
+Understanding the full chain is what separates "the page is slow" from "the TLS handshake to the origin is adding 180 ms because the CDN cache is missing" — the second sentence names the box to fix.
+
+**Concrete scenario, used throughout this note.** A user in Mumbai requests `https://shop.example.com/cart` for the first time this session (cold browser cache, cold TLS session, cold CDN edge cache for this exact URL since it's personalized). The origin's app servers and primary database sit in `us-east-1`, 220 ms round-trip away. A CDN with an edge PoP in Mumbai fronts the origin.
+
+> [!tip] Remember
+> Each layer's narrow contract is what lets six independently-owned systems cooperate without ever agreeing on a shared design — DNS, TCP, TLS, the CDN, the proxy and the app each only need to keep their own one promise.
 
 ## 2. Mental model
 
@@ -60,254 +65,214 @@ Think of the browser as a customer calling a company's switchboard:
 5. The customer states their request to whoever answers first — often a local branch office that already has the answer memorized (**CDN edge**, cache hit) — and only if the branch doesn't know, it is forwarded to the switchboard operator (**reverse proxy**) who connects the right department (**application server**), who looks something up in the company's filing system (**database**) before answering.
 6. The reply travels back the same chain, and only then does the customer act on it (**render**).
 
+**Picture it:**
+
+```mermaid
+flowchart LR
+    A["You (customer)"] --> B["Check your notebook (browser + DNS cache)"]
+    B -->|not written down| C["Call directory assistance (DNS resolution)"]
+    C --> D["Dial and wait for pickup (TCP handshake)"]
+    D --> E["Agree on a secret code word (TLS handshake)"]
+    E --> F["Local branch office (CDN edge)"]
+    F -->|"branch doesn't know"| G["Switchboard operator (reverse proxy)"]
+    G --> H["Right department (app server)"]
+    H --> I["Filing cabinet (database)"]
+```
+
 Every "look it up first" step in that list is a cache; every "ring and pick up" step is a handshake that costs a round trip.
+
+**Where the analogy breaks down:** a phone call is one continuous conversation once connected. The real chain is not one conversation — it's several separate request/response pairs (DNS is its own exchange, the TLS handshake is its own exchange, the HTTP request is yet another), each of which can independently be skipped if its own cache already holds the answer. The switchboard picture is useful for ordering, not for "it's all one call."
+
+> [!tip] Remember
+> If you can name which "call" in this chain is slow, you've already found the box to fix — the fix for a slow DNS call is never the same fix as a slow database call.
 
 ## 3. How it works
 
-The full request from a cold cache, with every participant and a representative timing budget for the Mumbai-to-`us-east-1`, CDN-miss scenario above:
+The full request below is the Mumbai-to-`us-east-1`, CDN-miss scenario from section 1, broken into the stages the whiteboard flowchart named. Each stage gets its own explanation; the exact round-trip costs for every stage are gathered once, in the table at the end of this section, so the numbers live in one place instead of being repeated in every diagram.
+
+### Browser cache and DNS: checking the notebook first
+
+**In plain words:** before sending anything onto the network, the browser asks itself two questions it can answer from memory: "do I already have this exact response cached?" and "do I already know this hostname's IP address?" Both checks are local, in-process lookups — no network round trip, no handshake.
+
+**Example:** `/cart` is a personalized, `Cache-Control: no-store` response, so the browser cache check is a guaranteed miss (under 1 ms to find that out). The hostname `shop.example.com` has never been looked up this session, so the DNS cache is also a miss, which sends the request to a recursive resolver, which asks the authoritative server, caches the answer for the record's TTL, and hands the IP back.
+
+```mermaid
+sequenceDiagram
+    participant Br as Browser
+    participant Res as OS/stub resolver
+    participant DNS as Recursive resolver
+    participant Auth as Authoritative DNS
+    Note over Br: HTTP cache check: miss (no-store)
+    Br->>Res: resolve shop.example.com
+    Res->>Res: OS DNS cache check: miss
+    Res->>DNS: recursive query
+    DNS->>Auth: query (resolver cache miss)
+    Auth-->>DNS: A/AAAA + TTL
+    DNS-->>Res: answer, cached for TTL
+    Res-->>Br: IP address
+```
+
+**Why it matters:** a cold DNS lookup is one of the few delays an application can't fix by writing faster code — the only lever is the record's TTL and whether the client is allowed to cache it at all (see [[DNS - Resolution, Records and Caching]]).
+
+> [!warning] Common mistake
+> Assuming the DNS answer, once received, is good for the rest of the session. It's only good until its TTL expires — a resolver that ignores a short TTL (or a client resolver with its own minimum cache floor) can serve a stale IP after the origin has moved.
+
+### TCP and TLS: two handshakes before one byte of HTTP moves
+
+**In plain words:** TCP has to confirm both sides are listening and agree on starting sequence numbers before any payload can ride on the connection — that's the three-packet SYN / SYN-ACK / ACK handshake. TLS then has to agree on an encryption key and prove the server's identity before the connection is safe to send real data over. With TLS 1.3, both sides' first messages carry enough information that the whole security handshake finishes in one more round trip, not two.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant Br as Browser
+    participant Edge as CDN edge
+    Br->>Edge: TCP SYN
+    Edge-->>Br: SYN-ACK
+    Br->>Edge: ACK
+    Note over Br,Edge: TCP handshake done: 1 RTT
+    Br->>Edge: TLS ClientHello (key_share, SNI)
+    Edge-->>Br: ServerHello, cert, Finished
+    Br->>Edge: Finished (+ first HTTP request, piggybacked)
+    Note over Br,Edge: TLS 1.3 handshake done: 1 more RTT
+```
+
+**Example:** the browser's TCP SYN reaches the nearby CDN edge in Mumbai, not the far origin — so this handshake costs roughly one *local* round trip, not one trans-Pacific round trip. The TLS 1.3 handshake that follows is the same shape: local to the edge, not to `us-east-1`.
+
+**Why it matters:** this is the entire reason a CDN edge exists at the TCP/TLS layer, not only at the caching layer — terminating the connection near the browser turns two expensive long-distance round trips into two cheap local ones.
+
+> [!tip] Remember
+> TLS 1.3 needs one round trip for its handshake because the client's very first message already carries its key share; TLS 1.2 needed two, because the key exchange and the final confirmation were two separate round trips.
+
+### CDN edge, reverse proxy, app and database: who actually answers
+
+**In plain words:** once the secure connection exists, the browser sends one HTTP request. The CDN edge checks its own cache first; only a miss (as it is here, since `/cart` is personalized) forwards the request onward, over a connection the CDN already keeps open to the origin's reverse proxy. The reverse proxy picks which application server instance should handle it, that server authenticates the session and queries the database, and the answer travels back the same chain.
+
+**Picture it:**
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Br as Browser
-    participant Res as OS/stub resolver
-    participant DNS as Recursive DNS resolver
-    participant Auth as Authoritative DNS
-    participant Edge as CDN edge (Mumbai PoP)
-    participant Proxy as Reverse proxy (origin, us-east-1)
+    participant Edge as CDN edge (Mumbai)
+    participant Proxy as Reverse proxy (us-east-1)
     participant App as App server
     participant DB as Database
-
-    Note over Br: 1. Browser cache check (under 1 ms) - HTTP cache miss for /cart (personalized, no-store)
-    Br->>Res: 2. resolve shop.example.com
-    Res->>Res: check OS DNS cache - miss
-    Res->>DNS: 3. recursive query
-    DNS->>Auth: 4. query (cache miss on resolver)
-    Auth-->>DNS: 5. A/AAAA + TTL
-    DNS-->>Res: 6. answer (cached for TTL)
-    Res-->>Br: 7. IP address
-    Note over Br,Edge: DNS total - about 28 ms cold, under 1 ms if cached
-    Br->>Edge: 8. TCP SYN
-    Edge-->>Br: 9. SYN-ACK
-    Br->>Edge: 10. ACK
-    Note over Br,Edge: TCP handshake: 1 RTT ~ 14 ms (Mumbai PoP, local)
-    Br->>Edge: 11. TLS ClientHello (key_share, SNI=shop.example.com)
-    Edge-->>Br: 12. ServerHello, EncryptedExtensions, Certificate, Finished
-    Br->>Edge: 13. Finished (+ first HTTP request, TLS 1.3 allows this in the same flight)
-    Note over Br,Edge: TLS 1.3 handshake: 1 RTT, combined with the request ~ 14 ms
-    Br->>Edge: 14. GET /cart (HTTP/2 over this connection)
-    Edge->>Edge: 15. cache lookup - MISS (Cache-Control: private, no-store on /cart)
-    Edge->>Proxy: 16. forward request (CDN already holds a warm connection to origin)
-    Note over Edge,Proxy: Edge-to-origin: 1 RTT ~ 220 ms (Mumbai to us-east-1), connection reused
-    Proxy->>Proxy: 17. TLS terminate, pick upstream (L7 routing on path + headers)
-    Proxy->>App: 18. forward request
-    App->>App: 19. authenticate session, build query
-    App->>DB: 20. SELECT cart rows for this user (pooled connection, no new handshake)
-    DB-->>App: 21. rows (index lookup, ~2 ms)
-    App-->>Proxy: 22. 200 OK + JSON body
-    Proxy-->>Edge: 23. response (edge may cache per Cache-Control - this one is private)
-    Edge-->>Br: 24. response
-    Note over Br: 25. parse HTML/JSON, build DOM/CSSOM, layout, paint (see "How Browsers Load and Render a Page")
+    Edge->>Edge: cache lookup - MISS (Cache-Control: private, no-store)
+    Edge->>Proxy: forward request over an already-open connection
+    Proxy->>Proxy: TLS terminate, pick an upstream (L7 routing)
+    Proxy->>App: forward request
+    App->>App: authenticate session, build query
+    App->>DB: SELECT cart rows (pooled connection, no new handshake)
+    DB-->>App: rows (index lookup)
+    App-->>Proxy: 200 OK + JSON body
+    Proxy-->>Edge: response (edge may cache per Cache-Control)
+    Edge-->>Br: response
 ```
 
-**Where the time actually goes** (same scenario, cumulative):
+**Example:** the edge-to-origin hop crosses the real 220 ms Mumbai-to-`us-east-1` distance, but it's only one round trip, because the CDN keeps a pool of connections to the origin already open and already TLS-handshaked (see [[Connection Pooling]]) — without that pool, this single hop would cost three round trips of its own (its own TCP + TLS handshake, on top of its own distance).
+
+**Picture it — why the warm pool matters:**
+
+```mermaid
+flowchart TB
+    subgraph cold["Without a kept-open pool"]
+        direction LR
+        c1[Edge] -->|"DNS + TCP + TLS to origin: 3 RTT at 220 ms each"| c2[Origin]
+    end
+    subgraph warm["With a kept-open pool, what CDNs actually run"]
+        direction LR
+        w1[Edge] -->|"already-open, already-TLS'd connection: 1 RTT"| w2[Origin]
+    end
+```
+
+**Why it matters:** this single design choice — the CDN keeping warm connections to the origin — is why a CDN-fronted site at real global distance still feels fast on a cache miss; without it, every miss would cost roughly four times the round trips.
+
+> [!warning] Common mistake
+> Assuming a CDN cache miss is as expensive as the browser's own DNS+TCP+TLS cost to a far origin would be. It isn't, because the CDN's connection to the origin is already warm — the miss only costs the one new round trip at the real distance, not three.
+
+### Render: the browser's own second chain of requests
+
+**In plain words:** the response arriving at the browser isn't the end of the work — the browser still has to parse it, discover everything else the page needs, fetch those things, and only then show anything. This step is itself a smaller version of the whole chain, repeated per subresource.
+
+**Picture it:**
+
+```mermaid
+sequenceDiagram
+    participant Br as Browser
+    participant Edge as CDN edge
+    Br->>Edge: GET /cart (HTML)
+    Edge-->>Br: HTML response
+    Note over Br: parses HTML, discovers CSS, JS, image and font links
+    par fetched in parallel, usually on the same warm connection
+        Br->>Edge: GET style.css
+        Br->>Edge: GET app.js
+        Br->>Edge: GET logo.png
+    end
+    Edge-->>Br: style.css
+    Edge-->>Br: app.js
+    Edge-->>Br: logo.png
+    Note over Br: builds DOM + CSSOM, computes layout, paints
+```
+
+**Why it matters:** none of these subresource fetches pay for a new DNS lookup, TCP handshake or TLS handshake if they share the page's origin and connection — the only new cost is each request's own round trip and the server's own response time, which is why HTTP/2's multiplexing (reusing one connection for many requests at once) matters so much for a typical page with dozens of subresources. The full mechanism is covered in [[How Browsers Load and Render a Page]].
+
+> [!tip] Remember
+> "The page loaded" is not one request-response pair — it's one primary request plus a second, usually-parallel chain of subresource requests, most of them riding the same already-warm connection.
+
+### Where the time actually goes
+
+All the numeric costs named above, gathered in one place for the same cold-cache, Mumbai-to-`us-east-1` scenario:
 
 | Phase | Typical cold-cache cost | Why |
 | --- | --- | --- |
 | Browser cache check | <1 ms | In-process memory/disk lookup |
 | DNS resolution | 20–120 ms cold, <1 ms warm | 1–2 round trips to a resolver; cached for the record's TTL |
-| TCP handshake | 1 RTT (local to the nearest server: often 10–40 ms) | SYN, SYN-ACK, ACK before any data |
-| TLS 1.3 handshake | 1 RTT, combined with the TCP RTT's last leg and often piggybacked with the first request | Key exchange + certificate; 0-RTT is possible on a resumed session but replayable, see [[TLS and HTTPS]] |
-| Edge-to-origin (CDN miss) | 1 RTT at the real distance (Mumbai↔us-east-1: ~220 ms) | Only paid on a cache miss; the CDN keeps a warm pool of connections to the origin so this is 1 RTT, not 3 |
+| TCP handshake | 1 RTT to the nearest server (CDN edge): often 10–40 ms | SYN, SYN-ACK, ACK before any data |
+| TLS 1.3 handshake | 1 RTT, combined with the last leg of the TCP RTT and often piggybacked with the first request | Key exchange + certificate; 0-RTT is possible on a resumed session but replayable, see [[TLS and HTTPS]] |
+| Edge-to-origin (CDN miss) | 1 RTT at the real distance (Mumbai↔us-east-1: ~220 ms) | Only paid on a cache miss; the CDN's warm pool makes this 1 RTT, not 3 |
 | App + DB | Single digit to tens of ms | Indexed query, pooled DB connection — see [[Connection Pooling]], [[Query Plans and EXPLAIN]] |
-| Render | Tens to hundreds of ms | Parsing, layout, paint — see [[How Browsers Load and Render a Page]] |
+| Render | Tens to hundreds of ms | Parsing, layout, paint, plus the subresource chain above — see [[How Browsers Load and Render a Page]] |
 
 A **warm** repeat visit (DNS cached, TCP+TLS connection kept alive, CDN cache hit) collapses this to one HTTP round trip to the nearest edge: often under 50 ms end to end.
 
+> [!tip] Remember
+> Every row in this table is skippable by some form of caching or connection reuse except the app/DB row — that's the one phase that genuinely has to run on every single request.
+
 ## 4. Worked example
 
-### Measuring the phases with Go's `net/http/httptrace`
+### A real `curl` timing breakdown
 
-`net/http/httptrace` exposes exactly the callbacks the sequence diagram's boxes need: DNS, connect, TLS, and time-to-first-byte. This is the same mechanism `curl -w` and browser DevTools' "waterfall" panel are built on.
+The same four phases the sequence diagrams above show — DNS, TCP connect, TLS, time to first byte — are exactly what `curl -w` exposes on a live request, and exactly what browser DevTools' "waterfall" panel is built on.
 
-```go
-// Package urltrace breaks a single HTTP request down into the phases from
-// "What Happens When You Type a URL": DNS lookup, TCP connect, TLS handshake,
-// time to first byte, and total time. It uses net/http/httptrace, the same
-// mechanism curl -w and browser devtools "waterfall" panels build on.
-package urltrace
+**Measured** (`curl 8.x`, 2026-11-06, a live HTTPS request to a public site over this machine's network; absolute numbers depend on the network path, but the ordering and the "warm connection skips connect+tls" relationship always hold):
 
-import (
-	"crypto/tls"
-	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptrace"
-	"time"
-)
-
-// Timings holds the duration of each phase. A phase is zero when the
-// transport skipped it (for example DNSLookup is 0 when connecting to a
-// literal IP, and TLSHandshake is 0 for a plain http:// URL).
-type Timings struct {
-	DNSLookup    time.Duration
-	Connect      time.Duration
-	TLSHandshake time.Duration
-	TTFB         time.Duration // time to first response byte, measured from request start
-	Total        time.Duration
-}
-
-// Do performs req and returns the phase breakdown alongside the response
-// status. The caller is responsible for closing the body it no longer needs;
-// Do drains and closes it after measuring TTFB so the connection can be reused.
-func Do(client *http.Client, req *http.Request) (Timings, int, error) {
-	var t Timings
-	var start, dnsStart, connectStart, tlsStart time.Time
-
-	trace := &httptrace.ClientTrace{
-		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
-		DNSDone: func(httptrace.DNSDoneInfo) {
-			if !dnsStart.IsZero() {
-				t.DNSLookup = time.Since(dnsStart)
-			}
-		},
-		ConnectStart: func(string, string) { connectStart = time.Now() },
-		ConnectDone: func(network, addr string, err error) {
-			if err == nil && !connectStart.IsZero() {
-				t.Connect = time.Since(connectStart)
-			}
-		},
-		TLSHandshakeStart: func() { tlsStart = time.Now() },
-		TLSHandshakeDone: func(tls.ConnectionState, error) {
-			if !tlsStart.IsZero() {
-				t.TLSHandshake = time.Since(tlsStart)
-			}
-		},
-		GotFirstResponseByte: func() {
-			t.TTFB = time.Since(start)
-		},
-	}
-
-	start = time.Now()
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return t, 0, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Drain the body so GotFirstResponseByte already fired and the
-	// connection returns to the pool; the body content itself doesn't
-	// matter for timing.
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return t, resp.StatusCode, fmt.Errorf("read body: %w", err)
-	}
-	t.Total = time.Since(start)
-	return t, resp.StatusCode, nil
-}
+```bash
+curl -s -o /dev/null -w \
+  "dns:%{time_namelookup}s connect:%{time_connect}s tls:%{time_appconnect}s ttfb:%{time_starttransfer}s total:%{time_total}s\n" \
+  https://example.com
 ```
 
-Tests that prove the parts of the mental model that are easy to get wrong — that a plain `http://` URL pays nothing for TLS, and that a second request on a kept-alive connection skips both connect and TLS entirely:
-
-```go
-package urltrace
-
-import (
-	"net/http"
-	"net/http/httptest"
-	"testing"
-	"time"
-)
-
-// TestDoHTTPS exercises the full phase set (connect + TLS handshake + TTFB)
-// against a local TLS test server, and checks the phases are internally
-// consistent: nothing takes longer than the total request.
-func TestDoHTTPS(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(5 * time.Millisecond) // simulate server think time so TTFB is non-trivial
-		w.Write([]byte("ok"))
-	}))
-	defer srv.Close()
-
-	client := srv.Client()
-	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-
-	timings, status, err := Do(client, req)
-	if err != nil {
-		t.Fatalf("Do: %v", err)
-	}
-	if status != http.StatusOK {
-		t.Fatalf("status = %d, want 200", status)
-	}
-	if timings.DNSLookup != 0 {
-		t.Errorf("DNSLookup = %v, want 0 for a literal-IP test server", timings.DNSLookup)
-	}
-	if timings.Connect <= 0 {
-		t.Errorf("Connect = %v, want > 0", timings.Connect)
-	}
-	if timings.TLSHandshake <= 0 {
-		t.Errorf("TLSHandshake = %v, want > 0 for an https:// server", timings.TLSHandshake)
-	}
-	if timings.TTFB < 5*time.Millisecond {
-		t.Errorf("TTFB = %v, want >= 5ms (the handler's sleep)", timings.TTFB)
-	}
-	if timings.Total < timings.TTFB {
-		t.Errorf("Total (%v) < TTFB (%v): total must cover every phase", timings.Total, timings.TTFB)
-	}
-}
-
-// TestDoReusesConnection checks that a second request on a keep-alive
-// connection skips Connect and TLSHandshake, which is exactly why a warm
-// connection makes the second request in a browser waterfall so much faster.
-func TestDoReusesConnection(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	}))
-	defer srv.Close()
-	client := srv.Client()
-
-	req1, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
-	if _, _, err := Do(client, req1); err != nil {
-		t.Fatalf("first request: %v", err)
-	}
-
-	req2, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
-	timings, _, err := Do(client, req2)
-	if err != nil {
-		t.Fatalf("second request: %v", err)
-	}
-	if timings.Connect != 0 || timings.TLSHandshake != 0 {
-		t.Errorf("reused connection still paid Connect=%v TLSHandshake=%v, want both 0", timings.Connect, timings.TLSHandshake)
-	}
-}
+```text
+dns:0.002563s connect:0.003054s tls:0.180100s ttfb:0.231865s total:0.232011s
 ```
 
-**Measured** (Go 1.24.4, darwin/arm64, 2026-11-06, `go test -run TestDo -v` against the `httptest` servers above):
+Read it as cumulative, not per-phase: DNS finished at 2.6 ms, the TCP handshake finished at 3.1 ms (so TCP itself took ~0.5 ms here, a nearby server), the TLS handshake finished at 180.1 ms (so TLS alone cost ~177 ms — the one long round trip in this path), and the first response byte arrived 51.8 ms after that.
+
+### Tracing the same four phases in Go
+
+The same breakdown can be measured from inside an application instead of from the command line, using `net/http/httptrace` — the mechanism both `curl -w` and the browser's own waterfall panel are built on. A Go package built around it confirms two things a learner should predict before running anything: a plain `http://` URL pays nothing for TLS, and a second request on a kept-alive connection skips both connect and TLS entirely.
+
+**Measured** (Go 1.24.4, darwin/arm64, `go test -race -run TestDo -v`, 2026-11-06):
 
 ```text
 === RUN   TestDoHTTPS
 --- PASS: TestDoHTTPS (0.01s)
 === RUN   TestDoReusesConnection
---- PASS: TestDoReusesConnection (0.01s)
+--- PASS: TestDoReusesConnection (0.00s)
 PASS
 ```
 
-### A real `curl` timing breakdown
-
-**Measured** (`curl 8.x`, 2026-11-06, a live HTTPS request to a public site over this machine's network; absolute numbers depend on the network path, but the ordering and the "warm connection skips connect+tls" relationship always hold):
-
-```bash
-$ curl -s -o /dev/null -w \
-  "dns:%{time_namelookup}s connect:%{time_connect}s tls:%{time_appconnect}s ttfb:%{time_starttransfer}s total:%{time_total}s\n" \
-  https://example.com
-dns:0.002563s connect:0.003054s tls:0.180100s ttfb:0.231865s total:0.232011s
-```
-
-Read it as cumulative, not per-phase: DNS finished at 2.6 ms, the TCP handshake finished at 3.1 ms (so TCP itself took ~0.5 ms here, a nearby server), the TLS handshake finished at 180.1 ms (so TLS alone cost ~177 ms — the one long round trip in this path), and the first response byte arrived 51.8 ms after that.
+Runnable Go version: [[What Happens When You Type a URL - Go]].
 
 ## 5. Variants and comparison
 
@@ -327,6 +292,9 @@ Read it as cumulative, not per-phase: DNS finished at 2.6 ms, the TCP handshake 
 - Keeping connections warm (HTTP keep-alive, TLS session resumption) trades server-side memory and open file descriptors for lower latency; an application server under a connection-count limit may need to reduce keep-alive timeouts instead of maximizing them.
 - 0-RTT TLS resumption removes a round trip but allows the first flight of application data to be replayed by an attacker who captured it; use it only for idempotent requests (see [[TLS and HTTPS]]).
 
+> [!tip] Remember
+> Every trade-off in this chain has the same shape: something is cached or kept warm to save a round trip, at the cost of memory, staleness risk, or (for 0-RTT) a real security trade-off.
+
 ## 7. In production
 
 - **Real systems:** this exact chain is what `example.com`, `shop.*` SaaS storefronts, and any CDN-fronted web app (Cloudflare, Akamai, Fastly, CloudFront in front of an origin) do for every page view. Browser DevTools' Network tab and WebPageTest draw this chain as a waterfall per request.
@@ -339,11 +307,25 @@ Read it as cumulative, not per-phase: DNS finished at 2.6 ms, the TCP handshake 
 
 ## 8. Deep dive
 
-- **Why TCP+TLS cost "2 round trips" and not 3.** TLS 1.3's client sends its key share in the very first flight (the `ClientHello`), so the server can reply with everything needed to finish the handshake in its one response; the client's `Finished` message can carry the first HTTP request piggybacked on it. The practical cost is 1 RTT for TCP and 1 RTT for TLS, and the first HTTP bytes move in the third flight — never 3 full round trips the way TLS 1.2 needed.
+- **Why TCP+TLS cost "2 round trips" and not 3.** TLS 1.3's client sends its key share in the very first flight (the `ClientHello`), so the server can reply with everything needed to finish the handshake in its one response; the client's `Finished` message can carry the first HTTP request piggybacked on it. TLS 1.2 needed its own separate `ClientKeyExchange`/`Finished` round trip on top of the `ClientHello`/`ServerHello` exchange, which is the round trip TLS 1.3 removes.
+
+  ```mermaid
+  flowchart TB
+      subgraph tls12["TLS 1.2 on top of TCP: 3 round trips before data"]
+          direction LR
+          a1["RTT 1: TCP SYN / SYN-ACK / ACK"] --> a2["RTT 2: ClientHello to ServerHello + cert"] --> a3["RTT 3: ClientKeyExchange, Finished, then first HTTP byte"]
+      end
+      subgraph tls13["TLS 1.3 on top of TCP: 2 round trips before data"]
+          direction LR
+          b1["RTT 1: TCP SYN / SYN-ACK / ACK"] --> b2["RTT 2: ClientHello with key share, to ServerHello + cert + Finished, then client Finished + first HTTP byte piggybacked"]
+      end
+  ```
+
+  **Why it matters:** the practical cost is 1 RTT for TCP and 1 RTT for TLS, and the first HTTP bytes move in the third flight — never 3 full round trips the way TLS 1.2 needed.
 - **Why the CDN hop to origin is cheap even at 220 ms distance.** The CDN keeps a pool of already-established, already-TLS-handshaked connections to the origin (see [[Connection Pooling]]). A browser paying for DNS+TCP+TLS to the edge, plus the edge forwarding over an already-warm connection, is cheaper than the browser doing DNS+TCP+TLS directly to the far origin.
 - **Where the application and database time actually goes.** A well-indexed point lookup (by primary key or a covering index) costs low single-digit milliseconds; an unindexed scan or an N+1 pattern of many small queries can dominate the entire request — see [[Query Plans and EXPLAIN]] and [[N+1 Query Problem]].
 - **What "render" hides.** The browser doesn't wait for the whole response before starting work: it streams-parses HTML, discovers subresources (CSS, JS, images, fonts) and fires new requests for each, builds the DOM and CSSOM, computes layout, and paints — a second request-response chain per subresource, each going through some or all of the same phases (often on the same warm connection via HTTP/2 multiplexing). The mechanism is covered in full in [[How Browsers Load and Render a Page]].
-- **Load balancing is invisible here on purpose.** Both the CDN's and the reverse proxy's "pick an upstream" step is a load-balancing decision; the algorithms (round robin, least connections, consistent hashing) live in [[Load Balancing]], and this note only shows that the decision happens, at step 17.
+- **Load balancing is invisible here on purpose.** Both the CDN's and the reverse proxy's "pick an upstream" step is a load-balancing decision; the algorithms (round robin, least connections, consistent hashing) live in [[Load Balancing]], and this note only shows that the decision happens.
 
 ## 9. Interview questions
 
@@ -374,7 +356,7 @@ Read it as cumulative, not per-phase: DNS finished at 2.6 ms, the TCP handshake 
 - Cold path costs: DNS (1–2 RTT), TCP (1 RTT), TLS 1.3 (1 RTT, piggybacked with the first request) — all skippable on a warm connection.
 - A CDN cache hit never reaches the origin; a miss adds exactly one more RTT at the real edge-to-origin distance, because the CDN keeps warm pooled connections to origin.
 - TLS 1.3 0-RTT trades a round trip for replay risk; only use it for idempotent requests.
-- `curl -w` and `net/http/httptrace` expose the same four phases this note's diagram shows: DNS, connect, TLS, TTFB.
+- `curl -w` and `net/http/httptrace` expose the same four phases this note's diagrams show: DNS, connect, TLS, TTFB.
 - When TTFB is high but DNS/TCP/TLS are fast, the problem is at the origin (proxy, app, or DB), not the network path.
 - Render is itself a second chain of request/response cycles for subresources, usually multiplexed over one warm connection.
 
@@ -384,3 +366,4 @@ Read it as cumulative, not per-phase: DNS finished at 2.6 ms, the TCP handshake 
 - **Next:** [[Network Debugging Toolkit - dig, curl, ss, tcpdump]], [[How Browsers Load and Render a Page]]
 - **Compare with:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[CDN and Edge]], [[Forward and Reverse Proxies - L4 vs L7]], [[Nginx]], [[Load Balancing]], [[Connection Pooling]], [[Query Plans and EXPLAIN]]
 - **Also in this folder:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]], [[IP Addressing, Subnets, NAT and VPC Basics]], [[UDP and QUIC]]
+- **Code:** [[What Happens When You Type a URL - Go]]

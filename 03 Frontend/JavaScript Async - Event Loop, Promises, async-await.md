@@ -87,6 +87,28 @@ console.log("5: sync end");
 
 All synchronous code (1, 5) runs first because the stack must empty before anything else is considered. Then every microtask (3, 4) runs, in the order they were queued, before the engine even looks at the macrotask queue. Only then does the `setTimeout` callback (2) run — even though it was scheduled with a 0 ms delay, which means "as soon as possible", not "immediately".
 
+**Picture the same trace as a timeline**, watching what sits in each queue at each moment:
+
+```mermaid
+sequenceDiagram
+    participant Stack as Call stack
+    participant MQ as Microtask queue
+    participant MacroQ as Macrotask queue
+
+    Stack->>Stack: run "1: sync start"
+    Stack->>MacroQ: queue setTimeout callback (2)
+    Stack->>MQ: queue .then callback (3)
+    Stack->>MQ: queue queueMicrotask callback (4)
+    Stack->>Stack: run "5: sync end"
+    Note over Stack: stack now empty
+    Stack->>MQ: drain ALL microtasks: run 3, then 4
+    Note over MQ: microtask queue empty
+    Stack->>MacroQ: take ONE macrotask: run 2
+```
+
+> [!tip] Remember
+> The stack always empties, then the microtask queue always empties completely, and only then does exactly one macrotask run — this is a strict order, never a race.
+
 ### Promise states
 
 ```mermaid
@@ -188,6 +210,23 @@ async function parallel(ids) {
 | `sequential` (await in a `for` loop) | 304 ms | each `delay` only starts after the previous one resolves |
 | `parallel` (`Promise.all`) | 101 ms | all three timers start together; `await` just waits for the slowest |
 
+**Picture it** — the same three 100 ms calls, laid out on a timeline:
+
+```mermaid
+gantt
+    title "sequential (await in a loop) vs parallel (Promise.all)"
+    dateFormat  X
+    axisFormat %s
+    section sequential
+    "call 1, 100ms"   :a1, 0, 100
+    "call 2, 100ms"   :a2, 100, 200
+    "call 3, 100ms"   :a3, 200, 300
+    section parallel
+    "call 1, 100ms"   :b1, 0, 100
+    "call 2, 100ms"   :b2, 0, 100
+    "call 3, 100ms"   :b3, 0, 100
+```
+
 Use the sequential form only when each step genuinely depends on the previous one's result (e.g. paginating until a cursor is empty). When the calls are independent, start them all and await together.
 
 ### Unhandled rejections
@@ -239,6 +278,26 @@ risky(); // no .catch and no await: this becomes an unhandled rejection
 - **Top-level await.** Since ES2022 (Node 14.8+ with ES modules, and natively in module `<script type="module">`), `await` is legal at the top level of a module, not only inside an `async function`. This lets a module block its own evaluation until a dependency resolves, which also means importers wait for it.
 - **`for await...of`** iterates an async iterable (e.g. a streaming response body or `ReadableStream`), awaiting each chunk in turn — appropriate here because each chunk genuinely depends on the stream's current position.
 - **Cancellation.** Promises have no built-in cancel; `AbortController`/`AbortSignal` is the standard pattern — pass `signal` to `fetch`, call `controller.abort()`, and the fetch's Promise rejects with an `AbortError`.
+
+  **Picture it:**
+
+  ```mermaid
+  sequenceDiagram
+      participant App as Your code
+      participant Ctl as AbortController
+      participant Fetch as fetch Promise
+      participant Net as Network
+
+      App->>Ctl: new AbortController()
+      App->>Fetch: fetch(url, { signal: ctl.signal })
+      Fetch->>Net: request sent
+      App->>Ctl: controller.abort() (e.g. user navigates away)
+      Ctl-->>Fetch: signal fires "abort"
+      Fetch-->>App: Promise rejects with AbortError
+      Note over Net: in-flight request is torn down,<br/>its eventual response is ignored
+  ```
+
+  A stale-response race (an older request's result overwriting a newer one) is exactly the failure mode this prevents: abort the old controller right before starting a new request for the same data, and the old Promise's `.catch` discards the result instead of racing it against the new one.
 - **Compare with Go.** A goroutine is pre-emptible and can run on a different OS thread; the event loop model here is cooperative and single-threaded — a long synchronous loop (e.g. sorting a huge array) blocks everything, including timer callbacks, until it returns control to the stack. There's no event-loop equivalent of Go's scheduler moving work across cores.
 
 ## 9. Interview questions

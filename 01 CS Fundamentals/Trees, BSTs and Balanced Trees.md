@@ -8,7 +8,7 @@ sources:
   - "Cormen, Leiserson, Rivest, Stein, Introduction to Algorithms (3rd ed.), ch. 12–13, 18"
   - "PostgreSQL 17 docs, Index Types (B-tree)"
   - "Linux kernel documentation, rbtree.rst"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Trees, BSTs and Balanced Trees
@@ -24,26 +24,22 @@ updated: 2026-11-06
 
 ## 1. Why it exists
 
-Say you need to store a million user records and repeatedly ask "is user ID 482913 present?", "give me the next ID after 482913", and "insert ID 619000". A plain sorted array answers the first two in `O(log n)` with binary search, but an insert in the middle shifts up to half a million elements — `O(n)`. A linked list inserts in `O(1)` once you have a pointer to the spot, but finding that spot takes `O(n)`, and there's no way to binary search a linked list because you can't jump to its middle.
+Picture a service that stores a million user records and repeatedly has to answer three kinds of question: "is user ID 482913 present?", "give me the next ID after 482913", and "insert ID 619000." Each existing structure you might reach for falls short in its own way.
 
-A BST gives you both: `O(log n)` search **and** `O(log n)` insert/delete, as long as its height stays close to `log n`. That "as long as" is the whole story of this note — a BST's worst case is as bad as the linked list's, and most of what makes balanced trees worth learning is how they prevent that worst case.
+A plain sorted array answers the first two questions in `O(log n)` with binary search — fast. But an insert in the middle shifts up to half a million elements, costing `O(n)` — the array has to make room by physically moving everything after the insertion point. A linked list inserts in `O(1)` once you already have a pointer to the right spot, but *finding* that spot takes `O(n)`, because you cannot jump to a linked list's middle the way you can jump to an array's middle index.
+
+A **binary search tree** is the structure that gives you both: `O(log n)` search *and* `O(log n)` insert/delete — as long as its height stays close to `log n`. That "as long as" is the whole story of this note: a BST's worst case is as bad as the linked list's, and most of what makes balanced trees worth learning is how they prevent that worst case from happening.
+
+> [!tip] Remember
+> A BST is the structure that tries to give you binary search's speed and a linked list's cheap inserts at the same time — but only while its shape stays balanced.
 
 ## 2. Mental model
 
-Picture a BST as a game of "guess the number, higher or lower": at the root, if your target is smaller, go left; if larger, go right; repeat at each node you land on. Each step eliminates one whole subtree from consideration — exactly like binary search, except the "array" is a chain of pointers instead of contiguous memory, so you can insert and delete by just relinking pointers instead of shifting elements.
+### Guess-the-number, with pointers instead of an array
 
-## 3. How it works
+**In plain words:** A BST is like playing "guess the number, higher or lower": at the root, if your target is smaller, go left; if larger, go right; repeat at each node you land on. Each step eliminates one whole subtree from consideration — exactly like binary search over a sorted array.
 
-### Terms
-
-- **Depth** of a node: the number of edges from the root to it.
-- **Height** of a node: the number of edges on the longest path from it down to a leaf. A single node has height 0; an empty tree has height -1 by convention.
-- **Degree**: the number of children a node has. In a binary tree, degree is at most 2.
-- **Subtree**: a node together with all its descendants.
-
-### BST property and operations
-
-Every node's key is greater than every key in its left subtree and less than every key in its right subtree.
+**Picture it:**
 
 ```mermaid
 flowchart TD
@@ -55,11 +51,37 @@ flowchart TD
     N70 --> N80(("80"))
 ```
 
-**Search(key)**: start at the root; if `key` equals the node's key, done; if smaller, recurse left; if larger, recurse right; if you reach a nil child, the key isn't present. Cost: `O(h)` where `h` is the tree's height.
+**Example:** Searching for `40` in this tree: start at `50` (40 < 50, go left), land on `30` (40 > 30, go right), land on `40` — found it in 3 steps, not 7 (the tree's total size).
 
-**Insert(key)**: search for where `key` would be, and attach it as a new leaf there. Cost: `O(h)`.
+**Why it matters:** The "array" here is a chain of pointers instead of contiguous memory, so you can insert and delete by just relinking pointers instead of shifting elements — that's the entire reason a BST exists instead of just always using a sorted array.
 
-**Delete(key)**: find the node. Three cases:
+> [!warning] Common mistake
+> Assuming any binary tree with numbers in it is a BST. The BST property is strict: *every* node in a left subtree must be smaller than the node above it, and *every* node in a right subtree must be larger — not just the immediate children. A tree can look locally sorted at every parent-child pair and still violate this globally (see the "validate BST" problem in the Deep dive).
+
+## 3. How it works
+
+### Terms, defined before they're used
+
+- **Depth** of a node: the number of edges from the root to it.
+- **Height** of a node: the number of edges on the longest path from it down to a leaf. A single node has height 0; an empty tree has height -1 by convention.
+- **Degree**: the number of children a node has. In a binary tree, degree is at most 2.
+- **Subtree**: a node together with all its descendants.
+
+> [!tip] Remember
+> Depth counts down from the root; height counts up from the leaves. A root's depth is always 0; a leaf's height is always 0.
+
+### The BST property and its three operations
+
+**In plain words:** Every node's key is greater than every key in its left subtree and less than every key in its right subtree. This one rule is what makes "go left or right" always lead you to the right place.
+
+**Picture it:** (the tree above already shows the property: every value under `30` is < 30; every value under `70` is > 70)
+
+**Example — Search(key):** start at the root; if `key` equals the node's key, done; if smaller, recurse left; if larger, recurse right; if you reach a nil child, the key isn't present. Cost: `O(h)` where `h` is the tree's height.
+
+**Example — Insert(key):** search for where `key` would be, and attach it as a new leaf there. Cost: `O(h)`.
+
+**Example — Delete(key):** find the node, then handle one of three cases:
+
 1. **Leaf** — just remove it.
 2. **One child** — splice the child up into the deleted node's place.
 3. **Two children** — replace the node's key with its **in-order successor** (the smallest key in its right subtree, found by walking left from the right child until there's no more left), then delete that successor node (which has at most one child, so it falls into case 1 or 2).
@@ -82,7 +104,9 @@ flowchart LR
     before -.-> after
 ```
 
-### Traversals
+**Why it matters:** The two-children case is the only tricky one, and it is tricky for a reason worth internalizing: you cannot just delete a node with two subtrees hanging off it without first finding *some* replacement that preserves the BST property everywhere. The in-order successor is guaranteed to be larger than everything in the left subtree and smaller than everything remaining in the right subtree — the only candidate that fits perfectly.
+
+### Traversals: four ways to walk the same tree
 
 | Order | Visit sequence | Used for |
 |---|---|---|
@@ -91,15 +115,29 @@ flowchart LR
 | Post-order | left, right, node | Deleting/freeing a tree (children always freed before parent) |
 | Level-order | breadth-first, using a queue | Printing a tree by level; finding the shallowest match |
 
-### Degenerate case
+> [!tip] Remember
+> If you need sorted output, use in-order. If you need to rebuild the tree from scratch (serialize/clone), use pre-order — the parent always arrives before its children. If you need to tear the tree down safely, use post-order — children go first.
 
-Insert keys `1, 2, 3, 4, 5` in that order into a BST with no rebalancing: each new key is larger than everything before it, so it always becomes the right child of the previous one. The result is a straight chain — a linked list wearing a tree's clothing — with height `n - 1` instead of `log₂ n`. Search, insert and delete all degrade to `O(n)`.
+### The degenerate case: when a tree is secretly a linked list
+
+**In plain words:** If you insert keys in already-sorted order, with no rebalancing, every new key is larger than everything before it — so it always becomes the right child of the previous node. The "tree" is now a straight chain.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    N1(("1")) --> N2(("2")) --> N3(("3")) --> N4(("4")) --> N5(("5"))
+```
+
+**Example:** Insert `1, 2, 3, 4, 5` in that order into a BST with no rebalancing. The result has height `4` (= `n - 1`), not `⌊log₂5⌋ = 2`. Search, insert and delete all degrade from `O(log n)` to `O(n)`.
+
+**Why it matters:** This is not a rare edge case to shrug off — sorted or near-sorted input is common in practice (timestamps, auto-incrementing IDs, already-sorted log files), and it is the exact failure mode every balanced tree in this note exists to prevent.
 
 ## 4. Worked example
 
 ### Whiteboard version
 
-The bare mechanism: recursive insert and search, no balancing.
+The bare mechanism, no balancing: recursive insert and search.
 
 ```go
 type Node struct {
@@ -120,180 +158,30 @@ func Insert(n *Node, key int) *Node {
 }
 ```
 
-The full version below adds search, delete (all three cases), height, four traversals, and the rotations balanced trees build on — tested on Go 1.24.
+### Tracing an insert, delete, and height check by hand
 
-```go
-package bst
+1. Start from an empty tree. Insert `50, 30, 70, 20, 40, 60, 80` in that order — each insert recurses left or right until it finds a nil spot, exactly as the whiteboard version above does. The result is the balanced 7-node tree shown in section 3.
+2. Delete `20` (a leaf): its parent `30` simply loses that child. No successor search needed.
+3. Delete `30` (one child, `40`): `40` is spliced directly into `30`'s old place. No successor search needed.
+4. Delete `50` (two children): find the in-order successor by walking left from `70` — there's no left child of `70`, so `70` itself is the successor. Copy `70`'s key into the root's position, then delete the original `70` node (which now has one child, `60`, falling into case 2).
+5. Compute `Height` on the result: it should be `2` for the balanced 7-node shape above, versus `4` for the degenerate 5-node chain from the sorted-insert example — the same `Height` function, run on two different shapes, produces numbers that make the difference concrete rather than theoretical.
 
-type Node struct {
-	Key         int
-	Left, Right *Node
-}
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Tree as BST (root)
 
-// Insert adds key and returns the (possibly new) root. O(h).
-func Insert(n *Node, key int) *Node {
-	if n == nil {
-		return &Node{Key: key}
-	}
-	if key < n.Key {
-		n.Left = Insert(n.Left, key)
-	} else if key > n.Key {
-		n.Right = Insert(n.Right, key)
-	}
-	return n
-}
-
-// Search reports whether key exists. O(h).
-func Search(n *Node, key int) bool {
-	for n != nil {
-		switch {
-		case key == n.Key:
-			return true
-		case key < n.Key:
-			n = n.Left
-		default:
-			n = n.Right
-		}
-	}
-	return false
-}
-
-func min(n *Node) *Node {
-	for n.Left != nil {
-		n = n.Left
-	}
-	return n
-}
-
-// Delete removes key and returns the (possibly new) root. O(h).
-func Delete(n *Node, key int) *Node {
-	if n == nil {
-		return nil
-	}
-	switch {
-	case key < n.Key:
-		n.Left = Delete(n.Left, key)
-	case key > n.Key:
-		n.Right = Delete(n.Right, key)
-	default:
-		if n.Left == nil {
-			return n.Right
-		}
-		if n.Right == nil {
-			return n.Left
-		}
-		succ := min(n.Right)
-		n.Key = succ.Key
-		n.Right = Delete(n.Right, succ.Key)
-	}
-	return n
-}
-
-// Height: -1 for an empty tree, 0 for a single node.
-func Height(n *Node) int {
-	if n == nil {
-		return -1
-	}
-	lh, rh := Height(n.Left), Height(n.Right)
-	if lh > rh {
-		return lh + 1
-	}
-	return rh + 1
-}
-
-func InOrder(n *Node, visit func(int)) {
-	if n == nil {
-		return
-	}
-	InOrder(n.Left, visit)
-	visit(n.Key)
-	InOrder(n.Right, visit)
-}
-
-func PreOrder(n *Node, visit func(int)) {
-	if n == nil {
-		return
-	}
-	visit(n.Key)
-	PreOrder(n.Left, visit)
-	PreOrder(n.Right, visit)
-}
-
-func PostOrder(n *Node, visit func(int)) {
-	if n == nil {
-		return
-	}
-	PostOrder(n.Left, visit)
-	PostOrder(n.Right, visit)
-	visit(n.Key)
-}
-
-func LevelOrder(root *Node, visit func(int)) {
-	if root == nil {
-		return
-	}
-	queue := []*Node{root}
-	for len(queue) > 0 {
-		n := queue[0]
-		queue = queue[1:]
-		visit(n.Key)
-		if n.Left != nil {
-			queue = append(queue, n.Left)
-		}
-		if n.Right != nil {
-			queue = append(queue, n.Right)
-		}
-	}
-}
-
-// rotateLeft: the single rotation AVL and red-black trees use to fix a
-// right-heavy subtree. Preserves the BST property.
-func rotateLeft(n *Node) *Node {
-	r := n.Right
-	n.Right = r.Left
-	r.Left = n
-	return r
-}
-
-func rotateRight(n *Node) *Node {
-	l := n.Left
-	n.Left = l.Right
-	l.Right = n
-	return l
-}
+    Caller->>Tree: Delete(20)  -- leaf
+    Tree-->>Caller: 30 loses its left child
+    Caller->>Tree: Delete(30)  -- one child
+    Tree-->>Caller: 40 spliced into 30's spot
+    Caller->>Tree: Delete(50)  -- two children
+    Tree->>Tree: find in-order successor (70)
+    Tree->>Tree: copy 70's key into root, delete original 70 node
+    Tree-->>Caller: root is now 60
 ```
 
-The test proving delete handles all three cases correctly, and that height differs sharply between a balanced tree and a degenerate chain:
-
-```go
-func TestDeleteLeafOneChildTwoChildren(t *testing.T) {
-	root := buildTree([]int{50, 30, 70, 20, 40, 60, 80})
-
-	root = Delete(root, 20) // leaf
-	root = Delete(root, 30) // one child (40 is spliced up)
-	root = Delete(root, 50) // two children: replaced by successor 60
-
-	var got []int
-	InOrder(root, func(k int) { got = append(got, k) })
-	want := []int{40, 60, 70, 80}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("InOrder after deletes = %v; want %v", got, want)
-	}
-}
-
-func TestHeightDegenerateVsBalanced(t *testing.T) {
-	balanced := buildTree([]int{50, 30, 70, 20, 40, 60, 80})
-	if h := Height(balanced); h != 2 {
-		t.Fatalf("Height(balanced 7-node tree) = %d; want 2", h)
-	}
-	degenerate := buildTree([]int{1, 2, 3, 4, 5}) // sorted input, no rebalancing
-	if h := Height(degenerate); h != 4 {
-		t.Fatalf("Height(degenerate 5-node chain) = %d; want 4", h)
-	}
-}
-```
-
-**Measured** (Go 1.24.4, `go test -race`): the 7-node balanced tree above has height 2 (`⌊log₂7⌋ = 2`); inserting the same 5 keys in sorted order instead produces height 4 — a chain, confirming the degenerate case is real, not theoretical.
+Runnable Go version: [[Trees, BSTs and Balanced Trees - Go]]
 
 ## 5. Variants and comparison
 
@@ -305,6 +193,34 @@ func TestHeightDegenerateVsBalanced(t *testing.T) {
 | **B-tree / B+tree** | Each node holds many keys (high fan-out) instead of just one, so the tree stays shallow even with billions of keys | O(log_b n), b in the hundreds | On-disk data: one node = one disk page, so height directly bounds the number of disk reads — see [[Storage Engines - B-tree vs LSM and WAL]] |
 | Heap (as a tree) | Only a weaker ordering (parent ≤ children, not left < node < right) | O(log n) | You only ever need the min/max, not arbitrary search — see [[Heaps and Priority Queues]] |
 | Trie | Branches by key *prefix*, not by comparison | O(key length) | Keys share structure (strings, routes, IPs) — see [[Tries, Suffix Trees and Suffix Arrays]] |
+
+### AVL vs. red-black, side by side
+
+**In plain words:** Both keep height at `O(log n)` always, but they enforce that guarantee with different strictness, which shows up directly in how many rotations each does.
+
+**Picture it:**
+
+```mermaid
+flowchart TB
+    subgraph AVL["AVL: strict balance factor"]
+        direction TB
+        A1["Insert/delete breaks the invariant\n|height(left) - height(right)| <= 1"]
+        A2["Rotate — possibly a cascade\nback up toward the root"]
+        A3["Tightest possible height:\nfastest lookups"]
+        A1 --> A2 --> A3
+    end
+    subgraph RB["Red-black: looser color invariant"]
+        direction TB
+        B1["Insert/delete may break\nthe black-height / red-parent rules"]
+        B2["Rotate + recolor —\ntypically a constant number of rotations"]
+        B3["Looser height bound\n(up to 2x shortest path):\nfewer rotations per write"]
+        B1 --> B2 --> B3
+    end
+```
+
+**Example:** Inserting a run of ascending keys into an AVL tree can trigger a rotation that itself unbalances an ancestor, requiring another rotation on the way back up to the root — a cascade. The same insert sequence into a red-black tree typically needs only a constant number of rotations (often one or two), because its invariant tolerates more imbalance before requiring a fix.
+
+**Why it matters:** This single difference is why general-purpose libraries overwhelmingly default to red-black trees: most real workloads mix reads and writes, and red-black's cheaper writes usually outweigh AVL's slightly faster reads.
 
 > [!warning] Interview trap
 > "Heap" and "BST" are both trees, but a heap is **not** a BST: a heap only guarantees a parent is ≤ (or ≥) its children, not that left < node < right. You cannot do an ordered in-order traversal of a heap and expect sorted output.
@@ -331,7 +247,21 @@ func TestHeightDegenerateVsBalanced(t *testing.T) {
 	- A tree's rotations under heavy concurrent writes serialize all writers → batch writes, or move to a structure built for concurrent access (e.g., a B-tree variant with latch-crabbing, as in production database engines).
 - **What to monitor:** tree height (or a cheap proxy like node count vs. log of node count) if you maintain one yourself; for a database, index bloat and the planner's chosen scan type for the query patterns you actually run.
 
-## 8. Deep dive
+## 8. Whiteboard version
+
+The three-case delete, drawn as a decision you'd make at a whiteboard:
+
+```mermaid
+flowchart TD
+    Start["Delete(key): find the node"] --> Q1{"Children?"}
+    Q1 -- "none (leaf)" --> C1["Remove it directly"]
+    Q1 -- "one" --> C2["Splice the single child\ninto its place"]
+    Q1 -- "two" --> C3["Find in-order successor\n(min of right subtree)"]
+    C3 --> C4["Copy successor's key\ninto this node"]
+    C4 --> C5["Delete the successor node\n(falls into leaf or one-child case)"]
+```
+
+## 9. Deep dive
 
 ### AVL vs. red-black, precisely
 
@@ -349,9 +279,13 @@ Go's designers chose to ship `map` (a hash table) rather than an ordered tree in
 
 ### Classic practice problems
 
-**Maximum depth** (the height of the tree plus one, computed with the same recursion as `Height` above); **validate BST** (recurse with an inherited `(min, max)` range, not just a check against immediate children); **lowest common ancestor** (for a BST specifically: walk down from the root, branching left or right by comparing both target keys to the current node — the first node where the targets split to different sides, or match the node itself, is the LCA, O(h)); **serialize/deserialize a binary tree** (pre-order traversal with explicit null markers reconstructs the exact shape); **kth smallest in a BST** (in-order traversal, stopping at the kth value visited, O(h + k)).
+- **Maximum depth:** the height of the tree plus one, computed with the same recursion as `Height` above.
+- **Validate BST:** recurse with an inherited `(min, max)` range, not just a check against immediate children — this is exactly the trap the "Common mistake" callout in section 2 warns about.
+- **Lowest common ancestor** (for a BST specifically): walk down from the root, branching left or right by comparing both target keys to the current node — the first node where the targets split to different sides, or match the node itself, is the LCA, `O(h)`.
+- **Serialize/deserialize a binary tree:** pre-order traversal with explicit null markers reconstructs the exact shape.
+- **Kth smallest in a BST:** in-order traversal, stopping at the kth value visited, `O(h + k)`.
 
-## 9. Interview questions
+## 10. Interview questions
 
 > [!question]- What is the worst-case height of a BST, and when does it happen?
 > `O(n)` — a straight chain, one child per node. It happens when keys are inserted in sorted (or reverse-sorted) order with no rebalancing, so every new key becomes the sole child of the previous largest (or smallest) node.
@@ -374,7 +308,7 @@ Go's designers chose to ship `map` (a hash table) rather than an ordered tree in
 > [!question]- What does Go give you instead of a built-in balanced tree?
 > Nothing directly ordered in the standard library — Go ships `map` (hash table, unordered) instead. For sorted iteration or range queries, use a sorted slice with `slices.BinarySearch`, or a third-party tree package like `github.com/google/btree`.
 
-## 10. Cheat sheet
+## 11. Cheat sheet
 
 - BST invariant: left subtree < node < right subtree. Search/insert/delete are all `O(h)`.
 - Worst case height is `O(n)` (sorted insert order, no balancing) — the reason balanced trees exist.
@@ -390,3 +324,4 @@ Go's designers chose to ship `map` (a hash table) rather than an ordered tree in
 - **Before this:** [[Arrays and Dynamic Arrays (Go Slices)]], [[Stacks, Queues and Deques]]
 - **Next:** [[Heaps and Priority Queues]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Compare with:** [[Hash Tables and Go Maps]] (O(1) but unordered), [[Tries, Suffix Trees and Suffix Arrays]] (branch by prefix, not comparison)
+- **Runnable Go version:** [[Trees, BSTs and Balanced Trees - Go]]

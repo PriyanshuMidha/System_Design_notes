@@ -3,7 +3,7 @@ tags: [databases, replication, postgres, high-availability]
 level: intermediate
 status: reviewed
 prereqs: ["[[Transactions and ACID]]", "[[Storage Engines - B-tree vs LSM and WAL]]"]
-related: ["[[High Availability and Failover]]", "[[Quorums and Leaderless Replication]]", "[[Backup, PITR and Disaster Recovery]]", "[[Partitioning and Sharding]]", "[[Transactional Outbox and CDC]]", "[[Consistency Models]]", "[[CRDTs and Conflict Resolution]]", "[[Distributed SQL]]"]
+related: ["[[High Availability and Failover]]", "[[Quorums and Leaderless Replication]]", "[[Backup, PITR and Disaster Recovery]]", "[[Partitioning and Sharding]]", "[[Transactional Outbox and CDC]]", "[[Consistency Models]]", "[[CRDTs and Conflict Resolution]]", "[[Distributed SQL]]", "[[Replication - Go]]"]
 sources:
   - "PostgreSQL 17 docs, chapter 26: Log-Shipping Standby Servers, Synchronous Replication, Hot Standby"
   - "PostgreSQL 17 docs, Replication and WAL settings: synchronous_commit, synchronous_standby_names, max_slot_wal_keep_size, max_standby_streaming_delay, hot_standby_feedback, recovery_min_apply_delay"
@@ -112,14 +112,53 @@ Which standbys count is set by `synchronous_standby_names`:
 -- Wait for one of two standbys, whichever answers first (quorum commit)
 ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (replica_1, replica_2)';
 SELECT pg_reload_conf();
+```
 
--- Durability can be chosen per transaction: pay for remote_apply only
--- on the write that the next page must see.
+Durability can be chosen per transaction: pay for `remote_apply` only on the write that the next page must see.
+
+```sql
 BEGIN;
 SET LOCAL synchronous_commit = remote_apply;
 UPDATE invoices SET status = 'paid' WHERE workspace_id = 7 AND id = 1042;
 COMMIT;
 ```
+
+#### What the client waits for in each mode
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Primary
+    participant S as Standby
+    C->>P: COMMIT
+    P->>P: flush own WAL (all modes)
+    Note over C,P: asynchronous: COMMIT returns here
+    P->>S: stream WAL
+    S->>S: write to OS (remote_write)
+    S->>S: fsync to disk (on)
+    S->>S: replay into data files (remote_apply)
+    S-->>P: ack at the chosen point
+    P-->>C: COMMIT returns
+```
+
+#### Quorum commit with `ANY 1`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Primary
+    participant R1 as replica_1 (slow, 40 ms)
+    participant R2 as replica_2 (fast, 2 ms)
+    C->>P: COMMIT
+    P->>R1: WAL
+    P->>R2: WAL
+    R2-->>P: flushed (2 ms)
+    Note over P: ANY 1 satisfied, no need to wait for replica_1
+    P-->>C: COMMIT ok
+    R1-->>P: flushed (40 ms, late, still fine)
+```
+
+With `FIRST 1 (replica_1, replica_2)` instead, the primary waits on `replica_1` first and only falls to `replica_2` when `replica_1` is gone.
 
 > [!warning] A synchronous standby is an availability dependency
 > With `'FIRST 1 (replica_1)'` and `replica_1` down, every commit on the primary **waits** until it returns. Name two candidates, or use `ANY 1 (…)` over two or three standbys.
@@ -147,6 +186,22 @@ Representative output (PostgreSQL 17):
 
 On a replica, `now() - pg_last_xact_replay_timestamp()` gives lag in seconds, but it keeps growing when the primary is idle even though nothing is missing. Prefer the byte-based lag above, or a heartbeat row that the primary updates every second.
 
+#### Where lag can build up
+
+```mermaid
+flowchart LR
+    W["Primary writes WAL<br/>LSN 16/B374D848"] -- "network" --> RC["Replica receives<br/>write_lag"]
+    RC --> FL["Replica flushes<br/>flush_lag"]
+    FL --> RP["Replica replays<br/>replay_lag"]
+    RP --> RD["Queries on the replica<br/>can see the change"]
+```
+
+| Lag column | Slow when | Typical cause |
+| --- | --- | --- |
+| `write_lag` | Network or the primary's walsender is the bottleneck | Cross-region link, saturated network |
+| `flush_lag` | The replica's disk is slow | Busy or small disk |
+| `replay_lag` | Single-process replay cannot keep up, or a query holds up replay | Write burst, long replica query, replay conflicts |
+
 ### 3.4 Replication slots
 
 A slot guarantees that WAL stays until its consumer confirms it. That cuts both ways: a replica or CDC connector that disappears leaves an **inactive slot**, and the primary keeps every WAL file from then on until its disk fills and it stops.
@@ -157,37 +212,26 @@ SELECT slot_name, slot_type, active, wal_status,
 FROM pg_replication_slots;
 ```
 
+```mermaid
+stateDiagram-v2
+    [*] --> Active: replica connects, slot created
+    Active --> Active: replica confirms WAL, primary recycles old files
+    Active --> Inactive: replica or CDC connector disappears
+    Inactive --> Inactive: primary keeps all new WAL, disk fills
+    Inactive --> Active: consumer returns and catches up
+    Inactive --> Lost: retained WAL exceeds max_slot_wal_keep_size
+    Lost --> [*]: replica must be re-cloned, or slot dropped
+```
+
 Set `max_slot_wal_keep_size` (PostgreSQL 13+). A slot that would retain more is invalidated (`wal_status = lost`), and that replica must be re-cloned. Losing a replica beats losing the primary.
 
 ## 4. Worked example
 
 ### Whiteboard version
 
-The bare idea: remember the WAL position (LSN) where the user's write ended, and read only from a replica that has replayed that far.
+The bare idea: remember the WAL position (LSN) where the user's write ended, and read only from a replica that has replayed that far. If no replica has, read from the primary. The code is a four-line loop over replicas comparing `Replayed >= token` (`pickForRead` in [[Replication - Go]]).
 
-```go
-package wb
-
-type LSN uint64
-
-type Replica struct {
-	Name     string
-	Replayed LSN // last WAL position this replica has applied
-}
-
-// pickForRead returns a replica that has replayed the user's last write
-// (token), or "primary" if none has caught up yet.
-func pickForRead(replicas []Replica, token LSN) string {
-	for _, r := range replicas {
-		if r.Replayed >= token {
-			return r.Name
-		}
-	}
-	return "primary"
-}
-```
-
-The full version below adds production concerns: LSN parsing, a background poller, round-robin, concurrency safety, and tests.
+The full version adds production concerns: LSN parsing, a background poller, round-robin, concurrency safety, and tests.
 
 ### The stale read
 
@@ -215,175 +259,33 @@ sequenceDiagram
     A-->>U: fresh invoice
 ```
 
-### The router in Go
+### The router, in words
 
-A poller reads each replica's replay position every 100 ms. Reads compare the cached position with the session's token, and fall back to the primary when no replica has caught up. A cached position can only be *older* than the truth, so it never sends a read to a replica that lacks the write. This compiles and passes `go vet` and `go test -race` on Go 1.24 with pgx v5.8.
+A poller reads each replica's replay position every 100 ms. Reads compare the cached position with the session's token, and fall back to the primary when no replica has caught up. A cached position can only be *older* than the truth, so it never sends a read to a replica that lacks the write.
 
-```go
-// Package rwsplit sends reads to replicas without breaking read-your-writes.
-package rwsplit
+| Piece | Job |
+| --- | --- |
+| `LSN` | Parse `16/B374D848` into a 64-bit number, so positions compare numerically |
+| `WriteToken` | After `COMMIT`, read `pg_current_wal_insert_lsn()`; the session keeps the maximum |
+| `PollReplay` | Every 100 ms read `pg_last_wal_replay_lsn()` on each replica |
+| `Observe` | Store a replay position, never moving backwards |
+| `ForRead(token)` | Round-robin over replicas with `replay >= token`; else the primary |
 
-import (
-	"context"
-	"fmt"
-	"strconv"
-	"strings"
-	"sync/atomic"
-	"time"
+LSNs must be parsed, not compared as strings: PostgreSQL does not zero-pad, so as text `16/FFFFFF` sorts after `16/1000000`, although numerically it is smaller.
 
-	"github.com/jackc/pgx/v5/pgxpool"
-)
-
-// LSN is a position in the PostgreSQL write-ahead log. Postgres prints it as
-// two hex numbers, "16/B374D848": the high and the low 32 bits.
-type LSN uint64
-
-func ParseLSN(s string) (LSN, error) {
-	hi, lo, ok := strings.Cut(s, "/")
-	if !ok {
-		return 0, fmt.Errorf("parse lsn %q: missing '/'", s)
-	}
-	h, err := strconv.ParseUint(hi, 16, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse lsn %q: %w", s, err)
-	}
-	l, err := strconv.ParseUint(lo, 16, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse lsn %q: %w", s, err)
-	}
-	return LSN(h<<32 | l), nil
-}
-
-func (l LSN) String() string {
-	return fmt.Sprintf("%X/%X", uint64(l)>>32, uint64(l)&0xFFFFFFFF)
-}
-
-// Replica is a read target plus the last replay position seen by a poller.
-type Replica[T any] struct {
-	Name   string
-	Conn   T
-	replay atomic.Uint64
-}
-
-// Observe records a replay position. It never moves backwards, so a stale
-// value only under-reports progress, which is the safe direction.
-func (r *Replica[T]) Observe(l LSN) {
-	for {
-		cur := r.replay.Load()
-		if uint64(l) <= cur || r.replay.CompareAndSwap(cur, uint64(l)) {
-			return
-		}
-	}
-}
-
-// Router picks a connection for each read.
-type Router[T any] struct {
-	primary  T
-	replicas []*Replica[T]
-	next     atomic.Uint64
-}
-
-func NewRouter[T any](primary T, replicas ...*Replica[T]) *Router[T] {
-	return &Router[T]{primary: primary, replicas: replicas}
-}
-
-// ForRead returns a replica that has replayed at least minLSN (the session's
-// token), trying replicas round-robin. If none has caught up, it returns the
-// primary. A session that has never written passes 0.
-func (r *Router[T]) ForRead(minLSN LSN) (conn T, name string) {
-	n := len(r.replicas)
-	if n == 0 {
-		return r.primary, "primary"
-	}
-	start := int(r.next.Add(1) % uint64(n))
-	for i := range n {
-		rep := r.replicas[(start+i)%n]
-		if LSN(rep.replay.Load()) >= minLSN {
-			return rep.Conn, rep.Name
-		}
-	}
-	return r.primary, "primary"
-}
-
-// WriteToken reads the primary's WAL insert position. Call it after COMMIT and
-// keep max(old, new) in the user's session. The insert position is never
-// behind our commit record, even with synchronous_commit = off.
-func WriteToken(ctx context.Context, primary *pgxpool.Pool) (LSN, error) {
-	var s string
-	err := primary.QueryRow(ctx, "SELECT pg_current_wal_insert_lsn()::text").Scan(&s)
-	if err != nil {
-		return 0, err
-	}
-	return ParseLSN(s)
-}
-
-// PollReplay refreshes a replica's replay position until ctx ends.
-func PollReplay(ctx context.Context, rep *Replica[*pgxpool.Pool], every time.Duration) {
-	tick := time.NewTicker(every)
-	defer tick.Stop()
-	for {
-		var s string
-		err := rep.Conn.QueryRow(ctx, "SELECT pg_last_wal_replay_lsn()::text").Scan(&s)
-		if err == nil {
-			if l, err := ParseLSN(s); err == nil {
-				rep.Observe(l)
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		}
-	}
-}
+```mermaid
+flowchart TD
+    R["ForRead(token)"] --> N{"any replicas?"}
+    N -- no --> PR["primary"]
+    N -- yes --> L["start at next round-robin index"]
+    L --> C{"replica replay >= token?"}
+    C -- yes --> RR["use this replica"]
+    C -- no --> NX{"more replicas to try?"}
+    NX -- yes --> C
+    NX -- no --> PR
 ```
 
-The test that pins the behaviour, including why LSNs must be parsed rather than compared as strings:
-
-```go
-func TestReadYourWrites(t *testing.T) {
-	r1 := &Replica[string]{Name: "replica-1", Conn: "r1"}
-	r2 := &Replica[string]{Name: "replica-2", Conn: "r2"}
-	r := NewRouter("p", r1, r2)
-	r1.Observe(lsn(t, "16/B3000000")) // lagging
-	r2.Observe(lsn(t, "16/B374D848")) // caught up with our write
-
-	token := lsn(t, "16/B374D848")
-	for range 10 {
-		if _, name := r.ForRead(token); name != "replica-2" {
-			t.Fatalf("read after write went to %s, want replica-2", name)
-		}
-	}
-	if _, name := r.ForRead(lsn(t, "16/B374D900")); name != "primary" {
-		t.Fatalf("no replica has the write yet, got %s", name)
-	}
-	seen := map[string]bool{}
-	for range 10 {
-		_, name := r.ForRead(0) // session never wrote: any replica
-		seen[name] = true
-	}
-	if !seen["replica-1"] || !seen["replica-2"] || seen["primary"] {
-		t.Fatalf("token 0 should spread over replicas, got %v", seen)
-	}
-}
-
-func TestParseLSN(t *testing.T) {
-	for _, s := range []string{"0/0", "16/B374D848", "FFFFFFFF/FFFFFFFF"} {
-		if got := lsn(t, s).String(); got != s {
-			t.Fatalf("round trip %s -> %s", s, got)
-		}
-	}
-	// Postgres does not zero-pad, so comparing LSNs as strings is wrong.
-	if !(lsn(t, "16/FFFFFF") < lsn(t, "16/1000000")) {
-		t.Fatal("16/FFFFFF must sort before 16/1000000")
-	}
-	if _, err := ParseLSN("16B374D848"); err == nil {
-		t.Fatal("want error for missing '/'")
-	}
-}
-```
-
-(`lsn` is a three-line helper that calls `ParseLSN` and fails the test on error. A third test hammers `Observe` and `ForRead` from 8 goroutines under `-race`.)
+Worked trace with the numbers from the diagram above: token `16/B374D848`; `replica_1` has replayed `16/B3000000` (behind), `replica_2` has replayed `16/B374D848` (equal, so caught up). Ten reads with that token all go to `replica_2`. A later write with token `16/B374D900` goes to the primary because no replica has reached it. A session that has never written passes token 0 and spreads over both replicas.
 
 ### Other fixes, and the two related anomalies
 
@@ -392,6 +294,37 @@ func TestParseLSN(t *testing.T) {
 | Read-your-writes | Their own change is missing | LSN token (above); read from the primary for N seconds after a write, with N above p99 lag (a cookie holding the write time); always read "my own" pages from the primary; `remote_apply` for that one transaction |
 | Monotonic reads | Refresh twice and data goes **backwards**, because the second read hit a staler replica | Pin a session to one replica (`hash(session) % replicas`), or keep the highest LSN the session has *seen* in the token as well |
 | Consistent prefix | An effect appears before its cause, e.g. a payment without its invoice update | Not possible inside one PostgreSQL cluster: a replica replays one ordered WAL, so it always shows a prefix of the primary's history. It does happen across **shards** or independent streams; keep causally related writes in one shard |
+
+### Monotonic reads, traced
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant R1 as replica_1 (replayed up to 16/B374D848)
+    participant R2 as replica_2 (replayed up to 16/B3000000)
+    U->>R1: GET invoice 1042
+    R1-->>U: status = partially_paid
+    U->>R2: refresh, GET invoice 1042
+    R2-->>U: status = sent (older state)
+    Note over U: the data went backwards in time
+```
+
+Pinning the session to one replica (`hash(session) % replicas`) removes this, because one replica only ever moves forward.
+
+```mermaid
+flowchart LR
+    subgraph ONE["One PostgreSQL cluster: always a prefix"]
+        w1["invoice created"] --> w2["payment recorded"] --> w3["invoice marked paid"]
+    end
+    subgraph SH["Two shards, independent streams"]
+        s1["shard A: invoice marked paid, applied"]
+        s2["shard B: payment recorded, not yet applied"]
+    end
+```
+
+On the left a replica can stop at any point, but it never shows the third step without the second. On the right, two independent streams can show an effect without its cause.
+
+Runnable Go version: [[Replication - Go]]
 
 ## 5. Variants and comparison
 
@@ -467,7 +400,41 @@ Its main uses are major-version upgrades with a short cut-over, copying a subset
 	3. Promote it: `SELECT pg_promote();` (PostgreSQL 12+). It starts a new **timeline**.
 	4. Fence the old primary so it can no longer accept writes: power it off, cut its network, or make it demote itself when it cannot renew its leader lease.
 	5. Repoint clients through DNS, a virtual IP or a proxy, then rebuild the old primary as a replica with `pg_rewind`.
+```mermaid
+sequenceDiagram
+    participant Pa as Patroni agents
+    participant E as etcd (leader key)
+    participant O as Old primary
+    participant R1 as replica_1 (LSN 16/B374D848)
+    participant R2 as replica_2 (LSN 16/B3000000)
+    participant X as Clients via proxy
+    O--xE: cannot renew leader lease
+    E-->>Pa: lease expired, no leader
+    Pa->>R1: highest received LSN wins the election
+    R1->>R1: pg_promote(), new timeline
+    Pa->>O: fence: demote or power off
+    R2->>R1: re-point replication to the new primary
+    Pa->>X: proxy now routes writes to replica_1
+    Note over O: later: pg_rewind, rejoin as a replica
+```
+
+
 - **Split brain:** after a network partition the old primary is still up and still accepting writes from clients that can reach it, while a new primary takes the rest. The two histories diverge and must be merged by hand. Prevent it with majority-based leader election and fencing (see [[Leader Election]] and [[Distributed Locks and Fencing Tokens]]); never with timeouts alone.
+```mermaid
+flowchart LR
+    subgraph L["Network partition"]
+        direction LR
+        subgraph SIDEA["Side A: old primary still up"]
+            ca["clients that reach A"] --> pa[("old primary: accepts writes, history A")]
+        end
+        subgraph SIDEB["Side B: new primary elected"]
+            cb["clients that reach B"] --> pb[("new primary: accepts writes, history B")]
+        end
+    end
+    pa -. "diverged histories must be merged by hand" .- pb
+```
+
+
 - **Failure modes → fixes:**
 	- Lag spikes after a bulk `UPDATE` or index build → batch and throttle large writes; watch `replay_lag` during migrations.
 	- Replica queries fail with `canceling statement due to conflict with recovery` → raise `max_standby_streaming_delay` (default 30 s) on a reporting replica, or enable `hot_standby_feedback` and accept bloat on the primary.
@@ -486,8 +453,30 @@ Its main uses are major-version upgrades with a short cut-over, copying a subset
 - **What "synchronous" really guarantees.** PostgreSQL's promise is narrow: the client gets no acknowledgement until the synchronous standbys have the WAL. If the primary crashes while a commit is waiting, the commit is already in the primary's local WAL, so it is committed after restart even though the standby may never have received it. If the waiting session is cancelled, PostgreSQL warns that the transaction committed locally but may not have been replicated. Code that treats a timeout as "not committed" is wrong. Treat it as **unknown**, and make the operation idempotent.
 - **Why replicas fall behind under write-heavy load.** The primary generates WAL from many backends in parallel, but a standby replays it with **one** startup process. PostgreSQL 15 added `recovery_prefetch` to hide read I/O during replay, but the apply step itself is still single-process. Sustained write rates that a big primary handles can therefore outrun a same-sized replica.
 - **Replay conflicts.** Replay may need to remove row versions that a long replica query still reads (vacuum cleanup on the primary), or to take an `ACCESS EXCLUSIVE` lock (for example `DROP TABLE`). Replay waits up to `max_standby_streaming_delay` and then cancels the query. `hot_standby_feedback = on` reports the replica's oldest snapshot to the primary so that vacuum keeps those rows. That trades cancellations for bloat on the primary, and it does not help with lock conflicts.
+- **Replay conflicts, in time order.**
+
+```mermaid
+sequenceDiagram
+    participant Q as Long query on replica (snapshot S)
+    participant RP as Replay process
+    participant PR as Primary
+    Q->>Q: start reading rows of invoices
+    PR->>PR: VACUUM removes dead row versions, writes WAL
+    PR->>RP: WAL with the cleanup record
+    RP->>RP: needs to remove rows that Q still reads
+    Note over RP: waits up to max_standby_streaming_delay (30 s)
+    RP->>Q: cancel: canceling statement due to conflict with recovery
+```
+
 - **Cascading replication.** A replica can stream to further replicas. This takes walsender load off the primary and sends WAL across a region boundary once instead of once per replica.
 - **Timelines.** Promotion forks history. WAL that the old primary wrote after the fork exists nowhere else, so the old primary cannot simply reconnect: `pg_rewind` rolls it back to the fork point first, and those unreplicated writes are gone.
+
+```mermaid
+flowchart LR
+    T1["timeline 1: shared history up to LSN 16/B374D848"] --> OLD["old primary keeps writing:<br/>16/B374D900 ... lost on rewind"]
+    T1 --> NEW["timeline 2: promoted replica<br/>new writes from 16/B374D848"]
+```
+
 - **Writable subscribers conflict.** A logical subscriber is a normal database. If a row inserted locally collides with an incoming insert, the apply worker errors and replication stops until someone fixes the row or skips the transaction (`ALTER SUBSCRIPTION … SKIP`, PostgreSQL 15+).
 - **Leaderless is not "Dynamo-named".** Amazon DynamoDB (the service) replicates each partition across three availability zones with a Multi-Paxos leader that takes all writes. The 2007 Dynamo paper's leaderless design survives in Cassandra and Riak, not in DynamoDB.
 

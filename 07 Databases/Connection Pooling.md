@@ -15,7 +15,7 @@ sources:
   - "PostgreSQL wiki, Number Of Database Connections ((core_count * 2) + effective_spindle_count)"
   - "AWS docs, Avoiding pinning an RDS Proxy"
   - "golang-migrate v4.18.3 source, postgres driver (pg_advisory_lock)"
-updated: 2026-11-02
+updated: 2026-11-07
 ---
 
 # Connection Pooling
@@ -36,9 +36,38 @@ Opening a PostgreSQL connection is expensive on both sides:
 - **Network:** around half a dozen round trips, for the TCP handshake, the TLS handshake, the startup message and SCRAM authentication. Since PostgreSQL 17, `sslnegotiation=direct` saves one of them.
 - **Server:** the postmaster **forks a new backend process** for every connection. Each backend builds its own catalog caches and has private memory, plus `work_mem` for each sort or hash while a query runs.
 
+```mermaid
+sequenceDiagram
+    participant A as Go app
+    participant PM as postmaster
+    participant BE as new backend process
+    A->>PM: TCP SYN, SYN-ACK, ACK (1 round trip)
+    A->>PM: TLS ClientHello ... Finished (1 to 2 round trips)
+    A->>PM: startup message: user, database
+    PM->>BE: fork a backend for this connection
+    BE-->>A: SCRAM challenge
+    A->>BE: SCRAM proof (about 2 round trips)
+    BE-->>A: AuthenticationOk, ParameterStatus, ReadyForQuery
+    Note over A,BE: only now can the first query be sent
+```
+
 Borrowing an idle pooled connection costs microseconds; opening one costs milliseconds (an estimate for the same region). Opening one per request would multiply latency and burn database CPU on process churn.
 
 The limit matters as much as the cost. `max_connections` is typically 100, and changing it needs a restart. A classic outage: 10 containers each set their pool to 50. That allows 500 connections against a limit of 100, so new connections fail with `FATAL: sorry, too many clients already` (SQLSTATE 53300). Even below the limit, hundreds of *active* backends on 8 cores spend their time on context switches and lock contention instead of queries.
+
+```mermaid
+flowchart LR
+    subgraph bad["Before: 10 pods x MaxOpenConns 50"]
+        direction TB
+        B1["pod 1 .. pod 10<br/>up to 500 connections"] --> BP[("PostgreSQL<br/>max_connections 100")]
+        BP --> BX["connections 98 and up:<br/>FATAL too many clients already"]
+    end
+    subgraph good["After: 15 pods x MaxOpenConns 5"]
+        direction TB
+        G1["pod 1 .. pod 15<br/>at most 75 connections"] --> GP[("PostgreSQL<br/>max_connections 100<br/>90 usable for the app")]
+        GP --> GX["75 fits, 15 spare"]
+    end
+```
 
 ## 2. Mental model
 
@@ -50,6 +79,8 @@ So a pool does two jobs:
 
 ## 3. How it works
 
+### Borrowing and returning
+
 Every `QueryContext`, `ExecContext` or `BeginTx` borrows a connection and gives it back when the work ends:
 
 | Call | Connection is held until |
@@ -59,6 +90,8 @@ Every `QueryContext`, `ExecContext` or `BeginTx` borrows a connection and gives 
 | `QueryContext` | `rows.Close()`, or `rows.Next()` returns false |
 | `BeginTx` | `Commit` or `Rollback`. It is the same connection for the whole transaction. |
 | `db.Conn(ctx)` | `conn.Close()` |
+
+### Waiting for a connection
 
 When a request asks for a connection and none is idle, the pool either opens one (below the cap) or parks the request until a connection comes back:
 
@@ -86,6 +119,8 @@ sequenceDiagram
     R->>P: rows.Close() returns the connection
 ```
 
+### The life of a pooled connection
+
 A pooled connection's life, with the `database/sql` knobs that end it:
 
 ```mermaid
@@ -101,7 +136,9 @@ stateDiagram-v2
     Closed --> [*]
 ```
 
-**The knobs** (Go 1.24 `database/sql` and pgx v5.8 `pgxpool`):
+### The knobs
+
+The settings (Go 1.24 `database/sql` and pgx v5.8 `pgxpool`):
 
 | Setting | Default | What it does |
 | --- | --- | --- |
@@ -154,7 +191,20 @@ func (p *Pool) Release(c *Conn) { p.free <- c }
 
 `*sql.DB` and `pgxpool` add what this leaves out: opening connections lazily, health checks, maximum lifetime and idle time, and wait statistics. The sizing walkthrough below is about choosing the numbers.
 
-**Sizing InvoiceOps with Little's Law.** Little's Law says the average number of busy connections is `L = λ × W`: arrival rate times how long each request holds a connection.
+### Sizing InvoiceOps with Little's Law
+
+Little's Law says the average number of busy connections is `L = λ × W`: arrival rate times how long each request holds a connection.
+
+```mermaid
+flowchart TD
+    L1["peak load: 1,200 requests/s"] --> L2["hold time per request: 5 ms"]
+    L2 --> L3["L = 1,200 x 0.005 = 6 busy connections, fleet-wide"]
+    L3 --> L4["3x headroom for bursts and p99: about 18"]
+    L4 --> L5["divide by 6 pods: 3 per pod,<br/>round up to MaxOpenConns = 5"]
+    L5 --> L6{"check both ceilings"}
+    L6 --> L7["connection budget: 15 pods x 5 = 75 <= 90"]
+    L6 --> L8["database CPU: 6 busy << 16 active-connection starting point"]
+```
 
 - Peak load: 1,200 requests/s across the fleet (an estimate for this example).
 - Each request holds a connection for about 5 ms in total: 3 queries plus the gaps between them inside its transaction (an estimate; measure yours with `AcquireDuration` and query timings).
@@ -171,7 +221,9 @@ Now check both limits:
 
 The old mistake fails both checks: 10 pods × 50 = 500 possible connections against a limit of 100.
 
-**Measured: the pool turns excess concurrency into queueing.** A fake `database/sql` driver whose every query sleeps 20 ms drives the real Go pool. 40 queries arrive at once (Go 1.24.4; three runs agreed within 2 ms):
+### The pool turns excess concurrency into queueing
+
+**Measured.** A fake `database/sql` driver whose every query sleeps 20 ms drives the real Go pool. 40 queries arrive at once (Go 1.24.4; three runs agreed within 2 ms):
 
 | MaxOpenConns | Time for 40 queries | WaitCount | Average wait |
 | ------------ | ------------------- | --------- | ------------ |
@@ -183,128 +235,64 @@ The old mistake fails both checks: 10 pods × 50 = 500 possible connections agai
 
 Throughput is capped at `MaxOpenConns / query time`: 4 connections ÷ 20 ms = 200 queries/s, so 40 queries take at least 200 ms. The fake database has unlimited capacity, so a bigger pool always wins here. A real PostgreSQL saturates its cores and disks, and past that point more connections only add contention.
 
-The test that pins this down:
+With `MaxOpenConns = 4` and 40 queries of 20 ms each, the queries run in ten waves of four:
 
-```go
-func newDB(delay time.Duration, maxOpen int) *sql.DB {
-	db := sql.OpenDB(&connector{delay: delay})
-	db.SetMaxOpenConns(maxOpen)
-	db.SetMaxIdleConns(maxOpen) // the default of 2 would close and reopen the rest
-	return db
-}
-
-func TestPoolCapsThroughput(t *testing.T) {
-	db := newDB(20*time.Millisecond, 4)
-	defer db.Close()
-
-	start := time.Now()
-	var wg sync.WaitGroup
-	for range 40 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := FirstOverdue(context.Background(), db); err != nil {
-				t.Error(err)
-			}
-		}()
-	}
-	wg.Wait()
-	elapsed, st := time.Since(start), db.Stats()
-
-	// 4 connections x 20 ms per query = at most 200 queries/s,
-	// so 40 queries cannot finish in under 200 ms.
-	if elapsed < 200*time.Millisecond {
-		t.Errorf("elapsed %v, want >= 200ms", elapsed)
-	}
-	if st.OpenConnections > 4 || st.WaitCount == 0 {
-		t.Errorf("stats %+v: want <= 4 open connections and some waits", st)
-	}
-	t.Logf("elapsed=%v WaitCount=%d WaitDuration=%v",
-		elapsed.Round(time.Millisecond), st.WaitCount, st.WaitDuration.Round(time.Millisecond))
-}
+```mermaid
+gantt
+    title 40 queries of 20 ms through a pool of 4 (first three of ten waves shown)
+    dateFormat x
+    axisFormat %L ms
+    section conn 1
+    query 1 : 0, 20
+    query 5 : 20, 40
+    query 9 : 40, 60
+    section conn 2
+    query 2 : 0, 20
+    query 6 : 20, 40
+    query 10 : 40, 60
+    section conn 3
+    query 3 : 0, 20
+    query 7 : 20, 40
+    query 11 : 40, 60
+    section conn 4
+    query 4 : 0, 20
+    query 8 : 20, 40
+    query 12 : 40, 60
 ```
 
-**A leak, caught by a test.** This function returns while `rows` is still open, so its connection never goes back to the pool:
+The last query starts at 180 ms and ends at 200 ms. The measured run of 209 ms includes scheduling overhead. The first four queries never wait; the other 36 do, which is the `WaitCount` of 36.
 
-```go
-// FirstOverdueLeaky returns the first overdue invoice ID. It never closes
-// rows, so the connection stays checked out of the pool until ctx ends.
-func FirstOverdueLeaky(ctx context.Context, db *sql.DB) (int64, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id FROM invoices WHERE status = 'overdue' ORDER BY due_at`)
-	if err != nil {
-		return 0, err
-	}
-	if !rows.Next() { // Next returning false closes rows by itself
-		if err := rows.Err(); err != nil {
-			return 0, err
-		}
-		return 0, sql.ErrNoRows
-	}
-	var id int64
-	err = rows.Scan(&id)
-	return id, err // BUG: rows is still open and holds its connection
-}
+### A leak, traced
+
+A function that returns while `rows` is still open never gives its connection back. With a pool of 2, two such calls empty the pool, and the third caller waits until its deadline.
+
+```mermaid
+sequenceDiagram
+    participant H1 as Handler 1 (leaky)
+    participant H2 as Handler 2 (leaky)
+    participant H3 as Handler 3 (fixed)
+    participant P as Pool, MaxOpenConns 2
+    H1->>P: QueryContext
+    P-->>H1: connection A
+    H1-->>H1: Scan the first row, return without rows.Close()
+    H2->>P: QueryContext
+    P-->>H2: connection B
+    H2-->>H2: Scan, return without rows.Close()
+    Note over P: InUse = 2, Idle = 0
+    H3->>P: QueryContext with a 50 ms deadline
+    Note over H3,P: waits, nothing ever returns
+    P-->>H3: context.DeadlineExceeded after 50 ms
 ```
 
-The fixed `FirstOverdue` is identical except for `defer rows.Close()` right after the error check. Two leaked calls empty a pool of 2, and the next caller times out:
+The fix is `defer rows.Close()` right after the error check. A request-scoped context heals a leak, because `database/sql` closes the rows when the context ends. A leak under `context.Background()` is permanent.
 
-```go
-func TestLeakedRowsExhaustThePool(t *testing.T) {
-	db := newDB(time.Millisecond, 2)
-	defer db.Close()
-	for range 2 {
-		if _, err := FirstOverdueLeaky(context.Background(), db); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if st := db.Stats(); st.InUse != 2 {
-		t.Fatalf("InUse = %d, want 2 leaked connections", st.InUse)
-	}
+The code for the throughput test, the leak test, the fixed function, the cancelled-context test and the production configuration is in the Go note.
 
-	// The pool is empty, so the next caller waits until its deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := FirstOverdue(ctx, db); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
-	}
-}
-```
+### Production configuration
 
-All four tests in the module (throughput cap, leak, fix returns every connection, cancelled context reclaims a leak) pass `go vet` and `go test -race` on Go 1.24.4. Asserting `db.Stats().InUse == 0` after each handler test is a cheap leak detector for your own suite.
+For the budget above, the app calls `ConfigureDB(db, 5)` or `NewPool(ctx, dsn, 5)`. Both set all the knobs from the table in section 3: a cap of 5, idle connections equal to the cap, a lifetime of 30 minutes (with 5 minutes of jitter in pgx) and an idle time of 5 minutes.
 
-Production configuration for the budget above. The app calls `ConfigureDB(db, 5)` or `NewPool(ctx, dsn, 5)`:
-
-```go
-// ConfigureDB sizes a database/sql pool. maxOpen comes from the connection
-// budget: (max_connections - reserved) / (pods at full scale, plus deploy surge).
-func ConfigureDB(db *sql.DB, maxOpen int) {
-	db.SetMaxOpenConns(maxOpen)             // default 0 = unlimited
-	db.SetMaxIdleConns(maxOpen)             // default 2: bursts would reconnect
-	db.SetConnMaxLifetime(30 * time.Minute) // default 0 = forever
-	db.SetConnMaxIdleTime(5 * time.Minute)  // default 0 = forever
-}
-
-// NewPool opens a pgx pool with the same budget.
-func NewPool(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, error) {
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, err
-	}
-	cfg.MaxConns = maxConns                     // default max(4, runtime.NumCPU())
-	cfg.MaxConnLifetime = 30 * time.Minute      // default 1 h
-	cfg.MaxConnLifetimeJitter = 5 * time.Minute // spread reconnects; default 0
-	cfg.MaxConnIdleTime = 5 * time.Minute       // default 30 min
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := pool.Ping(ctx); err != nil { // the pool does not connect on creation
-		pool.Close()
-		return nil, err
-	}
-	return pool, nil
-}
-```
+Runnable Go version: [[Connection Pooling - Go]]
 
 ## 5. Variants and comparison
 
@@ -318,6 +306,23 @@ func NewPool(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, er
 | PgCat, Supavisor, Odyssey | Newer poolers; multi-threaded, some add sharding or load balancing | Very high client counts | Younger tools, fewer operators know them |
 
 PostgreSQL 17 has no built-in pooler, so external poolers fill that gap.
+
+### What transaction mode does to session state
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as PgBouncer, transaction mode
+    participant S1 as Server connection 1
+    participant S2 as Server connection 2
+    C->>B: BEGIN, SET statement_timeout = '2s'
+    B->>S1: lend S1 for this transaction
+    C->>B: COMMIT
+    B->>S1: COMMIT, return S1 to the pool
+    C->>B: BEGIN, SELECT ...
+    B->>S2: lend S2: it never saw the SET
+    Note over C,S2: the 2 s timeout silently no longer applies
+```
 
 **What breaks in transaction mode** (from PgBouncer's feature table). Each item depends on session state, and the next transaction may run on a different server connection:
 
@@ -333,6 +338,19 @@ PostgreSQL 17 has no built-in pooler, so external poolers fill that gap.
 pgx prepares and caches every statement by default (`QueryExecModeCacheStatement`). Behind an older PgBouncer in transaction mode, that fails with "prepared statement does not exist" errors. pgx's docs suggest `default_query_exec_mode=exec` or `simple_protocol` there. Migrations need care too: golang-migrate holds a **session** advisory lock while it runs, so point it at the database directly, not at a transaction-mode pooler.
 
 ## 6. Trade-offs and when not to use
+
+```mermaid
+flowchart TD
+    Q["Pool symptoms"] --> A{"WaitCount rising?"}
+    A -- no --> OK["pool is fine"]
+    A -- yes --> B{"database CPU high?"}
+    B -- yes --> C["database is the limit:<br/>fix queries, add replicas,<br/>do not raise the pool"]
+    B -- no --> D{"idle in transaction<br/>sessions in pg_stat_activity?"}
+    D -- yes --> E["leak or network call in a transaction:<br/>fix the code, add timeouts"]
+    D -- no --> F{"fleet total below<br/>max_connections?"}
+    F -- yes --> G["raise MaxOpenConns a little"]
+    F -- no --> H["add PgBouncer in transaction mode"]
+```
 
 - **Too big a pool** does not make the database faster. Past roughly `cores × 2` active queries, throughput falls from context switching, lock and cache-line contention, and `work_mem` pressure (PostgreSQL wiki). It also uses up `max_connections`.
 - **Too small a pool** queues requests in the app: `WaitDuration` grows while the database idles.
@@ -445,5 +463,6 @@ flowchart LR
 ## Links
 
 - **Before this:** [[Transactions and ACID]], [[Processes, Threads and Context Switching]]
+- **Runnable code:** [[Connection Pooling - Go]] (a channel pool, a fake driver that measures the cap, leak tests, production configuration)
 - **Next:** [[Database Access (database-sql, pgx, sqlc)]], [[Replication]], [[Debugging Database Performance]]
 - **Compare with:** [[Bulkheads and Concurrency Limits]] (the pool as a bulkhead), [[N+1 Query Problem]] (the other way to waste connections), [[AWS 08 - RDS and Aurora]] (RDS Proxy)

@@ -15,7 +15,7 @@ sources:
   - "PostgreSQL wiki, Don't Do This (NOT IN)"
   - "MySQL 8.0 docs, Type Conversion in Expression Evaluation (string column compared with a number)"
   - "Codd, A Relational Model of Data for Large Shared Data Banks (CACM, 1970)"
-updated: 2026-11-02
+updated: 2026-11-07
 ---
 
 # SQL Essentials
@@ -50,47 +50,14 @@ SQL sends the question to the data instead. The server filters, joins and adds u
 
 ### The running schema
 
-A trimmed InvoiceOps schema. The full DDL with tenant-safe keys is in [[Relational Schema Design]]. Columns ending in `_minor` hold money as integer **minor units** (paise): ₹1,500.00 is `150000`.
+A trimmed InvoiceOps schema with four tables. The full DDL is in [[SQL Essentials - Go]]; the production version with tenant-safe keys is in [[Relational Schema Design]]. Columns ending in `_minor` hold money as integer **minor units** (paise): ₹1,500.00 is `150000`.
 
-```sql
-CREATE TABLE clients (
-  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  workspace_id bigint NOT NULL REFERENCES workspaces (id),
-  parent_id    bigint REFERENCES clients (id),   -- subsidiary of another client, or NULL
-  name         text NOT NULL,
-  email        text,                             -- NULL: no billing email yet
-  UNIQUE (workspace_id, email)
-);
-
-CREATE TABLE invoices (
-  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  workspace_id bigint NOT NULL REFERENCES workspaces (id),
-  client_id    bigint NOT NULL REFERENCES clients (id),
-  number       text NOT NULL,
-  status       text NOT NULL CHECK (status IN ('draft', 'sent', 'partially_paid', 'paid', 'overdue', 'cancelled')),
-  total_minor  bigint NOT NULL CHECK (total_minor >= 0),
-  paid_minor   bigint NOT NULL DEFAULT 0,
-  issue_date   date,
-  due_date     date,
-  UNIQUE (workspace_id, number)
-);
-
-CREATE TABLE invoice_items (
-  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  invoice_id       bigint NOT NULL REFERENCES invoices (id) ON DELETE CASCADE,
-  description      text NOT NULL,
-  quantity         integer NOT NULL CHECK (quantity > 0),
-  unit_price_minor bigint NOT NULL CHECK (unit_price_minor >= 0)
-);
-
-CREATE TABLE payments (
-  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  invoice_id   bigint NOT NULL REFERENCES invoices (id),
-  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
-  provider_ref text NOT NULL UNIQUE,
-  paid_at      timestamptz NOT NULL DEFAULT now()
-);
-```
+| Table | Key columns | Rules it carries |
+| --- | --- | --- |
+| `clients` | `id`, `workspace_id`, `parent_id`, `name`, `email` | `parent_id` points at another client (a subsidiary) or is NULL; `email` may be NULL; `UNIQUE (workspace_id, email)` |
+| `invoices` | `id`, `client_id`, `number`, `status`, `total_minor`, `paid_minor`, `issue_date`, `due_date` | `status` is one of six values; `total_minor >= 0`; `UNIQUE (workspace_id, number)` |
+| `invoice_items` | `invoice_id`, `description`, `quantity`, `unit_price_minor` | `quantity > 0`; deleted together with the invoice (`ON DELETE CASCADE`) |
+| `payments` | `invoice_id`, `amount_minor`, `provider_ref`, `paid_at` | `amount_minor > 0`; `provider_ref` is unique, so a webhook retry cannot double-pay |
 
 ```mermaid
 erDiagram
@@ -158,13 +125,29 @@ What follows from it (PostgreSQL 17):
 
 The most common join bug: a condition on the right-hand table in `WHERE` turns a `LEFT JOIN` back into an inner join, because `NULL = 'overdue'` is not TRUE.
 
+```mermaid
+flowchart TB
+    subgraph wrong["Condition in WHERE"]
+        direction LR
+        W1["LEFT JOIN: Cobalt gets<br/>one row, i.status = NULL"] --> W2["WHERE i.status = 'overdue'<br/>NULL = 'overdue' is UNKNOWN"] --> W3["Cobalt row dropped:<br/>the result equals an INNER JOIN"]
+    end
+    subgraph right["Condition in ON"]
+        direction LR
+        R1["ON ... AND i.status = 'overdue'<br/>decides which invoices match"] --> R2["Cobalt has no match:<br/>NULL-extended row kept"] --> R3["every client survives"]
+    end
+```
+
+The condition in `WHERE` is applied after the join, to the NULL-extended rows. The condition in `ON` only decides what counts as a match.
+
 ```sql
 -- Wrong: clients without an overdue invoice vanish again
 SELECT c.name, i.number
 FROM clients c
 LEFT JOIN invoices i ON i.client_id = c.id
 WHERE i.status = 'overdue';
+```
 
+```sql
 -- Right: the condition decides what matches, not which clients survive
 SELECT c.name, i.number
 FROM clients c
@@ -173,27 +156,24 @@ LEFT JOIN invoices i ON i.client_id = c.id AND i.status = 'overdue';
 
 ### Grouping and aggregates
 
+A `LEFT JOIN` from clients to invoices, grouped by client, shows the difference between the two counts. The full query (with `FILTER` columns) and its output table are in [[SQL Essentials - Go]]. The key lines:
+
 ```sql
-SELECT c.name,
-       count(*)                                     AS joined_rows,
-       count(i.id)                                  AS invoices,
-       count(*) FILTER (WHERE i.status = 'overdue') AS overdue,
-       sum(i.total_minor - i.paid_minor)
-         FILTER (WHERE i.status IN ('sent', 'partially_paid', 'overdue')) AS open_minor
-FROM clients c
-LEFT JOIN invoices i ON i.client_id = c.id
-GROUP BY c.id, c.name
-ORDER BY c.id;
+SELECT c.name, count(*) AS joined_rows, count(i.id) AS invoices
+FROM clients c LEFT JOIN invoices i ON i.client_id = c.id
+GROUP BY c.id, c.name;
 ```
 
-Representative output (PostgreSQL 17), computed from the sample data:
+```mermaid
+flowchart LR
+    J["joined rows: 7<br/>Acme Corp x2, Acme Labs x1,<br/>Bolt Foods x3, Cobalt x1 (NULLs)"] --> G["GROUP BY c.id: 4 groups"]
+    G --> A1["Acme Corp: count(*) 2, count(i.id) 2"]
+    G --> A2["Acme Labs: 1, 1"]
+    G --> A3["Bolt Foods: 3, 3"]
+    G --> A4["Cobalt: count(*) 1, count(i.id) 0,<br/>sum = NULL"]
+```
 
-| name       | joined_rows | invoices | overdue | open_minor |
-| ---------- | ----------- | -------- | ------- | ---------- |
-| Acme Corp  | 2           | 2        | 1       | 150000     |
-| Acme Labs  | 1           | 1        | 1       | 80000      |
-| Bolt Foods | 3           | 3        | 1       | 105000     |
-| Cobalt Ltd | 1           | 0        | 0       | NULL       |
+With the `FILTER` columns, the representative open balances are 150000 (Acme Corp), 80000 (Acme Labs), 105000 (Bolt Foods) and NULL (Cobalt).
 
 - Every selected column is either grouped or aggregated. Postgres also accepts columns of a table whose primary key is grouped, so `GROUP BY c.id` alone would allow `c.name`.
 - `count(*)` counts rows, `count(col)` counts non-NULL values. Cobalt's NULL-extended row makes `count(*)` 1 and `count(i.id)` 0.
@@ -203,6 +183,20 @@ Representative output (PostgreSQL 17), computed from the sample data:
 ### Window functions
 
 A window function computes over a set of rows related to the current row, like `GROUP BY` that keeps every row.
+
+```mermaid
+flowchart LR
+    subgraph p10["PARTITION client 10, ORDER BY issue_date"]
+        direction TB
+        a1["INV-101  120000<br/>nth 1, billed 120000"] --> a2["INV-102  250000<br/>nth 2, billed 370000, 16 days after"]
+    end
+    subgraph p12["PARTITION client 12"]
+        direction TB
+        b1["INV-105  45000<br/>nth 1, billed 45000"] --> b2["INV-104  60000<br/>nth 2, billed 105000, 51 days after"]
+    end
+```
+
+Each partition is numbered and summed on its own, and no row disappears. The query and its output:
 
 ```sql
 SELECT client_id, number, issue_date, total_minor,
@@ -252,20 +246,12 @@ WHERE rn = 1;
 - **`LATERAL`:** a subquery in `FROM` that may refer to earlier tables, the clean way to get "top N per row".
 - **CTE (`WITH name AS (…)`):** names a step so the query reads top to bottom. Since PostgreSQL 12, a side-effect-free CTE that is referenced once is inlined and optimized like a subquery. `AS MATERIALIZED` forces it to be computed once, separately.
 
-A **recursive CTE** walks a hierarchy. Acme's group balance, including subsidiaries:
+A **recursive CTE** walks a hierarchy. Acme's group balance, including subsidiaries, uses an anchor query (`id = 10`) and a step that joins `clients.parent_id` to the rows found so far. The full SQL is in [[SQL Essentials - Go]].
 
-```sql
-WITH RECURSIVE family AS (
-  SELECT id FROM clients WHERE id = 10               -- anchor: Acme Corp
-  UNION ALL
-  SELECT c.id
-  FROM clients c
-  JOIN family f ON c.parent_id = f.id                -- step: children of rows found so far
-)
-SELECT sum(i.total_minor - i.paid_minor) AS group_open_minor
-FROM invoices i
-WHERE i.client_id IN (SELECT id FROM family)
-  AND i.status IN ('sent', 'partially_paid', 'overdue');
+```mermaid
+flowchart LR
+    A["anchor: {10}<br/>Acme Corp"] --> S1["step 1: parent_id = 10<br/>adds {11} Acme Labs"] --> S2["step 2: parent_id = 11<br/>finds nothing: stop"]
+    S2 --> U["family = {10, 11}"] --> T["sum open balance<br/>150000 + 80000 = 230000"]
 ```
 
 The anchor yields `{10}`, the first step adds `{11}`, the second step finds nothing and recursion stops. Representative output (PostgreSQL 17): `group_open_minor = 230000` (150000 from INV-102 plus 80000 from INV-103). If the data could contain a cycle, add PostgreSQL 14's `CYCLE id SET is_cycle USING path` clause.
@@ -290,6 +276,14 @@ A comparison with NULL is neither true nor false but **UNKNOWN**.
 ```sql
 SELECT name FROM clients
 WHERE id NOT IN (SELECT parent_id FROM clients);
+```
+
+```mermaid
+flowchart TD
+    Q["id NOT IN (SELECT parent_id ...)<br/>subquery returns {NULL, 10, NULL, NULL}"] --> E["for Acme Labs (11):<br/>11 <> NULL AND 11 <> 10 AND ..."]
+    E --> U["11 <> NULL is UNKNOWN<br/>TRUE AND UNKNOWN = UNKNOWN"]
+    U --> D["WHERE keeps only TRUE:<br/>row dropped"]
+    D --> R["same for Bolt Foods and Cobalt;<br/>Acme Corp fails because 10 is in the list:<br/>0 rows"]
 ```
 
 Representative output (PostgreSQL 17): **0 rows**. The subquery returns `{NULL, 10, NULL, NULL}`. For Acme Labs (11) the test expands to `11 <> NULL AND 11 <> 10 AND …`, which is UNKNOWN, so the row is dropped. Bolt Foods and Cobalt Ltd are dropped the same way, and Acme Corp because 10 is in the list. `NOT EXISTS` asks the intended question and returns Acme Labs, Bolt Foods and Cobalt Ltd:
@@ -318,7 +312,9 @@ Your Go code should map these codes to API errors (23505 → 409 Conflict). Whic
 INSERT INTO invoices (workspace_id, client_id, number, status, total_minor)
 VALUES (1, 12, 'INV-107', 'draft', 0)
 RETURNING id, status;
+```
 
+```sql
 -- Upsert: a client CSV import; the same email in a workspace updates the name
 INSERT INTO clients (workspace_id, name, email)
 VALUES (1, 'Bolt Foods Pvt Ltd', 'ap@bolt.test')
@@ -368,29 +364,20 @@ HAVING SUM(i.total_minor - i.paid_minor) > 0
 ORDER  BY owed_minor DESC;
 ```
 
-The full version below adds tenant filters, lateness buckets, the traced execution order and a safe query builder in Go.
+The full version below adds tenant filters, lateness buckets, the traced execution order and a safe query builder.
 
 ### The collections query, traced
 
-```sql
-WITH open_invoices AS (                               -- invoices that still owe money
-  SELECT client_id,
-         total_minor - paid_minor     AS open_minor,
-         DATE '2026-11-02' - due_date AS days_late     -- date - date = whole days
-  FROM invoices
-  WHERE workspace_id = 1
-    AND status IN ('sent', 'partially_paid', 'overdue')
-)
-SELECT c.name,
-       sum(o.open_minor)                                AS open_minor,
-       max(o.days_late) FILTER (WHERE o.days_late > 0)  AS worst_days_late,
-       round(100.0 * sum(o.open_minor) / sum(sum(o.open_minor)) OVER (), 1) AS pct_of_open,
-       rank() OVER (ORDER BY sum(o.open_minor) DESC)    AS rank
-FROM open_invoices o
-JOIN clients c ON c.id = o.client_id
-GROUP BY c.id, c.name
-HAVING sum(o.open_minor) > 0
-ORDER BY rank;
+The full SQL (about 19 lines: a CTE of open invoices, a join, a group, a `HAVING`, two window functions) is in [[SQL Essentials - Go]]. Here is what each clause does to the six sample invoices.
+
+```mermaid
+flowchart LR
+    S0["invoices: 6 rows"] -->|"CTE: workspace 1 and status open"| S1["4 rows<br/>INV-102, 103, 104, 105<br/>days late 32, 13, -18, 33"]
+    S1 -->|"JOIN clients"| S2["4 rows"]
+    S2 -->|"GROUP BY c.id"| S3["3 groups<br/>Acme Corp {102}, Acme Labs {103},<br/>Bolt Foods {104, 105}"]
+    S3 -->|"HAVING sum > 0"| S4["3 groups"]
+    S4 -->|"SELECT + windows"| S5["total open 335000<br/>sum(sum(...)) OVER () on every row"]
+    S5 -->|"ORDER BY rank"| S6["3 rows"]
 ```
 
 | Step | Clause                                   | Rows                                                                 |
@@ -404,95 +391,42 @@ ORDER BY rank;
 
 Representative output (PostgreSQL 17):
 
-```text
-    name    | open_minor | worst_days_late | pct_of_open | rank
-------------+------------+-----------------+-------------+------
- Acme Corp  |     150000 |              32 |        44.8 |    1
- Bolt Foods |     105000 |              33 |        31.3 |    2
- Acme Labs  |      80000 |              13 |        23.9 |    3
-(3 rows)
-```
+| name       | open_minor | worst_days_late | pct_of_open | rank |
+| ---------- | ---------- | --------------- | ----------- | ---- |
+| Acme Corp  | 150000     | 32              | 44.8        | 1    |
+| Bolt Foods | 105000     | 33              | 31.3        | 2    |
+| Acme Labs  | 80000      | 13              | 23.9        | 3    |
 
 Two details are worth checking against the trace. INV-104 is not late yet (−18 days), so the `FILTER` keeps Bolt Foods' worst lateness at 33 instead of letting a negative number in. And `sum(sum(…)) OVER ()` works because windows run after grouping: the inner `sum` is the per-client aggregate, and the outer one adds the three group rows.
 
 ### Building SQL safely from Go
 
-Values must travel as **parameters** (`$1`, `$2`). Drivers such as pgx send the SQL text and the values in separate protocol messages by default, so a value can never become SQL. Column names and `ASC`/`DESC` cannot be parameters, so the builder maps user input to fixed fragments. It passes `go vet` and `go test -race` on Go 1.24.
+Values must travel as **parameters** (`$1`, `$2`). Drivers such as pgx send the SQL text and the values in separate protocol messages by default, so a value can never become SQL. Column names and `ASC`/`DESC` cannot be parameters, so the builder maps user input to fixed fragments from a whitelist and ends every sort with the unique `id`.
 
-```go
-package listquery
-
-import (
-	"fmt"
-	"strings"
-)
-
-// Filter is what GET /invoices?status=overdue&sort=-due_date&limit=20 parses into.
-type Filter struct {
-	WorkspaceID int64
-	Status      string // "" means any status
-	Sort        string // a key of orderBy
-	Limit       int
-}
-
-// orderBy maps each public sort key to a fixed SQL fragment. Column names and
-// ASC/DESC cannot be bind parameters, so user input never reaches the SQL text.
-// The trailing id makes the order total: equal due dates still page stably.
-var orderBy = map[string]string{
-	"due_date":  "due_date ASC, id ASC",
-	"-due_date": "due_date DESC, id DESC",
-	"total":     "total_minor ASC, id ASC",
-	"-total":    "total_minor DESC, id DESC",
-}
-
-// Build returns SQL with $n placeholders plus the matching arguments.
-func Build(f Filter) (string, []any, error) {
-	order, ok := orderBy[f.Sort]
-	if !ok {
-		return "", nil, fmt.Errorf("unsupported sort %q", f.Sort)
-	}
-	if f.Limit < 1 || f.Limit > 100 {
-		return "", nil, fmt.Errorf("limit %d not in 1..100", f.Limit)
-	}
-	var sql strings.Builder
-	args := []any{f.WorkspaceID}
-	sql.WriteString("SELECT id, number, status, total_minor, due_date FROM invoices WHERE workspace_id = $1")
-	if f.Status != "" {
-		args = append(args, f.Status)
-		fmt.Fprintf(&sql, " AND status = $%d", len(args))
-	}
-	args = append(args, f.Limit)
-	fmt.Fprintf(&sql, " ORDER BY %s LIMIT $%d", order, len(args))
-	return sql.String(), args, nil
-}
+```mermaid
+sequenceDiagram
+    participant U as Client
+    participant H as Go handler
+    participant B as Build
+    participant DB as Postgres
+    U->>H: GET /invoices?status=overdue' OR '1'='1&sort=-due_date&limit=20
+    H->>B: Filter{status: the evil string, sort: -due_date, limit: 20}
+    B->>B: look up -due_date in the whitelist, check limit 1..100
+    B-->>H: SQL with $1 $2 $3 + args [42, the evil string, 20]
+    H->>DB: Parse: the SQL text only
+    H->>DB: Bind: the three values, as data
+    Note over DB: the quote characters are part of a string value,<br/>never part of the statement
+    DB-->>H: zero rows (no status equals that string)
 ```
 
-The test that proves an injection attempt stays a value:
-
-```go
-func TestValuesTravelAsParameters(t *testing.T) {
-	evil := "overdue' OR '1'='1"
-	sql, args, err := Build(Filter{WorkspaceID: 42, Status: evil, Sort: "-due_date", Limit: 20})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "SELECT id, number, status, total_minor, due_date FROM invoices " +
-		"WHERE workspace_id = $1 AND status = $2 ORDER BY due_date DESC, id DESC LIMIT $3"
-	if sql != want {
-		t.Fatalf("sql:\n got %s\nwant %s", sql, want)
-	}
-	if !reflect.DeepEqual(args, []any{int64(42), evil, 20}) {
-		t.Fatalf("args = %#v", args)
-	}
-}
-```
-
-Two more tests check that placeholders renumber when the status filter is absent and that a sort key outside the map (`"due_date; DROP TABLE invoices"`) is rejected. The SQL it produces:
+The SQL it produces:
 
 ```sql
 SELECT id, number, status, total_minor, due_date FROM invoices
 WHERE workspace_id = $1 AND status = $2 ORDER BY due_date DESC, id DESC LIMIT $3
 ```
+
+A sort key outside the whitelist (`"due_date; DROP TABLE invoices"`) is rejected before any SQL exists. Runnable Go version: [[SQL Essentials - Go]]
 
 ## 5. Variants and comparison
 
@@ -587,4 +521,5 @@ The same question can often be written several ways. They differ in NULL behavio
 
 - **Before this:** nothing required. This note opens [[07 Databases MOC]].
 - **Next:** [[Relational Schema Design]], [[Transactions and ACID]], [[Indexing Fundamentals]]
+- **Code:** [[SQL Essentials - Go]] (schema DDL, long queries, the safe query builder with tests)
 - **Compare with:** [[SQL vs NoSQL]] (when not to use a relational store), [[Query Plans and EXPLAIN]] (how the planner executes what you declared), [[Pagination, Filtering and Sorting]] (keyset pagination)

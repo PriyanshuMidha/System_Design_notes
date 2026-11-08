@@ -22,6 +22,10 @@ updated: 2026-11-04
 > - interview questions
 > - a cheat sheet
 
+## Start here
+
+Open [[Study Index]]. It lists every topic in order with a checkbox, so you can work through the vault line by line.
+
 ## Learning map
 
 ```mermaid

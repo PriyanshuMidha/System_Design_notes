@@ -32,6 +32,24 @@ updated: 2026-11-02
 13. [[Performance Engineering and Capacity Planning]] · intermediate. The bottleneck loop and sizing a system against forecast load and its SLO.
 14. [[Production Readiness Review]] · advanced. The capstone checklist that gates a service before it takes real traffic.
 
+### Incident Playbooks
+
+What to do when a specific production problem hits. Each playbook covers the first 5 minutes, a diagnosis flowchart, the exact commands and PromQL, the fixes and prevention.
+
+- [[Playbook - High Latency]]
+- [[Playbook - Error Rate Spike (5xx)]]
+- [[Playbook - Database Overload and Connection Exhaustion]]
+- [[Playbook - Memory Leak and OOMKilled]]
+- [[Playbook - CPU Saturation]]
+- [[Playbook - Queue and Kafka Consumer Lag]]
+- [[Playbook - Cache Outage and Stampede]]
+- [[Playbook - Bad Deploy and Rollback]]
+- [[Playbook - Disk Full and Log Floods]]
+- [[Playbook - Third-Party Dependency Outage]]
+- [[Playbook - TLS Certificate and DNS Failures]]
+- [[Playbook - Traffic Spike and DDoS]]
+- [[Playbook - Data Inconsistency and Duplicate Processing]]
+
 ## Concept map
 
 ```mermaid

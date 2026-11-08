@@ -8,7 +8,7 @@ sources:
   - "Go standard library docs, package sort and package slices"
   - "Go source, cmd/compile and src/sort: pdqsort (pattern-defeating quicksort), introduced in Go 1.19"
   - "Orson Peters, pdqsort: Pattern-defeating Quicksort (2021)"
-updated: 2026-11-07
+updated: 2026-11-09
 ---
 
 # Sorting, Searching and Interview Patterns
@@ -31,29 +31,63 @@ Searching has the same shape: checking "is `x` present?" against an unsorted lis
 
 Most coding-interview problems are really asking "do you recognize which of these well-known patterns applies here," because the patterns turn a naive `O(n²)` or `O(2ⁿ)` brute force into something that runs in time for the given constraints.
 
+> [!tip] Remember
+> Sorting and most interview patterns are the same trade: pay a little more work up front (or recognize the right shape) so that every query or step afterward gets dramatically cheaper.
+
 ## 2. Mental model
 
 Think of sorting as the one-time cost of **organizing a library** so that later, finding any book by title is a quick jump to a shelf instead of scanning every book. Binary search is "open the book at the middle; is what you want earlier or later? Repeat on the half that matters" — exactly how a reader finds a word in a paper dictionary, and why it needs the dictionary to already be alphabetized.
 
 The interview patterns are mental shortcuts for recognizing shape: "two sorted things, converging from both ends" is two pointers; "a fixed- or variable-size window sliding across an array" is the sliding-window pattern; "I need many range sums fast" is prefix sums; "explore everything reachable, level by level" is BFS; "explore as deep as possible, then back out" is DFS or backtracking; "the answer to a big problem is built from the answers to smaller, overlapping versions of itself" is dynamic programming.
 
+```mermaid
+flowchart TD
+    Q["What shape is the problem?"] --> SORTED{"Two sorted arrays/sequences\nconverging toward each other?"}
+    SORTED -->|yes| TP["Two pointers"]
+    SORTED -->|no| WIN{"A contiguous run/window\nwith a size or sum condition?"}
+    WIN -->|yes| SW["Sliding window"]
+    WIN -->|no| RANGE{"Many range-sum queries\non a fixed array?"}
+    RANGE -->|yes| PS["Prefix sums"]
+    RANGE -->|no| GRAPH{"Explore a graph/grid:\nshortest path or just reachability?"}
+    GRAPH -->|shortest, unweighted| BFSN["BFS"]
+    GRAPH -->|reachability/order/cycles| DFSN["DFS"]
+    GRAPH -->|no| CHOICE{"Build from smaller,\noverlapping subproblems?"}
+    CHOICE -->|yes| DP["Dynamic programming"]
+    CHOICE -->|no, enumerate all configs| BT["Backtracking"]
+```
+
+> [!warning] Common mistake
+> Treating this flowchart as exhaustive. It covers the handful of patterns this note details; many problems combine two patterns (e.g. sort, then two pointers) or need a structure not listed here (a heap, a trie). Use it to narrow the search, not to replace reading the problem.
+
 ## 3. How it works
 
-### Comparison sorts and stability
+### In plain words: comparison sorts and the `O(n log n)` floor
 
-A **comparison sort** decides order only by comparing pairs of elements, and no comparison sort can do better than `O(n log n)` comparisons in the worst case — a result from a decision-tree argument (there are `n!` possible orderings, and each comparison provides at most one bit of information, so you need at least `log₂(n!) = O(n log n)` comparisons).
+A **comparison sort** decides order only by comparing pairs of elements — nothing more. It turns out no comparison sort can beat `O(n log n)` comparisons in the worst case, no matter how cleverly it's written.
+
+**Why:** there are `n!` possible orderings of `n` elements, and each comparison gives at most one bit of information (true/false). Distinguishing `n!` possibilities needs at least `log₂(n!)` bits of information, and `log₂(n!) = Θ(n log n)` by Stirling's approximation.
+
+**Example with numbers:** sorting just 10 elements has `10! ≈ 3.6 million` possible orderings. `log₂(3.6M) ≈ 22` — so even a perfect comparison sort needs roughly 22 comparisons in the worst case to pin down which of those 3.6 million orderings the input actually is.
+
+### Picture it: stability
 
 **Stability** means elements that compare equal keep their original relative order. It matters whenever you sort by one key but care about an earlier sort's order among ties — for example, sort a list of orders by customer, then (stably) by amount, and within a customer the orders stay time-ordered.
 
 ```mermaid
 flowchart LR
     In["Input: (A,30) (B,20) (C,30) (D,20)"] --> Stable["Stable sort by second field:\n(B,20) (D,20) (A,30) (C,30)\nB before D, A before C: input order kept among ties"]
-    In --> Unstable["Unstable sort by second field:\n(D,20) (B,20) (C,30) (A,30)\nties may be reordered — still correctly sorted, just not order-preserving"]
+    In --> Unstable["Unstable sort by second field:\n(D,20) (B,20) (C,30) (A,30)\nties may be reordered - still correctly sorted, just not order-preserving"]
 ```
+
+> [!warning] Common mistake
+> Assuming any sort that "looks right" on a quick test is stable. Both outputs above are correctly sorted by the second field — the only difference is tie order, which a small test is unlikely to catch unless it's specifically checking for it.
 
 Go's `slices.Sort` and the older `sort.Sort`/`sort.Slice` all use **pdqsort** (pattern-defeating quicksort) — a hybrid of quicksort, heapsort and insertion sort that picks good pivots, falls back to heapsort to avoid quicksort's `O(n²)` worst case, and detects already-sorted or few-distinct-value patterns to go faster on them. `sort.Sort`/`sort.Slice` switched to pdqsort in Go 1.19; the `slices` package (and `slices.Sort` with it) was added later, in Go 1.21, using the same algorithm from its first release. It is fast but **not stable**. `slices.SortStableFunc` and `sort.SliceStable` (an `O(n log n)` stable merge-based sort) exist specifically for when stability matters.
 
-### Binary search and `sort.Search`
+> [!tip] Remember
+> Fast and stable are in tension: pdqsort trades away stability for speed. If you ever depend on tie order, reach for `SortStableFunc`/`SliceStable` explicitly — never assume.
+
+### Picture it: binary search as a shrinking range
 
 Binary search works only on data where a yes/no condition is **monotonic** — all false values, then all true values (or vice versa), with no mixing. Each step halves the remaining range by checking the midpoint, giving `O(log n)` total steps.
 
@@ -67,7 +101,71 @@ flowchart TD
     P -- true --> MoveHi["hi = mid"] --> C
 ```
 
+**Example with numbers:** searching `nums = [1, 3, 5, 7, 9, 11]` for the first value `>= 6`. `lo=0, hi=6` → `mid=3`, `nums[3]=7 >= 6` so `hi=3`. `lo=0, hi=3` → `mid=1`, `nums[1]=3 < 6` so `lo=2`. `lo=2, hi=3` → `mid=2`, `nums[2]=5 < 6` so `lo=3`. Now `lo==hi==3`: answer is index 3 (value 7), found in 3 steps instead of scanning up to 6 elements.
+
 Go's `sort.Search(n, f)` is exactly this loop, generalized: it takes a length `n` and a predicate `f(i) bool` that must be false for some prefix and true for the rest, and returns the first index where `f` is true (or `n` if `f` is never true). This generalization is what lets the same function solve "find the first element `>= target`" **and** "binary search on the answer" problems — for example, "what's the smallest capacity that lets a ship carry all packages within `D` days?" — where the predicate is "does capacity `c` work?" instead of a simple comparison.
+
+### Picture it: two pointers converging
+
+```mermaid
+flowchart LR
+    subgraph arr["sorted array, target sum = 9"]
+        direction LR
+        A0["1"] --- A1["2"] --- A2["4"] --- A3["6"] --- A4["8"]
+    end
+    LO(["lo"]) -.-> A0
+    HI(["hi"]) -.-> A4
+```
+
+Walking it through: `1 + 8 = 9` on the first check — done in one step, because both pointers started at the ends and the sum happened to match immediately. If the sum is too small, `lo` moves right (toward larger values); if too large, `hi` moves left (toward smaller values) — each move discards one element permanently from consideration, which is why the whole pass is `O(n)`, not `O(n²)`.
+
+### Picture it: a sliding window
+
+```mermaid
+flowchart LR
+    W1["window: [2,1,5] sum=8"] -->|"slide right:\n+3, -2"| W2["window: [1,5,3] sum=9"]
+    W2 -->|"slide right:\n+7, -1"| W3["window: [5,3,7] sum=15"]
+```
+
+Each slide adds exactly one entering element and removes exactly one leaving element — the sum is updated incrementally, never recomputed from scratch, which is what keeps the whole scan at `O(n)` instead of `O(n·k)`.
+
+### Picture it: BFS vs DFS exploration order
+
+```mermaid
+flowchart TD
+    Root["start"] --> A["A"]
+    Root --> B["B"]
+    A --> C["C"]
+    A --> D["D"]
+    B --> E["E"]
+```
+
+- **BFS order:** start → A, B (both distance 1) → C, D, E (all distance 2). Every node at distance *k* is visited before any node at distance *k+1* — which is exactly why BFS is guaranteed to find the shortest path first in an unweighted graph.
+- **DFS order:** start → A → C (fully explore A's branch before touching B at all) → back out → D → back out → B → E. DFS commits to one branch as deep as possible before trying the next.
+
+> [!warning] Common mistake
+> Using DFS and expecting a shortest path. DFS has no distance guarantee at all — it can return *a* path, but not necessarily the shortest one. Shortest-path-in-an-unweighted-graph always means BFS.
+
+### Picture it: backtracking vs DP on overlapping subproblems
+
+```mermaid
+flowchart TD
+    subgraph BT["Backtracking: explore and undo"]
+        direction TB
+        n0["{}"] --> n1["{1}"] --> n2["{1,2}"]
+        n1 --> n3["{1} (2 excluded)"]
+        n0 --> n4["{} (1 excluded)"] --> n5["{2}"]
+    end
+    subgraph DP["DP: build from smaller answers, cached"]
+        direction TB
+        d0["dp[0]=0"] --> d1["dp[1] from dp[0]"] --> d2["dp[2] from dp[1],dp[0]"] --> d3["dp[3] from dp[2],dp[1]"]
+    end
+```
+
+Backtracking's tree branches into every possibility and prunes dead ends; DP never re-branches — it fills a table left to right, each cell built once from already-computed smaller cells, so no subproblem is ever solved twice.
+
+> [!tip] Remember
+> "How many ways" or "minimum cost" usually means DP (subproblems overlap and get cached); "list every valid configuration" usually means backtracking (every branch must actually be visited).
 
 ## 4. Worked example
 
@@ -90,209 +188,9 @@ func firstGE(nums []int, target int) int {
 }
 ```
 
-`sort.Search` below is this exact loop wrapped around an arbitrary predicate, which is why it can express both plain binary search and "binary search on the answer."
+`sort.Search` is this exact loop wrapped around an arbitrary predicate, which is why it can express both plain binary search and "binary search on the answer": pass `func(i int) bool { return nums[i] >= target }` and you get `firstGE` back for free, or pass `func(c int) bool { return shipFitsInDays(c, packages, D) }` and the same loop now searches over candidate *capacities* instead of array indices.
 
-**Representative output (Go 1.24, pdqsort via `slices.Sort`):**
-
-```go
-nums := []int{5, 2, 2, 8, 1}
-slices.Sort(nums)
-fmt.Println(nums) // [1 2 2 5 8] — correctly sorted; pdqsort gives no order guarantee among the two 2s
-```
-
-### Interview patterns, tested
-
-A Go package with one tested function per pattern. It compiles and passes `go vet` and `go test -race` on Go 1.24.
-
-**Two pointers** (converging from both ends of sorted data):
-
-```go
-// TwoSumSorted finds two indices in a sorted slice nums whose values
-// add to target, using the two-pointer pattern. O(n) time, O(1) extra
-// space.
-func TwoSumSorted(nums []int, target int) (int, int) {
-    lo, hi := 0, len(nums)-1
-    for lo < hi {
-        sum := nums[lo] + nums[hi]
-        switch {
-        case sum == target:
-            return lo, hi
-        case sum < target:
-            lo++
-        default:
-            hi--
-        }
-    }
-    return -1, -1
-}
-```
-
-**Sliding window** (a window of elements slides across the array, updating incrementally instead of recomputing):
-
-```go
-// MaxSubarraySum returns the largest sum of any contiguous window of
-// exactly k elements. O(n) time: the window slides one step at a
-// time, adding the entering element and removing the leaving one.
-func MaxSubarraySum(nums []int, k int) int {
-    if k <= 0 || k > len(nums) {
-        return 0
-    }
-    sum := 0
-    for i := 0; i < k; i++ {
-        sum += nums[i]
-    }
-    best := sum
-    for i := k; i < len(nums); i++ {
-        sum += nums[i] - nums[i-k]
-        if sum > best {
-            best = sum
-        }
-    }
-    return best
-}
-```
-
-**Prefix sums** (precompute once, answer range-sum queries in O(1)):
-
-```go
-// PrefixSums returns prefix[i] = sum(nums[0:i]); any range sum
-// nums[l:r] is prefix[r] - prefix[l] in O(1) after an O(n) precompute.
-func PrefixSums(nums []int) []int {
-    prefix := make([]int, len(nums)+1)
-    for i, v := range nums {
-        prefix[i+1] = prefix[i] + v
-    }
-    return prefix
-}
-```
-
-**BFS and DFS** (explore a graph or grid level-by-level, or depth-first):
-
-```go
-// NumIslands counts connected groups of '1' cells, flood-filling each
-// island with DFS. O(rows*cols): every cell is visited at most once.
-func NumIslands(grid [][]byte) int {
-    rows := len(grid)
-    if rows == 0 {
-        return 0
-    }
-    cols := len(grid[0])
-    seen := make([][]bool, rows)
-    for i := range seen {
-        seen[i] = make([]bool, cols)
-    }
-    var dfs func(r, c int)
-    dfs = func(r, c int) {
-        if r < 0 || r >= rows || c < 0 || c >= cols || seen[r][c] || grid[r][c] != '1' {
-            return
-        }
-        seen[r][c] = true
-        dfs(r+1, c)
-        dfs(r-1, c)
-        dfs(r, c+1)
-        dfs(r, c-1)
-    }
-    count := 0
-    for r := 0; r < rows; r++ {
-        for c := 0; c < cols; c++ {
-            if grid[r][c] == '1' && !seen[r][c] {
-                count++
-                dfs(r, c)
-            }
-        }
-    }
-    return count
-}
-
-// ShortestPathBFS returns the fewest edges from start to goal in an
-// unweighted graph, or -1 if unreachable. BFS visits nodes in
-// increasing distance order, so the first time it reaches goal is the
-// shortest path. O(V+E).
-func ShortestPathBFS(adj map[int][]int, start, goal int) int {
-    if start == goal {
-        return 0
-    }
-    dist := map[int]int{start: 0}
-    queue := []int{start}
-    for len(queue) > 0 {
-        cur := queue[0]
-        queue = queue[1:]
-        for _, next := range adj[cur] {
-            if _, seen := dist[next]; seen {
-                continue
-            }
-            dist[next] = dist[cur] + 1
-            if next == goal {
-                return dist[next]
-            }
-            queue = append(queue, next)
-        }
-    }
-    return -1
-}
-```
-
-**Backtracking and DP** (explore-and-undo vs. build-from-smaller-subproblems):
-
-```go
-// Subsets returns every subset of nums (the power set) by
-// backtracking: include or exclude nums[i], recurse, then undo. 2^n
-// subsets, so inherently O(2^n).
-func Subsets(nums []int) [][]int {
-    var out [][]int
-    var path []int
-    var backtrack func(i int)
-    backtrack = func(i int) {
-        if i == len(nums) {
-            cp := make([]int, len(path))
-            copy(cp, path)
-            out = append(out, cp)
-            return
-        }
-        backtrack(i + 1) // exclude nums[i]
-        path = append(path, nums[i])
-        backtrack(i + 1) // include nums[i]
-        path = path[:len(path)-1] // undo: the "backtrack" step
-    }
-    backtrack(0)
-    return out
-}
-
-// CoinChangeMinCoins returns the fewest coins summing to amount, or -1
-// if impossible. Bottom-up DP: dp[a] is built from smaller
-// sub-amounts, turning exponential brute force into O(amount*len(coins)).
-func CoinChangeMinCoins(coins []int, amount int) int {
-    const inf = 1 << 30
-    dp := make([]int, amount+1)
-    for i := 1; i <= amount; i++ {
-        dp[i] = inf
-    }
-    for a := 1; a <= amount; a++ {
-        for _, c := range coins {
-            if c <= a && dp[a-c]+1 < dp[a] {
-                dp[a] = dp[a-c] + 1
-            }
-        }
-    }
-    if dp[amount] == inf {
-        return -1
-    }
-    return dp[amount]
-}
-```
-
-```go
-func TestCoinChangeMinCoins(t *testing.T) {
-    if got := CoinChangeMinCoins([]int{1, 5, 10, 25}, 41); got != 4 { // 25+10+5+1
-        t.Fatalf("CoinChangeMinCoins(41) = %d, want 4", got)
-    }
-    if got := CoinChangeMinCoins([]int{5, 10}, 3); got != -1 {
-        t.Fatalf("CoinChangeMinCoins(3) = %d, want -1", got)
-    }
-}
-```
-
-**Measured:** the full test suite (`TestTwoSumSorted`, `TestMaxSubarraySum`, `TestPrefixSumsAndRangeSum`, `TestBinarySearchFirstGE`, `TestStableSortByAgeIsStable`, `TestNumIslands`, `TestShortestPathBFS`, `TestSubsets`, `TestCoinChangeMinCoins`) passes under `go test -race` (Go 1.24.4, darwin/arm64, 2026-11-06). `TestStableSortByAgeIsStable` confirms `sort.SliceStable` keeps equal-age people in input order; that test is the actual proof behind the stability claims above, not just an assertion.
+Runnable Go version (all six interview patterns, tested): [[Sorting, Searching and Interview Patterns - Go]]
 
 ## 5. Variants and comparison
 
@@ -331,7 +229,7 @@ func TestCoinChangeMinCoins(t *testing.T) {
 - **Failure modes → fixes:**
 	- Relying on `slices.Sort`'s output order for equal keys (it's pdqsort, unstable) → switch to `slices.SortStableFunc` or sort by a tiebreaker field explicitly.
 	- A sliding window that forgets to shrink from the left when the condition is violated → re-derive the window invariant (what must hold true inside the window) before coding, not after a bug report.
-	- Unmemoized recursive DP ("just recurse") blowing up exponentially on inputs that looked small in testing → add memoization or switch to the bottom-up tabulated form shown above.
+	- Unmemoized recursive DP ("just recurse") blowing up exponentially on inputs that looked small in testing → add memoization or switch to the bottom-up tabulated form shown in the Go note.
 - **What to monitor:**
 	- Sort/search hot paths: whether an `O(n log n)` sort runs once and is reused, versus accidentally re-sorting on every request.
 	- Backtracking/DP solvers used in request paths: wall-clock time or an iteration cap, since worst-case inputs can regress badly without a bound.
@@ -339,7 +237,7 @@ func TestCoinChangeMinCoins(t *testing.T) {
 ## 8. Deep dive
 
 - **Why `O(n log n)` is a hard floor for comparison sorts.** There are `n!` possible orderings of `n` elements, and a decision tree where each internal node is one comparison (two outcomes) needs at least `log₂(n!)` levels to distinguish all `n!` outcomes. By Stirling's approximation, `log₂(n!) = Θ(n log n)`. Non-comparison sorts (counting sort, radix sort) can beat this floor only because they exploit structure in the keys (small integer range, fixed-width keys) instead of comparing elements pairwise.
-- **How pdqsort avoids quicksort's `O(n²)` worst case.** Plain quicksort degrades to `O(n²)` on adversarial or already-sorted input with a naive pivot choice. pdqsort (the algorithm behind `sort.Sort`/`sort.Slice` since Go 1.19, and `slices.Sort` since the `slices` package's introduction in Go 1.21) picks pivots more carefully (median-of-three or median-of-medians on recursion), detects patterns like many equal elements or already-sorted runs and switches strategy, and falls back to heapsort entirely if it detects it's making bad progress (too many bad partitions) — guaranteeing `O(n log n)` worst case while staying fast on the common case. (Rust's standard library also ships a pdqsort-derived unstable sort; `verify:` whether any mainstream C++ `std::sort` implementation has adopted it, since GCC's libstdc++ and LLVM's libc++ have historically used introsort instead.)
+- **How pdqsort avoids quicksort's `O(n²)` worst case.** Plain quicksort degrades to `O(n²)` on adversarial or already-sorted input with a naive pivot choice. pdqsort (the algorithm behind `sort.Sort`/`sort.Slice` since Go 1.19, and `slices.Sort` since the `slices` package's introduction in Go 1.21) picks pivots more carefully (median-of-three or median-of-medians on recursion), detects patterns like many equal elements or already-sorted runs and switches strategy, and falls back to heapsort entirely if it detects it's making bad progress (too many bad partitions) — guaranteeing `O(n log n)` worst case while staying fast on the common case.
 - **"Binary search on the answer."** Many optimization problems ("minimum X such that condition holds") are solvable by binary searching over the space of possible answers rather than the input data, as long as the condition is monotonic in the candidate answer. `sort.Search`'s generalized signature (`func(i int) bool`) is built exactly for this: pass a predicate over candidate answers, not over array indices.
 - **DP state design is the real skill.** The hard part of dynamic programming is rarely the transition (`dp[a] = min(dp[a], dp[a-c]+1)`) — it's identifying what the state needs to capture so that the "optimal substructure" property holds (the optimal answer to a subproblem can be built purely from optimal answers to smaller subproblems, without needing to know how you got there). Getting the state definition wrong is the most common reason a DP solution produces a wrong answer that still "looks" like DP.
 - **Backtracking vs DP on the same problem.** Both explore a space of choices, but backtracking enumerates all valid configurations (and prunes dead branches), while DP collapses overlapping subproblems into a cache so the same sub-answer is never recomputed. A problem asking "how many ways" or "the minimum cost" is usually DP; a problem asking "list all valid configurations" is usually backtracking — recognizing which is being asked is often the actual interview signal.
@@ -383,3 +281,4 @@ func TestCoinChangeMinCoins(t *testing.T) {
 - **Before this:** [[Arrays and Dynamic Arrays (Go Slices)]], [[Complexity Analysis - Big-O and Amortized Cost]]
 - **Next:** [[Tries, Suffix Trees and Suffix Arrays]], [[Union-Find and Skip Lists]]
 - **Compare with:** [[Graphs and Graph Algorithms]] (BFS/DFS in full graph context), [[Heaps and Priority Queues]] (top-K and k-way merge patterns built on a heap instead of a sort)
+- **Runnable code:** [[Sorting, Searching and Interview Patterns - Go]]

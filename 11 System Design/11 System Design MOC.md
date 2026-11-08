@@ -57,6 +57,53 @@ Back to [[Home]].
 28. [[Case Study - Distributed Message Queue]] · advanced. Building Kafka: logs, partitions and replication.
 29. [[Case Study - Ad Click Aggregation]] · advanced. Windowed streaming counts with exactly-once results.
 
+### HLD Round and Decision Guides
+
+How to run the HLD round step by step, then one decision guide per big choice. Each guide has a flowchart, a comparison table, real-company examples and interview phrasing. Start with the step-by-step guide and the worked mock.
+
+- [[HLD Round - Complete Step-by-Step Guide]]
+- [[HLD Round - Full Worked Mock (Food Delivery App)]]
+- [[HLD Trade-offs Master Cheat Sheet]]
+- [[Choosing a Database - Decision Guide]]
+- [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]]
+- [[Choosing a Caching Strategy - Decision Guide]]
+- [[Choosing an API and Communication Style - Decision Guide]]
+- [[Choosing Consistency, Replication and Partitioning - Decision Guide]]
+- [[Choosing Storage for Files, Search and Analytics - Decision Guide]]
+- [[Choosing Compute, Scaling and Deployment - Decision Guide]]
+- [[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]]
+- [[Batch vs Stream - Lambda vs Kappa - Decision Guide]]
+- [[Staff-Level HLD Signals and Company Rubrics]]
+
+### HLD Concepts
+
+Cross-cutting ideas that come up in many designs.
+
+- [[Fan-out on Write vs Fan-out on Read]]
+- [[Batch Processing and Data Pipelines]]
+- [[Coordination and Configuration Services]]
+- [[Multi-Tenancy and Cell-Based Architecture]]
+- [[Security, Privacy and Compliance in HLD]]
+- [[Cost-Aware System Design]]
+
+### More case studies
+
+Practise these after the core case studies. Each one follows the same round flow.
+
+- [[Case Study - Distributed Cache]]
+- [[Case Study - Photo Sharing (Instagram)]]
+- [[Case Study - Collaborative Document Editor]]
+- [[Case Study - Hotel Reservation]]
+- [[Case Study - Stock Exchange]]
+- [[Case Study - Digital Wallet and Ledger]]
+- [[Case Study - Email Service]]
+- [[Case Study - Maps and Navigation]]
+- [[Case Study - Online Judge]]
+- [[Case Study - Live Comments and Reactions]]
+- [[Case Study - Distributed Counter (Likes and Views)]]
+- [[Case Study - Social Graph and Friend Recommendations]]
+- [[Case Study - Flash Sale and E-commerce Checkout]]
+
 ## Concept map
 
 ```mermaid

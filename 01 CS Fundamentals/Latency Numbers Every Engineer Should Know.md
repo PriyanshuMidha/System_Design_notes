@@ -1,6 +1,6 @@
 ---
 tags: [cs-fundamentals, performance, latency]
-level: basic
+level: intermediate
 status: reviewed
 prereqs: ["[[Memory Hierarchy and CPU Caches]]", "[[Storage Devices - HDD, SSD, NVMe]]"]
 related: ["[[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]", "[[TLS and HTTPS]]", "[[Complexity Analysis - Big-O and Amortized Cost]]"]
@@ -9,52 +9,88 @@ sources:
   - "JEDEC DDR5 standard and vendor datasheets (DDR5 timings, 2024-2025)"
   - "NVM Express Base Specification (NVMe latency figures)"
   - "Preshing on Programming, 'Numbers Every Programmer Should Know' (community-maintained update of Dean's figures)"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Latency Numbers Every Engineer Should Know
 
 > [!summary] TL;DR
-> Latency is the delay between making a request and getting the response; throughput is how many requests complete per second; bandwidth is the maximum data rate a channel can carry. Every operation a backend engineer touches — a CPU cache hit, a memory read, an SSD read, a network round trip — sits at a different, roughly order-of-magnitude point on a ladder from nanoseconds to seconds, and knowing the ladder lets you estimate a design's latency before you build it.
+> **Latency** is the delay between making a request and getting the response. **Throughput** is how many requests complete per second. **Bandwidth** is the maximum data rate a channel can carry. Every operation a backend engineer touches — a CPU cache hit, a memory read, an SSD read, a network round trip — sits at a different, roughly order-of-magnitude point on a ladder from nanoseconds to seconds (the full table is in "The latency ladder" below), and knowing that ladder lets you estimate a design's latency before you build it.
 
 > [!abstract] Core idea
-> - The latency ladder spans about 9 orders of magnitude, from a CPU cycle (~0.3 ns) to a cross-region round trip (~100+ ms).
-> - Each step up the ladder (L1 → RAM → SSD → network) costs roughly 10–1000× more than the step before it.
+> - The latency ladder spans about 9 orders of magnitude, from a CPU cycle (~0.3 ns) to a cross-region round trip (100+ ms).
+> - Each step up the ladder costs roughly 10–1,000× more than the step before it — not a small, steady increase, but a jump to a different *kind* of operation.
 > - Sequential access beats random access at every level, because it amortizes the fixed cost of "getting there" across more data.
 > - p50/p95/p99 latency, not the average, is what a backend engineer should actually budget and alert on — tails compound badly with fan-out.
-> - Little's Law (`L = λW`) connects arrival rate, time-in-system, and concurrent requests without needing to know the distribution.
+> - Little's Law (`L = λW`) connects arrival rate, time-in-system, and concurrent requests, without needing to know the distribution of either.
 
 ## 1. Why it exists
 
-A service that does one network call per request has a latency floor set by that one round trip. A service that does ten sequential database calls, each needing its own round trip, multiplies that floor by ten — and if each call is itself fanning out to further dependencies, the tail latency compounds further still. Without a mental ladder of "what costs what," it's easy to design an API that does 50 sequential 1 ms calls and ships a 50 ms p50 when a single well-designed batch call could have done it in 2 ms.
+A service that makes one network call per request has a latency floor set by that one round trip. A service that makes ten *sequential* database calls, each needing its own round trip, multiplies that floor by ten — and if each of those calls is itself fanning out to further dependencies, the tail latency compounds further still.
 
-Concretely: an in-region database round trip over a typical cloud network **(estimate: roughly 0.5–2 ms depending on network path and load)** is about 10,000–100,000× slower than an L1 cache hit (~1 ns), and a cross-continent round trip **(estimate: roughly 60–150 ms depending on exact distance and route)** is about 100× slower again than an in-region call. These ratios, more than any single absolute number, are what should guide architecture decisions like "should this be a local cache lookup or a network call."
+Without a mental ladder of "what costs what," it is easy to design an API that makes 50 sequential 1 ms calls and ships a 50 ms p50, when a single well-designed batch call could have done the same work in 2 ms. The ladder is what lets you catch that mistake on a whiteboard, before any code runs.
+
+Concretely: an in-region database round trip over a typical cloud network (an estimate: roughly 0.5–2 ms, depending on network path and load) is about 10,000–100,000× slower than an L1 cache hit (~1 ns). A cross-continent round trip (an estimate: roughly 60–150 ms, depending on exact distance and route) is about 100× slower again than an in-region call. These *ratios*, more than any single absolute number, are what should guide a decision like "should this be a local cache lookup, or a network call."
+
+> [!tip] Remember
+> You rarely need the exact nanosecond figures. You need the *ratios* between rungs of the ladder, because those ratios are what tell you whether a design choice costs 10× or 10,000×.
 
 ## 2. Mental model
 
-Imagine you need one fact. Is it already in your head (CPU register/cache — instant)? Is it on a sticky note on your desk (RAM — you reach for it, a few nanoseconds)? Is it in a filing cabinet in the next room (SSD — you get up and walk, microseconds to tens of microseconds)? Is it in a different building across town (same-region network call — over a millisecond)? Or is it in a different country, requiring you to mail a letter and wait for a reply (cross-continent round trip — tens to over a hundred milliseconds)? Each step is a different *kind* of operation, not just a slower version of the last one, and the cost of "getting there" dominates unless you bring back a lot of data each trip (sequential access).
+Imagine you need one fact. Is it already in your head (a CPU register or cache — instant)? Is it on a sticky note on your desk (RAM — you reach for it, a few nanoseconds)? Is it in a filing cabinet in the next room (SSD — you get up and walk, microseconds to tens of microseconds)? Is it in a different building across town (a same-region network call — over a millisecond)? Or is it in a different country, requiring you to mail a letter and wait for a reply (a cross-continent round trip — tens to over a hundred milliseconds)?
+
+Each step is a different *kind* of operation, not just a slower version of the last one, and the cost of "getting there" dominates unless you bring back a lot of data on each trip (sequential access).
+
+> [!warning] Common mistake
+> Stretching this analogy too far: in real hardware, "the next room" (an SSD) and "across town" (a network call) are not fundamentally different *mechanisms* in the way a building and a country are — they are both "ask something else and wait." The analogy's value is the order-of-magnitude intuition for *how long* each step takes, not a claim that each rung works nothing like the others.
 
 ## 3. How it works
 
 ### The latency ladder
 
+**In plain words.** Every operation a backend engineer deals with sits on one ladder, from "effectively instant" to "noticeably slow." Memorizing the exact numbers matters less than knowing roughly which rung an operation lands on, and that each rung up is a real jump, not a small increment.
+
+**Picture it.**
+
 ```mermaid
 flowchart TB
-    A["CPU cycle / register ~0.3 ns (documented: ~3 GHz clock)"] --> B["L1/L2 cache hit, branch mispredict<br/>~1-4 ns (documented: CPU vendor docs)"]
-    B --> C["L3 cache hit, main memory access<br/>~10-100 ns (documented: JEDEC DDR5 timing specs put DRAM access ~70-100 ns)"]
-    C --> D["Syscall / page fault / hashing small data<br/>~100 ns-1 µs (estimate, kernel-dependent)"]
-    D --> E["Context switch, 64 KB memcpy<br/>~1-10 µs (estimate, scheduler-dependent)"]
-    E --> F["NVMe SSD random read, 1 MB sequential RAM read<br/>~10-100 µs (documented: NVMe spec, 2025 vendor datasheets)"]
-    F --> G["SATA SSD write, intra-AZ round trip, Redis GET<br/>~100-1000 µs (estimate: typical cloud intra-AZ RTT)"]
-    G --> H["Inter-AZ/same-region round trip, HDD seek<br/>~1-10 ms (estimate: typical same-region RTT)"]
-    H --> I["Cross-continent round trip, 1 GB sequential RAM read<br/>~10-100 ms (estimate: geography-dependent RTT)"]
-    I --> J["bcrypt hashing, long-RTT TLS handshake, 1 GB SSD read<br/>~100-1000 ms (estimate: cost-factor- and device-dependent)"]
-    J --> K["1 GB over an in-region network link<br/>> 1 s (estimate, link-speed dependent)"]
+    A["CPU cycle / register<br/>~0.3 ns"] --> B["L1/L2 cache hit<br/>~1-4 ns"]
+    B --> C["L3 cache / main memory<br/>~10-100 ns"]
+    C --> D["Syscall / page fault<br/>~100 ns-1 us"]
+    D --> E["Context switch, 64 KB memcpy<br/>~1-10 us"]
+    E --> F["NVMe SSD random read<br/>~10-100 us"]
+    F --> G["Redis GET, intra-AZ round trip<br/>~100-1000 us"]
+    G --> H["Same-region round trip, HDD seek<br/>~1-10 ms"]
+    H --> I["Cross-continent round trip<br/>~10-100 ms"]
+    I --> J["bcrypt hash, long-RTT TLS handshake<br/>~100-1000 ms"]
 ```
 
-Each rung is labelled by kind, per the vault's accuracy rules: some are **documented** (hardware specs), some are reasoned **estimates** bounded by well-known physical limits (network RTT is bounded below by the speed of light in fiber, roughly 200,000 km/s, so a round trip to the literal antipode of Earth cannot be faster than about 133 ms no matter how good the network is).
+**Example — the canonical table**, with every number labelled by kind (documented hardware spec, or a reasoned estimate bounded by a known physical limit):
+
+| Rung | Operation | Typical cost | Kind |
+| --- | --- | --- | --- |
+| 1 | CPU cycle / register | ~0.3 ns | Documented (~3 GHz clock) |
+| 2 | L1/L2 cache hit, branch mispredict | ~1–4 ns | Documented (CPU vendor docs) |
+| 3 | L3 cache hit, main memory access | ~10–100 ns | Documented (JEDEC DDR5: ~70–100 ns) |
+| 4 | Syscall, page fault, hashing small data | ~100 ns–1 µs | Estimate (kernel-dependent) |
+| 5 | Context switch, 64 KB memcpy | ~1–10 µs | Estimate (scheduler-dependent) |
+| 6 | NVMe SSD random read, 1 MB sequential RAM read | ~10–100 µs | Documented (NVMe spec, 2025 vendor datasheets) |
+| 7 | SATA SSD write, intra-AZ round trip, Redis GET | ~100–1,000 µs | Estimate (typical cloud intra-AZ RTT) |
+| 8 | Inter-AZ/same-region round trip, HDD seek | ~1–10 ms | Estimate (typical same-region RTT) |
+| 9 | Cross-continent round trip, 1 GB sequential RAM read | ~10–100 ms | Estimate (geography-dependent) |
+| 10 | bcrypt hashing, long-RTT TLS handshake, 1 GB SSD read | ~100–1,000 ms | Estimate (cost-factor- and device-dependent) |
+| 11 | 1 GB over an in-region network link | > 1 s | Estimate (link-speed dependent) |
+
+**Why it matters.** A network round trip (rung 7–9) is not "a bit slower" than a memory access (rung 3) — it is 10,000 to 1,000,000 times slower. A design that turns one memory lookup into one network call per request has just paid for that entire jump, on every single request.
+
+> [!tip] Remember
+> This table is the one place in this note with the full numbers. Everywhere else, point back here instead of restating the ladder.
 
 ### A cold HTTPS request, hop by hop
+
+**In plain words.** Before a server can answer a brand-new HTTPS request, the client and server must first agree on where to connect, then agree on an encrypted channel, and only then exchange the actual request and response. Each of those agreements costs at least one full round trip.
+
+**Picture it.**
 
 ```mermaid
 sequenceDiagram
@@ -77,143 +113,83 @@ sequenceDiagram
     S-->>C: 200 OK
 ```
 
-Before the first byte of actual response data, a cold connection pays for a DNS lookup (if not cached), one RTT for the TCP handshake, one RTT for TLS 1.3 (TLS 1.2 needs two), and one more RTT for the HTTP request itself — a minimum of **three RTTs** even before counting server processing time. This is exactly why connection reuse (keep-alive, HTTP/2 multiplexing) and DNS caching matter so much for perceived latency; see [[TLS and HTTPS]] for the handshake mechanics.
+**Example.** Before the first byte of actual response data, a cold connection pays for a DNS lookup (if not cached), one round trip for the TCP handshake, one round trip for TLS 1.3 (TLS 1.2 needs two), and one more round trip for the HTTP request itself — a minimum of **three round trips** before counting server processing time at all.
+
+**Why it matters.** This is exactly why connection reuse (keep-alive, HTTP/2 multiplexing) and DNS caching matter so much for perceived latency: they let you pay this cost once per connection instead of once per request. See [[TLS and HTTPS]] for the handshake mechanics.
+
+### p50, p95, p99: why the average lies
+
+**In plain words.** The **average** (mean) latency can look perfectly healthy while a meaningful slice of real users have a terrible experience. A **percentile** answers a sharper question: "what latency do the slowest X% of requests exceed?"
+
+**Picture it.**
+
+```mermaid
+flowchart LR
+    subgraph dist["1,000 sorted latency samples, fastest to slowest"]
+        direction LR
+        P50["500th sample:<br/>p50 (median)"] --> P95["950th sample:<br/>p95"] --> P99["990th sample:<br/>p99"] --> Tail["worst few:<br/>the long tail"]
+    end
+```
+
+**Example.** A system with a 5 ms average and a 2-second p999 (the 0.1% slowest) will feel broken to that unlucky one-in-a-thousand user, even though "5 ms average" looks great on a dashboard that only shows the mean. Measured on this note's own code (Go 1.24.4, 2026-11-09): on the skewed sample set `{1,1,1,1,1,1,1,1,2,50}`, the p50 is `1` while the p99 is `45.68` — the tail is nearly 46× the median on a batch of only ten numbers.
+
+**Why it matters.** Alerting on the average hides exactly the users you most need to notice: the ones having the worst experience. Alert on p95/p99/p999 instead.
+
+> [!tip] Remember
+> The average tells you about the typical request. The tail tells you about the request that will make someone complain.
+
+### Why fan-out makes the tail worse, not just the average
+
+**In plain words.** A single downstream call that is slow only 1% of the time looks fine in isolation. But if a request fans out to 100 *independent* such calls and needs all of them to finish, the chance that *at least one* is slow approaches certainty.
+
+**Picture it.**
+
+```mermaid
+flowchart TB
+    R["One incoming request"] --> D1["Dependency 1<br/>99% fast"]
+    R --> D2["Dependency 2<br/>99% fast"]
+    R --> DN["... 98 more dependencies<br/>each 99% fast"]
+    D1 --> Agg{"Aggregator waits<br/>for all 100"}
+    D2 --> Agg
+    DN --> Agg
+    Agg --> Slow["63.4% of aggregate requests<br/>see at least one slow leg"]
+```
+
+**Example.** If each of `n` independent downstream calls is slow with probability `p = 0.01` (its own 1% tail), the probability that at least one of them is slow is `1 - (1-p)^n`. At `n = 100`, that works out to about 63.4% — measured directly from this note's own code (`FanOutP99(100) = 0.634`, Go 1.24.4, 2026-11-06).
+
+**Why it matters.** The aggregator's observed p99 is dominated by this compounding effect, not by the tail of any single dependency. This is one of the core arguments for keeping fan-out shallow, setting aggressive per-call timeouts, and using hedged requests (firing a duplicate request to a different replica if the first hasn't answered by some threshold).
+
+> [!warning] Common mistake
+> Assuming that because every individual dependency "looks healthy" (each at or above its own p99 SLA), the aggregate request must also be healthy. The math says otherwise once you fan out to more than a handful of independent legs.
+
+### Little's Law connects concurrency to the ladder
+
+**In plain words.** If you know how fast requests arrive, and how long each one takes to finish, you can compute how many are in flight *at any given moment* — without knowing anything else about the distribution of either.
+
+**Picture it.**
+
+```mermaid
+flowchart LR
+    Lam["arrival rate (lambda)<br/>requests/sec"] --> Mult["L = lambda * W"]
+    W["time in system (W)<br/>seconds per request"] --> Mult
+    Mult --> L["L: average number<br/>of in-flight requests"]
+```
+
+**Example.** A service handling 1,000 requests/sec, where each request takes 50 ms (0.05 s) end to end, has on average `1,000 × 0.05 = 50` requests in flight at once — matching `LittlesLaw(1000, 0.05) = 50` in the Go note's own test.
+
+**Why it matters.** This tells you the minimum concurrency (goroutines, connections, worker threads) a service needs to sustain that load without queuing. Undersizing that pool causes requests to queue, which raises `W`, which (by the same formula) raises `L` further — a feedback loop that gets worse, not better, on its own.
 
 ## 4. Worked example
 
 ### Whiteboard version
 
-A service budget: if your API's SLA is 100 ms p99 and it makes one sequential in-region database call at roughly 1 ms, you have about 99 ms of headroom for everything else — application logic, serialization, and any other calls. If it makes ten such calls *sequentially* instead of in parallel, that floor alone is 10 ms, eating a tenth of the budget before any real work happens. This is why "N+1 query" bugs are a latency problem, not just a database-load problem.
-
-### Why fan-out makes the tail worse, not just the average
-
-A single downstream call that is slow (above its own p99) only 1% of the time looks fine in isolation. But if a request fans out to 100 *independent* such calls and needs all of them, the chance that *at least one* is slow approaches certainty:
-
 ```go
-// Package latency has small, dependency-free helpers for the two things a
-// backend engineer actually does with latency numbers: compute percentiles
-// from a batch of measurements, and reason about fan-out with Little's Law.
-package latency
-
-import "sort"
-
-// Percentile returns the p-th percentile (0 <= p <= 100) of samples using
-// nearest-rank interpolation, the same method Go's own benchmarking tools
-// and most APM agents use for p50/p95/p99 dashboards. samples is sorted
-// in place.
-func Percentile(samples []float64, p float64) float64 {
-	if len(samples) == 0 {
-		return 0
-	}
-	sort.Float64s(samples)
-	if p <= 0 {
-		return samples[0]
-	}
-	if p >= 100 {
-		return samples[len(samples)-1]
-	}
-	rank := p / 100 * float64(len(samples)-1)
-	lo := int(rank)
-	hi := lo + 1
-	if hi >= len(samples) {
-		return samples[lo]
-	}
-	frac := rank - float64(lo)
-	return samples[lo] + frac*(samples[hi]-samples[lo]) // linear interpolation between ranks
-}
-
-// FanOutP99 estimates the probability that at least one of n parallel
-// downstream calls exceeds the given per-call p99 latency, assuming the
-// calls are independent. This is why a request that fans out to many
-// services sees a far worse tail than any one of them: at n=100 a
-// per-call 1%-of-requests-slow rate becomes "almost every request
-// has a slow leg".
-func FanOutP99(n int) float64 {
-	pFast := 0.99 // probability a single call is at or under its own p99
-	allFast := 1.0
-	for i := 0; i < n; i++ {
-		allFast *= pFast
-	}
-	return 1 - allFast // probability at least one of the n calls is slow
-}
-
-// LittlesLaw returns the average number of in-flight requests L, given the
-// arrival rate lambda (requests/sec) and the average time W (seconds) each
-// one spends in the system: L = lambda * W. It holds for any stable queue,
-// regardless of the arrival or service distribution.
-func LittlesLaw(lambdaPerSec, wSeconds float64) float64 {
-	return lambdaPerSec * wSeconds
-}
+func Percentile(samples []float64, p float64) float64
 ```
 
-Test, passing under `go test -race` on Go 1.24.4:
+A service budget: if your API's SLA is 100 ms p99 and it makes one sequential in-region database call at roughly 1 ms, you have about 99 ms of headroom for everything else — application logic, serialization, and any other calls. If it makes ten such calls *sequentially* instead of in parallel, that floor alone is 10 ms, eating a tenth of the budget before any real work happens. This is why an "N+1 query" bug is a latency problem, not just a database-load problem — see [[N+1 Query Problem]].
 
-```go
-package latency
-
-import (
-	"math"
-	"testing"
-)
-
-func TestPercentileKnownValues(t *testing.T) {
-	// 1..101, so p50 lands exactly on 51 and p99 near the top.
-	samples := make([]float64, 101)
-	for i := range samples {
-		samples[i] = float64(i + 1)
-	}
-	if got := Percentile(samples, 50); got != 51 {
-		t.Fatalf("p50 = %v, want 51", got)
-	}
-	if got := Percentile(samples, 0); got != 1 {
-		t.Fatalf("p0 = %v, want 1", got)
-	}
-	if got := Percentile(samples, 100); got != 101 {
-		t.Fatalf("p100 = %v, want 101", got)
-	}
-}
-
-func TestPercentileTailIsWorseThanMedian(t *testing.T) {
-	// A realistic skewed latency distribution: mostly fast, a long tail.
-	samples := []float64{1, 1, 1, 1, 1, 1, 1, 1, 2, 50}
-	p50 := Percentile(append([]float64{}, samples...), 50)
-	p99 := Percentile(append([]float64{}, samples...), 99)
-	if p99 <= p50 {
-		t.Fatalf("p99 (%v) should exceed p50 (%v) on a skewed distribution", p99, p50)
-	}
-}
-
-func TestFanOutP99GrowsWithN(t *testing.T) {
-	// Single call: by definition 1% exceed their own p99.
-	if got := FanOutP99(1); math.Abs(got-0.01) > 1e-9 {
-		t.Fatalf("FanOutP99(1) = %v, want 0.01", got)
-	}
-	// Fanning out to 100 independent legs: almost certain one is slow.
-	got := FanOutP99(100)
-	if got < 0.6 {
-		t.Fatalf("FanOutP99(100) = %v, want a large majority of requests to see a slow leg", got)
-	}
-	// Monotonic: more fan-out never makes the tail better.
-	if FanOutP99(50) >= FanOutP99(51) {
-		t.Fatalf("FanOutP99 must strictly increase with n")
-	}
-}
-
-func TestLittlesLaw(t *testing.T) {
-	// 1000 req/s, each held for 50ms (0.05s) of server time:
-	// on average 50 requests are in flight at once.
-	got := LittlesLaw(1000, 0.05)
-	if got != 50 {
-		t.Fatalf("LittlesLaw(1000, 0.05) = %v, want 50", got)
-	}
-}
-```
-
-**Measured** (this code, Go 1.24.4, 2026-11-06): `FanOutP99(100) = 0.634` — with each of 100 independent downstream legs slow only 1% of the time, 63.4% of fanned-out requests see at least one slow leg. This is why p99 latency at the edge of a system is usually far worse than the p99 of any single internal hop.
-
-### Measuring latency in Go
-
-`time.Since(start)` around a call gives a single sample; collecting enough samples and feeding them to a histogram (or the `Percentile` function above) gives the distribution that actually matters. `net/http/pprof` and `runtime/trace` let you see where wall-clock time goes inside a Go process without guessing — see [[Latency, Percentiles and Bottleneck Analysis]] for the full debugging workflow.
+Runnable Go version: [[Latency Numbers Every Engineer Should Know - Go]]
 
 ## 5. Variants and comparison
 
@@ -229,25 +205,28 @@ A system can have high throughput and bad latency at the same time (lots of para
 
 ## 6. Trade-offs and when not to use
 
-- Chasing average latency is often misleading: a system with a 5 ms average and a 2-second p999 will feel broken to the unlucky 0.1% of users even though the average "looks fine" on a dashboard.
-- Optimizing for lower latency per call sometimes trades off against throughput (e.g. disabling batching to respond faster per-request means doing more total round trips) — know which one your SLA actually demands.
-- Back-of-envelope ladder numbers are for *design-time* estimation, not a substitute for measuring your actual system; real numbers vary with hardware generation, load, and contention.
+- Chasing average latency is often misleading — see "p50, p95, p99" above. A dashboard that only shows the mean can look healthy while 1% of users have a terrible experience.
+- Optimizing for lower latency per call sometimes trades off against throughput: disabling batching to respond faster per request means doing more total round trips. Know which one your SLA actually demands.
+- The ladder numbers are for *design-time* estimation, not a substitute for measuring your actual system. Real numbers vary with hardware generation, load, and contention.
+
+> [!warning] Common mistake
+> Quoting a ladder number as if it were measured on your own system. Every number in the table above is labelled documented or estimate for a reason — treat it as a planning tool, and measure your actual service before trusting a specific number in production.
 
 ## 7. In production
 
 - **Real systems:** CDNs and edge caching exist specifically to turn a cross-continent round trip into an intra-region one for static content. Database connection pooling and HTTP keep-alive exist to amortize the TCP/TLS handshake cost shown in the sequence diagram above across many requests instead of paying it per request.
 - **Failure modes → fixes:**
-	- N+1 query pattern (one query per row of an earlier result) turns "1 round trip" into "1 + N round trips" → batch into a single query or use a data-loader pattern.
-	- A single slow downstream dependency drags down an otherwise-fast aggregator due to fan-out (see the `FanOutP99` math) → set per-call timeouts and use hedged requests or partial-response patterns so one slow leg doesn't block the whole response.
-	- A "fast" average hides a bad tail caused by GC pauses, lock contention, or noisy-neighbor CPU steal → alert on p99/p999, not just mean or p50.
+  - N+1 query pattern (one query per row of an earlier result) turns "1 round trip" into "1 + N round trips" → batch into a single query, or use a data-loader pattern.
+  - A single slow downstream dependency drags down an otherwise-fast aggregator due to fan-out (see "Why fan-out makes the tail worse" above) → set per-call timeouts and use hedged requests or partial-response patterns, so one slow leg doesn't block the whole response.
+  - A "fast" average hides a bad tail caused by GC pauses, lock contention, or noisy-neighbor CPU steal → alert on p99/p999, not just mean or p50.
 - **What to monitor:** p50/p95/p99/p999 latency per endpoint and per downstream dependency; RTT between regions/AZs as a baseline; queue depth and in-flight request count (both of which Little's Law connects directly to observed latency).
 
 ## 8. Deep dive
 
-- **Little's Law (`L = λW`)** says the average number of requests in a system equals the arrival rate times the average time each spends in the system. It requires no assumption about the distribution of arrivals or service times — only that the system is stable (arrivals don't exceed capacity long-term). Practically: if you know your service handles 1,000 req/s and each request takes 50 ms end-to-end, you know you need to support roughly 50 requests in flight concurrently (goroutines, connections, threads) at steady state — undersizing that pool causes requests to queue and latency to climb further, a feedback loop.
-- **Why sequential I/O beats random I/O** at every layer of the ladder is the same underlying reason: there is a fixed "getting there" cost (seek, RTT, cache-line fill) paid once per access, and sequential access amortizes it over more useful bytes per access, while random access pays it again and again for small amounts of data each time.
-- **Tail latency amplification**: as shown by `FanOutP99`, the probability that *at least one* of `n` independent legs is slow rises quickly with `n` even if each leg is individually well-behaved — this is one of the core arguments for keeping fan-out shallow, setting aggressive per-call timeouts, and using techniques like hedged requests (fire a duplicate request to a different replica if the first hasn't answered by some threshold).
-- **Latency budgets per hop**: a well-designed system assigns each hop in a request's path (load balancer → service → cache → database) an explicit slice of the total SLA, so that no single hop can silently consume the whole budget; this is standard practice at large-scale systems and is usually enforced via per-hop timeouts that sum to less than the end-to-end SLA.
+- **Why sequential I/O beats random I/O** at every layer of the ladder, for the same underlying reason each time: there is a fixed "getting there" cost (seek, RTT, cache-line fill) paid once per access, and sequential access amortizes it over more useful bytes per access, while random access pays it again and again for small amounts of data each time.
+- **Latency budgets per hop.** A well-designed system assigns each hop in a request's path (load balancer → service → cache → database) an explicit slice of the total SLA, so that no single hop can silently consume the whole budget. This is standard practice at large-scale systems, usually enforced via per-hop timeouts that sum to less than the end-to-end SLA.
+- **The physical floor on cross-region latency.** Signals in fiber travel at roughly two-thirds the speed of light in vacuum (~200,000 km/s). A round trip between two points separated by, say, 10,000 km therefore cannot be faster than about 100 ms no matter how good the network hardware or routing is — a genuine physical floor, which is why reducing cross-region latency requires moving the data or compute closer (CDNs, regional replicas, edge compute), not faster cables.
+- **Measuring latency in Go.** `time.Since(start)` around a call gives a single sample; collecting enough samples and feeding them to a histogram (or the `Percentile` function in the Go note) gives the distribution that actually matters. `net/http/pprof` and `runtime/trace` let you see where wall-clock time goes inside a Go process without guessing — see [[Latency, Percentiles and Bottleneck Analysis]] for the full debugging workflow.
 
 ## 9. Interview questions
 
@@ -258,7 +237,7 @@ A system can have high throughput and bad latency at the same time (lots of para
 > Average latency can look fine while a meaningful fraction of requests are much slower — a 5 ms average with a 500 ms p99 still means 1% of users have a terrible experience. Tail latency also compounds across fan-out: if a request depends on several downstream calls, the overall request is only as fast as its slowest dependency, so the tail of the whole system is often worse than the tail of any single component.
 
 > [!question]- Trap: TLS always adds exactly one extra round trip before the first byte of a response. True or false?
-> False, depends on the TLS version. TLS 1.3 needs one round trip for its handshake; TLS 1.2 needs two. Also, if the client has a cached session (TLS session resumption / 0-RTT in some configurations), the handshake cost can be lower still. The "1 round trip" figure is specifically for a cold TLS 1.3 handshake.
+> False, it depends on the TLS version. TLS 1.3 needs one round trip for its handshake; TLS 1.2 needs two. Also, if the client has a cached session (TLS session resumption, or 0-RTT in some configurations), the handshake cost can be lower still. The "1 round trip" figure is specifically for a cold TLS 1.3 handshake.
 
 > [!question]- How does Little's Law help with capacity planning?
 > `L = λW` relates the average number of in-flight requests (`L`) to the arrival rate (`λ`) and average time-in-system (`W`). Given a target throughput and a measured or expected latency, you can compute the concurrency (connections, goroutines, worker threads) a service needs to sustain that load, and conversely, if you know your concurrency limit and measured latency, you can derive the maximum throughput the service can sustain before requests start queuing.
@@ -267,20 +246,19 @@ A system can have high throughput and bad latency at the same time (lots of para
 > If each of `n` independent downstream calls is slow only with small probability `p`, the chance that at least one of them is slow is `1 - (1-p)^n`, which grows quickly with `n`. At `n = 100` and `p = 0.01`, about 63% of aggregate requests will have at least one slow leg — so the aggregator's observed tail latency is dominated by this compounding effect, not by any single dependency's own tail.
 
 > [!question]- Give a rough latency ratio between an L1 cache hit, a DRAM access, and an NVMe SSD read.
-> Roughly 1 : 30 : 10,000 in order of magnitude terms — an L1 hit is about 1 ns, a DRAM access is documented in the tens-to-low-hundreds of nanoseconds (DDR5 specs put it around 70–100 ns), and an NVMe read lands in the tens-of-microseconds range. The exact numbers shift with hardware generation, but the roughly 10–100× jump between each tier is the stable, interview-relevant fact.
+> Roughly 1 : 30 : 10,000 in order-of-magnitude terms — an L1 hit is about 1 ns, a DRAM access is documented in the tens-to-low-hundreds of nanoseconds (DDR5 specs put it around 70–100 ns), and an NVMe read lands in the tens-of-microseconds range. The exact numbers shift with hardware generation, but the roughly 10–100× jump between each tier is the stable, interview-relevant fact.
 
 > [!question]- Why is the minimum possible cross-continental round trip bounded below by physics, not engineering?
-> Signals in fiber travel at roughly two-thirds the speed of light in vacuum (~200,000 km/s). A round trip between two points separated by, say, 10,000 km therefore cannot be faster than about 100 ms no matter how good the network hardware or routing is — this is a genuine physical floor, which is why reducing cross-region latency requires moving the data or compute closer (CDNs, regional replicas, edge compute), not faster cables.
+> Signals in fiber travel at roughly two-thirds the speed of light in vacuum. A round trip between two points separated by, say, 10,000 km therefore cannot be faster than about 100 ms no matter how good the network hardware or routing is — this is a genuine physical floor, which is why reducing cross-region latency requires moving the data or compute closer, not faster cables.
 
 ## 10. Cheat sheet
 
-- Ladder, in order of magnitude: CPU cycle (~0.3 ns) → L1/L2 cache (~1–4 ns) → L3/DRAM (~10–100 ns) → syscall/hashing (~100 ns–1 µs) → context switch/memcpy (~1–10 µs) → NVMe read (~10–100 µs) → intra-AZ RTT/Redis GET (~100 µs–1 ms) → same-region RTT/HDD seek (~1–10 ms) → cross-continent RTT (~10–100 ms) → bcrypt/long-RTT TLS (~100–1000 ms).
+- Full ladder: see "The latency ladder" table above — CPU cycle at the top, network round trips and disk-scale reads at the bottom, about 9 orders of magnitude apart.
 - Cold HTTPS request pays DNS (if uncached) + 1 RTT TCP + 1 RTT TLS 1.3 (2 for TLS 1.2) + 1 RTT HTTP before the first response byte.
 - `throughput`, `latency`, and `bandwidth` are three different axes; Little's Law (`L = λW`) is what connects concurrency to the other two.
-- Alert on p95/p99/p999, not average; tails compound badly across fan-out.
-- `FanOutP99(n)` formalizes why aggregating many parallel dependencies makes tail latency worse even when each dependency looks fine alone.
-- Sequential access beats random access everywhere on the ladder because it amortizes the fixed "getting there" cost over more data.
-- Cross-region latency has a real physical floor (speed of light in fiber); you fix it by moving data/compute closer, not by better engineering of the link itself.
+- Alert on p95/p99/p999, not average; tails compound badly across fan-out (`FanOutP99(100) ≈ 0.63` at a 1% per-call tail rate).
+- Sequential access beats random access everywhere on the ladder, because it amortizes the fixed "getting there" cost over more data.
+- Cross-region latency has a real physical floor (speed of light in fiber); fix it by moving data/compute closer, not by better-engineering the link itself.
 - Label every latency number you quote as measured, documented, or an estimate — never state a number you can't back up one of those three ways.
 
 ## Links
@@ -288,3 +266,4 @@ A system can have high throughput and bad latency at the same time (lots of para
 - **Before this:** [[Memory Hierarchy and CPU Caches]], [[Storage Devices - HDD, SSD, NVMe]]
 - **Next:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]], [[TLS and HTTPS]]
 - **Compare with:** [[Complexity Analysis - Big-O and Amortized Cost]] (algorithmic cost vs. real-world wall-clock cost)
+- **Runnable Go version:** [[Latency Numbers Every Engineer Should Know - Go]]

@@ -19,7 +19,7 @@ sources:
   - "Bronson et al., TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC 2013)"
   - "Corbett et al., Spanner: Google's Globally-Distributed Database (OSDI 2012)"
   - "AWS What's New, Amazon Aurora PostgreSQL Limitless Database is generally available (2024-10-31)"
-updated: 2026-11-02
+updated: 2026-11-07
 ---
 
 # SQL vs NoSQL
@@ -70,6 +70,21 @@ Deeper notes: [[NoSQL Data Modeling]], [[Wide-Column Stores and Cassandra]], [[S
 - **Schema-on-write** (Postgres): the database rejects a row with a missing column or a wrong type at insert time. Changing the shape takes a migration ([[Zero-Downtime Schema Migrations]]).
 - **Schema-on-read** (MongoDB, DynamoDB): the store accepts any document, and every reader must handle every shape ever written: v1 invoices without `currency`, v2 with it. The schema still exists; it moved into your code and your tests. MongoDB can enforce one with optional `$jsonSchema` validation.
 
+```mermaid
+flowchart LR
+    subgraph w["Schema-on-write: Postgres"]
+        direction TB
+        W1["INSERT without currency"] --> W2["rejected at write time:<br/>NOT NULL violation"]
+    end
+    subgraph r["Schema-on-read: document store"]
+        direction TB
+        R1["v1 document: no currency"] --> R3["every reader needs:<br/>currency = doc.currency or 'INR'"]
+        R2["v2 document: currency present"] --> R3
+    end
+```
+
+Example with numbers: if 2 million v1 invoices exist and v2 adds `currency`, a relational migration touches 2 million rows once (see [[Zero-Downtime Schema Migrations]]). A document store touches none, but every reader has to handle both shapes for as long as v1 documents exist.
+
 ### Normalized joins vs denormalized aggregates
 
 ```mermaid
@@ -93,6 +108,21 @@ flowchart LR
 The document wins the read; the relational model wins the update and every query nobody planned for ("all unpaid items mentioning 'logo' across clients"). One subtlety: an issued invoice *should* keep the billing address it was issued with, so copying it into the invoice is the correct model in both worlds, not a denormalization. See [[Relational Schema Design]].
 
 ### ACID vs BASE
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant P as Primary
+    participant R as Replica
+    U->>P: save invoice INV-102 (payment recorded)
+    P-->>U: ok (committed on the primary)
+    P--)R: replicate asynchronously
+    U->>R: reload the page (read goes to the replica)
+    R-->>U: old data: payment missing
+    Note over R: about 50 ms later the change arrives:<br/>eventually consistent
+    U->>P: strongly consistent read (primary, or ConsistentRead=true)
+    P-->>U: new data
+```
 
 - **ACID** (atomicity, consistency, isolation, durability) is the relational default: [[Transactions and ACID]].
 - **BASE** (*basically available, soft state, eventually consistent*), named by Pritchett in 2008, accepts that replicas and derived copies are briefly out of date in exchange for availability and partition tolerance.
@@ -119,6 +149,12 @@ flowchart TB
         direction LR
         PK["choose the partition key"] --> AN["add nodes; data rebalances"] --> Q["queries without the key:<br/>secondary index, scatter-gather, or a new table"]
     end
+```
+
+```mermaid
+flowchart LR
+    Q1["query WITH the partition key<br/>invoice_id = 42"] --> H["hash(42) picks node 3"] --> N3["node 3 answers"]
+    Q2["query WITHOUT the key<br/>status = overdue"] --> SG["scatter to nodes 1..N"] --> M["gather and merge:<br/>latency = slowest node"]
 ```
 
 A partitioned store scales writes from the start, but every hot query must carry the partition key. Sharded SQL has exactly the same rule once you shard: the tenant id must be in every query. See [[Partitioning and Sharding]].
@@ -181,9 +217,19 @@ The full worked example below goes pattern by pattern through InvoiceOps with ra
 | 5 | Invoice activity timeline, newest first                                          | 20M rows/month | append, range scan per invoice              | Postgres table partitioned by month                        |
 | 6 | Per-workspace custom fields (PO number, project code)                            | with #1–#2   | flexible keys, filter by one of them          | Postgres `jsonb`                                           |
 
+```mermaid
+flowchart LR
+    P1["1 Record a payment<br/>3 tables, one transaction"] --> PG[("PostgreSQL primary")]
+    P2["2 Overdue list, 200/s"] --> PG
+    P3["3 Revenue by country"] --> RE[("Postgres replica")]
+    P5["5 Activity timeline<br/>20M rows/month"] --> PT[("Postgres, partitioned by month")]
+    P6["6 Custom fields"] --> PG
+    P4["4 Session by token, 2,000/s, TTL"] --> RD[("Redis")]
+```
+
 **Back-of-envelope (estimate):** 10,000 workspaces × 100 invoices a month = 1M invoices a month, about 0.4 inserts per second on average. Even a 100× peak is 40 per second. Storage is about 1M × (1 KB invoice + 5 items × 200 B) ≈ 2 GB a month. One Postgres primary with a replica handles this with large headroom, so the core stays relational.
 
-**Pattern 6 without a second database:**
+**Pattern 6 without a second database.** The custom fields live in one `jsonb` column; a GIN index serves containment queries on it.
 
 ```sql
 ALTER TABLE invoices ADD COLUMN custom_fields jsonb NOT NULL DEFAULT '{}';
@@ -197,6 +243,14 @@ WHERE workspace_id = 42
 ```
 
 `jsonb_path_ops` indexes containment (`@>`) compactly. The workspace keeps its fields; the payment logic keeps its constraints.
+
+```mermaid
+flowchart TD
+    M["Which pattern outgrows Postgres?"] --> A{"Dominant shape"}
+    A -->|"append-only, 20 billion events/month,<br/>read newest per invoice"| CS["Cassandra or ScyllaDB<br/>PRIMARY KEY (invoice_id, event_id)"]
+    A -->|"text relevance over item descriptions"| OS["OpenSearch fed by CDC<br/>Postgres stays the source of truth"]
+    A -->|"expiry and sub-millisecond lookup"| RD["Redis: already used for sessions"]
+```
 
 **What would move a pattern out of Postgres:**
 - Pattern 5 at 1,000 times today's volume (about 20 billion events a month) → Cassandra or ScyllaDB with `PRIMARY KEY (invoice_id, event_id)`: one small partition per invoice, newest first by a time-ordered `event_id`. A workspace-wide feed would need time buckets in the key, as Discord's ever-growing channels do.
@@ -239,9 +293,41 @@ Choosing by workload:
 - *"NoSQL is schemaless."* The schema moved from the database into every reader.
 - *"NoSQL is faster."* Speed comes from data laid out for the query. A key lookup is fast in any engine that is built for that key.
 
+### Dual write versus outbox
+
+```mermaid
+sequenceDiagram
+    participant H as Request handler
+    participant PG as Postgres
+    participant OS as OpenSearch
+    participant X as Outbox relay
+    rect rgb(255, 235, 235)
+    Note over H,OS: Dual write: can diverge
+    H->>PG: UPDATE invoice (commits)
+    H-xOS: index update fails (timeout)
+    Note over PG,OS: Postgres has the change, the index never will
+    end
+    rect rgb(235, 255, 235)
+    Note over H,OS: Outbox: one transaction, then relay
+    H->>PG: UPDATE invoice + INSERT outbox row (one commit)
+    X->>PG: read new outbox rows
+    X->>OS: apply idempotently, retry until it succeeds
+    end
+```
+
 **Polyglot persistence costs.** Every extra store adds backups, upgrades, monitoring, security review and on-call knowledge. Data copied between stores needs one writer and a pipeline: writing to Postgres and Elasticsearch from the same request is a *dual write* that silently diverges when one side fails. Use an outbox (a table written in the same transaction as the change, which a relay then publishes) or CDC (change data capture: streaming changes out of the database log), and run a reconciliation job.
 
 ## 7. In production
+
+```mermaid
+timeline
+    title Discord message store
+    2015 : MongoDB, about 100 million messages : data and index no longer fit in RAM
+         : moved to Cassandra, key ((channel_id, bucket), message_id)
+    2022 : Cassandra at 177 nodes : operational pain
+         : moved to 72 ScyllaDB nodes
+    After : p99 reads 40-125 ms to 15 ms : p99 inserts 5-70 ms to 5 ms
+```
 
 - **Real migrations:**
 	- **Discord** started on MongoDB. Around November 2015, at 100 million stored messages, the data and index no longer fit in RAM and latency became unpredictable, so it moved messages to Cassandra with key `((channel_id, bucket), message_id)` and about 10 days per bucket to keep partitions under 100 MB. By early 2022 that cluster had 177 nodes. Discord then moved to 72 ScyllaDB nodes: p99 historical reads went from 40–125 ms to 15 ms, and p99 inserts from 5–70 ms to a steady 5 ms.
@@ -266,6 +352,16 @@ Choosing by workload:
 - **CAP and PACELC defaults.** Dynamo-style stores choose availability during a partition and low latency otherwise; Spanner and CockroachDB choose consistency in both cases and pay in latency. That choice, more than the data model, decides how a store behaves under failure: [[CAP and PACELC]], [[Consistency Models]].
 - **What "scales horizontally" really requires.** A partition key in every hot query, partitions small enough to move, and keys spread evenly. Cross-partition joins and transactions are either unavailable or slow, whether the store says NoSQL or SQL.
 - **Distributed SQL.** Spanner (Paxos groups plus TrueTime), CockroachDB, TiDB (Raft-replicated TiKV) and YugabyteDB (which reuses the Postgres query layer) split tables into ranges, replicate each range with consensus and run SQL transactions across them. A commit waits for a majority of a range's replicas, so when those replicas are spread over regions to survive a region failure, every write pays at least one inter-region round trip: [[Distributed SQL]].
+```mermaid
+flowchart LR
+    W["UPDATE custom_fields: change 1 key"] --> V["new row version written<br/>the whole row, not one key"]
+    V --> T{"row larger than about 2 KB?"}
+    T -->|"yes"| TO["large values compressed or moved out of line (TOAST):<br/>rewrite costs more"]
+    T -->|"no"| IN["stored inline"]
+    Q["WHERE custom_fields @> '{...}'"] --> G["GIN index jsonb_path_ops:<br/>fast containment"]
+    Q2["WHERE custom_fields ->> 'k' = ..."] --> NS["no per-key statistics:<br/>rough row estimates"]
+```
+
 - **Inside `jsonb`.** Postgres stores it in a parsed binary form, so reads do not re-parse text. A GIN index makes `@>` and key-existence queries fast; `jsonb_path_ops` is smaller but supports only containment and jsonpath operators. Updating one key writes a new version of the whole row; once a row passes about 2 KB its large values are compressed or moved out of line (TOAST), and rewriting them costs more; and the planner has no per-key statistics, so estimates on `jsonb` predicates are rough. Promote a key to a real column once you filter, join or constrain on it.
 - **The models converged.** Postgres has `jsonb`; MongoDB has transactions and schema validation; DynamoDB has transactions and PartiQL, a SQL-compatible query language. The labels now describe defaults and strengths, not capabilities.
 

@@ -44,12 +44,33 @@ For a small workspace with 200 invoices this takes well under a millisecond. For
 
 The answer changes only when an invoice is created, edited or paid. Computing it once and storing it turns a 380 ms aggregation into a lookup of six rows by key.
 
+```mermaid
+flowchart LR
+    subgraph LIVE["Live aggregation: every page load"]
+        L1["2,000 tabs, one request each per 30 s<br/>= 67 queries per second"] --> L2["each reads 400,112 rows<br/>about 380 ms"] --> L3["6 rows out"]
+    end
+    subgraph MVW["Stored answer"]
+        M1["invoice changes<br/>create, edit, pay"] --> M2["recompute or adjust<br/>the 6 rows"]
+        M3["67 reads per second"] --> M4["index lookup of 6 rows<br/>about 0.04 ms"]
+    end
+```
+
 ## 2. Mental model
 
 - A **view** (`CREATE VIEW`) is a named query. Reading it runs the query every time. It is never stale and never faster.
 - A **materialized view** (`CREATE MATERIALIZED VIEW`) runs the query once and stores the rows on disk. Reading it is as fast as reading a small table. It is stale from the moment the base tables change until the next refresh.
 - A **summary table** (also called a rollup table) is an ordinary table that your application or a trigger keeps up to date, one change at a time.
 - **Denormalization** means storing a fact in more than one place on purpose, such as `invoices.paid_minor`, a copy of `sum(payments.amount_minor)` kept so the invoice list needs no join.
+
+```mermaid
+flowchart LR
+    subgraph T["Timeline of one materialized view"]
+        direction LR
+        A["10:00 refresh<br/>view shows 500 invoices"] --> B["10:01 a new invoice<br/>view still 500"] --> C["10:03 two more<br/>view still 500, stale by 3"] --> D["10:04 refresh<br/>view shows 503"]
+    end
+    V["plain view at 10:03: 503, always current"] -. "runs the query on every read" .-> C
+    S["summary table at 10:03: 503, current"] -. "updated by each write" .-> C
+```
 
 **Analogy:** a shop counts its cash drawer. A view is counting every coin each time someone asks the total. A materialized view is a sticky note with the total written at closing time: instant to read, wrong after the next sale. A summary table is a running tally that the cashier updates with every sale: always current if nobody forgets a sale.
 
@@ -68,19 +89,11 @@ The answer changes only when an invoice is created, edited or paid. Computing it
 
 ### 3.2 Creating and refreshing a materialized view in PostgreSQL 17
 
-```sql
-CREATE MATERIALIZED VIEW workspace_dashboard AS
-SELECT workspace_id,
-       status,
-       count(*)                      AS invoice_count,
-       sum(total_minor)              AS total_minor,
-       sum(total_minor - paid_minor) AS outstanding_minor
-FROM invoices
-GROUP BY workspace_id, status
-WITH DATA;   -- run the query now; WITH NO DATA leaves it unreadable until the first REFRESH
+The view groups invoices by `(workspace_id, status)` and stores `invoice_count`, `total_minor` and `outstanding_minor`, created `WITH DATA` so it is readable at once (`WITH NO DATA` leaves it unreadable until the first `REFRESH`). Because there is one row per `(workspace_id, status)`, a `UNIQUE` index on those two columns is possible, and `REFRESH ... CONCURRENTLY` requires it. The full statements are in [[Materialized Views and Denormalization - Go]].
 
--- One row per (workspace_id, status), so this can be UNIQUE.
+```sql
 CREATE UNIQUE INDEX workspace_dashboard_uidx ON workspace_dashboard (workspace_id, status);
+REFRESH MATERIALIZED VIEW CONCURRENTLY workspace_dashboard;
 ```
 
 There are two ways to refresh it:
@@ -94,6 +107,20 @@ There are two ways to refresh it:
 | Speed | faster when most rows change | slower overall, but invisible to readers; best when few rows change |
 
 The *lock* is what matters for users. With a plain refresh that takes 40 seconds, every dashboard request waits up to 40 seconds. With `CONCURRENTLY`, dashboards keep reading the old rows until the new ones are applied.
+
+```mermaid
+sequenceDiagram
+    participant Job as Refresh job
+    participant MV as workspace_dashboard
+    participant Rd as Dashboard readers
+    Job->>MV: REFRESH (plain), ACCESS EXCLUSIVE
+    Rd->>MV: SELECT (waits)
+    Note over Rd,MV: 40 seconds of blocked dashboards
+    MV-->>Rd: new rows after commit
+    Job->>MV: REFRESH CONCURRENTLY, EXCLUSIVE
+    Rd->>MV: SELECT
+    MV-->>Rd: old rows immediately (never blocked)
+```
 
 ```mermaid
 sequenceDiagram
@@ -144,6 +171,14 @@ Before choosing a mechanism, ask: *how old may this number be?*
 
 Write the budget down next to the view, show "updated 3 min ago" in the UI when it matters, and alert when the real lag exceeds the budget.
 
+```mermaid
+flowchart TD
+    Q{"How old may this number be?"} -- "must be exact after a write" --> E["same-transaction update<br/>paid_minor on the invoice"]
+    Q -- "minutes" --> M["scheduled REFRESH CONCURRENTLY<br/>every 4 minutes for a 5 minute budget"]
+    Q -- "a day" --> N["nightly rebuild"]
+    Q -- "seconds, at high write rate" --> A["async rollup from outbox or CDC"]
+```
+
 ## 4. Worked example
 
 ### Whiteboard version
@@ -152,43 +187,23 @@ Write the budget down next to the view, show "updated 3 min ago" in the UI when 
 -- the slow question
 SELECT status, count(*), sum(total_minor)
 FROM invoices WHERE workspace_id = 42 GROUP BY status;
-
--- store the answer for every workspace
-CREATE MATERIALIZED VIEW workspace_dashboard AS
-SELECT workspace_id, status, count(*) AS invoice_count, sum(total_minor) AS total_minor
-FROM invoices GROUP BY workspace_id, status;
-
-CREATE UNIQUE INDEX ON workspace_dashboard (workspace_id, status);
-
--- read: a few rows by key
-SELECT status, invoice_count, total_minor FROM workspace_dashboard WHERE workspace_id = 42;
-
--- every 5 minutes: recompute without blocking readers
-REFRESH MATERIALIZED VIEW CONCURRENTLY workspace_dashboard;
+-- store the answer: CREATE MATERIALIZED VIEW workspace_dashboard AS ... GROUP BY workspace_id, status;
+-- every 5 minutes: REFRESH MATERIALIZED VIEW CONCURRENTLY workspace_dashboard;
 ```
+
+The complete whiteboard SQL is in [[Materialized Views and Denormalization - Go]].
 
 ### 4.1 Before: the live aggregation
 
 Assume (estimates for this example) 20 million invoices across 50,000 workspaces, with workspace 42 owning 400,000 of them. The index `invoices_ws_status_due_idx (workspace_id, status, due_date)` exists, but the query also needs `total_minor` and `paid_minor`, which are not in the index, so each matching row is fetched from the table.
 
-Representative output (PostgreSQL 17):
+Representative output (PostgreSQL 17), key lines (the full plan is in [[Materialized Views and Denormalization - Go]]):
 
 ```text
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT status, count(*), sum(total_minor), sum(total_minor - paid_minor)
-FROM invoices WHERE workspace_id = 42 GROUP BY status;
-
-HashAggregate  (cost=61234.10..61234.16 rows=6 width=48) (actual time=381.902..381.905 rows=6 loops=1)
-  Group Key: status
-  Batches: 1  Memory Usage: 24kB
-  Buffers: shared hit=31877 read=24120
-  ->  Bitmap Heap Scan on invoices  (cost=5321.40..55234.10 rows=400000 width=24) (actual time=38.211..301.554 rows=400112 loops=1)
-        Recheck Cond: (workspace_id = 42)
+HashAggregate  (actual time=381.902..381.905 rows=6 loops=1)
+  ->  Bitmap Heap Scan on invoices  (actual time=38.211..301.554 rows=400112 loops=1)
         Heap Blocks: exact=54301
         Buffers: shared hit=31877 read=24120
-        ->  Bitmap Index Scan on invoices_ws_status_due_idx  (cost=0.00..5221.40 rows=400000 width=0) (actual time=31.904..31.904 rows=400112 loops=1)
-              Index Cond: (workspace_id = 42)
-Planning Time: 0.142 ms
 Execution Time: 382.011 ms
 ```
 
@@ -196,23 +211,27 @@ Reading the plan ([[Query Plans and EXPLAIN]] covers this in detail): 400,112 ro
 
 ### 4.2 After: read the materialized view
 
-Representative output (PostgreSQL 17):
+Representative output (PostgreSQL 17), key lines:
 
 ```text
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT status, invoice_count, total_minor, outstanding_minor
-FROM workspace_dashboard WHERE workspace_id = 42;
-
-Index Scan using workspace_dashboard_uidx on workspace_dashboard  (cost=0.42..12.55 rows=6 width=48) (actual time=0.021..0.026 rows=6 loops=1)
-  Index Cond: (workspace_id = 42)
+Index Scan using workspace_dashboard_uidx on workspace_dashboard  (actual time=0.021..0.026 rows=6 loops=1)
   Buffers: shared hit=4
-Planning Time: 0.088 ms
 Execution Time: 0.041 ms
 ```
 
 Four buffer hits instead of 56,000 page reads. The view holds at most 50,000 × 6 = 300,000 small rows, so it fits in memory.
 
 The unique index does two jobs: it makes this lookup an index scan, and it is the index that `REFRESH ... CONCURRENTLY` requires.
+
+```mermaid
+flowchart LR
+    subgraph BEFORE["Before: 382 ms"]
+        B1["Bitmap Index Scan<br/>400,112 row pointers"] --> B2["Bitmap Heap Scan<br/>54,301 pages, 24,120 from disk"] --> B3["HashAggregate: 6 rows"]
+    end
+    subgraph AFTER["After: 0.04 ms"]
+        A1["Index Scan on workspace_dashboard_uidx<br/>4 buffer hits"] --> A2["6 rows, no aggregation"]
+    end
+```
 
 ### 4.3 The refresh cost and cadence
 
@@ -256,192 +275,27 @@ HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 
 When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event. Delivery is **at-least-once**: after a consumer crash, the same event can arrive again. Applying it twice is the classic double-counting bug. The fix is to remember which event IDs were applied; in SQL, that is a `processed_events` table written in the same transaction as the rollup update.
 
-```go
-// Package rollup keeps an app-maintained summary table (per-workspace
-// invoice totals) up to date from change events, and checks it for drift.
-package rollup
-
-import "sync"
-
-// Event is one change to an invoice, as delivered by an outbox or CDC
-// consumer. Delivery is at-least-once, so the same ID can arrive twice.
-type Event struct {
-	ID          string // unique per change, e.g. "inv-7:v3"
-	WorkspaceID int64
-	InvoiceID   int64
-	OldTotal    int64 // total_minor before the change (0 for a new invoice)
-	NewTotal    int64 // total_minor after the change (0 for a deleted invoice)
-}
-
-// Totals is one row of the rollup: workspace_totals in SQL.
-type Totals struct {
-	InvoiceCount int64
-	TotalMinor   int64
-}
-
-// Rollup applies events exactly once by remembering the IDs it has seen.
-// In SQL the seen set is a processed_events table written in the same
-// transaction as the rollup update.
-type Rollup struct {
-	mu   sync.Mutex
-	seen map[string]bool
-	rows map[int64]Totals
-}
-
-func New() *Rollup {
-	return &Rollup{seen: map[string]bool{}, rows: map[int64]Totals{}}
-}
-
-// Apply adds the delta of one event. It reports false for a duplicate.
-func (r *Rollup) Apply(e Event) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.seen[e.ID] {
-		return false
-	}
-	r.seen[e.ID] = true
-	t := r.rows[e.WorkspaceID]
-	switch {
-	case e.OldTotal == 0 && e.NewTotal != 0:
-		t.InvoiceCount++ // created
-	case e.OldTotal != 0 && e.NewTotal == 0:
-		t.InvoiceCount-- // deleted
-	}
-	t.TotalMinor += e.NewTotal - e.OldTotal
-	r.rows[e.WorkspaceID] = t
-	return true
-}
-
-// Get returns the rollup row for one workspace.
-func (r *Rollup) Get(ws int64) Totals {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.rows[ws]
-}
-
-// Drift compares the rollup with a full recomputation from the source
-// rows (invoice id -> total_minor, per workspace) and returns the
-// workspaces whose rows disagree, with the correct values.
-func (r *Rollup) Drift(source map[int64]map[int64]int64) map[int64]Totals {
-	truth := map[int64]Totals{}
-	for ws, invoices := range source {
-		var t Totals
-		for _, total := range invoices {
-			if total != 0 {
-				t.InvoiceCount++
-				t.TotalMinor += total
-			}
-		}
-		truth[ws] = t
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	bad := map[int64]Totals{}
-	for ws, want := range truth {
-		if r.rows[ws] != want {
-			bad[ws] = want
-		}
-	}
-	for ws, got := range r.rows {
-		if _, ok := truth[ws]; !ok && got != (Totals{}) {
-			bad[ws] = Totals{}
-		}
-	}
-	return bad
-}
+```mermaid
+sequenceDiagram
+    participant S as CDC stream
+    participant C as Consumer
+    participant P as processed event IDs
+    participant T as workspace totals
+    S->>C: inv-1:v1 create 250000
+    C->>P: record inv-1:v1
+    C->>T: count +1, total +250000
+    S->>C: inv-1:v2 edit 250000 to 300000
+    C->>P: record inv-1:v2
+    C->>T: total +50000
+    Note over C: crash before acknowledging inv-1:v2
+    S->>C: inv-1:v2 redelivered
+    C->>P: already recorded
+    Note over C,T: ignored: total stays 300000, count stays 1
 ```
 
-The tests cover redelivery, deletes, a lost event caught by the drift check, and four concurrent consumers receiving the same 1,000 events:
+Trace with numbers: create adds 1 invoice and 250,000; the edit adds the delta 300,000 minus 250,000 = 50,000, giving 1 invoice and 300,000. The redelivered edit is skipped by its ID. Without the ID check the total would read 350,000, which is the double-counting bug. A delete event (new total 0) subtracts 1 from the count. If an event is lost altogether, a drift check recomputes the totals from the source rows and reports the workspaces that disagree: in the test, invoice 2 changed from 500 to 800 but the event was lost, so the rollup shows 500 and the check reports workspace 2 with the correct 1 invoice and 800.
 
-```go
-package rollup
-
-import (
-	"fmt"
-	"sync"
-	"testing"
-)
-
-func TestApplyIsIdempotent(t *testing.T) {
-	r := New()
-	create := Event{ID: "inv-1:v1", WorkspaceID: 7, InvoiceID: 1, OldTotal: 0, NewTotal: 250_000}
-	edit := Event{ID: "inv-1:v2", WorkspaceID: 7, InvoiceID: 1, OldTotal: 250_000, NewTotal: 300_000}
-
-	if !r.Apply(create) || !r.Apply(edit) {
-		t.Fatal("first delivery must apply")
-	}
-	if r.Apply(edit) {
-		t.Fatal("redelivered event must be ignored")
-	}
-	got := r.Get(7)
-	want := Totals{InvoiceCount: 1, TotalMinor: 300_000}
-	if got != want {
-		t.Fatalf("got %+v, want %+v", got, want)
-	}
-}
-
-func TestDeleteDecrementsCount(t *testing.T) {
-	r := New()
-	r.Apply(Event{ID: "a", WorkspaceID: 1, InvoiceID: 1, NewTotal: 100})
-	r.Apply(Event{ID: "b", WorkspaceID: 1, InvoiceID: 1, OldTotal: 100})
-	if got := r.Get(1); got != (Totals{}) {
-		t.Fatalf("got %+v, want zero row", got)
-	}
-}
-
-func TestDriftFindsMissedUpdate(t *testing.T) {
-	r := New()
-	r.Apply(Event{ID: "a", WorkspaceID: 1, InvoiceID: 1, NewTotal: 100})
-	r.Apply(Event{ID: "b", WorkspaceID: 2, InvoiceID: 2, NewTotal: 500})
-	// The event that changed invoice 2 from 500 to 800 was lost.
-	source := map[int64]map[int64]int64{
-		1: {1: 100},
-		2: {2: 800},
-	}
-	bad := r.Drift(source)
-	if len(bad) != 1 || bad[2] != (Totals{InvoiceCount: 1, TotalMinor: 800}) {
-		t.Fatalf("drift = %+v, want only workspace 2 with 1 invoice / 800", bad)
-	}
-}
-
-func TestConcurrentApplyWithDuplicates(t *testing.T) {
-	r := New()
-	var wg sync.WaitGroup
-	for w := 0; w < 4; w++ { // four consumers receive the same 1,000 events
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 1000; i++ {
-				r.Apply(Event{ID: fmt.Sprint(i), WorkspaceID: 1, InvoiceID: int64(i), NewTotal: 10})
-			}
-		}()
-	}
-	wg.Wait()
-	want := Totals{InvoiceCount: 1000, TotalMinor: 10_000}
-	if got := r.Get(1); got != want {
-		t.Fatalf("got %+v, want %+v", got, want)
-	}
-}
-```
-
-These pass under `go test -race` with Go 1.24. The toy treats `total_minor = 0` as "no invoice"; a real event carries an explicit `op` field (`create`, `update`, `delete`) as CDC tools do.
-
-In SQL, the same idempotent apply is one transaction:
-
-```sql
-BEGIN;
-INSERT INTO processed_events (event_id) VALUES ('inv-1:v2')
-ON CONFLICT (event_id) DO NOTHING;
--- The app must check the row count here: if it is 0 (INSERT 0 0), the event
--- is a duplicate, so it issues ROLLBACK and skips the statements below.
--- SQL on its own does not stop; without that check the delta is applied twice.
-INSERT INTO workspace_totals (workspace_id, invoice_count, total_minor)
-VALUES (7, 0, 50000)
-ON CONFLICT (workspace_id) DO UPDATE
-SET invoice_count = workspace_totals.invoice_count + EXCLUDED.invoice_count,
-    total_minor   = workspace_totals.total_minor + EXCLUDED.total_minor;
-COMMIT;
-```
+The Go rollup (`Rollup.Apply`, `Rollup.Get`, `Rollup.Drift`), its four tests including four concurrent consumers receiving the same 1,000 events, and the idempotent apply as one SQL transaction are in Go. Runnable Go version: [[Materialized Views and Denormalization - Go]]
 
 ## 5. Variants and comparison
 
@@ -505,25 +359,18 @@ COMMIT;
 
 **Hot rows and counter sharding.** If 200 invoices per second are created in one workspace and each transaction runs `UPDATE workspace_totals SET ... WHERE workspace_id = 42`, every transaction waits for the previous one's row lock until it commits. Throughput is capped at roughly `1 / (commit latency)`; at 5 ms per commit (an estimate), about 200 per second. Splitting the row into slots removes the queue:
 
-```sql
-CREATE TABLE workspace_totals_slots (
-  workspace_id  bigint NOT NULL,
-  slot          smallint NOT NULL,      -- 0..15
-  invoice_count bigint NOT NULL DEFAULT 0,
-  total_minor   bigint NOT NULL DEFAULT 0,
-  PRIMARY KEY (workspace_id, slot)
-);
-
--- write: pick a random slot
-INSERT INTO workspace_totals_slots (workspace_id, slot, invoice_count, total_minor)
-VALUES (42, floor(random() * 16)::int, 1, 250000)
-ON CONFLICT (workspace_id, slot) DO UPDATE
-SET invoice_count = workspace_totals_slots.invoice_count + 1,
-    total_minor   = workspace_totals_slots.total_minor + EXCLUDED.total_minor;
-
--- read: sum 16 rows
-SELECT sum(invoice_count), sum(total_minor) FROM workspace_totals_slots WHERE workspace_id = 42;
+```mermaid
+flowchart LR
+    subgraph ONE["One summary row"]
+        W1["200 writes per second"] --> R1["row workspace 42<br/>row lock queue<br/>about 200 per second cap"]
+    end
+    subgraph SLOTS["16 slot rows"]
+        W2["200 writes per second<br/>random slot 0 to 15"] --> S["about 12 writes per second<br/>per slot row"]
+        S --> RD["read: sum of 16 rows"]
+    end
 ```
+
+The table `workspace_totals_slots` has primary key `(workspace_id, slot)` with `slot` from 0 to 15. A write picks `floor(random() * 16)` and upserts that slot row with `ON CONFLICT ... DO UPDATE`; a read runs `sum(invoice_count), sum(total_minor)` over the 16 rows of the workspace. The full DDL and SQL are in [[Materialized Views and Denormalization - Go]].
 
 **Deltas versus recompute.** `sum` and `count` are easy to maintain incrementally: add on insert, subtract on delete. `min`, `max` and `count(DISTINCT ...)` are not: when the current maximum is deleted, the new maximum can only be found by looking at the remaining rows. That is why incremental view engines restrict which aggregates they support, and why ClickHouse stores intermediate *aggregate states* (for example a set for `uniq`) rather than final numbers.
 
@@ -567,6 +414,7 @@ SELECT sum(invoice_count), sum(total_minor) FROM workspace_totals_slots WHERE wo
 
 ## Links
 
+- **Runnable code:** [[Materialized Views and Denormalization - Go]]
 - **Before this:** [[Relational Schema Design]], [[Query Plans and EXPLAIN]], [[Indexing Fundamentals]], [[Transactions and ACID]]
 - **Next:** [[NoSQL Data Modeling]], [[Transactional Outbox and CDC]], [[CQRS]]
 - **Compare with:** [[Caching Fundamentals]], [[Time-Series and Columnar Storage]], [[Index Types and Index Design]]

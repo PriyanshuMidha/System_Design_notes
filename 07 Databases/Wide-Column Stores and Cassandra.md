@@ -42,9 +42,36 @@ A single PostgreSQL primary cannot absorb that write rate, and it accepts writes
 
 What it gives up: joins, ad-hoc queries, multi-partition transactions, and strong consistency unless you ask for it.
 
+```mermaid
+flowchart LR
+    subgraph PG["Single PostgreSQL primary"]
+        P1["all writes: 20,000 per second"] --> P2["one node, one region"]
+    end
+    subgraph CA["Cassandra, two data centres"]
+        M["Mumbai: local writes"] <-- "background replication" --> F["Frankfurt: local writes"]
+        M --> M3["3 replicas, no primary"]
+        F --> F3["3 replicas, no primary"]
+    end
+```
+
+The arithmetic: 1.7 billion events a day × 300 bytes is about 510 GB a day, and a year of it is the roughly 190 TB quoted above, before replication multiplies it by 3 in each data centre.
+
 ## 2. Mental model
 
 Think of a distributed, sorted **map of maps**: `partition key → (clustering key → row)`. Hashing the partition key decides which nodes hold the partition. Inside a partition, rows sit on disk in clustering order, so "the newest 50 events of workspace 7 on 2 November" is one sequential read from one partition.
+
+```mermaid
+flowchart TB
+    subgraph PART["Partition: workspace ws-7, day 2026-11-02, stored together on its replicas"]
+        direction TB
+        R1["clustering key: created_at 10:05, evt-9"]
+        R2["clustering key: created_at 10:03, evt-8"]
+        R3["clustering key: created_at 10:01, evt-7"]
+        R1 --> R2 --> R3
+    end
+    K["partition key (ws-7, 2026-11-02)"] -- "Murmur3 hash picks the nodes" --> PART
+    PART -- "LIMIT 50: one sequential read of the top rows" --> OUT["newest events first"]
+```
 
 Analogy: a library spread over many buildings. Each book (partition) is shelved by a hash of its title, and inside a book the pages (rows) are in order. You can ask "pages 10 to 60 of book B" instantly. You cannot ask "every page that mentions refunds" without reading every book in every building.
 
@@ -64,6 +91,18 @@ Terms:
 ### 3.1 Placement: tokens and replicas
 
 The default partitioner hashes the partition key with Murmur3 into a 64-bit **token**. Each node owns several token ranges (virtual nodes: `num_tokens` is 16 by default since Cassandra 4.0, 256 before), and replicas go to the next nodes clockwise on the ring, as described in [[Consistent Hashing]]. `NetworkTopologyStrategy` places RF replicas in each data centre, on different racks where it can. Nodes learn about each other by gossip (see [[Failure Detection, Gossip and Membership]]).
+
+```mermaid
+flowchart LR
+    K["partition key (ws-7, 2026-11-02)"] -- "Murmur3 token = 4,611,686,018,427,387,904" --> RING
+    subgraph RING["Token ring, RF = 3 in one DC"]
+        direction LR
+        N1["node A<br/>owns ranges<br/>up to token 0"] --> N2["node B<br/>owns ranges<br/>up to 4.6e18"] --> N3["node C<br/>owns ranges<br/>up to 9.2e18"] --> N4["node D<br/>wraps to -9.2e18"] --> N1
+    end
+    RING -- "range owner and the next 2 nodes clockwise" --> REP["replicas: C, D, A"]
+```
+
+Example with numbers: with 6 nodes and `num_tokens` 16, the ring holds 96 token ranges, so each node owns 16 small slices. Adding a seventh node takes a few slices from every existing node instead of splitting one big range in half, so the load moves evenly. (The token value in the diagram is illustrative.)
 
 ### 3.2 Write path
 
@@ -90,6 +129,8 @@ flowchart LR
 4. **Compaction** merges SSTables in the background, keeping the newest version of each cell.
 
 That is why writes are cheap: a sequential append and a memory insert. The cost moves to reads and to compaction (see [[Storage Engines - B-tree vs LSM and WAL]]).
+
+Example with numbers: 20,000 events per second, each written to 3 tables with 3 replicas in the local data centre, is 180,000 replica mutations per second. Spread over 30 nodes (an estimate), that is about 6,000 per node, and each one is a commit-log append of about 300 bytes plus a memtable insert, with no disk read.
 
 ### 3.3 Read path
 
@@ -138,6 +179,23 @@ sequenceDiagram
 
 If the write CL plus the read CL is greater than RF (for example `LOCAL_QUORUM` + `LOCAL_QUORUM` = 2 + 2 > 3), every read overlaps at least one replica that took the latest acknowledged write in that DC. That is overlap, not linearizability: concurrent writes, writes that failed half way, and last-write-wins with skewed clocks can still surprise you. See [[Quorums and Leaderless Replication]].
 
+```mermaid
+flowchart LR
+    subgraph W["Write at LOCAL_QUORUM: acked by 2 of 3 Mumbai replicas"]
+        WA["replica A: new value"]
+        WB["replica B: new value"]
+        WC["replica C: still old"]
+    end
+    subgraph R["Read at LOCAL_QUORUM: asks any 2 of 3"]
+        RB["B and C: B has the new value"]
+        RA["A and C: A has the new value"]
+        RX["A and B: both new"]
+    end
+    W -- "2 + 2 > 3, so any 2 replicas overlap the 2 that took the write" --> R
+```
+
+Example with numbers: RF = 3 and both sides use 2. The write reached A and B. Any 2 of {A, B, C} include at least one of A or B, so the read always meets a replica holding the new cell, and the newest timestamp wins.
+
 ### 3.5 Repair, hints and tombstones
 
 - **Hinted handoff:** when a replica is down, the coordinator stores the write as a hint and replays it later, for up to `max_hint_window` (3 hours by default). A node down for longer misses writes until **repair**.
@@ -167,6 +225,23 @@ IF NOT EXISTS;
 
 `IF NOT EXISTS` and `UPDATE … IF col = value` run Paxos among the partition's replicas. The classic implementation (Paxos v1) needs 4 round trips for a write and 3 for a read. Cassandra 4.1 added Paxos v2 (`paxos_variant: v2`, opt-in), which needs 2 round trips for a write and 1 or 2 for a read. Use LWTs only for compare-and-set (unique claims, state transitions), keep them off hot partitions, and do not mix LWT and plain writes on the same cells: plain writes bypass Paxos and break its guarantees.
 
+```mermaid
+sequenceDiagram
+    participant Co as Coordinator
+    participant R as 3 replicas of the partition
+    Co->>R: 1 prepare (ballot)
+    R-->>Co: promise
+    Co->>R: 2 read current value (IF NOT EXISTS check)
+    R-->>Co: no row for number 1042
+    Co->>R: 3 propose the insert
+    R-->>Co: accepted
+    Co->>R: 4 commit
+    R-->>Co: applied
+    Note over Co,R: Paxos v1: 4 round trips. Paxos v2 (4.1+, opt-in): 2
+```
+
+Example with numbers: at 1 ms between nodes in one data centre, a plain `LOCAL_QUORUM` write costs about 1 round trip, while a Paxos v1 write costs about 4 (an estimate), which is why LWTs stay off hot paths.
+
 ## 4. Worked example
 
 ### Whiteboard version
@@ -176,16 +251,11 @@ The bare idea: the primary key is written for one query.
 ```sql
 -- Query: newest events of one workspace on one day
 CREATE TABLE events_by_workspace_day (
-  workspace_id text,
-  bucket_day   date,
-  created_at   timestamp,
-  event_id     uuid,
-  action       text,
+  workspace_id text, bucket_day date, created_at timestamp,
+  event_id uuid, action text,
   PRIMARY KEY ((workspace_id, bucket_day), created_at, event_id)
 ) WITH CLUSTERING ORDER BY (created_at DESC, event_id ASC);
-
-SELECT * FROM events_by_workspace_day
-WHERE workspace_id = 'ws-7' AND bucket_day = '2026-11-03' LIMIT 50;
+-- SELECT ... WHERE workspace_id = 'ws-7' AND bucket_day = '2026-11-03' LIMIT 50;
 ```
 
 The full version below adds production concerns: one table per query, bounded partitions, and what happens to deleted rows.
@@ -200,34 +270,14 @@ List the queries first, then build one table per query and accept duplicated dat
 | Q2: what did user U do on day D (security review) | `audit_events_by_actor_day` | `((actor_id, bucket_day), created_at, event_id)` |
 | Q3: full timeline of one invoice | `audit_events_by_invoice` | `((workspace_id, invoice_id), created_at, event_id)` |
 
-```sql
--- CQL (Cassandra 5.0)
-CREATE KEYSPACE invoiceops
-  WITH replication = {'class': 'NetworkTopologyStrategy', 'mumbai': 3, 'frankfurt': 3};
+The full DDL (a keyspace with 3 replicas in each of two data centres, a day-bucketed table, time-window compaction and a 365-day TTL) is in [[Wide-Column Stores and Cassandra - Go]]. Q1 reads one partition that is already sorted newest first, `WHERE workspace_id = 'ws-7' AND bucket_day = '2026-11-02' LIMIT 50`. The anti-pattern is a query with no partition key, such as `WHERE actor_id = 'u-19' ALLOW FILTERING`, where every node scans every partition.
 
-CREATE TABLE invoiceops.audit_events_by_workspace_day (
-    workspace_id text,
-    bucket_day   date,
-    created_at   timestamp,
-    event_id     text,
-    actor_id     text,
-    action       text,
-    payload      text,
-    PRIMARY KEY ((workspace_id, bucket_day), created_at, event_id)
-) WITH CLUSTERING ORDER BY (created_at DESC, event_id DESC)
-  AND compaction = {'class': 'TimeWindowCompactionStrategy',
-                    'compaction_window_unit': 'DAYS', 'compaction_window_size': 1}
-  AND default_time_to_live = 31536000;   -- 365 days, then whole SSTables expire
-
--- Q1: one partition, already sorted newest first
-SELECT created_at, actor_id, action
-FROM invoiceops.audit_events_by_workspace_day
-WHERE workspace_id = 'ws-7' AND bucket_day = '2026-11-02'
-LIMIT 50;
-
--- Anti-pattern: no partition key, so every node scans every partition
-SELECT * FROM invoiceops.audit_events_by_workspace_day
-WHERE actor_id = 'u-19' ALLOW FILTERING;
+```mermaid
+flowchart LR
+    EV["audit event<br/>ws-7, u-19, inv-01JC9V"] --> B["logged batch:<br/>written to a batchlog first"]
+    B --> T1["audit_events_by_workspace_day<br/>((ws-7, 2026-11-02), ...)"]
+    B --> T2["audit_events_by_actor_day<br/>((u-19, 2026-11-02), ...)"]
+    B --> T3["audit_events_by_invoice<br/>((ws-7, inv-01JC9V), ...)"]
 ```
 
 The event goes into all three tables in one **logged batch**. The batch is first written to a batchlog on other nodes, so either all three tables eventually get the event or none does. It is not isolated: a reader can see the event in one table before another.
@@ -240,153 +290,62 @@ The event goes into all three tables in one **logged batch**. The batch is first
 
 Discord's message store, the best-known Cassandra case, used the same idea: `PRIMARY KEY ((channel_id, bucket), message_id)` with about 10 days per bucket, chosen to keep partitions under 100 MB.
 
+```mermaid
+flowchart TB
+    subgraph U["Without bucket_day: one partition per workspace"]
+        U1["(ws-big): grows every day,<br/>120 MB after one day,<br/>43 GB after a year"]
+    end
+    subgraph D["With bucket_day and sub-bucket (4 sub-buckets)"]
+        D1["(ws-big, 2026-11-02, 0): about 30 MB"]
+        D2["(ws-big, 2026-11-02, 1): about 30 MB"]
+        D3["(ws-big, 2026-11-02, 2): about 30 MB"]
+        D4["(ws-big, 2026-11-02, 3): about 30 MB"]
+    end
+    U -. "add time bucket and hash sub-bucket" .-> D
+```
+
 ### How deleted rows come back
 
-A model of replica reconciliation: last write wins per cell, deletes are tombstones, and compaction purges tombstones after `gc_grace_seconds`. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+A model of replica reconciliation: last write wins per cell, deletes are tombstones, and compaction purges tombstones after `gc_grace_seconds`. Three replicas A, B and C hold the row `invoice.sent` written at timestamp 1,000. The delete (a tombstone stamped 2,000) reaches A and B while C is down longer than the hint window.
 
-```go
-// Package lww models how Cassandra reconciles replicas: last write wins per
-// cell, a delete is a tombstone, and compaction purges tombstones older than
-// gc_grace_seconds.
-package lww
-
-// Cell is one column value on one replica.
-type Cell struct {
-	Value     string
-	WriteTS   int64 // write timestamp in microseconds, from the client or coordinator
-	Tombstone bool
-	DeletedAt int64 // local deletion time in seconds, compared with gc_grace
-}
-
-// Reconcile returns the winning version. The higher timestamp wins. On a tie
-// a tombstone beats a live value, and between live values the larger wins.
-func Reconcile(a, b Cell) Cell {
-	switch {
-	case a.WriteTS != b.WriteTS:
-		if a.WriteTS > b.WriteTS {
-			return a
-		}
-		return b
-	case a.Tombstone != b.Tombstone:
-		if a.Tombstone {
-			return a
-		}
-		return b
-	case a.Value >= b.Value:
-		return a
-	default:
-		return b
-	}
-}
-
-// Replica keeps the winning cell per key (as if fully compacted).
-type Replica map[string]Cell
-
-func (r Replica) Apply(key string, c Cell) {
-	if old, ok := r[key]; ok {
-		c = Reconcile(old, c)
-	}
-	r[key] = c
-}
-
-// Compact purges tombstones whose gc_grace has passed. After this the
-// replica has no memory that the key was ever deleted.
-func (r Replica) Compact(now, gcGrace int64) {
-	for k, c := range r {
-		if c.Tombstone && c.DeletedAt+gcGrace <= now {
-			delete(r, k)
-		}
-	}
-}
-
-// Read merges the replicas' answers the way a coordinator does.
-func Read(key string, replicas ...Replica) (string, bool) {
-	c, ok := merge(key, replicas)
-	if !ok || c.Tombstone {
-		return "", false
-	}
-	return c.Value, true
-}
-
-// Repair writes the merged winner back to every replica (anti-entropy).
-func Repair(key string, replicas ...Replica) {
-	c, ok := merge(key, replicas)
-	if !ok {
-		return
-	}
-	for _, r := range replicas {
-		r.Apply(key, c)
-	}
-}
-
-func merge(key string, replicas []Replica) (Cell, bool) {
-	var out Cell
-	found := false
-	for _, r := range replicas {
-		c, ok := r[key]
-		switch {
-		case !ok:
-		case !found:
-			out, found = c, true
-		default:
-			out = Reconcile(out, c)
-		}
-	}
-	return out, found
-}
+```mermaid
+sequenceDiagram
+    participant A as Replica A
+    participant B as Replica B
+    participant C as Replica C
+    Note over A,C: day 0: all three hold invoice.sent at t=1000
+    A->>A: tombstone t=2000
+    B->>B: tombstone t=2000
+    Note over C: down, never gets the tombstone
+    Note over A,C: read at day 1: tombstone t=2000 beats t=1000, the row reads as deleted
+    Note over A,B: day 11, no repair: compaction purges the tombstone
+    Note over C: C still holds invoice.sent at t=1000
+    A-->>C: read merges A, B (nothing) with C (invoice.sent)
+    Note over A,C: the deleted row is back. With a repair on day 5 C would hold the tombstone and the delete would survive
 ```
 
-The tests replay the failure and its fix:
+Reading the trace with numbers: before day 10 the tombstone (2,000) beats the live cell (1,000) on every read. At day 10 the tombstone is eligible for purging (`gc_grace_seconds` = 864,000 s), and on day 11 compaction drops it on A and B. Only C remembers the row, so it is the only version left and it wins. If `nodetool repair` had run on day 5, C would have received the tombstone and all three would have purged it together.
 
-```go
-const (
-	day     = 24 * 3600
-	gcGrace = 10 * day // Cassandra's default gc_grace_seconds: 864000
-	key     = "audit:ws-7:evt-42"
-)
+The model also shows the clock-skew trap. If node A stamps a write 10,000 and node B writes 2 ms *later in real time* but its clock is behind and it stamps 8,000, B's write is silently discarded because 8,000 is lower. On an exact timestamp tie, a tombstone beats a live value. The model keeps one cell per key, as if compaction had already merged everything; real compaction may drop a tombstone only when no older SSTable outside the compaction could still hold the data it shadows.
 
-// Three replicas hold a row. The delete reaches A and B while C is down
-// longer than the hint window.
-func setup() (a, b, c Replica) {
-	a, b, c = Replica{}, Replica{}, Replica{}
-	for _, r := range []Replica{a, b, c} {
-		r.Apply(key, Cell{Value: "invoice.sent", WriteTS: 1_000})
-	}
-	del := Cell{WriteTS: 2_000, Tombstone: true, DeletedAt: 0}
-	a.Apply(key, del)
-	b.Apply(key, del)
-	return a, b, c
-}
-
-func TestDeleteResurrectsWithoutRepair(t *testing.T) {
-	a, b, c := setup()
-	if _, ok := Read(key, a, b, c); ok {
-		t.Fatal("while the tombstone exists the row must read as deleted")
-	}
-	a.Compact(11*day, gcGrace) // day 11: no repair ran, tombstones purged
-	b.Compact(11*day, gcGrace)
-	if v, ok := Read(key, a, b, c); !ok || v != "invoice.sent" {
-		t.Fatalf("want the zombie row back, got %q %v", v, ok)
-	}
-}
-
-func TestRepairWithinGCGraceKeepsDelete(t *testing.T) {
-	a, b, c := setup()
-	Repair(key, a, b, c) // day 5: C receives the tombstone
-	for _, r := range []Replica{a, b, c} {
-		r.Compact(11*day, gcGrace)
-	}
-	if v, ok := Read(key, a, b, c); ok {
-		t.Fatalf("deleted row came back: %q", v)
-	}
-}
-```
-
-A third test, `TestLastWriteWins`, checks that a tombstone wins a timestamp tie, and that a write made *later* but stamped 2 ms *earlier* (its node's clock was behind) is silently discarded. The model keeps one cell per key, as if compaction had already merged everything; real compaction may drop a tombstone only when no older SSTable outside the compaction could still hold the data it shadows.
+The model (`Cell`, `Reconcile`, `Replica`, `Compact`, `Read`, `Repair`) and its three tests (`TestDeleteResurrectsWithoutRepair`, `TestRepairWithinGCGraceKeepsDelete`, `TestLastWriteWins`) are in Go. Runnable Go version: [[Wide-Column Stores and Cassandra - Go]]
 
 ## 5. Variants and comparison
 
 ### Compaction strategies
+
+```mermaid
+flowchart LR
+    subgraph STCS["Size-tiered"]
+        S1["4 SSTables of 10 MB"] --> S2["1 SSTable of 40 MB"]
+    end
+    subgraph LCS["Leveled"]
+        L1["L0: fresh flushes"] --> L2["L1: 10 SSTables, no overlap"] --> L3["L2: 100 SSTables, no overlap"]
+    end
+    subgraph TWCS["Time-window"]
+        T1["day 1 window"] ~~~ T2["day 2 window"] ~~~ T3["day 3 window: whole SSTables dropped when TTL ends"]
+    end
+```
 
 | Strategy | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -502,6 +461,7 @@ A third test, `TestLastWriteWins`, checks that a tombstone wins a timestamp tie,
 
 ## Links
 
+- **Runnable code:** [[Wide-Column Stores and Cassandra - Go]]
 - **Before this:** [[NoSQL Data Modeling]], [[Storage Engines - B-tree vs LSM and WAL]], [[Consistent Hashing]]
 - **Next:** [[Quorums and Leaderless Replication]], [[Failure Detection, Gossip and Membership]], [[Hot Keys and Hot Partitions]]
 - **Compare with:** [[Partitioning and Sharding]] (sharding a relational database by hand), [[Time-Series and Columnar Storage]] (true column stores for analytics), [[Replication]] (single-leader replication)

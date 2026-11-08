@@ -1,6 +1,6 @@
 ---
 tags: [frontend, css, layout]
-level: basic
+level: intermediate
 prereqs: ["[[CSS Fundamentals - Cascade, Selectors, Box Model]]"]
 related: ["[[How Browsers Load and Render a Page]]", "[[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]"]
 sources:
@@ -8,7 +8,7 @@ sources:
   - "MDN, Basic Concepts of Flexbox"
   - "MDN, Basic Concepts of Grid Layout"
 status: reviewed
-updated: 2026-11-04
+updated: 2026-11-09
 ---
 
 # CSS Layout - Position, Flexbox, Grid
@@ -36,9 +36,13 @@ updated: 2026-11-04
 
 A notification badge needs to sit at the exact top-right corner of a bell icon, regardless of where that icon ends up on the page — inside a nav bar, inside a sidebar, wherever. Normal flow alone can't do this: every element in normal flow pushes the next one down or across. You need a way to say "place this relative to one specific container, ignoring the elements around it," which is what taking an element out of flow with `position` provides. Separately, a row of three equal-width cards that should share leftover space, or a page grid with a header, sidebar, main content, and footer that reflows at different screen sizes, both need an axis-aware (flex) or two-dimensional (grid) layout system — normal block/inline flow alone can only stack things in one direction.
 
+> [!tip] Remember
+> Normal flow can only stack things in one direction at a time. The moment you need "pin this exactly here regardless of flow" or "arrange these along an axis, sharing space," you need `position`, flex, or grid — normal flow was never designed to do either.
+
 ## 2. Mental model
 
-Normal flow is water finding its level: block elements stack like bricks, inline elements run like text in a line, wrapping as needed. `position` lets you pick an element up out of that water and nail it to a specific point on a specific container. Flexbox is a ruler laid down one direction (say the row); items line up or spread along it, and `align-items` is a second, perpendicular ruler for the direction you didn't choose. Grid is graph paper: you draw the lines first (rows and columns), then drop items into cells or named regions on that paper.
+> [!quote] Analogy: water, a ruler, and graph paper
+> Normal flow is **water finding its level** — block elements stack like bricks, inline elements run like text in a line, wrapping as needed. `position` lets you pick one element up out of that water and nail it to a specific point on a specific container, ignoring everything flowing around it. Flexbox is a **ruler laid down in one direction** (say the row); items line up or spread along it, and `align-items` is a second, perpendicular ruler for the direction you didn't choose. Grid is **graph paper**: you draw the lines first (rows and columns), then drop items into cells or named regions on that paper. The analogy breaks down for `sticky`, which is water that turns into a nail only past a scroll threshold — neither pure flow nor pure position.
 
 ## 3. How it works
 
@@ -67,6 +71,12 @@ flowchart TD
 **z-index and stacking contexts.** `z-index` only has an effect on a positioned element (`position` other than `static`) — or on a flex/grid item, where `z-index` works even without `position`. A new **stacking context** is created by several triggers, most commonly: a positioned element with a `z-index` other than `auto`, `opacity` less than 1, or a `transform`/`filter`. Inside a stacking context, `z-index` values are only compared against siblings *within that same context* — a child with `z-index: 9999` can still render behind an unrelated element if its own ancestor's stacking context sits lower, because the comparison never escapes the parent context to compete directly against elements outside it.
 
 **The relative-parent/absolute-child pattern** (dropdown menus, tooltips, badges): give the container `position: relative` and the item that must pin to a corner `position: absolute` with `top`/`right`/`bottom`/`left`. The `inset` shorthand (`inset: 0;`) sets all four offsets at once — `inset: 0` on an absolutely positioned element makes it fill its positioned ancestor exactly.
+
+> [!warning] Common mistake
+> Assuming `position: absolute` always positions against the page. It doesn't — it positions against the **nearest ancestor with any `position` other than `static`**. Forgetting to add `position: relative` to the intended parent is the single most common cause of "my absolutely positioned badge jumped to the corner of the whole page instead of my card."
+
+> [!tip] Remember
+> `static` ignores offsets entirely. `relative` offsets visually but keeps its space and anchors any `absolute` descendants. `absolute` and `fixed` both leave flow completely — the only difference is what they're measured against.
 
 ### Flexbox
 
@@ -156,7 +166,51 @@ Grid is a two-dimensional layout: `display: grid` on the parent creates a **grid
 
 ### Flex vs. grid
 
-Flexbox is **content-out**: items bring their own size, and the container arranges them along one axis. Grid is **layout-in**: you define the structure first (rows, columns, named areas), then drop content into it, and it naturally works in two dimensions. A component that just needs to space out a row of buttons is flexbox; a page-level layout with a header, sidebar, and footer that needs to hold its shape regardless of content length is grid. The two combine constantly: a grid for the page skeleton, flexbox inside each grid cell for aligning that cell's own content.
+**In plain words:** flexbox starts from the content and arranges it along one line; grid starts from the layout and places content into a two-dimensional structure you drew first. Neither is "better" — they answer different questions.
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    subgraph Flex["Flexbox: content-out"]
+        direction LR
+        FC["Items bring their own size"] --> FR["Container arranges them\nalong ONE axis"]
+    end
+    subgraph Grid["Grid: layout-in"]
+        direction LR
+        GC["Tracks (rows/cols) defined first"] --> GR["Content dropped into\ncells, TWO axes at once"]
+    end
+```
+
+**Example — the same card gallery, both ways:**
+
+```css
+/* Flexbox version: items wrap, but widths aren't coordinated across rows */
+.gallery-flex {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.gallery-flex .card {
+  flex: 1 1 240px; /* grow/shrink from a 240px starting point */
+}
+
+/* Grid version: an explicit track list controls every row the same way */
+.gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+}
+```
+
+Both produce a visually similar wrapping row of 240px-ish cards. The difference shows up once rows don't divide evenly: with `flex-wrap`, the last row's leftover cards simply grow to fill whatever space is left on that row alone, so a 3-cards-then-1 layout gives that lone last card the whole row's width. With `grid`'s `auto-fit`, every row shares the exact same column tracks, so the lone card in the last row lines up in the first column instead of stretching — because grid coordinates columns across *all* rows at once, and flex only ever coordinates within a single row.
+
+**Why it matters:** reach for flex when you only need one row (or column) of items to behave well together; reach for grid the moment you need items in *different* rows to line up with each other.
+
+A component that just needs to space out a row of buttons is flexbox; a page-level layout with a header, sidebar, and footer that needs to hold its shape regardless of content length is grid. The two combine constantly: a grid for the page skeleton, flexbox inside each grid cell for aligning that cell's own content.
+
+> [!tip] Remember
+> Flex coordinates items within one row or column. Grid coordinates items across every row and column at once. That is the real test for which one a layout needs.
 
 ## 4. Worked example
 

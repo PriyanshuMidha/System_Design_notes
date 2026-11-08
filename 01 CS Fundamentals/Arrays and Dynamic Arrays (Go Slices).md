@@ -1,6 +1,6 @@
 ---
 tags: [cs-fundamentals, data-structures, go]
-level: basic
+level: intermediate
 status: reviewed
 prereqs: ["[[Data Structures Overview and Big-O Cheat Sheet]]"]
 related: ["[[Linked Lists]]", "[[Stacks, Queues and Deques]]", "[[Memory Hierarchy and CPU Caches]]", "[[Pointers, Values and Escape Analysis]]"]
@@ -8,7 +8,7 @@ sources:
   - "Go source, runtime/slice.go, function nextslicecap (Go 1.24, growth formula)"
   - "The Go Programming Language Specification, §Slice types"
   - "Go std lib docs, package slices (go.dev/pkg/slices)"
-updated: 2026-11-06
+updated: 2026-11-09
 ---
 
 # Arrays and Dynamic Arrays (Go Slices)
@@ -24,25 +24,70 @@ updated: 2026-11-06
 
 ## 1. Why it exists
 
-Say you're processing a day's worth of sensor readings, one `float64` per second: 86,400 values. If you store them as 86,400 separately heap-allocated nodes (like a linked list), each one is wherever the allocator happened to put it — scattered across memory. Summing them means following 86,400 pointers, and **each pointer follow that misses the CPU cache costs roughly 100 ns** (documented: typical DRAM random-access latency, see [[Memory Hierarchy and CPU Caches]]), versus **well under 1 ns** for the next element in a cache line already loaded. Scattered, that's upward of 8 ms just in memory stalls; contiguous, the CPU's prefetcher sees the sequential pattern and keeps the pipeline fed, finishing in a small fraction of that.
+Say you're processing a day's worth of sensor readings, one `float64` per second: 86,400 values. You need somewhere to put them, and the two obvious choices behave very differently.
 
-Store the same 86,400 values as one `[]float64` instead: they sit back-to-back in one allocation, `element[i]` is `base + i*8` bytes, and summing them is a tight loop the CPU can prefetch and vectorize. This is why arrays and slices are the default structure in nearly every language: the operation most code does most — iterate, or jump to an index — is exactly the one contiguous memory makes cheap.
+### Scattered memory vs. packed memory
+
+**In plain words:** A computer's main memory (RAM) is one giant row of numbered boxes. If every value you store gets its own box wherever one happens to be free, reading them back means jumping all over that row. If instead all your values sit in one unbroken stretch of boxes, reading them back is just walking forward one box at a time.
+
+**Picture it:**
+
+```mermaid
+flowchart TB
+    subgraph scattered["Scattered (like a linked list)"]
+        direction LR
+        s1["box 4,021"] -.pointer.-> s2["box 88,102"] -.pointer.-> s3["box 1,004"]
+    end
+    subgraph packed["Packed (an array)"]
+        direction LR
+        p0["[0]"] --- p1["[1]"] --- p2["[2]"] --- p3["[3]"]
+    end
+```
+
+**Example:** Store the 86,400 readings as 86,400 separately heap-allocated nodes (as a linked list would) and each one lands wherever the allocator happened to put it. Summing them means following 86,400 pointers, and **each pointer follow that misses the CPU cache costs roughly 100 ns** (documented: typical DRAM random-access latency, see [[Memory Hierarchy and CPU Caches]]), versus **well under 1 ns** for the next element in a cache line already loaded. Scattered, that's upward of 8 ms just in memory stalls. Store the same values as one `[]float64` instead: they sit back-to-back, `element[i]` is `base + i*8` bytes, and the CPU's prefetcher keeps the pipeline fed, finishing in a small fraction of that.
+
+**Why it matters:** This is why arrays and slices are the default structure in nearly every language: the operation most code does most — iterate, or jump to an index — is exactly the one contiguous memory makes cheap.
+
+This structure of values packed next to each other is called an **array**. A **slice** is Go's growable wrapper around one.
+
+> [!tip] Remember
+> Contiguous memory isn't just a storage detail — it's the reason sequential access over an array is dramatically faster than the same access pattern over a pointer-chasing structure.
 
 ## 2. Mental model
 
-A static array (`[5]int`) is a fixed, labelled set of parking spots: 5 spots, fixed size, each one addressed by its number.
+### The parking-lot analogy
 
-A slice is a **parking valet's ticket**, not the parking lot itself: it's a small card holding three numbers — where the lot starts (`ptr`), how many spots are currently in use (`len`), and how many spots exist before the lot needs to expand (`cap`). Handing someone your ticket (passing the slice to a function, assigning it to another variable) copies the card, not the parking lot. Both tickets point at the same lot until someone fills it up and the valet has to move every car to a bigger lot (`append` past capacity) — at that point, the two tickets start pointing at different lots.
+**In plain words:** A static array (`[5]int`) is a fixed, labelled parking lot: 5 spots, fixed size, each one addressed by its number — you can't add a 6th spot without building a new lot. A slice is a **parking valet's ticket**, not the lot itself: a small card holding three numbers — where the lot starts (`ptr`), how many spots are currently in use (`len`), and how many spots exist before the lot needs to expand (`cap`).
+
+**Picture it:**
+
+```mermaid
+flowchart LR
+    ticket["Valet ticket (slice header)<br/>ptr, len=3, cap=5"] -.points at.-> lot["Parking lot (backing array)<br/>[car][car][car][ ][ ]"]
+```
+
+**Example:** Handing someone your ticket — passing the slice to a function, assigning it to another variable — copies the card, not the parking lot. Both tickets point at the same lot until someone fills it up and the valet has to move every car to a bigger lot (`append` past capacity); only then do the two tickets start pointing at different lots.
+
+**Why it matters:** Confusing "copying a slice" with "copying its data" is the single most common Go slice bug. Copying the header is cheap (3 words) and happens on every function call; copying the data only happens when you explicitly loop or `append` past capacity.
+
+**Where the analogy breaks down:** a real parking valet never *moves cars without telling you*; a Go slice's backing array can be silently reallocated by `append`, after which your old ticket (an alias made before the append) points at a lot the new ticket has already abandoned.
+
+> [!warning] Common mistake
+> Assuming that writing through one slice always shows up in another slice that shares its backing array. It does — until an `append` on either one exceeds capacity and allocates a new array. After that point the two slices have quietly stopped sharing memory, with no error or signal that it happened.
 
 ## 3. How it works
 
 ### The slice header
 
+**In plain words:** A slice value itself is tiny — three machine words — no matter how many elements it can see. The data lives separately, in the backing array.
+
+**Picture it:**
+
 ```mermaid
 flowchart LR
     subgraph header["slice header (3 words, copied by value)"]
         direction TB
-        P["ptr"] 
+        P["ptr"]
         L["len = 3"]
         C["cap = 5"]
     end
@@ -53,9 +98,22 @@ flowchart LR
     P --> e0
 ```
 
-`len` is how many elements this slice can see (`s[0:len]` is valid); `cap` is how many elements fit in the backing array starting from `ptr` before a reallocation is needed. `cap(s) - len(s)` is free room `append` can use without copying.
+`len` is how many elements this slice can see (`s[0:len]` is valid); `cap` is how many elements fit in the backing array starting from `ptr` before a reallocation is needed.
 
-### append and growth
+**Example:** For the header above, `cap(s) - len(s)` = `5 - 3` = `2`: two more elements can be appended before the runtime must allocate a new, bigger array.
+
+**Why it matters:** Because the header is only 3 words, passing a slice to a function — even one with a million elements — never copies the million elements, only the 24 bytes describing where they are.
+
+### append and growth, step by step
+
+**In plain words:** `append` has exactly two paths: write into existing free space, or grow into a new array. Which path it takes depends on one comparison.
+
+**Step by step, what `append(s, v)` does:**
+1. Check whether `len(s) < cap(s)` — is there a free slot already reserved?
+2. If yes: write `v` into that slot, increment `len`, and return a slice still pointing at the same backing array.
+3. If no: allocate a new, bigger backing array (see the growth table below for how much bigger).
+4. Copy all `len(s)` existing elements into the new array.
+5. Write `v` at the end, and return a slice pointing at the **new** array — the old one is now unreachable unless something else still references it.
 
 ```mermaid
 flowchart TD
@@ -86,7 +144,17 @@ The growth decision (Go 1.18+, `runtime/slice.go`, function `nextslicecap`) is d
 | 849 | 1280 | 1.51x |
 | 1281 | 1792 | 1.40x |
 
-### Aliasing
+> [!warning] Common mistake
+> Assuming `append` always allocates. In the common case — a slice with spare capacity — it does not; the cost of `append` is amortized `O(1)` precisely because most calls take the cheap path. See [[Complexity Analysis - Big-O and Amortized Cost]] for the full argument.
+
+> [!tip] Remember
+> `append` writes in place while `len < cap`, and reallocates-and-copies only when it must. The growth factor shrinks from ~2x to ~1.25x above 256 elements to bound wasted memory.
+
+### Aliasing: two tickets, one lot
+
+**In plain words:** "Aliasing" means two slice variables secretly pointing at the same backing array, so a write through one is visible through the other — until one of them reallocates.
+
+**Picture it:**
 
 ```mermaid
 flowchart LR
@@ -96,126 +164,56 @@ flowchart LR
     note1["backing[2] is now 99:<br/>a and backing both see it"]
 ```
 
-Because `a`'s capacity (5) is bigger than its length (2), `append(a, 99)` writes `99` into `backing[2]` **in place** — it does not need a new array. Anyone else still holding `backing` now sees that write. This is the aliasing bug: two slices that look independent are secretly sharing memory until one of them is forced to reallocate.
+**Example:** Because `a`'s capacity (5) is bigger than its length (2), `append(a, 99)` writes `99` into `backing[2]` **in place** — it does not need a new array. Anyone else still holding `backing` now sees that write.
+
+**Why it matters:** This is the aliasing bug: two slices that look independent are secretly sharing memory until one of them is forced to reallocate. A function that returns a sub-slice of its input can leave the caller surprised later.
+
+**What happens if** you want to stop two slices from aliasing on purpose? Use the full slice expression `s[low:high:max]`, which pins capacity to `max`. Any `append` beyond that capacity is then forced onto a fresh array instead of silently overwriting shared memory — see the Go note's aliasing test for this in code.
+
+> [!tip] Remember
+> Two slices over the same backing array only stay independent once one of them has reallocated (or you've deliberately capped capacity with `s[low:high:max]`).
 
 ## 4. Worked example
 
-### Whiteboard version
+A day's weather, as rows of `(date, high, low)`, is a concrete case where the choice between layouts matters.
+
+1. Store it as `[][3]float64` ("slice of slices"): each row is its own heap allocation, a pointer hop away from its neighbor — convenient when rows genuinely vary in length, worse for cache locality when they don't.
+2. Store it as one flat `[]float64` of length `rows*cols`, indexed by `row*width + col` (**row-major** order: row 0's elements come first, then row 1's, and so on): one allocation, contiguous, cache-friendly.
+
+```mermaid
+flowchart TB
+    subgraph flat["Flat []float64, row-major, width=3"]
+        direction LR
+        f0["[0] r0c0"] --- f1["[1] r0c1"] --- f2["[2] r0c2"] --- f3["[3] r1c0"] --- f4["[4] r1c1"] --- f5["[5] r1c2"]
+    end
+    note["(row=1, col=1) -> index 1*3+1 = 4"]
+```
+
+Inserting or deleting in the middle of either layout costs `O(n)`, because every following element has to shift one place to make or close the gap — the array doesn't have a "hole," so the elements after the gap physically move:
+
+```mermaid
+flowchart LR
+    before["[1,2,4,5]"] -->|"Insert(2, 3): shift [4,5] right one"| after["[1,2,3,4,5]"]
+```
 
 ```go
 s := make([]int, 0, 2)  // len=0, cap=2
 s = append(s, 1, 2)     // len=2, cap=2: backing array full
-s = append(s, 3)        // len=3, cap=4: no room, so a NEW array is allocated and [1,2] is copied in
+s = append(s, 3)        // len=3, cap=4: new array allocated, [1,2] copied in
 ```
 
-After the third line, the original 2-element backing array is unreachable (nothing points to it anymore) and will be garbage collected; `s` now points at a fresh 4-element array holding `[1, 2, 3, _]`.
+After the third line, the original 2-element backing array is unreachable and will be garbage collected; `s` now points at a fresh 4-element array holding `[1, 2, 3, _]`.
 
-### Full version: growth, insert/delete, aliasing, and row-major 2-D layout
-
-Tested on Go 1.24.4 (darwin/arm64); `go vet` and `go test -race` both pass.
-
-```go
-// NextCap implements the documented two-phase growth decision from the Go
-// runtime (runtime/slice.go, nextslicecap, Go 1.18+): below a 256-element
-// threshold capacity doubles; above it, growth decays toward 1.25x. The
-// actual allocator then rounds the result up to the nearest size class,
-// which is why measured capacities (see the table above) are slightly
-// larger than this formula's raw output.
-func NextCap(oldCap, newLen int) int {
-	if newLen > 2*oldCap {
-		return newLen
-	}
-	const threshold = 256
-	if oldCap < threshold {
-		return 2 * oldCap
-	}
-	newCap := oldCap
-	for newCap < newLen {
-		newCap += (newCap + 3*threshold) / 4
-	}
-	return newCap
-}
-
-// Insert inserts v at index i, shifting everything after it one place right.
-// O(n) because every following element moves.
-func Insert[T any](s []T, i int, v T) []T {
-	var zero T
-	s = append(s, zero)
-	copy(s[i+1:], s[i:])
-	s[i] = v
-	return s
-}
-
-// Delete removes the element at index i, shifting everything after it one
-// place left. O(n). It clears the now-unused last slot so a pointer or
-// interface value there doesn't keep its target alive.
-func Delete[T any](s []T, i int) []T {
-	copy(s[i:], s[i+1:])
-	var zero T
-	s[len(s)-1] = zero
-	return s[:len(s)-1]
-}
-
-// RowMajorIndex maps a (row, col) pair in a width-column grid to the index
-// in a flat, row-major []T. Row-major means row 0's elements come first,
-// then row 1's, and so on.
-func RowMajorIndex(row, col, width int) int {
-	return row*width + col
-}
-```
-
-```go
-func TestAliasing(t *testing.T) {
-	backing := []int{1, 2, 3, 4, 5}
-	a := backing[0:2] // len=2, cap=5: shares backing's array
-	b := append(a, 99)
-	if backing[2] != 99 {
-		t.Fatalf("expected append to alias and overwrite backing[2], got %d", backing[2])
-	}
-	if &b[0] != &backing[0] {
-		t.Fatalf("expected b to still share backing's array")
-	}
-
-	// The full slice expression s[low:high:max] caps capacity at max, so an
-	// append beyond it allocates a fresh array instead of aliasing.
-	c := backing[0:2:2] // len=2, cap=2: cap pinned to len
-	d := append(c, 100)
-	if backing[2] != 99 {
-		t.Fatalf("backing[2] should be untouched by the capped append, got %d", backing[2])
-	}
-	if &d[0] == &backing[0] {
-		t.Fatalf("expected d to have a new backing array after growing past the pinned cap")
-	}
-}
-
-func TestNextCap(t *testing.T) {
-	cases := []struct{ oldCap, newLen, want int }{
-		{1, 2, 2},
-		{2, 3, 4},
-		{128, 129, 256},
-		{256, 257, 512},
-		{512, 513, 832}, // raw formula; the allocator rounds this up to the 848 size class
-	}
-	for _, c := range cases {
-		if got := NextCap(c.oldCap, c.newLen); got != c.want {
-			t.Errorf("NextCap(%d,%d) = %d, want %d", c.oldCap, c.newLen, got, c.want)
-		}
-	}
-}
-```
-
-### 2-D arrays as flat, row-major slices
-
-A day's weather as rows of `(date, high, low)` is cleanest as `[][3]float64` or, for a fixed shape, a single flat `[]float64` of length `rows*cols` indexed with `RowMajorIndex`. The flat form is one allocation (contiguous, cache-friendly); `[][]float64` ("slice of slices") is `rows` separate allocations, one per row, each a pointer hop away from the next — convenient when rows have different lengths, worse for cache locality when they don't.
-
-### The aliasing-leak trap
+**The aliasing-leak trap:** a tiny sub-slice of a huge array keeps the *whole* array alive for the garbage collector, because the sub-slice's header still points inside it:
 
 ```go
 huge := make([]byte, 1<<20) // 1 MiB
 tiny := huge[0:16]          // still references the whole 1 MiB backing array
 ```
 
-`tiny` looks small, but as long as it's reachable, the garbage collector cannot free the full 1 MiB backing array behind it. Fix it by copying the slice you actually need: `tiny := append([]byte(nil), huge[0:16]...)`.
+`tiny` looks small, but as long as it's reachable, the garbage collector cannot free the 1 MiB behind it. The fix is to copy out only what you need: `tiny := append([]byte(nil), huge[0:16]...)`.
+
+Runnable Go version: [[Arrays and Dynamic Arrays (Go Slices) - Go]].
 
 ## 5. Variants and comparison
 
@@ -230,9 +228,12 @@ tiny := huge[0:16]          // still references the whole 1 MiB backing array
 ## 6. Trade-offs and when not to use
 
 - Insert/delete in the middle is `O(n)` because everything after the index must shift. If your workload is insert/delete-heavy in the middle and never needs random access by index, a different structure wins — see [[Linked Lists]].
-- A slice you keep appending to in a loop without a size hint re-copies its backing array `O(log n)` times total (still `O(n)` amortised), but each copy is a real allocation; pre-size with `make([]T, 0, n)` when `n` is known, to skip all of them.
+- A slice you keep appending to in a loop without a size hint re-allocates its backing array `O(log n)` times total (still `O(n)` amortised), but each reallocation is a real allocation; pre-size with `make([]T, 0, n)` when `n` is known, to skip all of them.
 - Aliasing is a real footgun: a function that returns a sub-slice of its input can leave the caller surprised when a later `append` on either side mutates the other. Document (or avoid) returning aliased sub-slices from library functions.
 - Static arrays (`[N]T`) are rarely the right default in application code: their value semantics (full copy on assignment or when passed to a function) are a common source of accidental `O(N)` copies; reach for them for small, fixed-shape data (a hash sum's bytes, a 3D vector) rather than general collections.
+
+> [!tip] Remember
+> The same contiguous layout that makes slices fast at reading and appending at the end makes them slow at inserting or deleting in the middle — pick the structure that matches your actual access pattern.
 
 ## 7. In production
 
@@ -240,120 +241,24 @@ tiny := huge[0:16]          // still references the whole 1 MiB backing array
 - **Failure modes → fixes:** unbounded `append` in a hot loop causing GC pressure → pre-size with `make([]T, 0, n)`; a sub-slice of a huge buffer kept around (e.g., `bytes.Split` results from a large file) pinning the whole buffer in memory → copy out only what you need; concurrent `append` on a shared slice from multiple goroutines racing on the header's `len`/`cap` → guard with a mutex or give each goroutine its own slice and merge at the end.
 - **What to monitor:** allocations per request (`go test -benchmem`, or `pprof`'s `alloc_objects`), and GC pause frequency if a service appends heavily without pre-sizing.
 
-## 8. Deep dive
+## 8. Whiteboard version
+
+If someone asks you to explain slices at a whiteboard with no code:
+
+1. Draw a row of boxes labelled 0 to 4 — that's the backing array.
+2. Draw a small card beside it with three fields: `ptr → box 0`, `len = 3`, `cap = 5`.
+3. Shade boxes 0, 1, 2 to show they're "in use" (`len`); leave 3 and 4 unshaded (`cap - len` spare room).
+4. Append once: shade box 3, bump `len` to 4. No new row of boxes needed — there was spare room.
+5. Append past capacity: draw a *new*, bigger row of boxes, copy the shaded ones across, point the card at the new row.
+
+That five-step picture is the entire mental model; everything in section 3 is this diagram with precise numbers attached.
+
+## 9. Deep dive
 
 - **Why 256 is the growth threshold.** Doubling forever would waste more and more memory per growth as capacity gets large (doubling a slice of 1,000,000 wastes up to 1,000,000 slots); decaying toward 1.25x bounds the wasted fraction while keeping the number of reallocations logarithmic in the final size.
 - **Size classes.** Go's allocator only hands out memory in a fixed set of size classes (8, 16, 24, 32, 48, … bytes per object), so a requested capacity is rounded up to whichever class fits. That's the gap between the growth formula's raw output (832) and the measured capacity (848) in the table above.
 - **Arrays vs slices at the type level.** `[N]T` is part of the type (`[5]int` and `[6]int` are different types, incompatible without conversion); `[]T` has no size in its type, which is exactly what lets a function accept a slice of any length. Passing an array to a function copies it; passing a slice copies only the 3-word header.
-- **Escape analysis decides where the backing array lives.** `make([]T, n)` with a small, compile-time-constant `n` that never escapes the function can be allocated on the stack instead of the heap, skipping GC entirely; this is the compiler's job, not something this slice header diagram shows directly — see [[Pointers, Values and Escape Analysis]] for the mechanics and how to check it with `go build -gcflags="-m"`.
-
-## 9. Five classic interview patterns over slices
-
-These five patterns cover most array/slice interview problems. All five only need the contiguous-memory properties from section 3: `O(1)` index access and cheap sequential scans.
-
-Tested on Go 1.24.4 (darwin/arm64): `go vet` and `go test -race` both pass.
-
-```go
-// TwoSumSorted finds a pair in a sorted slice that sums to target, using two
-// pointers that close in from both ends. O(n) time, O(1) extra space — no
-// need for the O(n) extra space a hash-map version would use.
-func TwoSumSorted(sorted []int, target int) (int, int, bool) {
-	lo, hi := 0, len(sorted)-1
-	for lo < hi {
-		sum := sorted[lo] + sorted[hi]
-		switch {
-		case sum == target:
-			return lo, hi, true
-		case sum < target:
-			lo++
-		default:
-			hi--
-		}
-	}
-	return 0, 0, false
-}
-
-// MaxWindowSum returns the largest sum of any k consecutive elements, sliding
-// a fixed-size window one step at a time instead of resumming it from
-// scratch at every position. O(n) time instead of the naive O(n*k).
-func MaxWindowSum(nums []int, k int) int {
-	sum := 0
-	for i := 0; i < k; i++ {
-		sum += nums[i]
-	}
-	best := sum
-	for i := k; i < len(nums); i++ {
-		sum += nums[i] - nums[i-k] // drop the element leaving the window, add the one entering it
-		if sum > best {
-			best = sum
-		}
-	}
-	return best
-}
-
-// PrefixSums returns a length len(nums)+1 array where prefix[i] is the sum of
-// nums[0:i]. One O(n) build then answers any "sum of a range" query in O(1)
-// via RangeSum, instead of re-summing the range every time.
-func PrefixSums(nums []int) []int {
-	prefix := make([]int, len(nums)+1)
-	for i, v := range nums {
-		prefix[i+1] = prefix[i] + v
-	}
-	return prefix
-}
-
-func RangeSum(prefix []int, l, r int) int { return prefix[r+1] - prefix[l] }
-
-// MaxSubArray is Kadane's algorithm: the maximum sum of any contiguous
-// subarray, allowing negative numbers. At each index it decides whether
-// extending the running subarray or restarting here is better — a running
-// sum that's gone negative can only hurt what follows. O(n) time, O(1) space.
-func MaxSubArray(nums []int) int {
-	best, cur := nums[0], nums[0]
-	for _, v := range nums[1:] {
-		if cur < 0 {
-			cur = v
-		} else {
-			cur += v
-		}
-		if cur > best {
-			best = cur
-		}
-	}
-	return best
-}
-
-// MinEatingSpeed is "binary search on the answer": instead of searching the
-// input array, it searches the space of possible eating speeds (1..the
-// largest pile) for the smallest speed that still finishes every pile within
-// h hours. This only works because "can finish at this speed" is monotonic
-// (true for every speed at or above the answer, false below it) — the same
-// shape as a capacity or rate-limit search.
-func MinEatingSpeed(piles []int, h int) int {
-	lo, hi := 1, 0
-	for _, p := range piles {
-		if p > hi {
-			hi = p
-		}
-	}
-	canFinish := func(speed int) bool {
-		hours := 0
-		for _, p := range piles {
-			hours += (p + speed - 1) / speed // ceil(p / speed)
-		}
-		return hours <= h
-	}
-	for lo < hi {
-		mid := lo + (hi-lo)/2
-		if canFinish(mid) {
-			hi = mid
-		} else {
-			lo = mid + 1
-		}
-	}
-	return lo
-}
-```
+- **Escape analysis decides where the backing array lives.** `make([]T, n)` with a small, compile-time-constant `n` that never escapes the function can be allocated on the stack instead of the heap, skipping GC entirely; this is the compiler's job, not something the slice header diagram shows directly — see [[Pointers, Values and Escape Analysis]] for the mechanics and how to check it with `go build -gcflags="-m"`.
 
 ## 10. Interview questions
 
@@ -388,10 +293,11 @@ func MinEatingSpeed(piles []int, h int) int {
 - A tiny sub-slice of a huge array keeps the whole array alive; copy out what you need to let the rest be collected.
 - `[N]T` is a value type (full-copy semantics); `[]T` is the default for general collections.
 - Flat `[]T` with row-major indexing beats `[][]T` for cache locality on fixed-shape 2-D data.
-- Five patterns cover most array interview problems: two pointers, sliding window, prefix sums, Kadane's algorithm, binary search on the answer.
+- The five classic slice interview patterns (two pointers, sliding window, prefix sums, Kadane's algorithm, binary search on the answer) are implemented and tested in [[Arrays and Dynamic Arrays (Go Slices) - Go]].
 
 ## Links
 
 - **Before this:** [[Data Structures Overview and Big-O Cheat Sheet]]
 - **Next:** [[Linked Lists]], [[Stacks, Queues and Deques]]
 - **Compare with:** [[Memory Hierarchy and CPU Caches]] (why contiguous memory is fast), [[Pointers, Values and Escape Analysis]] (stack vs heap allocation for `make`)
+- **Runnable code:** [[Arrays and Dynamic Arrays (Go Slices) - Go]]

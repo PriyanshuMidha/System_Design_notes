@@ -78,10 +78,48 @@ flowchart TB
 1. Every row becomes a key-value pair. The key is the table id plus the primary key, so rows are sorted by primary key, and a secondary index is just another set of keys.
 2. The sorted key space is cut into ranges. CockroachDB splits a range when it passes 512 MiB (the default `range_max_bytes`) or when it gets too much load.
 3. Each range has 3 replicas by default (configurable to 5 or more) on different nodes, ideally in different zones or regions.
-4. The gateway looks up which range holds a key (a cached range directory, like the `Router` in the code below) and sends the request to that range's leaseholder.
+4. The gateway looks up which range holds a key (a cached range directory; [[Distributed SQL - Go]] implements one as a `Router`) and sends the request to that range's leaseholder.
 5. A write is proposed to the range's Raft leader, appended to a majority of logs, and then applied. A read at the leaseholder needs no consensus round, because the lease guarantees no other replica can be accepting writes.
 
-Range sharding keeps nearby keys together, so range scans are efficient, but a monotonically increasing key (a timestamp or a sequence) sends all inserts to the last range: a hot spot. The fixes are UUID keys, hash-sharded indexes, or a leading `workspace_id`. YugabyteDB hash-shards the first primary-key column by default for this reason, and lets you choose range sharding with `ASC`/`DESC`.
+### Range splits
+
+A range is not fixed. When it grows past the size limit or draws too much traffic, the database cuts it in two at a key and hands one half to a different set of nodes.
+
+```mermaid
+flowchart LR
+    subgraph before["Before: one range, 512 MiB reached"]
+        R1["Range 12<br/>keys /invoices/1 to /invoices/5000<br/>leaseholder n1"]
+    end
+    subgraph after["After split at /invoices/2500"]
+        R2["Range 12<br/>keys /invoices/1 to /invoices/2500<br/>leaseholder n1"]
+        R3["Range 58 (new)<br/>keys /invoices/2500 to /invoices/5000<br/>leaseholder moves to n2"]
+    end
+    R1 -->|"size or load threshold"| R2
+    R1 --> R3
+```
+
+Example: a 1 GiB table with a 512 MiB limit ends up as at least 2 ranges. Each new range gets its own Raft group, and the balancer may move its leaseholder to a less busy node.
+
+### Hot spots from sequential keys
+
+Range sharding keeps nearby keys together, so range scans are efficient. The price is that a monotonically increasing key (a timestamp or a sequence) sends all inserts to the last range: a hot spot.
+
+```mermaid
+flowchart LR
+    subgraph seq["Sequential key: SERIAL or created_at"]
+        i1["insert 1001"] --> L1["last range, one leaseholder<br/>takes 100% of writes"]
+        i2["insert 1002"] --> L1
+        i3["insert 1003"] --> L1
+        Z1["other ranges idle"]
+    end
+    subgraph spread["UUID or hash-sharded key"]
+        j1["insert a3f"] --> M1["range A"]
+        j2["insert 7c1"] --> M2["range B"]
+        j3["insert e90"] --> M3["range C"]
+    end
+```
+
+The fixes are UUID keys, hash-sharded indexes, or a leading `workspace_id`. YugabyteDB hash-shards the first primary-key column by default for this reason, and lets you choose range sharding with `ASC`/`DESC`.
 
 ### Transactions across ranges: two-phase commit over Raft
 
@@ -109,13 +147,51 @@ This is two-phase commit ([[Two-Phase Commit]]): phase one writes intents, phase
 
 CockroachDB's **parallel commits** (since v19.2) write the `STAGING` record at the same time as the last intents, which turns two sequential consensus rounds at commit into one. Spanner uses classic 2PC across Paxos groups, with one group's leader as coordinator. TiDB uses the Percolator protocol: a primary lock and secondary locks in TiKV, with commit decided by the primary key's lock.
 
+### What a reader does when it meets a write intent
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: intent written, txn record PENDING
+    Pending --> Staging: coordinator writes STAGING with intent list
+    Staging --> Committed: all intents replicated, or recovered by any node
+    Pending --> Aborted: coordinator dies, others push it past its timeout
+    Staging --> Aborted: an intent is missing
+    Committed --> [*]: reader uses the value, intent resolved async
+    Aborted --> [*]: reader ignores the intent
+```
+
+Example: transaction T1 has an intent on invoice 42 and then its coordinator crashes. A reader R finds the intent, reads T1's record from range 12, sees `STAGING`, checks that the payment intent in range 31 is also replicated, and concludes T1 is committed. R reads the new value and no one has to wait for the dead coordinator.
+
 ### Timestamps: TrueTime vs HLC vs a timestamp oracle
 
 All of these databases use MVCC ([[Isolation Levels and MVCC]]): every value is stored with a commit timestamp, and a transaction reads the newest version at or below its read timestamp. The question is where the timestamps come from, given that server clocks drift ([[Clocks and Ordering]]).
 
 - **Spanner: TrueTime.** Google's datacentres have GPS receivers and atomic clocks. `TT.now()` returns an interval `[earliest, latest]` guaranteed to contain true time; the uncertainty ε was typically 1–7 ms in the 2012 paper. At commit, Spanner picks timestamp `s = TT.now().latest` and then **waits until `TT.now().earliest > s`** before releasing locks (commit wait, about 2ε). After that wait, any transaction that starts later in real time is guaranteed to get a larger timestamp. That property is **external consistency** (also called strict serializability).
+| System | Timestamp source | Needs special hardware | Price paid |
+| --- | --- | --- | --- |
+| Spanner | TrueTime interval | GPS and atomic clocks | Commit wait of about 2ε per write transaction |
+| CockroachDB, YugabyteDB | HLC | No | Max clock offset, uncertainty restarts |
+| TiDB | Central TSO in PD | No | One round trip to PD per transaction (batched) |
+
 - **CockroachDB and YugabyteDB: hybrid logical clocks (HLC).** Each timestamp is wall time plus a logical counter. A node that receives a message with a larger timestamp moves its clock forward to it, so causally related events are ordered correctly without special hardware. Clocks must stay within a maximum offset (500 ms by default in CockroachDB); a node whose clock drifts past that shuts itself down. Because clocks are not exact, a reader that sees a value with a timestamp slightly above its own, inside its **uncertainty interval**, cannot tell whether it happened before or after it; it must restart at a higher timestamp.
 - **TiDB: timestamp oracle (TSO).** The Placement Driver (PD) cluster hands out strictly increasing timestamps from one leader. Ordering is trivial; the cost is a round trip to PD for each transaction (batched) and a dependency on PD's availability and location.
+
+### An HLC keeps cause before effect
+
+Example: node A's clock reads 5 ms, node B's clock reads 0 ms. A commits invoice 42 at timestamp (5.000 ms, 0) and sends the news to B. Without help, B would stamp the payment it writes next with a time near 0 ms, earlier than the invoice it depends on.
+
+```mermaid
+sequenceDiagram
+    participant A as Node A, wall clock 5.000 ms
+    participant B as Node B, wall clock 0.000 ms
+    A->>A: Now() returns (5.000 ms, 0) for invoice 42
+    A->>B: message carries (5.000 ms, 0)
+    B->>B: Update() sees remote wall above its own, adopts (5.000 ms, 1)
+    B->>B: Now() for payment returns (5.000 ms, 2), because wall clock still 0
+    Note over A,B: payment (5.000 ms, 2) is ordered after invoice (5.000 ms, 0)
+```
+
+### Commit wait in Spanner
 
 ```mermaid
 sequenceDiagram
@@ -135,6 +211,20 @@ sequenceDiagram
 ```
 
 ### Isolation and retries
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running: BEGIN
+    Running --> Committed: COMMIT ok
+    Running --> Restart: conflict found, SQLSTATE 40001
+    Restart --> Backoff: client ROLLBACK
+    Backoff --> Running: wait with jitter, re-run every statement
+    Backoff --> GaveUp: attempts exhausted
+    Running --> Failed: non-retryable error such as 23505
+    Committed --> [*]
+    GaveUp --> [*]
+    Failed --> [*]
+```
 
 CockroachDB and Spanner default to **SERIALIZABLE**. CockroachDB does it optimistically: transactions do not take read locks, and conflicts found at write or commit time cause one transaction to restart. The client sees SQLSTATE `40001` with a message such as `restart transaction: TransactionRetryWithProtoRefreshError: ... RETRY_SERIALIZABLE`. CockroachDB added `READ COMMITTED` (generally available in v24.1) for workloads that cannot handle retries. YugabyteDB's YSQL behaves as snapshot isolation by default (what PostgreSQL calls `REPEATABLE READ`; `READ COMMITTED` maps to snapshot unless the `yb_enable_read_committed_isolation` flag is set) and also supports serializable. TiDB defaults to snapshot isolation under the name `REPEATABLE READ`, with pessimistic locking the default for new clusters since v3.0.8. Aurora DSQL uses optimistic concurrency control with snapshot isolation and reports conflicts at commit.
 
@@ -167,6 +257,20 @@ Assume 3 replicas, about 1 ms round trip inside a region, about 70 ms US-east to
 | Three regions, leaders in US | US, EU, India | quorum = US + EU, about 70 ms | about 140–150 ms from a US client | loss of one region |
 | Regional by row (workspace pinned to its home region) | 3 zones inside the workspace's region, plus non-voting replicas elsewhere | about 1–2 ms in the home region | about 3–5 ms | loss of one zone, not the region |
 
+```mermaid
+flowchart TB
+    subgraph one["Layout 2: leaders in US, quorum US + EU"]
+        c1["US client"] -->|"1 ms"| l1["US leader"]
+        l1 -->|"about 70 ms, waits for 2 of 3"| e1["EU replica acks"]
+        l1 -.->|"India ack not needed"| i1["India replica"]
+    end
+    subgraph two["Layout 3: regional by row, EU workspace pinned to EU"]
+        c2["EU client"] -->|"1 ms"| l2["EU zone-a leader"]
+        l2 -->|"1 ms"| e2["EU zone-b replica acks"]
+        l2 -.->|"async copy"| n2["non-voting replica in US"]
+    end
+```
+
 The middle row is the price of surviving a whole region with consistent writes: every commit waits for a majority that lies in another region. The usual answer is the third row: pin each workspace's rows to its home region (CockroachDB `REGIONAL BY ROW`, YugabyteDB tablespaces, Spanner placement configurations), and replicate only small, read-mostly tables everywhere (CockroachDB `GLOBAL` tables, which make reads local and writes slower).
 
 ```sql
@@ -174,10 +278,14 @@ The middle row is the price of surviving a whole region with consistent writes: 
 ALTER DATABASE invoiceops SET PRIMARY REGION "us-east1";
 ALTER DATABASE invoiceops ADD REGION "europe-west1";
 ALTER DATABASE invoiceops ADD REGION "asia-south1";
+```
 
+```sql
 ALTER TABLE invoices SET LOCALITY REGIONAL BY ROW;   -- hidden crdb_region column per row
 ALTER TABLE currencies SET LOCALITY GLOBAL;          -- fast reads everywhere, slow writes
+```
 
+```sql
 -- Follower read: may be a few seconds stale, served by the nearest replica.
 SELECT count(*) FROM invoices AS OF SYSTEM TIME follower_read_timestamp()
 WHERE workspace_id = 7 AND status = 'open';
@@ -194,348 +302,7 @@ SHOW RANGES FROM TABLE invoices WITH DETAILS;  -- v23.1+: lease and replica colu
 --   …/5000           | <after:/Max>     |       59 |            4 | {2,3,4}
 ```
 
-### Building blocks in Go
-
-The code below models the three client-visible pieces: an HLC that never runs backwards and absorbs remote timestamps, a range router that finds and splits ranges, and the retry loop every application needs. `RunTx` accepts any error with a `SQLState()` method, which is what `*pgconn.PgError` from `github.com/jackc/pgx/v5` provides, so it works unchanged against CockroachDB, YugabyteDB or PostgreSQL.
-
-```go
-// Package distsql shows three building blocks of a distributed SQL database:
-// a hybrid logical clock, a range router, and a client retry loop.
-package distsql
-
-import (
-	"sync"
-	"time"
-)
-
-// Timestamp is a hybrid logical clock (HLC) value: wall-clock nanoseconds
-// plus a logical counter that breaks ties and absorbs clock skew.
-type Timestamp struct {
-	Wall    int64
-	Logical int32
-}
-
-// Less orders timestamps by wall time, then by logical counter.
-func (t Timestamp) Less(o Timestamp) bool {
-	return t.Wall < o.Wall || (t.Wall == o.Wall && t.Logical < o.Logical)
-}
-
-// Clock is an HLC. It never goes backwards and is always >= any timestamp
-// it has seen from another node, which gives causal ordering without
-// atomic clocks.
-type Clock struct {
-	mu      sync.Mutex
-	physNow func() int64
-	last    Timestamp
-}
-
-// NewClock builds a clock over a physical time source (nanoseconds).
-func NewClock(physNow func() int64) *Clock {
-	if physNow == nil {
-		physNow = func() int64 { return time.Now().UnixNano() }
-	}
-	return &Clock{physNow: physNow}
-}
-
-// Now returns a timestamp for a local event or an outgoing message.
-func (c *Clock) Now() Timestamp {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if pt := c.physNow(); pt > c.last.Wall {
-		c.last = Timestamp{Wall: pt}
-	} else {
-		c.last.Logical++
-	}
-	return c.last
-}
-
-// Update merges a timestamp received from another node and returns the
-// new local time, which is strictly greater than both.
-func (c *Clock) Update(remote Timestamp) Timestamp {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	pt := c.physNow()
-	switch {
-	case pt > c.last.Wall && pt > remote.Wall:
-		c.last = Timestamp{Wall: pt}
-	case remote.Wall > c.last.Wall:
-		c.last = Timestamp{Wall: remote.Wall, Logical: remote.Logical + 1}
-	case c.last.Wall > remote.Wall:
-		c.last.Logical++
-	default: // equal wall times
-		c.last.Logical = max(c.last.Logical, remote.Logical) + 1
-	}
-	return c.last
-}
-```
-
-```go
-package distsql
-
-import (
-	"errors"
-	"sort"
-)
-
-// Range is a contiguous slice of the sorted key space [Start, End),
-// replicated by its own Raft group. End == "" means +infinity.
-type Range struct {
-	ID          int
-	Start, End  string
-	Leaseholder string // the replica that serves reads and proposes writes
-}
-
-// Router maps a key to its range, like the range cache in a SQL gateway.
-type Router struct {
-	ranges []Range // sorted by Start, no gaps, first Start == ""
-}
-
-var ErrBadLayout = errors.New("distsql: ranges must be sorted and contiguous from \"\"")
-
-// NewRouter validates that the ranges tile the whole key space.
-func NewRouter(ranges []Range) (*Router, error) {
-	if len(ranges) == 0 || ranges[0].Start != "" {
-		return nil, ErrBadLayout
-	}
-	for i := 1; i < len(ranges); i++ {
-		if ranges[i-1].End != ranges[i].Start {
-			return nil, ErrBadLayout
-		}
-	}
-	if ranges[len(ranges)-1].End != "" {
-		return nil, ErrBadLayout
-	}
-	return &Router{ranges: ranges}, nil
-}
-
-// Lookup finds the range holding key with a binary search: the last range
-// whose Start <= key.
-func (r *Router) Lookup(key string) Range {
-	i := sort.Search(len(r.ranges), func(i int) bool { return r.ranges[i].Start > key })
-	return r.ranges[i-1]
-}
-
-// Split cuts the range containing at into [Start, at) and [at, End),
-// which is what the database does when a range grows too big or too hot.
-func (r *Router) Split(at string, newID int) {
-	i := sort.Search(len(r.ranges), func(i int) bool { return r.ranges[i].Start > at }) - 1
-	old := r.ranges[i]
-	if old.Start == at {
-		return // already a boundary
-	}
-	left := Range{ID: old.ID, Start: old.Start, End: at, Leaseholder: old.Leaseholder}
-	right := Range{ID: newID, Start: at, End: old.End, Leaseholder: old.Leaseholder}
-	r.ranges = append(r.ranges[:i], append([]Range{left, right}, r.ranges[i+1:]...)...)
-}
-```
-
-```go
-package distsql
-
-import (
-	"context"
-	"errors"
-	"math/rand/v2"
-	"time"
-)
-
-// sqlStater matches *pgconn.PgError from pgx without importing it.
-type sqlStater interface{ SQLState() string }
-
-// Retryable reports whether the database asked the client to retry the
-// whole transaction: 40001 serialization_failure (CockroachDB, YugabyteDB,
-// Spanner's PostgreSQL interface, Postgres SERIALIZABLE) or 40P01 deadlock.
-func Retryable(err error) bool {
-	var s sqlStater
-	if !errors.As(err, &s) {
-		return false
-	}
-	return s.SQLState() == "40001" || s.SQLState() == "40P01"
-}
-
-// RunTx runs fn (one whole transaction: BEGIN ... COMMIT) and retries it on
-// retryable errors with capped exponential backoff and full jitter.
-// fn must be safe to re-run: no side effects outside the transaction.
-func RunTx(ctx context.Context, maxAttempts int, fn func(ctx context.Context) error) error {
-	backoff := 10 * time.Millisecond
-	var err error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if err = fn(ctx); err == nil || !Retryable(err) {
-			return err
-		}
-		if attempt == maxAttempts {
-			break
-		}
-		sleep := time.Duration(rand.Int64N(int64(backoff)) + 1)
-		select {
-		case <-time.After(sleep):
-		case <-ctx.Done():
-			return errors.Join(err, ctx.Err())
-		}
-		backoff = min(backoff*2, time.Second)
-	}
-	return err
-}
-```
-
-```go
-package distsql
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"sync"
-	"testing"
-)
-
-type fakeTime struct {
-	mu sync.Mutex
-	ns int64
-}
-
-func (f *fakeTime) now() int64   { f.mu.Lock(); defer f.mu.Unlock(); return f.ns }
-func (f *fakeTime) set(ns int64) { f.mu.Lock(); f.ns = ns; f.mu.Unlock() }
-
-func TestHLCMonotonicWhenWallClockStalls(t *testing.T) {
-	ft := &fakeTime{ns: 1000}
-	c := NewClock(ft.now)
-	a, b := c.Now(), c.Now()
-	if !a.Less(b) || b != (Timestamp{1000, 1}) {
-		t.Fatalf("a=%v b=%v", a, b)
-	}
-	ft.set(900) // NTP steps the clock back 100 ns
-	if d := c.Now(); !b.Less(d) {
-		t.Fatalf("clock went backwards: %v then %v", b, d)
-	}
-}
-
-func TestHLCCausality(t *testing.T) {
-	// Node A's clock runs 5 ms ahead of node B's.
-	ta, tb := &fakeTime{ns: 5_000_000}, &fakeTime{ns: 0}
-	a, b := NewClock(ta.now), NewClock(tb.now)
-
-	sent := a.Now()        // A commits invoice 42 and tells B
-	recv := b.Update(sent) // B receives it
-	later := b.Now()       // B then writes payment for invoice 42
-	if !sent.Less(recv) || !recv.Less(later) {
-		t.Fatalf("causality broken: sent=%v recv=%v later=%v", sent, recv, later)
-	}
-	if later.Wall != 5_000_000 {
-		t.Fatalf("B should adopt A's wall time, got %v", later)
-	}
-}
-
-func TestHLCConcurrent(t *testing.T) {
-	c := NewClock(nil)
-	var wg sync.WaitGroup
-	seen := make(chan Timestamp, 8000)
-	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for range 1000 {
-				seen <- c.Now()
-			}
-		}()
-	}
-	wg.Wait()
-	close(seen)
-	uniq := map[Timestamp]bool{}
-	for ts := range seen {
-		if uniq[ts] {
-			t.Fatalf("duplicate timestamp %v", ts)
-		}
-		uniq[ts] = true
-	}
-}
-
-func TestRouter(t *testing.T) {
-	r, err := NewRouter([]Range{
-		{ID: 1, Start: "", End: "/invoices/m", Leaseholder: "n1"},
-		{ID: 2, Start: "/invoices/m", End: "", Leaseholder: "n2"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := r.Lookup("/invoices/acme/42").ID; got != 1 {
-		t.Fatalf("got range %d", got)
-	}
-	if got := r.Lookup("/invoices/m").ID; got != 2 {
-		t.Fatalf("boundary key belongs to the right range, got %d", got)
-	}
-	r.Split("/invoices/f", 3)
-	if got := r.Lookup("/invoices/globex/7").ID; got != 3 {
-		t.Fatalf("after split got %d", got)
-	}
-	if got := r.Lookup("/invoices/acme/42").ID; got != 1 {
-		t.Fatalf("left side keeps id 1, got %d", got)
-	}
-	if _, err := NewRouter([]Range{{ID: 1, Start: "a"}}); !errors.Is(err, ErrBadLayout) {
-		t.Fatal("expected layout error")
-	}
-}
-
-type pgErr struct{ code string }
-
-func (e *pgErr) Error() string    { return "pg error " + e.code }
-func (e *pgErr) SQLState() string { return e.code }
-
-func TestRunTxRetriesSerializationFailures(t *testing.T) {
-	calls := 0
-	err := RunTx(context.Background(), 5, func(context.Context) error {
-		calls++
-		if calls < 3 {
-			return fmt.Errorf("commit: %w", &pgErr{"40001"})
-		}
-		return nil
-	})
-	if err != nil || calls != 3 {
-		t.Fatalf("err=%v calls=%d", err, calls)
-	}
-}
-
-func TestRunTxStopsOnOtherErrorsAndGivesUp(t *testing.T) {
-	calls := 0
-	err := RunTx(context.Background(), 5, func(context.Context) error {
-		calls++
-		return &pgErr{"23505"} // unique_violation: retrying will not help
-	})
-	if calls != 1 || Retryable(err) {
-		t.Fatalf("calls=%d err=%v", calls, err)
-	}
-	calls = 0
-	err = RunTx(context.Background(), 3, func(context.Context) error {
-		calls++
-		return &pgErr{"40001"}
-	})
-	if calls != 3 || !Retryable(err) {
-		t.Fatalf("calls=%d err=%v", calls, err)
-	}
-}
-```
-
-Measured: all six tests pass under `go test -race` (Go 1.24.4, darwin/arm64). `TestHLCCausality` shows the key HLC property: node B's physical clock is 5 ms behind node A's, yet after receiving A's message, B's next timestamp is larger than A's, so "payment written after invoice" is ordered correctly.
-
-Using `RunTx` with pgx looks like this; the closure must start and commit its own transaction so that a retry re-runs every statement:
-
-```go
-err := distsql.RunTx(ctx, 5, func(ctx context.Context) error {
-	return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `UPDATE invoices SET status = 'paid', paid_minor = total_minor
-			WHERE workspace_id = $1 AND id = $2 AND status = 'open'`, wsID, invoiceID)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			return ErrNotOpen // not retryable: the invoice was already paid
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO payments (workspace_id, id, invoice_id, amount_minor)
-			VALUES ($1, $2, $3, $4)`, wsID, paymentID, invoiceID, amountMinor)
-		return err
-	})
-})
-```
+Runnable Go version: [[Distributed SQL - Go]]
 
 ## 5. Variants and comparison
 
@@ -577,6 +344,20 @@ err := distsql.RunTx(ctx, 5, func(ctx context.Context) error {
 **Why Raft per range and not one Raft for the cluster.** One log would serialise every write in the cluster through one leader. Thousands of small groups spread leadership across all nodes and let each range move, split and recover independently. The cost is per-group heartbeats; CockroachDB quiesces idle ranges and coalesces heartbeats per node pair.
 
 **Follower reads and closed timestamps.** A follower can serve a consistent read at time `t` only if it knows no write at or below `t` can still arrive. The leaseholder periodically **closes** a timestamp (promises not to accept writes below it) and sends it with the Raft log. Followers serve reads at or below the closed timestamp, so a follower read is consistent but a few seconds old. Spanner's equivalent is the safe time each replica tracks.
+
+```mermaid
+sequenceDiagram
+    participant C as EU client
+    participant F as EU follower replica
+    participant L as US leaseholder
+    L->>F: Raft log entries plus closed timestamp 10:00:00
+    L->>L: promises no new write at or below 10:00:00
+    C->>F: SELECT ... AS OF SYSTEM TIME follower_read_timestamp()
+    F->>F: picks t = 09:59:52, at or below closed 10:00:00
+    F-->>C: consistent but about 8 seconds old, no trip to US
+    C->>F: read at the current time
+    F->>L: forwards, because now is above the closed timestamp
+```
 
 **Read-only transactions and snapshots.** Because every value is versioned, a read-only transaction at timestamp `t` needs no locks: it reads the version at `t` from any replica that is caught up to `t`. Spanner and CockroachDB both use this to run large reads without blocking writers.
 
@@ -626,5 +407,6 @@ err := distsql.RunTx(ctx, 5, func(ctx context.Context) error {
 ## Links
 
 - **Before this:** [[Transactions and ACID]], [[Isolation Levels and MVCC]], [[Replication]], [[Partitioning and Sharding]], [[Consensus - Raft and Paxos]]
+- **Runnable Go version:** [[Distributed SQL - Go]]
 - **Next:** [[Multi-Region Architecture]], [[Clocks and Ordering]], [[Two-Phase Commit]]
 - **Compare with:** [[Consistent Hashing]] (hash placement vs ordered ranges), [[Wide-Column Stores and Cassandra]] (leaderless, tunable consistency), [[CAP and PACELC]], [[Time-Series and Columnar Storage]] (TiFlash-style columnar replicas)
