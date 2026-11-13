@@ -8,7 +8,7 @@ sources:
   - "AWS VPC User Guide, Security best practices for your VPC (accessed 2026-11-07)"
   - "AWS PrivateLink User Guide, AWS PrivateLink concepts (accessed 2026-11-07)"
   - "AWS VPC User Guide, VPC peering and Transit Gateway documentation"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 03 - VPC Networking
@@ -22,11 +22,64 @@ updated: 2026-11-07
 > - **VPC endpoints** let traffic reach an AWS service without leaving AWS's network or going through a NAT gateway: **Gateway endpoints** (S3, DynamoDB only, free, via route table entries) and **Interface endpoints** (most other services, priced per hour and per GB, powered by AWS PrivateLink, an ENI with a private IP in your subnet).
 > - **VPC Flow Logs** record accepted and rejected traffic metadata (not payloads) per ENI, subnet, or VPC — the primary tool for diagnosing "why can't this reach that."
 
+## Start here: the basics
+
+**The problem in one story.**
+You rent servers in AWS for a web app and its database.
+The web servers must be reachable from the internet, but the database must never be.
+Later you add a second network for another team, and both need to talk, plus reach S3 for files.
+A VPC is your own private, fenced network in AWS where you decide exactly who can talk to whom.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| IP address | A number that identifies a machine on a network | `10.0.1.25` |
+| CIDR block | A range of IP addresses written compactly | `10.0.0.0/16` = 65,536 addresses |
+| Subnet | A smaller slice of the VPC's address range, in one AZ | `10.0.1.0/24` for web servers |
+| Route table | Rules saying where traffic for each address range goes | "`0.0.0.0/0` goes to the internet gateway" |
+| Firewall | A filter that allows or blocks traffic | Allow port 443, block everything else |
+| Port | A numbered "door" on a machine for one kind of service | 443 = HTTPS, 5432 = Postgres |
+| ENI | A virtual network card attached to a resource | The network interface on an EC2 instance |
+| NAT gateway | Lets private machines reach out to the internet, not the reverse | A private server downloading updates |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    NET["Internet"] --> IGW["Internet gateway"]
+    subgraph VPC["Your VPC 10.0.0.0/16"]
+        IGW --> PUB["Public subnet<br/>(load balancer)"]
+        PUB --> PRIV["Private subnet<br/>(app + DB)"]
+        PRIV --> EP["VPC endpoint"]
+    end
+    EP --> S3["S3 (stays inside AWS)"]
+```
+
+**Analogy.** A VPC is a gated office park: subnets are buildings, route tables are the signposts, security groups are door badges and NACLs are the guard at each building entrance.
+Where it breaks: a real office park cannot be cloned or re-addressed in minutes, while a VPC can be created, peered or torn down with an API call.
+
+**How the rest of this note builds up**
+
+- First, why VPC networking beyond basic subnets matters (section 1) and the two-checkpoint mental model (section 2).
+- Then how security groups, NACLs, peering, Transit Gateway, endpoints and Flow Logs work (section 3).
+- Then a Go simulation of SG vs NACL rule evaluation (section 4) and comparisons (section 5).
+- Finally the SDE-3 view: trade-offs, production practice, deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Security groups = stateful, allow-only, per resource; NACLs = stateless, ordered, per subnet; endpoints keep AWS traffic off the internet.
+
 ## 1. Why it exists
 
-[[IP Addressing, Subnets, NAT and VPC Basics]] explains why a VPC is sliced into subnets with route tables deciding public vs private. What that note doesn't cover is what happens once you have multiple VPCs that need to talk to each other, or a private subnet that needs to call an AWS service like S3 without a NAT gateway in the path, or a security incident where you need to know exactly which rule let (or blocked) a specific flow of traffic.
+[[IP Addressing, Subnets, NAT and VPC Basics]] explains why a VPC is sliced into subnets with route tables deciding public vs private.
 
-Concretely: a private subnet with EC2 instances that need to pull images from ECR and read from S3 has two options. Route that traffic through a NAT gateway to the internet and back (which costs per-GB NAT processing charges and, more importantly, means that traffic technically transits a path that *could* reach the public internet) — or use VPC endpoints, which keep the traffic entirely inside AWS's network and, for S3/DynamoDB specifically, cost nothing extra. Many real AWS bills include a NAT gateway data-processing line item that would shrink significantly just by adding S3 and DynamoDB gateway endpoints, which take minutes to set up and have no additional charge.
+What that note doesn't cover is what happens once you have multiple VPCs that need to talk to each other, or a private subnet that needs to call an AWS service like S3 without a NAT gateway in the path, or a security incident where you need to know exactly which rule let (or blocked) a specific flow of traffic.
+
+Concretely: a private subnet with EC2 instances that need to pull images from ECR and read from S3 has two options.
+
+Route that traffic through a NAT gateway to the internet and back (which costs per-GB NAT processing charges and, more importantly, means that traffic technically transits a path that *could* reach the public internet) — or use VPC endpoints, which keep the traffic entirely inside AWS's network and, for S3/DynamoDB specifically, cost nothing extra.
+
+Many real AWS bills include a NAT gateway data-processing line item that would shrink significantly just by adding S3 and DynamoDB gateway endpoints, which take minutes to set up and have no additional charge.
 
 ### Whiteboard version
 
@@ -45,7 +98,15 @@ flowchart LR
 
 ## 2. Mental model
 
-Think of a VPC's two firewall layers as a building's two checkpoints. The **security group** is the badge reader on each office door: it only has an allow list ("these badge types may enter"), it doesn't care what order the rules were added in, and once you're let in, you're free to leave without being re-checked at the door on the way out (that's "stateful" — the return traffic from an allowed connection is automatically permitted). The **network ACL** is the guard at the building's main entrance checking a numbered list of rules in order, and that guard can say "no" explicitly, not just "not on the list" — and crucially, the guard checks you again on your way *out* too (that's "stateless" — inbound and outbound are independently evaluated).
+Think of a VPC's two firewall layers as a building's two checkpoints.
+
+The **security group** is the badge reader on each office door: 
+
+- It only has an allow list ("these badge types may enter").
+- It doesn't care what order the rules were added in.
+- Once you're let in, you're free to leave without being re-checked at the door on the way out (that's "stateful" — the return traffic from an allowed connection is automatically permitted).
+
+The **network ACL** is the guard at the building's main entrance checking a numbered list of rules in order, and that guard can say "no" explicitly, not just "not on the list" — and crucially, the guard checks you again on your way *out* too (that's "stateless" — inbound and outbound are independently evaluated).
 
 A **VPC endpoint** is a private service elevator that goes straight from your floor to a specific AWS service's floor, bypassing the building's public front doors (the internet gateway) entirely.
 
@@ -73,11 +134,19 @@ flowchart TB
     SG -- "no matching rule" --> Drop2["dropped"]
 ```
 
-The ordering trap: a network ACL rule numbered 100 that denies a specific CIDR is checked *before* a rule numbered 200 that broadly allows everything — so a narrow, low-numbered deny rule silently blocks traffic that a later, broader allow rule would otherwise have let through. Security groups have no such ordering concern, since there are no deny rules to conflict with.
+The ordering trap: a network ACL rule numbered 100 that denies a specific CIDR is checked *before* a rule numbered 200 that broadly allows everything — so a narrow, low-numbered deny rule silently blocks traffic that a later, broader allow rule would otherwise have let through.
+
+Security groups have no such ordering concern, since there are no deny rules to conflict with.
 
 ### VPC peering vs Transit Gateway
 
-**VPC peering** connects exactly two VPCs: each side adds a route pointing the other VPC's CIDR at the peering connection. It is **not transitive** — if VPC A peers with B, and B peers with C, A cannot reach C through B; A needs its own direct peering connection to C. For more than a handful of VPCs, the number of peering connections needed grows quadratically (`n(n-1)/2` for `n` fully-meshed VPCs), which is exactly the problem **Transit Gateway** solves: one regional hub that every VPC (and on-premises network, via VPN or Direct Connect) attaches to once, with Transit Gateway's own route tables deciding who can reach whom — including transitively, if you want that.
+**VPC peering** connects exactly two VPCs: each side adds a route pointing the other VPC's CIDR at the peering connection.
+
+It is **not transitive** — if VPC A peers with B, and B peers with C, A cannot reach C through B; A needs its own direct peering connection to C.
+
+For more than a handful of VPCs, the number of peering connections needed grows quadratically (`n(n-1)/2` for `n` fully-meshed VPCs).
+
+That is exactly the problem **Transit Gateway** solves: one regional hub that every VPC (and on-premises network, via VPN or Direct Connect) attaches to once, with Transit Gateway's own route tables deciding who can reach whom — including transitively, if you want that.
 
 ```mermaid
 flowchart LR
@@ -97,9 +166,15 @@ flowchart LR
 
 ### VPC endpoints and PrivateLink
 
-A **Gateway endpoint** only works for Amazon S3 and DynamoDB. It's a route table entry: traffic to those services' IP ranges goes directly to the endpoint instead of to a NAT gateway or internet gateway, and there is no additional charge for a Gateway endpoint itself (AWS PrivateLink User Guide, accessed 2026-11-07, draws this distinction explicitly — Gateway endpoints "do not use AWS PrivateLink," unlike every other endpoint type).
+A **Gateway endpoint** only works for Amazon S3 and DynamoDB.
 
-An **Interface endpoint** covers most other AWS services (and third-party or your own services published via PrivateLink) by placing an actual elastic network interface, with a private IP address, inside your subnet. DNS for the service's normal hostname resolves to that private IP from within the VPC (private hosted zone / split-horizon DNS), so application code doesn't need to change its endpoint URL — only the resolved address changes. Interface endpoints are billed hourly plus per-GB processed, unlike Gateway endpoints.
+It's a route table entry: traffic to those services' IP ranges goes directly to the endpoint instead of to a NAT gateway or internet gateway, and there is no additional charge for a Gateway endpoint itself (AWS PrivateLink User Guide, accessed 2026-11-07, draws this distinction explicitly — Gateway endpoints "do not use AWS PrivateLink," unlike every other endpoint type).
+
+An **Interface endpoint** covers most other AWS services (and third-party or your own services published via PrivateLink) by placing an actual elastic network interface, with a private IP address, inside your subnet.
+
+DNS for the service's normal hostname resolves to that private IP from within the VPC (private hosted zone / split-horizon DNS), so application code doesn't need to change its endpoint URL — only the resolved address changes.
+
+Interface endpoints are billed hourly plus per-GB processed, unlike Gateway endpoints.
 
 ```mermaid
 flowchart TB
@@ -117,7 +192,11 @@ flowchart TB
 
 ### VPC Flow Logs
 
-Flow Logs capture metadata for IP traffic at the ENI, subnet, or VPC level — source/destination IP and port, protocol, byte/packet counts, and whether the traffic was `ACCEPT` or `REJECT` — without capturing payloads. Sent to CloudWatch Logs or S3, they're the primary tool for answering "is this security group or NACL actually blocking the traffic I think it is," since a `REJECT` record with the identifying 5-tuple tells you exactly what was denied, even though it doesn't say *which* rule denied it (you still have to check the SG/NACL rules by hand, or use AWS's Reachability Analyzer / Network Access Analyzer for that).
+Flow Logs capture metadata for IP traffic at the ENI, subnet, or VPC level — source/destination IP and port, protocol, byte/packet counts, and whether the traffic was `ACCEPT` or `REJECT` — without capturing payloads.
+
+Sent to CloudWatch Logs or S3, they're the primary tool for answering "is this security group or NACL actually blocking the traffic I think it is."
+
+A `REJECT` record with the identifying 5-tuple tells you exactly what was denied, even though it doesn't say *which* rule denied it (you still have to check the SG/NACL rules by hand, or use AWS's Reachability Analyzer / Network Access Analyzer for that).
 
 ## 4. Worked example
 
@@ -261,7 +340,12 @@ func TestSecurityGroupRejectsOutOfBlockSource(t *testing.T) {
 }
 ```
 
-**Measured (Go 1.24.4, darwin/arm64, 2026-11-07):** `go test -race -v` output — all 4 tests pass: a NACL's low-numbered deny rule blocks traffic a later broad allow rule would have let through, a non-matching source still hits the broad allow, a security group allows on any matching rule regardless of list order, and a security group correctly rejects a source CIDR that no rule covers.
+**Measured (Go 1.24.4, darwin/arm64, 2026-11-07):** `go test -race -v` output — all 4 tests pass:
+
+1. A NACL's low-numbered deny rule blocks traffic a later broad allow rule would have let through.
+2. A non-matching source still hits the broad allow.
+3. A security group allows on any matching rule regardless of list order.
+4. A security group correctly rejects a source CIDR that no rule covers.
 
 ```text
 === RUN   TestNACLFirstMatchByNumWins
@@ -345,3 +429,7 @@ ok  	aws03	1.474s
 - **Before this:** [[AWS 02 - IAM]], [[IP Addressing, Subnets, NAT and VPC Basics]]
 - **Next:** [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]], [[Load Balancing]]
 - **Compare with:** [[Forward and Reverse Proxies - L4 vs L7]] (where a load balancer sits relative to these subnets), [[DNS - Resolution, Records and Caching]] (how private hosted zones resolve an Interface endpoint's hostname)
+
+### Watch on YouTube
+
+- [AWS VPC Beginner to Pro - Virtual Private Cloud Tutorial](https://www.youtube.com/watch?v=g2JOHLHh4rI) · freeCodeCamp.org · 131 min · 800,279 views

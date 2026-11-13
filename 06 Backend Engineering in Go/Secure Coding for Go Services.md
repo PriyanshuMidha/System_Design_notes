@@ -11,13 +11,17 @@ sources:
   - "Go 1.24 crypto/cipher package docs, NewGCM"
   - "govulncheck documentation, go.dev/doc/tutorial/govulncheck (reachability analysis via call-graph trimming)"
   - "gosec (securego/gosec) rule reference"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Secure Coding for Go Services
 
 > [!summary] TL;DR
-> [[OWASP API Security Top 10]] names the vulnerability classes; this note is the Go-specific implementation layer underneath it. Several items already have a full, tested treatment elsewhere in this vault — BOLA/BOPLA in [[OWASP API Security Top 10]] itself, mass assignment and body limits in [[Request Decoding, Validation and DTOs]], SSRF in [[Calling External APIs]], path-sandboxing with `os.Root` in [[File Uploads and Object Storage]], webhook signatures in [[Receiving Webhooks Idempotently]], XSS escaping in [[CSRF, XSS and Security Headers]] — and this note links to each rather than repeating them. What it covers directly, because nothing else does: SQL identifier allowlisting (values are parameterized; column names cannot be), running external commands without a shell, the lexical `filepath.IsLocal` check that runs *before* any filesystem call, Go 1.24's `crypto/rand.Text` and AES-GCM for data at rest, a decompression-bomb guard for uploaded archives, constant-time secret comparison, keeping secrets out of logs, and the `govulncheck`/`gosec` checks that gate all of it in CI.
+> [[OWASP API Security Top 10]] names the vulnerability classes; this note is the Go-specific implementation layer underneath it.
+>
+> Several items already have a full, tested treatment elsewhere in this vault — BOLA/BOPLA in [[OWASP API Security Top 10]] itself, mass assignment and body limits in [[Request Decoding, Validation and DTOs]], SSRF in [[Calling External APIs]], path-sandboxing with `os.Root` in [[File Uploads and Object Storage]], webhook signatures in [[Receiving Webhooks Idempotently]], XSS escaping in [[CSRF, XSS and Security Headers]] — and this note links to each rather than repeating them.
+>
+> What it covers directly, because nothing else does: SQL identifier allowlisting (values are parameterized; column names cannot be), running external commands without a shell, the lexical `filepath.IsLocal` check that runs *before* any filesystem call, Go 1.24's `crypto/rand.Text` and AES-GCM for data at rest, a decompression-bomb guard for uploaded archives, constant-time secret comparison, keeping secrets out of logs, and the `govulncheck`/`gosec` checks that gate all of it in CI.
 
 > [!abstract] Core idea
 > - Every item on the OWASP list reduces to the same question in Go terms: does untrusted data ever reach a shell, a query string, a filesystem call, or a template as unparsed structure, instead of as a typed, validated value?
@@ -26,20 +30,83 @@ updated: 2026-11-07
 > - `filepath.IsLocal` (Go 1.20) is a cheap, purely lexical check — not a symlink-aware one. `os.Root` (Go 1.24, see [[File Uploads and Object Storage]]) is the syscall-level check that closes the gap a lexical check leaves open.
 > - Classic mistake: assuming `govulncheck` passing means "no known vulnerable dependencies." It specifically means "no known vulnerable function in a dependency that this binary's call graph can actually reach" — a vulnerable function your code never calls does not fail the build.
 
+## Start here: the basics
+
+**The problem in one story.**
+A user types a name into a search box.
+Your code pastes that text straight into a database query.
+The user typed `x'; DROP TABLE invoices; --` instead of a name.
+Now the database runs their command, not yours.
+Secure coding means user text is always treated as data, never as instructions.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Untrusted input | Anything that came over the network from outside | A query parameter `?sort=name` |
+| Injection | User data gets run as code or commands | SQL injection, shell injection |
+| Placeholder | A slot in SQL filled safely with a value | `WHERE id = $1` |
+| Allowlist | A fixed list of the only values you accept | Sort by `"date"` or `"amount"`, nothing else |
+| Shell | The program that reads a command line and runs it | `sh -c "convert $file"` |
+| Path traversal | Using `../` to escape the folder you meant to allow | `../../etc/passwd` |
+| Constant-time compare | Comparing secrets without leaking timing hints | `subtle.ConstantTimeCompare` |
+| Vulnerability scanner | A tool that finds known-bad code or dependencies | `govulncheck`, `gosec` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Untrusted input"] --> G{"Typed gate<br/>for its destination"}
+    G -- "SQL name" --> A["Allowlist"]
+    G -- "command" --> V["argv slice,<br/>no shell"]
+    G -- "file path" --> P["IsLocal +<br/>os.Root"]
+    G -- "secret at rest" --> E["AES-GCM"]
+    A --> S["Safe to use"]
+    V --> S
+    P --> S
+    E --> S
+```
+
+**Analogy.** It is like a mailroom: letters (data) are opened and read, but nobody follows a note inside a letter that says "give the sender the master key".
+Where it breaks: a mailroom checks once at the door; in code each destination (SQL, shell, file system) needs its own check.
+
+**How the rest of this note builds up**
+
+- First, why OWASP lists alone do not stop bugs (section 1) and the "one typed gate per destination" model (section 2).
+- Then how it works: the trust boundary, why `ORDER BY` cannot use a placeholder, and argv vs shell (section 3).
+- Then Go worked examples: SQL allowlist, commands without a shell, path checks, `os.Root`, decompression bombs, crypto and log redaction (section 4).
+- Finally the SDE-3 deep dive: variants, trade-offs, CI gates with `govulncheck`/`gosec`, and production lessons (sections 5-8).
+
+> [!tip] Remember
+> Untrusted text must pass one typed gate for where it is going, and never becomes code.
+
 ## 1. Why it exists
 
-InvoiceOps ships a bulk-import feature: an admin uploads a `.zip` of CSV invoice batches, picks a column to sort the import summary by, and the system renders that summary to PDF by shelling out to an external renderer. One feature, four different places untrusted input can reach something dangerous if it is handled the generic way instead of the Go-specific way:
+InvoiceOps ships a bulk-import feature: an admin uploads a `.zip` of CSV invoice batches, picks a column to sort the import summary by, and the system renders that summary to PDF by shelling out to an external renderer.
 
-1. **The sort column.** `fmt.Sprintf("SELECT * FROM invoices ORDER BY %s", r.URL.Query().Get("sort"))` looks like the same kind of injection risk as an unparameterized `WHERE` clause — but it cannot be fixed the same way. `database/sql`'s placeholders bind **values**, not **identifiers**; there is no `$1` for a column name. A request for `sort=amount); DROP TABLE invoices;--` reaches the database verbatim if the only defense attempted is string formatting.
+One feature, four different places untrusted input can reach something dangerous if it is handled the generic way instead of the Go-specific way:
+
+1. **The sort column.** `fmt.Sprintf("SELECT * FROM invoices ORDER BY %s", r.URL.Query().Get("sort"))` looks like the same kind of injection risk as an unparameterized `WHERE` clause — but it cannot be fixed the same way.
+
+   `database/sql`'s placeholders bind **values**, not **identifiers**; there is no `$1` for a column name. A request for `sort=amount); DROP TABLE invoices;--` reaches the database verbatim if the only defense attempted is string formatting.
 2. **The PDF render step.** A handler that builds `"wkhtmltopdf --quiet " + htmlPath + " " + outPath` and runs it via `sh -c` hands an attacker who controls any part of that string a second command, joined with `;`, `&&`, or a backtick substitution — the same class of bug as the SQL case, one layer lower, in the shell instead of the database.
 3. **A "download the original CSV" link** built from a client-supplied filename. `../../etc/passwd` or a symlink planted by an earlier upload can walk outside the intended directory if the only check is a passing glance at the string.
-4. **The uploaded `.zip` itself.** A decompression bomb — a small file that expands enormously once decompressed — can exhaust memory or disk during extraction, long before any CSV parsing logic runs. **Measured** (this note's own test, `archive/zip`, a single repeated-byte entry, Go 1.24, 2026-11-07): 5,242,880 decompressed bytes compressed down to 5,250 bytes on disk — a ~999:1 ratio from the most naive possible payload; a deliberately adversarial stream (structured to maximize DEFLATE's back-reference compression) can do dramatically better than that.
+4. **The uploaded `.zip` itself.** A decompression bomb — a small file that expands enormously once decompressed — can exhaust memory or disk during extraction, long before any CSV parsing logic runs.
+
+   **Measured** (this note's own test, `archive/zip`, a single repeated-byte entry, Go 1.24, 2026-11-07): 5,242,880 decompressed bytes compressed down to 5,250 bytes on disk — a ~999:1 ratio from the most naive possible payload; a deliberately adversarial stream (structured to maximize DEFLATE's back-reference compression) can do dramatically better than that.
 
 Each of these has a narrow, specific Go fix — not "be more careful," but a specific function or pattern that removes the category of bug entirely.
 
 ## 2. Mental model
 
-Treat every value that crossed the network — a query parameter, a form field, an uploaded file's contents or name, a response from a URL a user configured — as adversarial input until it has passed through exactly one narrow, typed gate meant for its destination: an allowlist for anything that becomes SQL or shell text, an argv slice for anything that becomes a command, a lexical-then-syscall check for anything that becomes a filesystem path, authenticated encryption for anything written to disk that must stay confidential. String concatenation, a shell, or an un-capped decoder are never that gate — each is a way for input to carry its own structure past the destination's rules instead of being treated as inert data.
+Treat every value that crossed the network — a query parameter, a form field, an uploaded file's contents or name, a response from a URL a user configured — as adversarial input until it has passed through exactly one narrow, typed gate meant for its destination:
+
+- an allowlist for anything that becomes SQL or shell text,
+- an argv slice for anything that becomes a command,
+- a lexical-then-syscall check for anything that becomes a filesystem path,
+- authenticated encryption for anything written to disk that must stay confidential.
+
+String concatenation, a shell, or an un-capped decoder are never that gate — each is a way for input to carry its own structure past the destination's rules instead of being treated as inert data.
 
 ## 3. How it works
 
@@ -72,7 +139,11 @@ db.QueryContext(ctx, "SELECT * FROM invoices WHERE status = $1", status) // OK: 
 db.QueryContext(ctx, "SELECT * FROM invoices ORDER BY "+sortCol)         // NOT OK: identifier
 ```
 
-A placeholder tells the driver "substitute this value, quoted and escaped, at execution time" — it works because the database can tell a value apart from the query's own grammar. A column name or `ASC`/`DESC` keyword is part of the grammar itself; there is no protocol-level way to say "insert this identifier safely," because identifiers aren't values the wire protocol has a slot for. [[Building REST Endpoints]] already shows this exact allowlist pattern for a `WHERE`-clause filter value (`allowedStatusFilter`); the function below applies the same idea to the one place a value-allowlist isn't the whole story — a sort column feeds directly into the query text, not into a bind parameter, even once it's been validated.
+A placeholder tells the driver "substitute this value, quoted and escaped, at execution time" — it works because the database can tell a value apart from the query's own grammar.
+
+A column name or `ASC`/`DESC` keyword is part of the grammar itself; there is no protocol-level way to say "insert this identifier safely," because identifiers aren't values the wire protocol has a slot for.
+
+[[Building REST Endpoints]] already shows this exact allowlist pattern for a `WHERE`-clause filter value (`allowedStatusFilter`); the function below applies the same idea to the one place a value-allowlist isn't the whole story — a sort column feeds directly into the query text, not into a bind parameter, even once it's been validated.
 
 ### `os/exec`: argv vs. a shell string
 
@@ -86,7 +157,11 @@ flowchart TD
     end
 ```
 
-`exec.Command`/`exec.CommandContext` call `execve` (or the platform equivalent) directly with an argument vector — there is no intermediate shell to hand metacharacters to, ever, regardless of what bytes any argument contains. The moment code builds a string and passes it to `sh -c` (or shells out via `os/exec` with `"sh", "-c", cmdString"`), every shell metacharacter in that string is live again. Two residual risks remain even with argv: a user-controlled value starting with `-` can be read by the child as an option (use the tool's `--` end-of-options marker where it supports one, or only pass server-generated paths), and `exec.Command` resolves a bare name through `PATH`, so call a tool by absolute path in hardened containers (Go refuses to run a binary found via the current directory and returns `exec.ErrDot`).
+`exec.Command`/`exec.CommandContext` call `execve` (or the platform equivalent) directly with an argument vector — there is no intermediate shell to hand metacharacters to, ever, regardless of what bytes any argument contains.
+
+The moment code builds a string and passes it to `sh -c` (or shells out via `os/exec` with `"sh", "-c", cmdString"`), every shell metacharacter in that string is live again.
+
+Two residual risks remain even with argv: a user-controlled value starting with `-` can be read by the child as an option (use the tool's `--` end-of-options marker where it supports one, or only pass server-generated paths), and `exec.Command` resolves a bare name through `PATH`, so call a tool by absolute path in hardened containers (Go refuses to run a binary found via the current directory and returns `exec.ErrDot`).
 
 ## 4. Worked example
 
@@ -459,7 +534,9 @@ func TestExtractZipEntryRejectsDecompressionBomb(t *testing.T) {
 }
 ```
 
-Two more rules for archives. Cap the **number of entries** and the **total** decompressed bytes across the whole archive, not only per entry. And never use `entry.Name` as a path: a name like `../../etc/cron.d/x` is the "zip slip" attack. Run it through `filepath.IsLocal` (or extract through an `os.Root`), or better, store the bytes under a name the service generates. Since Go 1.20, setting `GODEBUG=zipinsecurepath=0` makes `zip.NewReader` return `zip.ErrInsecurePath` for such names, but it is off by default, so check each name yourself.
+Two more rules for archives. Cap the **number of entries** and the **total** decompressed bytes across the whole archive, not only per entry. And never use `entry.Name` as a path: a name like `../../etc/cron.d/x` is the "zip slip" attack.
+
+Run it through `filepath.IsLocal` (or extract through an `os.Root`), or better, store the bytes under a name the service generates. Since Go 1.20, setting `GODEBUG=zipinsecurepath=0` makes `zip.NewReader` return `zip.ErrInsecurePath` for such names, but it is off by default, so check each name yourself.
 
 ### Modern crypto/rand: one-time codes and encryption at rest
 
@@ -654,7 +731,11 @@ Smaller controls from the same audit, each with a one-line Go answer:
 - **Supply chain:** commit `go.sum` and keep the default `GOSUMDB` verification on, pin tools with the `go.mod` `tool` directive (Go 1.24), and automate updates with Renovate or Dependabot.
 
 > [!warning] Interview trap
-> `govulncheck` passing does not mean the project has zero vulnerable dependencies — it means zero vulnerable *functions the binary's own call graph can reach*. It performs reachability analysis: it builds a call graph from `main` outward and checks whether any function with a known advisory is actually called, directly or transitively. A vulnerable function in an imported package that the code never calls does not fail the check — which is also exactly why upgrading the dependency is still the right fix the moment that code path does start getting used.
+> `govulncheck` passing does not mean the project has zero vulnerable dependencies — it means zero vulnerable *functions the binary's own call graph can reach*.
+>
+> It performs reachability analysis: it builds a call graph from `main` outward and checks whether any function with a known advisory is actually called, directly or transitively.
+>
+> A vulnerable function in an imported package that the code never calls does not fail the check — which is also exactly why upgrading the dependency is still the right fix the moment that code path does start getting used.
 
 ## 6. Trade-offs and when not to use
 
@@ -676,33 +757,67 @@ Smaller controls from the same audit, each with a one-line Go answer:
 
 ## 8. Deep dive
 
-- **How `govulncheck`'s reachability analysis actually works.** It builds a static call graph starting from the binary's `main` (or, for a library, its exported API) and checks, function by function, whether any function named in a Go vulnerability database entry is present in that graph. This is strictly more precise than a naive "is a vulnerable module version in `go.sum`" check (what most non-Go dependency scanners do), because `go.sum` lists every transitive dependency regardless of whether any of it is actually imported by the code paths that run, let alone called. The trade-off: it only analyzes what it can see statically, so a vulnerable function reached only through `reflect`, a plugin, or a dynamically-dispatched interface it cannot resolve may be under-reported — reachability analysis is a sharper signal than a bill-of-materials match, not an absolute guarantee.
-- **What `gosec` actually checks, by rule family.** Its rules fall into a few families worth knowing by shape rather than by ID: pattern checks that flag a non-constant value reaching a sensitive call (`G107` — HTTP request made with a variable URL, close to the SSRF case; `G304` — file path from a variable passed to `os.Open`, close to the path-traversal case; newer releases add real taint analysis for some rules); weak-crypto checks (`G401`/`G402`/`G501` — MD5, SHA1, `DES`, or a `tls.Config` with an insecure minimum version); and unchecked-error checks (`G104`). A finding on code this note's functions guard against is exactly the signal `gosec` is for — it is a static approximation of the same questions this note answers by construction.
-- **Why GCM's nonce, not the key, is the thing that must never repeat.** AES-GCM's confidentiality and authenticity guarantees both depend on the keystream being unique per (key, nonce) pair. Reusing a nonce under the same key lets an attacker XOR two ciphertexts together to cancel the keystream and recover the XOR of the two plaintexts — and, for GCM specifically, can also recover the authentication key, letting the attacker forge valid tags for arbitrary messages. A 96-bit random nonce (what `cipher.NewGCM` uses by default, as generated above) keeps collision probability negligible as long as the number of messages encrypted under one key stays well below roughly 2^32 — past that volume, derive a per-message key (HKDF from a master key plus a counter) instead of relying on randomness alone.
-- **RE2 and why Go's regexp package cannot be made to hang on adversarial input.** `regexp` compiles patterns into an RE2-style automaton guaranteeing linear time in input length regardless of the pattern — unlike backtracking engines (PCRE-style, found in many other languages' standard libraries), where a pattern like `(a+)+$` can take exponential time on a crafted input (a classic ReDoS). This is a property of the package itself, not something a Go service has to opt into or verify per-regex — the one caveat is that `regexp` does not support backreferences or lookahead precisely because supporting them would require abandoning the linear-time guarantee.
+- **How `govulncheck`'s reachability analysis actually works.** It builds a static call graph starting from the binary's `main` (or, for a library, its exported API) and checks, function by function, whether any function named in a Go vulnerability database entry is present in that graph.
+
+  This is strictly more precise than a naive "is a vulnerable module version in `go.sum`" check (what most non-Go dependency scanners do), because `go.sum` lists every transitive dependency regardless of whether any of it is actually imported by the code paths that run, let alone called.
+
+  The trade-off: it only analyzes what it can see statically, so a vulnerable function reached only through `reflect`, a plugin, or a dynamically-dispatched interface it cannot resolve may be under-reported — reachability analysis is a sharper signal than a bill-of-materials match, not an absolute guarantee.
+- **What `gosec` actually checks, by rule family.** Its rules fall into a few families worth knowing by shape rather than by ID:
+
+  - Pattern checks that flag a non-constant value reaching a sensitive call (`G107` — HTTP request made with a variable URL, close to the SSRF case; `G304` — file path from a variable passed to `os.Open`, close to the path-traversal case; newer releases add real taint analysis for some rules).
+  - Weak-crypto checks (`G401`/`G402`/`G501` — MD5, SHA1, `DES`, or a `tls.Config` with an insecure minimum version).
+  - Unchecked-error checks (`G104`).
+
+  A finding on code this note's functions guard against is exactly the signal `gosec` is for — it is a static approximation of the same questions this note answers by construction.
+- **Why GCM's nonce, not the key, is the thing that must never repeat.** AES-GCM's confidentiality and authenticity guarantees both depend on the keystream being unique per (key, nonce) pair.
+
+  Reusing a nonce under the same key lets an attacker XOR two ciphertexts together to cancel the keystream and recover the XOR of the two plaintexts — and, for GCM specifically, can also recover the authentication key, letting the attacker forge valid tags for arbitrary messages.
+
+  A 96-bit random nonce (what `cipher.NewGCM` uses by default, as generated above) keeps collision probability negligible as long as the number of messages encrypted under one key stays well below roughly 2^32 — past that volume, derive a per-message key (HKDF from a master key plus a counter) instead of relying on randomness alone.
+- **RE2 and why Go's regexp package cannot be made to hang on adversarial input.** `regexp` compiles patterns into an RE2-style automaton guaranteeing linear time in input length regardless of the pattern — unlike backtracking engines (PCRE-style, found in many other languages' standard libraries), where a pattern like `(a+)+$` can take exponential time on a crafted input (a classic ReDoS).
+
+  This is a property of the package itself, not something a Go service has to opt into or verify per-regex — the one caveat is that `regexp` does not support backreferences or lookahead precisely because supporting them would require abandoning the linear-time guarantee.
 
 ## 9. Interview questions
 
 > [!question]- Why can a `WHERE` clause value be parameterized but an `ORDER BY` column cannot?
-> A placeholder works because the database driver can distinguish a *value* from the query's own grammar at the wire-protocol level and substitute it safely. A column name or sort direction is part of the query's grammar itself — there is no bind-parameter mechanism for "insert this identifier here." The only correct fix is to map the user's input through an allowlist to a known-safe literal before building the query string.
+> A placeholder works because the database driver can distinguish a *value* from the query's own grammar at the wire-protocol level and substitute it safely.
+>
+> A column name or sort direction is part of the query's grammar itself — there is no bind-parameter mechanism for "insert this identifier here." The only correct fix is to map the user's input through an allowlist to a known-safe literal before building the query string.
 
 > [!question]- Why does `exec.Command("wkhtmltopdf", "--quiet", htmlPath, outPath)` avoid injection that `exec.Command("sh", "-c", "wkhtmltopdf --quiet "+htmlPath+" "+outPath)` doesn't, even though both eventually run the same program?
-> The first form calls `execve` directly with an argument vector — each argument is passed as literal bytes to the target program, with no shell ever parsing them. The second form hands a shell a single string to parse, and every metacharacter in `htmlPath` (`;`, `|`, `&&`, a backtick) is live the moment that parsing happens, regardless of what `wkhtmltopdf` itself does with its own arguments.
+> The first form calls `execve` directly with an argument vector — each argument is passed as literal bytes to the target program, with no shell ever parsing them.
+>
+> The second form hands a shell a single string to parse, and every metacharacter in `htmlPath` (`;`, `|`, `&&`, a backtick) is live the moment that parsing happens, regardless of what `wkhtmltopdf` itself does with its own arguments.
 
 > [!question]- Does `filepath.IsLocal` fully stop path traversal on its own?
-> No — that's the trap. It's a purely lexical check: it looks at the path string and never touches the filesystem, so a symlink planted inside the base directory that points back outside it passes the check and still escapes when the path is actually opened. `os.Root` (Go 1.24) closes that gap by resolving every path against an open directory file descriptor at the syscall level, which is why [[File Uploads and Object Storage]] uses it for writes that must not escape, and why this note's `SafeJoin` is explicitly framed as the cheap first check, not the complete answer.
+> No — that's the trap.
+>
+> It's a purely lexical check: it looks at the path string and never touches the filesystem, so a symlink planted inside the base directory that points back outside it passes the check and still escapes when the path is actually opened.
+>
+> `os.Root` (Go 1.24) closes that gap by resolving every path against an open directory file descriptor at the syscall level, which is why [[File Uploads and Object Storage]] uses it for writes that must not escape, and why this note's `SafeJoin` is explicitly framed as the cheap first check, not the complete answer.
 
 > [!question]- What does Go 1.24's `crypto/rand.Text` add over generating random bytes and hex-encoding them by hand?
-> Nothing cryptographically new — both ultimately pull from the OS's CSPRNG. What it removes is the chance of a subtly wrong hand-rolled version: picking `math/rand` by mistake, an alphabet with ambiguous characters, or an encoding that isn't URL-safe. It standardizes on RFC 4648 base32 with at least 128 bits of randomness, which is enough entropy for any one-time code or token without a developer having to re-derive that number themselves.
+> Nothing cryptographically new — both ultimately pull from the OS's CSPRNG. What it removes is the chance of a subtly wrong hand-rolled version: picking `math/rand` by mistake, an alphabet with ambiguous characters, or an encoding that isn't URL-safe.
+>
+> It standardizes on RFC 4648 base32 with at least 128 bits of randomness, which is enough entropy for any one-time code or token without a developer having to re-derive that number themselves.
 
 > [!question]- Why must an AES-GCM nonce never repeat under the same key, and what's the actual consequence if it does?
-> GCM's security proof depends on each (key, nonce) pair producing a unique keystream. Reusing a nonce lets an attacker XOR the two resulting ciphertexts to cancel the keystream and recover the XOR of the two plaintexts, and for GCM specifically can also expose the authentication key, letting the attacker forge valid tags on messages of their own choosing. Generating a fresh random 96-bit nonce per call, as shown above, keeps the collision probability negligible unless a single key is reused across an enormous number of messages.
+> GCM's security proof depends on each (key, nonce) pair producing a unique keystream.
+>
+> Reusing a nonce lets an attacker XOR the two resulting ciphertexts to cancel the keystream and recover the XOR of the two plaintexts, and for GCM specifically can also expose the authentication key, letting the attacker forge valid tags on messages of their own choosing.
+>
+> Generating a fresh random 96-bit nonce per call, as shown above, keeps the collision probability negligible unless a single key is reused across an enormous number of messages.
 
 > [!question]- Does `govulncheck` passing mean there are no vulnerable dependencies in the project?
-> No — that's the trap. It means no function flagged in the Go vulnerability database is reachable from the binary's own call graph. A vulnerable function in an imported package the code never actually calls does not fail the check. The dependency should still be upgraded on its own schedule; `govulncheck` is a prioritization signal (is this one urgent, right now) not a complete absence-of-risk guarantee.
+> No — that's the trap. It means no function flagged in the Go vulnerability database is reachable from the binary's own call graph. A vulnerable function in an imported package the code never actually calls does not fail the check.
+>
+> The dependency should still be upgraded on its own schedule; `govulncheck` is a prioritization signal (is this one urgent, right now) not a complete absence-of-risk guarantee.
 
 > [!question]- Why does a decompression-bomb guard need to cap bytes read from the decompressor, rather than trusting the zip entry's declared uncompressed size?
-> Because that declared size is attacker-controlled metadata in the file's own header, not a property the reading code can verify independently of actually decompressing the data. `io.LimitReader` wrapped around the entry's decompressing reader enforces the real limit on the real byte stream as it comes out, regardless of what the header claims or how small the compressed file is on disk.
+> Because that declared size is attacker-controlled metadata in the file's own header, not a property the reading code can verify independently of actually decompressing the data.
+>
+> `io.LimitReader` wrapped around the entry's decompressing reader enforces the real limit on the real byte stream as it comes out, regardless of what the header claims or how small the compressed file is on disk.
 
 ## 10. Cheat sheet
 
@@ -721,3 +836,8 @@ Smaller controls from the same audit, each with a one-line Go answer:
 - **Before this:** [[OWASP API Security Top 10]], [[Request Decoding, Validation and DTOs]], [[Containerizing Go Services]]
 - **Next:** [[gRPC Services in Go]]
 - **Compare with:** [[Calling External APIs]] (SSRF), [[File Uploads and Object Storage]] (path sandboxing with `os.Root`), [[Receiving Webhooks Idempotently]] (HMAC signature verification), [[CSRF, XSS and Security Headers]] (XSS, CSRF, security headers), [[CI-CD Pipelines (GitHub Actions for Go)]] (where `govulncheck` runs in the pipeline)
+
+### Watch on YouTube
+
+- [GopherCon 2022: Secure Coding in Go: Avoiding Common Vulnerabilities - Benji Vesterby](https://www.youtube.com/watch?v=com5l5DKvqQ) · Gopher Academy · conference deep dive on Go-specific OWASP-style vulnerabilities
+- [8 Best Practices for Writing Secure Go Code](https://www.youtube.com/watch?v=SN8fRR5TiTA) · HashiCorp, an IBM Company · quick practical checklist for secure Go coding

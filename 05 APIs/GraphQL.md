@@ -12,7 +12,7 @@ sources:
   - "GitHub Docs, Rate limits and node limits for the GraphQL API"
   - "gqlgen documentation (gqlgen.com): Getting started, Dataloaders, Query complexity, APQ"
   - "Apollo Federation 2 documentation (apollographql.com/docs/federation)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # GraphQL
@@ -26,6 +26,54 @@ updated: 2026-11-02
 > - Rule: batch child lookups with a DataLoader (collect keys, fetch once) or a list of N items causes N extra queries (N+1).
 > - Classic mistake: exposing the graph without depth/cost limits and per-field authorization.
 
+## Start here: the basics
+
+**The problem in one story.**
+A phone app shows a game, its reviews, and the name of each reviewer.
+With plain web URLs, the app asks three times and gets lots of data it never shows.
+On a slow mobile link, every extra round trip makes the screen load later.
+GraphQL lets the app send one request that lists exactly the fields it wants, and get back exactly that.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| API | A way for one program to ask another for data or actions | The app asks the server for a game |
+| Endpoint | One URL the server answers on | `POST /graphql` |
+| JSON | A text format for structured data | `{"title": "Chess"}` |
+| Round trip | One request out plus its reply back | 150 ms on a mobile link |
+| Schema | A typed list of everything clients may ask for | `type Game { title: String }` |
+| Query / mutation | A read request / a write request | `query { game(id: "7") { title } }` |
+| Resolver | A server function that fetches one field | `Game.reviews` loads reviews from the DB |
+| N+1 problem | 1 query for a list, then 1 more per item | 10 invoices cause 10 customer lookups |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client app"] -- "one query:<br/>game, reviews, authors" --> S["GraphQL server"]
+    S --> R1["Game resolver"]
+    S --> R2["Reviews resolver"]
+    S --> R3["Author resolver"]
+    R1 --> DB[("Databases and<br/>other services")]
+    R2 --> DB
+    R3 --> DB
+    S -- "one JSON reply,<br/>same shape as query" --> C
+```
+
+**Analogy.** A waiter takes one order for exactly the items you want, collects them from different kitchen stations, and brings one plate.
+Where it breaks: a real waiter refuses an absurd order by common sense; a GraphQL server needs explicit depth and cost limits, or one huge query can overload it.
+
+**How the rest of this note builds up**
+
+- First, why GraphQL exists (over- and under-fetching, section 1) and the schema/query/resolver mental model (section 2).
+- Then how a query executes, resolvers run, and DataLoader fixes N+1 (sections 3-4).
+- Then trade-offs against REST and gRPC, and production concerns: errors, authorization, cost control, caching, federation.
+- Finally, the SDE-3 deep dive on batching, Int limits, mutation ordering and subscriptions, plus interview questions.
+
+> [!tip] Remember
+> One typed schema, one query naming exact fields, one resolver per field, and always batch child lookups.
+
 ## 1. Why it exists
 
 A game page shows a game's title, its reviews, and each reviewer's name. The data forms a graph: Game → Reviews → Authors.
@@ -36,7 +84,11 @@ With a resource-per-URL REST API the client needs three calls:
 2. `GET /games/7/reviews` returns review rows with `author_id`, but no names. One call was not enough. That is **under-fetching**.
 3. `GET /authors?ids=3,9,12` fetches the names.
 
-Calls 1 and 2 can go out in parallel, but call 3 needs the author IDs from call 2, so at least two round trips happen one after the other. On a mobile link with a 150 ms round trip (an estimate), that is at least 300 ms before rendering. With GraphQL the client sends one query and waits one round trip (150 ms):
+Calls 1 and 2 can go out in parallel, but call 3 needs the author IDs from call 2, so at least two round trips happen one after the other.
+
+On a mobile link with a 150 ms round trip (an estimate), that is at least 300 ms before rendering.
+
+With GraphQL the client sends one query and waits one round trip (150 ms):
 
 ```graphql
 query GamePage {
@@ -442,7 +494,11 @@ Side by side, topic by topic:
 ## 7. In production
 
 - **Real systems:**
-	- GitHub's GraphQL API (once called v4) enforces cost limits (GitHub Docs). Every connection must pass `first` or `last` between 1 and 100. One call may request at most 500,000 nodes. Users get 5,000 points per hour. A query's price is the number of requests needed to fill every connection, assuming each one returns its full `first`/`last`, divided by 100 (minimum 1 point).
+	- GitHub's GraphQL API (once called v4) enforces cost limits (GitHub Docs):
+		- Every connection must pass `first` or `last` between 1 and 100.
+		- One call may request at most 500,000 nodes.
+		- Users get 5,000 points per hour.
+		- A query's price is the number of requests needed to fill every connection, assuming each one returns its full `first`/`last`, divided by 100 (minimum 1 point).
 	- Shopify's Admin API is GraphQL with a calculated query cost.
 	- Netflix runs a federated graph whose subgraph services are built with its open-source DGS framework for Spring Boot.
 
@@ -468,7 +524,10 @@ By long-standing convention, a server that answers with `application/json` retur
 
 - `path` says which field failed. `extensions.code` gives machines a stable code. The message is for humans.
 - **Non-null propagation:** had `customer` been declared `Customer!`, the server could not return `null` there. The null would bubble up to the nearest nullable parent and wipe out the whole `invoice`. Mark fields that depend on other services as nullable.
-- The GraphQL-over-HTTP specification (still a working draft in late 2026) adds the `application/graphql-response+json` media type, whose status codes carry meaning. A request error with no `data` at all gets a 4xx: 400 when the document cannot be parsed and, in the September 2026 draft, 422 when it fails validation. A result with partial `data` stays 2xx: older drafts said 200, and recent drafts have discussed a dedicated partial-success status code so that proxies can count partial failures. The draft is still changing, so check which revision your server and gateway follow.
+- The GraphQL-over-HTTP specification (still a working draft in late 2026) adds the `application/graphql-response+json` media type, whose status codes carry meaning.
+	- A request error with no `data` at all gets a 4xx: 400 when the document cannot be parsed and, in the September 2026 draft, 422 when it fails validation.
+	- A result with partial `data` stays 2xx: older drafts said 200, and recent drafts have discussed a dedicated partial-success status code so that proxies can count partial failures.
+	- The draft is still changing, so check which revision your server and gateway follow.
 - Monitoring must parse `errors`. An alert based only on HTTP status can report 100% success while a backend service is down.
 - For expected business failures (an invalid coupon), prefer a typed `userErrors` field in the mutation payload over the `errors` array.
 
@@ -497,17 +556,29 @@ A single nested query can explode: `users(first: 100) { posts(first: 50) { comme
 ### Caching
 
 - **HTTP caches do not help by default.** Every query is a `POST /graphql` with a different body, and CDNs do not cache POST.
-- **Automatic persisted queries (APQ):** the client sends only a SHA-256 hash of the query in `extensions.persistedQuery`. On a miss the server replies `PersistedQueryNotFound`, the client resends the hash with the full text, and the server stores it. Small hash-only requests can then go out as **GET**, which a CDN can cache. APQ saves bandwidth but still accepts any query, so it is not a security control. Trusted documents are.
+- **Automatic persisted queries (APQ):** the client sends only a SHA-256 hash of the query in `extensions.persistedQuery`.
+	- On a miss the server replies `PersistedQueryNotFound`, the client resends the hash with the full text, and the server stores it.
+	- Small hash-only requests can then go out as **GET**, which a CDN can cache.
+	- APQ saves bandwidth but still accepts any query, so it is not a security control. Trusted documents are.
 - **Normalized client caches:** Apollo Client and Relay split each response into objects keyed by `__typename` + `id` (Relay uses a global ID). When a mutation returns `Invoice:inv_1` with a new status, every screen that shows that invoice updates.
 
 ### Pagination and schema evolution
 
 - **Relay cursor connections** are the standard shape: `invoices(first: 20, after: "cursor")` returns `edges { cursor node }` and `pageInfo { hasNextPage endCursor }`. The cursor is an opaque string, usually the base64 of the sort key. Why cursors beat offsets lives in [[Pagination, Filtering and Sorting]].
-- **Evolve, don't version:** add fields and types freely, because old clients never ask for them. Mark old fields `@deprecated(reason: "...")`, watch field-usage metrics until traffic reaches zero, then delete. Removing a field, making a nullable argument non-null, or turning a non-null output field nullable breaks clients. Adding an enum value or a union member is "dangerous" rather than breaking: a client with an exhaustive `switch` meets a value it has never seen, so clients must handle unknown values. Compare with URL versioning in [[API Versioning and Backward Compatibility]].
+- **Evolve, don't version:** add fields and types freely, because old clients never ask for them.
+	- Mark old fields `@deprecated(reason: "...")`, watch field-usage metrics until traffic reaches zero, then delete.
+	- Removing a field, making a nullable argument non-null, or turning a non-null output field nullable breaks clients.
+	- Adding an enum value or a union member is "dangerous" rather than breaking: a client with an exhaustive `switch` meets a value it has never seen, so clients must handle unknown values. Compare with URL versioning in [[API Versioning and Backward Compatibility]].
 
 ### Federation
 
-With Apollo Federation 2, each team runs a **subgraph** that owns some types. A subgraph marks an entity type with `@key(fields: "id")`, and other subgraphs declare the same type with the same key and add their own fields. **Composition** (the Rover CLI or GraphOS) merges the subgraph schemas into one supergraph schema. The **router** loads that supergraph, plans each query across the subgraphs, and fetches entities through each subgraph's `_entities` field. Composition and schema checks run in CI, so a conflicting or breaking change fails a build instead of production. See [[API Gateway and BFF]] for where the router sits.
+With Apollo Federation 2, each team runs a **subgraph** that owns some types.
+
+1. A subgraph marks an entity type with `@key(fields: "id")`, and other subgraphs declare the same type with the same key and add their own fields.
+2. **Composition** (the Rover CLI or GraphOS) merges the subgraph schemas into one supergraph schema.
+3. The **router** loads that supergraph, plans each query across the subgraphs, and fetches entities through each subgraph's `_entities` field.
+
+Composition and schema checks run in CI, so a conflicting or breaking change fails a build instead of production. See [[API Gateway and BFF]] for where the router sits.
 
 ### What to monitor
 
@@ -529,7 +600,11 @@ go run github.com/99designs/gqlgen generate   # rerun after every schema change
 - A resolver looks like `func (r *invoiceResolver) Customer(ctx context.Context, obj *model.Invoice) (*model.Customer, error)`. `obj` is the parent. `ctx` carries the authenticated user that middleware stored, so the resolver checks object-level access there.
 - Field-level rules: declare `directive @auth(requires: Role!) on FIELD_DEFINITION` and set `cfg.Directives.Auth` to a function that checks the role in `ctx` before calling `next(ctx)`.
 - N+1: middleware creates fresh loaders per request (with `dataloadgen.NewLoader(fetchFn, dataloadgen.WithWait(time.Millisecond))`) and stores them in `ctx`. Resolvers call `loaders.Customer.Load(ctx, obj.CustomerID)`.
-- Server setup: build the server with `handler.New(...)`, which adds nothing by default. Then opt in explicitly: `transport.POST{}`, `transport.Websocket{KeepAlivePingInterval: 10 * time.Second}` for subscriptions (subscription resolvers return a `<-chan *model.Invoice`), `extension.FixedComplexityLimit(300)`, and `extension.AutomaticPersistedQuery{Cache: lru.New[string](100)}`. Add `extension.Introspection{}` only outside production. gqlgen ships no depth-limit extension (its `extension` package holds only complexity, APQ and introspection), so a depth cap needs your own operation middleware or a third-party package. The older `handler.NewDefaultServer`, marked deprecated in current gqlgen, turns introspection on. These names were checked against the gqlgen v0.17.98 source.
+- Server setup: build the server with `handler.New(...)`, which adds nothing by default.
+	- Then opt in explicitly: `transport.POST{}`, `transport.Websocket{KeepAlivePingInterval: 10 * time.Second}` for subscriptions (subscription resolvers return a `<-chan *model.Invoice`), `extension.FixedComplexityLimit(300)`, and `extension.AutomaticPersistedQuery{Cache: lru.New[string](100)}`.
+	- Add `extension.Introspection{}` only outside production.
+	- gqlgen ships no depth-limit extension (its `extension` package holds only complexity, APQ and introspection), so a depth cap needs your own operation middleware or a third-party package.
+	- The older `handler.NewDefaultServer`, marked deprecated in current gqlgen, turns introspection on. These names were checked against the gqlgen v0.17.98 source.
 - Errors: return a `*gqlerror.Error` with `Extensions: map[string]any{"code": "FORBIDDEN"}`. The client receives HTTP 200 with that code in `errors[0].extensions`. Parse and validation failures are different: gqlgen's POST transport answers them with 422 over `application/json`, and with 400 when the client asked for `application/graphql-response+json` (v0.17.98 source).
 - Tests: `client.New(srv)` from `github.com/99designs/gqlgen/client` runs a query against the real handler in-process, for example `c.MustPost(query, &resp)`.
 
@@ -550,22 +625,36 @@ sequenceDiagram
 
 ## 8. Deep dive
 
-- **Why DataLoader batching works at all:** sibling resolvers in a list all start before any of them gets an answer. graphql-js calls all ten `Invoice.customer` resolvers in the same tick, and each returns a promise; gqlgen runs them in parallel goroutines. Either way, their keys meet in one batch. Execution is not strictly breadth-first, though: an executor that ran one sibling to completion before starting the next would defeat batching. Loaders deduplicate keys and memoize per request, so `customer(1)` asked from three places costs one key.
+- **Why DataLoader batching works at all:** sibling resolvers in a list all start before any of them gets an answer.
+	- graphql-js calls all ten `Invoice.customer` resolvers in the same tick, and each returns a promise; gqlgen runs them in parallel goroutines. Either way, their keys meet in one batch.
+	- Execution is not strictly breadth-first, though: an executor that ran one sibling to completion before starting the next would defeat batching.
+	- Loaders deduplicate keys and memoize per request, so `customer(1)` asked from three places costs one key.
 - **Batching across nested levels:** a loader fixes one level. A query three levels deep still makes one query per level (1 + 1 + 1), which is fine. Batch sizes grow with list sizes, so cap `first`.
 - **Ordering contract:** the classic JavaScript DataLoader requires the batch function to return values in the same order as the keys. The map-based loader above avoids that bug class: a missing key is "not found", not a shifted value.
-- **Int is 32-bit:** `totalCents: Int!` cannot hold more than 2,147,483,647 cents (about 21.4 million in currency units). The spec does not let the value wrap around: the server must raise a field error instead, so a large invoice suddenly comes back as `null` plus an error. Use a custom scalar (`Money`, or a decimal string) for large amounts. The same applies to 64-bit IDs: expose them as `ID` (a string).
-- **Mutations are serial, queries are not:** two top-level mutation fields in one request run in order, so `payInvoice(id: "inv_1")` followed by `archiveInvoice(id: "inv_1")` happens in that order. One field cannot pass its result to the next, though: creating an invoice and then sending it by its new ID takes two requests. Two query fields may run concurrently, so they must not depend on each other's side effects.
-- **Subscriptions** are long-lived operations, usually carried over WebSocket with the `graphql-transport-ws` subprotocol (from the `graphql-ws` library). The older Apollo protocol is confusingly named `graphql-ws`, so check which one the client speaks. They inherit every scaling problem in [[Real-time APIs - WebSocket, SSE and Long Polling]] and [[Scaling WebSockets]]. For fan-out to many listeners, a subscription resolver should subscribe to a broker topic rather than poll the database.
+- **Int is 32-bit:** `totalCents: Int!` cannot hold more than 2,147,483,647 cents (about 21.4 million in currency units).
+	- The spec does not let the value wrap around: the server must raise a field error instead, so a large invoice suddenly comes back as `null` plus an error.
+	- Use a custom scalar (`Money`, or a decimal string) for large amounts. The same applies to 64-bit IDs: expose them as `ID` (a string).
+- **Mutations are serial, queries are not:** two top-level mutation fields in one request run in order, so `payInvoice(id: "inv_1")` followed by `archiveInvoice(id: "inv_1")` happens in that order.
+	- One field cannot pass its result to the next, though: creating an invoice and then sending it by its new ID takes two requests.
+	- Two query fields may run concurrently, so they must not depend on each other's side effects.
+- **Subscriptions** are long-lived operations, usually carried over WebSocket with the `graphql-transport-ws` subprotocol (from the `graphql-ws` library).
+	- The older Apollo protocol is confusingly named `graphql-ws`, so check which one the client speaks.
+	- They inherit every scaling problem in [[Real-time APIs - WebSocket, SSE and Long Polling]] and [[Scaling WebSockets]].
+	- For fan-out to many listeners, a subscription resolver should subscribe to a broker topic rather than poll the database.
 - **Query-plan caching:** parsing and validating the same query text on every request wastes CPU. Servers cache the parsed and validated document by query text or hash (gqlgen's query cache), and persisted queries make that cache hit almost every time.
 - **Introspection is not a secret store:** turning it off hides the map, but field names still leak through client bundles and suggestion messages ("Did you mean `email`?"). Real protection is authorization in resolvers plus trusted documents.
 
 ## 9. Interview questions
 
 > [!question]- Why does GraphQL make N+1 queries likely, and how does DataLoader fix it?
-> Resolvers run per field, so a list of N parents calls the child resolver N times, giving 1 + N queries. DataLoader collects the keys requested during one tick or a short window, deduplicates them, and runs one `WHERE id = ANY($1)` query. The loader must be per request, so its memo cache never leaks data between users or goes stale.
+> Resolvers run per field, so a list of N parents calls the child resolver N times, giving 1 + N queries.
+>
+> DataLoader collects the keys requested during one tick or a short window, deduplicates them, and runs one `WHERE id = ANY($1)` query. The loader must be per request, so its memo cache never leaks data between users or goes stale.
 
 > [!question]- Trap: a GraphQL response came back with HTTP 200. Did the request succeed?
-> Not necessarily. Field errors come back as HTTP 200 with an `errors` array next to partial `data`. Clients and monitoring must inspect `errors` and `extensions.code`. Parse and validation failures may get a 4xx instead: the GraphQL-over-HTTP draft asks for 400 or 422 with `application/graphql-response+json`, and gqlgen already returns 422 for them over `application/json`. A 4xx can also come from a proxy, so a client should trust the body only when the response is a GraphQL one.
+> Not necessarily. Field errors come back as HTTP 200 with an `errors` array next to partial `data`. Clients and monitoring must inspect `errors` and `extensions.code`.
+>
+> Parse and validation failures may get a 4xx instead: the GraphQL-over-HTTP draft asks for 400 or 422 with `application/graphql-response+json`, and gqlgen already returns 422 for them over `application/json`. A 4xx can also come from a proxy, so a client should trust the body only when the response is a GraphQL one.
 
 > [!question]- How do you stop a client from sending a query that brings the server down?
 > Validate before executing: a depth limit, complexity scoring that multiplies by `first`, and hard caps on page sizes. Add per-request timeouts and cost-based rate limits. For first-party clients, accept only persisted (trusted) documents. Turn introspection off on public endpoints.
@@ -598,3 +687,8 @@ sequenceDiagram
 - **Before this:** [[REST and HTTP API Design]], [[Choosing an API Style]], [[N+1 Query Problem]]
 - **Next:** [[gRPC]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[API Gateway and BFF]]
 - **Compare with:** [[REST and HTTP API Design]] (resource URLs and HTTP caching), [[gRPC]] (typed RPC for internal calls), [[Pagination, Filtering and Sorting]] (cursor design)
+
+### Watch on YouTube
+
+- [GraphQL Explained in 100 Seconds](https://www.youtube.com/watch?v=eIQh02xuVw4) · Fireship · fast visual intro to schemas, queries and resolvers
+- [Introduction To GraphQL](https://www.youtube.com/watch?v=anW5Qpuh5kI) · dotnet · slightly deeper walkthrough of GraphQL concepts beyond the 100-second intro

@@ -10,13 +10,15 @@ sources:
   - "Prometheus docs, Querying basics and rate()"
   - "kubectl reference docs (rollout, logs, describe, get events)"
   - "NGINX docs, ngx_http_proxy_module (proxy_next_upstream, proxy_read_timeout)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Error Rate Spike (5xx)
 
 > [!summary] TL;DR
-> Users are getting error pages: the share of responses with status 500, 502, 503 or 504 jumped. In the first five minutes, confirm the spike is real, scope it (which endpoint, pod, region), check what changed (usually a deploy), and **mitigate before you diagnose**: roll back, flip a flag, scale, or shed load. Then use the status code itself (500 vs 502 vs 503 vs 504) to pick the investigation branch.
+> Users are getting error pages: the share of responses with status 500, 502, 503 or 504 jumped. In the first five minutes, confirm the spike is real, scope it (which endpoint, pod, region), check what changed (usually a deploy), and **mitigate before you diagnose**: roll back, flip a flag, scale, or shed load.
+>
+> Then use the status code itself (500 vs 502 vs 503 vs 504) to pick the investigation branch.
 
 > [!abstract] Core idea
 > - **The status code is a clue.** 500 means your code failed. 502 means the proxy got garbage or nothing from your app. 503 means "refusing right now". 504 means the proxy gave up waiting.
@@ -37,6 +39,56 @@ flowchart LR
 ```
 
 Say it out loud in an interview: "I confirm, scope, check what changed, mitigate, communicate, and only then diagnose, using the status code and the metrics to pick a branch."
+
+## Start here: the basics
+
+**The problem in one story**
+
+Users open the app and see an error page.
+A dashboard shows that 8 percent of requests now fail with server errors.
+Ten minutes ago a new version was deployed.
+You must decide fast: roll back, or find another cause?
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| HTTP status code | A number the server returns with every reply | 200 OK, 404 Not Found, 500 Error |
+| 5xx | Status codes meaning the server side failed | 500, 502, 503, 504 |
+| Error rate | Failed requests divided by all requests | 40 errors / 1000 requests = 4 percent |
+| Upstream / downstream | Upstream: a service you call. Downstream: who calls you | Your API calls the payments upstream |
+| Load balancer | Spreads traffic over many servers and may return its own 5xx | 502 when no healthy backend |
+| Rollback | Returning to the previous working version | Redeploy last good image |
+| SLO / error budget | A target for reliability and how much failure is allowed | 99.9 percent success per 30 days |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User"] --> LB["Load balancer"]
+    LB --> S["Service"]
+    S --> DEP["Dependency"]
+    S -->|"bug or crash"| E["500"]
+    LB -->|"no healthy backend"| E2["502 / 503"]
+    DEP -->|"slow"| E3["504 timeout"]
+```
+
+**Analogy**
+
+A restaurant where some plates come back wrong. You check: did the chef change the recipe today (deploy), is a supplier missing ingredients (dependency), or is the kitchen overloaded (capacity)?
+
+Where it breaks: a restaurant serves one table at a time; a service fails thousands of requests a second, so you act on the ratio, not single plates.
+
+**How the rest of this note builds up**
+
+- First, **Why it exists** and **Mental model** explain what a 5xx means and who produces it.
+- Then **How it works** walks through the triage order: recent change, dependency, capacity.
+- Next, the **Worked example** shows a deploy-caused spike end to end.
+- Then **Variants and comparison**, **Trade-offs** and **In production** cover each 5xx code.
+- Finally, the SDE-3 **Deep dive** covers ratio pitfalls and retries.
+
+> [!tip] Remember
+> Check what changed first; if a deploy lines up with the spike, roll back before debugging.
 
 ## 1. Why it exists
 
@@ -358,7 +410,9 @@ Screenshots of the graph with deploy markers, the exact error log lines, the `ku
 
 ### Why the ratio can mislead
 
-A 5xx ratio is errors divided by total. If an upstream outage drops real traffic by 90%, the ratio can look worse while the absolute number of errors is unchanged, or look fine while users cannot reach you at all (traffic that never arrives has no status). Always plot request **rate** next to the error ratio, and keep an external synthetic check.
+A 5xx ratio is errors divided by total. If an upstream outage drops real traffic by 90%, the ratio can look worse while the absolute number of errors is unchanged, or look fine while users cannot reach you at all (traffic that never arrives has no status).
+
+Always plot request **rate** next to the error ratio, and keep an external synthetic check.
 
 ### Retries amplify
 
@@ -424,3 +478,10 @@ An unrecovered panic in a goroutine you started yourself (not the request gorout
 - Signals and alerting: [[Metrics and Prometheus]], [[Alerting and On-Call]], [[SLIs, SLOs, SLAs and Error Budgets]], [[Latency, Percentiles and Bottleneck Analysis]]
 - Resilience: [[Circuit Breaker]], [[Timeouts, Retries and Backoff]], [[Load Shedding and Graceful Degradation]]
 - Tools: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]], [[Graceful Shutdown and Health Checks]], [[Debugging Memory Leaks and OOMs in Go]]
+
+## Links
+
+### Watch on YouTube
+
+- [Familywise error rate (FWER) - explained](https://www.youtube.com/watch?v=8CuFKY45UXQ) · TileStats · 12 min · 16,746 views
+- [Bit Error Rate - BER - explained (01-04-05)](https://www.youtube.com/watch?v=Xtb1EuAszHU) · HUBER+SUHNER  · 4 min · 7,195 views

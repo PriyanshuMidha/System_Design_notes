@@ -14,7 +14,7 @@ sources:
   - "PostgreSQL 17 docs, pg_trgm, btree_gist, pgstattuple modules; Monitoring Statistics (pg_stat_user_indexes)"
   - "MySQL 8.0 Reference Manual, Skip Scan Range Access Method (8.0.13), Functional Key Parts (8.0.13), Invisible Indexes"
   - "MongoDB Manual, Index Types (compound, multikey, wildcard, TTL); The ESR (Equality, Sort, Range) Guideline"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Index Types and Index Design
@@ -29,6 +29,51 @@ updated: 2026-11-07
 > - Pick a non-B-tree type only for a query a B-tree cannot answer: containment (GIN), overlap or nearest (GiST), huge time-ordered tables (BRIN).
 > - Every index costs writes, disk and RAM; find and drop the ones nobody uses.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your app runs `SELECT * FROM invoices WHERE workspace_id = 7 AND status = 'overdue' ORDER BY due_date LIMIT 20`.
+An index exists on `(due_date, workspace_id, status)`, yet the query is still slow.
+The columns are right but the order is wrong, so the database cannot jump to the rows it needs.
+This note is about choosing the right kind of index and the right column order for each query.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Index | A sorted helper structure that finds rows without reading the whole table | The index at the back of a book |
+| B-tree | The default index: a sorted, balanced tree | `CREATE INDEX ON invoices (due_date)` |
+| Multicolumn index | One index sorted by several columns in order | `(workspace_id, status, due_date)` |
+| Equality / range | `=` filters vs `<`, `>`, `BETWEEN` filters | `status = 'overdue'` vs `due_date > '2026-11-01'` |
+| Query planner | The part of the database that picks how to run a query | Chooses index scan or full scan |
+| `EXPLAIN` | Shows the plan the planner picked | `EXPLAIN ANALYZE SELECT ...` |
+| Partial index | An index on only some rows | `WHERE deleted_at IS NULL` |
+| GIN / GiST / BRIN | Special index types for arrays and text, shapes and ranges, huge ordered tables | Tag search uses GIN |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    Q["Look at the query:<br/>WHERE, ORDER BY, LIMIT"] --> T{"Can a B-tree answer it?"}
+    T -- "yes" --> ESR["Order columns:<br/>Equality, Sort, Range"]
+    T -- "contains / overlaps /<br/>huge time series" --> SP["GIN, GiST or BRIN"]
+    ESR --> SH["Shrink: partial index,<br/>INCLUDE columns"]
+    SP --> SH
+```
+
+**Analogy.** A phone book sorted by city, then surname, then first name finds "Pune, Sharma" fast. It cannot find "everyone named Rahul" without reading every page, because first name is last in the sort order.
+Where it breaks: a phone book has one fixed order; a database can keep several indexes with different orders, but each one costs write time and disk.
+
+**How the rest of this note builds up**
+
+- First, why one index type and one column order cannot serve every query (section 1) and the mental model (section 2).
+- Then how it works: picking the type from the query shape, the ESR rule, index-only scans, and how GIN, GiST and BRIN find rows (section 3).
+- Then worked InvoiceOps examples with `EXPLAIN`: column order, covering indexes and the special types (section 4).
+- Finally the SDE-3 view: trade-offs, unused-index cleanup, safe index changes in production, and deep internals (sections 5-8).
+
+> [!tip] Remember
+> Design the index from the query: Equality columns, then Sort, then Range, and use a special type only when a B-tree cannot answer.
+
 ## 1. Why it exists
 
 InvoiceOps keeps 10 million rows in `invoices` across 2,000 workspaces (a workspace is one customer company, the tenant). The most called endpoint lists one workspace's overdue invoices:
@@ -41,7 +86,9 @@ ORDER BY due_date DESC, id DESC
 LIMIT 20;
 ```
 
-With only a single-column index on `workspace_id`, PostgreSQL finds workspace 42's 5,000 invoices, fetches each from the table, throws away the 4,700 that are not overdue, sorts the remaining 300 and returns 20. That is about 5,000 random page reads to show 20 rows. With the right composite index (one index over several columns) it reads about 4 index pages and 20 table rows.
+With only a single-column index on `workspace_id`, PostgreSQL finds workspace 42's 5,000 invoices, fetches each from the table, throws away the 4,700 that are not overdue, sorts the remaining 300 and returns 20. That is about 5,000 random page reads to show 20 rows.
+
+With the right composite index (one index over several columns) it reads about 4 index pages and 20 table rows.
 
 Three other InvoiceOps questions cannot be helped by any B-tree, however the columns are ordered:
 
@@ -119,7 +166,11 @@ flowchart LR
     end
 ```
 
-An **index-only scan** answers the query from the index alone. In PostgreSQL the index does not store whether a row version is visible to your transaction (see [[Isolation Levels and MVCC]]), so it checks the **visibility map**, one bit per heap page that `VACUUM` sets when every row on the page is visible to everyone. Pages that are not all-visible still need a heap visit, shown as `Heap Fetches` in `EXPLAIN ANALYZE`. A table with heavy updates and lagging autovacuum gets few true index-only scans.
+An **index-only scan** answers the query from the index alone.
+
+In PostgreSQL the index does not store whether a row version is visible to your transaction (see [[Isolation Levels and MVCC]]), so it checks the **visibility map**, one bit per heap page that `VACUUM` sets when every row on the page is visible to everyone.
+
+Pages that are not all-visible still need a heap visit, shown as `Heap Fetches` in `EXPLAIN ANALYZE`. A table with heavy updates and lagging autovacuum gets few true index-only scans.
 
 ### 3.4 What each special type stores
 
@@ -252,7 +303,11 @@ WHERE workspace_id = 42 AND status = 'overdue' AND amount_minor > 100000
 ORDER BY due_date DESC, id DESC LIMIT 20;
 ```
 
-With an index ordered E-R-S, `(workspace_id, status, amount_minor, due_date)`, the range on `amount_minor` returns entries ordered by amount, so a Sort is back on top. With the E-S-R order `(workspace_id, status, due_date DESC, id DESC, amount_minor)` the scan walks in due-date order and checks `amount_minor` inside the index (`Index Cond` on the last column, no heap visit for the rejected rows), stopping after 20 matches. Representative output (PostgreSQL 17), E-R-S first, then E-S-R:
+With an index ordered E-R-S, `(workspace_id, status, amount_minor, due_date)`, the range on `amount_minor` returns entries ordered by amount, so a Sort is back on top.
+
+With the E-S-R order `(workspace_id, status, due_date DESC, id DESC, amount_minor)` the scan walks in due-date order and checks `amount_minor` inside the index (`Index Cond` on the last column, no heap visit for the rejected rows), stopping after 20 matches.
+
+Representative output (PostgreSQL 17), E-R-S first, then E-S-R:
 
 ```text
 Limit  (actual time=2.814..2.819 rows=20 loops=1)
@@ -277,7 +332,13 @@ ESR trades a few extra index entries read for never sorting, which wins whenever
 SELECT count(*) FROM invoices WHERE status = 'overdue';
 ```
 
-The leading column `workspace_id` is not constrained. Before PostgreSQL 18 the planner either reads the whole index or does a Seq Scan. PostgreSQL 18 added **B-tree skip scan**: when the skipped leading column has few distinct values, it performs one small descent per distinct `workspace_id` (2,000 descents here) instead of reading everything. MySQL has had the same idea since 8.0.13 (`Using index for skip scan` in `EXPLAIN`), with restrictions: one table, and the query must be answerable from the index. So "an index is useless if the query skips its first column" is no longer an absolute rule; it is still the right default, because skip scan is only cheap when the skipped column has few distinct values.
+The leading column `workspace_id` is not constrained. Before PostgreSQL 18 the planner either reads the whole index or does a Seq Scan.
+
+PostgreSQL 18 added **B-tree skip scan**: when the skipped leading column has few distinct values, it performs one small descent per distinct `workspace_id` (2,000 descents here) instead of reading everything.
+
+MySQL has had the same idea since 8.0.13 (`Using index for skip scan` in `EXPLAIN`), with restrictions: one table, and the query must be answerable from the index.
+
+So "an index is useless if the query skips its first column" is no longer an absolute rule; it is still the right default, because skip scan is only cheap when the skipped column has few distinct values.
 
 ```mermaid
 flowchart LR
@@ -295,7 +356,11 @@ CREATE INDEX CONCURRENTLY invoices_open_due_idx
     WHERE status IN ('open', 'overdue');
 ```
 
-`INCLUDE` (B-tree since PostgreSQL 11) stores `number` and `amount_minor` in leaf pages only. They are not part of the sort order and cannot be searched, but they let `SELECT id, number, due_date, amount_minor … WHERE workspace_id = 42 AND status IN ('open','overdue')` skip the heap. The index does not store `status`, so a query for `status = 'overdue'` alone still uses this index but must visit the heap to check the status; add `status` to `INCLUDE` if that query must be index-only. Representative output (PostgreSQL 17), right after `VACUUM`, then after a burst of updates:
+`INCLUDE` (B-tree since PostgreSQL 11) stores `number` and `amount_minor` in leaf pages only. They are not part of the sort order and cannot be searched, but they let `SELECT id, number, due_date, amount_minor … WHERE workspace_id = 42 AND status IN ('open','overdue')` skip the heap.
+
+The index does not store `status`, so a query for `status = 'overdue'` alone still uses this index but must visit the heap to check the status; add `status` to `INCLUDE` if that query must be index-only.
+
+Representative output (PostgreSQL 17), right after `VACUUM`, then after a burst of updates:
 
 ```text
 Index Only Scan using invoices_open_due_idx on invoices  (actual time=0.028..0.041 rows=20 loops=1)
@@ -307,7 +372,9 @@ Index Only Scan using invoices_open_due_idx on invoices  (actual time=0.029..0.1
   Heap Fetches: 17
 ```
 
-The partial predicate (`WHERE status IN (...)`) makes this index roughly a tenth of the size of a full one (open plus overdue rows are under 10% of the table). The planner uses it only when it can prove the query's `WHERE` implies the index's `WHERE`, so the query must say `status IN ('open','overdue')` or `status = 'overdue'`; a query parameter `status = $1` with a generic plan cannot be proven and will not use it.
+The partial predicate (`WHERE status IN (...)`) makes this index roughly a tenth of the size of a full one (open plus overdue rows are under 10% of the table).
+
+The planner uses it only when it can prove the query's `WHERE` implies the index's `WHERE`, so the query must say `status IN ('open','overdue')` or `status = 'overdue'`; a query parameter `status = $1` with a generic plan cannot be proven and will not use it.
 
 ```mermaid
 flowchart LR
@@ -400,7 +467,9 @@ Test cases against the key `(workspace_id, status, due_date DESC, id DESC)`:
 | gap in prefix | `workspace_id = ?`, range `due_date` | 1 | yes |
 | sort column pinned | same equality, order `status, due_date DESC` | 2 | yes |
 
-The ESR proposal for equality `workspace_id, status`, range `amount_minor`, order `due_date DESC` is `(workspace_id, status, due_date DESC, amount_minor)`, which seeks on 2 columns and serves the sort. The "gap in prefix" case is the classic mistake: `WHERE workspace_id = ? AND due_date > ?` on `(workspace_id, status, due_date)` seeks on one column only, and `due_date` becomes a filter over the whole workspace.
+The ESR proposal for equality `workspace_id, status`, range `amount_minor`, order `due_date DESC` is `(workspace_id, status, due_date DESC, amount_minor)`, which seeks on 2 columns and serves the sort.
+
+The "gap in prefix" case is the classic mistake: `WHERE workspace_id = ? AND due_date > ?` on `(workspace_id, status, due_date)` seeks on one column only, and `due_date` becomes a filter over the whole workspace.
 
 Runnable Go version: [[Index Types and Index Design - Go]]
 
@@ -472,7 +541,9 @@ ORDER BY pg_relation_size(s.indexrelid) DESC;
 
 `last_idx_scan` exists since PostgreSQL 16. Counters are per server: an index unused on the primary may serve all the reads on a replica, so check every node before dropping, and check after a full business cycle (month-end reports).
 
-**Bloat.** Deleted and updated rows leave dead entries; B-tree pages split and are rarely merged. `pgstatindex()` from the `pgstattuple` extension reports `avg_leaf_density`; a freshly built B-tree is about 90% full (the default `fillfactor`), and a density far below that indicates bloat. Fix with `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12+), which builds a new copy and swaps it without blocking writes. B-tree deduplication (PostgreSQL 13) stores repeated keys once and reduces bloat for low-cardinality columns.
+**Bloat.** Deleted and updated rows leave dead entries; B-tree pages split and are rarely merged. `pgstatindex()` from the `pgstattuple` extension reports `avg_leaf_density`; a freshly built B-tree is about 90% full (the default `fillfactor`), and a density far below that indicates bloat.
+
+Fix with `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12+), which builds a new copy and swaps it without blocking writes. B-tree deduplication (PostgreSQL 13) stores repeated keys once and reduces bloat for low-cardinality columns.
 
 **Failure modes → fixes:**
 - Index exists but is not used → the query wraps the column in a function, casts the type, uses a non-matching collation, or the estimate says a Seq Scan is cheaper; read the plan.
@@ -534,3 +605,8 @@ ORDER BY pg_relation_size(s.indexrelid) DESC;
 - **Next:** [[N+1 Query Problem]], [[Zero-Downtime Schema Migrations]], [[Debugging Database Performance]]
 - **Compare with:** [[Search Engines and Inverted Indexes]], [[Geospatial Indexing]], [[Vector Databases and ANN Indexes]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Go implementation:** [[Index Types and Index Design - Go]]
+
+### Watch on YouTube
+
+- [Database Internals, Part 2: Beyond B-trees: Hash, GIN, GiST, BRIN, LSM and Vector Indexes](https://www.youtube.com/watch?v=2c0y25g7-BM) · Johnny The Data Scientist · covers exactly GIN/GiST/BRIN beyond the basic B-tree
+- [Lesson #8 - What is a BRIN Index? (Index Types) -  Deep Dive Into PostgreSQL Indexes Course](https://www.youtube.com/watch?v=1tAyyXbEdTQ) · Percona · focused deep dive on BRIN for huge time-ordered tables

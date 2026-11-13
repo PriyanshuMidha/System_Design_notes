@@ -12,13 +12,15 @@ sources:
   - "Redis docs: Streams, Pub/Sub, LMOVE/BLMOVE"
   - "NATS docs: JetStream streams and consumers, message deduplication"
   - "Apache Pulsar docs: Messaging concepts (subscription types), architecture (BookKeeper)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Queues vs Streams and Broker Comparison
 
 > [!summary] TL;DR
-> A **message broker** is a server that holds messages between the program that sends them (the **producer**) and the program that handles them (the **consumer**). A **queue** hands each message to one consumer and deletes it once that consumer confirms it; a **stream** (also called a **log**) keeps every message in order and lets any number of readers go through it at their own pace.
+> A **message broker** is a server that holds messages between the program that sends them (the **producer**) and the program that handles them (the **consumer**).
+>
+> A **queue** hands each message to one consumer and deletes it once that consumer confirms it; a **stream** (also called a **log**) keeps every message in order and lets any number of readers go through it at their own pace.
 
 > [!abstract] Core idea
 > - Queue: one message, one worker, deleted on ack. Good for jobs ("send this email").
@@ -27,11 +29,63 @@ updated: 2026-11-04
 > - Every durable broker (all of these except Redis Pub/Sub and NATS core, which are at most once) is "at least once" in normal use, so consumers must tolerate duplicates.
 > - Pick by use case: task queue → SQS, RabbitMQ, a Postgres or Redis queue; event bus and replay → Kafka, Pulsar, Redis Streams, NATS JetStream.
 
+## Start here: the basics
+
+**The problem in one story.**
+After you pay, a shop must email a receipt, add points and tell the warehouse.
+If checkout does all three itself, you wait longer, and if email is down your checkout fails.
+So checkout leaves notes in a mailbox server, and other programs pick them up later.
+That mailbox can work like a to-do pile (a queue) or like a shared diary (a stream).
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Message | A small piece of data one program sends another | `{"type":"send_receipt","order":42}` |
+| Producer / consumer | The program that sends / the program that handles | Checkout / email worker |
+| Broker | Server that stores messages in between | RabbitMQ, SQS, Kafka |
+| Ack (acknowledge) | Consumer telling the broker "done, you can forget it" | Worker acks after the email is sent |
+| Offset | Position number of a message in a stream | "I have read up to message 1,203" |
+| Fan-out | One message copied to many receivers | `order.placed` to email and analytics |
+| At least once | Every message arrives, but maybe more than once | A receipt email sent twice after a crash |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    subgraph Queue
+      Q["Queue"] --> W1["Worker 1 gets msg A"]
+      Q --> W2["Worker 2 gets msg B"]
+    end
+    subgraph Stream
+      S["Log: A, B, C..."] --> G1["Group 1 reads all"]
+      S --> G2["Group 2 reads all"]
+    end
+```
+
+**Analogy.** A queue is a pile of to-do cards: a worker takes one, does it, throws it away. A stream is a diary that stays; every reader keeps a bookmark.
+Where it breaks: real brokers mix both (SQS with SNS fan-out, Redis Streams with groups), so the line is blurrier than cards vs diary.
+
+**How the rest of this note builds up**
+
+- First, why brokers exist (section 1) and the queue vs log mental model (section 2).
+- Then how queues, pub/sub and logs work (section 3), with a Go worked example (section 4).
+- Then a product comparison (RabbitMQ, SQS, Kafka, Redis, NATS and others) and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production issues, push vs pull, why logs scale reads cheaply (sections 7-8), then interview questions.
+
+> [!tip] Remember
+> Queue: one message, one worker, deleted on ack. Stream: messages stay, every group reads them all at its own pace.
+
 ## 1. Why it exists
 
-A checkout service calls three things after a payment: send a receipt email (≈400 ms at the email provider), update loyalty points (≈80 ms), and notify the warehouse (≈150 ms). Done inline, the user waits about 630 ms more, and if the email provider is down for 5 minutes, every checkout in those 5 minutes fails or hangs. (These latencies are an illustrative estimate.)
+A checkout service calls three things after a payment: send a receipt email (≈400 ms at the email provider), update loyalty points (≈80 ms), and notify the warehouse (≈150 ms).
 
-Put a broker in between and the checkout writes three small messages (a few milliseconds) and returns. The email consumer can be down for 5 minutes; its messages wait in the broker and are sent when it comes back. The broker gives you:
+Done inline, the user waits about 630 ms more, and if the email provider is down for 5 minutes, every checkout in those 5 minutes fails or hangs.
+(These latencies are an illustrative estimate.)
+
+Put a broker in between and the checkout writes three small messages (a few milliseconds) and returns.
+
+The email consumer can be down for 5 minutes; its messages wait in the broker and are sent when it comes back. The broker gives you:
 
 - **Decoupling in time:** producer and consumer do not have to be up at the same moment.
 - **Load levelling:** a burst of 5,000 orders in a minute becomes a backlog that 10 workers drain at their own rate instead of 5,000 concurrent calls.
@@ -428,9 +482,19 @@ What the tests show:
 
 ## 8. Deep dive
 
-**Push vs pull.** RabbitMQ pushes deliveries to a consumer up to its prefetch count; the broker does flow control. Kafka, SQS and JetStream pull consumers ask for batches; the consumer does flow control by not asking. Pull makes batching and backpressure natural; push gives lower latency for small volumes. SQS **long polling** (`WaitTimeSeconds` up to 20) avoids paying for empty responses while still being pull.
+**Push vs pull.** RabbitMQ pushes deliveries to a consumer up to its prefetch count; the broker does flow control.
 
-**Why a log scales reads cheaply.** A queue must track state per message (in flight, receipt, receive count). A log tracks one integer per group per partition. Reading is a sequential scan of a file, which the OS page cache serves well, so adding a fifth consumer group costs almost nothing on the broker. The price is coarse-grained acks: you cannot ack record 7 while record 6 is still being retried, because the offset is a single number.
+Kafka, SQS and JetStream pull consumers ask for batches; the consumer does flow control by not asking.
+
+Pull makes batching and backpressure natural; push gives lower latency for small volumes.
+
+SQS **long polling** (`WaitTimeSeconds` up to 20) avoids paying for empty responses while still being pull.
+
+**Why a log scales reads cheaply.** A queue must track state per message (in flight, receipt, receive count).
+
+A log tracks one integer per group per partition. Reading is a sequential scan of a file, which the OS page cache serves well, so adding a fifth consumer group costs almost nothing on the broker.
+
+The price is coarse-grained acks: you cannot ack record 7 while record 6 is still being retried, because the offset is a single number.
 
 **Queues on top of logs and logs on top of queues.** The line is blurring:
 - Pulsar's Shared subscription and Kafka's share groups (KIP-932: early access in Kafka 4.0, preview in 4.1, production-ready in 4.2) give per-message acks over a log.
@@ -453,7 +517,9 @@ What the tests show:
 > Redis Pub/Sub stores nothing. A message reaches only subscribers connected at that instant; if the worker is restarting, the job is gone. A slow subscriber can also be disconnected when its output buffer exceeds the `client-output-buffer-limit pubsub` setting. Use Redis Streams with consumer groups, or a real queue.
 
 > [!question]- How does fan-out work with SNS and SQS, and why put a queue behind each subscriber?
-> SNS copies each published message to all matching subscriptions. If a subscriber is an SQS queue, its copy is stored durably and consumed at that subscriber's pace with its own retries and DLQ. Pushing straight to an HTTP endpoint gives you only SNS's retry policy; when that is exhausted the message is dropped unless the subscription has its own DLQ.
+> SNS copies each published message to all matching subscriptions.
+> If a subscriber is an SQS queue, its copy is stored durably and consumed at that subscriber's pace with its own retries and DLQ.
+> Pushing straight to an HTTP endpoint gives you only SNS's retry policy; when that is exhausted the message is dropped unless the subscription has its own DLQ.
 
 > [!question]- What does a visibility timeout protect against, and what goes wrong if it is too short?
 > It hides a received message so other consumers do not take it, and it brings the message back if the consumer dies. If it is shorter than processing time, the message reappears while the first worker is still working, and two workers process it in parallel. Set it above p99 runtime and extend it with `ChangeMessageVisibility` for long jobs.
@@ -479,3 +545,8 @@ What the tests show:
 - **Before this:** [[Stacks, Queues and Deques]], [[Monolith vs Microservices]]
 - **Next:** [[Event-Driven Architecture Basics]], [[Background Jobs and Worker Pools]], [[Kafka and Event Streaming]]
 - **Compare with:** [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[AWS SQS, SNS and EventBridge]], [[Case Study - Distributed Message Queue]]
+
+### Watch on YouTube
+
+- [Ep. 11: Message Queues vs Streams Explained in About 14 Minutes](https://www.youtube.com/watch?v=3YI-kSUsH0Y) · Systemic Stack English · 13 min · 312 views
+- [Message Queues vs Event Streams: The Ultimate Architecture Guide](https://www.youtube.com/watch?v=UxsahIgivYM) · Ground Truth — AI News for Engineers · 16 min · 113 views

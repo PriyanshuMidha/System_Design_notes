@@ -11,13 +11,15 @@ sources:
   - "PgBouncer docs, Admin console (SHOW POOLS, SHOW STATS)"
   - "HikariCP wiki, About Pool Sizing; PostgreSQL wiki, Number Of Database Connections"
   - "Google, Site Reliability Engineering (2016), ch. 12 Effective Troubleshooting"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Database Overload and Connection Exhaustion
 
 > [!summary] TL;DR
-> The database is either **doing too much work** (CPU or I/O saturated by slow queries) or **has run out of connection slots** (every connection taken, new ones refused or queued). Both look like timeouts and 5xx from the app. In the first five minutes, confirm, check what changed, then relieve pressure: kill the worst queries and idle-in-transaction sessions, cap or pause the noisy caller, scale reads to replicas, and never "fix" it by adding more connections.
+> The database is either **doing too much work** (CPU or I/O saturated by slow queries) or **has run out of connection slots** (every connection taken, new ones refused or queued).
+>
+> Both look like timeouts and 5xx from the app. In the first five minutes, confirm, check what changed, then relieve pressure: kill the worst queries and idle-in-transaction sessions, cap or pause the noisy caller, scale reads to replicas, and never "fix" it by adding more connections.
 
 > [!abstract] Core idea
 > - **Two different problems with one symptom:** a *busy* database (queries are slow) and a *full* database (no connection slots). The fix for one can worsen the other.
@@ -40,6 +42,57 @@ flowchart LR
 
 Interview one-liner: "First I decide whether it is saturation (slow queries) or exhaustion (no slots), kill the worst offenders, cap demand, and only then fix the query or the pool sizing."
 
+## Start here: the basics
+
+**The problem in one story**
+
+An app talks to one database through a small set of open connections.
+A slow query starts holding connections for seconds instead of milliseconds.
+Soon every connection is busy, new requests wait in line, then time out.
+Users see errors even though the database is still running.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Connection | An open line between the app and the database | One TCP session to PostgreSQL |
+| Connection pool | A reusable set of connections the app shares | Go `sql.DB` with `SetMaxOpenConns(20)` |
+| `max_connections` | The database's hard limit on open connections | PostgreSQL default is 100 |
+| Pooler | A proxy that lets many clients share few database connections | PgBouncer in transaction mode |
+| Lock | A rule that stops two transactions changing the same row at once | `UPDATE` holds a row lock until commit |
+| Saturation | A resource is fully busy and work starts queuing | CPU at 100 percent, queries wait |
+| Slow query | A query that takes much longer than normal | Missing index, full table scan |
+| Query plan | The steps the database chooses to run a query | `EXPLAIN` shows Seq Scan vs Index Scan |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Requests"] --> P["App pool, 20 conns"]
+    P --> DB["Database"]
+    DB --> Q{"Queries fast?"}
+    Q -->|"yes"| OK["Conns return quickly"]
+    Q -->|"no, slow or locked"| W["Pool empty, requests wait"]
+    W --> T["Timeouts and errors"]
+```
+
+**Analogy**
+
+Connection slots are tables in a restaurant, and queries are diners. If diners linger, new guests wait at the door even when the kitchen is idle.
+
+Where it breaks: a restaurant can add chairs cheaply; each database connection costs memory and CPU, so adding more can make things worse.
+
+**How the rest of this note builds up**
+
+- First, **Why it exists** and **Mental model** separate too much work from too many connections.
+- Then **How it works** walks through checks for CPU, locks, slow queries and pool limits.
+- Next, the **Worked example** traces a real-style incident end to end.
+- Then **Variants and comparison**, **Trade-offs** and **In production** cover poolers and sizing.
+- Finally, the SDE-3 **Deep dive** explains per-connection cost and pool sizing math.
+
+> [!tip] Remember
+> Find whether the database is doing too much work or just has too many waiters, then fix that one.
+
 ## 1. Why it exists
 
 **Symptoms.**
@@ -60,7 +113,9 @@ Interview one-liner: "First I decide whether it is saturation (slow queries) or 
 
 ### A restaurant with a fixed number of tables
 
-In plain words: connection slots are tables, queries are diners. If diners linger (slow queries) or sit without ordering (idle in transaction), new customers queue at the door and eventually leave (timeouts). Adding more tables than the kitchen can cook for does not feed anyone faster, because the kitchen (CPU and disk) is the real limit. The analogy breaks where a real kitchen can ignore a diner, while a database must keep serving every open session's locks and memory.
+In plain words: connection slots are tables, queries are diners. If diners linger (slow queries) or sit without ordering (idle in transaction), new customers queue at the door and eventually leave (timeouts).
+
+Adding more tables than the kitchen can cook for does not feed anyone faster, because the kitchen (CPU and disk) is the real limit. The analogy breaks where a real kitchen can ignore a diner, while a database must keep serving every open session's locks and memory.
 
 ```mermaid
 flowchart TD
@@ -189,7 +244,9 @@ FROM pg_stat_activity a
 WHERE cardinality(pg_blocking_pids(a.pid)) > 0;
 ```
 
-Find the root blocker (a pid that blocks others but is not itself blocked) and look at its query and `state`. An `idle in transaction` blocker is a classic: a forgotten transaction pins a row lock and everyone queues behind it. A schema migration doing `ALTER TABLE` waits for a lock, and all new queries queue behind it; see [[Zero-Downtime Schema Migrations]].
+Find the root blocker (a pid that blocks others but is not itself blocked) and look at its query and `state`. An `idle in transaction` blocker is a classic: a forgotten transaction pins a row lock and everyone queues behind it.
+
+A schema migration doing `ALTER TABLE` waits for a lock, and all new queries queue behind it; see [[Zero-Downtime Schema Migrations]].
 
 ### Step E: Which statements cost the most?
 
@@ -419,7 +476,9 @@ Always pass a `context` with a deadline to `QueryContext`, `ExecContext` and `Be
 
 ### Sizing a pool
 
-A common starting rule of thumb, from the PostgreSQL and pooler community, is a pool size in the low tens per database server rather than hundreds, often quoted as about twice the CPU core count plus the number of effective disk spindles (the PostgreSQL wiki and HikariCP pool-sizing guidance). This is a heuristic, not a law: start small, measure throughput and latency under load, and raise only if the database has CPU headroom.
+A common starting rule of thumb, from the PostgreSQL and pooler community, is a pool size in the low tens per database server rather than hundreds, often quoted as about twice the CPU core count plus the number of effective disk spindles (the PostgreSQL wiki and HikariCP pool-sizing guidance).
+
+This is a heuristic, not a law: start small, measure throughput and latency under load, and raise only if the database has CPU headroom.
 
 ### Separate pools for separate workloads (bulkheads)
 
@@ -429,7 +488,9 @@ Give batch jobs, interactive API traffic and admin tools different roles and dif
 
 ### Why too many connections hurts
 
-Each PostgreSQL connection is a separate backend process with its own memory (work memory per sort or hash node, caches, catalog data). Hundreds of active backends mean more context switching, more contention on shared structures, and a bigger lock table. Throughput typically rises with concurrency up to roughly the core count, then flattens, then falls. That is why a pooler that queues excess clients outside the database often *improves* total throughput.
+Each PostgreSQL connection is a separate backend process with its own memory (work memory per sort or hash node, caches, catalog data). Hundreds of active backends mean more context switching, more contention on shared structures, and a bigger lock table.
+
+Throughput typically rises with concurrency up to roughly the core count, then flattens, then falls. That is why a pooler that queues excess clients outside the database often *improves* total throughput.
 
 ### Idle in transaction blocks vacuum
 
@@ -507,3 +568,10 @@ Short-TTL caching of hot read endpoints can cut load by large factors quickly, a
 - Sibling playbooks: [[Playbook - Error Rate Spike (5xx)]], [[Playbook - High Latency]], [[Playbook - Bad Deploy and Rollback]]
 - Resilience: [[Bulkheads and Concurrency Limits]], [[Circuit Breaker]], [[Load Shedding and Graceful Degradation]], [[Timeouts, Retries and Backoff]]
 - Go side: [[Database Access (database-sql, pgx, sqlc)]], [[Observability in Go Services]]
+
+## Links
+
+### Watch on YouTube
+
+- [Database Connection Pool Sizing - Demystified! by Jasmin Fluri](https://www.youtube.com/watch?v=Cp-aFYHLiCw) · Devoxx · 38 min · 4,628 views
+- [Database Connection Pooling: Why It Matters? Essential OS-Level Insights](https://www.youtube.com/watch?v=Vq34xPYZwXg) · Denis Magda · 5 min · 16,899 views

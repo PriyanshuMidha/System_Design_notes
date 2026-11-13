@@ -15,7 +15,7 @@ sources:
   - "redis.io blog, Redis adopts dual source-available licensing (March 2024) and AGPLv3 option in Redis 8 (May 2025)"
   - "Linux Foundation, Valkey project announcement (March 2024)"
   - "Measured on Redis 8.2.1, Apple M4, loopback: redis-benchmark, OBJECT ENCODING, MEMORY USAGE, SLOWLOG"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis Fundamentals
@@ -30,6 +30,52 @@ updated: 2026-11-04
 > - Persistence (RDB snapshots, AOF log) and replication are optional add-ons, so Redis is a great cache and a risky system of record unless you configure durability on purpose.
 > - Classic mistake: one slow command (`KEYS *`, a huge `DEL`, a long Lua script) blocks every other client.
 
+## Start here: the basics
+
+**The problem in one story.**
+A website shows "seats left" for a movie show.
+Thousands of people open that page every second.
+Asking the main database every time is slow and wears it out.
+So you keep the number in one fast shared place in memory that every web server can read and change.
+That shared fast place is Redis.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| RAM | The computer's fast, temporary memory; lost on power off | 16 GB of memory in a server |
+| Server / client | A program that answers requests / a program that sends them | Your Go app (client) asks Redis (server) |
+| Key-value store | Data saved as name → value pairs | `user:42` → `"alice"` |
+| Command | One instruction you send to Redis | `GET user:42`, `INCR views` |
+| Atomic | Happens fully or not at all, with nobody seeing a half-done state | Two `INCR` calls never lose a count |
+| Thread | One line of execution inside a program | Redis runs all commands on one main thread |
+| Round trip (RTT) | Time for a request to go out and the reply to come back | ~0.1 ms on the same data centre network |
+| TTL | "Time to live": how long until a key is auto-deleted | `EXPIRE session:9 3600` = 1 hour |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A1["App server 1"] --> R["Redis<br/>(one thread, data in RAM)"]
+    A2["App server 2"] --> R
+    A3["App server 3"] --> R
+    R -. "on a miss" .-> DB["PostgreSQL<br/>(source of truth)"]
+    R -. "optional save" .-> D["Disk<br/>(RDB / AOF)"]
+```
+
+**Analogy.** Redis is one very fast clerk at a single counter, with labelled boxes behind them. Customers queue, and the clerk serves one request at a time, so no two customers ever grab the same box at once.
+Where it breaks: a real clerk forgets nothing at closing time; Redis loses its boxes on restart unless you turn on saving to disk.
+
+**How the rest of this note builds up**
+
+- First, why Redis exists (section 1) and the clerk mental model with keys and value types (section 2).
+- Then how it works: the event loop, expiry, pipelining, transactions and scripts (section 3), and a worked example with measured numbers (section 4).
+- Then variants (Valkey, Memcached, KeyDB) and the trade-offs of RAM, slow commands and durability (sections 5-6).
+- Finally the SDE-3 deep dive: production failure modes, internal encodings, the precise single-threaded design and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Redis is shared memory with data structures: one thread, all in RAM, every command atomic.
+
 ## 1. Why it exists
 
 A movie-booking site shows "seats left" on every show page. The number lives in PostgreSQL, and a page view runs `SELECT seats_left FROM shows WHERE id = $1`.
@@ -38,7 +84,9 @@ A movie-booking site shows "seats left" on every show page. The number lives in 
 - An indexed primary-key read on a busy database is roughly 0.5–2 ms including the network (an estimate). A Redis `GET` on the same network is roughly 0.1–0.3 ms (an estimate; see the measured numbers in section 4).
 - When a booking happens you also need to *decrement* the counter safely while thousands of people read it.
 
-You could keep the counter in each app server's memory, but then 30 app servers hold 30 different numbers. You need one shared, very fast place that many servers can read and update atomically. That is what Redis gives you: a shared memory that speaks in data structures. The general idea of keeping a copy of data close to the reader is covered in [[Caching Fundamentals]]; this note is about Redis itself.
+You could keep the counter in each app server's memory, but then 30 app servers hold 30 different numbers.
+
+You need one shared, very fast place that many servers can read and update atomically. That is what Redis gives you: a shared memory that speaks in data structures. The general idea of keeping a copy of data close to the reader is covered in [[Caching Fundamentals]]; this note is about Redis itself.
 
 ## 2. Mental model
 
@@ -97,7 +145,8 @@ The catch: on a real network the **round-trip time (RTT)** between app and Redis
 ### 3.3 Keys, types and expiry
 
 - A **key** is a binary-safe string, usually namespaced with colons: `user:42`, `show:42:seats`.
-- A **value** has one type. The main types: string, hash, list, set, sorted set, stream, plus bitmaps and bitfields (operations on strings), HyperLogLog (a probabilistic counter stored as a string), geospatial indexes (stored as a sorted set) and, in Redis 8, JSON and vector sets. Pub/Sub is a messaging feature, not a data type. The full guide is [[Redis Data Structures and When to Use Each]].
+- A **value** has one type. The main types: string, hash, list, set, sorted set, stream, plus bitmaps and bitfields (operations on strings), HyperLogLog (a probabilistic counter stored as a string), geospatial indexes (stored as a sorted set) and, in Redis 8, JSON and vector sets.
+	- Pub/Sub is a messaging feature, not a data type. The full guide is [[Redis Data Structures and When to Use Each]].
 ```mermaid
 flowchart LR
     T(("Redis value types")) --> S["String"] --> S1["cache blob, counter INCR, SET NX lock"]
@@ -381,7 +430,9 @@ Measured on Redis 8.2 with 1,000,000 keys: `KEYS 'key:99999*'` took **53,759 µs
 
 ## 6. Trade-offs and when not to use
 
-- **RAM is the limit and the bill.** Every key, plus per-key overhead, lives in memory. Measured on Redis 8.2: 10,000 users stored as 3 separate string keys each used about 2.2 MB of extra memory; the same data as one small hash per user used about 1.0–1.4 MB (the `INFO memory` delta varies between runs because the keyspace hash table resizes). Design keys with memory in mind.
+- **RAM is the limit and the bill.** Every key, plus per-key overhead, lives in memory. 
+	- Measured on Redis 8.2: 10,000 users stored as 3 separate string keys each used about 2.2 MB of extra memory; the same data as one small hash per user used about 1.0–1.4 MB (the `INFO memory` delta varies between runs because the keyspace hash table resizes).
+	- Design keys with memory in mind.
 - **One slow command blocks everyone.** `KEYS *`, `HGETALL` or `SMEMBERS` on a key with millions of elements, `DEL` of a huge key (use `UNLINK`, which frees memory in a background thread, since 4.0), `FLUSHALL` without `ASYNC`, or a long Lua script all stall every client. Use `SCAN`, `HSCAN`, `SSCAN` and `ZSCAN` to walk large collections.
 - **Big keys.** A single 50 MB value or a set with 10 million members is slow to read, slow to delete, slow to replicate and impossible to split across shards. See [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 - **Durability is not the default you think.** With RDB snapshots only, a crash loses everything since the last snapshot. With AOF `appendfsync everysec` (the AOF default), you can lose about one second. See [[Redis Persistence - RDB and AOF]].
@@ -393,7 +444,9 @@ Measured on Redis 8.2 with 1,000,000 keys: `KEYS 'key:99999*'` took **53,759 µs
 
 ## 7. In production
 
-- **Real systems:** Redis is commonly used as the cache and fast-state layer in front of a relational database (sessions, rate limits, leaderboards, feature flags, job queues). Managed offerings include AWS ElastiCache (Redis OSS and Valkey engines), Google Cloud Memorystore, Azure Cache for Redis, Redis Cloud and Upstash. Setup and client config are in [[Redis Hands-on Setup with Go]]; Go client patterns are in [[Redis in Go]].
+- **Real systems:** Redis is commonly used as the cache and fast-state layer in front of a relational database (sessions, rate limits, leaderboards, feature flags, job queues).
+	- Managed offerings include AWS ElastiCache (Redis OSS and Valkey engines), Google Cloud Memorystore, Azure Cache for Redis, Redis Cloud and Upstash.
+	- Setup and client config are in [[Redis Hands-on Setup with Go]]; Go client patterns are in [[Redis in Go]].
 - **Failure modes and fixes:**
 	- Memory full with the default policy `noeviction` (measured: `maxmemory-policy noeviction` on a fresh Redis 8.2): writes start failing with `OOM command not allowed`. Fix: set `maxmemory` and an eviction policy such as `allkeys-lru` for a pure cache.
 	- Latency spikes from a blocking command: find it with `SLOWLOG GET`, ban `KEYS` with ACLs or `rename-command`.
@@ -417,7 +470,11 @@ Redis picks an internal **encoding** per value and switches it as the value grow
 | `HSET h f1 v1 f2 v2`, small list, small zset | `listpack` | – |
 | hash with 513 fields | `hashtable` | – |
 
-Thresholds come from config (measured defaults on Redis 8.2): `hash-max-listpack-entries 512`, `hash-max-listpack-value 64`, `set-max-intset-entries 512`, `set-max-listpack-entries 128`, `zset-max-listpack-entries 128`, `list-max-listpack-size -2` (8 KB per list node). Conversion is one-way: measured, a hash that grew to 513 fields stayed `hashtable` after one field was deleted. A listpack is scanned linearly, so its operations are O(n), but with n ≤ 128–512 it beats a pointer-heavy hash table on both memory and CPU cache.
+Thresholds come from config (measured defaults on Redis 8.2): `hash-max-listpack-entries 512`, `hash-max-listpack-value 64`, `set-max-intset-entries 512`, `set-max-listpack-entries 128`, `zset-max-listpack-entries 128`, `list-max-listpack-size -2` (8 KB per list node).
+
+Conversion is one-way: measured, a hash that grew to 513 fields stayed `hashtable` after one field was deleted.
+
+A listpack is scanned linearly, so its operations are O(n), but with n ≤ 128–512 it beats a pointer-heavy hash table on both memory and CPU cache.
 
 ### 8.2 The single-threaded design, precisely
 
@@ -475,3 +532,8 @@ To use more CPU cores for commands you run more Redis processes: shards in Redis
 - **Next:** [[Redis Hands-on Setup with Go]], then [[Redis Data Structures and When to Use Each]] and [[Redis Use Cases]]
 - **Go deeper:** [[Redis Persistence - RDB and AOF]], [[Redis Replication, Sentinel and Cluster]], [[Redis in Production - Memory, Latency, Security]]
 - **Compare with:** [[Caching Patterns]], [[Cache Eviction Policies - LRU, LFU, TTL]]
+
+### Watch on YouTube
+
+- [Redis Course - In-Memory Database Tutorial](https://www.youtube.com/watch?v=XCsS_NVAa1g) · freeCodeCamp.org · full-length reputable course covering Redis fundamentals end-to-end
+- [Redis Explained - One Thread, Over a Million Ops a Second](https://www.youtube.com/watch?v=mvhI5ZPgErM) · Pattern Repetition · short deep-dive on why Redis's single-threaded model is fast and atomic

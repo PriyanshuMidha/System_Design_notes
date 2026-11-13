@@ -9,13 +9,17 @@ sources:
   - "Martin Fowler, UML Distilled, 3rd ed. (2003)"
   - "Mermaid docs: classDiagram (relationships, cardinality, annotations, visibility), sequenceDiagram (alt, opt, loop, par), stateDiagram-v2"
   - "Go spec: struct embedding and promoted fields/methods; implicit interface satisfaction"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # UML for LLD
 
 > [!summary] TL;DR
-> **UML** (Unified Modeling Language) is a standard notation for drawing software designs. In an LLD interview you need only three of its diagrams: a **class diagram** (what exists and how it connects), a **sequence diagram** (who calls whom for the hardest flow, including failures) and a **state diagram** (which status changes are legal). Each maps directly to Go: structs and interfaces, method calls, and transition methods that return an error for illegal moves.
+> **UML** (Unified Modeling Language) is a standard notation for drawing software designs.
+>
+> In an LLD interview you need only three of its diagrams: a **class diagram** (what exists and how it connects), a **sequence diagram** (who calls whom for the hardest flow, including failures) and a **state diagram** (which status changes are legal).
+>
+> Each maps directly to Go: structs and interfaces, method calls, and transition methods that return an error for illegal moves.
 
 > [!abstract] Core idea
 > - Draw three diagrams, in this order: class, sequence for the hardest flow, state for anything with a status field.
@@ -24,9 +28,54 @@ updated: 2026-11-04
 > - Go has no inheritance arrow: draw interface realization (dotted) for "implements" and a plain association labelled "embeds" for embedding.
 > - Time-box it: about 5 minutes of diagrams in a 45-minute round, then code.
 
+## Start here: the basics
+
+**The problem in one story.**
+You start coding a movie-booking system straight away.
+At minute 30 you realise a seat belongs to a screen, two people can hold the same seat, and a cancelled booking can still be confirmed.
+Five minutes of simple drawings at the start would have shown all three.
+UML is the shared drawing language for that.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Class / struct | A type with fields and methods | `Booking` with `ID`, `Status` |
+| Interface | A set of methods a type promises to have | `PaymentGateway` with `Charge` |
+| Relationship | A line saying how two types are connected | A `Theater` has `Screen`s |
+| Multiplicity | How many objects sit on each end of a line | `1` theater to `*` screens |
+| Sequence | The order in which objects call each other | Service → Repo → Payment |
+| State | The current status of an object | `Held`, `Confirmed`, `Expired` |
+| Transition | A legal move from one state to another | `Held` → `Confirmed` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Requirements"] --> C["Class diagram:<br/>what exists"]
+    C --> SQ["Sequence diagram:<br/>who calls whom"]
+    SQ --> ST["State diagram:<br/>legal status changes"]
+    ST --> G["Go code:<br/>structs, methods, transitions"]
+```
+
+**Analogy.** A building's floor plan (class), wiring diagram (sequence) and lift panel (state).
+Where it breaks: a building is built once from the plan; your diagrams are rough sketches you redraw as the interview conversation changes.
+
+**How the rest of this note builds up**
+
+- First, why diagrams save time (section 1) and the building mental model (section 2).
+- Then the notation: which diagram answers which question, the six relationships in Go, embedding vs. realization, `alt`/`opt`/`loop`/`par`, guards and timeouts (section 3).
+- Then a booking example from whiteboard to tested Go code and files (section 4).
+- Finally the SDE-3 view: variants, when to skip diagrams, and deep-dive notation details like navigability (sections 5-8).
+
+> [!tip] Remember
+> Class, sequence, state: three quick sketches, each turning directly into Go.
+
 ## 1. Why it exists
 
-In a 45-minute LLD round on movie booking, a candidate who jumps straight into code usually discovers at minute 30 that `Seat` needs to know its `Screen`, that two users can hold the same seat, and that a `Booking` can be cancelled after it expired. Fixing that means rewriting half the structs with 15 minutes left.
+In a 45-minute LLD round on movie booking, a candidate who jumps straight into code usually discovers at minute 30 that `Seat` needs to know its `Screen`, that two users can hold the same seat, and that a `Booking` can be cancelled after it expired.
+
+Fixing that means rewriting half the structs with 15 minutes left.
 
 Five minutes of diagrams expose those questions early and cheaply:
 
@@ -38,7 +87,9 @@ The interviewer also gets a shared picture to argue about, which is cheaper than
 
 ## 2. Mental model
 
-UML is a building's floor plan, wiring diagram and lift-status panel. The floor plan (class diagram) shows rooms and doors, the wiring diagram (sequence) shows what happens when you flip one switch, and the lift panel (state) shows which floors it may go to next. An architect does not draw every brick, and you do not draw every getter.
+UML is a building's floor plan, wiring diagram and lift-status panel. The floor plan (class diagram) shows rooms and doors, the wiring diagram (sequence) shows what happens when you flip one switch, and the lift panel (state) shows which floors it may go to next.
+
+An architect does not draw every brick, and you do not draw every getter.
 
 Terms used below:
 
@@ -88,7 +139,11 @@ A class box has three parts: name, fields, methods. Stereotypes in `<<...>>` mar
 | Realization | Implements an interface | `I <\|.. C` | Implicit: C has I's methods; pin it with `var _ I = C{}` |
 | Dependency | Uses briefly | `A ..> B` | B is a method parameter or a local variable, not a field |
 
-**The lifecycle-ownership rule.** In Go, `[]Seat` versus `[]*Seat` does not decide composition versus aggregation. A `[]*Seat` can be composition (the screen created those seats and never hands the pointers out) and a `[]Seat` of copies can be aggregation-like (the values were copied from a catalogue that owns the originals). Ask two questions instead: *who creates the part?* and *does the part outlive the whole?* If the whole creates it and it dies with the whole, draw composition.
+**The lifecycle-ownership rule.** In Go, `[]Seat` versus `[]*Seat` does not decide composition versus aggregation.
+
+A `[]*Seat` can be composition (the screen created those seats and never hands the pointers out) and a `[]Seat` of copies can be aggregation-like (the values were copied from a catalogue that owns the originals).
+
+Ask two questions instead: *who creates the part?* and *does the part outlive the whole?* If the whole creates it and it dies with the whole, draw composition.
 
 Examples from movie booking:
 
@@ -176,7 +231,9 @@ classDiagram
     PricingStrategy <|.. WeekendPricing : satisfies implicitly
 ```
 
-- **Embedding** is composition with promotion: `b.Age(now)` is shorthand for `b.Audit.Age(now)`. A `*Booking` cannot be passed where an `Audit` is expected, and a method on `Audit` cannot call a `Booking` method, so there is no virtual dispatch. Promotion does put `Audit`'s methods in `Booking`'s method set, so a `Booking` satisfies any interface that `Audit` satisfies; that is interface satisfaction, not an is-a relationship between the structs. Draw it as composition labelled "embeds", never as inheritance. Mechanics are in [[Structs, Methods and Embedding]].
+- **Embedding** is composition with promotion: `b.Age(now)` is shorthand for `b.Audit.Age(now)`. A `*Booking` cannot be passed where an `Audit` is expected, and a method on `Audit` cannot call a `Booking` method, so there is no virtual dispatch.
+
+  Promotion does put `Audit`'s methods in `Booking`'s method set, so a `Booking` satisfies any interface that `Audit` satisfies; that is interface satisfaction, not an is-a relationship between the structs. Draw it as composition labelled "embeds", never as inheritance. Mechanics are in [[Structs, Methods and Embedding]].
 - **Realization** is the only "is-a" in Go: any type with the right methods satisfies the interface. See [[Interfaces]].
 
 ### Sequence diagrams: alt, opt, loop, par
@@ -589,7 +646,11 @@ If subclasses differ only in data (a car spot versus a bike spot), do not draw i
 
 ## 8. Deep dive
 
-**Navigability and direction.** An arrowhead on an association means "A can reach B" (A has a field for B). Two-way arrows mean both hold references, which in Go means two places to keep consistent and a possible cycle for the garbage collector to handle (it copes) and for `encoding/json`, which returns an "encountered a cycle" error instead of encoding the value. Prefer one direction plus a lookup by ID.
+**Navigability and direction.** An arrowhead on an association means "A can reach B" (A has a field for B).
+
+Two-way arrows mean both hold references, which in Go means two places to keep consistent and a possible cycle for the garbage collector to handle (it copes) and for `encoding/json`, which returns an "encountered a cycle" error instead of encoding the value.
+
+Prefer one direction plus a lookup by ID.
 
 **Qualified associations.** "A Screen has many Seats, looked up by seat ID" is a qualified association; in Go it is `map[string]Seat`. Draw it as composition with multiplicity and mention the key.
 
@@ -643,3 +704,8 @@ If subclasses differ only in data (a car spot versus a bike spot), do not draw i
 - **Before this:** [[OOP in Go - Structs, Interfaces, Embedding]], [[SOLID in Go]]
 - **Next:** [[Design Patterns Overview and Chooser]], [[LLD Interview Method]]
 - **Compare with:** [[State Machines in Go]], [[Movie Ticket Booking]], [[Parking Lot]]
+
+### Watch on YouTube
+
+- [Basics of LLD / UML Diagram in detail / Association Vs Aggregation Vs Composition / VERY imp!!](https://www.youtube.com/watch?v=j84w5VM9GT8) · Keerti Purswani · 28 min · 158,613 views
+- [UML Class Diagram for Beginners / Must-Know LLD Concepts / Basics of low level design with Notes](https://www.youtube.com/watch?v=VDdxfgZVOSQ) · Mrunmai Dahare · 6 min · 2,176 views

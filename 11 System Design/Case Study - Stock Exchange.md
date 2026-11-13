@@ -12,7 +12,7 @@ sources:
   - "SEC, Rule 15c6-1 amendment: US securities settlement moved from T+2 to T+1 on 28 May 2024"
   - "ESMA, MiFID II RTS 25: clock synchronisation to UTC (100 microsecond divergence for high-frequency algorithmic trading)"
   - "Real Logic, Aeron: efficient reliable UDP unicast, multicast and IPC message transport (open source, widely used in trading systems)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Stock Exchange
@@ -27,9 +27,55 @@ updated: 2026-11-09
 > - High availability comes from **hot-warm replicas** that replay the same sequenced log, not from locks or distributed transactions in the hot path.
 > - Everything else (market data, clearing, reporting, risk dashboards) is downstream and can be eventually consistent.
 
+## Start here: the basics
+
+**The problem in one story.**
+You want to buy 10 shares at ₹100; someone else wants to sell 10 at ₹100.
+The exchange must match you two fairly.
+If two buyers offer the same price, whoever came first must win, every time.
+And nobody may ever lose a trade because a server crashed.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Order | A request to buy or sell at a price | BUY 10 @ ₹100 |
+| Bid / ask | A buy offer / a sell offer | Bid ₹99, ask ₹101 |
+| Order book | All waiting orders for one stock, sorted by price | Best bid at the top |
+| Matching | Pairing a buyer and seller whose prices cross | BUY @101 meets SELL @100 |
+| Sequence number | A counter stamped on each event to fix its order | Order #1001 came before #1002 |
+| Log | An append-only list of events kept on disk | Every order, in order |
+| Deterministic | Same input always gives the same output | Replay the log, get the same trades |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Traders send orders"] --> G["Gateway +<br/>risk checks"]
+    G --> S["Sequencer:<br/>stamp #1, #2, #3"]
+    S --> LOG["Replicated log"]
+    LOG --> M["Matching engine<br/>(one thread per stock)"]
+    M --> T["Trades + market data"]
+```
+
+**Analogy.** One strict clerk per stock who numbers every order in a ledger and matches them one at a time.
+Where it breaks: a human clerk takes seconds; the real engine handles each order in microseconds and must be replayable exactly.
+
+**How the rest of this note builds up**
+
+- First, why exchanges exist and their requirements (section 1), then the clerk mental model (section 2).
+- Then the high-level design and estimates (section 3).
+- Then API, data model and a matching trace through the order book (section 4).
+- Finally the SDE-3 deep dive: sequencer and log, determinism, failover and fairness, pre-trade risk, scaling and failures (sections 5-8).
+
+> [!tip] Remember
+> Put every order in one numbered log, and let a single-threaded engine replay it in order.
+
 ## 1. Why it exists - requirements
 
-Picture a vegetable market with one rule: the highest buyer and the lowest seller deal first, and if two people offer the same price, whoever shouted first wins. Now make it electronic, with millions of shouts a day, where being 50 microseconds late can cost money and nobody may ever argue about who was first. A stock exchange exists to be that fair referee, at machine speed.
+Picture a vegetable market with one rule: the highest buyer and the lowest seller deal first, and if two people offer the same price, whoever shouted first wins. Now make it electronic, with millions of shouts a day, where being 50 microseconds late can cost money and nobody may ever argue about who was first.
+
+A stock exchange exists to be that fair referee, at machine speed.
 
 **Functional requirements**
 - Place an order: **limit** (buy at most X, sell at least X), **market** (any price), and time-in-force variants such as **IOC** (immediate-or-cancel) and **FOK** (fill-or-kill). Stop orders are optional.
@@ -54,7 +100,9 @@ Picture a vegetable market with one rule: the highest buyer and the lowest selle
 
 ## 2. Mental model
 
-Think of an old trading pit with a very strict clerk standing at each stock's window. All orders for that stock go through that one clerk, who writes them in a numbered ledger (1, 2, 3, ...) and then matches them one at a time. Nobody else touches the book. If the clerk faints, a second clerk who has been copying the same numbered ledger line by line picks up at the next number.
+Think of an old trading pit with a very strict clerk standing at each stock's window. All orders for that stock go through that one clerk, who writes them in a numbered ledger (1, 2, 3, ...) and then matches them one at a time.
+
+Nobody else touches the book. If the clerk faints, a second clerk who has been copying the same numbered ledger line by line picks up at the next number.
 
 Mapped to the system:
 - **The numbered ledger** is the sequenced event log written by the sequencer.
@@ -414,7 +462,9 @@ stateDiagram-v2
 
 Sell-side orders need shares; buy-side orders need cash. The check must be fast but it must also be consistent with what the participant already has outstanding. Two common designs:
 
-1. **Reserve at the gateway.** A risk service in front of the sequencer keeps a per-participant in-memory view of cash and positions, applies each order against it (reduce available cash by qty × price), and rejects if negative. It is updated by the same outbound events (fills) so it converges. Because it is before the log, a rejection costs nothing downstream.
+1. **Reserve at the gateway.** A risk service in front of the sequencer keeps a per-participant in-memory view of cash and positions, applies each order against it (reduce available cash by qty × price), and rejects if negative.
+
+It is updated by the same outbound events (fills) so it converges. Because it is before the log, a rejection costs nothing downstream.
 2. **Reserve inside the engine.** Slower and couples risk to matching; rarely used for the hot path.
 
 The authoritative cash and share balances live in a ledger outside the hot path (see [[Case Study - Digital Wallet and Ledger]] and [[Case Study - Payment System]]). Fills become ledger postings through clearing, with exactly-once effect via event ids and an outbox.
@@ -503,3 +553,8 @@ flowchart TD
 - **Next:** [[Case Study - Digital Wallet and Ledger]], [[Case Study - Payment System]], [[Consensus - Raft and Paxos]]
 - **Compare with:** [[Order Book Matching Engine]] (the LLD version in Go), [[Case Study - Ticket Booking]] (inventory under contention), [[Case Study - Distributed Message Queue]]
 - **Decision guides:** [[Choosing a Database - Decision Guide]], [[Choosing Consistency, Replication and Partitioning - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing an API and Communication Style - Decision Guide]], [[Choosing Compute, Scaling and Deployment - Decision Guide]]
+
+### Watch on YouTube
+
+- [27: High Throughput Stock Exchange / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=dGYfpO3WJ1o) · Jordan has no life · 20 min · 51,032 views
+- [Low Latency Stock Exchange Design Deep Dive with Google SWE! / Systems Design Interview Question 15](https://www.youtube.com/watch?v=erusCJu6CQY) · Jordan has no life · 22 min · 40,211 views

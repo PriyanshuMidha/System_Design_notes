@@ -9,7 +9,7 @@ sources:
   - "Go standard library docs: net/http (Handler, HandlerFunc, ResponseWriter, Flusher, Hijacker, ResponseController and Unwrap since Go 1.20, ErrAbortHandler, RoundTripper), net/http/httptest (NewRecorder, NewServer), io (LimitReader, TeeReader, MultiWriter), bufio, compress/gzip, context (WithValue)"
   - "OpenTelemetry Go contrib docs: otelhttp.NewHandler and otelhttp.NewTransport"
   - "chi docs: middleware.Logger should come before middleware.Recoverer"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Decorator and Middleware
@@ -23,9 +23,56 @@ updated: 2026-11-02
 > - The rule that matters: order is outside-in on the way in and inside-out on the way back, so `Logging(Auth(h))` runs Logging first.
 > - Classic mistake: putting business rules in middleware, or logging before the status code is known.
 
+## Start here: the basics
+
+**The problem in one story.**
+Every request to your API must be logged, checked for login and protected from crashes.
+Copying that code into 30 handlers means 30 places to forget something.
+Instead you wrap each handler in layers that add one job each.
+The handler itself stays focused on business logic.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Interface | A list of methods a type promises to have | `http.Handler` has `ServeHTTP` |
+| Handler | Code that answers one HTTP request | `func(w, r)` that returns an order |
+| Wrap | Put one thing around another with the same shape | `Logging(h)` |
+| Middleware | A wrapper of type `func(http.Handler) http.Handler` | auth, logging, recover |
+| Cross-cutting concern | A job every handler needs, not tied to one feature | request IDs |
+| Panic | A Go crash that unwinds the goroutine | nil pointer access |
+| Context | Go value that carries request data and cancel signals | user ID set by auth |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Req["Request"] --> L["Logging"]
+    L --> A["Auth"]
+    A --> H["Handler"]
+    H -. "response goes back out" .-> A
+    A -.-> L
+    L -.-> Resp["Response"]
+```
+
+**Analogy.** Gift wrapping: paper, then a box, then more paper; each layer still looks like "a parcel".
+Where it breaks: a parcel layer cannot read what is inside, but a middleware sees the response on the way back (status, latency).
+
+**How the rest of this note builds up**
+
+- First, why inline cross-cutting code drifts and the mental model (sections 1-2).
+- Then how decorators wrap handlers, writers and clients, with a full Go example (sections 3-4).
+- Then variants, comparisons with Proxy and Adapter, and trade-offs (sections 5-6).
+- Finally the SDE-3 view: middleware order in production, the deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Same interface outside, extra work inside; layers run outside-in on the way in and inside-out on the way back.
+
 ## 1. Why it exists
 
-An order API has 30 handlers. Each one needs panic recovery, a request ID, an access log line with status and latency, an auth check and a rate limit. Written inline, that is 5 concerns × 30 handlers = 150 copies of cross-cutting code, and each copy can drift: one handler forgets the auth check, another logs before the status is known.
+An order API has 30 handlers. Each one needs panic recovery, a request ID, an access log line with status and latency, an auth check and a rate limit.
+
+Written inline, that is 5 concerns × 30 handlers = 150 copies of cross-cutting code, and each copy can drift: one handler forgets the auth check, another logs before the status is known.
 
 Decorators move each concern into one wrapper that has the same interface as what it wraps. A handler stays a handler, so wrappers stack in any combination: `Chain(createOrder, Recover, RequestID, Logging, Auth, RateLimit)`. Adding a concern edits one line of wiring, not 30 handlers.
 
@@ -37,7 +84,11 @@ Three things to get right, all shown below:
 
 ## 2. Mental model
 
-Gift wrapping. The gift (the handler) is wrapped in paper (logging), then a box (auth), then more paper (recover). Each layer has the same outside shape, "a parcel", so you can add or remove layers without the gift knowing. Opening the parcel goes from the outside in; the layers you pass on the way in are passed again on the way out, in reverse order. That return trip is where an outer layer sees what an inner layer did, such as the status code the handler wrote.
+Gift wrapping. The gift (the handler) is wrapped in paper (logging), then a box (auth), then more paper (recover). Each layer has the same outside shape, "a parcel", so you can add or remove layers without the gift knowing.
+
+Opening the parcel goes from the outside in; the layers you pass on the way in are passed again on the way out, in reverse order.
+
+That return trip is where an outer layer sees what an inner layer did, such as the status code the handler wrote.
 
 ## 3. How it works
 
@@ -169,7 +220,11 @@ func main() {
 
 ## 4. Worked example
 
-One `package main` with `Logging` and `Auth` middleware (Logging captures status and bytes; Auth passes the user in the context), plus `Recover`, `RequestID`, `RateLimit`, a `Chain` helper, an `io.Writer` decorator, two `http.RoundTripper` decorators and an embedded repository decorator. `main` drives the handler chain with `httptest.NewRecorder`, so nothing listens on a port and the program ends. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with `Logging` and `Auth` middleware (Logging captures status and bytes; Auth passes the user in the context), plus `Recover`, `RequestID`, `RateLimit`, a `Chain` helper, an `io.Writer` decorator, two `http.RoundTripper` decorators and an embedded repository decorator.
+
+`main` drives the handler chain with `httptest.NewRecorder`, so nothing listens on a port and the program ends.
+
+Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
 ```go
 package main
@@ -860,3 +915,7 @@ Both are valid; choose one and test it.
 - **Before this:** [[Interfaces]], [[Context Package]], [[Adapter]]
 - **Next:** [[Proxy]]
 - **Compare with:** [[Middleware]], [[Chain of Responsibility and Pipelines]], [[Proxy]], [[Rate Limiting - Algorithms and Distributed Design]]
+
+### Watch on YouTube
+
+- [Django Middleware vs Decorator / Which One Should You Use? / Django mostly asked interview questions](https://www.youtube.com/watch?v=MWJfFd9hq-0) · Code With Hafiz Ammad · 9 min · 39 views

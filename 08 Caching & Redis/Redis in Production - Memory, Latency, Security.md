@@ -11,13 +11,17 @@ sources:
   - "redis.conf shipped with Redis 8.2 (maxmemory, maxclients, client-output-buffer-limit, enable-protected-configs, lazyfree-*, io-threads)"
   - "Redis security advisory for CVE-2025-49844 (Lua use-after-free, fixed in 8.2.2 and backports, October 2025)"
   - "AWS ElastiCache docs: reserved memory, encryption, RBAC"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis in Production - Memory, Latency, Security
 
 > [!summary] TL;DR
-> Running Redis well means three things. **Memory**: set `maxmemory` and an eviction policy, leave headroom for forks and buffers, and watch fragmentation and big keys. **Latency**: one main thread runs every command, so one slow command (`KEYS`, a big `DEL`, a long Lua script) delays everyone; find them with `SLOWLOG` and `LATENCY`. **Security**: never expose port 6379, require ACL users and TLS, block dangerous commands, and patch.
+> Running Redis well means three things.
+>
+> - **Memory**: set `maxmemory` and an eviction policy, leave headroom for forks and buffers, and watch fragmentation and big keys.
+> - **Latency**: one main thread runs every command, so one slow command (`KEYS`, a big `DEL`, a long Lua script) delays everyone; find them with `SLOWLOG` and `LATENCY`.
+> - **Security**: never expose port 6379, require ACL users and TLS, block dangerous commands, and patch.
 
 > [!abstract] Core idea
 > - Redis memory = your data + per-key overhead + buffers + fragmentation. Without `maxmemory`, it grows until the OS kills it.
@@ -25,6 +29,52 @@ updated: 2026-11-04
 > - Latency in Redis is mostly "who blocked the main thread?": slow commands, forks, swap, fsync, or the network.
 > - Security is network isolation first (private subnet, no public IP), then ACL users with least privilege, then TLS.
 > - Classic mistake: running `KEYS *` or `MONITOR` on a busy production server.
+
+## Start here: the basics
+
+**The problem in one story.**
+Redis ran fine in testing, so it went to production.
+Then it ran out of memory and was killed, one cleanup job froze every request for a third of a second, and a test copy was found open on the internet.
+None of these are bugs in your code; they are settings and habits.
+This note is about running Redis safely once real traffic hits it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| `maxmemory` | The RAM limit you give Redis | `maxmemory 6gb` on an 8 GB VM |
+| Eviction policy | Which keys Redis throws out when full | `allkeys-lru` drops least recently used |
+| OOM killer | The Linux part that kills a process when RAM runs out | Redis killed during a snapshot |
+| Latency / p99 | Time per request / the time 99% of requests beat | p99 = 2 ms |
+| Fragmentation | Free memory scattered in small unusable gaps | Process uses 10 GB to hold 7 GB of data |
+| Big key | One key holding a huge value or millions of members | A hash with 2 million fields |
+| ACL | Per-user rules for allowed commands and keys | App user cannot run `CONFIG` |
+| TLS | Encryption for network traffic | `rediss://` URL instead of `redis://` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Production Redis"] --> M["Memory<br/>maxmemory + policy + headroom"]
+    R --> L["Latency<br/>no slow commands on the main thread"]
+    R --> S["Security<br/>private network + ACL + TLS"]
+    M --> W["Watch: INFO, SLOWLOG, LATENCY"]
+    L --> W
+    S --> W
+```
+
+**Analogy.** Running Redis is like running a single-lane toll booth: limit how many cars fit in the lot (memory), never let one car stop to chat for minutes (slow commands), and lock the gate to outsiders (security).
+Where it breaks: a toll booth cannot throw cars out of a full lot, but Redis can evict keys automatically if you choose a policy.
+
+**How the rest of this note builds up**
+
+- First, the week of incidents that motivates all this (section 1) and the memory / latency / security mental model (section 2).
+- Then how memory accounting, eviction, latency sources and security controls work (section 3).
+- Then a worked example with measurements and a Go big-key scanner (section 4).
+- Finally alternatives, trade-offs, the production checklist and the SDE-3 deep dive, plus interview questions (sections 5-9).
+
+> [!tip] Remember
+> Production Redis = cap memory on purpose, keep the main thread free, and keep the port private.
 
 ## 1. Why it exists
 
@@ -68,7 +118,9 @@ flowchart TB
 - **Set `maxmemory`.** Default is 0 (no limit) on a self-managed server, measured on Redis 8.2. Leave room below the machine's RAM for fork copy-on-write, client buffers and fragmentation: a common rule is `maxmemory` at about 60-75% of RAM when persistence or replication forks (an estimate; ElastiCache reserves 25% by default).
 - **Pick a policy.** The default `maxmemory-policy` is `noeviction` (measured on Redis 8.2): writes fail when full. That is right for queues and data you cannot lose; for a cache use `allkeys-lru` or `allkeys-lfu`. How Redis samples keys for LRU/LFU is in [[Cache Eviction Policies - LRU, LFU, TTL]].
 - **Per-key overhead.** Every key costs a dictionary entry, a key header and possibly an expiry entry. Measured on Redis 8.2: 1,000,000 string keys with 100-byte values used 151.6 MB, about 159 bytes per key, and `MEMORY USAGE` reported 128 bytes for a single key.
-- **Compact encodings.** A hash with up to 512 fields of up to 64 bytes each (`hash-max-listpack-entries 512`, `hash-max-listpack-value 64`, measured defaults) is stored as a listpack. Measured on Redis 8.2: 512 fields used 6,160 bytes as a listpack and 36,992 bytes after the 513th field converted it to a hash table. Grouping many tiny keys into small hashes (`user:{id/1000}` with field `id%1000`) can save a lot of memory.
+- **Compact encodings.** A hash with up to 512 fields of up to 64 bytes each (`hash-max-listpack-entries 512`, `hash-max-listpack-value 64`, measured defaults) is stored as a listpack.
+	- Measured on Redis 8.2: 512 fields used 6,160 bytes as a listpack and 36,992 bytes after the 513th field converted it to a hash table.
+	- Grouping many tiny keys into small hashes (`user:{id/1000}` with field `id%1000`) can save a lot of memory.
 - **Fragmentation.** After many deletes, the allocator holds freed memory in partly used pages. On Linux builds with jemalloc, `activedefrag yes` moves values to compact memory while running. (The macOS build measured here uses the libc allocator, `mem_allocator:libc`, where active defrag is unavailable.)
 - **Client buffers.** Each client has an output buffer. Defaults measured on Redis 8.2: `normal 0 0 0` (no limit), `replica 256mb 64mb 60`, `pubsub 32mb 8mb 60`. A slow Pub/Sub subscriber or a client running `HGETALL` on a huge hash can grow its buffer without bound if its class has no limit.
 
@@ -165,7 +217,11 @@ OK
 
 ### Go: find the biggest keys without blocking Redis
 
-`redis-cli --bigkeys` and `--memkeys` exist, but a scheduled job that reports the top keys by memory to your metrics is more useful. This scanner uses `SCAN` in batches, measures each key with `MEMORY USAGE`, keeps a top-N heap, and pauses between batches. It compiles, passes `go vet`, and its tests pass with `go test -race` on Go 1.24 with go-redis v9.7.0.
+`redis-cli --bigkeys` and `--memkeys` exist, but a scheduled job that reports the top keys by memory to your metrics is more useful.
+
+This scanner uses `SCAN` in batches, measures each key with `MEMORY USAGE`, keeps a top-N heap, and pauses between batches.
+
+It compiles, passes `go vet`, and its tests pass with `go test -race` on Go 1.24 with go-redis v9.7.0.
 
 ```go
 // Package bigkeys finds the largest keys with SCAN + MEMORY USAGE,
@@ -478,3 +534,8 @@ The scan took 75 seconds because it makes one round trip per key (about 68 µs e
 - **Before this:** [[Redis Fundamentals]], [[Redis Persistence - RDB and AOF]], [[Redis Replication, Sentinel and Cluster]]
 - **Next:** [[Redis in Go]], [[Metrics and Prometheus]]
 - **Compare with:** [[Cache Eviction Policies - LRU, LFU, TTL]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]], [[Latency, Percentiles and Bottleneck Analysis]], [[Secrets Management]], [[TLS and HTTPS]]
+
+### Watch on YouTube
+
+- [How Redis Caps Its Memory Usage / Redis Internals](https://www.youtube.com/watch?v=xNfoeZuK3Mc) · Arpit Bhayani · 13 min · 2,584 views
+- [Why Every System Uses Redis: In-Memory Architecture Explained](https://www.youtube.com/watch?v=qq-tLyedJsI) · SimplyExplained · 10 min · 1 views

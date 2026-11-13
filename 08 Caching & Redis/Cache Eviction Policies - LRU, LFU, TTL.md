@@ -12,7 +12,7 @@ sources:
   - "Einziger, Friedman & Manes, TinyLFU: A Highly Efficient Cache Admission Policy (ACM TOS 2017)"
   - "Shah, Mitra & Matani, An O(1) algorithm for implementing the LFU cache eviction scheme (2010)"
   - "Go standard library docs, container/list and sync.Map"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Cache Eviction Policies - LRU, LFU, TTL
@@ -26,6 +26,51 @@ updated: 2026-11-04
 > - LFU keeps frequently used items through scans, but needs ageing so yesterday's hot items do not stay forever.
 > - Redis does not run exact LRU or LFU. It samples a few keys and evicts the best candidate, and its default policy is `noeviction`, which makes writes fail when memory is full.
 > - Modern libraries (Caffeine, Ristretto) use TinyLFU admission to get better hit ratios than LRU.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your phone's photo gallery keeps thumbnails in a small fast area.
+When that area is full and a new photo arrives, one old thumbnail must go.
+Throw out the wrong one and you rebuild it a second later.
+An eviction policy is the rule that picks which one to throw out.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cache capacity | How much the cache may hold | 3 items, or `maxmemory 100mb` |
+| Evict | Remove an item to make room | Drop `B` to fit `D` |
+| Recency | How recently an item was used | `A` read 1 s ago is recent |
+| Frequency | How often an item was used | `A` read 50 times |
+| Hash map | Lookup table: key → value in O(1) | Go `map[string]*node` |
+| Doubly linked list | Chain where each item links to next and previous | Move a node to the front in O(1) |
+| O(1) | Takes the same time no matter how big | Map lookup |
+| TTL | Expiry time for one item | `EX 60` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    N["New item arrives"] --> F{"Cache full?"}
+    F -- "no" --> S["Store it"]
+    F -- "yes" --> P["Policy picks a victim<br/>(LRU / LFU / FIFO)"]
+    P --> E["Evict victim"]
+    E --> S
+```
+
+**Analogy.** A small bookshelf: LRU removes the book you have not touched longest; LFU removes the book you open least often.
+Where it breaks: you know your own reading habits; a cache only sees past accesses and must guess the future.
+
+**How the rest of this note builds up**
+
+- First, why eviction exists and how it differs from invalidation (sections 1-2).
+- Then how LRU (map + linked list) and O(1) LFU work, other policies, and TTL expiry vs eviction (section 3).
+- Then full Go code for FIFO, LRU and LFU with tests and a measured comparison (section 4).
+- Finally the SDE-3 deep dive: how Redis approximates LRU/LFU by sampling, `maxmemory-policy`, and TinyLFU (sections 3, 5-8).
+
+> [!tip] Remember
+> Eviction = memory full, invalidation = data changed; LRU is map + doubly linked list with O(1) get and put.
 
 ## 1. Why it exists
 
@@ -563,3 +608,9 @@ The counter is logarithmic and probabilistic, so it distinguishes "hot" from "ve
 - **Before this:** [[Caching Fundamentals]], [[Hash Tables and Go Maps]]
 - **Next:** [[LRU Cache with TTL]] (practice), [[Redis in Production - Memory, Latency, Security]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]
 - **Compare with:** [[Cache Invalidation, TTL and Consistency]], [[Memory Hierarchy and CPU Caches]] (hardware eviction), [[Page Cache, File Systems and fsync]]
+
+### Watch on YouTube
+
+- [LRU Eviction Explained / Caching Fundamentals](https://www.youtube.com/watch?v=i5WMim1zc8o) · TheCodeAlchemist · focused explainer on LRU eviction mechanics
+- [LFU Eviction Explained / Caching Fundamentals](https://www.youtube.com/watch?v=FZnd0Y8EBik) · TheCodeAlchemist · companion video on LFU eviction mechanics, pairs with the LRU one
+- [Ep. 21: Cache Eviction Explained in Detail](https://www.youtube.com/watch?v=vAqFJp_eaGI) · Systemic Stack English · broader detailed overview of eviction policies in general

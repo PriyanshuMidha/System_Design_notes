@@ -14,7 +14,7 @@ sources:
   - "ZooKeeper Recipes and Solutions, Leader Election (ephemeral sequential znodes)"
   - "Consul docs, Sessions and Leader Election (lock-delay default 15 s)"
   - "PostgreSQL 17 docs, Advisory Lock Functions"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Leader Election
@@ -28,6 +28,52 @@ updated: 2026-11-04
 > - The leader stops acting before its lease can expire (renew deadline < lease TTL), and everyone else waits for full expiry.
 > - Even so, a paused old leader can wake up and act: protect writes with an **epoch** (fencing) number.
 > - Classic mistake: "the node with the lowest IP is leader", decided by each node from its own view of who is alive. That creates two leaders during a partition.
+
+## Start here: the basics
+
+**The problem in one story.**
+You run three copies of a billing service so one crash does not stop it.
+But the "charge everyone at 2 a.m." job must run only once.
+If all three run it, each customer pays three times.
+Leader election lets the copies agree that exactly one of them does the job, and another takes over if it dies.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Instance / replica | One running copy of the same program | 3 pods of `billing-svc` |
+| Leader | The one copy allowed to do the special job | The pod that runs the cron |
+| Lease | A "you are leader until time T" record that must be renewed | Kubernetes `Lease` object, 15 s |
+| TTL | How long something stays valid without renewal | Lease expires 15 s after last renew |
+| Consistent store | A database that never shows two different answers to the same question | etcd, ZooKeeper |
+| Network partition | Machines are alive but cannot reach each other | A switch fails between two racks |
+| Split brain | Two copies both think they are leader | Both pods run the billing job |
+| Epoch / fencing token | A number that goes up with every new leader | Leader #7 replaced leader #6 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Pod A"] -- "try to grab lease" --> S[("Lease in etcd")]
+    B["Pod B"] -- "try to grab lease" --> S
+    C["Pod C"] -- "try to grab lease" --> S
+    S -- "you win, epoch 7" --> A
+    A -- "renew every few s" --> S
+    A --> J["Runs the job"]
+```
+
+**Analogy.** A relay baton with a sand timer: only the holder may run, and they must flip the timer before it empties or someone else may take the baton.
+Where it breaks: a real runner knows when they dropped the baton; a paused process can wake up still believing it holds it, which is why epochs are needed.
+
+**How the rest of this note builds up**
+
+- First, why one owner is needed (section 1) and the lease vocabulary (section 2).
+- Then how lease-based election works step by step (section 3) and a worked Go example (section 4).
+- Then classic algorithms (bully, ring, Raft) and tools (etcd, ZooKeeper, Kubernetes, Postgres locks) compared (sections 5-6).
+- Finally the SDE-3 deep dive: paused leaders, clock limits and fencing writes with epochs (sections 7-8).
+
+> [!tip] Remember
+> A leader is just whoever holds an expiring lease in a consistent store, and every leader action should carry its epoch.
 
 ## 1. Why it exists
 
@@ -43,7 +89,9 @@ The hard part is not choosing; it is guaranteeing that two instances never both 
 
 ## 2. Mental model
 
-**A baton with a sand timer.** There is one baton in a locked box (the consistent store). Whoever takes it turns over a 15-second sand timer and must come back to flip the timer before it runs out. If the holder does not come back, after the sand runs out anyone may take the baton, and the box writes a new, higher number on it. Any action taken "as leader" quotes that number, so actions from an old holder can be spotted.
+**A baton with a sand timer.** There is one baton in a locked box (the consistent store). Whoever takes it turns over a 15-second sand timer and must come back to flip the timer before it runs out.
+
+If the holder does not come back, after the sand runs out anyone may take the baton, and the box writes a new, higher number on it. Any action taken "as leader" quotes that number, so actions from an old holder can be spotted.
 
 **Vocabulary:**
 
@@ -324,7 +372,11 @@ func TestConcurrentCandidatesExactlyOneWins(t *testing.T) {
 
 Between 20 and 25 nobody leads. That gap is the price of never having two leaders, and it is why failover takes "lease duration plus retry period" rather than zero.
 
-**A simplification to know about.** The test uses one shared clock. In real systems the store and the instances have separate clocks. Kubernetes' client-go avoids comparing them: each candidate measures, with its own monotonic clock, how long it has seen the same `renewTime` unchanged, and only takes over after a full lease duration of no change. That still assumes clocks *run* at roughly the same rate, which is why the 10 s / 15 s margin exists.
+**A simplification to know about.** The test uses one shared clock. In real systems the store and the instances have separate clocks.
+
+Kubernetes' client-go avoids comparing them: each candidate measures, with its own monotonic clock, how long it has seen the same `renewTime` unchanged, and only takes over after a full lease duration of no change.
+
+That still assumes clocks *run* at roughly the same rate, which is why the 10 s / 15 s margin exists.
 
 ## 5. Variants and comparison
 
@@ -495,3 +547,8 @@ func RunAsLeader(ctx context.Context, cli *clientv3.Client, id string, work func
 - **Before this:** [[Consensus - Raft and Paxos]], [[Clocks and Ordering]]
 - **Next:** [[Distributed Locks and Fencing Tokens]], [[Failure Detection, Gossip and Membership]]
 - **Compare with:** [[High Availability and Failover]] (electing a database primary), [[Scheduled Jobs - Cron to Durable Schedulers]] (running a job once without an election)
+
+### Watch on YouTube
+
+- [Distributed Consensus - Raft Leader Election / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=Al2JNJBGG30) · Jordan has no life · 8 min · 26,516 views
+- [How Leader Election work in Distributed Systems / System Design Interview Basics](https://www.youtube.com/watch?v=TzwiGTbUSHg) · ByteMonk · 4 min · 22,179 views

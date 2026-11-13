@@ -8,13 +8,22 @@ related: ["[[Forward and Reverse Proxies - L4 vs L7]]", "[[Load Balancing]]", "[
 sources:
   - "RFC 7230, HTTP/1.1 Message Syntax and Routing"
   - "RFC 7239, Forwarded HTTP Extension"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Forward and Reverse Proxies - L4 vs L7 - Go
 
 > [!summary] TL;DR
 > This code builds a minimal reverse proxy on top of `net/http/httputil.ReverseProxy` that correctly appends `X-Forwarded-For`, returns a clean `502` on a dead backend, and includes the hop-trust logic (`TrustedClientIP`) for reading that header safely. See the theory in [[Forward and Reverse Proxies - L4 vs L7]].
+
+## Before the code
+
+- **`net/http/httputil.ReverseProxy`**: a ready-made reverse proxy from the standard library; we only customize it.
+- **Closures (`Director`, `ErrorHandler`)**: functions stored in struct fields; the proxy calls them per request.
+- **`log/slog`**: structured logging with key/value pairs.
+- **`net/http/httptest`**: starts real local HTTP servers inside tests, so the proxy is tested end to end.
+- **Goroutines (implicit)**: every request is served on its own goroutine, which is why tests run with `-race`.
+- **Run it**: `go vet ./...` then `go test -race ./...` (see Setup).
 
 ## What this code shows
 
@@ -81,7 +90,11 @@ The second half wires in the failure path — what happens when the origin can't
 }
 ```
 
-**Concept.** This implements the reverse proxy walked through in [[Forward and Reverse Proxies - L4 vs L7#A minimal Go reverse proxy, traced step by step]]. `httputil.ReverseProxy`'s own `Director` is wrapped rather than replaced — calling the original `director` first keeps all of the standard library's own rewriting (scheme, path, query merging) and only adds the two things it doesn't do: forcing `req.Host` to match the origin, and appending `X-Forwarded-For`. Writing a reverse proxy entirely from scratch (manual `http.Client` calls) was rejected because `httputil.ReverseProxy` already handles streaming bodies, header hop-by-hop stripping, and connection reuse correctly.
+**Concept.** This implements the reverse proxy walked through in [[Forward and Reverse Proxies - L4 vs L7#A minimal Go reverse proxy, traced step by step]].
+
+`httputil.ReverseProxy`'s own `Director` is wrapped rather than replaced — calling the original `director` first keeps all of the standard library's own rewriting (scheme, path, query merging) and only adds the two things it doesn't do: forcing `req.Host` to match the origin, and appending `X-Forwarded-For`.
+
+Writing a reverse proxy entirely from scratch (manual `http.Client` calls) was rejected because `httputil.ReverseProxy` already handles streaming bodies, header hop-by-hop stripping, and connection reuse correctly.
 
 **How it works.**
 1. `director := proxy.Director` captures the standard library's default rewriting function before replacing it, so the override can still call it.

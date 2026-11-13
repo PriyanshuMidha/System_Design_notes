@@ -8,7 +8,7 @@ sources:
   - "dig(1), curl(1), openssl(1), ss(8), tcpdump(1), traceroute(8), nc(1) manual pages"
   - "RFC 1035, Domain Names - Implementation and Specification"
   - "RFC 793 / RFC 9293, Transmission Control Protocol"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Network Debugging Toolkit - dig, curl, ss, tcpdump
@@ -37,11 +37,63 @@ flowchart LR
 
 Everything below expands each branch with the exact flags and how to read the output.
 
+## Start here: the basics
+
+**The problem in one story.**
+You open an app and it says "something went wrong".
+The cause could be the phone book lookup, the road to the server, the security handshake, or the server itself.
+Guessing wastes hours.
+This note gives you one small tool per step so you can check each step and find the broken one in minutes.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| DNS | The internet's phone book: name to IP address | `example.com` → `93.184.216.34` |
+| IP address | The number that identifies a machine on a network | `10.0.1.5` |
+| Port | A numbered door on a machine for one service | HTTPS listens on port 443 |
+| TCP connection | A reliable two-way pipe opened with a handshake | Browser connects to server on 443 |
+| TLS | Encryption plus certificate check on top of TCP | The padlock in the browser |
+| Socket | The OS object a program uses for one connection | One row in `ss` output |
+| Packet | One small chunk of data sent over the network | A SYN packet starting a connection |
+| CLI flag | An option you pass to a command | `curl -v` turns on verbose output |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Name to IP<br/>(dig)"] --> B["Open TCP<br/>(nc, ss)"]
+    B --> C["TLS handshake<br/>(openssl)"]
+    C --> D["HTTP request<br/>(curl)"]
+    W["Raw packets<br/>(tcpdump)"] -.->|"sees all steps"| B
+```
+
+**Analogy.** A parcel did not arrive. You check, in order: was the address right, did the truck leave, did the gate guard let it in, did the receiver sign. Each check has its own logbook.
+Where it breaks: real network layers can fail partly (1% of requests), and one tool (tcpdump) can watch every step at once, which no single logbook does.
+
+**How the rest of this note builds up**
+
+- First, why layer-by-layer tools exist (section 1) and the symptom-to-layer mental model (section 2).
+- Then each tool with exact flags and real output: dig, curl, openssl, ss, tcpdump, traceroute/mtr/nc (sections 3-4).
+- Then variants, trade-offs and the production playbook (sections 5-7).
+- Finally the SDE-3 deep dive: BPF filters, ICMP noise in `mtr`, and `CLOSE_WAIT` leaks traced back to Go code (section 8).
+
+> [!tip] Remember
+> Match the symptom to one layer, then run the one tool that inspects that layer.
+
 ## 1. Why it exists
 
-A request can fail at any of the layers in [[What Happens When You Type a URL]]: the name might not resolve, the port might not accept connections, the TLS certificate might not validate, or the HTTP response might be wrong or slow. Reading an error message like `curl: (7) Failed to connect` or `curl: (35) SSL connect error` tells you roughly which layer broke, but not *why* — the "why" needs a tool that inspects that specific layer in isolation, instead of re-running the full request and guessing from the symptom alone.
+A request can fail at any of the layers in [[What Happens When You Type a URL]]: the name might not resolve, the port might not accept connections, the TLS certificate might not validate, or the HTTP response might be wrong or slow.
 
-**Concrete scenario.** A deploy goes out and a service starts returning `502 Bad Gateway` for 1% of requests. The error alone doesn't say whether DNS is flapping, a backend pod is unreachable, TLS to the backend is failing, or the backend is just slow. The playbook in this note turns "502 sometimes" into a 5-minute, layer-by-layer check instead of an open-ended investigation.
+Reading an error message like `curl: (7) Failed to connect` or `curl: (35) SSL connect error` tells you roughly which layer broke, but not *why*.
+
+The "why" needs a tool that inspects that specific layer in isolation, instead of re-running the full request and guessing from the symptom alone.
+
+**Concrete scenario.** A deploy goes out and a service starts returning `502 Bad Gateway` for 1% of requests.
+
+The error alone doesn't say whether DNS is flapping, a backend pod is unreachable, TLS to the backend is failing, or the backend is just slow.
+
+The playbook in this note turns "502 sometimes" into a 5-minute, layer-by-layer check instead of an open-ended investigation.
 
 ## 2. Mental model
 
@@ -267,7 +319,11 @@ New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
 Verify return code: 0 (ok)
 ```
 
-**Representative output (openssl 3.x against a public TLS 1.3 site)** — the cert content above is illustrative; what matters for debugging is always the same three facts: `-servername` must match what the server's certificate covers (an `s:` with the wrong CN, or `subjectAltName` not containing your host, means a hostname mismatch), `Verify return code: 0 (ok)` means the chain validated against the client's trust store (a non-zero code, such as `20` for "unable to get local issuer certificate," means the chain is incomplete or the CA isn't trusted), and the certificate's validity window (`openssl x509 -noout -dates`) catches an expired cert immediately.
+**Representative output (openssl 3.x against a public TLS 1.3 site)** — the cert content above is illustrative; what matters for debugging is always the same three facts:
+
+1. `-servername` must match what the server's certificate covers (an `s:` with the wrong CN, or `subjectAltName` not containing your host, means a hostname mismatch).
+2. `Verify return code: 0 (ok)` means the chain validated against the client's trust store (a non-zero code, such as `20` for "unable to get local issuer certificate," means the chain is incomplete or the CA isn't trusted).
+3. The certificate's validity window (`openssl x509 -noout -dates`) catches an expired cert immediately.
 
 ### Sockets: `ss` / `netstat`
 
@@ -282,7 +338,11 @@ CLOSE-WAIT  0       0        10.0.1.5:51400         10.0.2.9:443
 TIME-WAIT   0       0        10.0.1.5:51410         10.0.2.9:443
 ```
 
-A `LISTEN` row with `Recv-Q` climbing toward its `Send-Q` backlog limit means connections are queuing faster than `accept()` is being called; once `Recv-Q` reaches that limit, the kernel drops or refuses further incoming SYNs until the application catches up — the application is falling behind. Many `CLOSE-WAIT` rows for the same remote peer is the state diagram's leak: this process never called `close()` after the peer disconnected.
+A `LISTEN` row with `Recv-Q` climbing toward its `Send-Q` backlog limit means connections are queuing faster than `accept()` is being called.
+
+Once `Recv-Q` reaches that limit, the kernel drops or refuses further incoming SYNs until the application catches up — the application is falling behind.
+
+Many `CLOSE-WAIT` rows for the same remote peer is the state diagram's leak: this process never called `close()` after the peer disconnected.
 
 ### The wire itself: `tcpdump`
 
@@ -298,7 +358,11 @@ $ sudo tcpdump -i en0 -n 'host 172.66.147.243 and port 443' -c 6
 12:00:01.199  IP 10.0.1.5.51322 > 172.66.147.243.443: Flags [.], ack 5518, win 65535, length 0
 ```
 
-Read the `Flags`: `[S]` is a SYN, `[S.]` is SYN-ACK, `[.]` is a bare ACK, `[P.]` is a push with data. The three-way handshake is the first three lines; line 4 is the TLS ClientHello leaving the client, and the 181 ms gap before line 5 is the time the TLS handshake + first byte actually took on the wire — the same number `curl -w`'s `time_appconnect` would report, but captured independently of curl's own instrumentation. The filter expression (`host ... and port 443`) is Berkeley Packet Filter (BPF) syntax; narrowing it is essential on a busy interface.
+Read the `Flags`: `[S]` is a SYN, `[S.]` is SYN-ACK, `[.]` is a bare ACK, `[P.]` is a push with data.
+
+The three-way handshake is the first three lines; line 4 is the TLS ClientHello leaving the client, and the 181 ms gap before line 5 is the time the TLS handshake + first byte actually took on the wire — the same number `curl -w`'s `time_appconnect` would report, but captured independently of curl's own instrumentation.
+
+The filter expression (`host ... and port 443`) is Berkeley Packet Filter (BPF) syntax; narrowing it is essential on a busy interface.
 
 ### Reachability: `traceroute`, `mtr`, `nc`
 
@@ -314,7 +378,11 @@ traceroute to example.com (172.66.147.243), 5 hops max, 40 byte packets
  5  182.79.205.103 (182.79.205.103)  87.549 ms
 ```
 
-Each row is one more hop's TTL expiring and sending back an ICMP "time exceeded"; a `*` means that hop didn't reply (often a router that drops ICMP, not necessarily a failure — only a trend of timeouts at the *same* hop across repeated runs indicates a real problem there). `mtr` runs the same idea continuously and adds a live loss percentage and jitter per hop, which is what separates "one slow hop" from "this hop drops 20% of packets."
+Each row is one more hop's TTL expiring and sending back an ICMP "time exceeded".
+
+A `*` means that hop didn't reply (often a router that drops ICMP, not necessarily a failure — only a trend of timeouts at the *same* hop across repeated runs indicates a real problem there).
+
+`mtr` runs the same idea continuously and adds a live loss percentage and jitter per hop, which is what separates "one slow hop" from "this hop drops 20% of packets."
 
 **Measured** (`nc`, port reachability — the fastest way to answer "is TCP even possible" before touching HTTP or TLS at all):
 
@@ -341,7 +409,12 @@ flowchart LR
     R -->|"anything else"| E["OtherError"]
 ```
 
-**Why it matters:** the same three buckets this diagram shows are exactly the ones `ss -tan` and a `tcpdump` capture surface too — `Refused` is the kernel answering a SYN with an RST, `Timeout` is a SYN that got no reply at all. Having a program classify a health check into these same buckets (rather than a bare boolean "up/down") is what lets an on-call dashboard already say "this looks like a firewall problem" before a human runs `nc` by hand.
+**Why it matters:** the same three buckets this diagram shows are exactly the ones `ss -tan` and a `tcpdump` capture surface too:
+
+- `Refused` is the kernel answering a SYN with an RST.
+- `Timeout` is a SYN that got no reply at all.
+
+Having a program classify a health check into these same buckets (rather than a bare boolean "up/down") is what lets an on-call dashboard already say "this looks like a firewall problem" before a human runs `nc` by hand.
 
 Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implementation and all four tests: [[Network Debugging Toolkit - dig, curl, ss, tcpdump - Go]]
 
@@ -377,10 +450,20 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 ## 8. Deep dive
 
 - **`dig`'s flags section decodes the resolution itself.** `qr` means this is a response (not a query), `rd` means recursion was requested, `ra` means the server supports recursion, `ad` means the answer was validated with DNSSEC. Missing `ad` on a zone that should be signed is itself a finding.
-- **BPF filter syntax is a small language, not a free-text search.** `tcpdump 'tcp and port 443 and (tcp[tcpflags] & tcp-syn != 0)'` captures only SYN packets — useful for counting connection *attempts* separately from established traffic; `host a and host b` restricts to one conversation on a busy link.
+- **BPF filter syntax is a small language, not a free-text search.** `tcpdump 'tcp and port 443 and (tcp[tcpflags] & tcp-syn != 0)'` captures only SYN packets — useful for counting connection *attempts* separately from established traffic.
+
+  `host a and host b` restricts to one conversation on a busy link.
 - **`curl -v`'s `*` lines come from curl's own logic, not the wire** — for ground truth on exactly what bytes were exchanged (useful when curl's TLS library and the server disagree about something), drop to `openssl s_client` or `tcpdump`.
-- **`mtr`'s per-hop loss percentage is noisy for intermediate hops.** Many routers deprioritize or rate-limit the ICMP replies `traceroute`/`mtr` depend on, so a hop showing 30% loss while the hops after it show 0% almost always means that router deprioritizes ICMP, not that it's dropping real traffic — only loss at the *last* hop (the actual destination) or a consistent trend is actionable.
-- **A `CLOSE_WAIT` leak visible in `ss` output traces back to code, not network.** It means the local process received a FIN from the peer (the peer closed its side) but the local process's code path never called `Close()` on its end — in Go, almost always a missing `defer conn.Close()` or a response body that's read but never closed (`resp.Body.Close()`).
+- **`mtr`'s per-hop loss percentage is noisy for intermediate hops.**
+
+  Many routers deprioritize or rate-limit the ICMP replies `traceroute`/`mtr` depend on, so a hop showing 30% loss while the hops after it show 0% almost always means that router deprioritizes ICMP, not that it's dropping real traffic.
+
+  Only loss at the *last* hop (the actual destination) or a consistent trend is actionable.
+- **A `CLOSE_WAIT` leak visible in `ss` output traces back to code, not network.**
+
+  It means the local process received a FIN from the peer (the peer closed its side) but the local process's code path never called `Close()` on its end.
+
+  In Go, it is almost always a missing `defer conn.Close()` or a response body that's read but never closed (`resp.Body.Close()`).
 
 ## 9. Interview questions
 
@@ -422,3 +505,9 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 - **Next:** [[Forward and Reverse Proxies - L4 vs L7]]
 - **Compare with:** [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] (what a Go server's socket handling looks like from the kernel's side), [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Runnable code:** [[Network Debugging Toolkit - dig, curl, ss, tcpdump - Go]]
+
+### Watch on YouTube
+
+- [Wiresharking CURL - How a single GET request translates to 10 TCP Packets](https://www.youtube.com/watch?v=gOEiBliwMUA) · Hussein Nasser · shows curl + packet capture together, ties the tools to what's really on the wire
+- [ss command - use Socket statistics to investigate your Linux network. Alternative to Netstat](https://www.youtube.com/watch?v=92-RCkdoKDw) · dolastack devops · focused walkthrough of ss for inspecting socket/connection state
+- [Learn Tcpdump - Tutorial with Examples](https://www.youtube.com/watch?v=xyFLY1saDh0) · Hack eXPlorer · hands-on tcpdump filtering and packet capture examples

@@ -8,7 +8,7 @@ sources:
   - "Mike Cohn, Succeeding with Agile (2009) — the test pyramid"
   - "Google Testing Blog, 'Just Say No to More End-to-End Tests' (2015) — the testing trophy / ice-cream-cone discussion"
   - "Martin Fowler, TestPyramid (martinfowler.com)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Testing Strategy and the Test Pyramid
@@ -23,19 +23,70 @@ updated: 2026-11-04
 > - Coverage percentage tells you what ran, not what was checked; a suite can hit 100% coverage and still miss every real bug.
 > - What to test is a risk decision: money, data loss and the critical user journey get tested first and hardest.
 
+## Start here: the basics
+
+**The problem in one story.**
+You have time to write only a few tests before release.
+Should you test each small function, or click through the whole app in a browser?
+Small tests are fast but miss wiring bugs; full-app tests catch more but are slow and break often.
+A test strategy decides how many of each kind you write, and the test pyramid is the classic answer.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Unit test | Tests one small piece of logic, no network or DB | `TestCalcTax` |
+| Integration test | Tests your code with one real outside thing | Repository test against real Postgres |
+| E2E test | Tests the whole system like a user would | Browser places an order |
+| Test suite | All the tests for a project | `go test ./...` |
+| Coverage | Percent of code lines the tests ran | 80% coverage |
+| Feedback loop | Time between a change and knowing if it broke something | 5 seconds vs 40 minutes |
+| Critical path | The user journey that must never break | Login → pay |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    E2E["E2E: few, slow, broad"]
+    INT["Integration: some, medium"]
+    U["Unit: many, fast, narrow"]
+    E2E --- INT --- U
+```
+
+**Analogy.** Testing a car: check each bolt and part on the bench (unit), test the engine with the gearbox attached (integration), then take a few test drives (E2E). You do lots of cheap bench checks and only a few expensive drives.
+Where it breaks: some software is mostly "wiring" with little logic of its own, so the engine-plus-gearbox tests matter more than the bolts (the "trophy" shape).
+
+**How the rest of this note builds up**
+
+- First, why a strategy is needed (section 1) and the pyramid as a shape, not a flow (section 2).
+- Then how to choose a layer per bug and per risk (section 3), with a worked example (section 4).
+- Then the trophy and other shapes, trade-offs and real-world practice (sections 5-7).
+- Finally the SDE-3 deep dive on coverage, risk and suite health, plus interview questions (sections 8-9).
+
+> [!tip] Remember
+> Catch each bug at the cheapest test layer that can see it, and test money and critical journeys hardest.
+
 ## 1. Why it exists
 
 InvoiceOps (the running example used across this folder) has one core rule: an invoice can only be marked paid once, and only after a successful charge. Say a bug lets `Pay` run twice concurrently on the same invoice, double-charging a customer.
 
-If the only test for this is a manual click-through in staging, the bug reaches production, a customer is charged twice, support opens a ticket, and an engineer spends an afternoon tracing it through logs. If instead there's a unit test that calls `Pay` twice concurrently against a fake store and asserts the second call fails, the bug is caught in **under a second**, on the author's machine, before the code is even pushed.
+If the only test for this is a manual click-through in staging, the bug reaches production, a customer is charged twice, support opens a ticket, and an engineer spends an afternoon tracing it through logs.
 
-The cost of a bug roughly multiplies by 10 at each stage it survives: free to catch while typing (the compiler, `go vet`), cheap in a unit test (seconds), more expensive in an integration test (the bug now needs a real dependency to reproduce), expensive in a manual QA pass (a human has to notice), and most expensive in production (an incident, a postmortem, customer trust). A test strategy is the plan for catching as much as possible as early as possible, without paying for exhaustive testing at every layer.
+If instead there's a unit test that calls `Pay` twice concurrently against a fake store and asserts the second call fails, the bug is caught in **under a second**, on the author's machine, before the code is even pushed.
+
+The cost of a bug roughly multiplies by 10 at each stage it survives: free to catch while typing (the compiler, `go vet`), cheap in a unit test (seconds), more expensive in an integration test (the bug now needs a real dependency to reproduce), expensive in a manual QA pass (a human has to notice), and most expensive in production (an incident, a postmortem, customer trust).
+
+A test strategy is the plan for catching as much as possible as early as possible, without paying for exhaustive testing at every layer.
 
 ## 2. Mental model
 
-Think of a change moving through concentric rings of confidence. The innermost ring — a single function or type — is cheap to test exhaustively: hundreds of cases, pure logic, no I/O, no network. Each ring further out (does this unit talk to Postgres correctly? does the whole request path work end to end?) is slower and more realistic, so you deliberately test less of it directly and rely on the inner rings having already caught most bugs.
+Think of a change moving through concentric rings of confidence. The innermost ring — a single function or type — is cheap to test exhaustively: hundreds of cases, pure logic, no I/O, no network.
 
-The test pyramid names three of those rings and recommends a **count**, not a hard rule: lots of unit tests, a moderate number of integration tests, very few end-to-end tests. The shape is a consequence of cost and flakiness, not dogma — a service that is 90% "call these other six services correctly" and 10% business logic should look more like a **trophy** (integration-heavy) than a pyramid.
+Each ring further out (does this unit talk to Postgres correctly? does the whole request path work end to end?) is slower and more realistic, so you deliberately test less of it directly and rely on the inner rings having already caught most bugs.
+
+The test pyramid names three of those rings and recommends a **count**, not a hard rule: lots of unit tests, a moderate number of integration tests, very few end-to-end tests.
+
+The shape is a consequence of cost and flakiness, not dogma — a service that is 90% "call these other six services correctly" and 10% business logic should look more like a **trophy** (integration-heavy) than a pyramid.
 
 ## 3. How it works
 
@@ -170,7 +221,9 @@ actually serializes the two updates.
 
 ## 7. In production
 
-- **Real systems**: Google's internal size classification (small/medium/large, roughly unit/integration/E2E) gates which machines a test is allowed to run on and how long it may take. Spotify's "honeycomb" post documented moving away from cross-service E2E toward consumer-driven contracts as the service count grew past what E2E could cover. Netflix is a well-known adopter of chaos engineering as the layer above E2E for distributed failure modes (see `Chaos Engineering`).
+- **Real systems**: Google's internal size classification (small/medium/large, roughly unit/integration/E2E) gates which machines a test is allowed to run on and how long it may take.
+
+  Spotify's "honeycomb" post documented moving away from cross-service E2E toward consumer-driven contracts as the service count grew past what E2E could cover. Netflix is a well-known adopter of chaos engineering as the layer above E2E for distributed failure modes (see `Chaos Engineering`).
 - **Failure modes → fixes**:
   - *Suite is slow, PRs wait 20 minutes* → audit what layer each test is actually in; many "integration" tests that spin up a container per test case can often share one container per package (see [[Test Data Strategy]] for isolation techniques that make this safe).
   - *Suite is flaky* (see below) → the fix is almost never "add a retry"; it's removing the nondeterminism.
@@ -193,7 +246,9 @@ The fix for a flaky test is never "run it three times and take majority vote" in
 
 ### Coverage as a signal, not a target
 
-Line coverage says a line executed at least once; it says nothing about whether the test actually asserted the right thing. A test that calls `svc.Pay()` and asserts nothing about the result can produce 100% coverage of `Pay` and catch zero bugs. Use coverage to find **untested branches** ("the `amount <= 0` branch never ran in any test — that's a gap"), not as a merge gate with a hard percentage, and prefer mutation testing or a documented list of required cases (the Must-cover style used in this very note) as the stronger signal.
+Line coverage says a line executed at least once; it says nothing about whether the test actually asserted the right thing. A test that calls `svc.Pay()` and asserts nothing about the result can produce 100% coverage of `Pay` and catch zero bugs.
+
+Use coverage to find **untested branches** ("the `amount <= 0` branch never ran in any test — that's a gap"), not as a merge gate with a hard percentage, and prefer mutation testing or a documented list of required cases (the Must-cover style used in this very note) as the stronger signal.
 
 ### "What runs on every PR" — the shared checklist this folder keeps once
 
@@ -205,7 +260,9 @@ Line coverage says a line executed at least once; it says nothing about whether 
 ## 9. Interview questions
 
 > [!question]- Design the test strategy for a payments service like InvoiceOps.
-> Start from risk: money-moving logic gets the heaviest unit coverage (every branch of charge/refund/idempotency) plus an integration test against a real Postgres for the row-locking behavior, plus one E2E happy path and one E2E "provider down" path. Everything runs at a CI stage matched to its cost: unit+lint on every PR, integration on merge, E2E nightly and pre-release. Add a flake-rate and escaped-defect dashboard to know if the strategy is working.
+> Start from risk: money-moving logic gets the heaviest unit coverage (every branch of charge/refund/idempotency) plus an integration test against a real Postgres for the row-locking behavior, plus one E2E happy path and one E2E "provider down" path.
+>
+> Everything runs at a CI stage matched to its cost: unit+lint on every PR, integration on merge, E2E nightly and pre-release. Add a flake-rate and escaped-defect dashboard to know if the strategy is working.
 
 > [!question]- Why doesn't the test pyramid apply equally well to every service?
 > The pyramid assumes most risk lives in business logic that can be tested in isolation. A service that's mostly "call five other services and combine results" has most of its risk at the integration boundary, so an integration-heavy "trophy" shape gives more confidence per test written than forcing a classic pyramid ratio.
@@ -217,7 +274,9 @@ Line coverage says a line executed at least once; it says nothing about whether 
 > Diagnose the real cause (time, shared state, randomness, network) rather than retrying or deleting it. Quarantine it only temporarily, with an owner and a ticket, never silently; a suite where red builds are routinely ignored has already lost its value as a gate.
 
 > [!question]- When would you choose the testing trophy over the classic pyramid?
-> When the unit under test has little pure logic and mostly orchestrates calls to other systems — a BFF, a thin CRUD gateway. Unit tests there mostly test mocks calling mocks, which gives low confidence per test; integration tests exercising the real boundary (real HTTP client against a stubbed server, real DB) catch far more real bugs per test written.
+> When the unit under test has little pure logic and mostly orchestrates calls to other systems — a BFF, a thin CRUD gateway.
+>
+> Unit tests there mostly test mocks calling mocks, which gives low confidence per test; integration tests exercising the real boundary (real HTTP client against a stubbed server, real DB) catch far more real bugs per test written.
 
 > [!question]- What should run on every pull request versus nightly, and why?
 > PR-stage tests must be fast enough that a developer doesn't context-switch away — unit tests, lint, `go vet`, `-race`, and fast consumer-side contract checks. Integration tests (needing real Postgres/Redis containers) move to merge-time; full E2E, load, and chaos move to nightly or pre-release, because their cost doesn't fit a tight per-PR feedback loop.
@@ -239,3 +298,8 @@ Line coverage says a line executed at least once; it says nothing about whether 
 - **Before this:** none — this is the entry point for `15 Testing`.
 - **Next:** [[Unit, Integration and E2E Tests]]
 - **Compare with:** [[Test Doubles and Mocking in Go]] for how each layer fakes its dependencies; `Testing in Go` (04 Go Language) for the `testing` package mechanics this strategy runs on top of.
+
+### Watch on YouTube
+
+- [Modern Mobile App Testing Strategy, Agile team & Testing pyramid](https://www.youtube.com/watch?v=kgTzWLOI4Qs) · Software Testing with Ozan Ilhan / NomadTester · 6 min · 521 views
+- [ISTQB Agile Tester #42 - What is Test Pyramid / The Testing Pyramid](https://www.youtube.com/watch?v=JQVA3xIrwEo) · Software Testing Mentor · 3 min · 9,392 views

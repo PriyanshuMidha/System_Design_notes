@@ -10,7 +10,7 @@ sources:
   - "AWS IAM User Guide, IAM Access Analyzer"
   - "AWS documentation, IAM roles for Amazon ECS tasks (task role vs task execution role)"
   - "AWS documentation, IAM roles for service accounts (IRSA) and EKS Pod Identity"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 02 - IAM
@@ -25,11 +25,66 @@ updated: 2026-11-07
 > - **Roles**, not long-lived access keys, are how a workload gets credentials: `sts:AssumeRole` hands out short-lived, auto-expiring temporary credentials.
 > - The most common real mistake is `"Action": "*", "Resource": "*"` granted "to get it working," followed by never narrowing it.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your company has 50 engineers and 30 services running in AWS.
+The payments service must read one bucket; the intern must not delete the production database.
+Without a permission system, everyone holds the master key, and one leaked key can wipe out everything.
+IAM is the system that hands each person or program exactly the keys it needs, and nothing more.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Identity / principal | Whoever is making a request | An engineer, or your Go service |
+| Permission | Being allowed to do one action | "May read files from bucket X" |
+| Policy | A JSON list of allow/deny rules | `{"Effect":"Allow","Action":"s3:GetObject",...}` |
+| Action | One API operation in AWS | `s3:GetObject`, `ec2:StartInstances` |
+| Resource / ARN | The exact thing being acted on, named by an ARN | `arn:aws:s3:::invoices/*` |
+| Role | An identity anyone trusted can "wear" for a short time | The role your ECS task assumes |
+| Credentials | The secret proof of who you are | An access key, or a temporary token |
+| Least privilege | Give only the permissions actually needed | Read-only, one bucket, not `*` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W["Who: principal<br/>(user / role)"] --> Q["Request:<br/>action + resource"]
+    Q --> E{"IAM checks<br/>all policies"}
+    E -- "explicit Deny found" --> D["Denied"]
+    E -- "an Allow, nothing narrows it" --> A["Allowed"]
+    E -- "no matching rule" --> D
+```
+
+**Analogy.** IAM is an office access-card system: each card opens a listed set of doors, and a "never this door" rule beats any "yes".
+Where it breaks: real cards rarely expire in an hour, but IAM role credentials are designed to expire automatically.
+
+**How the rest of this note builds up**
+
+- First, why IAM exists (section 1, including the Capital One breach) and the access-card mental model (section 2).
+- Then policies, principals, roles and the full evaluation order with SCPs and boundaries (section 3).
+- Then a Go policy-evaluator you can run and test (section 4), and variants like ABAC and identity center (section 5).
+- Finally the SDE-3 view: trade-offs, production practice, deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Everything is denied by default, an explicit Deny always wins, and workloads should use short-lived roles, not stored keys.
+
 ## 1. Why it exists
 
-A backend service needs to read objects from an S3 bucket, write logs to CloudWatch, and nothing else. Without a permissions system, the two options are "give it the account's root credentials" (catastrophic if the service is compromised — it can do literally anything, including deleting every resource and disabling billing alarms) or "write custom access-control code per service" (a security team's nightmare to audit consistently across hundreds of services). IAM exists to give every principal exactly the permissions it needs and nothing more — the **principle of least privilege** — enforced centrally and auditable in one place.
+A backend service needs to read objects from an S3 bucket, write logs to CloudWatch, and nothing else.
 
-Concretely: the 2019 Capital One breach is the textbook case. An SSRF bug in a misconfigured web application firewall running on EC2 let an attacker make that WAF query the instance metadata service and retrieve the temporary credentials for its attached IAM role — a role that, by several public post-incident analyses, had far more S3 access than a WAF needs, which is what let the attacker list and read private buckets once they had those credentials. The attacker didn't need to break IAM itself; IAM did exactly what its policy said, and the policy said too much. This is the recurring theme in nearly every IAM-related incident.
+Without a permissions system, the two options are "give it the account's root credentials" (catastrophic if the service is compromised — it can do literally anything, including deleting every resource and disabling billing alarms) or "write custom access-control code per service" (a security team's nightmare to audit consistently across hundreds of services).
+
+IAM exists to give every principal exactly the permissions it needs and nothing more — the **principle of least privilege** — enforced centrally and auditable in one place.
+
+Concretely: the 2019 Capital One breach is the textbook case.
+
+An SSRF bug in a misconfigured web application firewall running on EC2 let an attacker make that WAF query the instance metadata service and retrieve the temporary credentials for its attached IAM role.
+
+That role, by several public post-incident analyses, had far more S3 access than a WAF needs, which is what let the attacker list and read private buckets once they had those credentials.
+
+The attacker didn't need to break IAM itself; IAM did exactly what its policy said, and the policy said too much. This is the recurring theme in nearly every IAM-related incident.
 
 ### Whiteboard version
 
@@ -42,7 +97,13 @@ flowchart LR
 
 ## 2. Mental model
 
-Think of IAM as a building's access-card system. A **principal** is a person holding a card. A **policy** is the list of doors that card opens — and a policy can also explicitly say "this card must never open that door," which overrides any other card or door-list that would have let them in. A **role** is a visitor badge issued at the front desk for a limited time, rather than a permanent employee card — exactly what a workload gets when it calls `AssumeRole` instead of embedding a permanent key. And an **Organizations SCP** is a building-wide rule the landlord sets that applies on top of every tenant's own door list — the landlord can say "no tenant's card may ever open the roof access door," and no tenant's own policy can override that.
+Think of IAM as a building's access-card system.
+
+A **principal** is a person holding a card. A **policy** is the list of doors that card opens — and a policy can also explicitly say "this card must never open that door," which overrides any other card or door-list that would have let them in.
+
+A **role** is a visitor badge issued at the front desk for a limited time, rather than a permanent employee card — exactly what a workload gets when it calls `AssumeRole` instead of embedding a permanent key.
+
+And an **Organizations SCP** is a building-wide rule the landlord sets that applies on top of every tenant's own door list — the landlord can say "no tenant's card may ever open the roof access door," and no tenant's own policy can override that.
 
 ## 3. How it works
 
@@ -362,7 +423,14 @@ func TestResourcePolicyGrantsCrossAccountAccessByUnion(t *testing.T) {
 }
 ```
 
-**Measured (Go 1.24.4, darwin/arm64, 2026-11-07):** `go test -race -v` output — all 6 tests pass: an identity allow alone grants access; an explicit deny overrides an allow at the same scope; a permission boundary narrows by intersection; an SCP narrows by intersection even against a fully-permissive identity policy; a resource policy grants cross-account access by union; and no matching statement anywhere falls through to an implicit deny.
+**Measured (Go 1.24.4, darwin/arm64, 2026-11-07):** `go test -race -v` output — all 6 tests pass:
+
+1. An identity allow alone grants access.
+2. An explicit deny overrides an allow at the same scope.
+3. A permission boundary narrows by intersection.
+4. An SCP narrows by intersection even against a fully-permissive identity policy.
+5. A resource policy grants cross-account access by union.
+6. No matching statement anywhere falls through to an implicit deny.
 
 ```text
 === RUN   TestIdentityAllowAloneGrantsAccess
@@ -455,3 +523,7 @@ ok  	aws02	1.428s
 - **Before this:** [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]]
 - **Next:** [[AWS 03 - VPC Networking]]
 - **Compare with:** [[Secrets Management]] (storing the application secrets IAM doesn't cover), [[OAuth 2.0 and OpenID Connect]] (the federation protocol IAM's OIDC identity providers rely on), [[Service-to-Service Auth - API Keys, HMAC, mTLS]] (auth between services that aren't both inside IAM's trust boundary)
+
+### Watch on YouTube
+
+- [AWS IAM Core Concepts You NEED to Know](https://www.youtube.com/watch?v=_ZCTvmaPgao) · Be A Better Dev · 21 min · 348,776 views

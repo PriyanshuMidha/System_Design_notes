@@ -19,19 +19,65 @@ sources:
   - "Stripe API reference (introduction); GitHub docs, About the REST API and About the GraphQL API; Slack docs, Events API and Socket Mode"
   - "Kubernetes API concepts (watch); etcd v3 API reference (gRPC)"
   - "AWS Elastic Load Balancing docs, ALB idle timeout default 60 seconds"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Choosing an API Style
 
 > [!summary] TL;DR
-> An **API style** is the set of rules two programs use to talk: how a request is shaped, what travels over the wire, and who starts the conversation. Pick it by asking **who calls** (a browser, your own service, another company) and **which way data flows** (ask-and-answer, server push, streams, or events). REST is the default for public resource APIs; the others win in specific cases.
+> An **API style** is the set of rules two programs use to talk: how a request is shaped, what travels over the wire, and who starts the conversation. Pick it by asking **who calls** (a browser, your own service, another company) and **which way data flows** (ask-and-answer, server push, streams, or events).
+>
+> REST is the default for public resource APIs; the others win in specific cases.
 
 > [!abstract] Core idea
 > - Start from the **caller** (browser, own service, partner company) and the **data flow** (ask-and-answer, server push, two-way stream, event).
 > - REST is the default for anything public and resource-shaped; pick something else only for a specific reason.
 > - gRPC fits internal service-to-service calls; GraphQL or a BFF (backend for frontend) fits many-screen mobile clients; SSE, WebSocket or webhooks fit push.
 > - Classic mistake: choosing a style because it is fashionable rather than because of who calls and which way data flows.
+
+## Start here: the basics
+
+**The problem in one story.**
+A movie-booking company has a public website, a phone app, internal services, partner cinemas and a live seat map.
+Each of them talks to the backend in a different way.
+Some ask and wait for an answer; some need the server to push updates the moment seats change.
+Picking the right style for each caller saves a lot of slow, wasteful traffic.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| REST | HTTP API built around resources and standard methods | `GET /shows/42` |
+| gRPC | Fast binary calls between services, defined in `.proto` files | `orders.Get(id)` over HTTP/2 |
+| GraphQL | One endpoint where the client asks for exactly the fields it wants | `{ show { title seats } }` |
+| Polling | Client asks again and again "anything new?" | Request every 2 s |
+| Push | Server sends data without being asked again | Seat map updates live |
+| SSE / WebSocket | Long-lived connections for server push (one-way / two-way) | Live scores feed / chat |
+| Webhook | Your server calls a partner's URL when an event happens | `POST partner.com/hooks` on payment |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    C{"Who calls?"} -- "public / browser" --> REST["REST"]
+    C -- "own service" --> GRPC["gRPC"]
+    C -- "many app screens" --> GQL["GraphQL or BFF"]
+    C -- "needs live updates" --> PUSH["SSE or WebSocket"]
+    C -- "partner wants events" --> WH["Webhooks"]
+```
+
+**Analogy.** Choosing an API style is like choosing how to contact someone: a letter (REST), an internal office phone (gRPC), a custom order form (GraphQL), a live radio channel (SSE/WebSocket) or "call me when it's ready" (webhook).
+Where it breaks: real systems mix several styles at once, often for the same data, while a person usually picks one channel per conversation.
+
+**How the rest of this note builds up**
+
+- First, why style choice matters (section 1) and the mental model of caller plus data direction (section 2).
+- Then the four communication patterns and the decision steps (section 3).
+- Then a worked example with real request-rate numbers for polling vs long polling vs push (section 4), variants and trade-offs (sections 5-6).
+- Finally the SDE-3 view: why gRPC needs HTTP/2, why only REST caches well, GraphQL vs BFF, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Ask who calls and which way data flows; default to REST and switch only for a concrete reason.
 
 ## 1. Why it exists
 
@@ -43,7 +89,9 @@ A movie-ticket platform needs five kinds of communication at once:
 - cinema partners who must be told when a booking is cancelled,
 - one old bank partner whose payment gateway only accepts SOAP.
 
-Forcing one style onto all five hurts. If the seat map **polls** every 2 seconds with 50,000 people watching, that is 25,000 requests per second even when nothing changes (arithmetic, not a benchmark). If partners must **poll** for cancellations, they either miss them or hammer you. If internal calls use JSON over HTTP/1.1, every call pays for text parsing, and every in-flight call needs its own connection because HTTP/1.1 cannot multiplex (carry several requests at the same time on one connection).
+Forcing one style onto all five hurts. If the seat map **polls** every 2 seconds with 50,000 people watching, that is 25,000 requests per second even when nothing changes (arithmetic, not a benchmark).
+
+If partners must **poll** for cancellations, they either miss them or hammer you. If internal calls use JSON over HTTP/1.1, every call pays for text parsing, and every in-flight call needs its own connection because HTTP/1.1 cannot multiplex (carry several requests at the same time on one connection).
 
 Each API style exists because it makes one of these shapes cheap. Choosing well means matching style to caller and data flow, and keeping the number of styles small.
 
@@ -96,7 +144,9 @@ sequenceDiagram
 
 ### The decision
 
-Ask about the **caller first**, then the **direction of data**. The old "is it normal CRUD?" first question is the wrong root: almost everything looks like CRUD, so the push and internal branches never get asked. In the chart, a **BFF** (backend for frontend) is a small server per client type that calls the internal services and returns exactly the shape that client's screens need.
+Ask about the **caller first**, then the **direction of data**. The old "is it normal CRUD?" first question is the wrong root: almost everything looks like CRUD, so the push and internal branches never get asked.
+
+In the chart, a **BFF** (backend for frontend) is a small server per client type that calls the internal services and returns exactly the shape that client's screens need.
 
 ```mermaid
 flowchart TD
@@ -196,7 +246,9 @@ func Pick(caller, flow string) string {
 **Sizing the seat map (estimates, by arithmetic).** Assume 50,000 people have a seat map open, spread over many shows, and the seat map each person watches changes about once every 10 seconds on average.
 
 - Polling every 2 s: 50,000 / 2 = **25,000 requests/s**. About 4 of every 5 polls find nothing new (one change per 10 s, one poll per 2 s), and a change still waits up to 2 s to appear.
-- Long polling: about one request per change per client, 50,000 / 10 = **5,000 requests/s**, plus 50,000 held-open requests and one reconnect round trip after every change. Its cost grows with the update rate: if a hot show changed 5 times per second, each of its viewers could send up to 5 requests/s, which is worse than polling every 2 s unless the server batches events.
+- Long polling: about one request per change per client, 50,000 / 10 = **5,000 requests/s**, plus 50,000 held-open requests and one reconnect round trip after every change.
+
+  Its cost grows with the update rate: if a hot show changed 5 times per second, each of its viewers could send up to 5 requests/s, which is worse than polling every 2 s unless the server batches events.
 - SSE: **50,000 open connections** and about **5,000 small messages/s** pushed, with no request per update. The cost moves from request rate to connection count, which is a memory and file-descriptor question (see [[Scaling WebSockets]]; the same scaling rules apply to SSE).
 
 Which to pick depends on what is scarce. With HTTP/2 at the edge, SSE avoids the browser limit of 6 HTTP/1.1 connections per domain, shared by all tabs of that browser, which hurts SSE over HTTP/1.1 (documented on MDN).
@@ -249,12 +301,18 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 
 ## 8. Deep dive
 
-- **Why gRPC needs HTTP/2.** gRPC sends each call as an HTTP/2 stream: headers, length-prefixed protobuf messages, then **trailers** carrying `grpc-status` and `grpc-message`. Multiplexing lets thousands of concurrent calls share one TCP connection. Browsers' `fetch` does not expose trailers, which is why gRPC-Web moves the status into the response body. A translating proxy such as Envoy then converts gRPC-Web to gRPC, unless the server speaks gRPC-Web itself (Connect servers do).
+- **Why gRPC needs HTTP/2.** gRPC sends each call as an HTTP/2 stream: headers, length-prefixed protobuf messages, then **trailers** carrying `grpc-status` and `grpc-message`. Multiplexing lets thousands of concurrent calls share one TCP connection.
+
+  Browsers' `fetch` does not expose trailers, which is why gRPC-Web moves the status into the response body. A translating proxy such as Envoy then converts gRPC-Web to gRPC, unless the server speaks gRPC-Web itself (Connect servers do).
 - **One contract, two surfaces.** With the `google.api.http` option, a method like `GetBooking` maps to `GET /v1/{name=bookings/*}`. grpc-gateway generates a Go reverse proxy from that mapping, and Envoy's gRPC-JSON transcoder does the same inside the proxy. You write the service once in gRPC and expose REST/JSON at the edge (see [[Serving REST and gRPC Together]]).
-- **Why REST caches and the others do not.** Shared caches store responses to `GET` (and `HEAD`). RFC 9110 allows caching a `POST` response only with explicit freshness and a matching `Content-Location`, and common caches do not do it. GraphQL sends queries as `POST`, so CDNs pass them through. Persisted queries fix this: the client sends a hash of a pre-registered query in a `GET` URL, which a CDN can cache.
+- **Why REST caches and the others do not.** Shared caches store responses to `GET` (and `HEAD`). RFC 9110 allows caching a `POST` response only with explicit freshness and a matching `Content-Location`, and common caches do not do it.
+
+  GraphQL sends queries as `POST`, so CDNs pass them through. Persisted queries fix this: the client sends a hash of a pre-registered query in a `GET` URL, which a CDN can cache.
 - **Message size limits are part of the style.** grpc-go rejects incoming messages over 4 MiB by default (`MaxRecvMsgSize`). Large files belong in object storage with a presigned URL, not in an RPC (see [[File Upload Architecture]]).
 - **Head-of-line blocking.** HTTP/2 removes blocking between requests at the HTTP layer, but one lost TCP packet still stalls every stream on the connection. HTTP/3 over QUIC removes that (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]). This matters for gRPC and SSE on lossy mobile networks.
-- **GraphQL vs BFF.** Both solve "each client needs a different shape". GraphQL lets each client ask for its own shape from one shared schema. A BFF (backend for frontend) is a small server per client type that composes the calls in code. GraphQL scales to many clients; a BFF is simpler when there are two or three and each team owns its own (see [[API Gateway and BFF]]).
+- **GraphQL vs BFF.** Both solve "each client needs a different shape". GraphQL lets each client ask for its own shape from one shared schema. A BFF (backend for frontend) is a small server per client type that composes the calls in code.
+
+  GraphQL scales to many clients; a BFF is simpler when there are two or three and each team owns its own (see [[API Gateway and BFF]]).
 
 ## 9. Interview questions
 
@@ -268,7 +326,9 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 > Browsers cannot speak native gRPC: they cannot read HTTP/2 trailers through `fetch`, so you need gRPC-Web or Connect and a proxy. You lose HTTP caching and easy debugging. Payload size rarely dominates a browser request's latency anyway; the network round trip does. Use gRPC inside and transcode to REST at the edge.
 
 > [!question]- SSE or WebSocket for a live score feed?
-> SSE. Data flows one way, SSE is plain HTTP (works with proxies, cookies and HTTP/2 multiplexing) and the browser reconnects automatically, sending `Last-Event-ID` so the server can resume. One catch: the browser's `EventSource` cannot set an `Authorization` header, so bearer-token auth needs a cookie, a short-lived token in the URL, or a `fetch`-based SSE client. Choose WebSocket only when the client also sends frequent messages, as in chat or games.
+> SSE. Data flows one way, SSE is plain HTTP (works with proxies, cookies and HTTP/2 multiplexing) and the browser reconnects automatically, sending `Last-Event-ID` so the server can resume. One catch: the browser's `EventSource` cannot set an `Authorization` header, so bearer-token auth needs a cookie, a short-lived token in the URL, or a `fetch`-based SSE client.
+>
+> Choose WebSocket only when the client also sends frequent messages, as in chat or games.
 
 > [!question]- When do you use webhooks instead of letting partners poll?
 > When events are sparse and partners need them quickly. Polling wastes requests and still adds up to one interval of delay. Webhooks need more from both sides: signing, retries with backoff, idempotent receivers and a replay or events endpoint for missed deliveries. Many providers (Stripe, GitHub) offer both.
@@ -295,3 +355,8 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]
 - **Next:** [[REST and HTTP API Design]], [[API Contract Design and OpenAPI]], [[GraphQL]], [[gRPC]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Webhooks - Sending and Receiving]]
 - **Compare with:** [[API Gateway and BFF]] (where the styles meet), [[Event-Driven Architecture Basics]] (async events inside a company), [[SOAP and WSDL (Legacy Integrations)]]
+
+### Watch on YouTube
+
+- [REST API vs GraphQL vs gRPC - The Complete Guide (1/38)](https://www.youtube.com/watch?v=NFxOuylU9S8) · Memi Lavi - The Software Architect · full comparison series covering when to pick each API style
+- [REST vs gRPC vs GraphQL - 90% of Developers Choose Wrong!](https://www.youtube.com/watch?v=ygM1VwtPF_k) · Code with tkssharma · quick decision-framework style overview of the main API styles

@@ -8,13 +8,24 @@ related: ["[[ROM, Flash, Firmware and the Boot Process]]", "[[RAM Technologies -
 sources:
   - "UEFI Specification, Unified EFI Forum (boot services, Secure Boot)"
   - "systemd.io documentation (init, unit ordering, boot targets)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # ROM, Flash, Firmware and the Boot Process - Go
 
 > [!summary] TL;DR
-> This code models the real boot sequence (POST → find boot device → bootloader → kernel → init) as an ordered list of `Stage`s, each of which can fail — exactly the state-machine shape described in [[ROM, Flash, Firmware and the Boot Process]]. It doesn't touch real hardware; it proves the *ordering and halt-on-failure* property that makes a physical boot diagnosable.
+> This code models the real boot sequence (POST → find boot device → bootloader → kernel → init) as an ordered list of `Stage`s, each of which can fail — exactly the state-machine shape described in [[ROM, Flash, Firmware and the Boot Process]].
+>
+> It doesn't touch real hardware; it proves the *ordering and halt-on-failure* property that makes a physical boot diagnosable.
+
+## Before the code
+
+- **Structs** (`Stage`, `Result`): a named bundle of fields, like one row of a boot log.
+- **Function values** (`Run func() error`): a function stored in a field, so each boot stage carries its own "do the work" step.
+- **Errors as values** (`error`, `errors.New`): a stage reports failure by returning a non-nil `error`, not by crashing.
+- **Slices** (`[]Stage`): an ordered, growable list; the boot chain is just a slice walked front to back.
+- **Table-style tests** (`testing`, `reflect.DeepEqual`): tests build stages, run `Sequence`, and compare the result to what they expect.
+- **What to run:** `go vet ./boot/... && go test -race ./boot/...` inside the module. No goroutines, interfaces or generics are needed here.
 
 ## What this code shows
 

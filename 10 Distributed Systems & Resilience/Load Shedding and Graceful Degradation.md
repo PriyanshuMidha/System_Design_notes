@@ -14,7 +14,7 @@ sources:
   - "Klein et al., Brownout: Building More Robust Cloud Applications (ICSE 2014)"
   - "RFC 5861, HTTP Cache-Control Extensions for Stale Content (stale-if-error)"
   - "RFC 9110 HTTP Semantics, 503 Service Unavailable and Retry-After"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Load Shedding and Graceful Degradation
@@ -28,6 +28,52 @@ updated: 2026-11-04
 > - Too much traffic → reject early, before doing work, and shed the lowest-priority requests first.
 > - An **adaptive concurrency limit** finds the server's capacity from its latency, so you do not have to guess it.
 > - Classic mistake: queueing everything "to be safe". Long queues mean every request is late, and late answers are wasted work.
+
+## Start here: the basics
+
+**The problem in one story.**
+A small restaurant can cook 50 meals an hour.
+On a festival night 80 people walk in, and the kitchen tries to serve all of them.
+Everyone waits two hours, gets cold food, and leaves angry.
+Turning 30 people away at the door, and dropping desserts from the menu, would have kept 50 people happy.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Capacity | How much work a server can finish per second | 1,000 requests/s |
+| Overload | More work arrives than the server can finish | 1,500 requests/s arrive |
+| Queue | Requests waiting their turn | 500 requests waiting in memory |
+| Latency | How long one request takes end to end | 50 ms |
+| Timeout | The client gives up after this long | Client stops waiting after 2 s |
+| HTTP 503 / 429 | "Too busy, try later" status codes | `503` with `Retry-After: 5` |
+| Dependency | Another service your service calls | Product page calls a reviews service |
+| Fallback | A simpler answer used when the real one fails | Show cached prices, hide reviews |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Incoming requests"] --> G{"Room for<br/>this request?"}
+    G -- "no" --> X["Reject fast:<br/>503 + Retry-After"]
+    G -- "yes" --> S["Handle request"]
+    S --> D{"Optional<br/>dependency OK?"}
+    D -- "yes" --> F["Full page"]
+    D -- "no" --> L["Reduced page<br/>(fallback)"]
+```
+
+**Analogy.** A hospital emergency room: triage sees the most urgent patients first and diverts ambulances when beds are full, while the gift shop closes so staff can help.
+Where it breaks: a turned-away patient cannot just retry in one second, but software clients can, and their retries add more load.
+
+**How the rest of this note builds up**
+
+- First, the two problems, overload and partial dependency failure (section 1), and the ER mental model (section 2).
+- Then how shedding and fallbacks work: rejecting early, priorities, adaptive concurrency limits (section 3), with a worked Go example (section 4).
+- Then variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production tuning, LIFO queues, static stability and retry storms (sections 7-8).
+
+> [!tip] Remember
+> When overloaded, say "no" fast to some requests so the rest stay fast, and keep the critical flow alive when optional parts fail.
 
 ## 1. Why it exists
 
@@ -574,3 +620,7 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 - **Before this:** [[Timeouts, Retries and Backoff]], [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]], [[Bulkheads and Concurrency Limits]]
 - **Next:** [[CAP and PACELC]], [[High Availability and Failover]], [[Multi-Region Architecture]]
 - **Compare with:** [[Rate Limiting - Algorithms and Distributed Design]] (per-client quotas), [[Backpressure and Flow Control]] (slowing producers instead of rejecting), [[Feature Flags]] (kill switches), [[Autoscaling]] (adding capacity rather than shedding demand)
+
+### Watch on YouTube
+
+- [Anthropic’s Claude Outage Explained / Rate Limiting, Autoscaling & Load Shedding](https://www.youtube.com/watch?v=0yEeqggdQ9w) · ByteMonk · 12 min · 27,733 views

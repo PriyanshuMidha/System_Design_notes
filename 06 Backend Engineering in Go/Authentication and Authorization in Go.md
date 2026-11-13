@@ -9,7 +9,7 @@ sources:
   - "OWASP Session Management and Authentication Cheat Sheets"
   - "RFC 6749 (OAuth 2.0), RFC 7519 (JWT)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Authentication and Authorization in Go
@@ -24,7 +24,9 @@ updated: 2026-11-07
 > - Authorization is two checks in order: does this role allow the action (RBAC), and does this specific row belong to this caller's workspace (object-level check in the SQL, not just in code).
 > - A refresh token is opaque, stored hashed, and rotated on every use; reusing an old one revokes the whole token family.
 
-The conceptual pieces — what a session is, what a JWT's claims mean, how OAuth's authorization-code flow works — are owned by [[Authentication vs Authorization]], [[Sessions and Cookies]], [[JWT - Structure, Validation and Pitfalls]], [[Access and Refresh Tokens]] and [[OAuth 2.0 and OpenID Connect]] in 12 Security & Auth. This note is the Go implementation that sits behind those concepts: the middleware chain, the token code, and the mistakes that show up only once you write it.
+The conceptual pieces — what a session is, what a JWT's claims mean, how OAuth's authorization-code flow works — are owned by [[Authentication vs Authorization]], [[Sessions and Cookies]], [[JWT - Structure, Validation and Pitfalls]], [[Access and Refresh Tokens]] and [[OAuth 2.0 and OpenID Connect]] in 12 Security & Auth.
+
+This note is the Go implementation that sits behind those concepts: the middleware chain, the token code, and the mistakes that show up only once you write it.
 
 ### Whiteboard version
 
@@ -45,6 +47,51 @@ func RequireAuth(next http.Handler) http.Handler {
 ```
 
 Everything below is what `verify` and the context key actually need to be safe in production: a real claims type, an algorithm allowlist, a typed unexported context key, and a role check layered on top.
+
+## Start here: the basics
+
+**The problem in one story.** An office building has a front desk and many locked rooms.
+The desk checks your ID card to know who you are.
+Each room then checks whether your card is allowed to open that door.
+A web service does the same for every request: first "who is this?", then "may they do this?".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Authentication | Proving who the caller is | Logging in with email and password |
+| Authorization | Deciding what that caller may do | Only an admin may delete a workspace |
+| Hash | One-way scrambling of a value; you cannot turn it back | bcrypt turns `hunter2` into `$2a$12$...` |
+| Session | A random ID the server stores and looks up | Cookie `sid=8f3a...` maps to a user row |
+| JWT | A signed token that carries claims; the server checks the signature | `{"sub":"u_42","exp":...}` plus a signature |
+| Middleware | Code that runs before the handler for every request | `RequireAuth(next)` wraps a route |
+| `context.Context` | Go value that carries request data and deadlines through calls | The verified user ID rides on `ctx` |
+| RBAC | Role-based access control: permissions come from a role | `role=viewer` cannot edit invoices |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R[Request] --> A{Valid token or session?}
+    A -- no --> U[401 Unauthorized]
+    A -- yes --> C[Put user on context]
+    C --> Z{Role and workspace allow it?}
+    Z -- no --> F[403 Forbidden]
+    Z -- yes --> H[Handler runs]
+```
+
+**Analogy.** Authentication is the ID check at the front desk; authorization is the card reader on each door.
+Where it breaks: a JWT is more like a signed letter you carry around; the desk cannot take it back until it expires unless it keeps a separate list.
+
+**How the rest of this note builds up**
+
+- First, why passwords are hashed and how sessions and JWTs differ (sections 1-2).
+- Then the middleware chain that verifies the caller and puts them on the context (section 3).
+- Then a full worked example with bcrypt, JWT parsing with an algorithm allowlist, and role plus workspace checks (section 4).
+- Finally, the SDE-3 deep dive: refresh-token rotation, revocation, and production pitfalls (sections 7-9).
+
+> [!tip] Remember
+> First prove who they are (401 if not), then check what they may touch (403 if not).
 
 ## 1. Why it exists
 
@@ -257,7 +304,9 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 ## 9. Interview questions
 
 > [!question]- Why is pinning the JWT algorithm necessary, and what attack does it stop?
-> Without `WithValidMethods`, a verifier that reads the algorithm from the token's own header can be tricked into accepting `alg: none` (no signature at all) or into using an RSA public key as an HMAC secret (`RS256`→`HS256` confusion), because the public key is, bit for bit, a valid HMAC key. Pinning the expected algorithm server-side makes the token's own header claim irrelevant.
+> Without `WithValidMethods`, a verifier that reads the algorithm from the token's own header can be tricked into accepting `alg: none` (no signature at all) or into using an RSA public key as an HMAC secret (`RS256`→`HS256` confusion), because the public key is, bit for bit, a valid HMAC key.
+>
+> Pinning the expected algorithm server-side makes the token's own header claim irrelevant.
 
 > [!question]- How do you revoke a JWT before it expires?
 > You can't edit a signed JWT's claims, so you check something *besides* the JWT at verify time: a `jti` denylist with a TTL matching the token's remaining life, or a per-user token-version number bumped on logout/password-change and compared against a `ver` claim. Short access-token TTLs (5–15 minutes) shrink the window either way.
@@ -275,7 +324,9 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 > False — it's backwards. Sessions are *trivially* revocable (delete the row). JWTs are stateless specifically because the server does *not* look anything up to verify them, which is exactly what makes revoking one before its natural expiry require extra state (a denylist or token version) that erases some of the statelessness benefit.
 
 > [!question]- Where does rate limiting the login endpoint belong, and what do you rate limit on?
-> Both per-IP and per-account, because an attacker distributing a password-spray attack across many IPs defeats a pure per-IP limit, while a single IP behind NAT legitimately serving many users defeats a pure per-account limit on its own. See [[Redis in Go]] for the token-bucket/Lua implementation; the policy itself (thresholds, lockout duration) is a security decision, not just a Go-code one.
+> Both per-IP and per-account, because an attacker distributing a password-spray attack across many IPs defeats a pure per-IP limit, while a single IP behind NAT legitimately serving many users defeats a pure per-account limit on its own.
+>
+> See [[Redis in Go]] for the token-bucket/Lua implementation; the policy itself (thresholds, lockout duration) is a security decision, not just a Go-code one.
 
 ## 10. Cheat sheet
 
@@ -292,3 +343,8 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 - **Before this:** [[Building REST Endpoints]], [[Middleware]], [[Context Package]]
 - **Next:** [[Redis in Go]] (login rate limiting), [[Calling External APIs]] (an OAuth-protected provider call)
 - **Compare with:** [[Password Storage and Login Security]], [[JWT - Structure, Validation and Pitfalls]], [[Access and Refresh Tokens]], [[Sessions and Cookies]], [[OAuth 2.0 and OpenID Connect]]
+
+### Watch on YouTube
+
+- [#36 Golang - Mastering JWT Authentication](https://www.youtube.com/watch?v=XFxm6NEWakQ) · codeHeim · full JWT auth implementation walkthrough in Go
+- [JWT Role-Based Authorization in Golang / Secure APIs with Gin Middleware](https://www.youtube.com/watch?v=Sh3i2BUDr-g) · The Exception Handler · covers the RBAC/authorization half specifically

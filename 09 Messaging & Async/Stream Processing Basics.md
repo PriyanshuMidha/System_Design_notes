@@ -11,7 +11,7 @@ sources:
   - "Carbone et al., Lightweight Asynchronous Snapshots for Distributed Dataflows (2015)"
   - "Apache Kafka Streams documentation: Core Concepts, Windowing, processing.guarantee, State stores"
   - "Kreps, Questioning the Lambda Architecture (2014)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Stream Processing Basics
@@ -25,6 +25,52 @@ updated: 2026-11-04
 > - A **window** groups events by time: tumbling (fixed, no overlap), hopping/sliding (fixed, overlapping) or session (closed by a gap of inactivity).
 > - A **watermark** says "no events older than T should still arrive"; a window is emitted when the watermark passes its end. Later events are **late data**: dropped, sent to a side output, or used to update the result.
 > - Checkpoints snapshot state together with input offsets, so a restart rewinds both and the state is exactly-once even though input is replayed.
+
+## Start here: the basics
+
+**The problem in one story**
+A shop wants to show "orders in the last minute" on a live screen.
+Orders never stop coming, so there is no "end of the file" to wait for.
+Some phones send their orders late, after losing signal.
+The screen must still show the right number for each minute, even if the counting program crashes.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Event | One small record of something that happened | `{"ad":"ad-1","time":"10:00:05"}` |
+| Stream | An endless sequence of events | All clicks, forever |
+| Batch job | A program that runs once over a finished set of data | A nightly report over yesterday's file |
+| Kafka topic / partition | A durable log of events, split into parallel pieces | Topic `clicks` with 12 partitions |
+| Offset | The position of an event in a partition | "I have read up to event 81,233" |
+| State | Data the program remembers between events | A running count per campaign |
+| Key | The field used to group events | `campaign_id` |
+| Window | A time bucket that groups events | All clicks from 10:00 to 10:01 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    E["events arrive<br/>(some late)"] --> B["put each in its<br/>time bucket (window)"]
+    B --> W{"watermark says<br/>bucket complete?"}
+    W -- yes --> O["emit the count"]
+    W -- no --> B
+    B -. "save counts + position" .-> C[("checkpoint")]
+```
+
+**Analogy**
+A clerk tallies cars per minute using the time stamped on each car's ticket, waits a little for slow cars, then reports the minute.
+Where it breaks: a real clerk is one person; a stream processor splits the tally across many machines by key.
+
+**How the rest of this note builds up**
+
+- First, why batch jobs and naive counters fail (section 1) and the toll-plaza mental model (section 2).
+- Then the mechanics: the pipeline, event time vs processing time, watermarks, windows and checkpoints (section 3).
+- Then a worked example with Go code and Flink SQL (section 4), and the tools to choose from (section 5).
+- Finally the SDE-3 depth: trade-offs, production failures, triggers, state rescaling and clock skew (sections 6-8).
+
+> [!tip] Remember
+> Bucket by when it happened (event time), close buckets with a watermark, and checkpoint state together with input position.
 
 ## 1. Why it exists
 
@@ -74,7 +120,14 @@ flowchart LR
 | Ingestion time | When the event entered the broker | A compromise when events carry no timestamp |
 | Processing time | Clock of the machine processing it | Lowest latency where approximate results are fine (live dashboards) |
 
-A **watermark** is a special marker flowing with the events that carries a time `W` and asserts "events with timestamp ≤ W are complete". The common heuristic is **bounded out-of-orderness**: `W = max event time seen − allowed delay`. A small delay emits results sooner but sends more events to late handling; a large delay is more complete but slower. With several input partitions, an operator's watermark is the **minimum** across its inputs, so one idle or slow partition holds everything back (Flink's `withIdleness` marks idle sources so they do not).
+A **watermark** is a special marker flowing with the events that carries a time `W` and asserts "events with timestamp ≤ W are complete".
+
+The common heuristic is **bounded out-of-orderness**: `W = max event time seen − allowed delay`.
+
+- A small delay emits results sooner but sends more events to late handling.
+- A large delay is more complete but slower.
+
+With several input partitions, an operator's watermark is the **minimum** across its inputs, so one idle or slow partition holds everything back (Flink's `withIdleness` marks idle sources so they do not).
 
 ### Windows
 
@@ -113,7 +166,14 @@ stateDiagram-v2
 
 ### Checkpoints and exactly-once state
 
-Flink injects **checkpoint barriers** into each source partition. When an operator has received the barrier on all inputs, it snapshots its state asynchronously and passes the barrier on. When every operator has acknowledged, the checkpoint (state plus the source offsets at the barrier) is complete. On failure the job restarts from the last complete checkpoint: offsets rewind, state rewinds to match, and replayed events rebuild exactly the same state. This is a variant of the Chandy-Lamport snapshot algorithm.
+Flink's checkpoint, step by step:
+
+1. Flink injects **checkpoint barriers** into each source partition.
+2. When an operator has received the barrier on all inputs, it snapshots its state asynchronously and passes the barrier on.
+3. When every operator has acknowledged, the checkpoint (state plus the source offsets at the barrier) is complete.
+4. On failure the job restarts from the last complete checkpoint: offsets rewind, state rewinds to match, and replayed events rebuild exactly the same state.
+
+This is a variant of the Chandy-Lamport snapshot algorithm.
 
 Kafka Streams keeps each state store in local RocksDB, backed by a compacted **changelog topic**; with `processing.guarantee=exactly_once_v2` it writes state changes, output records and input offsets in one Kafka transaction.
 
@@ -409,3 +469,8 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 - **Before this:** [[Kafka and Event Streaming]], [[Message Ordering and Partition Keys]], [[Delivery Semantics and Exactly-Once]]
 - **Next:** [[Case Study - Metrics and Logging Platform]], [[Case Study - Leaderboard and Top-K]], [[Time-Series and Columnar Storage]]
 - **Compare with:** [[Workflow Engines and Durable Execution]] (durable per-request flows rather than continuous aggregates), [[CQRS]] (stream-fed read models), [[Clocks and Ordering]]
+
+### Watch on YouTube
+
+- [What's Stream Processing + When Do We Use It?  / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=7PjPhgCoT9c) · Jordan has no life · 13 min · 42,217 views
+- [Intro to Stream Processing with Apache Flink / Apache Flink 101](https://www.youtube.com/watch?v=WajYe9iA2Uk) · Confluent, an IBM Company · 7 min · 81,525 views

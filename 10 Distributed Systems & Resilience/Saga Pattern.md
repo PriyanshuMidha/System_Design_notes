@@ -11,7 +11,7 @@ sources:
   - "AWS Step Functions documentation: Standard workflows, Retry and Catch"
   - "Camunda 8 documentation: BPMN compensation events"
   - "Stripe API documentation: PaymentIntents with capture_method=manual (authorize, then capture)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Saga Pattern
@@ -25,6 +25,50 @@ updated: 2026-11-04
 > - Order the steps: compensatable steps first, then one pivot (the point of no return), then retriable steps that must eventually succeed.
 > - Sagas are atomic in the end (all or compensated) but not isolated: other requests can see half-finished work.
 > - Classic mistake: charging the card before reserving stock, so every stock-out turns into a refund.
+
+## Start here: the basics
+
+**The problem in one story.**
+You buy a keyboard online.
+The shop must reserve the item, charge your card and book a courier, and each step lives in a different service.
+If the courier booking fails after your card was charged, someone must give your money back.
+A saga is the plan that runs these steps in order and runs "undo" steps when a later one fails.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Service | A separate program owning its own data | Inventory service, Payments service |
+| Transaction | A group of changes that all happen or none do | `BEGIN ... COMMIT` in PostgreSQL |
+| Commit | Making a change permanent | Stock row updated and saved |
+| Rollback | Cancelling uncommitted changes in one database | `ROLLBACK` before commit |
+| Compensation | A new action that undoes an earlier one in business terms | Refund the charge |
+| Idempotent | Safe to run twice with the same result | Refund #77 only refunds once |
+| Orchestrator | One component that tells each step what to do | A checkout workflow runner |
+| Event | A message saying something happened | `PaymentCharged` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Reserve stock"] --> P["Charge card"]
+    P --> S["Book courier"]
+    S -- "fails" --> RF["Refund card"]
+    RF --> RL["Release stock"]
+```
+
+**Analogy.** Booking a trip by phone: flight, then hotel, then car; if no car is available, you call and cancel the hotel and the flight.
+Where it breaks: phone cancellations are done by you on the spot, but a saga must survive crashes, so it writes down every step it finished.
+
+**How the rest of this note builds up**
+
+- First, why one big transaction across services is not possible (section 1) and the core terms (section 2).
+- Then how sagas work: compensations, step order with a pivot, orchestration vs choreography (section 3), with a worked Go orchestrator (section 4).
+- Then variants and trade-offs versus two-phase commit (sections 5-6).
+- Finally the SDE-3 deep dive: lack of isolation and its countermeasures, stuck sagas and workflow engines in production (sections 7-8).
+
+> [!tip] Remember
+> A saga is a chain of local commits with an undo step for each, run in reverse when a later step fails.
 
 ## 1. Why it exists
 
@@ -188,7 +232,9 @@ This is not yet safe: it forgets everything if the process crashes, it would und
 
 ### Go: an orchestrator with a saga log
 
-The orchestrator below validates the step order, writes a log entry after every step, retries retriable steps and compensations with exponential backoff, parks the saga as `Stuck` when a post-pivot step keeps failing, and can `Resume` from the log after a crash. Sleep is injected so the tests are deterministic. It passes `go vet` and `go test -race` on Go 1.24.
+The orchestrator below validates the step order, writes a log entry after every step, retries retriable steps and compensations with exponential backoff, parks the saga as `Stuck` when a post-pivot step keeps failing, and can `Resume` from the log after a crash.
+
+Sleep is injected so the tests are deterministic. It passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 package saga
@@ -714,3 +760,8 @@ An orchestrator is stateless code over the `saga_instance` table, so it scales h
 - **Before this:** [[Transactions and ACID]], [[Two-Phase Commit]], [[Transactional Outbox and CDC]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[Workflow Engines and Durable Execution]], [[CQRS]], [[Event Sourcing]], [[Case Study - Payment System]]
 - **Compare with:** [[Two-Phase Commit]] (atomic and isolated, but blocking), [[Patterns/State Machines in Go]] (the orchestrator is a persisted state machine)
+
+### Watch on YouTube
+
+- [Distributed Transactions Explained: 2 Phase Commit vs Saga Pattern](https://www.youtube.com/watch?v=DOFflggE_0Q) · Hello Interview · 14 min · 305,485 views
+- [Saga Pattern / Distributed Transactions / Microservices](https://www.youtube.com/watch?v=d2z78guUR4g) · ByteMonk · 17 min · 140,357 views

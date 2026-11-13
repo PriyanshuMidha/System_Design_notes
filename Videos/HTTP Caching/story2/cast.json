@@ -1,0 +1,38 @@
+{
+  "N": {
+    "voice": "en-US-EmmaMultilingualNeural",
+    "rate": 4,
+    "pitch": 0,
+    "volume": 0
+  },
+  "BEN": {
+    "voice": "en-US-ChristopherNeural",
+    "rate": 4,
+    "pitch": 2,
+    "volume": 0
+  },
+  "FRAN": {
+    "voice": "en-US-JennyNeural",
+    "rate": 6,
+    "pitch": 2,
+    "volume": 0
+  },
+  "CARL": {
+    "voice": "en-GB-RyanNeural",
+    "rate": -2,
+    "pitch": -2,
+    "volume": 0
+  },
+  "OLGA": {
+    "voice": "en-US-AriaNeural",
+    "rate": 0,
+    "pitch": 0,
+    "volume": 0
+  },
+  "VERA": {
+    "voice": "en-AU-NatashaNeural",
+    "rate": 2,
+    "pitch": 2,
+    "volume": 0
+  }
+}

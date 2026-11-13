@@ -9,13 +9,19 @@ sources:
   - "PostgreSQL 17 docs, UPDATE (conditional update with WHERE), INSERT ... ON CONFLICT"
   - "PostgreSQL 17 docs, CHECK constraints and unique indexes"
   - "IETF draft-ietf-httpapi-idempotency-key-header (Idempotency-Key HTTP header)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Digital Wallet and Ledger
 
 > [!summary] TL;DR
-> A wallet is a set of accounts whose money moves only through **ledger transactions**: each transaction writes two or more immutable entries that sum to zero (double entry). The balance is the sum of an account's entries, kept as a cached number that a reconciliation job checks. Each transfer carries an idempotency key, guarded by a lease while it runs and by a unique transaction ID in the ledger, so a retry never moves money twice. The balance check and the append happen atomically, so concurrent transfers can never overdraw. Mistakes are fixed by posting a reversal, never by deleting or editing entries.
+> A wallet is a set of accounts whose money moves only through **ledger transactions**: each transaction writes two or more immutable entries that sum to zero (double entry).
+>
+> The balance is the sum of an account's entries, kept as a cached number that a reconciliation job checks.
+>
+> Each transfer carries an idempotency key, guarded by a lease while it runs and by a unique transaction ID in the ledger, so a retry never moves money twice.
+>
+> The balance check and the append happen atomically, so concurrent transfers can never overdraw. Mistakes are fixed by posting a reversal, never by deleting or editing entries.
 
 > [!abstract] Core idea
 > - Money never appears or disappears: every transaction's entries sum to zero; top-ups come from a system account that may go negative.
@@ -24,6 +30,52 @@ updated: 2026-11-04
 > - Idempotency key: a lease while in progress, a saved receipt when done, and the key as the ledger transaction ID so even a stale worker cannot post twice.
 > - A reversal is a new transaction with every leg negated and a link to the original.
 > - Classic mistakes: `balance -= amount` without a check under concurrency, `float64` money, deleting a wrong entry, and an idempotency check that is not atomic with the write.
+
+## Start here: the basics
+
+**The problem in one story.**
+You send 500 rupees to a friend in a wallet app.
+Your balance must go down by exactly 500 and theirs up by exactly 500, even if you tap "Pay" twice or the network retries.
+Money must never appear from nowhere or vanish.
+A ledger, like an accountant's book, is how the app keeps this promise.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Account | A named bucket of money | Alice's wallet |
+| Ledger | An append-only book of every money movement | One row per entry |
+| Entry | One line in the ledger: an account and an amount (+ or -) | Alice -500 |
+| Double entry | Every transaction's entries add up to zero | Alice -500, Bob +500 |
+| Balance | The sum of an account's entries | 1000 - 500 = 500 |
+| Idempotency key | A unique ID per request so a retry does the work only once | `pay-7f3a` sent twice, moved once |
+| Atomic | Happens all at once or not at all | Check funds and debit together |
+| Reversal | A new transaction that undoes an old one | Alice +500, Bob -500 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Transfer request<br/>+ idempotency key"] --> K{"Key seen<br/>before?"}
+    K -- "yes" --> Old["Return saved receipt"]
+    K -- "no" --> C{"Enough<br/>balance?"}
+    C -- "no" --> E["Insufficient funds"]
+    C -- "yes" --> W["Write entries<br/>Alice -500, Bob +500"]
+    W --> Done["Save receipt"]
+```
+
+**Analogy.** A bank passbook written in pen: you never erase a line, you add a correcting line.
+Where it breaks: a passbook has one writer at a time; a wallet has many concurrent requests, so the funds check and the write must be one atomic step.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and Steps 1-4: requirements, actors, entities (account, transaction, entry) and how they relate.
+- Then Steps 5-7: the API and idempotency responses, the PostgreSQL schema and conditional `UPDATE`, and patterns.
+- Then Step 8 and the test cases: the Go ledger and wallet code, plus tests for concurrency, retries and reversals.
+- Finally the SDE-3 depth: edge cases, leases and fencing for idempotency keys, reconciliation and trade-offs.
+
+> [!tip] Remember
+> Entries are append-only and sum to zero; check and debit in one atomic step; one key, one effect.
 
 ## Problem statement
 
@@ -188,7 +240,9 @@ var _ WalletService = (*Wallet)(nil) // compile-time check
 
 ## Step 6: Storage and repositories
 
-In production the ledger is in PostgreSQL 17, and the database enforces most invariants, not only the Go code: unique transaction IDs, at most one reversal, non-zero entries and no negative user balance. The rule that a transaction's entries sum to zero is not expressible as a plain `CHECK`; the posting code enforces it, and a deferred constraint trigger or the reconciliation query catches any violation.
+In production the ledger is in PostgreSQL 17, and the database enforces most invariants, not only the Go code: unique transaction IDs, at most one reversal, non-zero entries and no negative user balance.
+
+The rule that a transaction's entries sum to zero is not expressible as a plain `CHECK`; the posting code enforces it, and a deferred constraint trigger or the reconciliation query catches any violation.
 
 ```sql
 CREATE TABLE accounts (
@@ -239,7 +293,13 @@ INSERT INTO entries (tx_id, account_id, amount) VALUES ($1, $2, -$4), ($1, $3, $
 COMMIT;
 ```
 
-The conditional `UPDATE` takes a row lock on the `from` account, so two concurrent debits on the same account serialise: the second waits, then re-checks `balance >= $amount` against the committed value under READ COMMITTED. That is why the check and the debit must be in one statement, not a `SELECT` followed by an `UPDATE`. When a transfer touches two user accounts, lock them in a fixed order (for example by ID) to avoid deadlocks between A to B and B to A. The trade-offs of row locks versus version checks are in [[Locking - Optimistic vs Pessimistic]].
+The conditional `UPDATE` takes a row lock on the `from` account, so two concurrent debits on the same account serialise: the second waits, then re-checks `balance >= $amount` against the committed value under READ COMMITTED.
+
+That is why the check and the debit must be in one statement, not a `SELECT` followed by an `UPDATE`.
+
+When a transfer touches two user accounts, lock them in a fixed order (for example by ID) to avoid deadlocks between A to B and B to A.
+
+The trade-offs of row locks versus version checks are in [[Locking - Optimistic vs Pessimistic]].
 
 The reconciliation query. On a healthy ledger it returns no rows (representative output, PostgreSQL 17):
 
@@ -1117,10 +1177,14 @@ stateDiagram-v2
 > A balance column only says where you are, not how you got there. Entries that sum to zero per transaction make every paisa traceable: money moves between accounts, it is never created by an `UPDATE`. They also let you detect bugs, because the cached balance must equal the sum of entries and the ledger must sum to zero.
 
 > [!question]- Trap: "I check the balance with SELECT, and if it is enough I run UPDATE balance = balance - x." What is wrong?
-> Two concurrent requests both read 1000, both pass the check, both subtract 600, and the balance ends at -200. The check and the write must be one atomic step: `UPDATE ... SET balance = balance - x WHERE id = $1 AND balance >= x` and treat 0 rows as insufficient funds, or `SELECT ... FOR UPDATE` first. A `CHECK (balance >= 0)` constraint is the backstop.
+> Two concurrent requests both read 1000, both pass the check, both subtract 600, and the balance ends at -200.
+>
+> The check and the write must be one atomic step: `UPDATE ... SET balance = balance - x WHERE id = $1 AND balance >= x` and treat 0 rows as insufficient funds, or `SELECT ... FOR UPDATE` first. A `CHECK (balance >= 0)` constraint is the backstop.
 
 > [!question]- Why does the idempotency key need a lease, and why is the lease not enough on its own?
-> Without a lease, a crashed request would block its key forever, or two copies could both start. The lease makes duplicates wait (409) and lets a retry take over after expiry. But a stale worker can wake up after its lease expired and still post, so the key is also the ledger transaction ID with a unique constraint; that is the fencing that makes the effect exactly once.
+> Without a lease, a crashed request would block its key forever, or two copies could both start. The lease makes duplicates wait (409) and lets a retry take over after expiry.
+>
+> But a stale worker can wake up after its lease expired and still post, so the key is also the ledger transaction ID with a unique constraint; that is the fencing that makes the effect exactly once.
 
 > [!question]- A worker posts the transfer and crashes before saving the response. What does the retry see?
 > The lease expires, the retry acquires a new token, and its post fails with a duplicate transaction ID. The wallet treats that as "already done", builds the receipt from the existing transaction and saves it. The client gets success, and money moved once.
@@ -1155,3 +1219,8 @@ I model money as a double-entry ledger: a transaction is two or more immutable e
 - **Before this:** [[LLD Interview Method]], [[Concurrency for LLD]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[LLD Problem Cheat Sheet]]
 - **Compare with:** [[Case Study - Payment System]] (the system-level design), [[Locking - Optimistic vs Pessimistic]] (the database locking side), [[Splitwise Expense Sharing]] (balances without real money movement), [[Order Book Matching Engine]]
+
+### Watch on YouTube
+
+- [Digital Wallet Ledger Architecture  Building Scalable, Consistent, and Fraud Resistant Payment Syste](https://www.youtube.com/watch?v=37tEgwLcUrQ) · SystemDesignPrep · 7 min · 785 views
+- [An Interoperable and Secure E-Wallet  based on Digital Ledger Technology using Blockchain](https://www.youtube.com/watch?v=5o7wxGHDzk0) · karan singh · 5 min · 28 views

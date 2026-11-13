@@ -14,7 +14,7 @@ sources:
   - "MongoDB docs, 2dsphere indexes"
   - "Elasticsearch docs, geo_point field type (BKD-tree indexing)"
   - "Finkel and Bentley, Quad Trees: A Data Structure for Retrieval on Composite Keys (Acta Informatica, 1974)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Geospatial Indexing
@@ -27,6 +27,53 @@ updated: 2026-11-04
 > - Most systems turn 2-D positions into **cells** with IDs that can be indexed: geohash strings, S2 or H3 cell IDs, quadtree nodes.
 > - A proximity query always has two steps: **coarse filter** (scan the cell plus its neighbours) then **exact filter** (true distance on the candidates).
 > - Classic mistake: searching only the cell that contains the point. A driver 50 m away across the cell edge is missed; always include the neighbouring cells.
+
+## Start here: the basics
+
+**The problem in one story**
+
+You open a ride app and ask for a cab.
+The app must find drivers within 2 km of you, out of a million drivers moving around the world.
+Checking the distance to every driver on every request is far too slow.
+It needs a way to look only at drivers who are already "in your area".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Latitude / longitude | Two numbers that give a point on Earth | (12.97, 77.59) is Bengaluru |
+| Index | A structure that finds rows without scanning everything | B-tree on `user_id` |
+| B-tree | A sorted tree index over one value | Finds `age BETWEEN 20 AND 30` fast |
+| Cell | A small area of the map with an ID | Geohash `tdr1v` |
+| Geohash | A string ID for a rectangle; shared prefix means nearby | `tdr1v` lies inside `tdr1` |
+| Quadtree | A tree that splits a square into 4 smaller squares | Split only where many points are |
+| Haversine | Formula for true distance on a sphere | Distance between two lat/lng points in km |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  Q[Point + radius] --> C[Find my cell]
+  C --> N[Add neighbour cells]
+  N --> K[Candidates in those cells]
+  K --> E[Exact distance check]
+  E --> R[Results]
+```
+
+**Analogy**
+
+A city is divided into postal codes: to find nearby shops you look in your postal code and the codes next to it, then measure the real walk.
+Where it breaks: postal codes have uneven, odd shapes, while geohash cells are regular grid rectangles that also distort near the poles.
+
+**How the rest of this note builds up**
+
+- First why one B-tree is not enough and the mental model of cells (sections 1-2).
+- Then how geohash, quadtrees, S2 and H3 work (section 3).
+- Then a worked example with real queries and code (section 4).
+- Finally variants, trade-offs, production systems and the SDE-3 deep dive (sections 5-8).
+
+> [!tip] Remember
+> Turn 2-D points into cell IDs, search your cell plus its neighbours, then check true distance.
 
 ## 1. Why it exists
 
@@ -611,3 +658,8 @@ sequenceDiagram
 - **Before this:** [[Indexing Fundamentals]], [[Index Types and Index Design]], [[Partitioning and Sharding]]
 - **Next:** [[Case Study - Ride Sharing and Proximity]]
 - **Compare with:** [[Ride Sharing]] and [[Delivery Partner Assignment]] (class-level matching logic), [[Search Engines and Inverted Indexes]] (geo filters in search)
+
+### Watch on YouTube
+
+- [DB Indexing in System Design Interviews - B-tree, Geospatial, Inverted Index, and more!](https://www.youtube.com/watch?v=BHCSL_ZifI0) · Hello Interview · 14 min · 286,664 views
+- [Geospatial Indexing Explained / Geohashing, Quadtrees & R-Trees](https://www.youtube.com/watch?v=cnKTS6THXO0) · Kartikeya Sharma · 9 min · 2,733 views

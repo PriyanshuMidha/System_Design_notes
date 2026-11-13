@@ -11,13 +11,15 @@ sources:
   - "curl man page, --write-out variables (time_namelookup, time_connect, time_appconnect, time_starttransfer)"
   - "Go net/http/pprof package docs (goroutine profile, debug=2)"
   - "Stripe API docs, Idempotent requests (Idempotency-Key header)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Third-Party Dependency Outage
 
 > [!summary] TL;DR
-> A third-party dependency (payment provider, SMS gateway, maps API, identity provider) is slow or down, and your service is hurting because of it. You cannot fix their system. Your job is to **stop their problem from becoming yours**: prove it is them in two minutes, cap how long you wait, stop sending traffic that will fail, switch to a fallback or queue the work, and tell users honestly what still works.
+> A third-party dependency (payment provider, SMS gateway, maps API, identity provider) is slow or down, and your service is hurting because of it. You cannot fix their system.
+>
+> Your job is to **stop their problem from becoming yours**: prove it is them in two minutes, cap how long you wait, stop sending traffic that will fail, switch to a fallback or queue the work, and tell users honestly what still works.
 
 > [!abstract] Core idea
 > - **Prove it is them, quickly.** One `curl -w` timing breakdown from a pod plus your outbound error and latency metrics tells you whether the dependency or your own code is at fault.
@@ -40,6 +42,50 @@ flowchart LR
     F --> G["Postmortem<br/>fix the missing guard"]
 ```
 
+## Start here: the basics
+
+**The problem in one story.**
+Your shop uses an outside company to take card payments.
+One evening their system gets very slow.
+Your checkout keeps waiting on them, requests pile up, and soon your whole site is slow, even pages that never touch payments.
+You cannot fix their system; you can only protect yours.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Third-party dependency | An outside service your code calls | Payment provider, SMS gateway |
+| Timeout | The longest you agree to wait for an answer | Give up after 2 seconds |
+| Retry | Trying a failed call again | Try up to 3 times |
+| Circuit breaker | A switch that stops calling a service that keeps failing | After 50% errors, fail fast for 30 s |
+| Fallback | A backup answer or path when the call fails | Show cached price, use a second SMS vendor |
+| Cascading failure | One slow part dragging everything that waits on it down | Goroutines pile up waiting on a slow API |
+| Idempotency key | An ID that makes repeating a request safe | Same key twice = charged once |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User request"] --> S["Your service"]
+    S --> T{"Vendor<br/>healthy?"}
+    T -- "yes" --> OK["Normal response"]
+    T -- "slow or down" --> B["Timeout + circuit breaker"]
+    B --> F["Fallback, queue,<br/>or feature off"]
+```
+
+**Analogy.** A restaurant whose fish supplier stops delivering. A good manager stops promising fish, offers other dishes, and tells customers honestly.
+Where it breaks: a supplier's delay does not make your kitchen freeze, but a slow API can tie up all your threads and freeze your service.
+
+**How the rest of this note builds up**
+
+- First, why outside outages become your outages (section 1), and the confirm, contain, degrade, recover model (section 2).
+- Then the hands-on steps: prove it is the vendor, check fast vs slow failure, pull the four levers (section 3).
+- Then a worked payment incident, variants and trade-offs (sections 4-6).
+- Finally the SDE-3 depth: production guards, retry amplification and bulkheads, safe recovery with idempotency (sections 7-8).
+
+> [!tip] Remember
+> You cannot fix the vendor; cap the wait, stop calling, fall back, and tell users the truth.
+
 ## 1. Why it exists
 
 Every modern product leans on vendors you do not control: a payment service provider (PSP), an SMS or email gateway, a maps or geocoding API, a KYC check, an auth provider. When one of them has a bad hour, your dashboards go red even though you deployed nothing.
@@ -60,7 +106,11 @@ The hard part is human, not technical. Engineers keep digging through their own 
 
 ## 2. Mental model
 
-Think of your service as a restaurant and the vendor as the only supplier of one ingredient. If the supplier's truck is late, a good restaurant does three things: stops promising dishes that need the ingredient, offers a substitute, and tells guests honestly at the door. A bad restaurant keeps taking orders for that dish, and the kitchen fills up with tickets nobody can complete until the whole kitchen is jammed.
+Think of your service as a restaurant and the vendor as the only supplier of one ingredient.
+
+If the supplier's truck is late, a good restaurant does three things: stops promising dishes that need the ingredient, offers a substitute, and tells guests honestly at the door.
+
+A bad restaurant keeps taking orders for that dish, and the kitchen fills up with tickets nobody can complete until the whole kitchen is jammed.
 
 Where the analogy breaks: a kitchen can see the empty shelf. Software only sees a slow response and cannot tell "slow" from "dead" without a timeout. That is why timeouts come first.
 
@@ -326,7 +376,11 @@ Different vendor types call for different degraded behaviour.
 
 ## 8. Deep dive
 
-**Why slow beats down in damage.** Little's Law says concurrent requests in the system equals arrival rate times time in system (L = lambda x W). With 500 requests per second and a normal 200 ms vendor call, you hold about 100 requests in flight. If the vendor slows to 20 s, you hold 10,000, which is 100 times more memory, connections and goroutines, with no change in traffic. This is why the cap on W (the timeout) matters more than almost any other setting.
+**Why slow beats down in damage.** Little's Law says concurrent requests in the system equals arrival rate times time in system (L = lambda x W).
+
+With 500 requests per second and a normal 200 ms vendor call, you hold about 100 requests in flight.
+
+If the vendor slows to 20 s, you hold 10,000, which is 100 times more memory, connections and goroutines, with no change in traffic. This is why the cap on W (the timeout) matters more than almost any other setting.
 
 **Retry amplification.** If each layer makes up to 3 attempts and there are 3 layers (client, gateway, service), a single user request can produce 27 vendor calls (3 x 3 x 3).
 
@@ -342,7 +396,9 @@ The fix is retries at one layer only, plus a **retry budget** (for example, retr
 
 **Bulkheads.** Give each dependency its own connection pool or concurrency semaphore. When the SMS gateway hangs, it can exhaust only its 50 slots, not the shared pool the PSP and database use. See [[Bulkheads and Concurrency Limits]].
 
-**Idempotency during recovery.** The danger window is a request that timed out on your side but succeeded on the vendor's side. Without an idempotency key your retry creates a second charge. With a stable key per logical payment, the vendor returns the original result. Also run a **reconciliation job** that compares your records against the vendor's settlement report, because no amount of retry logic removes all ambiguity.
+**Idempotency during recovery.** The danger window is a request that timed out on your side but succeeded on the vendor's side. Without an idempotency key your retry creates a second charge.
+
+With a stable key per logical payment, the vendor returns the original result. Also run a **reconciliation job** that compares your records against the vendor's settlement report, because no amount of retry logic removes all ambiguity.
 
 **Fail open or fail closed.** Decide per dependency, in advance, in writing. Rate limiter backing store down: fail open (let traffic through). Fraud check down: maybe fail open below a transaction value and fail closed above. KYC down: fail closed. This is a product and risk decision, so involve those owners before an incident.
 
@@ -351,7 +407,11 @@ The fix is retries at one layer only, plus a **retry budget** (for example, retr
 ## 9. Interview questions
 
 > [!question]- Your payment provider is returning slow responses and your whole service is degrading. What do you do?
-> Confirm it is the vendor with a `curl -w` timing from a pod and outbound error and latency metrics. Mitigate before diagnosing: cut the timeout, cap retries, open the circuit breaker, queue payments with idempotency keys, and flip a flag to a fallback or secondary vendor. Communicate on the status page and in the product. After recovery, drain the queue at a controlled rate and run a postmortem on the missing guards.
+> Confirm it is the vendor with a `curl -w` timing from a pod and outbound error and latency metrics.
+>
+> Mitigate before diagnosing: cut the timeout, cap retries, open the circuit breaker, queue payments with idempotency keys, and flip a flag to a fallback or secondary vendor. Communicate on the status page and in the product.
+>
+> After recovery, drain the queue at a controlled rate and run a postmortem on the missing guards.
 
 > [!question]- Why is a slow dependency more dangerous than a dead one?
 > A dead dependency fails fast, so resources are released immediately. A slow one holds goroutines, connections and memory for the full wait. By Little's Law, in-flight requests equal arrival rate times latency, so a 100 times slower vendor means 100 times more resources held, and the service collapses even though traffic did not change.
@@ -388,3 +448,8 @@ The fix is retries at one layer only, plus a **retry budget** (for example, retr
 - **Related playbooks:** [[Playbook - TLS Certificate and DNS Failures]]
 - **Tools:** [[Network Debugging Toolkit - dig, curl, ss, tcpdump]], [[Debugging Memory Leaks and OOMs in Go]], [[Metrics and Prometheus]]
 - **After the incident:** [[Postmortems and Root Cause Analysis]], [[Secrets Management]]
+
+### Watch on YouTube
+
+- [A Real Production Incident Every SRE Should Learn From Third-Party Dependency Failure](https://www.youtube.com/watch?v=AaEej0_CQGU) · Tech Apricate · 14 min · 2,865 views
+- [Unveiling Third-Party Risks: Key Lessons from the AWS Outage Breakdown](https://www.youtube.com/watch?v=Dz6j-cHdPKQ) · Resilient Foundations · 16 min · 17 views

@@ -9,7 +9,7 @@ sources:
   - "Robert C. Martin, Clean Architecture (2017), ch. 22, The Dependency Rule"
   - "Melvin Conway, How Do Committees Invent? (Datamation, 1968)"
   - "Go blog, Package names (go.dev/blog/package-names)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Architecture Fundamentals - Coupling, Cohesion and Dependency Direction
@@ -24,13 +24,56 @@ updated: 2026-11-07
 > - Go gives you three structural tools for this: packages, the `internal/` directory, and interfaces declared where they are consumed, not where they are implemented.
 > - There is no one correct architecture. The right one depends on domain complexity, team size and how many external systems you integrate with, and it is allowed to change as the service grows.
 
+## Start here: the basics
+
+**The problem in one story.**
+You change how invoices are saved to the database.
+Suddenly the email code, the PDF code and three tests break.
+They all knew details they never needed.
+This note is about drawing lines so one change stays in one place.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Module / package | A folder of code with one name you import | `internal/invoice` |
+| Dependency | Code A needs code B to compile or run | `invoice` imports `database/sql` |
+| Coupling | How much A must know about B | Handler reads SQL column names directly |
+| Cohesion | How well the things inside one module belong together | All invoice rules in one package |
+| Interface | A named list of methods, with no code behind it | `type Repo interface { Save(Invoice) error }` |
+| Boundary | A line between parts that change for different reasons | Business rules vs. database code |
+| `internal/` | A Go folder that only its parent tree may import | `svc/internal/domain` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    H["HTTP handler<br/>(changes often)"] --> D["Business rules<br/>(changes rarely)"]
+    DB["Postgres adapter<br/>(changes often)"] -- "implements interface<br/>declared by" --> D
+```
+
+**Analogy.** A wall socket: your lamp depends on the socket shape, not on the power plant. The power company can change plants without you buying a new lamp.
+Where it breaks: a socket standard is fixed for decades; your own interfaces will need to change as the business changes.
+
+**How the rest of this note builds up**
+
+- First, why boundaries matter (section 1) and a mental model of coupling vs. cohesion (section 2).
+- Then how dependency direction and dependency inversion work in Go packages (section 3), with a worked example (section 4).
+- Then package-by-layer vs. package-by-feature and other variants (section 5), and when not to bother (section 6).
+- Finally the SDE-3 view: Conway's law and team boundaries, production pitfalls, and the deep dive (sections 3, 7-8).
+
+> [!tip] Remember
+> Low coupling, high cohesion, and dependencies point toward the code that changes least.
+
 ## 1. Why it exists
 
 A two-person team building InvoiceOps starts with one package: `main.go` calls the Postgres driver directly inside the HTTP handler that creates an invoice. For the first month this is the fastest way to ship.
 
 By month four, three things have happened: a second engineer needs to add Razorpay webhook handling without breaking invoice creation; product wants an integration test that creates an invoice without a running Postgres; and a bug slips through because a handler silently skipped the "amount must be positive" rule that lived only in that one handler's `if` statement, not in a second handler that also creates invoices.
 
-None of these are bugs in the code that exists — they are costs of *where the boundaries are*. The business rule "an invoice amount must be positive" has no single home, so it can be forgotten in a second handler. The HTTP handler and the SQL driver are one unit, so testing one means running the other. These are architecture problems: who talks to whom, and in which direction.
+None of these are bugs in the code that exists — they are costs of *where the boundaries are*. The business rule "an invoice amount must be positive" has no single home, so it can be forgotten in a second handler.
+
+The HTTP handler and the SQL driver are one unit, so testing one means running the other. These are architecture problems: who talks to whom, and in which direction.
 
 **Measured, in this vault's own history:** the old note this one replaces (`Architecture Patterns Content Table`) scored about half "real content" against a template — roughly half its lines were definitions without ever drawing the dependency arrows a reader needs to apply them. This note exists to fix that: concrete arrows, not just names.
 
@@ -81,11 +124,15 @@ flowchart TB
     end
 ```
 
-Package-by-layer groups files that change for the *same reason* (all repositories change when the database driver is upgraded) but scatters files that change *together* for a feature (adding a field to `Invoice` touches three packages). Package-by-feature is the common Go default once a service has more than a handful of entities: each feature package is cohesive, and only the handful of things every feature needs (a shared `Invoice` ID type, a logger) live in a small, genuinely shared package — never a catch-all `utils`.
+Package-by-layer groups files that change for the *same reason* (all repositories change when the database driver is upgraded) but scatters files that change *together* for a feature (adding a field to `Invoice` touches three packages).
+
+Package-by-feature is the common Go default once a service has more than a handful of entities: each feature package is cohesive, and only the handful of things every feature needs (a shared `Invoice` ID type, a logger) live in a small, genuinely shared package — never a catch-all `utils`.
 
 ### Dependency inversion with a consumer-defined interface
 
-The direction that makes testable, swappable architecture possible: the package that *uses* a capability declares the interface, in its own package, in the shape it needs. The package that *provides* the capability imports that interface's package and implements it — the dependency arrow points from the concrete adapter to the abstract core, which is the reverse of the call's data flow.
+The direction that makes testable, swappable architecture possible: the package that *uses* a capability declares the interface, in its own package, in the shape it needs.
+
+The package that *provides* the capability imports that interface's package and implements it — the dependency arrow points from the concrete adapter to the abstract core, which is the reverse of the call's data flow.
 
 ```mermaid
 flowchart LR
@@ -134,7 +181,9 @@ Three consequences fall out of this one picture:
 > [!quote] Melvin Conway, 1968
 > Organizations which design systems are constrained to produce designs which are copies of the communication structures of these organizations.
 
-In practice: if two teams own "invoices" and "notifications" and talk to each other only through a ticket queue, the code boundary between those two concerns will end up matching that communication gap, whether or not anyone draws it on a diagram first. Deliberately choosing module or service boundaries along team boundaries (the "inverse Conway manoeuvre") is often easier than fighting the organization's shape.
+In practice: if two teams own "invoices" and "notifications" and talk to each other only through a ticket queue, the code boundary between those two concerns will end up matching that communication gap, whether or not anyone draws it on a diagram first.
+
+Deliberately choosing module or service boundaries along team boundaries (the "inverse Conway manoeuvre") is often easier than fighting the organization's shape.
 
 ### Choosing a style
 
@@ -151,9 +200,13 @@ flowchart TD
     Scale -- "no" --> StayModular["stay a modular monolith"]
 ```
 
-Domain-driven design is **orthogonal** to this chooser, not a branch on it: bounded contexts and the tactical patterns in [[Domain-Driven Design - Strategic Design]] apply inside a layered service, a hexagonal one, or a microservice, whenever the domain's rules are complex enough to deserve a rich model instead of a thin CRUD layer. "Complex business rules" is a reason to add DDD's tactical patterns, not a fork that excludes hexagonal or clean.
+Domain-driven design is **orthogonal** to this chooser, not a branch on it: bounded contexts and the tactical patterns in [[Domain-Driven Design - Strategic Design]] apply inside a layered service, a hexagonal one, or a microservice, whenever the domain's rules are complex enough to deserve a rich model instead of a thin CRUD layer.
 
-The evolutionary path almost every real service takes: start layered, and once a second or third external integration shows up (a payment provider, then an email provider, then a file store), extract ports for exactly those integrations rather than adopting a full architecture up front. [[Hexagonal Architecture (Ports and Adapters)]] and [[Clean Architecture]] cover what that extraction looks like in Go.
+"Complex business rules" is a reason to add DDD's tactical patterns, not a fork that excludes hexagonal or clean.
+
+The evolutionary path almost every real service takes: start layered, and once a second or third external integration shows up (a payment provider, then an email provider, then a file store), extract ports for exactly those integrations rather than adopting a full architecture up front.
+
+[[Hexagonal Architecture (Ports and Adapters)]] and [[Clean Architecture]] cover what that extraction looks like in Go.
 
 ## 4. Worked example
 
@@ -542,3 +595,8 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 - **Before this:** [[Interfaces]], [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]
 - **Next:** [[Layered Architecture]], [[Hexagonal Architecture (Ports and Adapters)]], [[Clean Architecture]]
 - **Compare with:** [[Modular Monolith]] (the same boundaries drawn at service scale), [[Monolith vs Microservices]] (what happens when a boundary crosses a process), [[Service Project Layout and Wiring]] (where these packages physically live in a Go repo)
+
+### Watch on YouTube
+
+- [Cohesion and Coupling: Write BETTER PYTHON CODE Part 1](https://www.youtube.com/watch?v=eiDyK_ofPPM) · ArjanCodes · 26 min · 231,837 views
+- [Cohesion and Coupling in Software Engineering](https://www.youtube.com/watch?v=NweTzHYBgYU) · Gate Smashers · 12 min · 722,394 views

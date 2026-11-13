@@ -16,13 +16,22 @@ sources:
   - "PostgreSQL wiki, Number Of Database Connections ((core_count * 2) + effective_spindle_count)"
   - "AWS docs, Avoiding pinning an RDS Proxy"
   - "golang-migrate v4.18.3 source, postgres driver (pg_advisory_lock)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Connection Pooling - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Connection Pooling]]: a pool written as a buffered channel with a deadline on waiting, a fake `database/sql` driver that sleeps 20 ms per query so the real Go pool can be measured without a server, a leaky and a fixed query function with tests that prove the leak and the fix, and the production configuration for `database/sql` and `pgxpool`.
+
+## Before the code
+
+- **Buffered channels** (`chan *Conn`): a queue with a fixed capacity; receiving borrows a connection and sending returns it.
+- **`select`**: waits on several channel operations at once, here "a free connection" or "the deadline passed".
+- **`context.Context`**: carries a deadline or cancellation, so a waiting request can give up cleanly.
+- **Interfaces** (`driver.Connector`, `driver.Conn`): the fake driver implements them so the real `database/sql` pool runs without a server.
+- **`defer`**: runs `rows.Close()` when the function returns, which is what prevents the leak.
+- **What to run:** `go vet ./... && go test -race -v ./...`; `config.go` needs `github.com/jackc/pgx/v5` (`go mod tidy`).
 
 ## What this code shows
 
@@ -53,13 +62,21 @@ flowchart LR
 
 ## How to read this note
 
-Each code step has the same shape: a Concept paragraph that links the code to the theory note and names the alternatives, a short block of at most about 25 lines, and a numbered How it works list that walks through the key lines. Blocks that belong to one file continue each other, so a function may be cut in two pieces with a sentence in between. The files are `pool.go`, `fakedb.go`, `overdue.go`, `config.go`, `pool_test.go` and `overdue_test.go`.
+Each code step has the same shape: a Concept paragraph that links the code to the theory note and names the alternatives, a short block of at most about 25 lines, and a numbered How it works list that walks through the key lines.
+
+Blocks that belong to one file continue each other, so a function may be cut in two pieces with a sentence in between. The files are `pool.go`, `fakedb.go`, `overdue.go`, `config.go`, `pool_test.go` and `overdue_test.go`.
 
 ## Code
 
 ### Step 1: the channel pool
 
-**Concept.** The theory note says a pool is a bounded queue of connections where a caller waits when the queue is empty and gives up when its deadline passes ([[Connection Pooling#Borrowing and returning]], [[Connection Pooling#Waiting for a connection]]). A buffered Go channel is that queue: its capacity is the pool size, receiving takes a connection out, and sending puts one back. Using `select` on the channel and `ctx.Done()` gives the "wait with a deadline" behaviour in four lines. The alternatives are a mutex with a slice and a `sync.Cond`, which cannot wait on a context, or a semaphore from `golang.org/x/sync`, which limits concurrency but does not hold the connection objects. The channel was chosen because it is the smallest correct model; the real `database/sql` pool is much larger because it also opens connections lazily and ages them out.
+**Concept.** The theory note says a pool is a bounded queue of connections where a caller waits when the queue is empty and gives up when its deadline passes ([[Connection Pooling#Borrowing and returning]], [[Connection Pooling#Waiting for a connection]]).
+
+A buffered Go channel is that queue: its capacity is the pool size, receiving takes a connection out, and sending puts one back. Using `select` on the channel and `ctx.Done()` gives the "wait with a deadline" behaviour in four lines.
+
+The alternatives are a mutex with a slice and a `sync.Cond`, which cannot wait on a context, or a semaphore from `golang.org/x/sync`, which limits concurrency but does not hold the connection objects.
+
+The channel was chosen because it is the smallest correct model; the real `database/sql` pool is much larger because it also opens connections lazily and ages them out.
 
 ```go
 package pool
@@ -125,7 +142,13 @@ sequenceDiagram
 
 ### Step 2: a fake driver
 
-**Concept.** To measure a real `database/sql` pool without a PostgreSQL server, the code plugs a fake driver under it. This is the "pool turns excess concurrency into queueing" idea from [[Connection Pooling#The pool turns excess concurrency into queueing]]: if every query takes exactly 20 ms, the numbers you measure come only from the pool, not from disk or network noise. The alternatives are a real database in a container, which is closer to production but slower and noisy, or a mock of the `sql.DB` type, which would skip the pool logic that we want to test. A `driver.Connector` was chosen because `sql.OpenDB` accepts it directly, so the standard-library pool code runs unchanged. The first piece defines the connector and the driver.
+**Concept.** To measure a real `database/sql` pool without a PostgreSQL server, the code plugs a fake driver under it.
+
+This is the "pool turns excess concurrency into queueing" idea from [[Connection Pooling#The pool turns excess concurrency into queueing]]: if every query takes exactly 20 ms, the numbers you measure come only from the pool, not from disk or network noise.
+
+The alternatives are a real database in a container, which is closer to production but slower and noisy, or a mock of the `sql.DB` type, which would skip the pool logic that we want to test.
+
+A `driver.Connector` was chosen because `sql.OpenDB` accepts it directly, so the standard-library pool code runs unchanged. The first piece defines the connector and the driver.
 
 ```go
 package pool
@@ -225,7 +248,11 @@ flowchart LR
 
 ### Step 3: the leaky and the fixed query
 
-**Concept.** The theory note's leak example shows that `QueryContext` holds its connection until `rows.Close()` or until `rows.Next()` returns false ([[Connection Pooling#Borrowing and returning]], [[Connection Pooling#A leak, traced]]). The two functions below are identical except for one line, so a test can prove that the missing `defer rows.Close()` is the entire bug. The alternative to writing `defer rows.Close()` yourself is to use `QueryRowContext(...).Scan`, which closes for you, but that cannot be used here because the example wants to show the `rows` pattern that leaks. The fixed function is first because it is the one to copy.
+**Concept.** The theory note's leak example shows that `QueryContext` holds its connection until `rows.Close()` or until `rows.Next()` returns false ([[Connection Pooling#Borrowing and returning]], [[Connection Pooling#A leak, traced]]).
+
+The two functions below are identical except for one line, so a test can prove that the missing `defer rows.Close()` is the entire bug.
+
+The alternative to writing `defer rows.Close()` yourself is to use `QueryRowContext(...).Scan`, which closes for you, but that cannot be used here because the example wants to show the `rows` pattern that leaks. The fixed function is first because it is the one to copy.
 
 ```go
 package pool
@@ -301,7 +328,11 @@ stateDiagram-v2
 
 ### Step 4: production configuration
 
-**Concept.** In production you size the pool from the connection budget, not from the defaults ([[Connection Pooling#The knobs]], [[Connection Pooling#Production configuration]]). The defaults are unsafe: `MaxOpenConns` is unlimited, so a traffic spike turns into a connection storm on PostgreSQL. `ConfigureDB` sets the four `database/sql` knobs, and `NewPool` does the same for `pgxpool`, which also has jitter on the lifetime. The alternative is to put PgBouncer or RDS Proxy in front and keep the app pool large; this code keeps the app pool small, which is the first line of defence in either case.
+**Concept.** In production you size the pool from the connection budget, not from the defaults ([[Connection Pooling#The knobs]], [[Connection Pooling#Production configuration]]). The defaults are unsafe: `MaxOpenConns` is unlimited, so a traffic spike turns into a connection storm on PostgreSQL.
+
+`ConfigureDB` sets the four `database/sql` knobs, and `NewPool` does the same for `pgxpool`, which also has jitter on the lifetime.
+
+The alternative is to put PgBouncer or RDS Proxy in front and keep the app pool large; this code keeps the app pool small, which is the first line of defence in either case.
 
 ```go
 package pool

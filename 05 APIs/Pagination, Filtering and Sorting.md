@@ -15,7 +15,7 @@ sources:
   - "GraphQL Cursor Connections Specification (Relay)"
   - "Elasticsearch docs, Paginate search results (index.max_result_window = 10000, search_after with point in time)"
   - "Markus Winand, Use The Index, Luke: Paging Through Results (seek method)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Pagination, Filtering and Sorting
@@ -30,14 +30,64 @@ updated: 2026-11-02
 > - Allow-list filter and sort fields; never paste them into SQL.
 > - Classic mistake: deep `OFFSET`, which gets slower with every page and shifts when rows are inserted.
 
+## Start here: the basics
+
+**The problem in one story.**
+You open "My orders" in a shopping app and you have 200,000 old orders.
+Sending all of them at once would be slow and waste memory, and you only see 20 on screen.
+So the server sends 20, plus a bookmark saying where to continue.
+This note is about building that bookmark so that every page is fast and no order is shown twice or skipped.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Page | One slice of a long list | Orders 1-20 |
+| Page size / limit | How many items one page holds | `?limit=20` |
+| Offset | How many items to skip before the page starts | `OFFSET 100000` |
+| Cursor | An opaque token marking where the next page begins | `next_cursor: "eyJ2Ijo..."` |
+| Index | A sorted lookup structure the database keeps on columns | Index on `(created_at, id)` |
+| Sort key / tie-breaker | Columns the list is ordered by; a unique last column breaks ties | `created_at DESC, id DESC` |
+| Query parameter | Options appended to a URL | `?status=paid&sort=-created_at` |
+| Allow-list | A fixed list of accepted values; everything else is rejected | Sort only by `created_at` or `total` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client: GET /orders?limit=20"] --> S["Server reads 20 rows<br/>in index order"]
+    S --> R["Reply: 20 orders<br/>+ next_cursor"]
+    R --> C2["Client: GET /orders?cursor=..."]
+    C2 --> S2["Server jumps to rows<br/>after the cursor's key"]
+    S2 --> R2["Next 20 orders<br/>+ next_cursor"]
+```
+
+**Analogy.** A bookmark in a sorted phone book: you open straight at "Sharma, Priya" and read the next 20 names, instead of counting past the first 100,000.
+Where it breaks: a printed book never changes; a live list gains and loses rows while you read, which is why the bookmark must be a unique sort key, not a position number.
+
+**How the rest of this note builds up**
+
+- First, why returning everything or using `OFFSET` fails (section 1) and the bookmark mental model (section 2).
+- Then how offset, keyset and cursor encoding work, with filtering and sorting (section 3).
+- Then a Go test that reproduces offset duplicates, trade-offs, and production practice.
+- Finally, the SDE-3 deep dive on mixed sort directions, user-chosen sorts, search engines and GraphQL/gRPC shapes.
+
+> [!tip] Remember
+> Return one page plus an opaque cursor built from a unique sort key, and seek past it with an index instead of skipping with `OFFSET`.
+
 ## 1. Why it exists
 
-A customer with 200,000 orders opens "My orders". Without pagination, `GET /orders` serializes 200,000 rows (about 40 MB of JSON at 200 bytes per order, an estimate), holds them in server memory, and the phone shows 20 of them.
+A customer with 200,000 orders opens "My orders". Without pagination, `GET /orders` serializes 200,000 rows (about 40 MB of JSON at 200 bytes per order, an estimate), holds them in server memory.
+
+And the phone shows only 20 of them.
 
 Pagination fixes the size problem. The naive fix, `LIMIT 20 OFFSET n`, creates two new ones:
 
 - **Cost grows with depth.** To return rows 100,001–100,020, the database walks the first 100,000 rows in sort order and throws them away. PostgreSQL's docs say it directly: rows skipped by `OFFSET` still have to be computed inside the server. Page 1 reads 20 rows; page 5,001 reads 100,020.
-- **Pages shift under the reader.** If a new order arrives between page 1 and page 2, every row moves down one position. Row 20 of page 1 becomes row 21, so page 2 starts with it again: the client shows a **duplicate**. A delete does the opposite and the client **skips** a row it never saw. The Go test in section 4 reproduces the duplicate.
+- **Pages shift under the reader.** If a new order arrives between page 1 and page 2, every row moves down one position.
+	- Row 20 of page 1 becomes row 21, so page 2 starts with it again: the client shows a **duplicate**.
+	- A delete does the opposite and the client **skips** a row it never saw.
+	- The Go test in section 4 reproduces the duplicate.
 
 Keyset pagination fixes both: every page costs about the same, and inserts or deletes elsewhere in the list never shift it.
 
@@ -458,7 +508,11 @@ func TestParseAllowListAndLimits(t *testing.T) {
 }
 ```
 
-**Measured** with the test above (Go 1.24, 2026-11-02): five orders, page size 2, one order inserted after page 1. Offset returned order 4 on page 1 and again on page 2. Keyset returned `5, 4, 3, 2, 1`, each once, including orders 3 and 4 that share a timestamp. The new order 6 is not on the later pages; the client sees it when it refreshes from the top, which is the behaviour users expect from a feed.
+**Measured** with the test above (Go 1.24, 2026-11-02): five orders, page size 2, one order inserted after page 1.
+
+- Offset returned order 4 on page 1 and again on page 2.
+- Keyset returned `5, 4, 3, 2, 1`, each once, including orders 3 and 4 that share a timestamp.
+- The new order 6 is not on the later pages; the client sees it when it refreshes from the top, which is the behaviour users expect from a feed.
 
 **The response** the handler writes (one of the 20 items shown; the cursor payload is real base64url of `{"t":"2026-11-02T08:01:12Z","i":812366,"q":"status=paid;sort=-created_at,-id"}`, signature shortened):
 
@@ -529,7 +583,11 @@ What well-known APIs do:
 
 **Why an index cannot make `OFFSET` fast.** A B-tree is ordered but does not store how many entries sit under each subtree, so the database cannot compute "where is entry 100,000" without walking the leaves. Keyset turns the position into a **value**, and finding a value is what a B-tree does in `O(log n)`.
 
-**Mixed sort directions.** The row comparison `(a, b) < (x, y)` works only when both columns sort the same way. For `ORDER BY price ASC, id DESC` you must expand it: `WHERE price > $1 OR (price = $1 AND id < $2)`, with an index on `(price ASC, id DESC)`. PostgreSQL may not use that `OR` as a single index range, so check the plan, or keep every API sort in the same direction as its tie-breaker.
+**Mixed sort directions.** The row comparison `(a, b) < (x, y)` works only when both columns sort the same way.
+
+For `ORDER BY price ASC, id DESC` you must expand it: `WHERE price > $1 OR (price = $1 AND id < $2)`, with an index on `(price ASC, id DESC)`.
+
+PostgreSQL may not use that `OR` as a single index range, so check the plan, or keep every API sort in the same direction as its tie-breaker.
 
 **Backward cursors ("previous page").** Flip the comparison and the order, then reverse the rows in the application:
 
@@ -544,7 +602,18 @@ LIMIT 21;
 
 The cursor carries its direction (Stripe's `ending_before`, Relay's `last` and `before`). The extra row now means "there is a previous page" (`hasPreviousPage`).
 
-**Sorting by a user-chosen field.** The cursor must hold the value of *that* field plus the tie-breaker, for example `{"sort": "total_cents", "v": 49900, "i": 812366}`. Column names cannot be SQL placeholders, so map API field names to fixed SQL fragments through an allow-list (`"total" → "total_cents"`) and never splice user text into `ORDER BY`. Common request syntaxes: `?sort=-created_at` (JSON:API style), `?order_by=created_at desc` (Google AIP-132), `?filter[status]=paid` or `?status=paid`, and range operators like `?created_after=2026-10-01T00:00:00Z`. Pick one style per API and reject unknown fields with 400.
+**Sorting by a user-chosen field.** The cursor must hold the value of *that* field plus the tie-breaker, for example `{"sort": "total_cents", "v": 49900, "i": 812366}`.
+
+Column names cannot be SQL placeholders, so map API field names to fixed SQL fragments through an allow-list (`"total" → "total_cents"`) and never splice user text into `ORDER BY`.
+
+Common request syntaxes:
+
+- `?sort=-created_at` (JSON:API style)
+- `?order_by=created_at desc` (Google AIP-132)
+- `?filter[status]=paid` or `?status=paid`
+- range operators like `?created_after=2026-10-01T00:00:00Z`
+
+Pick one style per API and reject unknown fields with 400.
 
 **Total counts.** Options, from cheapest:
 
@@ -554,9 +623,17 @@ The cursor carries its direction (Stripe's `ending_before`, Relay's `last` and `
 4. A maintained counter (a `customer_stats` row updated in the same transaction, or a cache with a TTL).
 5. An exact `count(*)`, which in PostgreSQL must check visibility of every matching row (an index-only scan helps only when the visibility map is current).
 
-**Search engines.** In Elasticsearch, `from: 9980, size: 20` makes every shard return its top 10,000 hits to the coordinating node, which then sorts `shards × 10,000` entries to keep 20. That is why `index.max_result_window` defaults to 10,000. `search_after` is keyset pagination: pass the sort values of the last hit, with a point in time (PIT) so the view stays consistent, and a unique tie-breaker (`_shard_doc` with a PIT).
+**Search engines.** In Elasticsearch, `from: 9980, size: 20` makes every shard return its top 10,000 hits to the coordinating node, which then sorts `shards × 10,000` entries to keep 20.
 
-**GraphQL and gRPC shapes.** Relay connections wrap each item in an edge with its own cursor, so a client can resume from any item, not only the last. In gRPC, AIP-158 puts `page_size` and `page_token` on the request and `next_page_token` on the response; a `page_size` of 0 means "server default", values above the maximum are coerced down, and the token is opaque. Both are keyset designs with different wrapping; see [[GraphQL]] and [[gRPC]].
+That is why `index.max_result_window` defaults to 10,000.
+
+`search_after` is keyset pagination: pass the sort values of the last hit, with a point in time (PIT) so the view stays consistent, and a unique tie-breaker (`_shard_doc` with a PIT).
+
+**GraphQL and gRPC shapes.** Relay connections wrap each item in an edge with its own cursor, so a client can resume from any item, not only the last.
+
+In gRPC, AIP-158 puts `page_size` and `page_token` on the request and `next_page_token` on the response; a `page_size` of 0 means "server default", values above the maximum are coerced down, and the token is opaque.
+
+Both are keyset designs with different wrapping; see [[GraphQL]] and [[gRPC]].
 
 **Caching.** A first page with no cursor changes on every insert, so cache it briefly or not at all. Pages fetched by cursor are more stable, but with deletes they can still change; see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] before adding `Cache-Control`.
 
@@ -578,7 +655,11 @@ The cursor carries its direction (Stripe's `ending_before`, Relay's `last` and `
 > An exact total costs a full count on every request, and page numbers force offset with its depth cost and drift. Offer "10,000+" with a capped count, a planner estimate, or a maintained counter. If random page access is truly needed, keep offset with a depth cap, or jump by value (date) instead of by position.
 
 > [!question]- What goes into a cursor, and why make it opaque and signed?
-> The sort-key values of the last row, the direction, and a fingerprint of the filter and sort, plus a format version. Opaque means clients cannot depend on its structure, so you can change the implementation. Signing stops clients from editing it to probe other positions or inject odd values, and binding it to the query rejects reuse under a different filter.
+> The sort-key values of the last row, the direction, and a fingerprint of the filter and sort, plus a format version.
+>
+> Opaque means clients cannot depend on its structure, so you can change the implementation.
+>
+> Signing stops clients from editing it to probe other positions or inject odd values, and binding it to the query rejects reuse under a different filter.
 
 > [!question]- How do you page past 10,000 results in Elasticsearch?
 > Not with `from`/`size`: each shard must return `from + size` hits to be merged, so cost grows with depth, and the default window stops at 10,000. Use `search_after` with the last hit's sort values, a unique tie-breaker, and a point in time for a consistent view.
@@ -599,3 +680,8 @@ The cursor carries its direction (Stripe's `ending_before`, Relay's `last` and `
 - **Before this:** [[REST and HTTP API Design]], [[Indexing Fundamentals]], [[Index Types and Index Design]]
 - **Next:** [[API Versioning and Backward Compatibility]], [[Building REST Endpoints]] (the full Go handler)
 - **Compare with:** [[GraphQL]] (Relay connections), [[gRPC]] (`page_token`), [[Search Engines and Inverted Indexes]] (`search_after`), [[Query Plans and EXPLAIN]] (reading the plans above)
+
+### Watch on YouTube
+
+- [API Pagination - Why OFFSET Breaks and Cursors Don't](https://www.youtube.com/watch?v=AMszC3yAbbw) · LearnThatStack · directly explains why keyset/cursor pagination beats OFFSET, the note's core idea
+- [Pagination Optimization: Keyset vs Offset](https://www.youtube.com/watch?v=XHQ8QhslXS0) · ByteDistrict · performance-focused comparison of keyset vs offset pagination

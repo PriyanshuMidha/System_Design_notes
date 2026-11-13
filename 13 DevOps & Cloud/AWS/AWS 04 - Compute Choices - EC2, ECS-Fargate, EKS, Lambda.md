@@ -9,7 +9,7 @@ sources:
   - "AWS Lambda Developer Guide, Lambda execution environment and cold starts"
   - "AWS ECS Developer Guide, Fargate vs EC2 launch type"
   - "AWS EKS User Guide, Overview"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda
@@ -23,11 +23,62 @@ updated: 2026-11-07
 > - Lambda's unit is a single invocation with a cold start; ECS/Fargate and EC2 keep a process warm and serve many requests.
 > - A pricing shape question decides more of this than a technology question: steady, high-throughput traffic favors EC2/Fargate; spiky or rare traffic favors Lambda.
 
+## Start here: the basics
+
+**The problem in one story.**
+You wrote a Go web API and now it needs to run somewhere, all day, for real users.
+You also wrote a tiny script that resizes a photo whenever someone uploads one, a few times a day.
+Paying for a full computer to sit idle waiting for that script is wasteful; running the busy API as tiny on-demand functions is wasteful too.
+AWS offers four ways to run code, and this note is about choosing the right one for each job.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Virtual machine (VM) | A software-made computer carved out of a real one | One EC2 instance |
+| Container | Your app plus everything it needs, packed to run anywhere | A Docker image of your Go API |
+| Orchestrator | Software that starts, places and restarts containers for you | ECS or Kubernetes |
+| Kubernetes | A popular open-source orchestrator with its own API | `kubectl apply -f deploy.yaml` |
+| Serverless function | Code that AWS runs only when an event arrives | A Lambda handler per upload |
+| Cold start | Extra delay when a new copy of your code must start up | First request after idle takes 300 ms |
+| vCPU | One virtual CPU core you rent | "2 vCPU, 8 GiB" task size |
+| Concurrency | How many requests are being handled at the same moment | 40 requests in flight at once |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    EC2["EC2<br/>you manage the VM"] --> ECS["ECS / Fargate<br/>you manage containers"]
+    ECS --> EKS["EKS<br/>you manage Kubernetes objects"]
+    EKS --> L["Lambda<br/>you manage only a function"]
+    C1["More control,<br/>cheaper at steady load"] -.- EC2
+    L -.- C2["Less toil,<br/>best for spiky load"]
+```
+
+**Analogy.** EC2 is renting a whole flat, Fargate is renting a furnished room, EKS is renting a room in a co-living building with its own house rules, and Lambda is a hotel room by the hour.
+Where it breaks: a hotel never makes you wait for the room to "warm up", but Lambda can add a cold-start delay.
+
+**How the rest of this note builds up**
+
+- First, why four options exist and what they cost (section 1), then the "smaller slices of a computer" mental model (section 2).
+- Then how each option works under the hood (section 3).
+- Then Go sizing helpers for task counts, Little's Law concurrency and cold starts (section 4), plus a comparison table (section 5).
+- Finally the SDE-3 view: trade-offs, production patterns, deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Steady traffic → keep warm processes (EC2/Fargate/EKS); rare or spiky work → Lambda; pick EKS only if you want Kubernetes itself.
+
 ## 1. Why it exists
 
-A Go API that serves 2,000 requests/sec around the clock has a predictable, continuous workload: it is cheapest and simplest to keep a fixed pool of warm processes running and let a load balancer spread traffic across them. A webhook handler that fires 50 times a day, each one finishing in 200ms, is the opposite: keeping a server warm 24 hours a day to handle 10 seconds of actual work a day wastes almost all of the spend.
+A Go API that serves 2,000 requests/sec around the clock has a predictable, continuous workload: it is cheapest and simplest to keep a fixed pool of warm processes running and let a load balancer spread traffic across them.
 
-AWS's compute services exist because no single operational model fits both. EC2 gives full control of the box (useful for unusual OS/kernel requirements, GPU workloads, or licensing that is per-host). ECS and Fargate package the app as a container and let AWS place and restart it. EKS gives you the actual Kubernetes API when your team already standardizes on it or needs its ecosystem (operators, CRDs, multi-cloud portability). Lambda removes the server entirely and bills per invocation and per millisecond.
+A webhook handler that fires 50 times a day, each one finishing in 200ms, is the opposite: keeping a server warm 24 hours a day to handle 10 seconds of actual work a day wastes almost all of the spend.
+
+AWS's compute services exist because no single operational model fits both.
+
+EC2 gives full control of the box (useful for unusual OS/kernel requirements, GPU workloads, or licensing that is per-host).
+
+ECS and Fargate package the app as a container and let AWS place and restart it. EKS gives you the actual Kubernetes API when your team already standardizes on it or needs its ecosystem (operators, CRDs, multi-cloud portability). Lambda removes the server entirely and bills per invocation and per millisecond.
 
 **Concrete numbers (estimate, AWS pricing as of late 2026, prices vary by region — always confirm in the AWS Pricing Calculator before committing to a choice):**
 - An `m7g.large` EC2 on-demand instance (2 vCPU, 8 GiB) runs roughly $0.08/hour ≈ $58/month, continuously, whether or not it serves traffic.
@@ -103,7 +154,9 @@ A slow handler needs much more concurrency than its request rate alone suggests:
 
 ### Full version
 
-Two sizing problems, modeled and tested together: how many warm Fargate/EC2 task copies a steady workload needs (with headroom for a lost AZ or a rolling deploy), and how much concurrency a Lambda workload needs by Little's Law. A third helper shows why cold starts matter less as traffic grows: a fixed burst of cold invocations is a shrinking fraction of a growing total.
+Two sizing problems, modeled and tested together: how many warm Fargate/EC2 task copies a steady workload needs (with headroom for a lost AZ or a rolling deploy), and how much concurrency a Lambda workload needs by Little's Law.
+
+A third helper shows why cold starts matter less as traffic grows: a fixed burst of cold invocations is a shrinking fraction of a growing total.
 
 ```go
 // Package capacity models the two capacity-planning questions that come up
@@ -292,3 +345,8 @@ func TestColdStartImpactShrinksAsTrafficGrows(t *testing.T) {
 - **Before this:** [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]], [[AWS 03 - VPC Networking]]
 - **Next:** [[AWS 05 - ECS, Fargate and ECR]], [[AWS 06 - Load Balancing (ALB vs NLB)]]
 - **Compare with:** [[Kubernetes Fundamentals]] (EKS runs this), [[Autoscaling]] (how each compute option scales out), [[Containerizing Go Services]] (building the image these options run)
+
+### Watch on YouTube
+
+- [AWS Compute Services: EC2, Lambda, ECS, EKS, Fargate, Beanstalk Explained (CLF-C02)](https://www.youtube.com/watch?v=13Yv1LTjebg) · BiteSizedCerts · 4 min · 94 views
+- [AWS Compute Explained: EC2, Lambda, ECS, EKS and Fargate / Ch.5](https://www.youtube.com/watch?v=PWzvP3O_yuw) · PM Techhub · 9 min · 1 views

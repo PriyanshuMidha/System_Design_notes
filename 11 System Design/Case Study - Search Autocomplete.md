@@ -9,13 +9,15 @@ sources:
   - "Redis documentation, ZRANGEBYLEX and ZRANGE BYLEX (lexicographic range queries on sorted sets)"
   - "RFC 9111, HTTP Caching (Cache-Control max-age)"
   - "Google Search Help, How Google autocomplete predictions work (policies for removing predictions)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Search Autocomplete
 
 > [!summary] TL;DR
-> Search autocomplete (typeahead) shows the top 5 to 10 popular queries that start with what the user has typed so far, updated on every keystroke. The design splits into a fast read path (a precomputed prefix → top-K lookup served from memory and caches in a few milliseconds) and a slow offline path that counts real queries and rebuilds that lookup every few minutes or hours.
+> Search autocomplete (typeahead) shows the top 5 to 10 popular queries that start with what the user has typed so far, updated on every keystroke.
+>
+> The design splits into a fast read path (a precomputed prefix → top-K lookup served from memory and caches in a few milliseconds) and a slow offline path that counts real queries and rebuilds that lookup every few minutes or hours.
 
 > [!abstract] Core idea
 > - Never compute "top K for this prefix" at request time; precompute it for every prefix and store it in each trie node (or in a prefix → list table).
@@ -23,6 +25,50 @@ updated: 2026-11-04
 > - Query logs flow into an aggregation pipeline (counts with time decay); a builder produces an immutable snapshot; serving nodes swap snapshots atomically.
 > - Most keystrokes never reach the service: debouncing on the client, browser caching and CDN caching for short prefixes absorb them.
 > - Trending queries need a fast lane (streaming counts merged on top of the snapshot), and offensive suggestions need a block list.
+
+## Start here: the basics
+
+**The problem in one story.**
+You type "tr" into a search box.
+Before you type the next letter, a list appears: "train tickets", "translate", "trending news".
+That list must show up in a blink, for millions of people typing at once.
+There is no time to count every past search while you wait.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Prefix | The start of a word typed so far | "tr" is a prefix of "train" |
+| Top-K | The K best items by some score | Top 5 most searched queries |
+| Trie | A tree where each step down adds one character | root → t → r → a → i → n |
+| Cache | A fast copy of an answer kept close to the user | Browser remembers suggestions for "tr" |
+| Offline job | Work done in the background, not while a user waits | Rebuild counts every hour |
+| Latency | How long one request takes | 20 ms per keystroke |
+| Shard | One slice of the data on its own server | Prefixes "a"-"m" on server 1 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User types 'tr'"] --> C["Cache / CDN"]
+    C -- "miss" --> S["Suggestion service:<br/>trie node 'tr'"]
+    S --> L["Stored top-K list"]
+    LOG["Search logs"] --> B["Offline builder:<br/>count and rebuild"]
+    B --> S
+```
+
+**Analogy.** A drawer for every prefix, holding one card with the 10 most popular titles already written on it.
+Where it breaks: real drawers are not rewritten every few minutes, and trends can change faster than a nightly clerk.
+
+**How the rest of this note builds up**
+
+- First, requirements and scale (section 1) and the card-drawer mental model (section 2).
+- Then the design: a fast read path and a slow offline build path (section 3).
+- Then estimates, API, data model, Go trie code and one traced request (section 4).
+- Finally the SDE-3 deep dive: trending queries, sharding the trie and Unicode normalization (sections 5-8).
+
+> [!tip] Remember
+> Precompute the top answers for every prefix offline, so each keystroke is just a lookup.
 
 ## 1. Why it exists - requirements
 
@@ -44,7 +90,9 @@ Typing "how to bo" and seeing "how to boil eggs" saves keystrokes, fixes spellin
 
 ## 2. Mental model
 
-Picture a **library card catalogue drawer for every prefix**. The drawer labelled "tr" does not contain every book starting with "tr"; it contains a single card with the 10 most borrowed titles already written on it. Looking something up is opening the right drawer. The expensive work, counting borrowings and rewriting the cards, happens at night (the offline builder), and a clerk pins a "trending this hour" note to drawers when something spikes (the fast lane).
+Picture a **library card catalogue drawer for every prefix**. The drawer labelled "tr" does not contain every book starting with "tr"; it contains a single card with the 10 most borrowed titles already written on it.
+
+Looking something up is opening the right drawer. The expensive work, counting borrowings and rewriting the cards, happens at night (the offline builder), and a clerk pins a "trending this hour" note to drawers when something spikes (the fast lane).
 
 The data structure is a **trie** ([[Tries, Suffix Trees and Suffix Arrays]]): each node is a prefix, children extend it by one character. The design trick is to cache the answer, the top-K list, in every node, trading memory for constant-time reads.
 
@@ -394,7 +442,9 @@ func TestConcurrentReads(t *testing.T) {
 
 `go vet` and `go test -race` pass on Go 1.24.4 in a scratch module. `TestMatchesBruteForce` checks the cached lists against a full scan for 2,000 queries, which is the property that matters: the precomputed answer equals the slow answer.
 
-Build cost: each query updates `len(query) + 1` nodes, and each update is a binary search plus a shift of at most K entries, so building costs about `O(total characters × K)`. For 100M queries of 20 characters and K = 10 that is about 2 × 10^10 small operations, minutes on one machine (an estimate), which is why it runs offline.
+Build cost: each query updates `len(query) + 1` nodes, and each update is a binary search plus a shift of at most K entries, so building costs about `O(total characters × K)`.
+
+For 100M queries of 20 characters and K = 10 that is about 2 × 10^10 small operations, minutes on one machine (an estimate), which is why it runs offline.
 
 ### One request traced
 
@@ -467,7 +517,9 @@ The top levels (prefixes of 1 to 2 characters) are the hottest and smallest; the
 
 ### 8.3 Unicode and normalization
 
-Lower-casing is locale-sensitive (Turkish dotted and dotless i), accents may or may not matter ("café" vs "cafe"), and scripts like Hindi combine characters. Normalize queries the same way in the aggregator and at lookup: Unicode NFC, locale-aware lower-casing, optional accent folding per language. Store trie edges by rune (as the Go code does with `range` over a string), not by byte, so a multi-byte character is one edge. A mismatch between build-time and request-time normalization shows up as "no suggestions" for real users, so test it with sample inputs in every supported language.
+Lower-casing is locale-sensitive (Turkish dotted and dotless i), accents may or may not matter ("café" vs "cafe"), and scripts like Hindi combine characters. Normalize queries the same way in the aggregator and at lookup: Unicode NFC, locale-aware lower-casing, optional accent folding per language.
+
+Store trie edges by rune (as the Go code does with `range` over a string), not by byte, so a multi-byte character is one edge. A mismatch between build-time and request-time normalization shows up as "no suggestions" for real users, so test it with sample inputs in every supported language.
 
 ## 9. Interview questions
 
@@ -507,3 +559,8 @@ A 45-minute interview script:
 - **Before this:** [[Tries, Suffix Trees and Suffix Arrays]], [[Back-of-the-Envelope Estimation]], [[Caching Patterns]], [[Case Study - Key-Value Store]]
 - **Next:** [[Case Study - News Feed]], [[Case Study - Leaderboard and Top-K]], [[Search Engines and Inverted Indexes]]
 - **Compare with:** [[Keyword, Semantic and Hybrid Search]], [[Bloom Filters and Probabilistic Data Structures]], [[CDN and Edge]], [[Kafka and Event Streaming]], [[Stream Processing Basics]]
+
+### Watch on YouTube
+
+- [System design : Design Autocomplete or Typeahead Suggestions for Google search](https://www.youtube.com/watch?v=us0qySiUsGU) · Tushar Roy - Coding Made Simple · 19 min · 333,065 views
+- [System Design: Search Autocomplete / Typeahead Explained](https://www.youtube.com/watch?v=G_RE4PFly-o) · codingX krishna · 33 min · 2,579 views

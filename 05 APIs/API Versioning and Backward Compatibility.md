@@ -16,13 +16,15 @@ sources:
   - "Google AIP-185, API Versioning"
   - "Semantic Versioning 2.0.0 (semver.org)"
   - "Protocol Buffers docs, Updating a Message Type"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # API Versioning and Backward Compatibility
 
 > [!summary] TL;DR
-> **Backward compatibility** means a client written last year still works after today's deploy. Most changes can be made compatibly (add a field, add an endpoint). A **breaking change** (remove, rename or retype a field, change a meaning) needs a new **API version** that old clients do not see until they opt in, plus a planned way to retire the old version.
+> **Backward compatibility** means a client written last year still works after today's deploy. Most changes can be made compatibly (add a field, add an endpoint).
+>
+> A **breaking change** (remove, rename or retype a field, change a meaning) needs a new **API version** that old clients do not see until they opt in, plus a planned way to retire the old version.
 
 > [!abstract] Core idea
 > - Most changes can be backward compatible: add fields and endpoints, never remove or change meaning.
@@ -30,6 +32,51 @@ updated: 2026-11-02
 > - Serve every version from one core: build the latest response, then walk it back for older clients.
 > - Retire old versions on a published schedule with `Deprecation` and `Sunset` headers.
 > - Classic mistake: copying the whole codebase per version, so every fix must be made N times.
+
+## Start here: the basics
+
+**The problem in one story.**
+Last year your app shipped reading `status: "paid"` from the payments API.
+Today a developer renames it to `state` because it reads better.
+Millions of phones still run last year's app, and their payment screen now crashes.
+Versioning is how you change an API without breaking the clients you cannot update.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Client | Any program calling your API | An app installed on a phone |
+| Backward compatible | Old clients keep working after a change | Adding a new optional field |
+| Breaking change | A change that makes old clients fail | Renaming `status` to `state` |
+| Version | A label saying which API behaviour a client wants | `/v2/charges` or a date `2025-03-01` |
+| Header | Extra key-value info sent with an HTTP request | `Api-Version: 2025-03-01` |
+| Deprecation | Announcing that something will be removed later | `Deprecation` response header |
+| Sunset | The date an old version stops working | `Sunset: Sat, 01 Mar 2026 00:00:00 GMT` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    CH["Planned change"] --> Q{"Can old clients<br/>still work?"}
+    Q -- "yes" --> SHIP["Ship it to everyone"]
+    Q -- "no" --> NV["New version"]
+    NV --> CORE["One core builds<br/>latest response"]
+    CORE --> OLD["Transform back<br/>for old clients"]
+    OLD --> RET["Retire old version<br/>on a schedule"]
+```
+
+**Analogy.** It is like a power socket standard: new appliances can add features, but the plug shape stays the same so old appliances still fit.
+Where it breaks: you can never force people to buy new appliances, but an API can eventually sunset an old version after enough warning.
+
+**How the rest of this note builds up**
+
+- First, why compatibility matters (section 1) and the mental model of "add, never change" (section 2).
+- Then the four steps: classify the change, choose where the version lives, serve old versions from one core, retire on a schedule (section 3).
+- Then a full Go example with date-based versions and transformers (section 4), variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: never-updating mobile apps, Protobuf rules, semver for SDKs, and how many versions to support (sections 7-9).
+
+> [!tip] Remember
+> Add freely, never change meaning, and give breaking changes a new version with a published end date for the old one.
 
 ## 1. Why it exists
 
@@ -39,7 +86,9 @@ Your payments API returns `"amount": 49900` (an integer, in paise). The mobile a
 {"amount": {"value": 49900, "currency": "inr"}}
 ```
 
-Every installed copy of the app now fails to decode the payment screen. You can ship a fixed app, but you cannot make users install it: app versions linger on phones for months (an estimate of a typical tail; measure your own with an app-version header). Partners who integrated through your SDK broke the same day, and their deploy calendar is not yours.
+Every installed copy of the app now fails to decode the payment screen. You can ship a fixed app, but you cannot make users install it: app versions linger on phones for months (an estimate of a typical tail; measure your own with an app-version header).
+
+Partners who integrated through your SDK broke the same day, and their deploy calendar is not yours.
 
 Versioning lets the server keep changing while each client sees the contract it was written against, until that client chooses to move.
 
@@ -141,7 +190,9 @@ func Render(c Charge, version string) map[string]any {
 
 ### Full version
 
-A charge resource with two breaking changes: on 2025-03-01 the status enum gained `partially_refunded`; on 2025-09-01 `amount` became an object. One core handler renders the latest shape; the policy walks it back for older clients, adds deprecation headers, and rejects retired or unknown versions. It compiles and passes `go vet` and `go test -race` on Go 1.24 (`slices.Backward` needs Go 1.23 or later).
+A charge resource with two breaking changes: on 2025-03-01 the status enum gained `partially_refunded`; on 2025-09-01 `amount` became an object. One core handler renders the latest shape; the policy walks it back for older clients, adds deprecation headers, and rejects retired or unknown versions.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24 (`slices.Backward` needs Go 1.23 or later).
 
 ```go
 // Package apiversion serves every supported API version from one core
@@ -408,7 +459,11 @@ How old versions are served:
 
 ## 8. Deep dive
 
-**Mobile clients that never update.** Apps send their version on every request (`User-Agent` or an app-version header). The server keeps a **minimum supported app version** per platform and exposes it through a small config endpoint. Below the minimum, the app shows a blocking "update required" screen; between minimum and latest, a dismissible prompt. On the server side, reject requests from apps below the minimum with a specific error code that the oldest apps already understand. `426 Upgrade Required` is a poor fit: RFC 9110 defines it for protocol upgrades and requires an `Upgrade` header naming the protocol.
+**Mobile clients that never update.** Apps send their version on every request (`User-Agent` or an app-version header). The server keeps a **minimum supported app version** per platform and exposes it through a small config endpoint.
+
+Below the minimum, the app shows a blocking "update required" screen; between minimum and latest, a dismissible prompt. On the server side, reject requests from apps below the minimum with a specific error code that the oldest apps already understand.
+
+`426 Upgrade Required` is a poor fit: RFC 9110 defines it for protocol upgrades and requires an `Upgrade` header naming the protocol.
 
 **Expand/contract for a field rename** (`name` → `display_name`):
 
@@ -420,13 +475,27 @@ The same three steps drive database renames (see [[Zero-Downtime Schema Migratio
 
 **GraphQL evolves instead of versioning.** Add fields freely, mark old ones `@deprecated(reason: "Use displayName")`, and remove them when usage reaches zero. Because every query names the fields it reads, the server can log per-field usage, which REST cannot do. See [[GraphQL]].
 
-**Protobuf and gRPC rules** (details in [[Protocol Buffers and Schema Evolution]]): never change or reuse a field number; mark removed numbers and names `reserved`; do not change a field's type; adding fields is safe because old readers skip unknown fields; proto3 enums are open, so an old reader keeps an unknown enum value as its number. Package names carry the major version (`acme.payments.v1`).
+**Protobuf and gRPC rules** (details in [[Protocol Buffers and Schema Evolution]]):
 
-**Semver for SDKs.** SDKs follow Semantic Versioning: MAJOR for a breaking change in the SDK's own surface, MINOR for additions, PATCH for fixes. The SDK version and the API version are different axes. Stripe's SDKs for strongly typed languages (Go, Java, .NET), for example, use a fixed API version, the latest one when that SDK release shipped, and Stripe advises against overriding it, so moving such an integration to a new API version means upgrading the SDK. Its Ruby, Python, PHP and Node SDKs have also defaulted to their release's API version since their 2023 major versions, but accept a per-client or per-request override (Stripe docs, "Set a Stripe API version", checked 2026-11-02).
+- Never change or reuse a field number.
+- Mark removed numbers and names `reserved`.
+- Do not change a field's type.
+- Adding fields is safe because old readers skip unknown fields.
+- proto3 enums are open, so an old reader keeps an unknown enum value as its number.
+
+Package names carry the major version (`acme.payments.v1`).
+
+**Semver for SDKs.** SDKs follow Semantic Versioning: MAJOR for a breaking change in the SDK's own surface, MINOR for additions, PATCH for fixes. The SDK version and the API version are different axes.
+
+Stripe's SDKs for strongly typed languages (Go, Java, .NET), for example, use a fixed API version, the latest one when that SDK release shipped, and Stripe advises against overriding it, so moving such an integration to a new API version means upgrading the SDK.
+
+Its Ruby, Python, PHP and Node SDKs have also defaulted to their release's API version since their 2023 major versions, but accept a per-client or per-request override (Stripe docs, "Set a Stripe API version", checked 2026-11-02).
 
 **Webhooks are versioned too.** An event payload is a response the receiver never asked for. Render each event at the version of the receiving endpoint (Stripe lets each webhook endpoint set one) and run it through the same transformer chain. See [[Webhooks - Sending and Receiving]].
 
-**How many versions to support.** With transformers, the cost grows with the number of *changes*, not versions, which is why date-based APIs can keep many versions alive. With parallel deployments, cost grows with versions, so keep two (current and previous) and publish a fixed support window. A common rule of thumb for public APIs is a deprecation notice of at least 6 to 12 months (an estimate of common practice; GitHub commits to 24 months).
+**How many versions to support.** With transformers, the cost grows with the number of *changes*, not versions, which is why date-based APIs can keep many versions alive. With parallel deployments, cost grows with versions, so keep two (current and previous) and publish a fixed support window.
+
+A common rule of thumb for public APIs is a deprecation notice of at least 6 to 12 months (an estimate of common practice; GitHub commits to 24 months).
 
 **Transformers are code with edge cases.** A `Down` must handle every place the resource appears: list items, nested expansions, webhook payloads, and error bodies. Keep one golden-file test per version per resource so a core change that a transformer forgot shows up as a diff.
 
@@ -468,3 +537,7 @@ The same three steps drive database renames (see [[Zero-Downtime Schema Migratio
 - **Before this:** [[REST and HTTP API Design]], [[API Contract Design and OpenAPI]], [[Pagination, Filtering and Sorting]]
 - **Next:** [[Idempotency and Idempotency Keys]], [[Contract Testing]]
 - **Compare with:** [[Protocol Buffers and Schema Evolution]] (wire-level rules), [[GraphQL]] (evolution without versions), [[Zero-Downtime Schema Migrations]] (expand/contract in the database), [[Event Schemas and Schema Registry]] (compatibility modes for events), [[Feature Flags]] (rolling out behaviour, not contracts)
+
+### Watch on YouTube
+
+- [Versioning & Backward Compatibility in APIs / Low-Level Design - Tabspace](https://www.youtube.com/watch?v=paSXDTcdfww) · Tabspace · Interview-style walkthrough of versioning strategies and backward compatibility

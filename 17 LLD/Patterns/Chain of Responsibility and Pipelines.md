@@ -8,7 +8,7 @@ sources:
   - "Gamma, Helm, Johnson, Vlissides, Design Patterns (1994), Chain of Responsibility"
   - "Go standard library docs: net/http Handler and HandlerFunc, errors.Join (since Go 1.20), log/slog Handler.Enabled"
   - "gRPC-Go docs: grpc.ChainUnaryInterceptor"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Chain of Responsibility and Pipelines
@@ -22,9 +22,57 @@ updated: 2026-11-02
 > - **Pipeline:** every step must pass; any step can stop the request (validation, HTTP middleware).
 > - Classic mistake: doing irreversible work (dispensing cash, charging a card) while the chain is still running. Plan the whole result first, then commit it.
 
+## Start here: the basics
+
+**The problem in one story.**
+You call a bank helpline. A recorded menu tries to help first.
+If it cannot, a junior agent tries; if they cannot, a senior agent takes over.
+Separately, at airport security every check must pass: ticket, ID, bag scan.
+Both are a line of small steps; they differ in when the line stops.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Handler | A small piece of code that deals with one request | a function that checks the cart total |
+| Request | The thing being passed along the steps | a checkout with a coupon |
+| Chain | An ordered list of handlers | `[minCart, firstOrder, city]` |
+| Short-circuit | Stop early without running the rest | first failed rule ends the check |
+| Middleware | A step that wraps an HTTP handler | auth check before the real handler |
+| Irreversible work | Something you cannot undo | dispensing cash |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request"] --> H1["Handler 1"]
+    H1 -- "can't handle / passed" --> H2["Handler 2"]
+    H2 -- "can't handle / passed" --> H3["Handler 3"]
+    H1 -. "handled or rejected: stop" .-> Out["Result"]
+    H2 -. "stop" .-> Out
+    H3 --> Out
+```
+
+**Analogy.** A helpline escalation ladder (chain of responsibility) and an airport security line (pipeline).
+Where it breaks: humans can use judgement to skip steps; code runs exactly the order you wrote.
+
+**How the rest of this note builds up**
+
+- First, why one big nested `if` function breaks down, and the mental model of the two kinds (sections 1-2).
+- Then how each kind works and a full Go example (sections 3-4).
+- Then variants, comparisons and when not to use a chain (sections 5-6).
+- Finally the SDE-3 view: production pitfalls such as committing side effects too early, the deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> A chain is an ordered list of small steps: in CoR the first one that handles it wins, in a pipeline all must pass.
+
 ## 1. Why it exists
 
-Take the checkout of a food-delivery app. Before the coupon `WELCOME50` is applied, five rules must hold: the cart is at least ₹500, it is the user's first order, the user has not used the coupon before, the city is eligible, and the payment method is allowed. The first version is one function with five nested `if` blocks. Then three problems show up:
+Take the checkout of a food-delivery app.
+
+Before the coupon `WELCOME50` is applied, five rules must hold: the cart is at least ₹500, it is the user's first order, the user has not used the coupon before, the city is eligible, and the payment method is allowed.
+
+The first version is one function with five nested `if` blocks. Then three problems show up:
 
 - **Every new rule edits the same function.** A sixth rule (block coupon stacking) means touching code that already works and retesting all five rules.
 - **The order is buried.** The usage check calls a remote store. If it runs first, every ₹300 cart pays for a network call it never needed. In an estimate where a field check costs well under a microsecond and the remote call costs about 20 ms, checking cheap rules first saves the full 20 ms on every cart rejected early.
@@ -694,3 +742,8 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 - **Next:** [[Command, Undo and Memento]], [[Decorator and Middleware]]
 - **Compare with:** [[Decorator and Middleware]] (wraps and always delegates), [[Strategy and Template Method]] (one algorithm chosen up front, not many tried in turn), [[Observer and Event Bus]] (every subscriber gets the event; none can stop it), [[Rate Limiting - Algorithms and Distributed Design]] (a rate limiter is often one middleware link)
 - **Practice:** [[Cart Checkout with Coupons]], [[ATM]], [[Logging Library]]
+
+### Watch on YouTube
+
+- [The Chain of Responsibility Pattern Explained & Implemented / Behavioral Design Patterns / Geekific](https://www.youtube.com/watch?v=FafNcoBvVQo) · Geekific · 7 min · 83,714 views
+- [Chain of Responsibility Pattern / Build Cash Dispenser(UML & Code) / System Design](https://www.youtube.com/watch?v=LXVKB6deQMo) · Coder Army · 29 min · 20,848 views

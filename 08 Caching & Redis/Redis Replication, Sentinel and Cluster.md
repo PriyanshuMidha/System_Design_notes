@@ -12,7 +12,7 @@ sources:
   - "AWS ElastiCache user guide: cluster mode, Multi-AZ, endpoints, Serverless, Valkey engine, encryption, RBAC, reserved memory"
   - "go-redis v9 docs: FailoverOptions, ClusterOptions"
   - "Linux Foundation Valkey announcement (March 2024); Redis licensing announcements (March 2024, May 2025)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis Replication, Sentinel and Cluster
@@ -26,6 +26,51 @@ updated: 2026-11-04
 > - Cluster = sharding plus high availability. A key's slot is `CRC16(key) mod 16384`; clients keep a slot map and follow `MOVED`/`ASK` redirects.
 > - Multi-key commands, transactions and Lua scripts in Cluster need all keys in one slot: use hash tags like `{user:42}`.
 > - Managed services (ElastiCache, Redis Cloud) run the same two shapes: "cluster mode disabled" (one shard) and "cluster mode enabled" (many shards).
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app uses a single Redis server.
+One day that machine dies, and every cache read and job write fails until someone fixes it.
+Later your data grows bigger than one machine's RAM.
+You need copies of the data on other machines, and a way to split data across machines.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Primary / replica | The server that takes writes / a copy that follows it | 1 primary + 2 replicas |
+| Replication | Sending every change from the primary to its replicas | `SET a 1` is copied to each replica |
+| Asynchronous | The primary answers "OK" before replicas have the change | A crash can lose the last few writes |
+| Failover | Promoting a replica to primary when the primary dies | Replica 1 becomes the new primary |
+| Single point of failure | One part whose crash takes the whole system down | One Redis VM with no copies |
+| Sharding | Splitting data so each server holds only part of it | Keys A-M on server 1, N-Z on server 2 |
+| Hash slot | One of 16,384 buckets a key is mapped to in Redis Cluster | `CRC16("user:42") mod 16384` |
+| Quorum / majority | Enough voters agreeing before acting | 2 of 3 Sentinels agree the primary is down |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    C["Clients"] --> P["Primary<br/>(takes writes)"]
+    P -- "async copy" --> R1["Replica 1"]
+    P -- "async copy" --> R2["Replica 2"]
+    S["Sentinels<br/>(watch + vote)"] -. "promote on failure" .-> R1
+    CL["Cluster: 16,384 slots<br/>split across several primaries"]
+```
+
+**Analogy.** Replication is a teacher (primary) dictating while students (replicas) copy into their notebooks. Sentinel is a hall monitor who picks a new teacher if the teacher faints. Cluster is splitting a huge class into several rooms, each with its own teacher.
+Where it breaks: students here copy slightly behind the teacher, so a new teacher picked from them may be missing the last sentence or two (async replication loses writes).
+
+**How the rest of this note builds up**
+
+- First, the three problems: availability, read scale, size and write scale (section 1), and the mental model (section 2).
+- Then how replication, Sentinel and Cluster each work (section 3), with a hands-on worked example (section 4).
+- Then how to choose between them, trade-offs and production setup (sections 5-7).
+- Finally the SDE-3 deep dive on lost writes, split brain and failover details, plus interview questions (sections 8-9).
+
+> [!tip] Remember
+> Replicas give copies, Sentinel gives automatic failover, Cluster gives sharding plus failover; all of them are asynchronous.
 
 ## 1. Why it exists
 
@@ -76,7 +121,10 @@ sequenceDiagram
 - Each primary has a **replication ID** and an **offset** (bytes of replication stream produced). A replica that reconnects sends both; if the bytes it missed are still in the **backlog** (`repl-backlog-size`, default 1 MB, measured on Redis 8.2), it gets a cheap **partial resync**. Otherwise it needs a **full resync**: a whole RDB snapshot.
 - Size the backlog to cover your longest expected disconnect: write rate in bytes per second × seconds. At 5 MB/s of writes, 1 MB covers 0.2 seconds; 512 MB covers about 100 seconds.
 - After a failover the promoted replica keeps the old ID as `master_replid2`, so other replicas can partially resync with it instead of all doing full syncs.
-- **Replication is asynchronous.** The primary replies to the client before replicas have the write. `WAIT numreplicas timeout` blocks until that many replicas acknowledged the write, which narrows the loss window but is not a consensus protocol: a replica that acknowledged can still lose the write if it restarts without persistence, and a replica without it can still be promoted. `min-replicas-to-write N` plus `min-replicas-max-lag S` makes a primary refuse writes when fewer than N replicas are within S seconds, which limits how much an isolated primary can accept.
+- **Replication is asynchronous.**
+	- The primary replies to the client before replicas have the write.
+	- `WAIT numreplicas timeout` blocks until that many replicas acknowledged the write, which narrows the loss window but is not a consensus protocol: a replica that acknowledged can still lose the write if it restarts without persistence, and a replica without it can still be promoted.
+	- `min-replicas-to-write N` plus `min-replicas-max-lag S` makes a primary refuse writes when fewer than N replicas are within S seconds, which limits how much an isolated primary can accept.
 - Replicas are read-only by default (`replica-read-only yes`) and do not expire keys themselves; they wait for the primary's `DEL`, but they report logically expired keys as missing to readers.
 
 ### Sentinel
@@ -126,7 +174,11 @@ flowchart TB
 - **Slot of a key** = `CRC16(key) mod 16384`. If the key contains `{...}` with at least one character between the braces, only that part is hashed. That is a **hash tag**: `{user:42}:cart` and `{user:42}:orders` share a slot.
 - **Routing.** A client may send a command to any node. If that node does not own the slot it replies `-MOVED <slot> <host:port>`; the client updates its slot map and retries. Smart clients load the map at start with `CLUSTER SHARDS` (or the older `CLUSTER SLOTS`) and almost never get redirected.
 - **Resharding.** An operator moves a slot from node A to node B. During the move, A marks the slot *migrating* and B *importing*. A key already moved gets `-ASK <slot> <B>`: the client sends `ASKING` and the command to B once, without updating its map. When the move finishes, A answers `MOVED`.
-- **Failure detection and failover.** Nodes gossip on the cluster bus (port + 10000 by default). A node not answering for `cluster-node-timeout` (default 15,000 ms, measured on Redis 8.2) is marked PFAIL, and FAIL once a majority of primaries report it. Its replicas then ask the other primaries for votes; the one with the most up-to-date offset waits the shortest delay and usually wins. A majority of primaries must vote, so a cluster needs at least three primaries.
+- **Failure detection and failover.**
+	- Nodes gossip on the cluster bus (port + 10000 by default).
+	- A node not answering for `cluster-node-timeout` (default 15,000 ms, measured on Redis 8.2) is marked PFAIL, and FAIL once a majority of primaries report it.
+	- Its replicas then ask the other primaries for votes; the one with the most up-to-date offset waits the shortest delay and usually wins.
+	- A majority of primaries must vote, so a cluster needs at least three primaries.
 - **Limits.** Only database 0 exists (measured on Redis 8.2 at start-up: "Changing databases number from 16 to 1 since we are in cluster mode"). Multi-key commands, `MULTI`/`EXEC` and Lua scripts must touch keys in one slot, or they fail with `CROSSSLOT`. By default (`cluster-require-full-coverage yes`) the whole cluster stops accepting queries if any slot is unserved.
 
 Redis Cluster does not use a consistent-hashing ring; the fixed slots and why they differ are explained in [[Consistent Hashing]].
@@ -449,3 +501,8 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 - **Before this:** [[Replication]], [[Partitioning and Sharding]], [[Redis Persistence - RDB and AOF]]
 - **Next:** [[Redis in Production - Memory, Latency, Security]], [[Redis in Go]]
 - **Compare with:** [[Consistent Hashing]] (rings vs fixed slots), [[High Availability and Failover]], [[Leader Election]], [[Quorums and Leaderless Replication]]
+
+### Watch on YouTube
+
+- [Clustering in Redis](https://www.youtube.com/watch?v=3WOfXRjYnGA) · Redis · 8 min · 72,531 views
+- [Redis Cluster Replication and Redis Sentinel Failover (HA) with Endpoint Route HAProxy](https://www.youtube.com/watch?v=J27AcaVuAPM) · Mahmudur Rahman · 9 min · 7,888 views

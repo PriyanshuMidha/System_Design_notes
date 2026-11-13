@@ -1,0 +1,396 @@
+1
+00:00:02,399 --> 00:00:17,297
+Narrator: Packet City, three in the morning. An alarm rings in the detective's office. After tonight's deploy, one percent of requests are failing, with five oh two, bad gateway. Not all of them. Just one in a hundred. The worst kind of crime. Because it comes and goes.
+
+2
+00:00:17,728 --> 00:00:25,185
+Dana: I am Dana, the on call detective. Rio, my rookie, wake up. We have a case.
+
+3
+00:00:25,615 --> 00:00:37,609
+Rio: The app says, something went wrong. Which part broke, Dana? The phone book lookup? The road? The security check? The server?
+
+4
+00:00:38,140 --> 00:00:53,421
+Dana: That is exactly the problem, Rio. Guessing wastes hours. But every step of a request has its own witness, with its own logbook. We question them one at a time, and find the broken step in five minutes.
+
+5
+00:00:53,851 --> 00:01:26,245
+Narrator: Rio needs the words first. D N S is the internet's phone book, a name goes in, an I P address comes out. An I P address identifies a machine. A port is a numbered door on that machine, four forty three for H T T P S. A T C P connection is a reliable two way pipe, opened with a handshake. T L S is encryption and a certificate check on top. A socket is the operating system's handle for one connection. A packet is one small chunk of data. And a flag is an option you pass to a command, like curl dash v.
+
+6
+00:01:26,676 --> 00:01:41,718
+Dana: Think of a lost parcel. Was the address right? Did the truck leave? Did the gate guard let it in? Did the receiver sign? Each check has its own logbook. Our witnesses are the tools.
+
+7
+00:01:44,668 --> 00:02:02,134
+Narrator: Why do we need separate witnesses? Because an error message only tells you roughly which layer broke, not why. Curl error seven, failed to connect, or curl error thirty five, S S L connect error, name a layer. But the why needs a tool that inspects that layer alone, instead of re running the whole request and guessing.
+
+8
+00:02:02,563 --> 00:02:19,141
+Dana: Our case. A deploy goes out, and a service returns five oh two, for one percent of requests. The error alone cannot tell us if D N S is flapping, a backend is unreachable, T L S to the backend is failing, or a backend is just slow.
+
+9
+00:02:19,572 --> 00:02:42,078
+Narrator: The mental model. A stack of layers, one witness fixed to each. D N S, witness Dex, with dig. T C P reachability, witness Nell, with nc and ss, and Mel with traceroute and mtr. T L S, witness Tess, with open S S L s client. H T T P, witness Curt, with curl dash v and curl dash w. And the wire itself, witness Tad, with tcpdump.
+
+10
+00:02:42,508 --> 00:03:01,294
+Dana: The rule. Work top down. D N S first, because it is cheapest to check. Then T C P, then T L S, then H T T P. And call Tad, the eavesdropper, only when a witness's own report does not explain what we see.
+
+11
+00:03:01,723 --> 00:03:19,837
+Narrator: And Dana's wall map shows where to start. Does the request time out? Then ask Nell, does the port even accept T C P? If it times out, or no route, check routing, that is a firewall or a dead route. If refused, nothing is listening. If open, but curl still hangs, the app accepted the connection, and never answers.
+
+12
+00:03:20,268 --> 00:03:40,782
+Narrator: If instead there is an H T T P status. A name that does not resolve, N X domain, goes to Dex, with dig plus trace. A five oh two or five oh four from a proxy, goes to Curt, straight to the backend, bypassing the proxy. A certificate error goes to Tess. A two hundred that is slow goes to Curt's stopwatch. And anything still unclear goes to Tad.
+
+13
+00:03:43,731 --> 00:03:48,021
+Narrator: Suspect one, the phone book. Dana and Rio walk to Dex's office.
+
+14
+00:03:48,451 --> 00:03:57,973
+Dex: Dex, the phone book clerk. Ask me a name, and I will tell you what I know. Dig, example dot com, type A.
+
+15
+00:03:58,403 --> 00:04:16,541
+Narrator: The answer comes back. Status, no error, and an answer section. That means the name resolved. The number beside each address, a hundred ninety six, is the remaining T T L, in seconds, how much longer this answer stays cached. And the query time, thirty milliseconds, tells how fast the resolver answered.
+
+16
+00:04:16,971 --> 00:04:33,382
+Dex: Two addresses, a hundred seventy two dot sixty six dot one forty seven dot two forty three, and a hundred four dot twenty dot twenty three dot one fifty four. I answered from the server at a hundred dot sixty four dot zero dot one, port fifty three.
+
+17
+00:04:33,812 --> 00:04:36,949
+Dana: And if the name does not exist, Dex?
+
+18
+00:04:37,480 --> 00:04:56,194
+Dex: Then there is no answer section, and an authority section carrying the zone's S O A record. That is the signature of N X domain. This exact name does not exist. A timeout, with neither, means the resolver itself never answered. Not the same thing.
+
+19
+00:04:56,624 --> 00:05:17,305
+Narrator: Dex shows a C name too. Dig, www dot github dot com, C name, short, answers, github dot com. That is how most sites point a subdomain at a C D N or a load balancer. And for a quick manual check, ns lookup gives the same information in a friendlier form. But dig is preferred for scripting, because it shows the T T L and the flags.
+
+20
+00:05:17,735 --> 00:05:37,937
+Dex: The flags tell a story. Q R, this is a response. R D, recursion was requested. R A, the server supports recursion. And A D, the answer was validated with D N S sec. A missing A D on a zone that should be signed is itself a finding.
+
+21
+00:05:38,367 --> 00:06:00,225
+Dex: And my best trick. Dig plus trace. I ask the root, who handles dot com. Then the dot com servers, who handles example dot com. Then example dot com's own servers for the address. Your normal resolver never gets to serve a cached answer. So it catches a stale cache, or a bad delegation.
+
+22
+00:06:00,656 --> 00:06:10,706
+Dana: Our D N S answers are fine. Fast, correct, and not expired. Dex is cleared. Suspect one, innocent.
+
+23
+00:06:13,656 --> 00:06:18,209
+Narrator: Suspect two, the road, and the gate. Dana walks on to the road surveyor, Mel.
+
+24
+00:06:18,639 --> 00:06:40,473
+Mel: Mel, road surveyor. Traceroute, five hops. Each row is one more hop, whose time to live ran out, and who sent back a message, time exceeded. Hop two, fourteen milliseconds. Hop three, sixteen. Hop four, fifty six. Hop five, eighty seven.
+
+25
+00:06:40,903 --> 00:06:45,505
+Rio: Hop one shows only a star. Is that a broken road?
+
+26
+00:06:46,036 --> 00:07:09,478
+Mel: Not necessarily. A star means that hop did not reply. Often a router that drops these messages, not a failure. Only a trend of timeouts at the same hop, across repeated runs, means a real problem. And a clean road does not rule out an application problem. I measure the path, not the app.
+
+27
+00:07:09,908 --> 00:07:21,494
+Narrator: Mel's longer tool, M T R, runs the same idea continuously, and adds a live loss percentage and jitter per hop. That separates one slow hop from a hop that drops twenty percent of packets.
+
+28
+00:07:21,923 --> 00:07:28,805
+Dana: Good. Now the gate. Nell, can I even open a connection to this host and port?
+
+29
+00:07:29,235 --> 00:07:44,709
+Nell: Nell, gate guard. Netcat, dash v z, example dot com, port four forty three. Connection succeeded. And to a closed door, port one on the same machine. Connection refused.
+
+30
+00:07:45,139 --> 00:07:59,461
+Narrator: Refused means a packet reached the host, and the operating system answered, nobody is listening on that port. The road works, but the service or the port is wrong. Timed out means no reply came back at all, usually a firewall dropping the packet, or a dead route.
+
+31
+00:07:59,891 --> 00:08:07,254
+Dana: Nell says the gate is open. So the road and the gate are cleared. Suspect two, innocent.
+
+32
+00:08:10,204 --> 00:08:14,757
+Narrator: Suspect three. The security check. Tess inspects passports.
+
+33
+00:08:15,187 --> 00:08:31,814
+Tess: Tess. Open S S L s client, connect to example dot com, four forty three, with servername example dot com. I read the certificate chain. The certificate, issued by an intermediate, issued by a root. And three facts decide everything.
+
+34
+00:08:32,244 --> 00:09:05,046
+Tess: One. The servername must match what the certificate covers. A wrong common name, or a subject alternative name missing your host, means a hostname mismatch. Two. Verify return code zero, okay, means the chain validated against your trust store. A non zero code, like twenty, unable to get local issuer certificate, means an incomplete chain, or an untrusted authority. And three. The validity dates. A date check catches an expired certificate immediately.
+
+35
+00:09:05,475 --> 00:09:21,238
+Tess: And always pass the servername. Without it, S N I based routing may hand you a different certificate than a browser sees. A missing servername is a very common script bug. It makes T L S work in a browser, and fail in a script.
+
+36
+00:09:21,668 --> 00:09:36,182
+Dana: Verify code zero. Names match. Dates valid. Tess is cleared. Suspect three, innocent. But Rio, three suspects cleared, and the failures continue.
+
+37
+00:09:39,131 --> 00:09:46,446
+Narrator: Suspect four. The H T T P request itself. Curt is a courier, who walks the route with a stopwatch.
+
+38
+00:09:46,875 --> 00:10:09,981
+Curt: Curt. Curl dash v. I narrate three kinds of lines. A star is my own commentary, the host resolved, trying the address, connected, the T L S version, the protocol negotiated, H T T P two. A greater than sign is what I sent. A less than sign is what I received. The status, and the headers.
+
+39
+00:10:10,412 --> 00:10:23,029
+Curt: A connection failure shows up in the star lines, before any H T T P happens. The star lines come from my own logic, not from the wire. For ground truth, ask Tess or Tad.
+
+40
+00:10:23,460 --> 00:10:40,494
+Curt: Now my stopwatch. Curl dash w. D N S, two and a half milliseconds. Connect, three. T L S, a hundred eighty. First byte, two hundred thirty two. Total, two hundred thirty two.
+
+41
+00:10:40,923 --> 00:11:01,918
+Narrator: Careful. These numbers are cumulative from the start, not per phase. Subtract consecutive fields to get each phase's own cost. T L S alone is a hundred eighty minus three, about a hundred seventy seven milliseconds. The server's think time is about fifty one. Read as a timeline, the dominant cost, T L S here, jumps out.
+
+42
+00:11:02,347 --> 00:11:19,909
+Curt: And my favourite. Curl dash dash resolve. I force one specific address, without touching system D N S. The standard way to test, does the new server work, before changing a record. Or to test one node behind a load balancer directly.
+
+43
+00:11:20,340 --> 00:11:29,405
+Dana: That is it, Curt. Go straight to each backend, bypassing the proxy. Isolate the proxy from the backend.
+
+44
+00:11:29,836 --> 00:11:45,070
+Curt: Backend one, two hundred, fast. Backend two, two hundred, fast. Backend three. Hanging. Sometimes it takes a second. Sometimes it resets the connection.
+
+45
+00:11:45,500 --> 00:11:54,422
+Rio: Backend three! A slow backend, under load, can fail like that, even when the proxy's own health check still passes it.
+
+46
+00:11:57,371 --> 00:12:03,053
+Dana: Nell, you check the sockets on backend three. S S dash t a n.
+
+47
+00:12:03,484 --> 00:12:11,614
+Nell: Hundreds of sockets in close dash wait, all to the same peers. Dana, that is the state machine talking.
+
+48
+00:12:12,043 --> 00:12:30,902
+Narrator: S S and netstat report a socket's state from the T C P state machine. Reading the state tells you which side is stuck. A socket stuck in S Y N sent means the first packet, or its reply, never arrived, a routing or firewall problem. A large number in time wait after a load test is normal cleanup, not a bug.
+
+49
+00:12:31,331 --> 00:12:47,166
+Nell: But close wait is different. It means the peer sent a close, a fin, and my application accepted it, but never called close itself. The socket sits, waiting for the local side to finish. That is a resource leak.
+
+50
+00:12:47,596 --> 00:13:04,677
+Narrator: Nell reads the listening row too. If the receive queue climbs toward the backlog limit, connections arrive faster than the program accepts them. Once the limit is reached, the kernel drops or refuses new connections. And on a Mac, there is no S S, so use netstat dash a n, with equivalent columns.
+
+51
+00:13:05,107 --> 00:13:14,725
+Dana: A leak, in the application, not the network. But I want proof from the wire itself. Tad. Come down from the tower.
+
+52
+00:13:17,676 --> 00:13:33,101
+Tad: Tad, the eavesdropper. I need power, root, to open a raw socket. And I will only listen to one conversation, so I use a tight filter. Tcpdump, host, and port four forty three.
+
+53
+00:13:33,532 --> 00:13:56,062
+Narrator: Tad reads the flags. A capital S is a sin, the first packet. S dot is the sin ack. A bare dot is an ack. And P dot is a push, carrying data. The first three lines are the three way handshake. The fourth is the T L S client hello leaving, and the hundred eighty one millisecond gap before the fifth is the T L S handshake and the first byte, the same number curl's stopwatch showed.
+
+54
+00:13:56,491 --> 00:14:16,549
+Tad: The filter is Berkeley packet filter syntax. A small language, not free text. To count only connection attempts, I filter for packets with the sin flag set. To follow one conversation on a busy link, host a and host b. Narrow it, or the interface drowns you.
+
+55
+00:14:16,980 --> 00:14:36,005
+Tad: And a warning. I can capture sensitive payloads. Never run me without a tight filter. For anything beyond one line, write to a file, dash w capture dot p cap, and open it in Wireshark. Reading me live is slow.
+
+56
+00:14:36,436 --> 00:14:59,734
+Tad: In my capture from backend three, I see it, Dana. The peer's fin arrives, I send the ack, and then nothing. The application never closes its side. Retransmissions, resets, they are the footprints of network loss. Here there is no loss at all. This is not the network.
+
+57
+00:15:02,683 --> 00:15:19,453
+Narrator: A close wait leak traces back to code, not to the network. The local process received a fin from the peer, but its code never called close. In Go, it is almost always a missing defer conn dot close, or a response body that was read, but never closed. Resp dot body dot close.
+
+58
+00:15:19,884 --> 00:15:24,389
+Dana: Bo, the backend written in Go. Show me your code.
+
+59
+00:15:24,820 --> 00:15:29,590
+Bo: I call another service. I read the response. And then I return.
+
+60
+00:15:30,019 --> 00:15:45,086
+Dana: You never closed the response body, Bo. Every call leaves a connection waiting. Under load, they pile up, until a new connection finally fails, and the proxy reports five oh two, for one percent of requests.
+
+61
+00:15:45,515 --> 00:15:49,350
+Bo: I did not know. I thought that reading the body was enough.
+
+62
+00:15:49,779 --> 00:15:58,053
+Dana: One line. Defer, resp dot body dot close, right after the error check. Case closed.
+
+63
+00:16:01,004 --> 00:16:14,077
+Narrator: Dana does not stop at the fix. She writes the same check as a Go health probe, so the city never needs a human to run netcat again. Netcat dash z v is a manual, one shot version of the T C P check a load balancer runs continuously.
+
+64
+00:16:14,508 --> 00:16:34,518
+Narrator: The probe dials an address, with a timeout, and classifies the answer into the same buckets a human reads off nc, ss, and tcpdump. No error means open. A net error where timeout is true means a timeout, a firewall drop, or a dead route. An error that is connection refused means nothing is listening. Anything else is other error.
+
+65
+00:16:34,947 --> 00:16:49,173
+Narrator: Refused is the kernel answering a sin with a reset. Timeout is a sin that got no reply at all. A program that reports these buckets, instead of a bare, up or down, lets an on call dashboard say, this looks like a firewall problem, before a human runs a single command.
+
+66
+00:16:49,604 --> 00:16:52,981
+Narrator: The tests prove all four outcomes, with the race detector on.
+
+67
+00:16:55,932 --> 00:17:17,142
+Dana: The case file, Rio. Symptoms and witnesses. A name that will not resolve, Dex, dig, dig plus trace. A connect that hangs for a long time, a firewall dropping packets, Nell and Mel, nc, traceroute. Connection refused at once, nothing listening, Nell, nc and ss.
+
+68
+00:17:17,571 --> 00:17:36,766
+Dana: Certificate errors, Tess, open S S L s client, read the verify code and the dates. Five oh two or five oh four through a proxy, Curt, straight to the backend. A two hundred that is slow, Curt's stopwatch. And everything fine, but behaviour still wrong, Tad, the wire.
+
+69
+00:17:37,195 --> 00:18:02,173
+Narrator: Know the limits. Dig, curl and open S S L are read only, and safe to run against production. Tcpdump needs elevated privileges, and can capture sensitive data. Traceroute and mtr measure the path, not the application, and TCP often recovers from loss invisibly. Curl dash dash resolve and D N S overrides are for testing, never a permanent fix, or you hide the problem from everyone else.
+
+70
+00:18:02,604 --> 00:18:24,390
+Narrator: Production failures. A resolver returns stale addresses after a D N S change. Check the record's T T L with dig, because clients keep the old answer until it expires. An intermittent five oh two. Curl each backend directly. A backend that is slow or crash looping shows up as a hang, or a reset, even when the proxy's health check passes it.
+
+71
+00:18:24,819 --> 00:18:42,670
+Narrator: T L S works in a browser but fails from a script. Check the trust store, and whether the servername is sent at all. And a host that sometimes does not respond. Capture with tcpdump during a failure window, and look for retransmissions or resets. Those point at network loss, rather than application logic.
+
+72
+00:18:43,099 --> 00:19:03,038
+Narrator: And what to monitor. D N S query latency, and the N X domain rate. T C P connect failures, split into refused and timeout, because they mean different things. T L S handshake failures, and days to certificate expiry. And H T T P errors broken down by phase timing, so a dashboard can already say, this is slow in T L S.
+
+73
+00:19:03,468 --> 00:19:25,470
+Dana: And two more tricks for your notebook. Mtr's loss on a middle hop is noisy. Many routers rate limit those replies, so thirty percent loss at one hop, with zero after it, is that router's policy. Only loss at the last hop is actionable. And a close wait leak in Go is a missing defer close, or an unclosed response body.
+
+74
+00:19:28,420 --> 00:19:32,710
+Narrator: Back at the office, Dana tests Rio. Seven questions you will really get.
+
+75
+00:19:33,140 --> 00:19:38,413
+Rio: A request times out with no error at all. What is my first command?
+
+76
+00:19:38,943 --> 00:19:56,554
+Dana: Nc dash z v, with the host and port. It answers the cheapest question first. Does T C P even connect? If it hangs, it is routing or a firewall, so trace the route. If it succeeds at once, the problem is above T C P.
+
+77
+00:19:56,983 --> 00:20:01,105
+Rio: Curl says error thirty five, S S L connect error.
+
+78
+00:20:01,635 --> 00:20:14,973
+Dana: Open S S L s client, with the servername. Read the verify code, the names, and the dates. The usual causes are an expired certificate, a hostname mismatch, or a missing intermediate.
+
+79
+00:20:15,403 --> 00:20:22,933
+Rio: Trace route shows stars at hop six, but the destination answers at hop ten. A problem at hop six?
+
+80
+00:20:23,463 --> 00:20:35,433
+Dana: Not necessarily. Many routers drop those replies without affecting the real traffic. One silent hop with good connectivity on both sides is usually ICMP policy.
+
+81
+00:20:35,864 --> 00:20:41,498
+Rio: Hundreds of sockets in close wait, for one process. Where is the bug?
+
+82
+00:20:42,028 --> 00:20:53,422
+Dana: In the application. The peer closed, and the process never called close. In Go, a missing response body close, or a connection handler without a defer close.
+
+83
+00:20:53,852 --> 00:20:57,301
+Rio: When would I trust tcpdump over curl's own narration?
+
+84
+00:20:57,832 --> 00:21:10,521
+Dana: When the explanation does not match the behaviour. Curl says connected, yet the request stalls, or two tools disagree about reachability. Tcpdump shows the literal bytes and flags on the wire.
+
+85
+00:21:10,951 --> 00:21:21,193
+Rio: The T T L is thirty six hundred, and I changed the address. My dig shows the new one, but users see the old one an hour later. Why?
+
+86
+00:21:21,723 --> 00:21:36,981
+Dana: Resolvers cache independently. Yours may not have cached the old answer, while their ISP resolver did, and will not ask again until that entry expires. Query the same resolver they use, and check the remaining T T L.
+
+87
+00:21:37,412 --> 00:21:39,902
+Rio: And refused versus timed out?
+
+88
+00:21:40,432 --> 00:21:59,362
+Dana: Refused, a packet reached the host, and the O S answered with a reset. Nothing is listening, so check the service and the port. Timed out, no reply at all. Usually a firewall dropping the packet, or a dead route. It tells you whether to look at the service, or the network.
+
+89
+00:22:02,311 --> 00:22:05,354
+Narrator: Case closed. Let us put it all together.
+
+90
+00:22:05,784 --> 00:22:23,778
+Narrator: One. Match the symptom to one layer, then run the one tool that inspects that layer. The order of attack. D N S with dig. T C P with nc and ss. T L S with open S S L. H T T P with curl. And raw packets with tcpdump, only if the rest do not explain it.
+
+91
+00:22:24,208 --> 00:22:37,834
+Narrator: Two. Dig. No answer section, with an S O A in the authority section, means N X domain. A timeout with neither means the resolver is unreachable. Plus trace walks root, dot com, authoritative.
+
+92
+00:22:38,263 --> 00:22:49,034
+Narrator: Three. Curl dash w timings are cumulative. Subtract consecutive fields for each phase's cost. Curl dash dash resolve tests one address without touching D N S.
+
+93
+00:22:49,463 --> 00:22:56,465
+Narrator: Four. Open S S L s client, always with servername. Read the verify code, the names, and the dates.
+
+94
+00:22:56,895 --> 00:23:11,673
+Narrator: Five. Nc, refused means nothing is listening. Timeout means no reply, a firewall or a dead route. S S, a growing listen backlog means the app is too slow to accept. Many close wait rows mean the app leaks unclosed connections.
+
+95
+00:23:12,104 --> 00:23:24,602
+Narrator: Six. Tcpdump needs a tight filter and root, and a capture file for anything beyond a line. Traceroute and mtr measure the path, not the app, and a lossy middle hop is usually that router's policy.
+
+96
+00:23:25,031 --> 00:23:31,193
+Narrator: And the one line to keep. Match the symptom to one layer, then run the one tool that inspects that layer.
+
+97
+00:23:34,144 --> 00:23:51,250
+Narrator: To go deeper, open the network debugging note, and its Go note, in your vault. Before it, read what happens when you type a U R L, then D N S, T C P, and T L S. After it, forward and reverse proxies. Compare it with I O models, and H T T P fundamentals.
+
+98
+00:23:51,680 --> 00:23:54,458
+Rio: Dana, you solved it in five minutes.
+
+99
+00:23:54,887 --> 00:23:56,705
+Dana: Next case.
+

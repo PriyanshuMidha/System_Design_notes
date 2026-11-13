@@ -10,7 +10,7 @@ sources:
   - "KIP-101, leader epoch for log truncation; KIP-405, tiered storage (production-ready in Kafka 3.9); KIP-500, KRaft (ZooKeeper removed in Kafka 4.0); KIP-848, new consumer group protocol (GA in Kafka 4.0)"
   - "AWS Kinesis Data Streams docs, data retention (24 hours by default)"
   - "Kreps, Narkhede, Rao, Kafka: a Distributed Messaging System for Log Processing (NetDB 2011)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Distributed Message Queue
@@ -24,6 +24,50 @@ updated: 2026-11-04
 > - The log is stored as segment files named by their first offset, each with a sparse offset index, so a read is two binary searches and a short scan.
 > - Consumers keep their own position (an offset) and commit it to the broker; the broker never deletes a message because it was read. Retention deletes whole old segments.
 > - Classic mistake: designing a queue that deletes each message on acknowledgement. That serves one consumer group, makes replay impossible and turns every ack into a random write.
+
+## Start here: the basics
+
+**The problem in one story.**
+An order service must tell billing, shipping and email about every new order.
+If it calls each one directly and email is down, the order fails or the message is lost.
+A message queue sits in the middle: the order service drops a message once, and each reader picks it up when ready.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Message | A small record describing something that happened | `{order: 81, status: placed}` |
+| Producer | The program that writes messages | Order service |
+| Consumer | The program that reads messages | Billing service |
+| Topic | A named stream of related messages | `orders` |
+| Partition | One ordered slice of a topic | `orders-3` |
+| Offset | A message's position number in a partition | Message #1,042 |
+| Replica | A copy of a partition on another broker | Three copies across three machines |
+| Broker | A server that stores and serves partitions | `broker-2` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Producer"] --> B["Broker:<br/>topic partition log"]
+    B --> R1["Replica 1"]
+    B --> R2["Replica 2"]
+    B --> C1["Consumer A<br/>(own offset)"]
+    B --> C2["Consumer B<br/>(own offset)"]
+```
+
+**Analogy.** A partition is a ship's logbook: entries only added at the bottom, each reader keeps their own bookmark.
+Where it breaks: a logbook is read by people who remember where they stopped, while consumers can crash and must commit their bookmark (offset) to the broker to resume safely.
+
+**How the rest of this note builds up**
+
+- First, why services need a queue (section 1) and the logbook mental model (section 2).
+- Then the high-level design: topics, partitions, replication and consumer groups (section 3), with estimates and storage format (section 4).
+- Then variants and trade-offs: log vs classic queue (sections 5-6).
+- Finally the SDE-3 deep dive: production systems, durability settings, ordering and delivery guarantees (sections 7-8).
+
+> [!tip] Remember
+> A message queue is a durable, append-only log; producers write once, and each consumer reads at its own pace.
 
 ## 1. Why it exists - requirements
 
@@ -54,7 +98,12 @@ A classic work queue (one message, one consumer, deleted on ack) cannot give fou
 
 ## 2. Mental model
 
-A partition is a **ship's logbook**. Entries are only ever added at the bottom and numbered in order; nothing is edited in place. Readers keep a bookmark (their offset); one reader can be on page 10 while another is on page 900, and neither affects the other. When the logbook gets thick, the oldest volumes are archived or thrown away as whole volumes (segments), never one line at a time. Three officers keep identical copies (replicas); an entry counts as written once every officer who is keeping up has copied it.
+A partition is a **ship's logbook**.
+
+- Entries are only ever added at the bottom and numbered in order; nothing is edited in place.
+- Readers keep a bookmark (their offset); one reader can be on page 10 while another is on page 900, and neither affects the other.
+- When the logbook gets thick, the oldest volumes are archived or thrown away as whole volumes (segments), never one line at a time.
+- Three officers keep identical copies (replicas); an entry counts as written once every officer who is keeping up has copied it.
 
 The design moves work to the clients: the producer chooses the partition, the consumer tracks its position, and the broker becomes a fast, mostly sequential file server.
 
@@ -599,3 +648,8 @@ stateDiagram-v2
 - **Before this:** [[Kafka and Event Streaming]], [[Replication]], [[Partitioning and Sharding]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Next:** [[Case Study - Ad Click Aggregation]], [[Stream Processing Basics]]
 - **Compare with:** [[Pub-Sub Message Queue]] (the class-level LLD twin: topics, subscribers and offsets in one process), [[Queues vs Streams and Broker Comparison]], [[Case Study - Metrics and Logging Platform]] (another append-heavy store), [[Case Study - Distributed Job Scheduler]]
+
+### Watch on YouTube
+
+- [Message Queues in System Design Interviews w/ Meta Staff Engineer](https://www.youtube.com/watch?v=1ISRd0bS714) · Hello Interview · 26 min · 271,936 views
+- [What is a MESSAGE QUEUE and Where is it used?](https://www.youtube.com/watch?v=oUJbuFMyBDk) · Gaurav Sen · 9 min · 1,222,399 views

@@ -8,7 +8,7 @@ sources:
   - "golang.org/x/time/rate docs (pkg.go.dev/golang.org/x/time/rate)"
   - "Fetch Standard, CORS protocol (fetch.spec.whatwg.org)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Middleware
@@ -22,9 +22,56 @@ updated: 2026-11-07
 > - A canonical order exists for a reason: `recover → request ID → logging/tracing → CORS → body limit → auth → rate limit → routes`. Each step depends on something the step before it set up, or must run before a step it would otherwise break (CORS before auth, because a preflight carries no `Authorization` header).
 > - The one genuinely hard part is capturing the response **status and whether anything was written yet** — `http.ResponseWriter` has no `Status()` method, so recovery and logging middleware have to wrap it themselves.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your web server has 30 different pages (routes).
+Every one of them must log the visit, check who the caller is, and survive a crash.
+Copying that code into 30 places means one day one copy is forgotten.
+Middleware writes it once and wraps it around every route.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Handler | The code that answers one HTTP request | `func(w, r)` that returns an invoice |
+| Route | A URL path plus method mapped to a handler | `POST /invoices` |
+| Cross-cutting concern | A job every route needs, unrelated to its business logic | Logging, auth, panic recovery |
+| Panic | A Go crash in the current goroutine | Nil pointer dereference |
+| Request ID | A unique tag for one request, used to find its logs | `req_7f3a...` |
+| Status code | The number the server sends back saying how it went | `200`, `401`, `429` |
+| Preflight | A browser's `OPTIONS` check before a cross-site call | CORS asking "may I POST?" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request"] --> M1["Recover"]
+    M1 --> M2["Request ID"]
+    M2 --> M3["Logging"]
+    M3 --> M4["Auth"]
+    M4 --> H["Your handler"]
+    H -- "response flows back out" --> M3
+```
+
+**Analogy.** Airport security: every passenger passes the same checkpoints (ID check, bag scan) before reaching any gate, whichever flight they take.
+Where it breaks: a passenger does not walk back through security on the way out, but a response does pass back through every middleware layer.
+
+**How the rest of this note builds up**
+
+- First, why middleware exists (section 1) and the onion mental model (section 2).
+- Then the mechanics: the `func(http.Handler) http.Handler` shape, chaining, and ordering (section 3).
+- Then a full worked example with recover, request ID, logging, CORS, auth, rate limiting and timeouts (section 4).
+- Finally the SDE-3 material: variants, trade-offs, production failures and the response-writer deep dive (sections 5-8).
+
+> [!tip] Remember
+> Middleware is a wrapper around a handler: code before, code after, or stop the request early.
+
 ## 1. Why it exists
 
-Every handler in InvoiceOps needs the same handful of things done around it: a panic must not take down the process, every request needs a correlation ID, every request needs an access-log line, `POST /invoices` needs the caller authenticated and rate-limited. Without middleware, that is five blocks of boilerplate pasted into the top of every handler function — and the moment one handler's copy drifts from the others (forgets the rate limit, logs before generating the request ID), the drift is a bug nobody notices until it matters.
+Every handler in InvoiceOps needs the same handful of things done around it: a panic must not take down the process, every request needs a correlation ID, every request needs an access-log line, `POST /invoices` needs the caller authenticated and rate-limited.
+
+Without middleware, that is five blocks of boilerplate pasted into the top of every handler function — and the moment one handler's copy drifts from the others (forgets the rate limit, logs before generating the request ID), the drift is a bug nobody notices until it matters.
 
 [[Building REST Endpoints]] showed one handler done right. This note is about the thing that wraps **every** handler the same way: one small function type, a helper to chain several of them, and the specific middleware every production Go service ends up writing — recover, request ID, access logging, CORS, a body-size cap, auth, rate limiting, and timeouts.
 
@@ -613,3 +660,8 @@ func TestCORS_PreflightNeverReachesNext(t *testing.T) {
 - **Before this:** [[HTTP Server Fundamentals (net-http)]], [[Building REST Endpoints]], [[Context Package]]
 - **Next:** [[Authentication and Authorization in Go]], [[Observability in Go Services]], [[OpenAPI-First Development in Go]]
 - **Compare with:** [[Decorator and Middleware]] (the general OOP pattern this is an instance of), [[Chain of Responsibility and Pipelines]] (the general chaining pattern), [[CORS and Same-Origin Policy]] (the browser-side protocol this note's CORS middleware implements)
+
+### Watch on YouTube
+
+- [Go Middleware Explained: Patterns for Request Processing in Go (Golang)](https://www.youtube.com/watch?v=E0B-65LuJIE) · CodeLucky · overview of the func(Handler) Handler chaining pattern
+- [#43 Golang - Web Development: Adding Middleware to HTTP Server](https://www.youtube.com/watch?v=irSUU1K1qtU) · codeHeim · practical net/http middleware implementation

@@ -16,13 +16,15 @@ sources:
   - "Sam Newman, Backends For Frontends (samnewman.io, 2015)"
   - "Istio blog, ambient mode generally available in Istio 1.24 (November 2024)"
   - "Go 1.24 docs, net/http/httputil.ReverseProxy (Rewrite) and crypto/rand.Text"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # API Gateway and BFF
 
 > [!summary] TL;DR
-> An **API gateway** is the single front door for outside clients: a reverse proxy that terminates TLS, authenticates, rate-limits, routes each request to the right service and records what happened. A **BFF (backend for frontend)** is a small service per client type (web, iOS, partner) that calls several services and shapes one response for that client. Keep both free of business rules: the gateway does cross-cutting checks, the BFF does composition, and the services still make their own authorization decisions.
+> An **API gateway** is the single front door for outside clients: a reverse proxy that terminates TLS, authenticates, rate-limits, routes each request to the right service and records what happened.
+>
+> A **BFF (backend for frontend)** is a small service per client type (web, iOS, partner) that calls several services and shapes one response for that client. Keep both free of business rules: the gateway does cross-cutting checks, the BFF does composition, and the services still make their own authorization decisions.
 
 > [!abstract] Core idea
 > - A gateway is one reverse proxy in front of all services: TLS, authentication, rate limits, routing, logs.
@@ -30,13 +32,63 @@ updated: 2026-11-02
 > - Rule: no business logic in either; services still make their own authorization decisions.
 > - Classic mistake: trusting identity headers like `X-User-Id` that a client could set, instead of setting them only from a verified token.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your company has 20 small backend services: users, orders, payments, offers and more.
+The phone app should not know 20 addresses or check login 20 times.
+So you put one front door in front of all of them, which checks who you are and sends each request to the right service.
+And because the phone home screen needs data from five services, a small helper per app gathers it into one reply.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Service | A small backend program that owns one job | `orders-service` |
+| Proxy | A server that forwards requests to another server | Nginx passing `/orders` to `orders-service` |
+| Reverse proxy | A proxy that sits in front of your servers for clients | All traffic enters via `api.example.com` |
+| TLS | Encryption for traffic over the network | The padlock in `https://` |
+| Authentication | Checking who the caller is | Verifying a login token (JWT) |
+| Rate limit | A cap on requests per caller per time window | 100 requests per minute |
+| Latency | Time from sending a request to getting the answer | 80 ms per call |
+| BFF | Backend for frontend: one small service per client type | `mobile-bff` builds the home screen |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    APP["Phone app"] --> GW["API gateway<br/>TLS, auth, rate limit"]
+    WEB["Browser"] --> GW
+    GW --> BFF["Mobile BFF"]
+    BFF --> U["Users"]
+    BFF --> O["Orders"]
+    BFF --> OF["Offers"]
+```
+
+**Analogy.** The gateway is the reception desk of an office building: it checks your badge and points you to a floor. The BFF is a personal assistant who visits three floors for you and comes back with one folder.
+Where it breaks: a receptionist may decide who enters, but each service must still decide what you are allowed to do; the gateway alone is not authorization.
+
+**How the rest of this note builds up**
+
+- First, why gateways and BFFs exist (section 1) and the mental model of one door plus per-client helpers (section 2).
+- Then how it works: the filter pipeline, north-south vs east-west traffic and service meshes, and BFF response shaping (section 3).
+- Then a full Go gateway and BFF example with tests (section 4), variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: retry storms, rate limits across a fleet, AWS API Gateway limits and interview questions (sections 7-9).
+
+> [!tip] Remember
+> One front door for cross-cutting checks, one helper per client for shaping data, and no business logic in either.
+
 ## 1. Why it exists
 
 A shop splits its monolith into 30 services. Without a gateway:
 
 - **Every service re-implements the edge.** TLS certificates, JWT validation, CORS, rate limits, request logging: 30 copies, 30 slightly different behaviours, and one forgotten check is a breach.
 - **Clients know the internal topology.** The mobile app hard-codes `orders.shop.com`, `users.shop.com`, … Splitting or renaming a service breaks shipped apps that users never update.
-- **Phones pay for chattiness.** The home screen needs user, orders, recommendations, cart, offers and notifications: 6 calls. On a mobile link with about 100 ms round-trip time (an estimate), six sequential calls cost about 600 ms of network alone, before any server time. HTTP/2 lets the app send independent calls in parallel, but calls that need an earlier result (orders need the user's ID) still wait, and every call costs radio time, battery and repeated headers. Through a BFF the phone makes 1 call (about 100 ms) and the BFF fans out in parallel inside the data centre, where a round trip is around 1 ms (also an estimate).
+- **Phones pay for chattiness.** The home screen needs user, orders, recommendations, cart, offers and notifications: 6 calls. On a mobile link with about 100 ms round-trip time (an estimate), six sequential calls cost about 600 ms of network alone, before any server time.
+
+  HTTP/2 lets the app send independent calls in parallel, but calls that need an earlier result (orders need the user's ID) still wait, and every call costs radio time, battery and repeated headers.
+
+  Through a BFF the phone makes 1 call (about 100 ms) and the BFF fans out in parallel inside the data centre, where a round trip is around 1 ms (also an estimate).
 
 The gateway gives one stable public surface and one place for cross-cutting policy. The BFF gives each client exactly the data it needs in one round trip.
 
@@ -126,7 +178,9 @@ flowchart TB
 ```
 
 - **The gateway handles north-south traffic**: requests entering from outside. It cares about API keys, end-user tokens, quotas, public routing and API products.
-- **A service mesh handles east-west traffic**: calls between services inside. Sidecar proxies (Istio with Envoy, Linkerd with its own Rust proxy) give every call mTLS identity, retries, timeouts and telemetry, configured centrally by a control plane. Istio's ambient mode (generally available since Istio 1.24, November 2024) replaces sidecars with a per-node proxy for mTLS and optional waypoint proxies for L7 rules; the north-south vs east-west split is the same.
+- **A service mesh handles east-west traffic**: calls between services inside. Sidecar proxies (Istio with Envoy, Linkerd with its own Rust proxy) give every call mTLS identity, retries, timeouts and telemetry, configured centrally by a control plane.
+
+  Istio's ambient mode (generally available since Istio 1.24, November 2024) replaces sidecars with a per-node proxy for mTLS and optional waypoint proxies for L7 rules; the north-south vs east-west split is the same.
 - They complement each other. Many teams run both, often on the same proxy technology (Envoy).
 
 ### BFF: one response per client
@@ -446,7 +500,9 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 - **Real systems:** Netflix's Zuul edge gateway; SoundCloud's BFFs (Phil Calçado, formerly of SoundCloud, coined the name, and Sam Newman's 2015 article describes the pattern in use at SoundCloud and REA); Kong, Envoy Gateway and AWS API Gateway as the common off-the-shelf choices; Istio and Linkerd as meshes behind the edge.
 - **Failure modes → fixes:**
 	- **Single point of failure** → run several stateless instances across availability zones behind an L4 load balancer or anycast; keep config in a store that survives the loss of an instance; keep rate-limit counters in a replicated store or accept per-instance limits.
-	- **Retry storms:** the gateway retries, the BFF retries, the service retries, and 3 × 3 × 3 = 27 attempts hit a struggling database → retry only at one layer, only idempotent requests, with a **retry budget** (an Envoy retry budget, once configured, caps concurrent retries at a share of active plus pending requests: 20% by default, never below 3 concurrent retries) ([[Timeouts, Retries and Backoff]]).
+	- **Retry storms:** the gateway retries, the BFF retries, the service retries, and 3 × 3 × 3 = 27 attempts hit a struggling database.
+
+	  Fix: retry only at one layer, only idempotent requests, with a **retry budget** (an Envoy retry budget, once configured, caps concurrent retries at a share of active plus pending requests: 20% by default, never below 3 concurrent retries) ([[Timeouts, Retries and Backoff]]).
 	- **Slow upstream exhausts the gateway** → per-route timeouts, circuit breakers (Envoy defaults: 1,024 max connections, pending requests and requests per cluster, 3 concurrent retries), and per-route concurrency limits with fast `503`, as in the code above ([[Circuit Breaker]], [[Bulkheads and Concurrency Limits]], [[Load Shedding and Graceful Degradation]]).
 	- **Timeouts that grow inward** → deadlines must shrink as you go deeper: client 10 s > gateway route 3 s > service 2.5 s > database 1 s. Otherwise the gateway gives up while the work continues, and retries pile duplicate work on top.
 	- **Bad config push takes down every route** → validate config in CI, roll it out gradually, keep the last good version for instant rollback.
@@ -464,7 +520,15 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 - never trust a plain `X-User-Id` header that any pod in the cluster could forge (the gateway strips client-sent copies, as in the code, but internal callers could still set one);
 - make object-level decisions themselves. Broken object-level authorization is the first item in the OWASP API Security Top 10 ([[OWASP API Security Top 10]]).
 
-**Rate limits across a gateway fleet.** Nine instances each enforcing "100 requests per minute" locally allow up to 900. Either share counters in Redis (one extra network call, a dependency to protect), or divide the limit by the instance count and accept some unevenness, or use a dedicated rate-limit service like Envoy's global rate limiting. Details live in [[Rate Limiting - Algorithms and Distributed Design]].
+**Rate limits across a gateway fleet.** Nine instances each enforcing "100 requests per minute" locally allow up to 900.
+
+Fixes:
+
+- Share counters in Redis (one extra network call, a dependency to protect).
+- Divide the limit by the instance count and accept some unevenness.
+- Use a dedicated rate-limit service like Envoy's global rate limiting.
+
+Details live in [[Rate Limiting - Algorithms and Distributed Design]].
 
 **Load shedding vs queueing.** A gateway that queues requests under overload turns a short spike into long latency for everyone, and clients time out on work the server still finishes. Rejecting extra requests at once with `503` and `Retry-After` keeps latency normal for the requests it admits. Shed low-priority routes first (recommendations before checkout).
 
@@ -474,7 +538,9 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 
 **BFF vs GraphQL vs gateway aggregation.** Gateway-level aggregation (scripts in the gateway) puts client-specific logic in shared infrastructure: avoid it. A BFF puts it in code owned by the client team. GraphQL lets clients pick fields themselves, which suits many similar clients but moves cost control (query depth, complexity limits) to the server.
 
-**AWS API Gateway specifics worth knowing.** REST API integrations time out after 29 s by default; since June 2024 Regional and private REST APIs can request a higher limit, which may lower the account's throttle quota. HTTP APIs allow up to 30 s. Both cap payloads at 10 MB, and in most Regions an account starts with a 10,000 requests per second throttle (5,000 burst); some newer Regions start lower.
+**AWS API Gateway specifics worth knowing.** REST API integrations time out after 29 s by default; since June 2024 Regional and private REST APIs can request a higher limit, which may lower the account's throttle quota.
+
+HTTP APIs allow up to 30 s. Both cap payloads at 10 MB, and in most Regions an account starts with a 10,000 requests per second throttle (5,000 burst); some newer Regions start lower.
 
 ## 9. Interview questions
 
@@ -517,3 +583,7 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 - **Before this:** [[REST and HTTP API Design]], [[Forward and Reverse Proxies - L4 vs L7]], [[Load Balancing]]
 - **Next:** [[Rate Limiting - Algorithms and Distributed Design]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[Circuit Breaker]], [[Load Shedding and Graceful Degradation]], [[Serving REST and gRPC Together]]
 - **Compare with:** [[GraphQL]] (client-chosen aggregation), [[AWS 06 - Load Balancing (ALB vs NLB)]], [[Monolith vs Microservices]], [[Choosing an API Style]]
+
+### Watch on YouTube
+
+- [Using The BFF Architectural Pattern Instead of API Gateway](https://www.youtube.com/watch?v=b8wPnMtL_xU) · bulama io  · Directly compares BFF vs API gateway, the note's core distinction

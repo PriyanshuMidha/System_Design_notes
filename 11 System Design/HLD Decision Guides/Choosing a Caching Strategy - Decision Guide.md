@@ -13,7 +13,7 @@ sources:
   - "golang.org/x/sync/singleflight package docs"
   - "Netflix Tech Blog, Caching for a Global Netflix (EVCache, memcached based, replicated across zones and regions)"
   - "Instagram Engineering, Storing hundreds of millions of simple key-value pairs in Redis (2011)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Choosing a Caching Strategy - Decision Guide
@@ -26,6 +26,53 @@ updated: 2026-11-09
 > - **Cache-aside + TTL + delete on write** solves about 80 percent of cases. Reach for write-through or write-behind only with a stated reason.
 > - Every cache needs an answer to "what if it is empty or down?" Stampede protection is part of the design, not an extra.
 > - Numbers in this note are rough estimates unless a source is named.
+
+## Start here: the basics
+
+**The problem in one story**
+
+You ask a colleague the office Wi-Fi password ten times a day. Each time they look it up in a binder.
+After the second time you write it on a sticky note. Now the answer is instant.
+But if IT changes the password, your note is wrong until you update it. That is caching: fast copies that can go stale.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Cache | A fast store holding copies of data that lives elsewhere | Redis holds a user profile copy |
+| Hit / miss | Hit: found in cache. Miss: not there, go to the database | 95 hits per 100 reads |
+| TTL | Time to live: how long a cached copy is allowed to stay | Expire after 60 seconds |
+| Stale data | A cached copy older than the real value | Old price shown after a change |
+| Eviction | Removing items when the cache is full | LRU drops the least recently used key |
+| Cache-aside | App checks cache, on miss reads DB and fills cache | Default pattern in most services |
+| CDN | A cache spread across cities, near users | Product images served from an edge |
+| Stampede | Many requests miss at once and all hit the database | A hot key expires at peak traffic |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C[Client] --> CDN[CDN]
+    CDN --> App[App]
+    App -->|1 get| R[(Redis)]
+    App -->|2 on miss read| DB[(Database)]
+    App -->|3 fill| R
+```
+
+**Analogy**
+
+A cache is the sticky note next to the binder: fast to read, and wrong if the binder changes and no one updates the note.
+Where it breaks: a sticky note never fills up, but a real cache has limited memory and must evict entries.
+
+**How the rest of this note builds up**
+
+- First, why caches exist and where they can sit (sections 1-2).
+- Then the read and write patterns, invalidation and stampede protection (section 3), with a worked example (section 4).
+- Next, variants, trade-offs and production lessons (sections 5-7).
+- Finally, the SDE-3 deep dive on two-level caches, multi-region, negative caching and why delete beats update, then interview questions, cheat sheet and drills.
+
+> [!tip] Remember
+> Cache-aside, a TTL and delete-on-write; then plan for the cache being empty or down.
 
 ## 1. Why it exists
 
@@ -440,3 +487,7 @@ Updating the cache on write has a race: two writers can set the cache in the opp
 - Edge: [[CDN and Edge]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[API Gateway and BFF]]
 - System design: [[Hot Keys and Hot Partitions]], [[Rate Limiting - Algorithms and Distributed Design]], [[Bloom Filters and Probabilistic Data Structures]], [[Case Study - Leaderboard and Top-K]], [[System Design Interview Framework]]
 - Related decisions: [[Choosing an API and Communication Style - Decision Guide]], [[Choosing a Database - Decision Guide]], [[Choosing Consistency, Replication and Partitioning - Decision Guide]], [[HLD Trade-offs Master Cheat Sheet]]
+
+### Watch on YouTube
+
+- [Every Caching Strategy Explained in 15 Minutes / System Design Interviews](https://www.youtube.com/watch?v=sW6wPHX-ij0) · Shubham Kulkarni / Coding and Interviews · 14 min · 630 views

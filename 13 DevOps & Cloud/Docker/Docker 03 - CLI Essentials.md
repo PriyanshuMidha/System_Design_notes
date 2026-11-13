@@ -7,7 +7,7 @@ related: ["[[Docker 05 - Networking and Port Publishing]]", "[[Docker 06 - Volum
 sources:
   - "Docker docs, CLI reference (docs.docker.com/reference/cli/docker)"
   - "Docker docs, docker stop reference (docs.docker.com/reference/cli/docker/container/stop)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 03 - CLI Essentials
@@ -35,6 +35,52 @@ flowchart LR
 ```
 
 Build or pull, run, look at it, poke at it if something's wrong, stop it, remove it. Every CLI session is some subset of this loop.
+
+## Start here: the basics
+
+**The problem in one story.**
+You have a Dockerfile and want to see your Go API actually running.
+You need to build it, start it, look at its logs, open a shell inside it, and stop it cleanly.
+Each of those is one `docker` command.
+This note is the small set of commands you use every day.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| CLI | A program you control by typing commands | `docker ps` |
+| Daemon | A background service doing the real work | `dockerd` receives CLI requests |
+| Image | The packaged app you start containers from | `myapi:dev` |
+| Container | A running (or stopped) instance of an image | Started by `docker run` |
+| Port mapping | Connecting a host port to a container port | `-p 8080:8080` |
+| Signal | A message the OS sends a process | `SIGTERM` = please shut down |
+| Exit code | A number a process returns when it ends | `0` = success, `137` = killed |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["docker build"] --> I["Image"]
+    I --> R["docker run"]
+    R --> C["Running container"]
+    C --> L["docker logs / exec"]
+    C --> S["docker stop"]
+    S --> X["Stopped container"]
+    X --> RM["docker rm"]
+```
+
+**Analogy.** A TV remote: a few buttons (play, pause, stop, info) cover nearly everything you do.
+Where it breaks: the remote talks to one TV; the `docker` CLI is a client that can talk to any Docker daemon, even a remote one.
+
+**How the rest of this note builds up**
+
+- First, why the CLI matters and the client → daemon mental model (sections 1-2).
+- Then container lifecycle states, `pull` vs `run` vs `create` + `start`, and `stop` vs `kill` (section 3).
+- Then a full build-and-run worked example (section 4).
+- Finally variants, trade-offs and the SDE-3 production and debugging details.
+
+> [!tip] Remember
+> build → run → logs/exec → stop → rm covers most of daily Docker work.
 
 ## 1. Why it exists
 
@@ -83,11 +129,17 @@ flowchart TD
     RUN["docker run myapi"] -->|pulls image if missing,<br/>then create + start| RUNNING
 ```
 
-`docker pull` only downloads layers; it never starts anything. `docker run` is a convenience that does `pull` (if the image isn't already local), `create`, and `start` in one step — which is why `docker run node` with no other flags does start a container, briefly: it creates and starts it, and if that container's main process needs a terminal (like a shell with nothing piped to it) and gets none, it exits immediately rather than hanging around.
+`docker pull` only downloads layers; it never starts anything.
+
+`docker run` is a convenience that does `pull` (if the image isn't already local), `create`, and `start` in one step — which is why `docker run node` with no other flags does start a container, briefly: it creates and starts it, and if that container's main process needs a terminal (like a shell with nothing piped to it) and gets none, it exits immediately rather than hanging around.
 
 ### `stop` vs. `kill`
 
-`docker stop <container>` sends `SIGTERM` to the container's PID 1, then waits a grace period (10 seconds by default, `docker 27`'s documented default) before escalating to `SIGKILL` if the process hasn't exited. `docker kill <container>` sends `SIGKILL` (or another signal you specify) immediately, with no grace period — the process has no chance to flush buffers, close connections, or run cleanup code. Prefer `stop` for anything that should shut down gracefully (see [[Graceful Shutdown and Health Checks]]); reach for `kill` only when a container is hung and `stop` has already timed out.
+`docker stop <container>` sends `SIGTERM` to the container's PID 1, then waits a grace period (10 seconds by default, `docker 27`'s documented default) before escalating to `SIGKILL` if the process hasn't exited.
+
+`docker kill <container>` sends `SIGKILL` (or another signal you specify) immediately, with no grace period — the process has no chance to flush buffers, close connections, or run cleanup code.
+
+Prefer `stop` for anything that should shut down gracefully (see [[Graceful Shutdown and Health Checks]]); reach for `kill` only when a container is hung and `stop` has already timed out.
 
 ## 4. Worked example
 
@@ -294,3 +346,8 @@ docker push myregistry.example.com/myapi:v1
 - **Before this:** [[Docker 02 - Images, Layers and Containers]]
 - **Next:** [[Docker 05 - Networking and Port Publishing]], [[Docker 06 - Volumes and Bind Mounts]]
 - **Compare with:** [[Docker 07 - Docker Compose for Local Development]] (the same lifecycle, declared for several containers at once)
+
+### Watch on YouTube
+
+- [Ep-4: Docker CLI Essentials + Understanding Docker Images/ @DockerInc #docker](https://www.youtube.com/watch?v=hEQUHKNnSCo) · DevOps Codex · 22 min · 47 views
+- [Docker CLI Explained / run, exec, logs & inspect (Daily Docker Commands) / Cloud & Devops](https://www.youtube.com/watch?v=pry-Vs4Ew6Y) · DheerajTechInsight · 31 min · 1,482 views

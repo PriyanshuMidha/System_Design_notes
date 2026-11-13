@@ -9,7 +9,7 @@ sources:
   - "Go source, runtime/runtime2.go (g, m, p structs)"
   - "golang.org/issue/24543, non-cooperative goroutine preemption design (Go 1.14)"
   - "golang.org/doc/go1.25, container-aware GOMAXPROCS"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Runtime - Goroutine Scheduler (GMP)
@@ -24,15 +24,66 @@ updated: 2026-11-07
 > - When a G blocks on a syscall, its M keeps the G but hands the **P** to another M (or a freshly started one), so the P is never idle just because one M is stuck.
 > - Idle Ps **steal** half the runnable Gs from a busy P's queue instead of sitting empty.
 
+## Start here: the basics
+
+**The problem in one story.**
+A restaurant has 4 cooks but 10,000 orders.
+Hiring one cook per order would be absurd, and cooks would trip over each other.
+Instead each cook keeps a small pile of tickets, grabs the next one, and borrows from a busy cook's pile when theirs is empty.
+Go's scheduler runs many goroutines (orders) on a few OS threads (cooks) the same way.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Goroutine (G) | A very cheap function running concurrently | `go handle(req)` |
+| OS thread (M) | A thread the kernel schedules on a CPU core | Each M runs one G at a time |
+| Processor (P) | Go's permission slip to run Go code, with a local queue | `GOMAXPROCS=4` gives 4 Ps |
+| Run queue | A list of goroutines ready to run | Each P holds up to 256 |
+| Context switch | Pausing one task to run another | G blocks on a channel, another G runs |
+| Syscall | A request from the program to the kernel | Reading a file |
+| Preemption | Forcing a running task to pause | A tight loop stopped after ~10ms |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    GQ["Global run queue"] --> P1
+    P1["P1: local queue<br/>G G G"] --> M1["M1 (OS thread)"] --> C1["CPU core"]
+    P2["P2: local queue<br/>(empty)"] --> M2["M2 (OS thread)"] --> C2["CPU core"]
+    P2 -. "steals half" .-> P1
+```
+
+**Analogy.** Ps are cooking stations, Ms are cooks, Gs are order tickets. A cook needs a station to cook.
+Where it breaks: if a cook goes to the store (a blocking syscall), the station is handed to another cook; real kitchens don't hire a new cook on the spot.
+
+**How the rest of this note builds up**
+
+- First, why OS threads alone are too heavy and the G-M-P mental model (sections 1-2).
+- Then local and global queues, work stealing, syscall handoff, parking and `GOMAXPROCS` (section 3).
+- Then a worked example with `GODEBUG=schedtrace`, plus comparisons and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive: containers and CPU limits, preemption, interview questions (sections 7-9).
+
+> [!tip] Remember
+> Many Gs, few Ms, exactly `GOMAXPROCS` Ps; a G runs only when an M holds a P.
+
 ## 1. Why it exists
 
-A server handling 50,000 concurrent connections cannot give each one an OS thread: each thread needs a multi-KB-to-MB stack and costs microseconds to context-switch, and the kernel scheduler knows nothing about which threads are "really" blocked on a channel versus a socket. Pre-2012 Go (and plain OS-thread concurrency in C, Java before virtual threads, or Python threads) pays that cost per connection.
+A server handling 50,000 concurrent connections cannot give each one an OS thread: each thread needs a multi-KB-to-MB stack and costs microseconds to context-switch, and the kernel scheduler knows nothing about which threads are "really" blocked on a channel versus a socket.
 
-Go instead starts a goroutine for a 2 KB stack and schedules **M goroutines onto N OS threads** (M:N scheduling) itself, in user space, where it has information the kernel doesn't: that a goroutine blocked on `ch <- v` or a mutex is not doing anything the OS needs to schedule around. A Go process on an 8-core machine typically runs with 8 OS threads actively executing Go code (`GOMAXPROCS = 8`) no matter whether it has 10 goroutines or 500,000 of them.
+Pre-2012 Go (and plain OS-thread concurrency in C, Java before virtual threads, or Python threads) pays that cost per connection.
+
+Go instead starts a goroutine for a 2 KB stack and schedules **M goroutines onto N OS threads** (M:N scheduling) itself, in user space, where it has information the kernel doesn't: that a goroutine blocked on `ch <- v` or a mutex is not doing anything the OS needs to schedule around.
+
+A Go process on an 8-core machine typically runs with 8 OS threads actively executing Go code (`GOMAXPROCS = 8`) no matter whether it has 10 goroutines or 500,000 of them.
 
 ## 2. Mental model
 
-Picture a kitchen with a fixed number of chef's stations (**P**, one per CPU core) and a pool of chefs (**M**, OS threads) that can stand at a station. Orders (**G**, goroutines) pile up in a queue in front of each station. A chef at a station cooks one order at a time from that station's queue; when a chef has to step out to answer the phone (a blocking syscall), they hand their station to another chef so the station never sits idle. A chef with an empty queue walks over and grabs half the orders waiting at a busy station instead of standing around.
+Picture a kitchen with a fixed number of chef's stations (**P**, one per CPU core) and a pool of chefs (**M**, OS threads) that can stand at a station. Orders (**G**, goroutines) pile up in a queue in front of each station.
+
+A chef at a station cooks one order at a time from that station's queue; when a chef has to step out to answer the phone (a blocking syscall), they hand their station to another chef so the station never sits idle.
+
+A chef with an empty queue walks over and grabs half the orders waiting at a busy station instead of standing around.
 
 ## 3. How it works
 
@@ -101,7 +152,9 @@ An M that finds no work anywhere enters a brief **spinning** state (looking with
 
 ### Blocking syscall handoff
 
-A goroutine calling a blocking syscall (reading a regular file, `exec`-ing a subprocess, cgo) parks its M inside the kernel for the syscall's duration. If the scheduler did nothing else, that P would sit idle for however long the syscall takes. Instead, **entering** a blocking syscall hands the M's P to another M (an idle one, or a newly created one) so that P keeps running other Gs immediately:
+A goroutine calling a blocking syscall (reading a regular file, `exec`-ing a subprocess, cgo) parks its M inside the kernel for the syscall's duration. If the scheduler did nothing else, that P would sit idle for however long the syscall takes.
+
+Instead, **entering** a blocking syscall hands the M's P to another M (an idle one, or a newly created one) so that P keeps running other Gs immediately:
 
 ```mermaid
 sequenceDiagram
@@ -122,15 +175,21 @@ sequenceDiagram
 
 A background thread, **sysmon**, also retakes a P from an M that has been in a syscall "too long" (roughly 20 μs plus some backoff) even if the M itself never explicitly hands it off, so a slow syscall can't starve the P indefinitely.
 
-This is why one blocking syscall never stalls other goroutines, but it is also why syscall-heavy code (many short-lived subprocesses, cgo calls, or blocking file I/O) can balloon the thread count: each concurrently blocked syscall needs its own M. **Network** I/O does not pay this cost at all, because `net` sockets are set non-blocking and registered with the OS's async I/O facility (epoll on Linux, kqueue on Darwin/BSD) through Go's netpoller; see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] for that mechanism. A goroutine doing `conn.Read` parks on the netpoller and releases its P immediately, with no extra M needed; the netpoller wakes it (`goready`) once the fd is readable.
+This is why one blocking syscall never stalls other goroutines, but it is also why syscall-heavy code (many short-lived subprocesses, cgo calls, or blocking file I/O) can balloon the thread count: each concurrently blocked syscall needs its own M. **Network** I/O does not pay this cost at all, because `net` sockets are set non-blocking and registered with the OS's async I/O facility (epoll on Linux, kqueue on Darwin/BSD) through Go's netpoller; see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] for that mechanism.
+
+A goroutine doing `conn.Read` parks on the netpoller and releases its P immediately, with no extra M needed; the netpoller wakes it (`goready`) once the fd is readable.
 
 ### Parking: gopark and goready
 
-A goroutine blocked on a channel, a mutex, or the netpoller doesn't spin or hold any resource: the scheduler calls `gopark`, which records why it's parked, detaches it from its M/P, and lets that M run something else. Whatever unblocks it (`ch <- v`, `Unlock`, an epoll event) calls `goready`, which puts the G back on a run queue. No OS thread is tied up while a goroutine waits — the thread serves other work in the meantime.
+A goroutine blocked on a channel, a mutex, or the netpoller doesn't spin or hold any resource: the scheduler calls `gopark`, which records why it's parked, detaches it from its M/P, and lets that M run something else.
+
+Whatever unblocks it (`ch <- v`, `Unlock`, an epoll event) calls `goready`, which puts the G back on a run queue. No OS thread is tied up while a goroutine waits — the thread serves other work in the meantime.
 
 ### GOMAXPROCS
 
-`runtime.GOMAXPROCS(n)` sets the P count; `runtime.GOMAXPROCS(0)` reads it without changing it. It defaults to `runtime.NumCPU()`, the number of logical CPUs the OS reports. Inside a Linux container with a CPU quota (a Kubernetes `resources.limits.cpu: "2"`), `NumCPU()` historically reported the **host's** core count, not the quota, so a pod limited to 2 CPUs would see `GOMAXPROCS=32` on a 32-core node, over-schedule, and burn its quota as throttling instead of throughput. Uber's `automaxprocs` library fixed this by reading the cgroup quota and calling `runtime.GOMAXPROCS` at startup. **Since Go 1.25**, the runtime does this itself: `GOMAXPROCS` is derived from the cgroup CPU limit automatically and is updated at runtime if the limit changes, making `automaxprocs` unnecessary on 1.25+ (verify: confirm this on your exact container runtime before dropping the library from an existing service).
+`runtime.GOMAXPROCS(n)` sets the P count; `runtime.GOMAXPROCS(0)` reads it without changing it. It defaults to `runtime.NumCPU()`, the number of logical CPUs the OS reports. Inside a Linux container with a CPU quota (a Kubernetes `resources.limits.cpu: "2"`), `NumCPU()` historically reported the **host's** core count, not the quota, so a pod limited to 2 CPUs would see `GOMAXPROCS=32` on a 32-core node, over-schedule, and burn its quota as throttling instead of throughput.
+
+Uber's `automaxprocs` library fixed this by reading the cgroup quota and calling `runtime.GOMAXPROCS` at startup. **Since Go 1.25**, the runtime does this itself: `GOMAXPROCS` is derived from the cgroup CPU limit automatically and is updated at runtime if the limit changes, making `automaxprocs` unnecessary on 1.25+ (verify: confirm this on your exact container runtime before dropping the library from an existing service).
 
 Raising `GOMAXPROCS` above the core count does not add real parallelism; it adds more Ps than cores, so Ms fight over the same CPUs and context-switch more, which helps only if goroutines spend real time blocked on something the scheduler doesn't already handle for you (rare, since locks/channels/network already yield the P).
 
@@ -138,7 +197,9 @@ Raising `GOMAXPROCS` above the core count does not add real parallelism; it adds
 
 Early Go (pre-1.14) was **cooperatively** scheduled: a goroutine only yielded at specific points — a function call prologue, a channel operation, an allocation. A goroutine running a tight loop with no function calls (`for { x++ }`) could hold its P and starve every other goroutine on it, including the garbage collector's stop-the-world phase, indefinitely.
 
-**Since Go 1.14**, the runtime adds **asynchronous preemption**: `sysmon` notices a G has run for more than ~10 ms and sends it a signal (`SIGURG` on Unix) that the runtime's signal handler turns into a safe-point check, forcibly suspending the G so its P can run something else. This closed the long-standing "tight loop blocks GC forever" class of bugs, though it is still not instantaneous and is not a substitute for goroutines that actually check `ctx.Done()`.
+**Since Go 1.14**, the runtime adds **asynchronous preemption**: `sysmon` notices a G has run for more than ~10 ms and sends it a signal (`SIGURG` on Unix) that the runtime's signal handler turns into a safe-point check, forcibly suspending the G so its P can run something else.
+
+This closed the long-standing "tight loop blocks GC forever" class of bugs, though it is still not instantaneous and is not a substitute for goroutines that actually check `ctx.Done()`.
 
 ### Stacks
 
@@ -154,7 +215,9 @@ SCHED 24ms: gomaxprocs=2 idleprocs=1 threads=22 spinningthreads=0 needspinning=0
 SCHED 51ms: gomaxprocs=2 idleprocs=2 threads=22 spinningthreads=0 needspinning=0 idlethreads=1 runqueue=0 [0 0]
 ```
 
-**Measured output** (go1.24.4 darwin/arm64, Apple M4, `GOMAXPROCS=2 GODEBUG=schedtrace=20 ./demo`) from a program that starts 20 goroutines, each running `exec.Command("sleep", "0.05").Run()` — a real blocking syscall (fork/exec/`wait4`), not a channel or timer wait. `gomaxprocs` stays pinned at 2 throughout, but `threads` grows from 2 to 22: one native OS thread per concurrently blocked syscall, exactly the handoff behaviour described above. `runqueue=0` and the trailing `[0 0]` (each P's local queue length) because this workload has no CPU-bound backlog — every G is either running `exec` or already finished.
+**Measured output** (go1.24.4 darwin/arm64, Apple M4, `GOMAXPROCS=2 GODEBUG=schedtrace=20 ./demo`) from a program that starts 20 goroutines, each running `exec.Command("sleep", "0.05").Run()` — a real blocking syscall (fork/exec/`wait4`), not a channel or timer wait. `gomaxprocs` stays pinned at 2 throughout, but `threads` grows from 2 to 22: one native OS thread per concurrently blocked syscall, exactly the handoff behaviour described above.
+
+`runqueue=0` and the trailing `[0 0]` (each P's local queue length) because this workload has no CPU-bound backlog — every G is either running `exec` or already finished.
 
 Add `scheddetail=1` for a per-P, per-M breakdown (status, what each P/M/G is doing); use it sparingly, it's verbose. `go tool trace` ([[Benchmarks, Profiling and Tracing]]) draws the same information as a per-P timeline you can zoom into, which reads far more easily than a schedtrace log for anything beyond "is the thread count sane".
 
@@ -330,3 +393,8 @@ func main() {
 - **Before this:** [[Goroutines and Channels]], [[Processes, Threads and Context Switching]], [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]
 - **Next:** [[Runtime - Memory Allocator and Garbage Collector]], [[Benchmarks, Profiling and Tracing]]
 - **Compare with:** [[sync Primitives and Atomics]] (what actually parks a goroutine), [[select and Concurrency Patterns]] (sizing worker pools in practice)
+
+### Watch on YouTube
+
+- [GopherCon 2018: The Scheduler Saga - Kavya Joshi](https://www.youtube.com/watch?v=YHRO5WQGh0k) · Gopher Academy · deep dive on internals of the G-M-P scheduler
+- [Why Go Needs a Scheduler & GMP Model](https://www.youtube.com/watch?v=RUJt0HZa_5c) · programmerCave · concise explainer of the GMP model and why it exists

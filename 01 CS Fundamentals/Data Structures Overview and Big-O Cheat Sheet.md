@@ -6,7 +6,7 @@ prereqs: []
 related: ["[[Arrays and Dynamic Arrays (Go Slices)]]", "[[Linked Lists]]", "[[Stacks, Queues and Deques]]", "[[Hash Tables and Go Maps]]", "[[Trees, BSTs and Balanced Trees]]", "[[Heaps and Priority Queues]]", "[[Graphs and Graph Algorithms]]", "[[Complexity Analysis - Big-O and Amortized Cost]]", "[[Data Structures Overview and Big-O Cheat Sheet - Go]]"]
 sources:
   - "Go source, runtime/slice.go and runtime/map.go (growth and layout behaviour referenced in the table)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Data Structures Overview and Big-O Cheat Sheet
@@ -20,15 +20,66 @@ updated: 2026-11-09
 > - Pick a structure by naming the operation your code does most often, then matching it against the table below.
 > - When in doubt, start with a slice or a map. Reach for a tree, heap, or specialised structure only once you know *why* a slice or map isn't enough.
 
+## Start here: the basics
+
+### The problem in one story
+
+You keep 10,000 contacts on your phone. Finding "Priya" by scrolling one by one is slow.
+Your phone keeps them sorted, so it can jump to "P" instead.
+A different app wants "who called most recently" — sorting by name does not help there.
+Same data, different question, different best arrangement. That arrangement is a data structure.
+
+### Words you need first
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Data structure | A way to arrange values in memory | A list, a dictionary, a tree |
+| Operation | Something your code does to the data | Look up, insert, delete, list in order |
+| `n` | How many items you are storing | 10,000 contacts → `n = 10,000` |
+| Big-O | How the work grows as `n` grows | `O(n)`: twice the items, about twice the work |
+| `O(1)` | Same work no matter how big `n` is | Reading item 42 of a slice |
+| `O(log n)` | Work grows very slowly; halves the search each step | 1,000,000 sorted items → about 20 steps |
+| Slice / map | Go's built-in list and key→value dictionary | `[]int{1,2}`, `map[string]int{"a": 1}` |
+| Cache locality | Values next to each other in memory are faster to read together | Scanning a slice beats chasing list pointers |
+
+### Picture it
+
+```mermaid
+flowchart LR
+    Q["What does my code<br/>do most often?"] --> P["By position"] --> S["Slice"]
+    Q --> K["By key"] --> M["Map"]
+    Q --> MIN["Smallest / largest"] --> H["Heap"]
+    Q --> R["Sorted range"] --> T["Tree"]
+```
+
+### Analogy
+
+A data structure is like how you organise a kitchen: spices on a rack by name, knives in a block, plates stacked. Each layout makes one kind of grab fast.
+Where it breaks: a kitchen rarely holds a million items, so the "hidden" costs here (memory layout, resizing) have no kitchen equivalent.
+
+### How the rest of this note builds up
+
+- First, **Why it exists** and **Mental model**: one leaderboard story and the four basic ways of finding something.
+- Then **How it works**: the choosing flowchart, memory layout, amortised cost, balanced trees and heaps.
+- Then the **master table** in Variants and comparison, the one-page cost reference.
+- Finally the SDE-3 **Deep dive** on why Big-O hides constants, layout and latency spikes, plus interview questions.
+
+> [!tip] Remember
+> Name the operation your code does most, then pick the structure that makes that operation cheap.
+
 ## 1. Why it exists
 
-Say you're building a leaderboard that supports three operations: add a player's score, look up a player's score by name, and list the top 10 scores. Pick the wrong structure and one of those operations becomes slow at scale:
+Say you're building a leaderboard that supports three operations: add a player's score, look up a player's score by name, and list the top 10 scores.
+
+Pick the wrong structure and one of those operations becomes slow at scale:
 
 - Store players in a plain unsorted slice: adding is `O(1)`, but finding "top 10" means sorting all `n` players every time, `O(n log n)` per request.
 - Store them in a `map[string]int`: looking up by name is `O(1)` average, but there is no order at all, so "top 10" still means collecting and sorting everything.
 - Store them in a max-heap keyed by score, plus a `map[string]int` for name lookups: adding is `O(log n)`, finding the top 10 is `O(10 log n)`, and name lookup stays `O(1)`.
 
-None of these is "the right data structure" in the abstract. The heap-plus-map combination wins **for this specific mix of operations**. A cache that only ever needs recency order would reach for a different pair (map plus doubly linked list — see [[Linked Lists]]). The job of this note is to make that match-up mechanical instead of a guess.
+None of these is "the right data structure" in the abstract. The heap-plus-map combination wins **for this specific mix of operations**.
+
+A cache that only ever needs recency order would reach for a different pair (map plus doubly linked list — see [[Linked Lists]]). The job of this note is to make that match-up mechanical instead of a guess.
 
 > [!tip] Remember
 > There is no single "best" data structure — only the best structure for the exact mix of operations your code performs most often.
@@ -50,7 +101,9 @@ Think of a data structure as answering one question: **"when I ask for item X, h
 
 **Why it matters:** once you recognise which of these four questions your code is really asking, the right family of structures follows almost automatically — the rest of this note is just the specialisations built on top of these four.
 
-**Where the analogy breaks down:** a real post office's PO boxes never collide (each box has exactly one owner); a hash table's "box number" is a hash of the key modulo the table size, so two different keys *can* compute to the same box — see the hash table diagram in section 3 for what happens next.
+**Where the analogy breaks down:** a real post office's PO boxes never collide (each box has exactly one owner).
+
+A hash table's "box number" is a hash of the key modulo the table size, so two different keys *can* compute to the same box — see the hash table diagram in section 3 for what happens next.
 
 Everything else — trees, heaps, graphs, tries, skip lists, union-find — is a specialisation of one of these four answers, built to make one more operation (ordered range scans, "the current minimum", "is there a path", "the longest shared prefix") just as cheap.
 
@@ -85,7 +138,10 @@ flowchart TD
 
 **Why it matters:** picking a structure before naming the operation is guessing; naming the operation first turns the choice into a lookup.
 
-Two structures sit outside this flowchart because they specialise one branch further: a **trie** (see [[Tries, Suffix Trees and Suffix Arrays]]) is a map specialised for keys that share prefixes (autocomplete, routers); **union-find** (see [[Union-Find and Skip Lists]]) answers "are these two items in the same group?" faster than a graph traversal would, for a structure that only ever merges groups.
+Two structures sit outside this flowchart because they specialise one branch further:
+
+- A **trie** (see [[Tries, Suffix Trees and Suffix Arrays]]) is a map specialised for keys that share prefixes (autocomplete, routers).
+- **Union-find** (see [[Union-Find and Skip Lists]]) answers "are these two items in the same group?" faster than a graph traversal would, for a structure that only ever merges groups.
 
 > [!warning] Common mistake
 > Picking the structure that's fastest for the *one* operation you thought of first, while ignoring the others your code also needs. The leaderboard example needs two structures together precisely because no single one is cheap at both jobs.
@@ -112,7 +168,9 @@ flowchart LR
 
 **Example:** scanning 1,000 contiguous `int64` values touches about 8 cache lines total (each cache line holds 8 values); scanning 1,000 linked-list nodes touches up to 1,000 separate cache lines, one per node, because each node's address is unknown until the previous one is loaded.
 
-**Why it matters:** reading the contiguous layout sequentially lets the CPU prefetch the next cache line before you ask for it; reading the scattered layout is a cache miss at nearly every step. See [[Memory Hierarchy and CPU Caches]] for the actual latency numbers behind "cache miss." This is exactly why [[Linked Lists]] explains why a slice usually beats a linked list in Go even when their Big-O for an operation is identical.
+**Why it matters:** reading the contiguous layout sequentially lets the CPU prefetch the next cache line before you ask for it; reading the scattered layout is a cache miss at nearly every step.
+
+See [[Memory Hierarchy and CPU Caches]] for the actual latency numbers behind "cache miss." This is exactly why [[Linked Lists]] explains why a slice usually beats a linked list in Go even when their Big-O for an operation is identical.
 
 ### Amortised cost: why a single `append` can be slow even though "append is O(1)"
 
@@ -129,7 +187,9 @@ flowchart LR
     G2 -- "yes: grow to cap=16,<br/>copy all 8 elements" --> A3["append #9...<br/>cap=16: O(1) each"]
 ```
 
-**Example:** appending to a slice that doubles its capacity each time it's full costs `O(1)` for most calls, but the specific call that triggers a grow from capacity 1,000,000 to 2,000,000 copies a million elements in that one call — `O(n)` for that call alone. Averaged over the whole sequence of appends, the cost still works out to `O(1)` per call, which is what "amortised" means.
+**Example:** appending to a slice that doubles its capacity each time it's full costs `O(1)` for most calls, but the specific call that triggers a grow from capacity 1,000,000 to 2,000,000 copies a million elements in that one call — `O(n)` for that call alone.
+
+Averaged over the whole sequence of appends, the cost still works out to `O(1)` per call, which is what "amortised" means.
 
 **Why it matters:** a system with a strict p99 latency budget can be hurt by the occasional expensive resize even though the *average* cost looks fine — this is exactly the kind of spike [[Complexity Analysis - Big-O and Amortized Cost]] proves with the accounting-method argument.
 
@@ -163,7 +223,9 @@ flowchart TB
 
 **Example:** looking up `7` in the balanced tree takes 3 comparisons (`4 → 6 → 7`). Looking up `7` in the degenerate tree takes 7 comparisons — every single node, because it's really just a linked list wearing a tree's name.
 
-**Why it matters:** this is precisely why the master table below lists a plain BST's *worst-case* search as `O(n)`, not `O(log n)` — only a tree that actively rebalances itself (AVL, red-black, B-tree) can guarantee `O(log n)` in the worst case; see [[Trees, BSTs and Balanced Trees]] for how rebalancing prevents this.
+**Why it matters:** this is precisely why the master table below lists a plain BST's *worst-case* search as `O(n)`, not `O(log n)`.
+
+Only a tree that actively rebalances itself (AVL, red-black, B-tree) can guarantee `O(log n)` in the worst case; see [[Trees, BSTs and Balanced Trees]] for how rebalancing prevents this.
 
 > [!warning] Common mistake
 > Quoting a BST's cost as `O(log n)` without checking whether it's actually kept balanced. An unbalanced BST's worst case is `O(n)` — exactly as bad as a linked list — and sorted or near-sorted input is precisely the case that triggers it.
@@ -198,7 +260,9 @@ flowchart TD
 
 ### Whiteboard version
 
-For the leaderboard from section 1: "add player", "look up by name", "top 10" maps to heap (current max) + map (lookup by key). Confirm it against the flowchart: "always need the current minimum/maximum" → heap; "look up by an arbitrary key" → map. Two different needs, two structures, used together — this is normal, not a sign you picked wrong.
+For the leaderboard from section 1: "add player", "look up by name", "top 10" maps to heap (current max) + map (lookup by key). Confirm it against the flowchart: "always need the current minimum/maximum" → heap; "look up by an arbitrary key" → map.
+
+Two different needs, two structures, used together — this is normal, not a sign you picked wrong.
 
 The `Need`/`Choose` function that turns this flowchart into testable Go code, plus its test, live in the runnable version: [[Data Structures Overview and Big-O Cheat Sheet - Go]].
 
@@ -206,7 +270,9 @@ The `Need`/`Choose` function that turns this flowchart into testable Go code, pl
 
 ### The master table
 
-`n` is the number of elements. All costs below are average case unless a worst-case column exists; "amortised" means the cost averaged over a sequence of operations, explained in [[Complexity Analysis - Big-O and Amortized Cost]]. The **worst case** column is a true worst case throughout the table — including for the balanced BST row, whose worst case assumes it has degenerated as shown in section 3, not that it stayed balanced.
+`n` is the number of elements. All costs below are average case unless a worst-case column exists; "amortised" means the cost averaged over a sequence of operations, explained in [[Complexity Analysis - Big-O and Amortized Cost]].
+
+The **worst case** column is a true worst case throughout the table — including for the balanced BST row, whose worst case assumes it has degenerated as shown in section 3, not that it stayed balanced.
 
 | Structure | Access | Search | Insert | Delete | Worst case (search) | Memory layout | Go type / package | Typical real use |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -253,9 +319,28 @@ Every row above gets its own note with the full mechanism, a tested Go implement
 
 ## 7. In production
 
-- **Real systems:** a web server's router is a trie or radix tree ([[Tries, Suffix Trees and Suffix Arrays]]); a load balancer's consistent-hash ring is a sorted structure over hashed positions (see [[Consistent Hashing]]); a database index is a B+tree ([[Storage Engines - B-tree vs LSM and WAL]]); a job scheduler's "run next" queue is a heap ([[Heaps and Priority Queues]]); Kruskal's minimum spanning tree algorithm is union-find plus a sorted edge list ([[Union-Find and Skip Lists]]).
-- **Failure modes → fixes:** choosing an unsorted slice for a lookup-heavy workload → switch to a map once profiling shows linear scans dominating; choosing a map where insertion order matters → Go maps randomise iteration order on purpose, so pair the map with a slice of keys or switch to a sorted structure; choosing a linked list for cache-sensitive hot-path code → benchmark against a slice first, almost always the slice wins below cache-capacity sizes; choosing a plain BST for data from an untrusted or naturally sorted source → it degenerates exactly as section 3 shows, so use a self-balancing structure instead.
-- **What to monitor:** allocations per operation (`go test -benchmem`), p99 latency of the operation your structure serves (the amortisation subsection above explains why p99, not just p50, is where a slice's occasional resize shows up), and — for anything backed by a hash table — load factor and the collision/resize rate.
+**Real systems:**
+
+- A web server's router is a trie or radix tree ([[Tries, Suffix Trees and Suffix Arrays]]).
+- A load balancer's consistent-hash ring is a sorted structure over hashed positions (see [[Consistent Hashing]]).
+- A database index is a B+tree ([[Storage Engines - B-tree vs LSM and WAL]]).
+- A job scheduler's "run next" queue is a heap ([[Heaps and Priority Queues]]).
+- Kruskal's minimum spanning tree algorithm is union-find plus a sorted edge list ([[Union-Find and Skip Lists]]).
+
+**Failure modes → fixes:**
+
+| Failure mode | Fix |
+| --- | --- |
+| Choosing an unsorted slice for a lookup-heavy workload | Switch to a map once profiling shows linear scans dominating |
+| Choosing a map where insertion order matters | Go maps randomise iteration order on purpose, so pair the map with a slice of keys or switch to a sorted structure |
+| Choosing a linked list for cache-sensitive hot-path code | Benchmark against a slice first; almost always the slice wins below cache-capacity sizes |
+| Choosing a plain BST for data from an untrusted or naturally sorted source | It degenerates exactly as section 3 shows, so use a self-balancing structure instead |
+
+**What to monitor:**
+
+- Allocations per operation (`go test -benchmem`).
+- p99 latency of the operation your structure serves (the amortisation subsection above explains why p99, not just p50, is where a slice's occasional resize shows up).
+- For anything backed by a hash table: load factor and the collision/resize rate.
 
 ## 8. Deep dive
 
@@ -309,3 +394,7 @@ The practical rule that falls out of all three: **measure before you specialise*
 - **Next:** [[Arrays and Dynamic Arrays (Go Slices)]], [[Linked Lists]], [[Stacks, Queues and Deques]], [[Hash Tables and Go Maps]]
 - **Compare with:** [[Complexity Analysis - Big-O and Amortized Cost]] (the formal cost model this note's table relies on), [[Memory Hierarchy and CPU Caches]] (why the constants behind Big-O differ)
 - **Runnable code:** [[Data Structures Overview and Big-O Cheat Sheet - Go]]
+
+### Watch on YouTube
+
+- [ALL Data Structures in 15MINS! Data Structures Revision, Data Structures Crash Course](https://www.youtube.com/watch?v=5seZMzTyNLA) · KnowledgeCatch · Fast top-level revision across arrays, lists, trees, heaps, hash tables, graphs — matches the note's map/cheat-sheet role

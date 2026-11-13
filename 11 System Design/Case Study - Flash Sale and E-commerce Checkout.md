@@ -10,13 +10,17 @@ sources:
   - "Alex Xu, System Design Interview Vol. 2 (hotel reservation chapter: reservation holds and idempotency)"
   - "General industry practice for flash sales (virtual waiting rooms, pre-warming, static pages on a CDN); described generically, no company-specific claims or numbers used"
   - "All numbers in this note are labelled estimates for teaching, not measurements"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Flash Sale and E-commerce Checkout
 
 > [!summary] TL;DR
-> A **flash sale** sells a small, fixed stock (say 10,000 phones) to a huge crowd (say 1,000,000 people) that all arrive in the same minute. The design has to do three things at once: never sell more than the stock, never fall over under the spike, and stay fair. The recipe is a cheap front door that sheds most of the crowd, a fast atomic stock counter that decides winners, a short reservation that expires, and a slow, safe checkout behind a queue.
+> A **flash sale** sells a small, fixed stock (say 10,000 phones) to a huge crowd (say 1,000,000 people) that all arrive in the same minute.
+>
+> The design has to do three things at once: never sell more than the stock, never fall over under the spike, and stay fair.
+>
+> The recipe is a cheap front door that sheds most of the crowd, a fast atomic stock counter that decides winners, a short reservation that expires, and a slow, safe checkout behind a queue.
 
 > [!abstract] Core idea
 > - Most of the crowd cannot win. Filter them out **before** they touch the database: CDN, waiting room, per-user limits.
@@ -24,6 +28,52 @@ updated: 2026-11-09
 > - A winner gets a **reservation** with a timer. Pay in time and it becomes an order; do not pay and the stock returns.
 > - Checkout is a **saga** (reserve, pay, confirm, or compensate), with idempotency keys on every step.
 > - Redis is the fast gate; the SQL database is the final judge. Better to undersell briefly than to oversell.
+
+## Start here: the basics
+
+**The problem in one story.**
+A shop says: "10,000 phones at half price, 12:00 sharp."
+At 12:00, a million people tap "Buy" in the same few seconds.
+Only 10,000 can win, and the shop must never promise phone number 10,001.
+The website also must not crash for everyone else who is just browsing.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Stock / inventory | How many units are left to sell | `stock = 10000` |
+| Race condition | Two requests read the same value and both act on it | Both see "1 left", both buy it |
+| Atomic operation | A step that happens all at once, nobody can cut in | Redis `DECR stock` |
+| Cache (Redis) | Very fast in-memory store in front of the database | Stock counter kept in RAM |
+| Queue | A line of work items processed in order | Orders waiting for payment workers |
+| Idempotency key | An ID that makes a retry do nothing new | Same reservation ID sent twice = one order |
+| CDN | Servers near users that hand out static files | Sale page served from a nearby city |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["1,000,000 buyers"] --> W["Waiting room<br/>lets a few in"]
+    W --> G{"Stock counter<br/>above 0?"}
+    G -- "yes, take one" --> R["Reservation<br/>(10 min timer)"]
+    G -- "no" --> S["Sold out"]
+    R --> P["Pay"]
+    P --> O["Order confirmed"]
+    R -- "timer ends" --> B["Unit goes back"]
+```
+
+**Analogy.** A bouncer lets 50 people into the shop at a time, and a clerk hands out numbered tokens from a box until the box is empty.
+Where it breaks: a real box is never read by 100,000 people per second, and a real till never loses a message halfway through.
+
+**How the rest of this note builds up**
+
+- First, the requirements and how this differs from ticket booking (section 1), then the shop analogy and order lifecycle (section 2).
+- Then the high-level design and the load funnel (section 3), with estimates, API and tables (section 4).
+- Then the deep dives: atomic stock gate, reservations and expiry, crowd control, checkout as a saga (section 5).
+- Finally the SDE-3 view: variants, trade-offs, production failures and interview questions (sections 6-10).
+
+> [!tip] Remember
+> Shed the crowd early, decide winners with one atomic step, and let the database have the final word.
 
 ## 1. Why it exists - requirements
 
@@ -72,7 +122,9 @@ Two things go wrong in a naive design. First, the database melts under load, bec
 
 ### Analogy: a shop door with a bouncer and a tiny till
 
-Think of a physical shop opening a sale. A bouncer lets in 50 people at a time (waiting room). Inside, a staff member hands out 10,000 numbered tokens and stops when the box is empty (atomic counter). A token holder walks to the till and pays within 10 minutes (checkout with reservation). If they walk away, their token goes back in the box (expiry).
+Think of a physical shop opening a sale. A bouncer lets in 50 people at a time (waiting room). Inside, a staff member hands out 10,000 numbered tokens and stops when the box is empty (atomic counter).
+
+A token holder walks to the till and pays within 10 minutes (checkout with reservation). If they walk away, their token goes back in the box (expiry).
 
 The analogy breaks down because a real box cannot be read by 100,000 people per second, and a real till has no network failures. In software the "box" must be a data structure designed for this load, and the till can lose a message half-way.
 
@@ -594,3 +646,8 @@ A 45-minute script:
 - **Next:** [[Case Study - Payment System]], [[Saga Pattern]], [[Transactional Outbox and CDC]]
 - **Decision guides:** [[Choosing a Database - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Consistency, Replication and Partitioning - Decision Guide]], [[Choosing an API and Communication Style - Decision Guide]], [[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]]
 - **Related:** [[Hot Keys and Hot Partitions]], [[Load Shedding and Graceful Degradation]], [[API Abuse and Bot Protection]], [[Distributed Locks and Fencing Tokens]], [[Receiving Webhooks Idempotently]], [[System Design Interview Framework]]
+
+### Watch on YouTube
+
+- [flashsale module system design in 6 minutes](https://www.youtube.com/watch?v=dlV7l_VqCXk) · Mike tech sharing · 5 min · 27,882 views
+- [Flash Sale System: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=U2Acfwcah80) · TechPrep · 20 min · 8,555 views

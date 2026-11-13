@@ -9,7 +9,7 @@ sources:
   - "Google, The Site Reliability Workbook, ch. 9 'Incident Response'"
   - "FEMA, Incident Command System (ICS) basic structure (incident.io and PagerDuty both derive their roles from it)"
   - "PagerDuty, Incident Response Documentation (roles, severity levels)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Incident Response
@@ -34,13 +34,65 @@ flowchart LR
 
 Everything in this note is about making each arrow fast and each box well-defined: what counts as "detected," who decides severity, what "mitigate" is allowed to mean before root cause is known, and how you know you are actually stable rather than just quiet for five minutes.
 
+## Start here: the basics
+
+**The problem in one story.**
+At 2 a.m. the checkout page starts failing.
+Five engineers jump into a chat, each tries a different fix, and nobody knows who decided what.
+An hour later, it is still broken.
+Incident response is the agreed routine that makes this a calm, 15-minute fix instead.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Incident | Something broken that hurts users or the business now | Checkout returns errors |
+| On-call | The engineer whose job is to answer alerts right now | Paged at 2 a.m. |
+| Alert / page | An automatic message that wakes someone up | "Error rate above 5%" |
+| Severity (SEV) | A number for how bad it is | SEV1 = many users down |
+| Mitigate | Stop the user pain, even before knowing why | Roll back the last deploy |
+| Incident Commander (IC) | The one person who coordinates and decides | Says "we roll back now" |
+| Root cause | The underlying reason it broke | A config typo in the deploy |
+| Postmortem | A written review after the incident | Timeline plus action items |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Detect"] --> B["Assess severity"]
+    B --> C["Mitigate"]
+    C --> D["Confirm stable"]
+    D --> E["Postmortem"]
+```
+
+**Analogy.** A fire brigade: one chief gives orders, firefighters put out the fire first, and investigators find the cause later.
+Where it breaks: a fire is obvious, but a software incident can look "quiet" while still broken, so you must check it is truly stable.
+
+**How the rest of this note builds up**
+
+- First, why a process is needed (section 1) and the detect-to-postmortem model (section 2).
+- Then how it works: severity levels, roles and communication (section 3).
+- Then a full worked incident timeline (section 4), variants and trade-offs (sections 5-6).
+- Finally the SDE-3 depth: production practice and the deeper why behind roles and mitigation-first (sections 7-8).
+
+> [!tip] Remember
+> One person in charge, stop the bleeding first, explain it later.
+
 ## 1. Why it exists
 
-InvoiceOps's payment webhook handler commits the database update for an invoice, then returns `200 OK`. One day a load balancer timeout fires between the commit and the response: the handler's write succeeds, but the client never sees the `200`, so the payment provider's retry logic resends the same webhook. Within four minutes, the `webhook_duplicate_total` counter — normally near zero — is climbing by about 40 a minute, and support tickets about double-charged invoices start arriving.
+InvoiceOps's payment webhook handler commits the database update for an invoice, then returns `200 OK`.
 
-Without an incident process, what typically happens is: three engineers independently notice the alert, two start reading unrelated parts of the code, nobody tells the on-call manager, and twenty minutes pass with no decision made about whether to disable the webhook endpoint. By the time someone finally flips the kill switch, the duplicate count has reached roughly 800 events — a bound almost entirely set by how long the group took to decide, not by how long the actual fix took to write (the kill switch was a five-line config change available from minute one).
+One day a load balancer timeout fires between the commit and the response: the handler's write succeeds, but the client never sees the `200`, so the payment provider's retry logic resends the same webhook.
 
-With a defined process, the shape is different: the on-call engineer who takes the alert becomes IC by default, states "SEV2, webhook duplicates, kill switch going on now," flips it, and the duplicate count stops climbing within roughly a minute of the alert firing. The difference between the two timelines is not technical skill — it is that **mitigation did not wait for a decision about who was allowed to act.**
+Within four minutes, the `webhook_duplicate_total` counter — normally near zero — is climbing by about 40 a minute, and support tickets about double-charged invoices start arriving.
+
+Without an incident process, what typically happens is: three engineers independently notice the alert, two start reading unrelated parts of the code, nobody tells the on-call manager, and twenty minutes pass with no decision made about whether to disable the webhook endpoint.
+
+By the time someone finally flips the kill switch, the duplicate count has reached roughly 800 events — a bound almost entirely set by how long the group took to decide, not by how long the actual fix took to write (the kill switch was a five-line config change available from minute one).
+
+With a defined process, the shape is different: the on-call engineer who takes the alert becomes IC by default, states "SEV2, webhook duplicates, kill switch going on now," flips it, and the duplicate count stops climbing within roughly a minute of the alert firing.
+
+The difference between the two timelines is not technical skill — it is that **mitigation did not wait for a decision about who was allowed to act.**
 
 ## 2. Mental model
 
@@ -267,7 +319,9 @@ Both tests pass under `go vet` and `go test -race` on Go 1.24.
 | 14:11:30 | IC | Duplicate rate back to baseline, confirms over one more polling cycle |
 | 14:16:30 | IC | Declares Resolved after five stable minutes |
 
-Total time to mitigation: 4 minutes 20 seconds from alert to rollback complete. Root cause (a changed timeout value that made the load balancer time out before the handler's response, not the handler being slow) was found afterward, during the postmortem, and took a further 40 minutes to isolate — confirming the mitigate-first order: a correct fix that takes 40 minutes would have let the duplicate count run roughly ten times longer than the rollback did.
+Total time to mitigation: 4 minutes 20 seconds from alert to rollback complete.
+
+Root cause (a changed timeout value that made the load balancer time out before the handler's response, not the handler being slow) was found afterward, during the postmortem, and took a further 40 minutes to isolate — confirming the mitigate-first order: a correct fix that takes 40 minutes would have let the duplicate count run roughly ten times longer than the rollback did.
 
 ## 5. Variants and comparison
 
@@ -304,9 +358,13 @@ Total time to mitigation: 4 minutes 20 seconds from alert to rollback complete. 
 
 ## 8. Deep dive
 
-**Why "mitigate before root cause" survives scrutiny.** The objection is "what if the rollback doesn't actually fix it, and we wasted time?" The answer is asymmetric cost: a rollback is a known, reversible, pre-tested state (the previous deploy was running minutes ago, under load, without this symptom), while a root-cause fix is unverified code written under pressure. Reverting to a known-good state is close to risk-free by comparison, even when it later turns out the deploy was not the actual cause — you lose a few minutes retrying, instead of risking a worse outage from an untested hotfix.
+**Why "mitigate before root cause" survives scrutiny.** The objection is "what if the rollback doesn't actually fix it, and we wasted time?" The answer is asymmetric cost: a rollback is a known, reversible, pre-tested state (the previous deploy was running minutes ago, under load, without this symptom), while a root-cause fix is unverified code written under pressure.
 
-**Why the IC must not debug.** The instant the IC opens a terminal, two things degrade simultaneously: nobody is deciding whether to escalate severity, extend the incident, or bring in more people, and nobody is tracking whether "five more minutes" has turned into forty. Separating the roles is a scheduling discipline, not a skill hierarchy — the IC can be the most junior person in the room, because their job is coordination, not expertise.
+Reverting to a known-good state is close to risk-free by comparison, even when it later turns out the deploy was not the actual cause — you lose a few minutes retrying, instead of risking a worse outage from an untested hotfix.
+
+**Why the IC must not debug.** The instant the IC opens a terminal, two things degrade simultaneously: nobody is deciding whether to escalate severity, extend the incident, or bring in more people, and nobody is tracking whether "five more minutes" has turned into forty.
+
+Separating the roles is a scheduling discipline, not a skill hierarchy — the IC can be the most junior person in the room, because their job is coordination, not expertise.
 
 **Severity as an evidence problem, not a vibe.** A useful discipline is writing the severity criteria as a table before any incident happens (as in section 3) and training the on-call rotation to match symptoms to rows, rather than asking "how bad does this feel" in the moment — under 3 a.m. stress, feelings run both too high (small cosmetic bugs declared SEV1) and too low (slow data corruption dismissed as SEV3 because nothing is "down" yet).
 
@@ -353,3 +411,8 @@ Total time to mitigation: 4 minutes 20 seconds from alert to rollback complete. 
 - **Before this:** [[Observability Fundamentals]], [[Alerting and On-Call]]
 - **Next:** [[Production Debugging Playbook]], [[Postmortems and Root Cause Analysis]]
 - **Compare with:** [[SLIs, SLOs, SLAs and Error Budgets]] (the numbers that often trigger detection in the first place)
+
+### Watch on YouTube
+
+- [SOC Stories / Real-World Scenarios / Suspicious PowerShell Alert / Incident Response for SOC Analyst](https://www.youtube.com/watch?v=LNI8SnlJv0s) · Rajneesh Gupta · 16 min · 9,889 views
+- [Introduction to Cybersecurity Incident Response](https://www.youtube.com/watch?v=YZSM3YPn998) · Struggle Security · 7 min · 21,220 views

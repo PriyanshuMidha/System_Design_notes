@@ -8,7 +8,7 @@ sources:
   - "CodeWithAryan, How to approach LLD problems (codewitharyan.com/tech-blogs/how-to-approach-lld-problems)"
   - "CodeWithAryan, What is low-level system design (codewitharyan.com/tech-blogs/what-is-low-level-system-design)"
   - "Go blog / Go docs, Organizing a Go module (go.dev/doc/modules/layout)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # LLD Interview Method
@@ -22,6 +22,50 @@ updated: 2026-11-04
 > - You drive: state assumptions out loud, write them down, and ask the interviewer to confirm them.
 > - The score is mostly correctness of the hard method, clean boundaries, and how you handle concurrency and failure, not how many patterns you name.
 > - Classic failure: drawing 15 classes, coding getters, and never reaching the method where the race lives.
+
+## Start here: the basics
+
+**The problem in one story.**
+An interviewer says "design a parking lot" and starts a 60-minute timer.
+You draw boxes for cars, floors, tickets, payments and lights.
+At minute 55 you still have not written the one method that hands out a spot.
+A fixed method tells you what to do in each slice of the hour so the important code gets written.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| LLD (low-level design) | Designing classes, methods and code for one feature | `ParkingLot.Park(v Vehicle) (Ticket, error)` |
+| Use case | One thing a user wants to do | "Driver parks a car" |
+| Actor | Someone or something that uses the system | Driver, gate machine, admin |
+| Entity | A main noun in the problem with its own data | `Spot`, `Ticket`, `Vehicle` |
+| Method signature | A method's name, inputs and outputs | `Unpark(t Ticket) (int64, error)` |
+| Invariant | A rule that must always hold | "One spot holds at most one car" |
+| Trade-off | Giving up one good thing to get another | Simpler code but only one instance |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Requirements"] --> E["Entities and<br/>relationships"]
+    E --> A["APIs"]
+    A --> P["Patterns"]
+    P --> C["Code the hardest<br/>method"]
+    C --> T["Edge cases and<br/>trade-offs"]
+```
+
+**Analogy.** Like a cooking show with a timer: you plan the menu fast, prep only what you need, and spend most of the time on the main dish.
+Where it breaks: in a real kitchen nobody stops you to ask "what if two chefs grab the last egg?"; the interviewer will, so concurrency must be part of the main dish.
+
+**How the rest of this note builds up**
+
+- First, why a fixed method helps (section 1) and its mental model (section 2).
+- Then the 10 steps with time boxes, how to drive requirements, how to pick the hardest method and lay out code (section 3).
+- Then a full worked example with tested core code and what to test (section 4).
+- Finally variants, trade-offs, how this maps to real design work, the deep dive and interview questions (sections 5-9).
+
+> [!tip] Remember
+> Same 10 steps every time, keep the early steps short, and spend the biggest block on the hardest method.
 
 ## 1. Why it exists
 
@@ -620,3 +664,8 @@ The same steps map onto real design work, which is why interviewers use them:
 - **Before this:** [[OOP in Go - Structs, Interfaces, Embedding]], [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]
 - **Next:** [[UML for LLD]], [[Design Patterns Overview and Chooser]], then practise on [[Parking Lot]] and [[Movie Ticket Booking]]
 - **Compare with:** [[LLD Round Playbook]] (round logistics and scripts), [[Testing LLD Code]], [[Concurrency for LLD]], [[LLD Problem Cheat Sheet]]
+
+### Watch on YouTube
+
+- [10 LLD Interview Tips you should follow!!](https://www.youtube.com/watch?v=paNwoBzpYto) · Keerti Purswani · 13 min · 77,199 views
+- [Low Level Design of a Fitness App and Mock LLD interview with Intuit SWE @Keerti Purswani](https://www.youtube.com/watch?v=7-A5NgGrJqY) · sudoCODE · 52 min · 81,864 views

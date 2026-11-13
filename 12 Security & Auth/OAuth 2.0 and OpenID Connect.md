@@ -12,7 +12,7 @@ sources:
   - "RFC 9700, Best Current Practice for OAuth 2.0 Security"
   - "OAuth 2.1 Authorization Framework, draft-ietf-oauth-v2-1"
   - "OpenID Connect Core 1.0"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # OAuth 2.0 and OpenID Connect
@@ -26,6 +26,52 @@ updated: 2026-11-07
 > - PKCE binds the code exchange to the client that started the flow, so an intercepted code is useless on its own.
 > - OIDC adds the **ID token**: a signed, machine-readable answer to "who is this user", separate from the access token that says "what can this app do".
 > - Classic mistake: treating OAuth as a login protocol. OAuth proves *authorization*; only OIDC's ID token proves *authentication*.
+
+## Start here: the basics
+
+**The problem in one story.**
+You want a photo-printing site to read your Google Photos.
+You should not give it your Google password.
+Instead Google asks you "allow this site to view photos?" and hands the site a limited pass.
+OAuth is that pass system; OpenID Connect adds "and here is who the user is".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Client | The app that wants access | The photo-printing site |
+| Authorization server | The service that logs you in and issues passes | Google's login page |
+| Resource server | The API holding your data | Google Photos API |
+| Access token | A short-lived pass to call the API | `Bearer eyJ...` valid 1 hour |
+| Scope | What the pass is allowed to do | `photos.readonly` |
+| Redirect URI | Where the browser is sent back after login | `https://app.example/callback` |
+| ID token | A signed note saying who logged in (OIDC) | A JWT with `sub` and `email` |
+| PKCE | A one-time secret proving the same app finishes the flow | `code_verifier` + `code_challenge` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User"] --> C["Client app"]
+    C -- "redirect to login" --> AS["Authorization server"]
+    AS -- "code" --> C
+    C -- "code + verifier" --> AS
+    AS -- "access token<br/>(+ ID token)" --> C
+    C -- "token" --> RS["Resource server (API)"]
+```
+
+**Analogy.** A hotel key card. Reception (authorization server) checks your ID once and gives you a card that opens only your room and the gym (scopes), and it expires at checkout.
+Where it breaks: a key card does not prove who you are to anyone else; that identity part is exactly what OpenID Connect's ID token adds on top.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then the authorization code flow with PKCE step by step (section 3) and a full worked example (section 4).
+- Then the other grant types and how OAuth differs from OIDC (section 5).
+- Finally the SDE-3 deep dive: token validation, redirect URI and state attacks, production pitfalls (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> OAuth hands out limited passes (authorization); OpenID Connect adds a signed ID token saying who the user is (authentication).
 
 ## 1. Why it exists
 
@@ -415,3 +461,8 @@ stateDiagram-v2
 - **Before this:** [[Access and Refresh Tokens]], [[JWT - Structure, Validation and Pitfalls]], [[Secrets Management]]
 - **Next:** [[Service-to-Service Auth - API Keys, HMAC, mTLS]]
 - **Compare with:** [[Service-to-Service Auth - API Keys, HMAC, mTLS]] (no user present, machine identity instead), [[Authentication and Authorization in Go]] (implementing the client/resource-server side in Go)
+
+### Watch on YouTube
+
+- [OAuth 2.0 and OpenID Connect (in plain English)](https://www.youtube.com/watch?v=996OiexHze0) · OktaDev · 62 min · 2,051,848 views
+- [An Illustrated Guide to OAuth and OpenID Connect](https://www.youtube.com/watch?v=t18YB3xDfXI) · OktaDev · 16 min · 828,851 views

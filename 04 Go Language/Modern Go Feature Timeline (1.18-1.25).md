@@ -9,7 +9,7 @@ sources:
   - "go.dev/doc/godebug (default-value history and GODEBUG settings)"
   - "go.dev/ref/mod#go-mod-file-go (the go.mod `go` directive and toolchain management)"
   - "go.dev/blog (per-release deep dives: generics, PGO, Swiss Tables, range-over-func)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Modern Go Feature Timeline (1.18-1.25)
@@ -23,9 +23,57 @@ updated: 2026-11-07
 > - `GOTOOLCHAIN` (since 1.21) lets `go build` auto-download the exact toolchain a module asks for, so a team can pin a newer language version without every machine upgrading by hand.
 > - A feature behind `GOEXPERIMENT` (PGO before 1.21, `json/v2` and the Green Tea GC as they shipped in 1.25) is not the default and can still change shape before it ships; do not depend on it in production code. Green Tea GC has since become the 1.26 default - see the note on `GOEXPERIMENT` items in section 3.
 
+## Start here: the basics
+
+**The problem in one story.**
+You open a Go codebase and see `for i := range 5` and a `tool` line in `go.mod`.
+You learned Go a few years ago and have never seen either.
+Go adds features every six months, and old code keeps working, so a codebase mixes old and new styles.
+This note is the map of what arrived when, so unfamiliar code stops being a mystery.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Release | A numbered version of Go | Go 1.22 (February 2024) |
+| `go.mod` | The file that names your module and its Go version | `go 1.24` line |
+| Toolchain | The `go` command plus compiler and standard library | Go 1.24.4 installed on your laptop |
+| Standard library | Packages shipped with Go itself | `slices`, `net/http` |
+| Generics | Writing code once for many types | `func Max[T cmp.Ordered](a, b T) T` |
+| Backward compatible | Old code still compiles on new Go | Go 1.0 code builds on Go 1.25 |
+| Experiment | A feature that ships turned off, opt-in only | `GOEXPERIMENT=jsonv2` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["1.18<br/>generics"] --> B["1.21<br/>min/max, toolchains"]
+    B --> C["1.22<br/>loop vars, range int"]
+    C --> D["1.23<br/>iterators"]
+    D --> E["1.24<br/>Swiss maps, tool directive"]
+    E --> F["1.25<br/>wg.Go, experiments"]
+```
+
+**Analogy.** Go is like layers of rock: each release adds a thin layer on top, and the lower layers are never dug out. The `go` line in `go.mod` says how high up the layers your code may reach.
+Where it breaks: rock layers never change once laid, but experiments can still change shape or be dropped before they become default.
+
+**How the rest of this note builds up**
+
+- First, why a timeline matters (section 1) and the strata-plus-experiments model (section 2).
+- Then release-by-release changes and how `go.mod` picks a toolchain (section 3).
+- Then tested code for the key features (section 4).
+- Finally the SDE-3 view: trade-offs, production upgrade practice, `GODEBUG` defaults and preview vs. GA vs. experiment (sections 6-8).
+
+> [!tip] Remember
+> The `go` line in `go.mod` decides which features and defaults you get; experiments are never something to ship on.
+
 ## 1. Why it exists
 
-Go has released on a fixed six-month cadence since 1.18 (February and August each year, documented in the release history). A backend team that last paid attention around Go 1.18 will see code using `for i := range 5`, `sync.OnceFunc`, `slices.Sort`, or a `tool` line in `go.mod` and have no idea which of those need a newer compiler, which are stable, and which are still experiments that can disappear. The practical cost shows up in two places:
+Go has released on a fixed six-month cadence since 1.18 (February and August each year, documented in the release history).
+
+A backend team that last paid attention around Go 1.18 will see code using `for i := range 5`, `sync.OnceFunc`, `slices.Sort`, or a `tool` line in `go.mod` and have no idea which of those need a newer compiler, which are stable, and which are still experiments that can disappear.
+
+The practical cost shows up in two places:
 
 - **Code review confusion.** A reviewer flags `for i := range n` as "didn't you mean `range arr`?" when it is ordinary Go 1.22+ syntax, or approves code that quietly relies on an experiment (`GOEXPERIMENT=jsonv2`) that is not on in CI.
 - **Toolchain drift.** A `go.mod` with `go 1.24` fails to build on a CI runner whose `go` binary is 1.21, with an error that looks unrelated to the actual missing feature.
@@ -34,7 +82,9 @@ This note is the map: what shipped in each release since 1.18, so you can read u
 
 ## 2. Mental model
 
-Picture Go's standard library and language as **strata**: each six-month release adds a thin layer on top of the last one, and the layers below never get removed or broken. The `go` directive in `go.mod` (for example `go 1.24`) is a line drawn through the strata: it tells the compiler "you may use language features up to this layer," which is how `for i := range n` (1.22) can be a hard compile error in a module still declaring `go 1.20`.
+Picture Go's standard library and language as **strata**: each six-month release adds a thin layer on top of the last one, and the layers below never get removed or broken.
+
+The `go` directive in `go.mod` (for example `go 1.24`) is a line drawn through the strata: it tells the compiler "you may use language features up to this layer," which is how `for i := range n` (1.22) can be a hard compile error in a module still declaring `go 1.20`.
 
 A second idea sits next to the strata: **experiments**. A few features ship behind `GOEXPERIMENT=name` before they are the default - PGO was one in 1.20, `json/v2` and a new garbage collector ("Green Tea") are two in 1.25. They are real, built-in code, but off by default and not yet promised to stay the same shape.
 
@@ -100,9 +150,25 @@ Each release is tagged with the note that teaches the feature itself; this note 
 - `GOMAXPROCS` became container-aware by default: it now tracks the cgroup CPU quota (previously you needed `uber-go/automaxprocs`). Owned by [[Runtime - Goroutine Scheduler (GMP)]].
 - `testing/synctest` reached general availability (no `GOEXPERIMENT` flag needed), for deterministic tests of code built on fake time. Owned by [[Testing in Go]].
 - `(*sync.WaitGroup).Go(f)`, a helper that runs `f` in a new goroutine and calls `Add(1)`/`Done()` around it for you. Owned by [[sync Primitives and Atomics]] and [[Goroutines and Channels]].
-- `net/http.CrossOriginProtection`, a standard-library middleware that rejects cross-origin state-changing requests by default (a built-in CSRF defense for browser-facing APIs). It decides from the `Sec-Fetch-Site` header first: `same-origin` or no header at all is allowed, `cross-site` or `same-site` is rejected (two hosts on the same registrable domain, like `tools.example.com` and `til.example.com`, are "same-site" but not "same-origin," so that case is still blocked). If `Sec-Fetch-Site` is absent, it falls back to comparing the `Origin` header against the request's `Host` and rejects a mismatch; a request with neither header is allowed through, since that is either a same-origin request or a non-browser client. Safe methods (`GET`, `HEAD`, `OPTIONS`) are always allowed regardless. Owned by [[CSRF, XSS and Security Headers]].
-- `runtime/trace.FlightRecorder`, an always-on ring buffer of recent execution trace data you can dump on demand (for example, right after a latency spike) instead of trace-logging continuously. It takes an explicit `FlightRecorderConfig{MinAge, MaxBytes}`; leaving `MaxBytes` at its zero value means the maximum size is implementation-defined rather than a fixed documented constant, so size it explicitly (the Go team's own introduction uses a few hundred milliseconds of `MinAge` and roughly a megabyte of `MaxBytes` as a starting point, then suggests sizing `MinAge` to about twice the time window you need to capture) instead of assuming a specific default. Owned by [[Benchmarks, Profiling and Tracing]].
-- Two **experiments** as Go 1.25 shipped, both opt-in via `GOEXPERIMENT` and neither the default: `encoding/json/v2` (`jsonv2`), a redesigned JSON API; and "Green Tea," a reworked garbage collector aimed at lower CPU overhead. Owned by [[Request Decoding, Validation and DTOs]] and [[Runtime - Memory Allocator and Garbage Collector]] respectively. As of Go 1.26, Green Tea GC left experimental status and is on by default (with an opt-out `GOEXPERIMENT=nogreenteagc` that the Go team has said will itself be removed in 1.27); `encoding/json/v2` remains behind `GOEXPERIMENT=jsonv2` and has not shipped as a default. `verify:` re-check both flags' status against the release notes current at read time, since this can keep moving after 1.26.
+- `net/http.CrossOriginProtection`, a standard-library middleware that rejects cross-origin state-changing requests by default (a built-in CSRF defense for browser-facing APIs).
+
+  It decides from the `Sec-Fetch-Site` header first: `same-origin` or no header at all is allowed, `cross-site` or `same-site` is rejected (two hosts on the same registrable domain, like `tools.example.com` and `til.example.com`, are "same-site" but not "same-origin," so that case is still blocked).
+
+  If `Sec-Fetch-Site` is absent, it falls back to comparing the `Origin` header against the request's `Host` and rejects a mismatch; a request with neither header is allowed through, since that is either a same-origin request or a non-browser client.
+
+  Safe methods (`GET`, `HEAD`, `OPTIONS`) are always allowed regardless. Owned by [[CSRF, XSS and Security Headers]].
+- `runtime/trace.FlightRecorder`, an always-on ring buffer of recent execution trace data you can dump on demand (for example, right after a latency spike) instead of trace-logging continuously.
+
+  It takes an explicit `FlightRecorderConfig{MinAge, MaxBytes}`; leaving `MaxBytes` at its zero value means the maximum size is implementation-defined rather than a fixed documented constant.
+
+  So size it explicitly (the Go team's own introduction uses a few hundred milliseconds of `MinAge` and roughly a megabyte of `MaxBytes` as a starting point, then suggests sizing `MinAge` to about twice the time window you need to capture) instead of assuming a specific default.
+
+  Owned by [[Benchmarks, Profiling and Tracing]].
+- Two **experiments** as Go 1.25 shipped, both opt-in via `GOEXPERIMENT` and neither the default: `encoding/json/v2` (`jsonv2`), a redesigned JSON API; and "Green Tea," a reworked garbage collector aimed at lower CPU overhead.
+
+  Owned by [[Request Decoding, Validation and DTOs]] and [[Runtime - Memory Allocator and Garbage Collector]] respectively. As of Go 1.26, Green Tea GC left experimental status and is on by default (with an opt-out `GOEXPERIMENT=nogreenteagc` that the Go team has said will itself be removed in 1.27); `encoding/json/v2` remains behind `GOEXPERIMENT=jsonv2` and has not shipped as a default.
+
+  `verify:` re-check both flags' status against the release notes current at read time, since this can keep moving after 1.26.
 
 ### How `go.mod` picks a toolchain
 
@@ -453,7 +519,9 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 
 ## 6. Trade-offs and when not to use
 
-- **Do not ship on an experiment.** `GOEXPERIMENT=jsonv2` and `GOEXPERIMENT=greenteagc`, both introduced in 1.25, were real but not the default, not covered by the Go 1 compatibility promise the same way stable features are, and able to change behavior release to release. Green Tea GC has since become the default as of Go 1.26 and no longer needs the flag; `jsonv2` has not. Treat any still-experimental flag as a trial in a non-critical service, not a default for new code.
+- **Do not ship on an experiment.** `GOEXPERIMENT=jsonv2` and `GOEXPERIMENT=greenteagc`, both introduced in 1.25, were real but not the default, not covered by the Go 1 compatibility promise the same way stable features are, and able to change behavior release to release.
+
+  Green Tea GC has since become the default as of Go 1.26 and no longer needs the flag; `jsonv2` has not. Treat any still-experimental flag as a trial in a non-critical service, not a default for new code.
 - **A newer `go.mod` version is a one-way door for your users.** Raising the `go` line to use range-over-func (1.23) means every consumer of your module now needs a toolchain that understands it; a library aimed at wide reuse stays conservative, a leaf service does not need to.
 - **`GOTOOLCHAIN=auto` downloads code from the network at build time.** In an air-gapped or strict supply-chain environment, pin `GOTOOLCHAIN=local` and manage the installed `go` version explicitly instead.
 - **Newness is not a reason to adopt.** `sync.OnceValue` is strictly nicer than a hand-rolled `sync.Once` + variable, but a service that already has the old pattern everywhere does not need a mechanical rewrite; use the new form going forward.
@@ -470,18 +538,28 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 ## 8. Deep dive
 
 - **Language-version gating is per-module, not per-binary.** The `go` directive sets the language version the compiler accepts for that module's own source. A binary can link packages from modules declaring different `go` lines; each package is checked against its own module's directive, not the main module's.
-- **`GODEBUG` defaults move forward with the `go` line, not with the installed toolchain.** Go changes a runtime default (for example, TLS or `http2` behavior) by flipping a `GODEBUG` setting's default value, but it only takes effect for modules whose `go` line is new enough; this is how the project avoids breaking old code the instant you install a new `go` binary. The full table of which setting flipped in which release lives at `go.dev/doc/godebug` - check it before assuming a default changed under you.
+- **`GODEBUG` defaults move forward with the `go` line, not with the installed toolchain.** Go changes a runtime default (for example, TLS or `http2` behavior) by flipping a `GODEBUG` setting's default value, but it only takes effect for modules whose `go` line is new enough.
+
+  This is how the project avoids breaking old code the instant you install a new `go` binary.
+
+  The full table of which setting flipped in which release lives at `go.dev/doc/godebug` - check it before assuming a default changed under you.
 - **A toolchain download is content-addressed and verified, the same way a dependency is.** `GOTOOLCHAIN=auto` fetches the toolchain archive from the configured `GOPROXY`, which serves it with the same checksum-database backing as module downloads, so a compromised mirror cannot silently swap in a different `go` binary without failing verification.
-- **"Preview," "GA," and "experiment" are three different promises.** PGO was explicitly a *preview* in 1.20 (opt-in, expected to stabilize) and reached GA in 1.21 (on by default given `default.pgo`). An *experiment* (`json/v2`, Green Tea GC in 1.25) carries no promise of landing in its current shape at all - some experiments are later redesigned or dropped. Read a release's own notes for which word it uses, rather than assuming "it's in the binary" means "it's safe to depend on."
+- **"Preview," "GA," and "experiment" are three different promises.** PGO was explicitly a *preview* in 1.20 (opt-in, expected to stabilize) and reached GA in 1.21 (on by default given `default.pgo`). An *experiment* (`json/v2`, Green Tea GC in 1.25) carries no promise of landing in its current shape at all - some experiments are later redesigned or dropped.
+
+  Read a release's own notes for which word it uses, rather than assuming "it's in the binary" means "it's safe to depend on."
 - `verify:` whether `encoding/json/v2` has left experimental status in a release after 1.26 (Green Tea GC already has, as of 1.26 - see section 3) - this note was written against the Go 1.25 release as shipped in August 2025, with a 1.26 status check added afterward.
 
 ## 9. Interview questions
 
 > [!question]- What exactly changed with loop variables in Go 1.22, and what bug does it fix?
-> Before 1.22, a `for` loop declared one variable and reused it every iteration, so a closure or goroutine created inside the loop without an explicit `i := i` copy could observe a later (often the final) value once the loop moved on. Since 1.22, each iteration gets its own variable, so the closure captures that iteration's value automatically. The `TestPerIterationLoopVariable` test above proves it directly.
+> Before 1.22, a `for` loop declared one variable and reused it every iteration, so a closure or goroutine created inside the loop without an explicit `i := i` copy could observe a later (often the final) value once the loop moved on.
+>
+> Since 1.22, each iteration gets its own variable, so the closure captures that iteration's value automatically. The `TestPerIterationLoopVariable` test above proves it directly.
 
 > [!question]- What is `GOTOOLCHAIN`, and why does it matter for CI?
-> It is the Go 1.21+ mechanism that lets a module's `go.mod` declare a minimum (or exact, via a `toolchain` line) Go version; when the installed `go` is older, the `go` command can auto-download the right one from the module proxy. It matters for CI because a runner with an older cached Go binary will either auto-upgrade (if `GOTOOLCHAIN=auto` and the network is reachable) or fail with a version error that is really a missing-toolchain problem, not a code problem.
+> It is the Go 1.21+ mechanism that lets a module's `go.mod` declare a minimum (or exact, via a `toolchain` line) Go version; when the installed `go` is older, the `go` command can auto-download the right one from the module proxy.
+>
+> It matters for CI because a runner with an older cached Go binary will either auto-upgrade (if `GOTOOLCHAIN=auto` and the network is reachable) or fail with a version error that is really a missing-toolchain problem, not a code problem.
 
 > [!question]- Trap: is `for i := range n` (an int) the same as `for i := range someSlice`?
 > No - they look alike but mean different things. `range n` on an integer (Go 1.22) counts `0` to `n-1` with no underlying collection. `range someSlice` iterates the slice's elements. Passing a slice's `len()` to the first form is a common idiom, but the two aren't interchangeable: `range n` never touches a collection at all.
@@ -490,16 +568,22 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 > An `iter.Seq[T]` is `func(yield func(T) bool)`. The iterator calls `yield` with each value; `yield` returns `true` to keep going or `false` when the consuming loop stopped (via `break`, `return`, or a panic). A correct iterator must stop producing values as soon as `yield` returns `false` - continuing afterward can corrupt the loop or leak work.
 
 > [!question]- What is the difference between a generic type and a generic type alias (Go 1.24)?
-> `type Box[T any] struct{ V T }` defines a brand-new named type parameterized by `T`. `type IntBox = Box[int]` (pre-1.24, no type parameters allowed on the alias itself) or `type NamedBox[T any] = Box[T]` (1.24, the alias itself can now be generic) both just give an existing type another name - the alias and its target are identical types with identical method sets and no conversion needed between them.
+> `type Box[T any] struct{ V T }` defines a brand-new named type parameterized by `T`.
+>
+> `type IntBox = Box[int]` (pre-1.24, no type parameters allowed on the alias itself) or `type NamedBox[T any] = Box[T]` (1.24, the alias itself can now be generic) both just give an existing type another name - the alias and its target are identical types with identical method sets and no conversion needed between them.
 
 > [!question]- Why might a team deliberately choose NOT to adopt `encoding/json/v2` as soon as it is available in Go 1.25?
 > It ships behind `GOEXPERIMENT=jsonv2` and is explicitly not the default or API-stable yet; adopting it means both opting into a flag that is off in a stock toolchain (so CI, local dev and production must all agree to set it) and accepting that its behavior or API can still change before it is promoted out of experimental status.
 
 > [!question]- A service on `go 1.20` can't compile a file using `min`/`max`/`clear`. Is the fix to upgrade the installed `go` binary?
-> Only partly. Those builtins need the *module* to declare `go 1.21` or later in `go.mod` - the compiler gates language-level features by that line, independent of how new the installed `go` binary is. If the installed toolchain is already 1.21+ but `go.mod` still says `go 1.20`, raising the `go` line (and re-running `go mod tidy`) is the actual fix; if the installed binary is older still, `GOTOOLCHAIN=auto` (or a manual upgrade) handles that half.
+> Only partly. Those builtins need the *module* to declare `go 1.21` or later in `go.mod` - the compiler gates language-level features by that line, independent of how new the installed `go` binary is.
+>
+> If the installed toolchain is already 1.21+ but `go.mod` still says `go 1.20`, raising the `go` line (and re-running `go mod tidy`) is the actual fix; if the installed binary is older still, `GOTOOLCHAIN=auto` (or a manual upgrade) handles that half.
 
 > [!question]- What does `b.Loop()` (Go 1.24) fix compared to the classic `for i := 0; i < b.N; i++` benchmark shape?
-> With the classic shape, any setup code written before the loop runs only once but can still be counted if the author forgets `b.ResetTimer()`, and the compiler can sometimes eliminate work inside the loop if its result is never used. `b.Loop()` has the framework own the iteration count and the timer window directly, and keeps each iteration's result alive long enough to prevent dead-code elimination, so a benchmark is correct by construction instead of by careful manual bookkeeping.
+> With the classic shape, any setup code written before the loop runs only once but can still be counted if the author forgets `b.ResetTimer()`, and the compiler can sometimes eliminate work inside the loop if its result is never used.
+>
+> `b.Loop()` has the framework own the iteration count and the timer window directly, and keeps each iteration's result alive long enough to prevent dead-code elimination, so a benchmark is correct by construction instead of by careful manual bookkeeping.
 
 ## 10. Cheat sheet
 
@@ -517,3 +601,8 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 - **Before this:** [[Syntax, Types and Control Flow]], [[Generics and Iterators]]
 - **Next:** [[Go Toolchain, Tooling and Debugging]], [[Packages, Modules and Dependency Management]]
 - **Compare with:** [[Benchmarks, Profiling and Tracing]] (what to do with `b.Loop` and PGO once you know they exist), [[Runtime - Goroutine Scheduler (GMP)]] (what container-aware `GOMAXPROCS` actually changes at runtime)
+
+### Watch on YouTube
+
+- [Going through the Go 1.24 Release Notes](https://www.youtube.com/watch?v=h5Sxe-gcS_I) · Code With Cypert · walkthrough of the newest release's language/runtime/tooling changes
+- [Golang 1.23 What is new?](https://www.youtube.com/watch?v=EL4hg73mT2A) · Mario Carrion · covers range-over-func iterators and other 1.23 additions

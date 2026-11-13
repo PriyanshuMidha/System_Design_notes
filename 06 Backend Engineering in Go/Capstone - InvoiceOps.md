@@ -8,13 +8,15 @@ sources:
   - "Razorpay webhooks documentation (signature header and retry behaviour)"
   - "ISO 4217 currency and minor-unit table"
   - "See the per-section 06 notes linked throughout for their own sources"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Capstone - InvoiceOps
 
 > [!summary] TL;DR
-> InvoiceOps is one running Go service — an invoicing and payments backend for freelancers and small businesses — that every other `06 Backend Engineering in Go` note builds a piece of. This note is the project plan: scope, data model, state machine, the two hardest flows end to end, the build order with acceptance criteria per milestone, and the interview story that ties it together.
+> InvoiceOps is one running Go service — an invoicing and payments backend for freelancers and small businesses — that every other `06 Backend Engineering in Go` note builds a piece of.
+>
+> This note is the project plan: scope, data model, state machine, the two hardest flows end to end, the build order with acceptance criteria per milestone, and the interview story that ties it together.
 
 > [!abstract] Core idea
 > - One system, not 29 unrelated exercises: each `06` note is "the chapter that builds InvoiceOps's X", and this note is the table of contents plus the parts no single chapter owns — the schema, the state machine, the tenancy rule and the milestone order.
@@ -39,15 +41,66 @@ A client calls the API over REST (or gRPC internally); every write that changes 
 
 If you read nothing else: **the invoice is the aggregate, the outbox is the only way anything leaves that aggregate's transaction, and workspace_id is non-negotiable on every row.**
 
+## Start here: the basics
+
+**The problem in one story.** A freelancer sends a client an invoice for some work.
+The client pays online; the bank tells the freelancer's app; the invoice turns to "paid" and the dashboard updates.
+If the client forgets, the app sends a reminder.
+InvoiceOps is that app, and every note in this folder builds one part of it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Invoice | A bill sent to a customer | `inv_42`, 1,500.00 INR, due 30 Nov |
+| Workspace / tenant | One customer account; data must never leak between them | Every row has `workspace_id` |
+| Webhook | An HTTP call a provider sends you when something happens | Provider POSTs "payment succeeded" |
+| Ledger | Append-only record of money movements | One row per payment received |
+| State machine | Allowed states and moves between them | `draft → sent → paid`, never `void → paid` |
+| Outbox | Table of messages written in the same transaction, sent later | Row "invoice 42 paid" for the worker |
+| Minor units | Money as whole smallest units, not decimals | 1,500.00 INR stored as `150000` |
+| Transaction | Group of database writes that all succeed or all fail | Invoice update plus outbox row together |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U[User] --> API[API service]
+    API --> PG[(Postgres)]
+    P[Payment provider] -->|webhook| API
+    PG --> W[Worker]
+    W -->|reminders, live updates| U
+```
+
+**Analogy.** A small shop's order book: every sale is written in the book first, and the assistant reads the book to send receipts and reminders.
+Where it breaks: a shop assistant does not run two copies at once; workers can, so every step must be safe to repeat.
+
+**How the rest of this note builds up**
+
+- First, why one connected project beats separate exercises (sections 1-2).
+- Then scope, data model, tenancy, money rules, the state machine and the webhook flow (section 3).
+- Then the two hardest flows worked end to end in code (section 4).
+- Then build phases with acceptance criteria (section 5).
+- Finally, the SDE-3 deep dive: outbox versus CDC, ADRs and the interview story (sections 6-9).
+
+> [!tip] Remember
+> The invoice is the aggregate, the outbox is the only way out of its transaction, and `workspace_id` is on every row.
+
 ## 1. Why it exists
 
-A list of Go topics without one body to hang them on teaches each topic in isolation: you can write a correct JWT middleware and a correct webhook handler and still not know how they compose, because nothing ever asked you to make a request pass through both of them against the same schema. Real backend interviews ask "walk me through what happens when a payment comes in" — a question with no answer if "payment", "invoice" and "webhook" live in three unconnected demo repos.
+A list of Go topics without one body to hang them on teaches each topic in isolation: you can write a correct JWT middleware and a correct webhook handler and still not know how they compose, because nothing ever asked you to make a request pass through both of them against the same schema.
 
-InvoiceOps is the one system every `06` note writes code against. Concretely: a freelancer creates a client, sends an invoice, the client pays by card through a payment provider, a webhook tells InvoiceOps the money arrived, the invoice flips to `paid`, a dashboard updates live over WebSocket, and if the client only pays part of the amount the invoice sits in `partially_paid` until a second payment (or the due date passes and a scheduled job marks it `overdue`). That one paragraph already touches nine of the `06` notes.
+Real backend interviews ask "walk me through what happens when a payment comes in" — a question with no answer if "payment", "invoice" and "webhook" live in three unconnected demo repos.
+
+InvoiceOps is the one system every `06` note writes code against. Concretely: a freelancer creates a client, sends an invoice, the client pays by card through a payment provider, a webhook tells InvoiceOps the money arrived, the invoice flips to `paid`, a dashboard updates live over WebSocket, and if the client only pays part of the amount the invoice sits in `partially_paid` until a second payment (or the due date passes and a scheduled job marks it `overdue`).
+
+That one paragraph already touches nine of the `06` notes.
 
 ## 2. Mental model
 
-Think of InvoiceOps as **one ledger with three doors in**: the REST API (a human or a frontend), the payment webhook (the outside world telling you something happened), and the scheduler (time itself telling you something happened — a due date passed). All three doors write through the same rule: **one database transaction updates the invoice and appends exactly one outbox row**, and nothing downstream (a WebSocket push, an email, a metric) is allowed to be the thing that decides whether the money state changed. If the outbox write commits, the event *will* eventually be delivered, even across a crash; if it doesn't commit, nothing happened, full stop.
+Think of InvoiceOps as **one ledger with three doors in**: the REST API (a human or a frontend), the payment webhook (the outside world telling you something happened), and the scheduler (time itself telling you something happened — a due date passed). All three doors write through the same rule: **one database transaction updates the invoice and appends exactly one outbox row**, and nothing downstream (a WebSocket push, an email, a metric) is allowed to be the thing that decides whether the money state changed.
+
+If the outbox write commits, the event *will* eventually be delivered, even across a crash; if it doesn't commit, nothing happened, full stop.
 
 ## 3. How it works
 
@@ -185,7 +238,9 @@ stateDiagram-v2
     refunded --> [*]
 ```
 
-`paid`, `cancelled`, `void` and `refunded` are terminal: no event moves an invoice out of them. Every arrow's guard is evaluated against the invoice row read inside the same transaction that applies the event, so two concurrent payment webhooks for the same invoice can never both see "not yet paid" and both write `paid` — the second one's `UPDATE ... WHERE status = $expected` affects zero rows and the handler re-reads and re-evaluates. The exact guarded transition function, tested against every arrow above (including the `overdue -> partially_paid` arrow the old project plan was missing), is in the worked example.
+`paid`, `cancelled`, `void` and `refunded` are terminal: no event moves an invoice out of them. Every arrow's guard is evaluated against the invoice row read inside the same transaction that applies the event, so two concurrent payment webhooks for the same invoice can never both see "not yet paid" and both write `paid` — the second one's `UPDATE ... WHERE status = $expected` affects zero rows and the handler re-reads and re-evaluates.
+
+The exact guarded transition function, tested against every arrow above (including the `overdue -> partially_paid` arrow the old project plan was missing), is in the worked example.
 
 ### 3.6 Payment webhook flow
 
@@ -220,7 +275,9 @@ sequenceDiagram
     end
 ```
 
-This is the same signature-then-dedupe-then-transaction-then-outbox shape that [[Receiving Webhooks Idempotently]] derives in general; InvoiceOps is where it gets a concrete invoice, a concrete `webhook_events` unique key, and a concrete outbox row shape. A separate **reconciliation job** (a [[Scheduled Jobs]] task) re-pulls the provider's payment list for any invoice last-updated more than N minutes ago with no matching webhook, for the case where the webhook itself never arrives — polling as the backstop for push.
+This is the same signature-then-dedupe-then-transaction-then-outbox shape that [[Receiving Webhooks Idempotently]] derives in general; InvoiceOps is where it gets a concrete invoice, a concrete `webhook_events` unique key, and a concrete outbox row shape.
+
+A separate **reconciliation job** (a [[Scheduled Jobs]] task) re-pulls the provider's payment list for any invoice last-updated more than N minutes ago with no matching webhook, for the case where the webhook itself never arrives — polling as the backstop for push.
 
 ### 3.7 Component view
 
@@ -242,7 +299,9 @@ flowchart TB
     REPO --> S3[(Object storage: attachments)]
 ```
 
-Import direction only ever points down this diagram: `cmd` depends on `internal/invoice`'s service, the service depends on a repository *interface* it declares (see [[Service Project Layout and Wiring]] for why the consumer owns the interface), and the concrete Postgres/Redis/S3 clients implement that interface from outside. Nothing in `internal/invoice` imports `net/http`, `database/sql` concrete types, or a Redis client directly — see [[Backend Request Lifecycle and Layering]] for the general version of this rule.
+Import direction only ever points down this diagram: `cmd` depends on `internal/invoice`'s service, the service depends on a repository *interface* it declares (see [[Service Project Layout and Wiring]] for why the consumer owns the interface), and the concrete Postgres/Redis/S3 clients implement that interface from outside.
+
+Nothing in `internal/invoice` imports `net/http`, `database/sql` concrete types, or a Redis client directly — see [[Backend Request Lifecycle and Layering]] for the general version of this rule.
 
 ### 3.8 Idempotent writes, reminders and the dashboard cache
 
@@ -738,7 +797,9 @@ func TestHandlePaymentWebhookBadSignatureRejected(t *testing.T) {
 }
 ```
 
-Running this scratch module: `go vet ./...` is clean, and `go test -race -v ./...` passes all 15 `Transition` sub-tests (one per arrow plus the rejected-event cases), the `Money`/tax table, and 3 webhook tests (apply-once, retry-dedupes, bad-signature-rejected). The suite includes `TestHandlePaymentWebhookDedupesRetry`, which delivers the same webhook 3 times and asserts `paidTotal == 50000`, not `150000` — the concrete regression test for the idempotency story in 3.6.
+Running this scratch module: `go vet ./...` is clean, and `go test -race -v ./...` passes all 15 `Transition` sub-tests (one per arrow plus the rejected-event cases), the `Money`/tax table, and 3 webhook tests (apply-once, retry-dedupes, bad-signature-rejected).
+
+The suite includes `TestHandlePaymentWebhookDedupesRetry`, which delivers the same webhook 3 times and asserts `paidTotal == 50000`, not `150000` — the concrete regression test for the idempotency story in 3.6.
 
 ## 5. Build phases and acceptance criteria
 
@@ -784,7 +845,9 @@ Every note that ships code should do it against this project: if a `06` note has
 
 ### Why the outbox pattern and not a Kafka/Debezium CDC pipeline for this scope
 
-Change Data Capture (reading Postgres's write-ahead log to emit events) removes the outbox table entirely and guarantees the event reflects exactly what committed, but it adds an operational piece (Debezium + a broker) this capstone's volume does not need yet. The polling outbox is strictly simpler to run and test, at the cost of a small polling delay (bounded by the worker's poll interval) instead of near-zero CDC latency. Either is "correct"; the choice here is about scope, not correctness — see [[Transactional Outbox and CDC]] for the full comparison.
+Change Data Capture (reading Postgres's write-ahead log to emit events) removes the outbox table entirely and guarantees the event reflects exactly what committed, but it adds an operational piece (Debezium + a broker) this capstone's volume does not need yet.
+
+The polling outbox is strictly simpler to run and test, at the cost of a small polling delay (bounded by the worker's poll interval) instead of near-zero CDC latency. Either is "correct"; the choice here is about scope, not correctness — see [[Transactional Outbox and CDC]] for the full comparison.
 
 ### ADRs
 
@@ -820,10 +883,14 @@ Change Data Capture (reading Postgres's write-ahead log to emit events) removes 
 > Minor units are plain integer arithmetic — add, subtract, compare — with no library dependency and no rounding ambiguity for the operations an invoice actually needs (sum line items, compare to a threshold). A decimal library earns its place when you need arbitrary-precision division or display formatting beyond "two decimal places for this currency", which InvoiceOps's scope doesn't require.
 
 > [!question]- Trap: the state diagram shows `overdue -> paid` directly — doesn't the invoice have to pass through `partially_paid` first if any payment arrived before the due date?
-> No: an invoice can go `sent -> overdue` (due date passed, zero payments) and then receive one payment that covers the full amount, going straight `overdue -> paid` without ever touching `partially_paid`. `partially_paid` only applies when `0 < paid < due`; a single sufficient payment skips it entirely, which the `Transition` function's nested switch (checking `paid >= due` before `paid > 0`) encodes directly.
+> No: an invoice can go `sent -> overdue` (due date passed, zero payments) and then receive one payment that covers the full amount, going straight `overdue -> paid` without ever touching `partially_paid`.
+>
+> `partially_paid` only applies when `0 < paid < due`; a single sufficient payment skips it entirely, which the `Transition` function's nested switch (checking `paid >= due` before `paid > 0`) encodes directly.
 
 > [!question]- Why Postgres-as-queue for reminders instead of Redis or a broker, given 06 also covers Redis queues?
-> Reminders and outbox dispatch need the same transactional guarantee the invoice write already has (claim exactly once, survive a crash) and the volume is low — one row per invoice event, not per click. Piggybacking on Postgres's `SKIP LOCKED` avoids introducing a second storage system's failure modes for a volume Postgres handles comfortably; see [[Scheduled Jobs]] and [[Background Workers and Job Queues]] for when a real broker earns its place instead.
+> Reminders and outbox dispatch need the same transactional guarantee the invoice write already has (claim exactly once, survive a crash) and the volume is low — one row per invoice event, not per click.
+>
+> Piggybacking on Postgres's `SKIP LOCKED` avoids introducing a second storage system's failure modes for a volume Postgres handles comfortably; see [[Scheduled Jobs]] and [[Background Workers and Job Queues]] for when a real broker earns its place instead.
 
 > [!question]- What would you change if InvoiceOps needed to support a second payment provider tomorrow?
 > Keep `VerifySignature` and the core `HandlePaymentWebhook` logic provider-agnostic (already true: it takes a secret and a body, not a provider name), add a second thin HTTP handler that maps that provider's payload into the same `WebhookEvent`/`Money` shapes, and extend the `webhook_events` unique key's `provider` column (already present) to disambiguate event ids across providers.
@@ -844,3 +911,8 @@ Change Data Capture (reading Postgres's write-ahead log to emit events) removes 
 - **Before this:** [[Backend Request Lifecycle and Layering]], [[Service Project Layout and Wiring]], [[Configuration and Secrets]]
 - **Every 06 note this capstone exercises:** [[HTTP Server Fundamentals (net-http)]] · [[Building REST Endpoints]] · [[Request Decoding, Validation and DTOs]] · [[Middleware]] · [[OpenAPI-First Development in Go]] · [[Database Access (database-sql, pgx, sqlc)]] · [[Transactions and the Repository Pattern]] · [[Schema Migrations in Go Services]] · [[Testing Go Services]] · [[Authentication and Authorization in Go]] · [[Calling External APIs]] · [[Redis in Go]] · [[Background Workers and Job Queues]] · [[Scheduled Jobs]] · [[Receiving Webhooks Idempotently]] · [[File Uploads and Object Storage]] · [[Observability in Go Services]] · [[Graceful Shutdown and Health Checks]] · [[TLS, HTTPS and HTTP2 in Go Servers]] · [[Containerizing Go Services]] · [[Secure Coding for Go Services]] · [[gRPC Services in Go]] · [[gRPC Streaming in Go]] · [[Serving REST and gRPC Together]] · [[WebSockets and SSE in Go]]
 - **Compare with:** [[REST and HTTP API Design]], [[API Contract Design and OpenAPI]], [[gRPC]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Secrets Management]], [[OWASP API Security Top 10]], [[CSRF, XSS and Security Headers]], [[Transactional Outbox and CDC]]
+
+### Watch on YouTube
+
+- [Production-Grade Webhook System That Never Loses Events](https://www.youtube.com/watch?v=B6PWwIwXnmA) · Madme Codes · maps closely to the capstone's payment-webhook-to-ledger flow
+- [Design a Payment System - System Design Interview](https://www.youtube.com/watch?v=olfaBgJrUBI) · Code with Lucian · interview-style system design walkthrough for the payments domain

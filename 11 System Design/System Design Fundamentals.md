@@ -8,7 +8,7 @@ sources:
   - "AWS S3 User Guide, Data protection in Amazon S3 (designed for 99.999999999% durability)"
   - "Google SRE Book, ch. 4 Service Level Objectives"
   - "Martin Kleppmann, Designing Data-Intensive Applications (2017), ch. 1"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # System Design Fundamentals
@@ -22,6 +22,52 @@ updated: 2026-11-04
 > - A standard stack of building blocks (DNS, CDN, load balancer, stateless app tier, cache, database, queue, object storage) solves most problems; each block exists to fix one specific pain.
 > - Keep the app tier stateless and push state into a few purpose-built stores; the stores are where the hard trade-offs live.
 > - Trap: "highly available" or "scalable" without a number means nothing.
+
+## Start here: the basics
+
+**The problem in one story.**
+You build a small shop website on one computer, and it works.
+Then a sale brings 50 times more visitors, the disk dies, and a restart drops orders.
+None of that is a coding bug.
+System design is planning, before that day, how the system stays fast, safe and up.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Functional requirement | What the system must do | "Users can create invoices" |
+| Non-functional requirement | How well it must do it | "p99 under 200 ms, 99.9% up" |
+| Latency | Time for one request | 80 ms |
+| Throughput | Requests handled per second | 5,000 RPS |
+| Availability | Share of time the system works | 99.9% ≈ 8.8 hours down a year |
+| Cache | Fast copy of data used often | Redis holding a user profile |
+| Queue | A line of jobs processed later | Send email after signup |
+| Single point of failure | One part whose failure stops everything | The only database server |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User"] --> CDN["CDN"]
+    CDN --> LB["Load balancer"]
+    LB --> APP["App servers<br/>(stateless)"]
+    APP --> C[("Cache")]
+    APP --> DB[("Database")]
+    APP --> Q["Queue"] --> W["Workers"]
+```
+
+**Analogy.** Designing a restaurant kitchen, not cooking one dish: stations, staff and storage chosen for the expected crowd.
+Where it breaks: a kitchen grows slowly; software traffic can jump 10 times in minutes.
+
+**How the rest of this note builds up**
+
+- First, why design matters (section 1) and the kitchen model (section 2).
+- Then requirements, quality attributes with units, the building-block catalogue and a request's lifecycle (section 3).
+- Then a worked example with availability arithmetic (section 4).
+- Finally the SDE-3 view: variants, trade-offs, production practice and deep dive (sections 5-8).
+
+> [!tip] Remember
+> Start from requirements with numbers, then pick building blocks, and say what each trade-off costs.
 
 ## 1. Why it exists
 
@@ -328,3 +374,8 @@ Systems fall into a few shapes, and the shape decides the first components you r
 - **Before this:** [[What Happens When You Type a URL]], [[Backend Request Lifecycle and Layering]]
 - **Next:** [[Scaling Basics]], [[Back-of-the-Envelope Estimation]], [[Load Balancing]], [[System Design Interview Framework]], and the case-study index in [[11 System Design MOC]]
 - **Compare with:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]] (inside one service rather than across services), [[Distributed Systems Fundamentals]] (what goes wrong between the boxes)
+
+### Watch on YouTube
+
+- [20 System Design Concepts Explained in 10 Minutes](https://www.youtube.com/watch?v=i53Gi_K3o7I) · NeetCode · 11 min · 1,768,613 views
+- [System Design Concepts Course and Interview Prep](https://www.youtube.com/watch?v=F2FmTdLtb_4) · freeCodeCamp.org · 53 min · 3,275,212 views

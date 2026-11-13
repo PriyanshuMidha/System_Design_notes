@@ -9,7 +9,7 @@ sources:
   - "Google, The Site Reliability Workbook, ch. 9 'Postmortem Culture' (postmortem template and anti-patterns)"
   - "Richard I. Cook, 'How Complex Systems Fail' (Cognitive Technologies Laboratory, 1998)"
   - "Sidney Dekker, 'Just Culture: Balancing Safety and Accountability' (2nd ed., 2016)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Postmortems and Root Cause Analysis
@@ -34,15 +34,67 @@ flowchart LR
 
 Everything below is about doing each box honestly: a timeline that is facts only (no interpretation), a factors list that resists collapsing to one sentence, and action items that get tracked to closure rather than filed and forgotten.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your service broke yesterday and you fixed it by undoing a change.
+If nobody writes down why it really broke, the same thing breaks again next month.
+A postmortem is the short write-up after an outage: what happened, why, and what we change so it can't repeat.
+It blames the system, not a person.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Incident | Something broke and users were affected | Duplicate invoices sent for 40 min |
+| Mitigate | Stop the damage, even before you understand it | Roll back the deploy |
+| Timeline | Timestamped facts of what happened, in order | 14:02 deploy, 14:09 first alert |
+| Root cause | The underlying reason, not just the trigger | A timeout set shorter than the handler's latency |
+| Contributing factor | One of several conditions that together caused it | A race window in the duplicate check |
+| Blameless | Ask "what let this happen", never "who did it" | "The runbook link was stale", not "Sam forgot" |
+| Action item | A concrete fix with an owner and a date | Add alert on latency near the timeout |
+| SEV1 / SEV2 | Severity levels; lower number = worse | SEV1 = full outage |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    I["Incident"] --> M["Mitigate"]
+    M --> T["Write timeline<br/>(facts only)"]
+    T --> C["Find contributing<br/>factors (5 whys)"]
+    C --> A["Action items<br/>owner + date"]
+    A --> R["Review & share"]
+    R --> P["Fewer repeats"]
+```
+
+**Analogy.** An air-crash investigation: the goal is to change cockpits, checklists and training so the next crew is safe, not to punish the pilot.
+Where it breaks: aviation reports are slow and formal; a software postmortem should be done within days, while memories are fresh.
+
+**How the rest of this note builds up**
+
+- First, why postmortems exist (section 1) and the blameless mental model (section 2).
+- Then how it works: the template, 5 whys, contributing factors and good action items (section 3).
+- Then a worked example on the InvoiceOps webhook incident with Go code (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: why a single "root cause" is a trap, hindsight bias, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Facts first, several causes not one, blame the system, and every action item has an owner and a date.
+
 ## 1. Why it exists
 
-After the InvoiceOps webhook-duplication incident is mitigated (see [[Incident Response]]), the team has stopped the bleeding but has learned nothing yet that prevents a repeat. Without a postmortem, the natural outcome is a one-line Slack message — "rolled back the bad deploy, duplicates stopped" — and the actual mechanism (a load-balancer timeout shorter than the handler's p99 latency, which made the client retry a request whose write had already succeeded) stays undiscovered. Three weeks later, a different deploy introduces a slightly slower code path, the same timeout mismatch fires again, and the team re-discovers the same lesson from scratch.
+After the InvoiceOps webhook-duplication incident is mitigated (see [[Incident Response]]), the team has stopped the bleeding but has learned nothing yet that prevents a repeat. Without a postmortem, the natural outcome is a one-line Slack message — "rolled back the bad deploy, duplicates stopped" — and the actual mechanism (a load-balancer timeout shorter than the handler's p99 latency, which made the client retry a request whose write had already succeeded) stays undiscovered.
 
-With a postmortem: the timeline shows the deploy at 14:02 did not cause the symptom directly — the actual chain was (a) a config change two weeks earlier raised the handler's average processing time by 90 ms, (b) the load balancer's client timeout was never updated to match, (c) at 14:02 a minor, unrelated deploy added just enough latency to cross that threshold under peak traffic, and (d) the webhook handler's idempotency check had a narrow race window that let a few retried requests slip through before the duplicate check caught them. Four contributing factors, not one. The action items fix the timeout mismatch, widen the idempotency window, and add an alert on handler-latency approaching the LB timeout — three real, different fixes a single sentence like "fixed the deploy" would never have produced.
+Three weeks later, a different deploy introduces a slightly slower code path, the same timeout mismatch fires again, and the team re-discovers the same lesson from scratch.
+
+With a postmortem: the timeline shows the deploy at 14:02 did not cause the symptom directly — the actual chain was (a) a config change two weeks earlier raised the handler's average processing time by 90 ms, (b) the load balancer's client timeout was never updated to match, (c) at 14:02 a minor, unrelated deploy added just enough latency to cross that threshold under peak traffic, and (d) the webhook handler's idempotency check had a narrow race window that let a few retried requests slip through before the duplicate check caught them.
+
+Four contributing factors, not one. The action items fix the timeout mismatch, widen the idempotency window, and add an alert on handler-latency approaching the LB timeout — three real, different fixes a single sentence like "fixed the deploy" would never have produced.
 
 ## 2. Mental model
 
-A postmortem is closer to an aviation incident report than a bug ticket: it is written assuming the people involved made locally reasonable decisions with the information and pressure they had at the time, and it looks for the **conditions** that made those decisions produce a bad outcome, rather than for a person to label at fault. An investigator who writes "the pilot should have noticed X" has stopped investigating — the useful question is **why X was not noticeable**, given the displays, training, and workload at that moment, which is exactly transferable to "why didn't the on-call engineer notice the timeout mismatch before it mattered."
+A postmortem is closer to an aviation incident report than a bug ticket: it is written assuming the people involved made locally reasonable decisions with the information and pressure they had at the time, and it looks for the **conditions** that made those decisions produce a bad outcome, rather than for a person to label at fault.
+
+An investigator who writes "the pilot should have noticed X" has stopped investigating — the useful question is **why X was not noticeable**, given the displays, training, and workload at that moment, which is exactly transferable to "why didn't the on-call engineer notice the timeout mismatch before it mattered."
 
 ## 3. How it works
 
@@ -52,7 +104,9 @@ A postmortem is mandatory for any SEV1 or SEV2 (see [[Incident Response]] for th
 
 ### Blameless, Just Culture
 
-Blameless does not mean consequence-free or detail-free. It means the write-up never names an individual as the cause and never asks "who" — it asks "what about our systems, processes, or defaults let this happen," which is Sidney Dekker's Just Culture framing: accountability is owed to the organization that builds the conditions people operate under, not extracted from the individual who happened to be on shift. A postmortem that says "the engineer forgot to check the dashboard" has identified nothing useful; one that says "the dashboard the runbook points to was three releases out of date" has identified something fixable.
+Blameless does not mean consequence-free or detail-free. It means the write-up never names an individual as the cause and never asks "who" — it asks "what about our systems, processes, or defaults let this happen," which is Sidney Dekker's Just Culture framing: accountability is owed to the organization that builds the conditions people operate under, not extracted from the individual who happened to be on shift.
+
+A postmortem that says "the engineer forgot to check the dashboard" has identified nothing useful; one that says "the dashboard the runbook points to was three releases out of date" has identified something fixable.
 
 ### The template
 
@@ -94,7 +148,9 @@ flowchart TD
 
 ### No single root cause, in complex systems
 
-Richard Cook's *How Complex Systems Fail* argues that failures in complex systems are normally the result of several small, individually survivable conditions combining — the system already contains latent weaknesses (the stale timeout, the narrow race window) that sit harmless until a trigger (the deploy) lines them up. Writing "root cause: the 14:02 deploy" treats a trigger as if it were the whole explanation and leaves the latent weaknesses in place for the next trigger.
+Richard Cook's *How Complex Systems Fail* argues that failures in complex systems are normally the result of several small, individually survivable conditions combining — the system already contains latent weaknesses (the stale timeout, the narrow race window) that sit harmless until a trigger (the deploy) lines them up.
+
+Writing "root cause: the 14:02 deploy" treats a trigger as if it were the whole explanation and leaves the latent weaknesses in place for the next trigger.
 
 ### Action items
 
@@ -119,7 +175,9 @@ flowchart LR
 
 ### Review and follow-through
 
-A postmortem is reviewed in a short meeting (or async review for a smaller incident), shared beyond the immediate team so the lesson generalizes, and archived searchably — a new on-call engineer hitting a similar symptom should be able to find it. Teams that track postmortems in one place over time can run trend analysis: the same contributing factor (stale timeouts, missing alerts on a specific class of thing) appearing across several unrelated incidents is itself a signal worth its own action item.
+A postmortem is reviewed in a short meeting (or async review for a smaller incident), shared beyond the immediate team so the lesson generalizes, and archived searchably — a new on-call engineer hitting a similar symptom should be able to find it.
+
+Teams that track postmortems in one place over time can run trend analysis: the same contributing factor (stale timeouts, missing alerts on a specific class of thing) appearing across several unrelated incidents is itself a signal worth its own action item.
 
 ## 4. Worked example
 
@@ -270,11 +328,17 @@ Both tests pass under `go vet` and `go test -race` on Go 1.24.
 
 ## 8. Deep dive
 
-**Why "root cause" as a singular noun is itself a trap.** The word invites a one-sentence answer, which is convenient for a status update but wrong for an incident that needed several conditions to align. The InvoiceOps example needed four: a latency-raising config change, a stale timeout, a deploy, and a race window. Removing any one of the four would have prevented this specific incident — which also means naming any single one as "the" root cause and fixing only it leaves three latent weaknesses in place for next time.
+**Why "root cause" as a singular noun is itself a trap.** The word invites a one-sentence answer, which is convenient for a status update but wrong for an incident that needed several conditions to align.
 
-**Hindsight bias is the postmortem author's main occupational hazard.** Writing a week after the fact, with the answer already known, it is easy to write "the team should have seen the timeout mismatch coming" — a sentence that is true only because the outcome is now known. The discipline is to reconstruct what was actually visible and known *at each point in the timeline*, not what is obvious now, which is also why the timeline section is kept strictly factual and separated from the contributing-factors analysis.
+The InvoiceOps example needed four: a latency-raising config change, a stale timeout, a deploy, and a race window. Removing any one of the four would have prevented this specific incident — which also means naming any single one as "the" root cause and fixing only it leaves three latent weaknesses in place for next time.
 
-**"Where we got lucky" earns its section.** The InvoiceOps incident happened during a low-traffic window; had it occurred during a daily peak, the retry volume (and duplicate count) would likely have been several times higher before the kill switch caught it. Naming that explicitly turns a day that "wasn't so bad" into a genuine warning about the ceiling of a similar future incident, rather than false reassurance that the system handled it fine.
+**Hindsight bias is the postmortem author's main occupational hazard.** Writing a week after the fact, with the answer already known, it is easy to write "the team should have seen the timeout mismatch coming" — a sentence that is true only because the outcome is now known.
+
+The discipline is to reconstruct what was actually visible and known *at each point in the timeline*, not what is obvious now, which is also why the timeline section is kept strictly factual and separated from the contributing-factors analysis.
+
+**"Where we got lucky" earns its section.** The InvoiceOps incident happened during a low-traffic window; had it occurred during a daily peak, the retry volume (and duplicate count) would likely have been several times higher before the kill switch caught it.
+
+Naming that explicitly turns a day that "wasn't so bad" into a genuine warning about the ceiling of a similar future incident, rather than false reassurance that the system handled it fine.
 
 **Action items need an SLO of their own.** A team that tracks action-item completion against a due date the same way it tracks an SLO (completed within N days, with a visible burn-down) treats follow-through as seriously as uptime — which is the practical difference between a postmortem that changes anything and one that is a well-written historical document.
 
@@ -317,3 +381,8 @@ Both tests pass under `go vet` and `go test -race` on Go 1.24.
 - **Before this:** [[Incident Response]], [[Production Debugging Playbook]]
 - **Next:** [[Production Readiness Review]]
 - **Compare with:** [[SLIs, SLOs, SLAs and Error Budgets]] (error-budget burn is often part of a postmortem's impact section)
+
+### Watch on YouTube
+
+- [What is Root Cause Analysis (RCA)?](https://www.youtube.com/watch?v=7t3lTYEd_PM) · IBM Technology · 8 min · 150,219 views
+- [5 Root Cause Analysis Tools / RCA Tools](https://www.youtube.com/watch?v=K2yHOYeZsSQ) · Pharmaguideline · 3 min · 99,364 views

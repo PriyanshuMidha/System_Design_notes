@@ -12,7 +12,7 @@ sources:
   - "gRPC docs: name resolution, load balancing policies (pick_first default, round_robin), xDS support"
   - "Envoy docs: xDS protocol, Endpoint Discovery Service (EDS)"
   - "Chris Richardson, microservices.io patterns: client-side discovery, server-side discovery, self registration, third-party registration"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Service Discovery
@@ -25,6 +25,50 @@ updated: 2026-11-04
 > - A **registry** holds `service name → healthy instances`; entries are kept alive by heartbeats or health checks and expire when they stop.
 > - **Client-side discovery:** the caller fetches the list and load-balances itself. **Server-side discovery:** the caller hits one stable address and a proxy picks the instance.
 > - Every answer is slightly stale. Design callers to survive a dead address: timeouts, retries on another instance, and graceful deregistration on shutdown.
+
+## Start here: the basics
+
+**The problem in one story.**
+You want to call a friend, but they change phone numbers every few hours.
+Writing their number on paper fails by lunch.
+Instead you ask a shared contacts app, which always has their latest number.
+Service discovery is that contacts app for services whose addresses keep changing.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Service | A program other programs call | `payments` |
+| Instance | One running copy of a service | Pod 3 of 12 |
+| IP and port | The network address of an instance | `10.0.1.5:8080` |
+| Registry | A list of healthy instances per service | `payments → [ip1, ip2]` |
+| Heartbeat | A regular "I'm alive" message | Every 3 s |
+| TTL / lease | Time after which an entry expires unless renewed | 10 s |
+| Health check | A test that the instance can serve | `GET /healthz` returns 200 |
+| Load balancer | Picks one instance for each call | Round robin |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    I["payments instances"] -- "register + heartbeat" --> R[("Registry")]
+    C["checkout"] -- "who serves payments?" --> R
+    R -- "healthy IPs" --> C
+    C -- "call one" --> I
+```
+
+**Analogy.** A shopping mall directory board that updates when shops move.
+Where it breaks: the board can be a few seconds out of date, so you may still walk to a shop that just closed; callers must retry elsewhere.
+
+**How the rest of this note builds up**
+
+- First, why hard-coded addresses fail (section 1) and the mental model (section 2).
+- Then the four jobs, client-side vs server-side discovery, a lease-based registry and Kubernetes (section 3).
+- Then a registry and client-side balancer in Go, and choosing TTL and heartbeat with numbers (section 4).
+- Finally the SDE-3 deep dive: CP vs AP registries, removal propagation in Kubernetes, gRPC balancing, zone-aware routing and health checks (sections 5-8).
+
+> [!tip] Remember
+> Look addresses up at runtime from a registry kept fresh by heartbeats, and assume every answer is a little stale.
 
 ## 1. Why it exists
 
@@ -381,11 +425,19 @@ func TestConcurrentAccess(t *testing.T) {
 Take a TTL of 10 s and a heartbeat every 3 s:
 
 - **Detection time for a crash:** up to 10 s after the last heartbeat. The average is about 10 − 3/2 = 8.5 s after the crash, since the crash happens at a random point between heartbeats.
-- **Tolerance for lost heartbeats:** after a beat at t = 0 the lease runs to 10 s. If the beats at 3 s and 6 s are lost, the one at 9 s still renews it; if that one is lost too, the entry expires at 10 s. So two lost heartbeats in a row are survived and three are not.
-- **Registry load:** 2,000 instances × 1 heartbeat / 3 s ≈ **667 writes per second**. If every heartbeat were a Raft write (as a naive "rewrite the key with a TTL" design would make it), the registry would replicate 667 writes per second just to say "still alive". etcd avoids this: one lease can cover many keys, and keep-alives are sent to the leader over a stream without being written through Raft. Consul goes further and runs health checks on a local agent on each node, so only status changes reach the servers.
+- **Tolerance for lost heartbeats:** after a beat at t = 0 the lease runs to 10 s. If the beats at 3 s and 6 s are lost, the one at 9 s still renews it; if that one is lost too, the entry expires at 10 s.
+
+  So two lost heartbeats in a row are survived and three are not.
+- **Registry load:** 2,000 instances × 1 heartbeat / 3 s ≈ **667 writes per second**.
+
+  If every heartbeat were a Raft write (as a naive "rewrite the key with a TTL" design would make it), the registry would replicate 667 writes per second just to say "still alive". etcd avoids this: one lease can cover many keys, and keep-alives are sent to the leader over a stream without being written through Raft.
+
+  Consul goes further and runs health checks on a local agent on each node, so only status changes reach the servers.
 - **Caller staleness:** if callers cache the list for 5 s, the worst case for sending to a crashed instance becomes 10 + 5 = **15 s**. Watching the registry for changes (etcd watch, Consul blocking queries, Kubernetes watches) brings the cache delay down to the push latency.
 
-Shorter TTLs detect failures faster but turn a 2-second GC pause or network blip into a false removal; a mass expiry during a network partition can drop most of a healthy fleet. Eureka's defaults (30 s renewals, 90 s expiry) sit at the slow and safe end; Kubernetes readiness probes default to every 10 s, with 3 failures before a pod is marked not ready.
+Shorter TTLs detect failures faster but turn a 2-second GC pause or network blip into a false removal; a mass expiry during a network partition can drop most of a healthy fleet.
+
+Eureka's defaults (30 s renewals, 90 s expiry) sit at the slow and safe end; Kubernetes readiness probes default to every 10 s, with 3 failures before a pod is marked not ready.
 
 ## 5. Variants and comparison
 
@@ -401,7 +453,9 @@ Shorter TTLs detect failures faster but turn a 2-second GC pause or network blip
 | Service mesh (Envoy + xDS) | Control plane pushes endpoints (EDS) to sidecar proxies | Active and passive (outlier detection) | Eventually consistent push | Need mTLS, retries, zone-aware routing for many languages |
 | Cloud service registries (AWS Cloud Map, ALB target groups) | Managed registry or LB health checks | LB health checks | Managed | You are on one cloud and want no extra servers |
 
-**CP vs AP registries.** etcd, ZooKeeper and Consul's catalog use consensus (see [[Consensus - Raft and Paxos]]), so during a partition the minority side cannot register or renew. Eureka chose availability: each node keeps serving what it has, and its **self-preservation** mode stops expiring instances when renewals drop sharply, on the theory that the network, not the fleet, is broken. For discovery, slightly stale data is usually better than no data, because callers already retry on dead instances.
+**CP vs AP registries.** etcd, ZooKeeper and Consul's catalog use consensus (see [[Consensus - Raft and Paxos]]), so during a partition the minority side cannot register or renew. Eureka chose availability: each node keeps serving what it has, and its **self-preservation** mode stops expiring instances when renewals drop sharply, on the theory that the network, not the fleet, is broken.
+
+For discovery, slightly stale data is usually better than no data, because callers already retry on dead instances.
 
 ## 6. Trade-offs and when not to use
 
@@ -432,7 +486,13 @@ Shorter TTLs detect failures faster but turn a 2-second GC pause or network blip
 
 ### How fast does a removal propagate in Kubernetes?
 
-A pod being deleted is removed from the EndpointSlices, and in parallel the kubelet sends SIGTERM to the container. The removal then travels: the API server → EndpointSlice watch → kube-proxy on every node → new iptables or IPVS rules, plus any ingress controllers or mesh proxies doing their own watching. Those steps are asynchronous, so for a short time some nodes still route new connections to a pod that has already received SIGTERM. If the app exits immediately, those connections fail. The usual fix is to keep accepting requests for a few seconds after SIGTERM (a `preStop` sleep, or a delay in the app's shutdown handler) and only then drain and exit. The right delay depends on your cluster size and proxies, so measure it rather than guessing.
+A pod being deleted is removed from the EndpointSlices, and in parallel the kubelet sends SIGTERM to the container. The removal then travels: the API server → EndpointSlice watch → kube-proxy on every node → new iptables or IPVS rules, plus any ingress controllers or mesh proxies doing their own watching.
+
+Those steps are asynchronous, so for a short time some nodes still route new connections to a pod that has already received SIGTERM. If the app exits immediately, those connections fail.
+
+The usual fix is to keep accepting requests for a few seconds after SIGTERM (a `preStop` sleep, or a delay in the app's shutdown handler) and only then drain and exit.
+
+The right delay depends on your cluster size and proxies, so measure it rather than guessing.
 
 ### gRPC and connection-level balancing
 
@@ -447,7 +507,9 @@ See [[gRPC]] for the protocol background.
 
 ### Zone-aware routing
 
-With instances in three availability zones, sending every request to a random instance means two-thirds of calls cross zones, which adds latency and, in most clouds, data-transfer charges. Discovery systems can prefer same-zone endpoints (Kubernetes topology-aware routing, Envoy zone-aware balancing) and fall back to other zones when the local zone lacks healthy capacity. The risk is overloading a zone that has fewer instances, so these features only kick in when capacity is balanced.
+With instances in three availability zones, sending every request to a random instance means two-thirds of calls cross zones, which adds latency and, in most clouds, data-transfer charges. Discovery systems can prefer same-zone endpoints (Kubernetes topology-aware routing, Envoy zone-aware balancing) and fall back to other zones when the local zone lacks healthy capacity.
+
+The risk is overloading a zone that has fewer instances, so these features only kick in when capacity is balanced.
 
 ### Health checking: active, passive and both
 
@@ -467,7 +529,9 @@ With instances in three availability zones, sending every request to a random in
 > Probably not. kube-proxy balances connections, and a gRPC client keeps one long-lived HTTP/2 connection, so all its requests go to one pod. Use a headless Service with client-side `round_robin`, an xDS control plane, a mesh, or `MaxConnectionAge` on the servers.
 
 > [!question]- Should a service registry be CP or AP?
-> For discovery, slightly stale data is usually better than none, because callers already retry on dead addresses; Eureka is deliberately AP. CP stores (etcd, ZooKeeper, Consul servers) give one consistent view and are also used for locks and leader election, but the minority side of a partition cannot register or renew. Whichever you choose, callers should cache the last good list.
+> For discovery, slightly stale data is usually better than none, because callers already retry on dead addresses; Eureka is deliberately AP.
+>
+> CP stores (etcd, ZooKeeper, Consul servers) give one consistent view and are also used for locks and leader election, but the minority side of a partition cannot register or renew. Whichever you choose, callers should cache the last good list.
 
 > [!question]- What is the difference between liveness and readiness, and why does discovery care?
 > Liveness asks "is the process stuck? restart it". Readiness asks "should it receive traffic now?". Discovery uses readiness: a failing readiness probe removes the pod from EndpointSlices without restarting it, which is right for warming up, overload or a lost dependency. Wiring a dependency check into liveness instead causes restart storms.
@@ -490,3 +554,8 @@ With instances in three availability zones, sending every request to a random in
 - **Before this:** [[Load Balancing]], [[DNS - Resolution, Records and Caching]], [[Bloom Filters and Probabilistic Data Structures]]
 - **Next:** [[Hot Keys and Hot Partitions]]
 - **Compare with:** [[Kubernetes Fundamentals]] (Services and probes), [[API Gateway and BFF]] (the edge entry point that also routes by service), [[Leader Election]] (the same lease mechanism used to own a role), [[Graceful Shutdown and Health Checks]] (the instance side of deregistration)
+
+### Watch on YouTube
+
+- [Service discovery and heartbeats in micro-services 👍📈](https://www.youtube.com/watch?v=lWE_UIbm8NA) · Gaurav Sen · 6 min · 120,843 views
+- [Master Service Discovery in Microservices / Eureka and Java Spring Boot](https://www.youtube.com/watch?v=ecuEkmFs5Vk) · ByteMonk · 8 min · 55,096 views

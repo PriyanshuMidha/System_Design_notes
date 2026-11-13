@@ -9,7 +9,7 @@ sources:
   - "Go standard library docs: net/http ConnState and Server.ConnState (StateHijacked and StateClosed are terminal)"
   - "Go source: text/template/parse lexer (type stateFn func(*lexer) stateFn); Rob Pike, Lexical Scanning in Go (2011)"
   - "PostgreSQL 17 docs: UPDATE, command tag row counts"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # State Machines in Go
@@ -22,6 +22,52 @@ updated: 2026-11-02
 > - All status changes go through one function (`Next`/`Fire`); nobody writes `status = ...` directly.
 > - When saving, use **compare-and-set** (CAS: `UPDATE ... SET status = new WHERE id = $1 AND status = old`), so two concurrent requests cannot both move the same order.
 > - Classic mistake: reading the status, checking it in Go, then writing without the `AND status = old` condition. A concurrent request slips in between.
+
+## Start here: the basics
+
+**The problem in one story.**
+A food order is placed, then paid, then packed, then delivered.
+It should never jump from "placed" straight to "delivered", and a delivered order should never be cancelled.
+If any code can write `status = "delivered"`, sooner or later a bug will.
+A state machine writes the allowed moves down in one place and refuses everything else.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| State | The situation an object is in right now | `Paid` |
+| Event | Something that happens and may change the state | `Ship` |
+| Transition | A legal move: from state + event gives new state | `Paid + Pack -> Packed` |
+| Guard | An extra check before a move is allowed | "only if payment captured" |
+| Enum | A fixed set of named values | `const (Placed Status = iota; Paid)` |
+| Concurrency | Two requests running at the same time | Customer cancels while shop packs |
+| Compare-and-set (CAS) | Write only if the value is still what you read | `... WHERE status = 'paid'` |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Placed
+    Placed --> Paid: pay
+    Placed --> Cancelled: cancel
+    Paid --> Packed: pack
+    Paid --> Cancelled: cancel
+    Packed --> Delivered: deliver
+    Delivered --> [*]
+```
+
+**Analogy.** A board game: you can only move along the drawn paths, and the rulebook says which squares connect.
+Where it breaks: board-game players take turns, but two web requests can try to move the same order at the same moment, which is why the save needs compare-and-set.
+
+**How the rest of this note builds up**
+
+- First, why state machines exist (section 1) and the mental model (section 2).
+- Then the two ways to build one in Go, table-driven and the GoF State pattern (section 3), and a full worked example with tests (section 4).
+- Then variants and when a state machine is overkill (sections 5-6).
+- Finally the SDE-3 view: compare-and-set saves, events per transition and production pitfalls (sections 7-8).
+
+> [!tip] Remember
+> List the legal moves as data, route every change through one function, and save with compare-and-set.
 
 ## 1. Why it exists
 
@@ -776,7 +822,9 @@ VALUES ('evt_42', 'order.pack', '{"order_id": "o1", "from": "paid", "to": "packe
 COMMIT;
 ```
 
-In Go, compare the command tag's rows affected with 1 (`RowsAffected()` in `database/sql` and pgx). A timeout transition can run as one set-based statement from a sweeper job, with the same compare-and-set predicate and the same guard as `holdExpired` (`hold_until <= now()`). A data-modifying CTE writes the outbox rows in the same statement, so expired orders announce themselves like every other transition:
+In Go, compare the command tag's rows affected with 1 (`RowsAffected()` in `database/sql` and pgx). A timeout transition can run as one set-based statement from a sweeper job, with the same compare-and-set predicate and the same guard as `holdExpired` (`hold_until <= now()`).
+
+A data-modifying CTE writes the outbox rows in the same statement, so expired orders announce themselves like every other transition:
 
 ```sql
 WITH expired AS (
@@ -879,3 +927,8 @@ The two main forms mix well: a table for the legal moves, and a small State inte
 - **Before this:** [[Interfaces]], [[Strategy and Template Method]], [[Observer and Event Bus]]
 - **Next:** [[Vending Machine]], [[Food Ordering System]], [[Transactional Outbox and CDC]]
 - **Compare with:** [[Strategy and Template Method]] (the client picks a strategy; a state picks its successor), [[Locking - Optimistic vs Pessimistic]] (compare-and-set vs row locks), [[Saga Pattern]] (a state machine spread across services), [[Case Study - Ticket Booking]] (seat holds at system scale)
+
+### Watch on YouTube
+
+- [Lecture 4: State Machines](https://www.youtube.com/watch?v=gVdrFsnOo_s) · MIT OpenCourseWare · 81 min · 42,752 views
+- [Finite State Machines in Godot 4 in Under 10 Minutes](https://www.youtube.com/watch?v=ow_Lum-Agbs) · Bitlytic · 7 min · 580,467 views

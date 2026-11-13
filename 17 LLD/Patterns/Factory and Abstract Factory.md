@@ -12,7 +12,7 @@ sources:
   - "pgx v5 README: database/sql compatibility via the stdlib package"
   - "Razorpay docs: validate webhook signatures (HMAC-SHA256 of the raw body)"
   - "Stripe docs: verify webhook signatures (Stripe-Signature header, t= and v1=)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Factory and Abstract Factory
@@ -26,6 +26,50 @@ updated: 2026-11-02
 > - The rule that matters: the choice of concrete type is made in exactly one place, usually from config.
 > - Classic mistake: returning a typed nil pointer as an interface, which makes `err != nil` or `n != nil` true when you expected false.
 
+## Start here: the basics
+
+**The problem in one story.**
+A coffee shop has one order counter. You say "latte"; you never walk into the back and assemble the machine yourself.
+If the shop swaps its espresso machine, customers do not change how they order.
+A factory is that counter in code: you name what you want, it builds the right thing and hands it back.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Concrete type | A real struct with real fields | `SMSNotifier{senderID: "SHOP"}` |
+| Interface | A set of methods any type can satisfy | `type Notifier interface { Notify(...) error }` |
+| Constructor | A function that builds and returns a value | `NewSMSNotifier(cfg)` |
+| Factory | A function that picks which concrete type to build | `NewNotifier("sms", cfg, w)` |
+| Product family | Objects that must come from the same provider | Razorpay charge + Razorpay refund |
+| Config | Settings read at startup that drive the choice | `PAYMENT_PROVIDER=razorpay` |
+| Typed nil | A nil pointer stored inside a non-nil interface | `var p *SMS = nil; var n Notifier = p` gives `n != nil` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    H["Handler"] -->|"'sms'"| F["NewNotifier factory"]
+    F --> E["EmailNotifier"]
+    F --> S["SMSNotifier"]
+    F --> P["PushNotifier"]
+    E & S & P --> I["returned as Notifier interface"]
+    I --> H
+```
+
+**Analogy.** A factory is a restaurant counter that takes your order and returns a dish; an abstract factory is a set menu, where choosing "Italian" fixes the starter, main and dessert together.
+Where it breaks: a menu can mix cuisines on request; an abstract factory deliberately forbids mixing families.
+
+**How the rest of this note builds up**
+
+- First, why factories exist: 16 construction sites and mixed payment providers (section 1), then the mental model (section 2).
+- Then how a simple factory and an abstract factory are shaped, with a whiteboard version (section 3).
+- Then a runnable worked example with tests (section 4) and a comparison of variants (section 5).
+- Finally the SDE-3 depth: trade-offs, production wiring, the typed-nil trap in the deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Decide the concrete type in one place, return an interface, and never return a typed nil.
+
 ## 1. Why it exists
 
 An order service notifies users on four events: placed, shipped, delivered and refunded. Each user picks a channel: email, SMS, push or WhatsApp.
@@ -33,7 +77,9 @@ An order service notifies users on four events: placed, shipped, delivered and r
 - Without a factory, each of the 4 handlers contains `if channel == "sms" { ... } else if ...` with the construction details (sender ID, API key, writer). That is 4 events × 4 channels = 16 construction sites. Adding WhatsApp edits all 4 handlers, and one forgets.
 - With a factory, each handler calls `NewNotifier(channel, cfg, w)`, and adding a channel edits one function.
 
-Payments show the second problem. Checkout charges through Razorpay. Months later, someone writes the refund path and builds a Stripe client from a different config key. Every refund now fails with "unknown payment intent", because a Razorpay payment can only be refunded by Razorpay. An **abstract factory** removes the possibility: the service receives one `ProviderFactory`, and every product it gets (payments, refunds, webhook verification) comes from the same provider.
+Payments show the second problem. Checkout charges through Razorpay. Months later, someone writes the refund path and builds a Stripe client from a different config key. Every refund now fails with "unknown payment intent", because a Razorpay payment can only be refunded by Razorpay.
+
+An **abstract factory** removes the possibility: the service receives one `ProviderFactory`, and every product it gets (payments, refunds, webhook verification) comes from the same provider.
 
 ## 2. Mental model
 
@@ -634,7 +680,9 @@ What to notice:
 
 The textbook abstract factory is a UI toolkit: a `LightTheme` factory makes a light button and a light checkbox, and a `DarkTheme` factory makes dark ones. It shows the idea, but backend code meets the pattern in provider families, cloud SDKs and database drivers instead.
 
-**Return an interface or a concrete type?** A common Go proverb is "accept interfaces, return structs": `NewSMSNotifier` returns `*SMSNotifier`, so callers see its whole API and the type can gain methods without breaking anyone. A factory is the exception: its whole job is to choose among types, so it must return the interface. If a "factory" always returns the same type, it is a constructor and should return that type.
+**Return an interface or a concrete type?** A common Go proverb is "accept interfaces, return structs": `NewSMSNotifier` returns `*SMSNotifier`, so callers see its whole API and the type can gain methods without breaking anyone.
+
+A factory is the exception: its whole job is to choose among types, so it must return the interface. If a "factory" always returns the same type, it is a constructor and should return that type.
 
 ## 6. Trade-offs and when not to use
 
@@ -672,7 +720,9 @@ The textbook abstract factory is a UI toolkit: a `LightTheme` factory makes a li
 
 ## 8. Deep dive
 
-**The typed-nil trap, mechanically.** An interface value is a pair: (dynamic type, dynamic value). `return sms` where `sms` is a nil `*SMSNotifier` stores the pair `(*SMSNotifier, nil)`. An interface is `nil` only when both halves are nil, so the comparison `n == nil` is false. The same trap produces non-nil `error` values: a function declared to return `error` that returns a nil `*MyError` variable returns a non-nil error. The fix is the same: return the literal `nil`. [[Interfaces]] and [[Error Handling]] cover the representation.
+**The typed-nil trap, mechanically.** An interface value is a pair: (dynamic type, dynamic value). `return sms` where `sms` is a nil `*SMSNotifier` stores the pair `(*SMSNotifier, nil)`. An interface is `nil` only when both halves are nil, so the comparison `n == nil` is false.
+
+The same trap produces non-nil `error` values: a function declared to return `error` that returns a nil `*MyError` variable returns a non-nil error. The fix is the same: return the literal `nil`. [[Interfaces]] and [[Error Handling]] cover the representation.
 
 **Why `init()` registration costs more than it looks.**
 
@@ -681,7 +731,9 @@ The textbook abstract factory is a UI toolkit: a `LightTheme` factory makes a li
 - Each `init()` function runs once, before `main`, after every package it imports is initialized (a package may declare several). You cannot pass config or return an error from it, so a registered constructor must be cheap and must not do I/O.
 - A lock is still needed. `init()` functions run in one goroutine, but nothing stops a later `Register` call from another goroutine. `database/sql` guards its driver map with a `sync.RWMutex`, and `Registry` here does the same.
 
-**Evolving a family with optional interfaces.** `database/sql/driver` added context support without breaking old drivers. The core `driver.Conn` interface stayed small; new abilities are separate interfaces such as `driver.ConnBeginTx` and `driver.QueryerContext`. `database/sql` checks them with a type assertion and falls back when a driver lacks them. Apply the same trick to a payment family: keep `ProviderFactory` small and let a provider optionally implement `PayoutGateway`, checked with `if p, ok := f.(PayoutGateway); ok`.
+**Evolving a family with optional interfaces.** `database/sql/driver` added context support without breaking old drivers. The core `driver.Conn` interface stayed small; new abilities are separate interfaces such as `driver.ConnBeginTx` and `driver.QueryerContext`. `database/sql` checks them with a type assertion and falls back when a driver lacks them.
+
+Apply the same trick to a payment family: keep `ProviderFactory` small and let a provider optionally implement `PayoutGateway`, checked with `if p, ok := f.(PayoutGateway); ok`.
 
 **Errors or panics.** A factory that reads config at run time returns an error. A factory called with constant input at startup can offer a `Must` form that panics, like `regexp.MustCompile` and `template.Must`, because a failure there is a programming error.
 
@@ -726,3 +778,8 @@ The textbook abstract factory is a UI toolkit: a `LightTheme` factory makes a li
 - **Before this:** [[Interfaces]], [[Error Handling]], [[Strategy and Template Method]]
 - **Next:** [[Builder and Functional Options]]
 - **Compare with:** [[Builder and Functional Options]], [[Singleton and sync.Once]], [[Rare GoF Patterns in Go]], [[Case Study - Notification System]]
+
+### Watch on YouTube
+
+- [Factory Design Pattern / Simple, Factory Method & Abstract Factory with Real-Life Examples](https://www.youtube.com/watch?v=dMK4TbG29fk) · Coder Army · 32 min · 122,226 views
+- [Factory, Abstract Factory, Factory Method - Design Pattern (C#)](https://www.youtube.com/watch?v=xN7EFHU_rXA) · Raw Coding · 9 min · 137,653 views

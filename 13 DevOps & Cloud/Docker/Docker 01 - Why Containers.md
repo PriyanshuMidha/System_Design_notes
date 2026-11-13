@@ -7,7 +7,7 @@ related: ["[[Docker 02 - Images, Layers and Containers]]", "[[Docker 08 - How Do
 sources:
   - "Docker docs, What is a Container? (docs.docker.com/guides/docker-overview)"
   - "Open Container Initiative, Image Format and Runtime Specifications (opencontainers.org)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 01 - Why Containers
@@ -24,15 +24,65 @@ updated: 2026-11-07
 
 ### Whiteboard version
 
-A team ships a Go service. In 2024 it was built and tested against Go 1.21 and a specific version of a C library used by a CGO dependency. By 2026, a new engineer's laptop has Go 1.24 and a newer system library. The code that compiled and passed tests in 2024 now fails to build, or builds but behaves differently at runtime, because the **environment**, not the code, changed underneath it.
+A team ships a Go service. In 2024 it was built and tested against Go 1.21 and a specific version of a C library used by a CGO dependency. By 2026, a new engineer's laptop has Go 1.24 and a newer system library.
+
+The code that compiled and passed tests in 2024 now fails to build, or builds but behaves differently at runtime, because the **environment**, not the code, changed underneath it.
 
 A container fixes this by shipping the Go 1.21 toolchain's *output* (a compiled binary) together with the exact base OS layer and libraries it was built and tested against, as one artifact. Nothing about the new engineer's laptop — its Go version, its library versions, its OS — can leak into how that artifact runs.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your Go service runs fine on your laptop.
+On the server it crashes: a different OS version, a missing certificate file, a wrong timezone setting.
+A teammate's laptop fails in a third way.
+Containers ship the app *and* its surroundings together, so "works on my machine" means works everywhere.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Dependency | Something your app needs to run | CA certificates, `libc`, a config file |
+| Operating system (OS) | Software that manages the machine | Linux, macOS |
+| Kernel | The core of the OS that talks to hardware | The Linux kernel shared by all containers on a host |
+| Process | One running program | Your `./server` binary while it runs |
+| Virtual machine (VM) | A full fake computer with its own OS | An EC2 instance |
+| Image | A frozen package of app + files | `myapi:1.4.0` |
+| Container | A running, isolated process started from an image | `docker run myapi:1.4.0` |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    subgraph Host["One Linux host (one kernel)"]
+        C1["Container A:<br/>Go API + its files"]
+        C2["Container B:<br/>Postgres + its files"]
+        C3["Container C:<br/>Redis + its files"]
+    end
+```
+
+**Analogy.** Shipping containers: the crane does not care whether the box holds shoes or TVs, because every box has the same shape.
+Where it breaks: real shipping boxes are fully sealed; software containers share the host's kernel, so isolation is weaker than a VM.
+
+**How the rest of this note builds up**
+
+- First, why containers exist and the "isolated process, not a mini-VM" mental model (sections 1-2).
+- Then how isolation works (namespaces, cgroups, images) in section 3, and a worked example in section 4.
+- Then containers vs VMs vs bare binaries, and when not to use them (sections 5-6).
+- Finally the SDE-3 view: production concerns and the deep dive (sections 7-8).
+
+> [!tip] Remember
+> A container is just a normal Linux process with a fenced-off view of the machine and its own packaged files.
 
 ## 1. Why it exists
 
 Before containers, deploying meant replicating a server's exact state by hand or with a configuration-management tool: install this OS package at this version, this language runtime, this library, set these environment variables, open these ports. Four places had to agree: a developer's laptop, a teammate's laptop, the CI runner, and production. They rarely did.
 
-Concretely: an API depends on `libssl` 1.1 and Node.js 18. A teammate's laptop has `libssl` 3.0 and Node.js 20 because they set it up a year later. The code runs locally for them with subtly different TLS defaults and V8 behavior, passes their tests, and then fails a cipher-negotiation test in CI, which still has the older versions. Nobody changed the code; the environment changed under it. Multiply this by every dependency and every machine, and "works on my machine" becomes the default failure mode of the team, not an edge case.
+Concretely: an API depends on `libssl` 1.1 and Node.js 18. A teammate's laptop has `libssl` 3.0 and Node.js 20 because they set it up a year later.
+
+The code runs locally for them with subtly different TLS defaults and V8 behavior, passes their tests, and then fails a cipher-negotiation test in CI, which still has the older versions. Nobody changed the code; the environment changed under it.
+
+Multiply this by every dependency and every machine, and "works on my machine" becomes the default failure mode of the team, not an edge case.
 
 Containers close the gap by making the environment part of the shipped artifact instead of part of the target machine.
 
@@ -47,7 +97,11 @@ The host kernel is the only thing actually running the code — there is no seco
 - **Network namespace** — the process gets its own loopback and network interfaces.
 - **cgroups** — the kernel caps how much CPU, memory, and I/O the process (and its children) may use, and can kill it if it goes over a memory limit.
 
-Analogy: a container is like a hotel room, not a separate building. Every room (container) shares the same building's foundation, plumbing, and electrical grid (the host kernel), but each guest sees only their own room's door, furniture, and thermostat (namespaces), and the hotel caps how much power and water each room can draw (cgroups). A VM, by contrast, is a separate building with its own foundation, plumbing, and electrical grid — a full guest OS and kernel — which is why it costs far more to stand up and run.
+Analogy: a container is like a hotel room, not a separate building.
+
+Every room (container) shares the same building's foundation, plumbing, and electrical grid (the host kernel), but each guest sees only their own room's door, furniture, and thermostat (namespaces), and the hotel caps how much power and water each room can draw (cgroups).
+
+A VM, by contrast, is a separate building with its own foundation, plumbing, and electrical grid — a full guest OS and kernel — which is why it costs far more to stand up and run.
 
 ## 3. How it works
 
@@ -177,3 +231,8 @@ A single-host `docker run` and a Kubernetes-scheduled pod both end up starting t
 - **Before this:** [[Processes, Threads and Context Switching]]
 - **Next:** [[Docker 02 - Images, Layers and Containers]], [[Docker 03 - CLI Essentials]]
 - **Compare with:** [[Cloud Native and the 12-Factor App]], [[Containerizing Go Services]] (Go-specific packaging), [[Docker 08 - How Docker Works Under the Hood]] (the namespaces/cgroups internals in depth)
+
+### Watch on YouTube
+
+- [Docker Tutorial 1- Why and What is Docker, Dockers Containers, Virtualization In Machine Learning](https://www.youtube.com/watch?v=hTacGMfL8lc) · Krish Naik · 18 min · 144,448 views
+- [What is Docker? / Containerization Explained! / Why use Docker Container? (In Hindi)](https://www.youtube.com/watch?v=qN1CzLdCq5g) · CodeWithHarry · 8 min · 482,135 views

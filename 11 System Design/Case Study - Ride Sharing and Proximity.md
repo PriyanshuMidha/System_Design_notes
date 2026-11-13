@@ -10,13 +10,15 @@ sources:
   - "S2 Geometry documentation (s2geometry.io): cube faces, Hilbert curve, 31 levels"
   - "Redis documentation: GEOADD, GEOSEARCH (since Redis 6.2), geo sets stored as sorted sets with 52-bit geohash scores"
   - "PostgreSQL 17 documentation: UPDATE ... RETURNING, explicit locking"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Ride Sharing and Proximity
 
 > [!summary] TL;DR
-> Design the backend of an Uber-style app: drivers send their GPS position every few seconds, riders ask for a car, and the system finds nearby free drivers, offers the trip to exactly one of them, and tracks the trip. The hard parts are a write-heavy **location index** that lives in memory, and a **dispatch** step that must never give one driver to two riders.
+> Design the backend of an Uber-style app: drivers send their GPS position every few seconds, riders ask for a car, and the system finds nearby free drivers, offers the trip to exactly one of them, and tracks the trip.
+>
+> The hard parts are a write-heavy **location index** that lives in memory, and a **dispatch** step that must never give one driver to two riders.
 
 > [!abstract] Core idea
 > - Driver locations are **soft state**: a fresh copy arrives every 4 seconds, so keep them in RAM, bucketed by map cell, and do not write each ping to a database.
@@ -25,9 +27,56 @@ updated: 2026-11-04
 > - Shard everything by city (or region) so a ride, its driver and its location shard live together.
 > - Straight-line distance only shortlists drivers; road-network **ETA** picks the winner.
 
+## Start here: the basics
+
+**The problem in one story.**
+You stand on a street corner and tap "Book a ride".
+Somewhere nearby, dozens of drivers are moving every second.
+The app must find a free driver close to you, fast, and ask only one of them.
+If two riders get the same driver, one of them is left waiting on the kerb.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| GPS fix (ping) | One "I am here" message with latitude and longitude | Driver sends `(12.97, 77.59)` every 4 s |
+| Soft state | Data that is fine to lose because a fresh copy arrives soon | The last driver position |
+| Cell / geohash | A tile of the map with a short string name | `tdr1v` covers a few km of Bengaluru |
+| Index | A lookup structure that answers a question without scanning everything | "Which drivers are in cell X?" |
+| Shard | One slice of the data on its own server | All drivers in one city region |
+| Dispatch | Picking one driver and offering them the trip | Ring the closest free driver |
+| Lock / lease | A short claim that stops two people taking the same thing | Driver marked "offered" for 15 s |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D["Drivers send<br/>GPS every 4 s"] --> IDX["In-memory index<br/>drivers by cell"]
+    R["Rider taps Book"] --> Q["Look at rider's cell<br/>+ 8 neighbours"]
+    IDX --> Q
+    Q --> F["Filter by real distance,<br/>pick closest"]
+    F --> L["Lock that driver<br/>and send offer"]
+    L --> T["Trip tracked<br/>to drop-off"]
+```
+
+**Analogy.** A wall map cut into tiles, with one pin per free driver; you only look at the pins on the rider's tile and the tiles around it.
+Where it breaks: real pins do not move by themselves every 4 seconds, and a wall map never needs to be split across many servers.
+
+**How the rest of this note builds up**
+
+- First, the requirements and scale (section 1) and the map-and-pins mental model (section 2).
+- Then the high-level design (section 3): location ingest, the cell index and dispatch.
+- Then numbers, cell size choice, API, data model and Go code for a geohash index (section 4).
+- Finally the SDE-3 material: variants, trade-offs, production issues and the deep dive (sections 5-8), then interview questions.
+
+> [!tip] Remember
+> Keep driver positions in memory by map cell, search your cell plus neighbours, and lock a driver before you offer the trip.
+
 ## 1. Why it exists - requirements
 
-A rider in Bengaluru opens the app at 9 am. Within a second or two they want to see cars around them, a fare quote, and after tapping "Book", a driver who accepted within about 15 seconds. Meanwhile one million drivers across the country are each sending a GPS fix every 4 seconds. A naive design that stores each fix as a row and answers "nearby" with a SQL range scan collapses under 250,000 writes per second.
+A rider in Bengaluru opens the app at 9 am. Within a second or two they want to see cars around them, a fare quote, and after tapping "Book", a driver who accepted within about 15 seconds.
+
+Meanwhile one million drivers across the country are each sending a GPS fix every 4 seconds. A naive design that stores each fix as a row and answers "nearby" with a SQL range scan collapses under 250,000 writes per second.
 
 **Functional requirements**
 - Drivers go online and offline and stream their location while online.
@@ -47,7 +96,9 @@ A rider in Bengaluru opens the app at 9 am. Within a second or two they want to 
 
 ## 2. Mental model
 
-Think of a city map cut into a grid of tiles, and a board on the wall with one pin per free driver. Every 4 seconds each driver tells you which tile they are on, and you move their pin. When a rider calls, you look at the rider's tile and the 8 tiles around it, measure the distance to each pin, ring the closest driver, and **take their pin off the board while the phone is ringing** so nobody else can ring them too.
+Think of a city map cut into a grid of tiles, and a board on the wall with one pin per free driver. Every 4 seconds each driver tells you which tile they are on, and you move their pin.
+
+When a rider calls, you look at the rider's tile and the 8 tiles around it, measure the distance to each pin, ring the closest driver, and **take their pin off the board while the phone is ringing** so nobody else can ring them too.
 
 Everything else in the design (sharding, ETA, surge, live tracking) is about doing that at a million pins and hundreds of calls per second.
 
@@ -155,7 +206,9 @@ A geohash with `p` characters has `5p` bits, split between longitude and latitud
 | 6 | 15 / 15 | ~1.2 km × 0.61 km | search radius up to ~0.6 km |
 | 7 | 18 / 17 | ~153 m × 153 m | dense pickup zones, cell-level surge |
 
-The rule: a 3 × 3 block of cells is guaranteed to contain every point within radius `r` of the rider only if a cell is at least `r` wide in both directions. For a 2 km pickup radius use precision 5, then filter by real distance. Using precision 7 and scanning 9 cells would silently ignore drivers 300 m away.
+The rule: a 3 × 3 block of cells is guaranteed to contain every point within radius `r` of the rider only if a cell is at least `r` wide in both directions.
+
+For a 2 km pickup radius use precision 5, then filter by real distance. Using precision 7 and scanning 9 cells would silently ignore drivers 300 m away.
 
 ### API
 
@@ -262,7 +315,9 @@ stateDiagram-v2
 
 ### Go: geohash and an in-memory cell index
 
-This is the core of one location shard: encode a position to a geohash cell, keep drivers bucketed by cell, and answer "k nearest fresh drivers within r km" by scanning the 3 × 3 block and filtering by great-circle distance. The clock is injected so tests control staleness. For production indexing choices (H3, S2, quadtrees, Redis GEO) see [[Geospatial Indexing]].
+This is the core of one location shard: encode a position to a geohash cell, keep drivers bucketed by cell, and answer "k nearest fresh drivers within r km" by scanning the 3 × 3 block and filtering by great-circle distance.
+
+The clock is injected so tests control staleness. For production indexing choices (H3, S2, quadtrees, Redis GEO) see [[Geospatial Indexing]].
 
 ```go
 package geo
@@ -670,7 +725,9 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 > The in-memory index is only a hint. Reservation is a compare-and-set on the durable driver row: `UPDATE drivers SET status='offered' WHERE id=$1 AND status='available'`. The loser gets zero rows and tries the next candidate. An offer expiry plus a sweeper releases drivers if dispatch crashes mid-offer.
 
 > [!question]- Trap: "Use geohash precision 7 and look only in the rider's cell." What breaks?
-> Two things. A rider near a cell edge misses drivers a few metres away in the next cell, so you must scan the 8 neighbours too. And precision 7 cells are about 153 m wide, so even a 3 × 3 block only covers ~150 m in every direction; a 2 km radius needs precision 5 cells, then a real distance filter.
+> Two things. A rider near a cell edge misses drivers a few metres away in the next cell, so you must scan the 8 neighbours too.
+>
+> And precision 7 cells are about 153 m wide, so even a 3 × 3 block only covers ~150 m in every direction; a 2 km radius needs precision 5 cells, then a real distance filter.
 
 > [!question]- How would you shard the location service?
 > By city or metro region first, because dispatch, rides and drivers all stay inside a city. Inside very large cities, sub-shard by cell prefix and send a driver's pings to the shard that owns their current cell; a query near a shard boundary fans out to at most a few neighbouring shards.
@@ -701,3 +758,8 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 - **Building blocks:** [[Partitioning and Sharding]], [[Consistent Hashing]], [[Replication]], [[Caching Patterns]], [[Kafka and Event Streaming]], [[Hot Keys and Hot Partitions]], [[Idempotency and Idempotency Keys]], [[Timeouts, Retries and Backoff]], [[Distributed Locks and Fencing Tokens]]
 - **Next:** [[Case Study - Distributed Job Scheduler]], [[Case Study - Metrics and Logging Platform]]
 - **Compare with:** [[Ride Sharing]] (class-level LLD twin), [[Delivery Partner Assignment]] (the same matching problem for deliveries), [[Case Study - Ticket Booking]] (the same "hold one item exactly once" pattern for seats)
+
+### Watch on YouTube
+
+- [Uber - System Design Interview Question (Ride Sharing Service)](https://www.youtube.com/watch?v=DGtalg5efCw) · TechPrep · 16 min · 109,856 views
+- [✅ System Design 11: Design Ride Sharing Application like UBER / OLA / Rapido / Lyft / HLD / LLD](https://www.youtube.com/watch?v=twUz_hWw2T8) · InterviewWithBunny · 65 min · 25,533 views

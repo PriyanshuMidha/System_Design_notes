@@ -12,7 +12,7 @@ sources:
   - "CockroachDB docs: Architecture overview, Transaction layer, Transaction retry error reference, Follower reads, range_max_bytes default 512 MiB, --max-offset default 500ms"
   - "YugabyteDB docs: DocDB sharding (hash and range), transaction isolation levels"
   - "AWS docs: Amazon Aurora DSQL concurrency control"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Distributed SQL
@@ -26,6 +26,51 @@ updated: 2026-11-03
 > - Transactions are ordered by timestamps: Spanner uses atomic-clock **TrueTime**, CockroachDB and YugabyteDB use **hybrid logical clocks**, TiDB uses a central timestamp server.
 > - Serializable is the default in CockroachDB and Spanner, so conflicts surface as `40001` "retry the transaction" errors that the client must handle.
 > - Global consistency costs cross-region latency on every write. If one PostgreSQL primary with replicas fits your load, it is simpler, cheaper and faster.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your invoices table no longer fits on one server, and you need it in two regions.
+You still want normal SQL: joins, transactions, and "the money moved from A to B or not at all".
+Splitting the data by hand breaks transactions that touch two servers.
+Distributed SQL databases split the data for you and still run real transactions across servers.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Transaction | A group of writes that all happen or none happen | Debit A and credit B together |
+| Shard / range | One slice of a table, by key order, stored on some servers | Keys `a` to `m` on range 1 |
+| Replica | A copy of a range on another machine | 3 copies of range 1 in 3 zones |
+| Raft | A voting protocol so replicas agree on the order of writes | A write counts once 2 of 3 replicas accept it |
+| Two-phase commit (2PC) | "Everyone ready? Then everyone commit" across several ranges | Prepare range 1 and 2, then commit both |
+| Timestamp / clock | A number that orders transactions in time | Tx 1 at 100, Tx 2 at 105 |
+| Serializable | Results look as if transactions ran one after another | No two people book the same seat |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    APP["SQL client"] --> GW["Any node<br/>(gateway)"]
+    GW --> R1["Range 1<br/>Raft group: 3 copies"]
+    GW --> R2["Range 2<br/>Raft group: 3 copies"]
+    R1 --> C{"2PC: both ranges<br/>agree to commit?"}
+    R2 --> C
+    C --> OK["Committed with<br/>one timestamp"]
+```
+
+**Analogy.** A big library splits its books across several branches, and each branch keeps three copies of its shelf. Borrowing two books from two branches is one checkout: either both are stamped out or neither is.
+Where it breaks: branches are minutes apart, but a real library has no clock problem; databases must work hard to agree on what "now" is across machines.
+
+**How the rest of this note builds up**
+
+- First, why one PostgreSQL server stops being enough (section 1) and the "many small Raft groups" mental model (section 2).
+- Then how it works: ranges, splits, hot spots, 2PC over Raft, write intents and isolation (section 3).
+- Then the clocks: TrueTime, hybrid logical clocks, timestamp oracles and Spanner's commit wait (section 3), traced with latency numbers (section 4).
+- Finally the SDE-3 view: CockroachDB vs Spanner vs YugabyteDB vs TiDB, `40001` retries, follower reads and when not to use it (sections 5-8).
+
+> [!tip] Remember
+> Cut tables into ranges, replicate each with Raft, join them with 2PC, and order everything by timestamps.
 
 ## 1. Why it exists
 
@@ -143,9 +188,15 @@ sequenceDiagram
     G->>R31: resolve intent into a normal value (async)
 ```
 
-This is two-phase commit ([[Two-Phase Commit]]): phase one writes intents, phase two flips the transaction record. Classic 2PC blocks if the coordinator dies between the phases, because participants hold locks and do not know the outcome. Here the transaction record and every intent are **replicated by Raft**, so any node can read the record and finish or abort the transaction. A reader that meets an intent looks up the record: committed means use the value, aborted means ignore it, pending means wait or push the other transaction's timestamp.
+This is two-phase commit ([[Two-Phase Commit]]): phase one writes intents, phase two flips the transaction record. Classic 2PC blocks if the coordinator dies between the phases, because participants hold locks and do not know the outcome.
 
-CockroachDB's **parallel commits** (since v19.2) write the `STAGING` record at the same time as the last intents, which turns two sequential consensus rounds at commit into one. Spanner uses classic 2PC across Paxos groups, with one group's leader as coordinator. TiDB uses the Percolator protocol: a primary lock and secondary locks in TiKV, with commit decided by the primary key's lock.
+Here the transaction record and every intent are **replicated by Raft**, so any node can read the record and finish or abort the transaction.
+
+A reader that meets an intent looks up the record: committed means use the value, aborted means ignore it, pending means wait or push the other transaction's timestamp.
+
+CockroachDB's **parallel commits** (since v19.2) write the `STAGING` record at the same time as the last intents, which turns two sequential consensus rounds at commit into one. Spanner uses classic 2PC across Paxos groups, with one group's leader as coordinator.
+
+TiDB uses the Percolator protocol: a primary lock and secondary locks in TiKV, with commit decided by the primary key's lock.
 
 ### What a reader does when it meets a write intent
 
@@ -226,7 +277,11 @@ stateDiagram-v2
     Failed --> [*]
 ```
 
-CockroachDB and Spanner default to **SERIALIZABLE**. CockroachDB does it optimistically: transactions do not take read locks, and conflicts found at write or commit time cause one transaction to restart. The client sees SQLSTATE `40001` with a message such as `restart transaction: TransactionRetryWithProtoRefreshError: ... RETRY_SERIALIZABLE`. CockroachDB added `READ COMMITTED` (generally available in v24.1) for workloads that cannot handle retries. YugabyteDB's YSQL behaves as snapshot isolation by default (what PostgreSQL calls `REPEATABLE READ`; `READ COMMITTED` maps to snapshot unless the `yb_enable_read_committed_isolation` flag is set) and also supports serializable. TiDB defaults to snapshot isolation under the name `REPEATABLE READ`, with pessimistic locking the default for new clusters since v3.0.8. Aurora DSQL uses optimistic concurrency control with snapshot isolation and reports conflicts at commit.
+CockroachDB and Spanner default to **SERIALIZABLE**. CockroachDB does it optimistically: transactions do not take read locks, and conflicts found at write or commit time cause one transaction to restart. The client sees SQLSTATE `40001` with a message such as `restart transaction: TransactionRetryWithProtoRefreshError: ... RETRY_SERIALIZABLE`.
+
+CockroachDB added `READ COMMITTED` (generally available in v24.1) for workloads that cannot handle retries. YugabyteDB's YSQL behaves as snapshot isolation by default (what PostgreSQL calls `REPEATABLE READ`; `READ COMMITTED` maps to snapshot unless the `yb_enable_read_committed_isolation` flag is set) and also supports serializable.
+
+TiDB defaults to snapshot isolation under the name `REPEATABLE READ`, with pessimistic locking the default for new clusters since v3.0.8. Aurora DSQL uses optimistic concurrency control with snapshot isolation and reports conflicts at commit.
 
 The practical rule for every one of them: **wrap each transaction in a retry loop**, and keep anything non-transactional (HTTP calls, emails, Kafka publishes) outside it.
 
@@ -271,7 +326,9 @@ flowchart TB
     end
 ```
 
-The middle row is the price of surviving a whole region with consistent writes: every commit waits for a majority that lies in another region. The usual answer is the third row: pin each workspace's rows to its home region (CockroachDB `REGIONAL BY ROW`, YugabyteDB tablespaces, Spanner placement configurations), and replicate only small, read-mostly tables everywhere (CockroachDB `GLOBAL` tables, which make reads local and writes slower).
+The middle row is the price of surviving a whole region with consistent writes: every commit waits for a majority that lies in another region.
+
+The usual answer is the third row: pin each workspace's rows to its home region (CockroachDB `REGIONAL BY ROW`, YugabyteDB tablespaces, Spanner placement configurations), and replicate only small, read-mostly tables everywhere (CockroachDB `GLOBAL` tables, which make reads local and writes slower).
 
 ```sql
 -- CockroachDB multi-region syntax (v21.1 and later)
@@ -343,7 +400,11 @@ Runnable Go version: [[Distributed SQL - Go]]
 
 **Why Raft per range and not one Raft for the cluster.** One log would serialise every write in the cluster through one leader. Thousands of small groups spread leadership across all nodes and let each range move, split and recover independently. The cost is per-group heartbeats; CockroachDB quiesces idle ranges and coalesces heartbeats per node pair.
 
-**Follower reads and closed timestamps.** A follower can serve a consistent read at time `t` only if it knows no write at or below `t` can still arrive. The leaseholder periodically **closes** a timestamp (promises not to accept writes below it) and sends it with the Raft log. Followers serve reads at or below the closed timestamp, so a follower read is consistent but a few seconds old. Spanner's equivalent is the safe time each replica tracks.
+**Follower reads and closed timestamps.** A follower can serve a consistent read at time `t` only if it knows no write at or below `t` can still arrive.
+
+The leaseholder periodically **closes** a timestamp (promises not to accept writes below it) and sends it with the Raft log. Followers serve reads at or below the closed timestamp, so a follower read is consistent but a few seconds old.
+
+Spanner's equivalent is the safe time each replica tracks.
 
 ```mermaid
 sequenceDiagram
@@ -361,7 +422,9 @@ sequenceDiagram
 
 **Read-only transactions and snapshots.** Because every value is versioned, a read-only transaction at timestamp `t` needs no locks: it reads the version at `t` from any replica that is caught up to `t`. Spanner and CockroachDB both use this to run large reads without blocking writers.
 
-**Why external consistency needs commit wait or a central clock.** With HLC alone, two transactions on unrelated keys with no message between them can be timestamped in the opposite order of their real-time order if clocks differ (within the max offset). CockroachDB guarantees serializability and orders causally related transactions, and uses uncertainty restarts to give single-key linearizability; Spanner's commit wait makes the order match real time for all transactions. TiDB's central oracle gets the same effect with a network hop instead of a wait.
+**Why external consistency needs commit wait or a central clock.** With HLC alone, two transactions on unrelated keys with no message between them can be timestamped in the opposite order of their real-time order if clocks differ (within the max offset).
+
+CockroachDB guarantees serializability and orders causally related transactions, and uses uncertainty restarts to give single-key linearizability; Spanner's commit wait makes the order match real time for all transactions. TiDB's central oracle gets the same effect with a network hop instead of a wait.
 
 **CAP placement.** These systems choose consistency over availability during a partition: a range that loses its majority stops accepting writes ([[CAP and PACELC]]). In PACELC terms they are PC/EC: even without a partition they pay latency for consistency.
 
@@ -410,3 +473,8 @@ sequenceDiagram
 - **Runnable Go version:** [[Distributed SQL - Go]]
 - **Next:** [[Multi-Region Architecture]], [[Clocks and Ordering]], [[Two-Phase Commit]]
 - **Compare with:** [[Consistent Hashing]] (hash placement vs ordered ranges), [[Wide-Column Stores and Cassandra]] (leaderless, tunable consistency), [[CAP and PACELC]], [[Time-Series and Columnar Storage]] (TiFlash-style columnar replicas)
+
+### Watch on YouTube
+
+- [Google Spanner: TrueTime, Global Consistency & Distributed Databases Explained](https://www.youtube.com/watch?v=5NxPcafIy0Q) · Tech Papers Summary · explains TrueTime and Spanner's ordering guarantees
+- [CockroachDB: A True Distributed SQL Database](https://www.youtube.com/watch?v=AeX5b89TJ2o) · CockroachDB · official vendor talk on ranges, Raft groups and distributed transactions

@@ -9,7 +9,7 @@ sources:
   - "AWS Builders' Library, Timeouts, retries and backoff with jitter"
   - "golang.org/x/time/rate docs"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Calling External APIs
@@ -48,6 +48,51 @@ func callProvider(ctx context.Context, url string) (*http.Response, error) {
 ```
 
 Everything below fixes what this whiteboard version gets wrong: no transport pool tuning, no retry, no drain-and-close, and a status check that is right by luck but not explicit about which codes are retryable.
+
+## Start here: the basics
+
+**The problem in one story.** Your shop phones a supplier for every order.
+If the supplier never picks up and you wait on the line forever, every other customer in your shop waits too.
+A smart shop hangs up after a set time, tries again a bit later, and stops calling a supplier that keeps failing.
+Calling an external API from Go needs the same habits.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| External API | A service run by someone else that you call over HTTP | A payment or email provider |
+| `http.Client` | Go value that sends HTTP requests and reuses connections | `&http.Client{Timeout: 15 * time.Second}` |
+| Timeout / deadline | Maximum time to wait | `context.WithTimeout(ctx, 2*time.Second)` |
+| Connection pool | Open connections kept for reuse | Saves a new TLS handshake per call |
+| Retry | Trying a failed call again | Retry a `GET` after a 503 |
+| Backoff with jitter | Waiting longer each retry, with randomness | Wait random 0-400 ms, then 0-800 ms |
+| Idempotent | Safe to repeat; same effect as once | `GET`, or a `POST` with an Idempotency-Key |
+| Circuit breaker | Stops calling a dependency that keeps failing | After many errors, fail fast for 30 s |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S[Your service] --> B{Breaker open?}
+    B -- yes --> F[Fail fast]
+    B -- no --> C[Call with deadline]
+    C -->|ok| OK[Use response, close body]
+    C -->|retryable error| W[Backoff with jitter]
+    W --> C
+```
+
+**Analogy.** Phoning a supplier with a kitchen timer next to the phone, and a rule to stop calling after several dead lines.
+Where it breaks: a phone call either connects or not; an HTTP call can succeed on the provider side while your reply gets lost, which is why idempotency keys matter.
+
+**How the rest of this note builds up**
+
+- First, why `http.DefaultClient` is dangerous and what one client per provider fixes (sections 1-2).
+- Then deadlines, body draining, deciding what to retry, and backoff (section 3).
+- Then a full provider client with retries, a breaker and a bulkhead (section 4).
+- Finally, the SDE-3 deep dive on variants, trade-offs and production (sections 5-9).
+
+> [!tip] Remember
+> One reused client per provider, a deadline on every call, retry only what is safe to repeat.
 
 ## 1. Why it exists
 
@@ -262,7 +307,9 @@ func (b *Bulkhead) Acquire(ctx context.Context) (release func(), err error) {
 }
 ```
 
-Each outbound call should also log the provider's own request ID (most payment, email and storage providers return one, e.g. `X-Request-Id` or `Stripe-Request-Id`) alongside your own trace ID, and map the provider's status/error body to a domain error your handlers actually switch on (`ErrProviderDeclined`, `ErrProviderRateLimited`, `ErrProviderUnavailable`) instead of leaking the provider's raw status code or JSON shape up to the handler — the handler should never need to know whether the payment gateway's "do not retry" signal is a `402` or a `{"error":{"type":"card_error"}}` body, only that it's one of your own sentinel errors. The provider's request ID is what you hand their support team when a charge needs investigating; without logging it, a dispute means grepping raw response bodies in old logs instead of a one-line lookup.
+Each outbound call should also log the provider's own request ID (most payment, email and storage providers return one, e.g. `X-Request-Id` or `Stripe-Request-Id`) alongside your own trace ID, and map the provider's status/error body to a domain error your handlers actually switch on (`ErrProviderDeclined`, `ErrProviderRateLimited`, `ErrProviderUnavailable`) instead of leaking the provider's raw status code or JSON shape up to the handler — the handler should never need to know whether the payment gateway's "do not retry" signal is a `402` or a `{"error":{"type":"card_error"}}` body, only that it's one of your own sentinel errors.
+
+The provider's request ID is what you hand their support team when a charge needs investigating; without logging it, a dispute means grepping raw response bodies in old logs instead of a one-line lookup.
 
 Tests using `httptest.Server` with fault injection — the exact scenarios a real provider produces: a transient 503 that recovers, a 429 with `Retry-After`, and a 400 that must never be retried:
 
@@ -366,7 +413,9 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 > An Idempotency-Key generated once per logical charge attempt and sent on every retry of that same attempt. The provider deduplicates by that key: the second POST with the same key returns the first charge's result instead of creating a new one. Retrying a non-idempotent write with no such mechanism is unsafe regardless of how the retry/backoff is tuned.
 
 > [!question]- Why jitter the backoff instead of a fixed exponential delay?
-> If many clients fail at the same instant (e.g. a provider blip) and all back off 1s, 2s, 4s… with no randomness, they retry in synchronized waves that hit the recovering provider just as hard as before. Full jitter — a uniformly random delay up to the exponential cap — spreads those retries across the whole window instead of one spike.
+> If many clients fail at the same instant (e.g. a provider blip) and all back off 1s, 2s, 4s… with no randomness, they retry in synchronized waves that hit the recovering provider just as hard as before.
+>
+> Full jitter — a uniformly random delay up to the exponential cap — spreads those retries across the whole window instead of one spike.
 
 > [!question]- Why does the response body need to be drained before closing it, not just closed?
 > `Transport` only returns a connection to its idle pool for reuse once the body has been read to EOF. Closing an unread body still releases resources but the underlying TCP connection cannot be reused, so skipping the drain under load silently turns a tuned connection pool into one that opens a new connection (and redoes the TLS handshake) on every call.
@@ -375,7 +424,9 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 > False. `client.Do` returns `err == nil` for a successful round trip regardless of the status code — a 404, 429 or 500 is a perfectly well-formed HTTP response, not a Go error. The caller must check `resp.StatusCode` explicitly; treating "no error" as "success" silently ignores failed calls.
 
 > [!question]- When would you add a circuit breaker on top of retries, and what does it protect that retries don't?
-> Retries handle a transient blip in one call. A circuit breaker protects the *rest of the service* once a dependency is reliably failing: without one, every request still tries the full retry sequence against a dead provider, holding goroutines and connections the whole time. The breaker trips to "open" after a failure-rate threshold and fails fast immediately, freeing those resources, then probes occasionally ("half-open") to detect recovery. Full state machine in [[Circuit Breaker]].
+> Retries handle a transient blip in one call. A circuit breaker protects the *rest of the service* once a dependency is reliably failing: without one, every request still tries the full retry sequence against a dead provider, holding goroutines and connections the whole time.
+>
+> The breaker trips to "open" after a failure-rate threshold and fails fast immediately, freeing those resources, then probes occasionally ("half-open") to detect recovery. Full state machine in [[Circuit Breaker]].
 
 > [!question]- How would you safely call a URL a customer configured themselves (e.g. a webhook delivery address)?
 > Treat it as untrusted input with SSRF potential: resolve the hostname, reject private/link-local/loopback IP ranges via a custom `Dialer.Control`, and re-check on every connection attempt (not just once at config time) because DNS can rebind an external-looking hostname to an internal IP between the check and the actual connect.
@@ -395,3 +446,8 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 - **Before this:** [[Building REST Endpoints]], [[Context Package]], [[Timeouts, Retries and Backoff]]
 - **Next:** [[Circuit Breaker]], [[Redis in Go]] (caching a provider's slow or rate-limited responses)
 - **Compare with:** [[Idempotency and Idempotency Keys]], [[Authentication and Authorization in Go]] (calling an OAuth-protected provider)
+
+### Watch on YouTube
+
+- [Retries, Timeouts and Circuit Breakers: How Retries Turn 1 Request Into 243](https://www.youtube.com/watch?v=wj0IJf27LV4) · José Cruz (IT Architect) · explains why naive retries amplify outages, the core risk this note guards against
+- [Retry Storms Explained: How Exponential Backoff with Jitter Prevents System Meltdowns](https://www.youtube.com/watch?v=WjEmM1Jy79M) · SystemDR - Scalable System Design  · focused visual explainer on backoff + full jitter

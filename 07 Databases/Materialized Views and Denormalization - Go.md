@@ -10,7 +10,7 @@ sources:
   - "pg_ivm extension README (Incremental View Maintenance; create_immv)"
   - "ClickHouse docs: Materialized views (insert triggers), AggregatingMergeTree, SummingMergeTree"
   - "Materialize and RisingWave docs: incrementally maintained materialized views over streams"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Materialized Views and Denormalization - Go
@@ -18,9 +18,20 @@ updated: 2026-11-03
 > [!summary] TL;DR
 > This note holds the code behind [[Materialized Views and Denormalization]]: the PostgreSQL 17 SQL for a materialized view and its refresh, the same-transaction payment update, the drift query, the slot-sharded counter, and a Go rollup that applies change events idempotently and detects drift, with race-tested unit tests.
 
+## Before the code
+
+- **Structs and maps**: the rollup is a map from workspace ID to `Totals`, plus a set of seen event IDs.
+- **`sync.Mutex`**: one lock guards both maps so a duplicate check and an update happen together.
+- **Idempotency**: `Apply` returns `false` for an event ID it has already seen, so redelivery is harmless.
+- **Goroutines and `sync.WaitGroup`**: one test applies events, with duplicates, from many goroutines at once.
+- **SQL blocks**: the PostgreSQL parts are SQL, not Go; read them as the database side of the same design.
+- **Run**: `go vet ./... && go test -race ./...` (standard library only).
+
 ## What this code shows
 
-The theory note describes three ways to keep a precomputed result: a scheduled full refresh, a same-transaction update, and an asynchronous rollup from events. This note implements each of them, from the slowest query through the three maintenance styles to the failure modes (duplicate delivery, drift, hot rows). The SQL half is PostgreSQL 17 and the Go half is a self-contained rollup that is tested with `go test -race`.
+The theory note describes three ways to keep a precomputed result: a scheduled full refresh, a same-transaction update, and an asynchronous rollup from events.
+
+This note implements each of them, from the slowest query through the three maintenance styles to the failure modes (duplicate delivery, drift, hot rows). The SQL half is PostgreSQL 17 and the Go half is a self-contained rollup that is tested with `go test -race`.
 
 | Code | Theory concept in [[Materialized Views and Denormalization]] |
 | --- | --- |
@@ -62,7 +73,11 @@ sequenceDiagram
 
 ### Step 1: the dashboard query and the whiteboard view
 
-**Concept.** The dashboard asks one question per workspace: how many invoices are in each status, and what do they add up to? Computing it live reads every invoice of the workspace ([[Materialized Views and Denormalization#3.1 View vs materialized view vs summary table]]). A materialized view stores the answer for all workspaces once, so a page load becomes a small keyed read. The alternatives are a plain view (always fresh but never faster) and a cache (only hot keys, outside the database), and the view is chosen here because every key is expensive to compute and the answer can be a few minutes old.
+**Concept.** The dashboard asks one question per workspace: how many invoices are in each status, and what do they add up to? Computing it live reads every invoice of the workspace ([[Materialized Views and Denormalization#3.1 View vs materialized view vs summary table]]).
+
+A materialized view stores the answer for all workspaces once, so a page load becomes a small keyed read.
+
+The alternatives are a plain view (always fresh but never faster) and a cache (only hot keys, outside the database), and the view is chosen here because every key is expensive to compute and the answer can be a few minutes old.
 
 ```sql
 -- the slow question
@@ -103,7 +118,9 @@ flowchart LR
 
 ### Step 2: the full materialized view
 
-**Concept.** The production version adds `outstanding_minor`, the money still owed, and two details that the first version leaves implicit. `WITH DATA` populates the view immediately, because a view created `WITH NO DATA` is unreadable until its first refresh and cannot be refreshed `CONCURRENTLY` until then. The index must be `UNIQUE` and cover plain column names with no `WHERE` clause, which is what makes the concurrent refresh possible: PostgreSQL needs a key to match old rows with new ones.
+**Concept.** The production version adds `outstanding_minor`, the money still owed, and two details that the first version leaves implicit. `WITH DATA` populates the view immediately, because a view created `WITH NO DATA` is unreadable until its first refresh and cannot be refreshed `CONCURRENTLY` until then.
+
+The index must be `UNIQUE` and cover plain column names with no `WHERE` clause, which is what makes the concurrent refresh possible: PostgreSQL needs a key to match old rows with new ones.
 
 ```sql
 CREATE MATERIALIZED VIEW workspace_dashboard AS
@@ -188,7 +205,11 @@ Execution Time: 0.041 ms
 
 ### Step 5: schedule the refresh
 
-**Concept.** A materialized view never refreshes itself, so something must run `REFRESH`. The cadence comes from the staleness budget ([[Materialized Views and Denormalization#4.3 The refresh cost and cadence]]): with a 5-minute budget, refreshing every 4 minutes leaves room for a refresh that takes up to a minute. Running it from exactly one scheduler matters because a concurrent refresh takes an `EXCLUSIVE` lock, and a second one would queue behind it.
+**Concept.** A materialized view never refreshes itself, so something must run `REFRESH`.
+
+The cadence comes from the staleness budget ([[Materialized Views and Denormalization#4.3 The refresh cost and cadence]]): with a 5-minute budget, refreshing every 4 minutes leaves room for a refresh that takes up to a minute.
+
+Running it from exactly one scheduler matters because a concurrent refresh takes an `EXCLUSIVE` lock, and a second one would queue behind it.
 
 ```sql
 -- pg_cron extension: run every 4 minutes
@@ -215,7 +236,9 @@ sequenceDiagram
 
 ### Step 6: the same idea maintained by the application
 
-**Concept.** Some copies must be exact. The invoice list shows `paid_minor` and the status next to each invoice, and a 4-minute-old value would be wrong for a user who has just paid ([[Materialized Views and Denormalization#4.4 The same idea maintained by the application]]). So the copy is updated in the same transaction as the payment, using the atomicity of [[Transactions and ACID]]: either both statements commit or neither does. The alternative is an asynchronous update, which keeps writes fast but lets the copy lag.
+**Concept.** Some copies must be exact. The invoice list shows `paid_minor` and the status next to each invoice, and a 4-minute-old value would be wrong for a user who has just paid ([[Materialized Views and Denormalization#4.4 The same idea maintained by the application]]).
+
+So the copy is updated in the same transaction as the payment, using the atomicity of [[Transactions and ACID]]: either both statements commit or neither does. The alternative is an asynchronous update, which keeps writes fast but lets the copy lag.
 
 ```sql
 BEGIN;
@@ -264,11 +287,17 @@ flowchart LR
 
 ### Step 7: the asynchronous rollup in Go
 
-When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event, as in [[Materialized Views and Denormalization#4.5 Asynchronous rollup in Go, with idempotency and a drift check]]. Delivery is at-least-once, so the same event can arrive again, and applying it twice is the classic double-counting bug. The fix is to remember which event IDs were applied. In SQL that is a `processed_events` table written in the same transaction as the rollup update, and in Go it is a `seen` set guarded by a mutex. The code is split into four pieces: the types, `Apply`, `Get`, and `Drift`.
+When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event, as in [[Materialized Views and Denormalization#4.5 Asynchronous rollup in Go, with idempotency and a drift check]].
+
+Delivery is at-least-once, so the same event can arrive again, and applying it twice is the classic double-counting bug. The fix is to remember which event IDs were applied.
+
+In SQL that is a `processed_events` table written in the same transaction as the rollup update, and in Go it is a `seen` set guarded by a mutex. The code is split into four pieces: the types, `Apply`, `Get`, and `Drift`.
 
 #### 7a: the event and the rollup types
 
-**Concept.** An `Event` carries the old and new total of one invoice, so the rollup can apply a delta without reading the invoice. The `ID` must be unique per change (for example invoice id plus version), because it is the idempotency key. Carrying deltas instead of full state makes the rollup order-insensitive, since addition commutes. The alternative is to carry the new state and overwrite, which is naturally idempotent but needs a version check to survive out-of-order delivery.
+**Concept.** An `Event` carries the old and new total of one invoice, so the rollup can apply a delta without reading the invoice. The `ID` must be unique per change (for example invoice id plus version), because it is the idempotency key.
+
+Carrying deltas instead of full state makes the rollup order-insensitive, since addition commutes. The alternative is to carry the new state and overwrite, which is naturally idempotent but needs a version check to survive out-of-order delivery.
 
 ```go
 // Package rollup keeps an app-maintained summary table (per-workspace
@@ -308,7 +337,9 @@ type Totals struct {
 
 #### 7b: the rollup state
 
-**Concept.** `Rollup` holds the two maps the SQL version stores in tables: `seen` is `processed_events` and `rows` is `workspace_totals`. One mutex guards both, because `Apply` must check the seen set and update the totals as a single step. This is the in-memory version of putting both statements in one database transaction. The alternative of two separate locks would let two consumers pass the dedupe check together and both apply the same event.
+**Concept.** `Rollup` holds the two maps the SQL version stores in tables: `seen` is `processed_events` and `rows` is `workspace_totals`. One mutex guards both, because `Apply` must check the seen set and update the totals as a single step.
+
+This is the in-memory version of putting both statements in one database transaction. The alternative of two separate locks would let two consumers pass the dedupe check together and both apply the same event.
 
 ```go
 // Rollup applies events exactly once by remembering the IDs it has seen.
@@ -334,7 +365,9 @@ func New() *Rollup {
 
 #### 7c: apply one event
 
-**Concept.** `Apply` is exactly-once processing built from at-least-once delivery: check the ID, mark it, apply the delta. It returns `false` for a duplicate, so the caller can acknowledge the message either way. The mark and the delta happen under the same lock, so no other goroutine can observe one without the other. A duplicate is detected by ID only, not by comparing content, so IDs must be unique per change.
+**Concept.** `Apply` is exactly-once processing built from at-least-once delivery: check the ID, mark it, apply the delta. It returns `false` for a duplicate, so the caller can acknowledge the message either way.
+
+The mark and the delta happen under the same lock, so no other goroutine can observe one without the other. A duplicate is detected by ID only, not by comparing content, so IDs must be unique per change.
 
 ```go
 // Apply adds the delta of one event. It reports false for a duplicate.
@@ -395,7 +428,11 @@ func (r *Rollup) Get(ws int64) Totals {
 
 #### 7e: drift, step one: recompute the truth
 
-**Concept.** A rollup will eventually disagree with the source: an event is lost, a bug skips a code path, someone edits a row by hand. `Drift` finds that by recomputing the totals from the source rows and comparing them with the rollup ([[Materialized Views and Denormalization#4.5 Asynchronous rollup in Go, with idempotency and a drift check]]). The first half builds the truth map. This costs a full scan of the source, which is why a real system runs it nightly or on a sample, not on every request.
+**Concept.** A rollup will eventually disagree with the source: an event is lost, a bug skips a code path, someone edits a row by hand.
+
+`Drift` finds that by recomputing the totals from the source rows and comparing them with the rollup ([[Materialized Views and Denormalization#4.5 Asynchronous rollup in Go, with idempotency and a drift check]]). The first half builds the truth map.
+
+This costs a full scan of the source, which is why a real system runs it nightly or on a sample, not on every request.
 
 ```go
 // Drift compares the rollup with a full recomputation from the source
@@ -424,7 +461,11 @@ func (r *Rollup) Drift(source map[int64]map[int64]int64) map[int64]Totals {
 
 #### 7f: drift, step two: compare
 
-**Concept.** The second half holds the lock only while it compares, and checks in both directions. A workspace in the truth whose rollup row differs is a missed or duplicated update. A workspace present in the rollup but absent from the truth, with a non-zero row, is a phantom: events were counted for data that no longer exists. The result is the set of workspaces to repair, each with its correct row, so the caller can fix them directly.
+**Concept.** The second half holds the lock only while it compares, and checks in both directions. A workspace in the truth whose rollup row differs is a missed or duplicated update.
+
+A workspace present in the rollup but absent from the truth, with a non-zero row, is a phantom: events were counted for data that no longer exists.
+
+The result is the set of workspaces to repair, each with its correct row, so the caller can fix them directly.
 
 ```go
 	r.mu.Lock()
@@ -464,7 +505,9 @@ The toy treats `total_minor = 0` as "no invoice"; a real event carries an explic
 
 ### Step 8: the same idempotent apply in SQL
 
-**Concept.** Inside Postgres the same idea needs the dedupe key and the update in one transaction, because a crash between them would either lose the delta or apply it twice. `INSERT ... ON CONFLICT DO NOTHING` into `processed_events` is the atomic "have I seen this?" check, and the row count says what happened. The alternative of a `SELECT` followed by an `INSERT` has a race between the two statements.
+**Concept.** Inside Postgres the same idea needs the dedupe key and the update in one transaction, because a crash between them would either lose the delta or apply it twice.
+
+`INSERT ... ON CONFLICT DO NOTHING` into `processed_events` is the atomic "have I seen this?" check, and the row count says what happened. The alternative of a `SELECT` followed by an `INSERT` has a race between the two statements.
 
 ```sql
 BEGIN;
@@ -490,7 +533,11 @@ COMMIT;
 
 ### Step 9: a hot summary row split into slots
 
-**Concept.** A single summary row is a serial bottleneck: every transaction that updates it waits for the previous one's row lock ([[Materialized Views and Denormalization#8. Deep dive]]). At 200 invoices per second and about 5 ms per commit (an estimate), one row caps throughput near 200 per second. Splitting the row into 16 slots spreads the writers over 16 locks, at the cost of a read that sums 16 rows. The alternative is batching updates in memory and flushing them periodically, which is faster still but loses the same-transaction guarantee.
+**Concept.** A single summary row is a serial bottleneck: every transaction that updates it waits for the previous one's row lock ([[Materialized Views and Denormalization#8. Deep dive]]).
+
+At 200 invoices per second and about 5 ms per commit (an estimate), one row caps throughput near 200 per second. Splitting the row into 16 slots spreads the writers over 16 locks, at the cost of a read that sums 16 rows.
+
+The alternative is batching updates in memory and flushing them periodically, which is faster still but loses the same-transaction guarantee.
 
 ```sql
 CREATE TABLE workspace_totals_slots (

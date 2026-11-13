@@ -10,7 +10,7 @@ sources:
   - "Go 1.23 release notes: range-over-func iterators and package iter"
   - "runtime/debug.SetMaxStack docs: default maximum stack 1 GB on 64-bit systems"
   - "PostgreSQL 17 docs: WITH RECURSIVE and the CYCLE clause; ltree extension"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Composite
@@ -23,6 +23,49 @@ updated: 2026-11-02
 > - The composite answers by **looping over its children** and combining their answers; the recursion stops at leaves.
 > - The one rule: the tree must really be a tree. Guard against cycles and very deep input before recursing.
 > - Classic mistake: recomputing a whole subtree on every page view (for example product counts) instead of caching or precomputing it.
+
+## Start here: the basics
+
+**The problem in one story.**
+An online shop has categories like Electronics, which holds Phones, which holds actual products.
+You want "how many products are in Electronics?"
+You do not want to write one rule for a product and another for a category.
+Composite lets you ask the same question of a single item or a whole group.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Tree | Data where each item has one parent and may have children | category > subcategory > product |
+| Node | One item in the tree | "Phones" |
+| Leaf | A node with no children | one product |
+| Composite | A node that holds children | a category |
+| Interface | A list of methods a type promises to have | `CountProducts() int` |
+| Recursion | A function that calls itself on smaller parts | category asks each child to count |
+| Cycle | A loop where a node ends up inside itself | A contains B, B contains A |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    E["Electronics<br/>(composite)"] --> P["Phones<br/>(composite)"]
+    E --> L["Laptop<br/>(leaf)"]
+    P --> P1["Phone A<br/>(leaf)"]
+    P --> P2["Phone B<br/>(leaf)"]
+```
+
+**Analogy.** Folders on your computer: a folder's size is the sum of its files and sub-folders.
+Where it breaks: a real disk cannot put a folder inside itself, but buggy data can create a cycle, so code must guard against it.
+
+**How the rest of this note builds up**
+
+- First, why trees need one uniform interface and the mental model (sections 1-2).
+- Then how leaf and composite work together and a full Go catalog example (sections 3-4).
+- Then variants and when Composite is the wrong tool (sections 5-6).
+- Finally the SDE-3 view: cycle and depth guards, caching subtree results, the deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Leaf and group share one interface; the group answers by asking its children, and the tree must really be a tree.
 
 ## 1. Why it exists
 
@@ -684,3 +727,8 @@ WHERE ancestor_id = 1 AND depth > 0;
 - **Before this:** [[Interfaces]], [[Trees, BSTs and Balanced Trees]], [[Design Patterns Overview and Chooser]]
 - **Next:** [[Observer and Event Bus]], [[Iterator and range-over-func]], [[File Search (Unix find)]]
 - **Compare with:** [[Decorator and Middleware]] (wraps one object, not many), [[Chain of Responsibility and Pipelines]] (a linear chain of handlers instead of a tree), [[Rare GoF Patterns in Go]] (Visitor for operations over a composite)
+
+### Watch on YouTube
+
+- [The Incredible Properties of Composite Materials](https://www.youtube.com/watch?v=04K0bLwCDdM) · The Efficient Engineer · 23 min · 593,910 views
+- [What are Composite Numbers? / Math with Mr. J](https://www.youtube.com/watch?v=R1CM-W8FMRA) · Math with Mr. J · 4 min · 349,087 views

@@ -14,13 +14,17 @@ sources:
   - "India Digital Personal Data Protection Act, 2023"
   - "Stripe documentation, Tokens and Elements (card data goes from the browser to Stripe, merchants handle tokens)"
   - "Capital One 2019 incident, US DOJ and OCC public filings (SSRF to cloud metadata credentials)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Security, Privacy and Compliance in HLD
 
 > [!summary] TL;DR
-> In an HLD round, security is not a closing remark. It is a short, ordered checklist you apply to the boxes you already drew: **encrypt** data in transit and at rest, **classify** what is sensitive and keep it in as few places as possible, **authenticate every call** even inside your network, **log** who touched what, and **plan for deletion** and for where data may live. Name each control, the threat it stops, and what it costs.
+> In an HLD round, security is not a closing remark.
+>
+> It is a short, ordered checklist you apply to the boxes you already drew: **encrypt** data in transit and at rest, **classify** what is sensitive and keep it in as few places as possible, **authenticate every call** even inside your network, **log** who touched what, and **plan for deletion** and for where data may live.
+>
+> Name each control, the threat it stops, and what it costs.
 
 > [!abstract] Core idea
 > - Draw a **trust boundary** first. Every arrow that crosses one needs authentication, authorization and encryption.
@@ -28,6 +32,51 @@ updated: 2026-11-09
 > - **Minimise PII**: store the least data in the fewest places, and replace the rest with **tokens**.
 > - **Zero trust** means the network location of a caller proves nothing. Each service proves identity on every call.
 > - **Erasure and retention** are design problems when data is copied into logs, events, caches and backups. Plan them early.
+
+## Start here: the basics
+
+**The problem in one story.**
+You run a food delivery app. It stores names, phone numbers, addresses and cards.
+One day a laptop with a database copy is stolen.
+Another day a user asks you to delete everything about them, and nobody knows where their data is.
+Security in system design means planning, while you draw the boxes, how data is locked, who may touch it, and how it is found and deleted.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Encryption | Scrambling data so only key holders can read it | A card number stored as random-looking bytes |
+| In transit / at rest | Data moving over a network / data sitting on disk | HTTPS call / a database file |
+| TLS | The protocol that encrypts network traffic (the "S" in HTTPS) | Browser to load balancer |
+| Key / KMS | The secret that unlocks encrypted data / a service that guards keys | AWS KMS holds the master key |
+| PII | Personally identifiable information: data that points to a person | Phone number, email, address |
+| Token (tokenization) | A meaningless stand-in for sensitive data | `tok_8f3a` instead of a card number |
+| Authentication / authorization | Proving who you are / checking what you may do | Login / "only admins can refund" |
+| Trust boundary | A line where data passes between parts that trust each other differently | Internet to your API gateway |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U[User] -->|TLS| E[Edge: WAF + TLS]
+    E -->|mTLS, identity checked| S[Service]
+    S -->|encrypted| DB[(Database)]
+    S --> V[Token vault for PII]
+    S --> A[Audit log]
+```
+
+**Analogy.** A bank branch: a guard at the door, a vault that needs a key, a ledger of every vault visit, and customer names kept in a separate locked drawer.
+Where it breaks: a bank vault is in one place, while your data is copied into logs, caches, events and backups, and each copy needs the same care.
+
+**How the rest of this note builds up**
+
+- First, why it exists and the bank-branch mental model (sections 1-2).
+- Then the controls one by one (section 3): encryption in transit, envelope encryption, secrets, PII and tokens, audit logs and zero trust, erasure and residency, edge defences.
+- Then a worked example and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive (section 8): AES-GCM, deterministic encryption, passwords, multi-tenant isolation and threat modelling.
+
+> [!tip] Remember
+> Encrypt, minimise, check every call, log access, and know where every copy of personal data lives.
 
 ## 1. Why it exists
 
@@ -46,7 +95,11 @@ None of this is exotic. It is what happens when security is added after the boxe
 
 ## 2. Mental model
 
-Think of a **bank branch**. The street is the internet. The front door has a guard (edge: WAF, TLS). Inside, the lobby is open, but the vault needs a key and two signatures. Every vault entry is written in a ledger the clerks cannot edit. Customer files are in numbered folders, and the name-to-number table is in a separate locked drawer.
+Think of a **bank branch**. The street is the internet. The front door has a guard (edge: WAF, TLS).
+
+Inside, the lobby is open, but the vault needs a key and two signatures. Every vault entry is written in a ledger the clerks cannot edit.
+
+Customer files are in numbered folders, and the name-to-number table is in a separate locked drawer.
 
 Mapping:
 
@@ -105,7 +158,9 @@ Where TLS is needed in a typical design:
 3. **Service to database, cache, broker:** enable TLS on Postgres, Redis and Kafka clients. Cheap insurance.
 4. **Cross-region links:** always, since traffic leaves your physical control.
 
-**Example:** terminating TLS at a load balancer and sending plain HTTP behind it is acceptable only if the segment is genuinely isolated and you accept that a compromised host can sniff it. PCI DSS requires strong cryptography for card data sent over open, public networks; many auditors and security teams also expect internal hops to be encrypted, and it is cheap to do.
+**Example:** terminating TLS at a load balancer and sending plain HTTP behind it is acceptable only if the segment is genuinely isolated and you accept that a compromised host can sniff it.
+
+PCI DSS requires strong cryptography for card data sent over open, public networks; many auditors and security teams also expect internal hops to be encrypted, and it is cheap to do.
 
 **Why it matters:** the cost is a handshake per connection (about one round trip with TLS 1.3, and connection reuse hides it). The benefit is that a stolen packet capture is useless.
 
@@ -283,7 +338,9 @@ The hard parts, and the usual answers:
 
 **In plain words (retention):** GDPR Art. 5(1)(e) says keep personal data no longer than needed. Define a retention period per data class and enforce it with automatic jobs (TTL on rows, object-store lifecycle rules), not with a wiki page.
 
-**In plain words (residency):** some laws restrict moving personal data across borders (GDPR Chapter V on transfers out of the EU; India's DPDP Act 2023 has its own transfer rules). The design answer is **regional cells**: EU users' data stays in an EU region with its own database and keys, and only non-personal or pseudonymised data flows to a global tier.
+**In plain words (residency):** some laws restrict moving personal data across borders (GDPR Chapter V on transfers out of the EU; India's DPDP Act 2023 has its own transfer rules).
+
+The design answer is **regional cells**: EU users' data stays in an EU region with its own database and keys, and only non-personal or pseudonymised data flows to a global tier.
 
 ```mermaid
 flowchart LR
@@ -405,7 +462,11 @@ Passwords are never encrypted. They are hashed with a slow, salted algorithm (Ar
 
 ### Multi-tenant isolation
 
-For B2B systems, the strongest isolation is a key and a database per tenant (or per tier of tenants). It makes tenant deletion and tenant-specific key revocation trivial, and limits the blast radius of an authorization bug. It costs more to operate. The cheaper model is a shared database with a tenant ID on every row, enforced by row-level security, and a per-tenant DEK for sensitive columns.
+For B2B systems, the strongest isolation is a key and a database per tenant (or per tier of tenants).
+
+It makes tenant deletion and tenant-specific key revocation trivial, and limits the blast radius of an authorization bug. It costs more to operate.
+
+The cheaper model is a shared database with a tenant ID on every row, enforced by row-level security, and a per-tenant DEK for sensitive columns.
 
 ### Threat modelling in five minutes
 
@@ -439,13 +500,21 @@ Say it in 30 seconds: "Trust boundary at the gateway. TLS outside, mTLS inside w
 ## 9. Interview questions
 
 > [!question]- How would you protect card data in a checkout system?
-> Keep it out of your systems. The browser sends the card straight to a payment provider that returns a token; we store the token, brand and last four digits. That shrinks PCI scope, because we never handle the card number. Server calls use the token. Never store the verification code after authorization. The remaining risk is the token vault or provider, which is their hardened scope.
+> Keep it out of your systems. The browser sends the card straight to a payment provider that returns a token; we store the token, brand and last four digits.
+>
+> That shrinks PCI scope, because we never handle the card number. Server calls use the token.
+>
+> Never store the verification code after authorization. The remaining risk is the token vault or provider, which is their hardened scope.
 
 > [!question]- Explain envelope encryption and why not encrypt everything with KMS directly.
 > KMS calls are remote, rate-limited and size-limited (4 KB for AWS KMS direct encrypt). So KMS generates a data key; we encrypt locally with it and store the wrapped key beside the data. KMS only ever sees small keys, every unwrap is audited, rotation means re-wrapping small keys, and disabling the master key makes the data unreadable.
 
 > [!question]- A user invokes the right to be forgotten. Your data is in Postgres, Redis, Elasticsearch, Kafka and backups. What do you do?
-> Keep a data map. Delete or anonymise in Postgres, delete cache and index entries, and for immutable logs use crypto-shredding: personal fields are encrypted with a per-user key, so deleting the key makes every copy unreadable. Backups age out by retention (document the window) and deletions are replayed on restore. Keep what law requires, such as tax records, in anonymised form.
+> Keep a data map. Delete or anonymise in Postgres, delete cache and index entries.
+>
+> For immutable logs use crypto-shredding: personal fields are encrypted with a per-user key, so deleting the key makes every copy unreadable.
+>
+> Backups age out by retention (document the window) and deletions are replayed on restore. Keep what law requires, such as tax records, in anonymised form.
 
 > [!question]- What does zero trust mean for service-to-service calls, and what is mTLS missing?
 > No call is trusted because of where it comes from. Each caller proves identity (mTLS with workload certs) and a policy decides whether that caller may call that method. mTLS only proves identity. You still need authorization policy, user context propagation and audit.
@@ -480,3 +549,10 @@ Order to mention in an interview: classify, boundary, TLS, auth, encrypt, tokeni
 - Attack surface: [[OWASP API Security Top 10]], [[CSRF, XSS and Security Headers]], [[API Abuse and Bot Protection]], [[Website Security Hardening Checklist]], [[Security Incident Response - When Your Website Is Hacked]]
 - Data and resilience: [[Multi-Region Architecture]], [[Event Sourcing]], [[Backup, PITR and Disaster Recovery]], [[TLS and HTTPS]]
 - Framework: [[System Design Interview Framework]], [[Cost-Aware System Design]]
+
+## Links
+
+### Watch on YouTube
+
+- [Security vs. Privacy](https://www.youtube.com/watch?v=x3rg8bttldg) · IBM Technology · 9 min · 33,732 views
+- [VIDEO 1.14  Compliance and Privacy in Cybersecurity — Sensitive Data Explained](https://www.youtube.com/watch?v=Tcl2CgyRMW8) · DigitalUrim · 3 min · 24 views

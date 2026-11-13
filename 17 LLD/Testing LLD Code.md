@@ -12,7 +12,7 @@ sources:
   - "Go 1.24 and Go 1.25 release notes: testing/synctest experimental in 1.24, standard in 1.25"
   - "go.uber.org/goleak README"
   - "Martin Fowler, Mocks Aren't Stubs; Gerard Meszaros, xUnit Test Patterns (test double vocabulary)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Testing LLD Code
@@ -29,6 +29,51 @@ updated: 2026-11-04
 
 Generic Go testing mechanics (`go test` flags, coverage, benchmarks, subtests) live in [[Testing in Go]]. The test pyramid lives in [[Unit, Integration and E2E Tests]]. This note is about testing an LLD design.
 
+## Start here: the basics
+
+**The problem in one story.**
+You build a checkout: reserve stock, charge the card, release the stock if the charge fails.
+It looks right, but one forgotten "release" line slowly leaks stock until the shop shows "sold out" with a full shelf.
+A test that runs that exact failure in milliseconds would have caught it.
+This note shows how to write such tests for interview-style designs.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Unit test | A small function that checks one behaviour | `TestCheckout_DeclinedReleasesStock` |
+| Interface | A list of methods a type must have | `Inventory` with `Reserve` and `Release` |
+| Fake | A working, simplified stand-in | A map-backed inventory |
+| Stub | A stand-in that returns a fixed answer | Payment that always says "declined" |
+| Mock | A stand-in that checks which calls happened | "Expect `Charge` called once" |
+| Race condition | Two goroutines touching the same data at once, giving wrong results | Two buyers both get the last item |
+| Deterministic | Same input, same result, every run | A fixed fake clock instead of `time.Now()` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    T["Test"] --> S["Service under test"]
+    S --> FI["Fake inventory"]
+    S --> SP["Stub payment"]
+    S --> FC["Fake clock"]
+    S --> ID["Fixed ID generator"]
+    T -- "checks result<br/>and fake state" --> FI
+```
+
+**Analogy.** An engine on a test bench: you control the fuel, the air and the clock on the wall, and can rerun the same run a thousand times.
+Where it breaks: a bench engine is the real engine; a fake is not the real database, so it can disagree with it (that is why contract tests exist).
+
+**How the rest of this note builds up**
+
+- First, the bugs tests catch (section 1) and the test-double vocabulary (section 2).
+- Then what to test, how doubles plug into interfaces, and the concurrent "one winner" test (section 3).
+- Then full tested code: fakes, clock, table-driven tests, contract test, benchmark, and `testing/synctest` (section 4).
+- Finally the SDE-3 view: trade-offs, a test layout for a 60-minute round and deep-dive limits (sections 5-8).
+
+> [!tip] Remember
+> Inject everything you cannot control, then test the happy path, the failures, the race and the clock.
+
 ## 1. Why it exists
 
 In a machine-coding round, the interviewer cannot read 400 lines carefully in the last five minutes. A passing test that says `TestCheckout_LastItemOnlyOneWinner` answers the question they were going to ask. In a take-home, tests often decide the result outright.
@@ -43,7 +88,11 @@ Each has a 10-to-30-line test, shown below.
 
 ## 2. Mental model
 
-Think of the service as an **engine on a test bench**. You do not test it inside the car on a motorway; you bolt it to a bench where you control the fuel (inputs), the air (fakes for inventory and payment), and the clock on the wall (an injected clock). Then you can run the engine at any "time of day" and repeat the exact same run a thousand times.
+Think of the service as an **engine on a test bench**.
+
+You do not test it inside the car on a motorway; you bolt it to a bench where you control the fuel (inputs), the air (fakes for inventory and payment), and the clock on the wall (an injected clock).
+
+Then you can run the engine at any "time of day" and repeat the exact same run a thousand times.
 
 Vocabulary, from Meszaros's *xUnit Test Patterns*:
 
@@ -626,7 +675,9 @@ Measured on an Apple Silicon laptop with Go 1.24.4: `BenchmarkCheckout-10  17603
 
 ### Fake time for goroutines: testing/synctest
 
-When the code under test calls `time.Sleep`, `time.After` or `context.WithTimeout` itself, an injected clock is not enough. `testing/synctest` runs the test in a "bubble" with a fake clock that jumps forward whenever every goroutine in the bubble is blocked. This snippet passed on Go 1.24.4 with `GOEXPERIMENT=synctest go test -race`; without the experiment flag the file is excluded by its build tag.
+When the code under test calls `time.Sleep`, `time.After` or `context.WithTimeout` itself, an injected clock is not enough. `testing/synctest` runs the test in a "bubble" with a fake clock that jumps forward whenever every goroutine in the bubble is blocked.
+
+This snippet passed on Go 1.24.4 with `GOEXPERIMENT=synctest go test -race`; without the experiment flag the file is excluded by its build tag.
 
 ```go
 //go:build goexperiment.synctest
@@ -712,7 +763,9 @@ In Go 1.25 the package is standard: no build tag or experiment flag, and the ent
 - **`B.Loop` (Go 1.24).** `for b.Loop() { ... }` replaces `for i := 0; i < b.N; i++`. The benchmark function itself runs only once, so setup before the loop is not repeated or timed, and it keeps the compiler from optimising away the body's results.
 - **How `-count` and the race detector interact.** `-count=N` disables test caching and repeats tests; with `-race`, every repetition is instrumented. The race detector reports only races it observes, so more repetitions and the start barrier raise the odds of catching one.
 - **Fuzz corpus.** `go test -fuzz` mutates seed inputs from `f.Add` and stores any failing input under `testdata/fuzz/<FuzzName>/`. A plain `go test` then reruns those inputs as regular cases, so a found bug stays fixed.
-- **synctest limits.** Only goroutines started inside the bubble share its fake clock, and blocking on real I/O (a network socket) does not count as "durably blocked", so time will not advance. Waiting to lock a `sync.Mutex` does not count as durably blocked either; channel operations, `select`, `time.Sleep`, timers and `sync.Cond.Wait` do (and `sync.WaitGroup.Wait` from Go 1.25). Use it for timers, tickers and channel-based code.
+- **synctest limits.** Only goroutines started inside the bubble share its fake clock, and blocking on real I/O (a network socket) does not count as "durably blocked", so time will not advance.
+
+  Waiting to lock a `sync.Mutex` does not count as durably blocked either; channel operations, `select`, `time.Sleep`, timers and `sync.Cond.Wait` do (and `sync.WaitGroup.Wait` from Go 1.25). Use it for timers, tickers and channel-based code.
 
 ## 9. Interview questions
 
@@ -752,3 +805,7 @@ In Go 1.25 the package is standard: no build tag or experiment flag, and the ent
 - **Before this:** [[Testing in Go]], [[Concurrency for LLD]], [[OOP in Go - Structs, Interfaces, Embedding]]
 - **Next:** [[Parking Lot]] (the first practice problem), [[Cart Checkout with Coupons]], [[Movie Ticket Booking]], [[Fuzz and Property-Based Testing]]
 - **Compare with:** [[Unit, Integration and E2E Tests]] (the pyramid), [[Contract Testing]] (keeping doubles honest across services)
+
+### Watch on YouTube
+
+- [Flipkart Machine Coding Round: FlipMed / LLD + Code Walkthrough](https://www.youtube.com/watch?v=eh4e1VJ05Gc) · Shubh Patel · 29 min · 6,557 views

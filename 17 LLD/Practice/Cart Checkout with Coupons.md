@@ -11,7 +11,7 @@ sources:
   - "PostgreSQL 17 docs: INSERT ... ON CONFLICT, UPDATE ... RETURNING, data-modifying statements in WITH, UPDATE ... FROM"
   - "IETF HTTPAPI draft, The Idempotency-Key HTTP Header Field (409 while the first request is in flight, 422 for a key reused with a different payload)"
   - "Stripe API docs, Idempotent requests (a reused key with different parameters is rejected)"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Cart Checkout with Coupons
@@ -25,6 +25,51 @@ updated: 2026-11-03
 > - An idempotency key (a client-chosen ID for one checkout attempt) makes a retry return the first result instead of charging twice.
 > - The one rule: check and consume the coupon in the same critical section, before payment.
 > - Classic mistake: holding a mutex during the slow payment call, or incrementing coupon use only after payment.
+
+## Start here: the basics
+
+**The problem in one story.**
+You fill a shopping cart, apply a coupon "SAVE100" and press Pay.
+The shop must work out the real price, check the coupon is still valid, hold the items so nobody else buys them, charge your card and create the order.
+If the card is charged but the order cannot be saved, you must get a refund.
+And if you tap Pay twice, you must be charged only once.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Coupon | A code that lowers the price under some rules | `SAVE100`: ₹100 off above ₹500 |
+| Reservation (hold) | Stock set aside for you for a short time | 2 units held for 10 minutes |
+| Payment gateway | The outside service that charges cards | Razorpay, Stripe |
+| Saga | A chain of steps where each step has an undo | Refund if order save fails |
+| Compensation | The undo action for a step that already happened | Release held stock |
+| Idempotency key | An ID for one checkout attempt so retries do not repeat it | Same key on double tap -> same order |
+| Mutex / critical section | A lock so only one goroutine runs a piece of code at a time | Check and use a coupon together |
+| Paise | 1/100 of a rupee; money kept as whole numbers | ₹499.50 = 49950 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Reprice cart<br/>from catalog"] --> B["Validate +<br/>use coupon"]
+    B --> C["Reserve stock"]
+    C --> D["Charge payment"]
+    D --> E["Save order"]
+    E -- "fails" --> R["Undo: refund,<br/>release stock,<br/>give coupon back"]
+```
+
+**Analogy.** Booking a trip: flight, then hotel, then car. If the car booking fails, you cancel the hotel and the flight.
+Where it breaks: some undos can fail too (a refund can fail), so the system needs a "stuck" state and a reconciler instead of assuming every undo works.
+
+**How the rest of this note builds up**
+
+- First, the problem statement, requirements and actors (Steps 1-2).
+- Then entities, relationships, APIs and storage (Steps 3-6), and the patterns: Facade, Strategy for coupons, a validator chain (Step 7).
+- Then the core Go code for the checkout saga with idempotency and leases (Step 8), with tests.
+- Finally the SDE-3 view: edge cases, failure modes, trade-offs and interview questions (Steps 9-10 onward).
+
+> [!tip] Remember
+> Price from the catalog, use the coupon before payment, give every side effect an undo, and key every checkout so a retry never charges twice.
 
 ## Problem statement
 
@@ -62,7 +107,9 @@ It tests a pricing pipeline (Strategy plus Chain of Responsibility), atomic stoc
 
 ## Step 2: Actors and use cases
 
-The **customer** edits the cart, previews a coupon and checks out (and may double tap). The **payment gateway** charges and refunds. **Inventory** reserves, commits and releases stock. A **sweeper** releases expired holds after crashes. **Ops** reconcile "paid but no order" cases. The hardest use case, and the one to code: **Checkout**, because it touches four systems and each failure point needs a different undo.
+The **customer** edits the cart, previews a coupon and checks out (and may double tap). The **payment gateway** charges and refunds. **Inventory** reserves, commits and releases stock. A **sweeper** releases expired holds after crashes.
+
+**Ops** reconcile "paid but no order" cases. The hardest use case, and the one to code: **Checkout**, because it touches four systems and each failure point needs a different undo.
 
 ## Step 3: Entities
 
@@ -136,7 +183,9 @@ stateDiagram-v2
     EXPIRED --> [*]
 ```
 
-`Service` is the Facade; every dependency is an interface faked in tests. The idempotency entry has its own small lifecycle: **in progress** until the saga ends, then **done** (replay the order), **forgotten** after a clean failure (the user may retry), or **stuck** when money was taken and the refund failed. An in-progress claim carries a **lease** (15 minutes, from the injected clock): if the process crashes after claiming, the key would otherwise stay in progress forever and every retry would get 409. A retry that finds an expired lease **takes the key over** with a higher attempt number, and the crashed or late attempt can no longer write a result.
+`Service` is the Facade; every dependency is an interface faked in tests. The idempotency entry has its own small lifecycle: **in progress** until the saga ends, then **done** (replay the order), **forgotten** after a clean failure (the user may retry), or **stuck** when money was taken and the refund failed.
+
+An in-progress claim carries a **lease** (15 minutes, from the injected clock): if the process crashes after claiming, the key would otherwise stay in progress forever and every retry would get 409. A retry that finds an expired lease **takes the key over** with a higher attempt number, and the crashed or late attempt can no longer write a result.
 
 ## Step 5: APIs and public methods
 
@@ -860,7 +909,9 @@ type CouponRepository interface {
 | `TestCrashedCheckoutKeyIsTakenOverAfterLease` | The process dies after claiming the key and reserving (simulated with `runtime.Goexit` in the gateway hook). A retry inside the lease gets `ErrCheckoutPending`; after the lease and the sweeper, the retry succeeds and a second retry replays it: one charge, one hold, one coupon use. Without the lease this test fails with "checkout already in progress" |
 | `TestLateOriginalCannotOverwriteTakeover` | The first attempt is slow, not dead: while it waits on the gateway a retry takes the key over and finishes. The original gets `ErrLeaseLost`, releases its hold and does not refund; the replay returns the retry's order |
 
-Measured: `go test -race -cover` on Go 1.24.4 passes all 8 test functions with 96.1% statement coverage, and `go test -race -count=3` passes on every run. The uncovered lines are the two rare lease-lost branches (lost the key while the save failed, or just before the final write). The gateway fake now calls its `onCharge` hook before taking its own lock, so a hook can run a second checkout.
+Measured: `go test -race -cover` on Go 1.24.4 passes all 8 test functions with 96.1% statement coverage, and `go test -race -count=3` passes on every run. The uncovered lines are the two rare lease-lost branches (lost the key while the save failed, or just before the final write).
+
+The gateway fake now calls its `onCharge` hook before taking its own lock, so a hook can run a second checkout.
 
 ```go
 // File: checkout_test.go
@@ -1270,7 +1321,21 @@ func TestLateOriginalCannotOverwriteTakeover(t *testing.T) {
 | Discount above subtotal; float money | `min(discount, subtotal)`; `int64` paise and basis points |
 | Order ID leaks the user | Random opaque ID; the user ID lives in its own column |
 
-Common mistakes: an in-progress key with no lease, so one crash blocks the key forever; a takeover with no attempt number, so the late original overwrites the new result; float money; a discount larger than the subtotal (negative total); checking usage but incrementing after payment; no idempotency key, so a retry charges twice; checking the key only after repricing, so a retry of a finished checkout fails; no compensation; releasing stock and forgetting the key when the refund failed; holding a mutex during the payment call; trusting client prices; one giant `switch couponType`; wrapping the gateway error with `%v`, which drops it from `errors.Is`.
+Common mistakes:
+
+- An in-progress key with no lease, so one crash blocks the key forever
+- A takeover with no attempt number, so the late original overwrites the new result
+- Float money
+- A discount larger than the subtotal (negative total)
+- Checking usage but incrementing after payment
+- No idempotency key, so a retry charges twice
+- Checking the key only after repricing, so a retry of a finished checkout fails
+- No compensation
+- Releasing stock and forgetting the key when the refund failed
+- Holding a mutex during the payment call
+- Trusting client prices
+- One giant `switch couponType`
+- Wrapping the gateway error with `%v`, which drops it from `errors.Is`
 
 ## Step 10: Tradeoffs and extensions
 
@@ -1296,7 +1361,9 @@ Common mistakes: an in-progress key with no lease, so one crash blocks the key f
 
 ![[Cart Checkout LLD Drawing.excalidraw]]
 
-The drawing shows the entities (Facade, Coupon with its strategies, the validator chain, ports), the saga with a red box for every failure and its undo, the reservation state machine and the tables with their key constraints. Redraw the saga from memory, including the stuck path. The drawing predates three changes: add the global cap link after the per-user link, move the idempotency check in front of repricing, and give the in-progress key a lease with an attempt number so a retry can take over a crashed claim.
+The drawing shows the entities (Facade, Coupon with its strategies, the validator chain, ports), the saga with a red box for every failure and its undo, the reservation state machine and the tables with their key constraints. Redraw the saga from memory, including the stuck path.
+
+The drawing predates three changes: add the global cap link after the per-user link, move the idempotency check in front of repricing, and give the in-progress key a lease with an attempt number so a retry can take over a crashed claim.
 
 Redraw it from memory: the checkout steps in order and the undo each failure runs; Strategy (how much) vs chain (may I); the reservation state machine with the sweeper; `UPDATE ... WHERE available >= qty` and `UNIQUE (user_id, idempotency_key)`; the "paid but the save failed" path and what happens when the refund fails too.
 

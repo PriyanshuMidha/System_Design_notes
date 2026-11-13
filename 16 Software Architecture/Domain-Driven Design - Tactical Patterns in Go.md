@@ -8,7 +8,7 @@ sources:
   - "Eric Evans, Domain-Driven Design: Tackling Complexity in the Heart of Software (2003)"
   - "Vaughn Vernon, Implementing Domain-Driven Design (2013)"
   - "Vaughn Vernon, Effective Aggregate Design, parts I-III (2011)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Domain-Driven Design - Tactical Patterns in Go
@@ -59,15 +59,65 @@ func (inv *Invoice) AddLine(amount int64) error {
 
 The full version below adds the rest of the pattern: a Money and a Recipient value object, an entity (LineItem) inside the aggregate, domain events, a repository interface the domain itself declares, and a second factory (`Rehydrate`) for loading an existing aggregate instead of creating a new one.
 
+## Start here: the basics
+
+**The problem in one story.**
+Three pieces of code can change an invoice: create, pay, and a reminder job.
+Each one is supposed to check "amount due equals sum of lines".
+One forgets, and a customer gets billed the wrong amount.
+Tactical DDD puts the rule inside the invoice, so nobody can forget it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Invariant | A rule that must always be true | Amount due = sum of line items |
+| Value object | Data with no identity; equal if fields are equal | `Money{500, "INR"}` |
+| Entity | An object with its own identity | Line item #3 |
+| Aggregate | A group of objects changed and saved as one unit | `Invoice` plus its line items |
+| Aggregate root | The one object outsiders talk to | `Invoice`, not `LineItem` |
+| Repository | Code that loads and saves one aggregate | `InvoiceRepo.FindByID` |
+| Domain event | A record that something happened | `InvoicePaid` |
+| Unexported field | A lowercase Go field only its package can touch | `amountDue int64` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Caller"] --> R["Invoice (root)<br/>checks rules"]
+    R --> L1["LineItem"]
+    R --> L2["LineItem"]
+    R --> M["Money (value)"]
+    Repo["Repository"] -- "load / save whole" --> R
+    R -. "after commit" .-> E["Domain event"]
+```
+
+**Analogy.** A bank teller: you never reach into the vault yourself; you ask the teller, who checks the rules and updates the books in one go.
+Where it breaks: a teller can serve many accounts at once; an aggregate guards only its own data, and cross-aggregate changes go through events.
+
+**How the rest of this note builds up**
+
+- First, why rules scattered across handlers fail (section 1) and the "object with a lock" mental model (section 2).
+- Then value objects, entities, aggregates, repositories, domain events and services in Go (section 3).
+- Then a full compiling InvoiceOps example with tests (section 4) and variants (section 5).
+- Finally the SDE-3 deep dive: aggregate size, optimistic locking with versions, and eventual consistency (sections 6-8).
+
+> [!tip] Remember
+> The aggregate root is the only door; every change goes through a method that checks the rules first.
+
 ## 1. Why it exists
 
-A `CreateInvoice` handler, a `MarkInvoicePaid` handler and a reminder job each hold a piece of "what makes an invoice valid" if `Invoice` is a plain struct with exported fields: nothing stops one of them from setting `AmountPaid` higher than `AmountDue` and forgetting to flip `Status`, or from building an `Invoice{}` literal with a line item whose currency does not match the invoice's own. Three call sites agreeing to follow the same unwritten rule is how real systems end up with a partially-paid invoice silently marked `paid`, discovered only when a customer disputes a charge.
+A `CreateInvoice` handler, a `MarkInvoicePaid` handler and a reminder job each hold a piece of "what makes an invoice valid" if `Invoice` is a plain struct with exported fields: nothing stops one of them from setting `AmountPaid` higher than `AmountDue` and forgetting to flip `Status`, or from building an `Invoice{}` literal with a line item whose currency does not match the invoice's own.
+
+Three call sites agreeing to follow the same unwritten rule is how real systems end up with a partially-paid invoice silently marked `paid`, discovered only when a customer disputes a charge.
 
 Tactical DDD's answer is to give the rule exactly one owner. `Invoice` becomes a type that is impossible to construct or change except through code that already enforces the rule, so there is only one place to get it right and only one place to look when something is wrong.
 
 ## 2. Mental model
 
-Think of an aggregate as a small object with a lock on it that only its own methods have the key to. `NewInvoice` builds the first valid one. Every `Add*`, `Apply*`, `Send` method is the only door in, and each one checks the invariant before it lets a change through. A repository is the only thing allowed to carry the whole object across a transaction boundary — load it whole, save it whole — and it is declared by the domain itself, not by whatever package happens to hold a database connection (see [[Hexagonal Architecture (Ports and Adapters)]] for why the domain never imports its own infrastructure).
+Think of an aggregate as a small object with a lock on it that only its own methods have the key to. `NewInvoice` builds the first valid one. Every `Add*`, `Apply*`, `Send` method is the only door in, and each one checks the invariant before it lets a change through.
+
+A repository is the only thing allowed to carry the whole object across a transaction boundary — load it whole, save it whole — and it is declared by the domain itself, not by whatever package happens to hold a database connection (see [[Hexagonal Architecture (Ports and Adapters)]] for why the domain never imports its own infrastructure).
 
 ## 3. How it works
 
@@ -133,7 +183,11 @@ A `Repository` is drawn as an interface that *depends on* `Invoice`, never the r
 
 ### 3.2 Aggregates: one root, one transaction, invariants inside
 
-`Invoice` is the root; `LineItem` is an entity that lives only inside it. There is no `LineItemRepository` — a line item is never loaded, changed or saved on its own, because doing so could leave `Invoice.AmountDue` out of sync with the sum of its lines. **One aggregate is one transaction**: `ApplyPayment` changes only this `Invoice`'s own fields in one call; it never reaches into a `Client` or a ledger aggregate in the same method, even though a payment conceptually "belongs" to both. A second aggregate that needs to know about the payment finds out through a domain event, consumed later, not through a direct call across the aggregate boundary (see 3.4 and "Eventual consistency between aggregates" below).
+`Invoice` is the root; `LineItem` is an entity that lives only inside it. There is no `LineItemRepository` — a line item is never loaded, changed or saved on its own, because doing so could leave `Invoice.AmountDue` out of sync with the sum of its lines.
+
+**One aggregate is one transaction**: `ApplyPayment` changes only this `Invoice`'s own fields in one call; it never reaches into a `Client` or a ledger aggregate in the same method, even though a payment conceptually "belongs" to both.
+
+A second aggregate that needs to know about the payment finds out through a domain event, consumed later, not through a direct call across the aggregate boundary (see 3.4 and "Eventual consistency between aggregates" below).
 
 A `LineItem` is referenced by its own ID within the aggregate, but another aggregate is always referenced **by ID only**, never by embedding or pointer: if `Invoice` held a `*Client` pointer, saving the invoice could accidentally also save stale client data, and the two aggregates' transaction boundaries would blur into one.
 
@@ -165,15 +219,21 @@ sequenceDiagram
 
 ### 3.4 Domain events: recorded, then pulled after commit
 
-`Send` and `ApplyPayment` append to `Invoice`'s own `events` slice; nothing is sent anywhere yet. Only after `Repository.Save` has committed does the application service call `PullEvents` and hand the result to the outbox — the ordering that `Transactional Outbox and CDC` builds the delivery guarantee on top of. Publishing before the commit (or on a goroutine racing the commit) risks an event for a write that then rolls back.
+`Send` and `ApplyPayment` append to `Invoice`'s own `events` slice; nothing is sent anywhere yet. Only after `Repository.Save` has committed does the application service call `PullEvents` and hand the result to the outbox — the ordering that `Transactional Outbox and CDC` builds the delivery guarantee on top of.
+
+Publishing before the commit (or on a goroutine racing the commit) risks an event for a write that then rolls back.
 
 ### 3.5 Domain service vs application service
 
-Neither is where business logic goes if it can live on the aggregate instead. `ApplicationService.RecordPayment` in the worked example below has no `if` about invoice rules in it at all — it loads, calls `inv.ApplyPayment`, saves, and pulls events. A **domain service** earns its place only for logic that spans two aggregates but belongs to neither on its own (for example, "can this payment provider refund this currency", which is not really `Invoice`'s business or a `PaymentProvider` adapter's business); this note's example needs none, because `ApplyPayment`'s invariant is entirely `Invoice`'s own.
+Neither is where business logic goes if it can live on the aggregate instead. `ApplicationService.RecordPayment` in the worked example below has no `if` about invoice rules in it at all — it loads, calls `inv.ApplyPayment`, saves, and pulls events.
+
+A **domain service** earns its place only for logic that spans two aggregates but belongs to neither on its own (for example, "can this payment provider refund this currency", which is not really `Invoice`'s business or a `PaymentProvider` adapter's business); this note's example needs none, because `ApplyPayment`'s invariant is entirely `Invoice`'s own.
 
 ## 4. Worked example
 
-The code below is the InvoiceOps billing domain, split across two Go packages to make the dependency direction a type signature instead of a comment: `invoice` (the domain: the aggregate, its value objects, the `Repository` interface) and `memstore` (an adapter: it imports `invoice` to implement `Repository`; `invoice` imports nothing from `memstore`). It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
+The code below is the InvoiceOps billing domain, split across two Go packages to make the dependency direction a type signature instead of a comment: `invoice` (the domain: the aggregate, its value objects, the `Repository` interface) and `memstore` (an adapter: it imports `invoice` to implement `Repository`; `invoice` imports nothing from `memstore`).
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
 **`invoice/invoice.go`** — value objects, the entity, the aggregate root, and its own factory:
 
@@ -874,19 +934,31 @@ func TestApplicationServiceRecordPaymentPullsEvents(t *testing.T) {
 
 ### Aggregate sizing
 
-Vernon's rule of thumb (*Effective Aggregate Design*, 2011) is "model true invariants in consistency boundaries" and otherwise keep aggregates small: an aggregate should hold only what must be updated together in one transaction, and reference everything else by ID. `Invoice` holds its `LineItem`s because "amount due must equal the sum of the lines" is a true invariant that must never be observed broken. It references a `Client` by ID only, because "this client's name changed" has no bearing on whether this invoice's total is correct. A larger aggregate means fewer round trips but more contention: two unrelated updates to the same aggregate now race on the same optimistic-concurrency version, each forcing the other to reload and retry.
+Vernon's rule of thumb (*Effective Aggregate Design*, 2011) is "model true invariants in consistency boundaries" and otherwise keep aggregates small: an aggregate should hold only what must be updated together in one transaction, and reference everything else by ID.
+
+`Invoice` holds its `LineItem`s because "amount due must equal the sum of the lines" is a true invariant that must never be observed broken. It references a `Client` by ID only, because "this client's name changed" has no bearing on whether this invoice's total is correct.
+
+A larger aggregate means fewer round trips but more contention: two unrelated updates to the same aggregate now race on the same optimistic-concurrency version, each forcing the other to reload and retry.
 
 ### Optimistic locking, exactly
 
-`Invoice.version` is not business data — `AddLineItem` and `ApplyPayment` never read or change it. Only the repository boundary uses it: `FindByID` returns the version an aggregate was loaded at, `Save` takes `matchVersion` as a separate argument, and a real Postgres adapter would run `UPDATE invoices SET ..., version = version + 1 WHERE id = $1 AND version = $2` and treat zero rows affected as `ErrConcurrentUpdate` — exactly what `memstore.Repository.Save` does with a map lookup under a mutex instead of a `WHERE` clause. This is cheaper than a pessimistic `SELECT ... FOR UPDATE` lock held for the whole request, at the cost of making the caller handle a conflict instead of just waiting for one.
+`Invoice.version` is not business data — `AddLineItem` and `ApplyPayment` never read or change it.
+
+Only the repository boundary uses it: `FindByID` returns the version an aggregate was loaded at, `Save` takes `matchVersion` as a separate argument, and a real Postgres adapter would run `UPDATE invoices SET ..., version = version + 1 WHERE id = $1 AND version = $2` and treat zero rows affected as `ErrConcurrentUpdate` — exactly what `memstore.Repository.Save` does with a map lookup under a mutex instead of a `WHERE` clause.
+
+This is cheaper than a pessimistic `SELECT ... FOR UPDATE` lock held for the whole request, at the cost of making the caller handle a conflict instead of just waiting for one.
 
 ### Eventual consistency between aggregates
 
-`ApplyPayment` only ever changes `Invoice`'s own fields. If a `Client`'s lifetime-spend total also needs to move when a payment lands, that update happens in a second transaction, driven by the `InvoicePaid` event, after this one commits — the two aggregates are eventually, not immediately, consistent with each other. This is a deliberate cost: the alternative (one transaction touching both aggregates) would mean every payment write locks two unrelated rows together, and a `Client` table hotspot would slow down every invoice in the system, not just that client's own.
+`ApplyPayment` only ever changes `Invoice`'s own fields. If a `Client`'s lifetime-spend total also needs to move when a payment lands, that update happens in a second transaction, driven by the `InvoicePaid` event, after this one commits — the two aggregates are eventually, not immediately, consistent with each other.
+
+This is a deliberate cost: the alternative (one transaction touching both aggregates) would mean every payment write locks two unrelated rows together, and a `Client` table hotspot would slow down every invoice in the system, not just that client's own.
 
 ### Why `Rehydrate` re-derives `AmountDue` instead of trusting the stored column
 
-A stored `amount_due_minor` column could, in principle, be hand-edited by an operator running a one-off `UPDATE` in an incident, or by a future migration bug. `Rehydrate` re-sums `LineItems` on every load rather than reading a persisted total, so that kind of drift surfaces the moment the row is read again, instead of propagating silently until a customer notices their invoice total is wrong.
+A stored `amount_due_minor` column could, in principle, be hand-edited by an operator running a one-off `UPDATE` in an incident, or by a future migration bug.
+
+`Rehydrate` re-sums `LineItems` on every load rather than reading a persisted total, so that kind of drift surfaces the moment the row is read again, instead of propagating silently until a customer notices their invoice total is wrong.
 
 ## 9. Interview questions
 
@@ -928,3 +1000,8 @@ A stored `amount_due_minor` column could, in principle, be hand-edited by an ope
 - **Before this:** [[Domain-Driven Design - Strategic Design]], [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Modular Monolith]], [[Strangler Fig Pattern and Legacy Migration]]
 - **Compare with:** [[Hexagonal Architecture (Ports and Adapters)]] (the same port/adapter shape applied to the whole app, not just persistence), [[Clean Architecture]], [[SOLID in Go]] (dependency inversion, the general principle this note's `Repository` is one instance of), [[Transactions and the Repository Pattern]] (the repository mechanics without the DDD vocabulary), [[Transactional Outbox and CDC]] (what happens to a pulled domain event next), [[Capstone - InvoiceOps]] (the full invoice state machine and webhook flow this note's aggregate is a slice of)
+
+### Watch on YouTube
+
+- [Domain Driven Design: Tactical Patterns](https://www.youtube.com/watch?v=nU7VripqFyc) · Trendyol Tech · 126 min · 8,442 views
+- [Domain Driven Design: What You Need To Know](https://www.youtube.com/watch?v=4rhzdZIDX_k) · Alex Hyett · 8 min · 297,098 views

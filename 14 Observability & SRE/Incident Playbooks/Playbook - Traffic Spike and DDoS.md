@@ -10,7 +10,7 @@ sources:
   - "AWS Shield and AWS WAF developer guides (rate-based rules)"
   - "Prometheus docs, querying functions (rate, histogram_quantile)"
   - "Linux man pages: ss(8), conntrack(8); kubectl reference"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Traffic Spike and DDoS
@@ -23,6 +23,50 @@ updated: 2026-11-09
 > - **Mitigate at the outermost layer you control** (CDN, WAF, load balancer) so bad traffic never consumes origin capacity.
 > - **Scaling out is not always the fix.** If the database is the bottleneck, adding web pods makes it worse.
 > - **Protect the money path.** Checkout and login stay alive; recommendations and search may degrade.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your shop starts a flash sale and traffic jumps ten times in one minute.
+Pages slow down, then show errors.
+Is it happy customers, an attacker flooding you, or your own apps retrying in a loop?
+Each needs a different fix, so you must tell them apart fast.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Request rate | How many requests arrive per second | 2,000 req/s normally, 20,000 now |
+| DDoS | Many machines flooding you on purpose | 50,000 bots hitting `/login` |
+| Retry storm | Clients retrying failures so load multiplies | 3 layers x 3 retries = 27 calls |
+| CDN / edge | Servers near users that serve and filter traffic first | Cloudflare, CloudFront |
+| WAF | Firewall that blocks bad HTTP requests by rules | Block one odd User-Agent |
+| Rate limiting | Capping requests per client | 100 req/min per IP |
+| Load shedding | Rejecting low-value work on purpose to save the core | Turn off recommendations |
+| Bottleneck | The one part that runs out first | The database connection limit |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    T["Traffic spike"] --> Q{"What kind?"}
+    Q -- "real users" --> R["Cache, degrade,<br/>scale the bottleneck"]
+    Q -- "attack" --> A["Block at the edge<br/>(WAF, CDN)"]
+    Q -- "retry storm" --> S["Stop retries,<br/>fix the failing part"]
+```
+
+**Analogy.** A store with a crowd at the door. Shoppers need more tills; a mob needs security at the gate; a crowd re-queueing because the till is broken needs the till fixed.
+Where it breaks: in a store you can see who is who; online, bots look like users until you study paths, IPs and User-Agents.
+
+**How the rest of this note builds up**
+
+- First, why spikes hurt (section 1), the classify-then-protect model (section 2) and how overload builds up (section 3).
+- Then the on-call path: first 5 minutes, diagnosis flowchart, investigation by cause, and fixes (sections 4-7).
+- Then a flash sale worked example, variants and trade-offs (sections 8-10).
+- Finally the SDE-3 depth: production practice, SYN cookies, amplification, connection fan-out, slow attacks, retry amplification (sections 11-12).
+
+> [!tip] Remember
+> Classify the traffic first, block at the outermost layer, and scale only what can actually scale.
 
 ## 1. Why it exists
 
@@ -368,7 +412,9 @@ flowchart LR
 
 ### Why scaling out can backfire
 
-If each web pod holds 20 database connections and you go from 8 to 40 pods, you demand 800 connections from a database configured for `max_connections = 200`. New pods queue for connections, request time rises, health checks fail, pods restart, and the cluster flaps. Fix by putting a pooler such as PgBouncer in front and by capping concurrency per pod.
+If each web pod holds 20 database connections and you go from 8 to 40 pods, you demand 800 connections from a database configured for `max_connections = 200`.
+
+New pods queue for connections, request time rises, health checks fail, pods restart, and the cluster flaps. Fix by putting a pooler such as PgBouncer in front and by capping concurrency per pod.
 
 ### SYN cookies
 
@@ -459,3 +505,7 @@ If each of 3 layers retries 3 times, one user failure produces up to 27 calls on
 - [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]
 - [[Timeouts, Retries and Backoff]]
 - [[Postmortems and Root Cause Analysis]]
+
+### Watch on YouTube
+
+- [How Modern Infrastructure Handles Traffic Spikes & DDoS Attacks](https://www.youtube.com/watch?v=k_lajv4pe18) · Intrilogi Optima Solusi · 72 min · 138 views

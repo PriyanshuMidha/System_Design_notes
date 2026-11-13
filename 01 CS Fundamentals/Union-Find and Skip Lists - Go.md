@@ -8,13 +8,22 @@ related: ["[[Union-Find and Skip Lists]]"]
 sources:
   - "Tarjan & van Leeuwen, Worst-case analysis of set union algorithms (JACM, 1984)"
   - "Pugh, Skip lists: a probabilistic alternative to balanced trees (CACM, 1990)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Union-Find and Skip Lists - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Union-Find and Skip Lists]]: a disjoint-set union with path compression and union by rank, a Kruskal's-algorithm minimum spanning tree built on it, a benchmark comparing it against a naive reachability check, and a from-scratch skip list ordered the way Redis's sorted set (`ZSET`) is.
+
+## Before the code
+
+- **Slices as arrays of state** (`parent []int`, `rank []int`): each element is an index, so the forest is two slices, not a tree of pointers.
+- **Recursion** (`Find`): calls itself to reach the root, then repoints nodes on the way back (path compression).
+- **Methods on pointer receivers** (`func (d *DSU) Union`): functions attached to a type that can change its fields.
+- **`sort` / `slices` and `math/rand`**: sort edges by weight for Kruskal; flip coins for skip-list levels.
+- **Testing and benchmarks** (`testing.T`, `testing.B`): tests assert behavior; a benchmark measures speed and has no pass/fail.
+- **What to run**: `go vet ./... && go test -race -v ./...`; benchmark with `go test -run=NONE -bench=BenchmarkConnectedQueries .`.
 
 ## What this code shows
 
@@ -39,16 +48,24 @@ flowchart LR
 - Layout: a module `unionfind` with `dsu.go` (the disjoint-set union), `kruskal.go` (the MST built on it), `bench_test.go` (the measured comparison against a naive baseline), and `skiplist.go` (the unrelated-but-same-chapter skip list), each with its own `_test.go`.
 - Run it with `go vet ./... && go test -race -v ./...`. The benchmark is separate: `go test -run=NONE -bench=BenchmarkConnectedQueries .`.
 - The ordinary test suite (`go test -race ./...`) finishes in well under two seconds on a modern machine; the benchmark is run separately and deliberately excluded from `go test`'s default run via `-run=NONE`, since benchmarks are not assertions and have no pass/fail outcome of their own.
-- `go test -race` matters here specifically because both `DSU` and `SkipList` mutate shared state through plain pointers and slice indices with no locking at all — the race detector is the cheapest way to confirm that the single-goroutine test suite never accidentally exercises a concurrent path that the code was never designed to survive. None of the tests below spawn goroutines, so a clean `-race` run here is really confirming the absence of a false negative, not catching a real race; see "Pitfalls in the code" for why concurrency safety was deliberately left out of scope.
+- `go test -race` matters here specifically because both `DSU` and `SkipList` mutate shared state through plain pointers and slice indices with no locking at all — the race detector is the cheapest way to confirm that the single-goroutine test suite never accidentally exercises a concurrent path that the code was never designed to survive.
+
+  None of the tests below spawn goroutines, so a clean `-race` run here is really confirming the absence of a false negative, not catching a real race; see "Pitfalls in the code" for why concurrency safety was deliberately left out of scope.
 - Nothing in this module reads from a database, a file, or the network, so there is no "representative" or "fake" label to track anywhere in this note — every test is a pure, in-memory, deterministic computation, and every number quoted below (including the benchmark) was measured directly on this machine rather than simulated or estimated.
 
 ## Code
 
-The code below walks through four pieces in order: the disjoint-set union itself (steps 1-2), the minimum-spanning-tree algorithm it exists to serve (step 3), a measured benchmark proving the "near-constant" claim with real numbers rather than only an asymptotic argument (step 4, covered in the Tests section below), and the unrelated-but-same-chapter skip list (steps 5-7). Union-find and the skip list share a package here purely because the theory note covers both in one chapter — in a real codebase, these would almost certainly live in two separate packages, since nothing about either structure depends on the other.
+The code below walks through four pieces in order: the disjoint-set union itself (steps 1-2), the minimum-spanning-tree algorithm it exists to serve (step 3), a measured benchmark proving the "near-constant" claim with real numbers rather than only an asymptotic argument (step 4, covered in the Tests section below), and the unrelated-but-same-chapter skip list (steps 5-7).
+
+Union-find and the skip list share a package here purely because the theory note covers both in one chapter — in a real codebase, these would almost certainly live in two separate packages, since nothing about either structure depends on the other.
 
 ### Step 1: the disjoint-set union
 
-**Concept.** The theory note's whiteboard sketch is parent pointers with no optimization at all ([[Union-Find and Skip Lists#4. Worked example]]). The alternative kept here adds both path compression and union by rank, because the theory note is explicit that either one alone only gives `O(log n)`, not the near-constant `O(α(n))` the TL;DR promises — skipping either optimization would make every later cost claim in this file false. A slice-based `parent`/`rank` pair (rather than a `map[int]int`, or a struct holding a pointer to another struct) is also the simplest representation that works whenever the elements are already dense integers `0..n-1`, which is true for both the graph-node use case here and for most competitive-programming and interview settings.
+**Concept.** The theory note's whiteboard sketch is parent pointers with no optimization at all ([[Union-Find and Skip Lists#4. Worked example]]).
+
+The alternative kept here adds both path compression and union by rank, because the theory note is explicit that either one alone only gives `O(log n)`, not the near-constant `O(α(n))` the TL;DR promises — skipping either optimization would make every later cost claim in this file false.
+
+A slice-based `parent`/`rank` pair (rather than a `map[int]int`, or a struct holding a pointer to another struct) is also the simplest representation that works whenever the elements are already dense integers `0..n-1`, which is true for both the graph-node use case here and for most competitive-programming and interview settings.
 
 ```go
 // Package unionfind implements a disjoint-set (union-find) structure
@@ -100,7 +117,9 @@ func (d *DSU) Find(x int) int {
 
 ### Step 3: Union, by rank
 
-**Concept.** `Union` always attaches the shorter tree under the taller one, which the theory note's deep dive proves keeps any tree's height at `O(log n)` even before path compression helps ([[Union-Find and Skip Lists#8. Deep dive]]). The alternative, "union by size" (track node count instead of rank), gives the identical asymptotic guarantee; rank is kept here only because it is the more commonly quoted version in interviews.
+**Concept.** `Union` always attaches the shorter tree under the taller one, which the theory note's deep dive proves keeps any tree's height at `O(log n)` even before path compression helps ([[Union-Find and Skip Lists#8. Deep dive]]).
+
+The alternative, "union by size" (track node count instead of rank), gives the identical asymptotic guarantee; rank is kept here only because it is the more commonly quoted version in interviews.
 
 ```go
 // Union merges the sets containing x and y. It returns false if they
@@ -185,7 +204,11 @@ func KruskalMST(n int, edges []Edge) []Edge {
 
 ### Step 5: the skip list's node shape and level choice
 
-**Concept.** The theory note's mental model is "a sorted list with random express lanes" ([[Union-Find and Skip Lists#3.2 Skip lists: randomized levels]]). `slNode` holds one forward pointer per level it participates in, and `randomLevel` is the coin-flip process that decides how many levels a new node gets. The alternative design — a fixed number of levels for every node, chosen up front by the caller — would avoid the coin flip entirely, but it loses the property that makes a skip list worth building at all: most nodes staying short (and therefore cheap) while a few tall nodes do the heavy lifting of skipping ahead.
+**Concept.** The theory note's mental model is "a sorted list with random express lanes" ([[Union-Find and Skip Lists#3.2 Skip lists: randomized levels]]).
+
+`slNode` holds one forward pointer per level it participates in, and `randomLevel` is the coin-flip process that decides how many levels a new node gets.
+
+The alternative design — a fixed number of levels for every node, chosen up front by the caller — would avoid the coin flip entirely, but it loses the property that makes a skip list worth building at all: most nodes staying short (and therefore cheap) while a few tall nodes do the heavy lifting of skipping ahead.
 
 ```mermaid
 flowchart LR
@@ -267,7 +290,9 @@ func (s *SkipList) randomLevel() int {
 
 ### Step 6: finding predecessors, inserting and deleting
 
-**Concept.** `findPredecessors` is the one walk every other operation builds on: starting from the top level, it records the last node at each level whose key is still smaller than the target — exactly the "express lane, then local" walk from the mental model. The alternative design would give `Insert` and `Delete` their own separate walking logic, each re-implementing the same top-down, move-right-then-drop-down loop; factoring it into one helper means a bug in the walk only has one place to hide, and a test on `Insert`'s ordering indirectly exercises `Delete`'s correctness too, since both depend on the same predecessors being found correctly.
+**Concept.** `findPredecessors` is the one walk every other operation builds on: starting from the top level, it records the last node at each level whose key is still smaller than the target — exactly the "express lane, then local" walk from the mental model.
+
+The alternative design would give `Insert` and `Delete` their own separate walking logic, each re-implementing the same top-down, move-right-then-drop-down loop; factoring it into one helper means a bug in the walk only has one place to hide, and a test on `Insert`'s ordering indirectly exercises `Delete`'s correctness too, since both depend on the same predecessors being found correctly.
 
 ```mermaid
 flowchart TD
@@ -378,7 +403,9 @@ func (s *SkipList) Delete(member string) {
 
 ### Step 7: range queries
 
-**Concept.** `RangeByScore` is the operation Redis's `ZRANGEBYSCORE` is built on, and the reason a skip list — not a hash table — backs a sorted set: an ordered range scan needs the list to actually be ordered, which a hash table never is. The alternative of keeping members in a plain sorted slice would also support range queries (via binary search for the start, then a linear scan), but every insert or delete would then cost `O(n)` to shift the rest of the slice — the skip list trades a little extra per-node memory (the forward-pointer arrays) for `O(log n)` inserts and deletes alongside the same `O(log n) + k` range scan.
+**Concept.** `RangeByScore` is the operation Redis's `ZRANGEBYSCORE` is built on, and the reason a skip list — not a hash table — backs a sorted set: an ordered range scan needs the list to actually be ordered, which a hash table never is.
+
+The alternative of keeping members in a plain sorted slice would also support range queries (via binary search for the start, then a linear scan), but every insert or delete would then cost `O(n)` to shift the rest of the slice — the skip list trades a little extra per-node memory (the forward-pointer arrays) for `O(log n)` inserts and deletes alongside the same `O(log n) + k` range scan.
 
 ```go
 // RangeByScore returns members with min <= score <= max, in
@@ -491,6 +518,55 @@ func TestUnionByRankKeepsTreesShallow(t *testing.T) {
 | --- | --- |
 | 50,000 nodes, 25,000 random unions, 100,000 `Connected` queries (union-find) vs. 2,000 naive-BFS queries on the same graph | union-find measurably faster per query by roughly 2-3 orders of magnitude |
 
+The benchmark needs two helpers in `bench_test.go`: one builds the same random graph twice (as a `DSU` and as an adjacency list), the other answers `Connected` the slow way with a fresh BFS.
+
+```go
+package unionfind
+
+import (
+	"math/rand"
+	"testing"
+)
+
+// buildScenario applies n/2 random unions (fixed seed) to a DSU and
+// records the same edges in an adjacency list for the naive baseline.
+func buildScenario(n int) (*DSU, [][]int) {
+	d := New(n)
+	adj := make([][]int, n)
+	r := rand.New(rand.NewSource(1))
+	for i := 0; i < n/2; i++ {
+		u, v := r.Intn(n), r.Intn(n)
+		d.Union(u, v)
+		adj[u] = append(adj[u], v)
+		adj[v] = append(adj[v], u)
+	}
+	return d, adj
+}
+```
+
+```go
+// naiveConnected re-explores the graph from a on every call: O(V+E).
+func naiveConnected(adj [][]int, a, b int) bool {
+	seen := make([]bool, len(adj))
+	seen[a] = true
+	queue := []int{a}
+	for len(queue) > 0 {
+		x := queue[0]
+		queue = queue[1:] // pop front
+		if x == b {
+			return true
+		}
+		for _, y := range adj[x] {
+			if !seen[y] {
+				seen[y] = true
+				queue = append(queue, y)
+			}
+		}
+	}
+	return false
+}
+```
+
 ```go
 func BenchmarkConnectedQueries(b *testing.B) {
 	const n = 50000
@@ -509,12 +585,20 @@ func BenchmarkConnectedQueries(b *testing.B) {
 			}
 		}
 	})
-	// naive-bfs sub-benchmark runs the same query pairs through
-	// naiveConnected over a 2,000-query slice (see "Running it" below).
+	// Same pairs, but only the first 2,000: a full BFS per query is slow.
+	b.Run("naive-bfs", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for _, p := range pairs[:2000] {
+				_ = naiveConnected(adj, p[0], p[1])
+			}
+		}
+	})
 }
 ```
 
-**How it works.** Both sub-benchmarks run against the *same* underlying graph and overlapping query pairs, so the comparison isolates the lookup strategy, not the data. The naive baseline deliberately runs over a smaller slice of the same query list rather than all 100,000, purely to keep the benchmark run fast — the per-query cost is what's being compared, not the total wall time of one specific run.
+**How it works.** Both sub-benchmarks run against the *same* underlying graph and overlapping query pairs, so the comparison isolates the lookup strategy, not the data.
+
+The naive baseline deliberately runs over a smaller slice of the same query list rather than all 100,000, purely to keep the benchmark run fast — the per-query cost is what's being compared, not the total wall time of one specific run.
 
 **If it fails.** This is a benchmark, not an assertion-based test, so it never fails `go test`; "failure" here means the measured ratio collapses toward 1×, which would mean path compression or union by rank regressed back toward `O(n)` per `Find`.
 
@@ -530,6 +614,7 @@ func BenchmarkConnectedQueries(b *testing.B) {
 package unionfind
 
 import (
+	"math/rand"
 	"slices"
 	"testing"
 )
@@ -631,16 +716,26 @@ PASS
 2. `5` in the second column is the number of iterations the benchmark actually ran (`-benchtime=5x` asked for exactly 5), since each iteration here already runs the full 100,000-query (or 2,000-query) inner loop.
 3. `1189492 ns/op` means each of those 5 iterations — each one a full pass over 100,000 `Connected` calls — took about 1.19 ms; dividing by 100,000 gives roughly 12 nanoseconds per individual query.
 4. `12423242 ns/op` for `naive-bfs` means each iteration — a pass over only 2,000 `naiveConnected` calls — took about 12.4 ms; dividing by 2,000 gives roughly 6.2 *microseconds* per query, already about 500× a single union-find query before any extrapolation.
-5. Scaling the naive per-query cost up to 100,000 queries (6.2 µs × 100,000 ≈ 620 ms) and comparing it against union-find's measured 1.19 ms for the same 100,000 queries gives the roughly 300-500× figure quoted in the theory note. The exact multiplier varies run to run (BFS cost depends on how connected the random graph happens to be), but the order of magnitude is stable, which is the point: union-find's near-constant cost per query versus a linear-in-graph-size reachability check.
+5. Scaling the naive per-query cost up to 100,000 queries (6.2 µs × 100,000 ≈ 620 ms) and comparing it against union-find's measured 1.19 ms for the same 100,000 queries gives the roughly 300-500× figure quoted in the theory note.
+
+   The exact multiplier varies run to run (BFS cost depends on how connected the random graph happens to be), but the order of magnitude is stable, which is the point: union-find's near-constant cost per query versus a linear-in-graph-size reachability check.
 
 ## Pitfalls in the code
 
-- **Neither `DSU` nor `SkipList` is safe for concurrent use.** Both mutate shared state (`parent`/`rank` slices; the linked `forward` pointers) with no `sync.Mutex` or other synchronization anywhere in this file. A caller that shares one `*DSU` or one `*SkipList` across goroutines without its own external locking will corrupt the structure — `go test -race` only catches this if a test actually exercises concurrent access, which none of the tests above do, since the theory note's use cases (an offline MST build, a single-threaded teaching model of `ZSET`) don't call for it. A production `ZSET`-like structure guards every operation with a mutex (or relies on Redis's own single-threaded command execution model to make the question moot).
-- **No `context.Context` anywhere in this file.** Every operation here is pure, in-memory computation with no I/O, no blocking, and no possibility of needing to be cancelled partway through — exactly the kind of code that should *not* take a `context.Context` parameter just for the sake of a convention. Contrast this with code that calls a database or an external service, where a `ctx` parameter lets a caller enforce a deadline or cancel an in-flight request.
+- **Neither `DSU` nor `SkipList` is safe for concurrent use.** Both mutate shared state (`parent`/`rank` slices; the linked `forward` pointers) with no `sync.Mutex` or other synchronization anywhere in this file.
+
+  A caller that shares one `*DSU` or one `*SkipList` across goroutines without its own external locking will corrupt the structure — `go test -race` only catches this if a test actually exercises concurrent access, which none of the tests above do, since the theory note's use cases (an offline MST build, a single-threaded teaching model of `ZSET`) don't call for it.
+
+  A production `ZSET`-like structure guards every operation with a mutex (or relies on Redis's own single-threaded command execution model to make the question moot).
+- **No `context.Context` anywhere in this file.** Every operation here is pure, in-memory computation with no I/O, no blocking, and no possibility of needing to be cancelled partway through — exactly the kind of code that should *not* take a `context.Context` parameter just for the sake of a convention.
+
+  Contrast this with code that calls a database or an external service, where a `ctx` parameter lets a caller enforce a deadline or cancel an in-flight request.
 - **No custom error types.** `Union`'s `bool` return and `SkipList.Delete`'s silent no-op on a missing member are both deliberate "this isn't exceptional, it's a normal outcome" signals, not errors — returning an `error` for "these two elements were already connected" or "that member didn't exist" would force every caller to handle a case that isn't actually a failure.
 - **Calling `Union` before checking `Find(x) == Find(y)` elsewhere in a caller's code is redundant** — `Union` already does that check internally and returns `false` for an existing connection; duplicating the check elsewhere just doubles the tree walks.
 - **The recursive `Find` has no depth guard.** For `n` in the millions with adversarial insert order and *no* path compression, the recursion could in principle run deep enough to risk a large stack — not a practical concern here, since path compression keeps real paths short, but worth knowing if this code were ever adapted to skip that optimization.
-- **`SkipList.Delete` costs an `O(n)` scan**, not `O(log n)`, because it first has to find the node's current score by walking level 0 before it can re-run the `O(log n)` predecessor search — see "Design decisions" above. A production `ZSET`-style implementation typically keeps score alongside the member in a side hash map precisely to avoid this scan.
+- **`SkipList.Delete` costs an `O(n)` scan**, not `O(log n)`, because it first has to find the node's current score by walking level 0 before it can re-run the `O(log n)` predecessor search — see "Design decisions" above.
+
+  A production `ZSET`-style implementation typically keeps score alongside the member in a side hash map precisely to avoid this scan.
 - **`maxLevel = 16` is a silent cap.** Insert never panics past roughly 2^16 elements, but ask for more and the skip list's effective fan-out degrades gracefully rather than failing loudly — worth a comment or an assertion in anything beyond a teaching implementation.
 - **`Insert` calling `Delete` internally** means every insert of an existing member pays for a full level-0 scan even on the common "just update the score" path, not only on genuine re-inserts — acceptable for a teaching implementation, but a production `ZSET` would special-case "found the existing node, same identity, just unsplice and re-splice it" rather than always scanning from scratch.
 - **The benchmark's naive baseline runs over only 2,000 of the 100,000 query pairs** (see "Running it" below), so the theory note's "300-500× slower" figure is an extrapolation from a smaller sample, not a single directly measured ratio — worth saying explicitly so nobody mistakes it for a literal single benchmark line.
@@ -666,15 +761,31 @@ Two follow-up questions this table raises, answered directly:
 
 ## Concurrency and performance notes
 
-Neither `DSU` nor `SkipList` is safe to share across goroutines, and that is a deliberate scope decision rather than an oversight. The theory note's use cases for union-find are an offline minimum-spanning-tree build and a batch connectivity check — both naturally single-threaded, one-shot computations where adding a mutex would only cost throughput for no real benefit. The skip list here plays the role of a teaching model for Redis's `ZSET`, and Redis itself sidesteps the whole question by executing commands on a single thread, so a real `ZSET` never needs its own internal lock either — the "concurrency safety" that matters for a production sorted set lives one level up, in whatever process model serializes access to it, not inside the data structure.
+Neither `DSU` nor `SkipList` is safe to share across goroutines, and that is a deliberate scope decision rather than an oversight.
 
-That said, a caller that does need concurrent access has two honest options, each with a real cost. The first is to wrap every exported method in a `sync.Mutex`, which is simple to add and easy to reason about, but turns every operation into a serialization point — fine for a low-contention workload, a real bottleneck for a hot path with many goroutines hammering the same structure. The second is a sharded design (several independent `DSU`s or `SkipList`s, each guarding a disjoint key range, picked by a hash of the key), which keeps contention low but reintroduces exactly the kind of cross-shard coordination problem union-find and skip lists were chosen to avoid in the first place. Neither option is included in the code above, because the theory note never claims either structure is concurrency-safe, and adding locking here would silently suggest a guarantee this teaching implementation does not make.
+The theory note's use cases for union-find are an offline minimum-spanning-tree build and a batch connectivity check — both naturally single-threaded, one-shot computations where adding a mutex would only cost throughput for no real benefit.
 
-The benchmark's own numbers are worth reading with one more caveat in mind: `ns/op` measures wall-clock time for the whole labeled inner loop, not CPU time, and on a shared or thermally throttled machine the absolute numbers will drift run to run even though the *relative* gap between union-find and the naive baseline stays stable, because both sub-benchmarks are subject to the same background noise. That is exactly why the theory note quotes a range ("roughly 300-500× slower") instead of a single fixed multiplier, and why a reader re-running this benchmark on different hardware should expect the order of magnitude to hold even if the exact `ns/op` figures differ.
+The skip list here plays the role of a teaching model for Redis's `ZSET`, and Redis itself sidesteps the whole question by executing commands on a single thread, so a real `ZSET` never needs its own internal lock either — the "concurrency safety" that matters for a production sorted set lives one level up, in whatever process model serializes access to it, not inside the data structure.
+
+That said, a caller that does need concurrent access has two honest options, each with a real cost.
+
+The first is to wrap every exported method in a `sync.Mutex`, which is simple to add and easy to reason about, but turns every operation into a serialization point — fine for a low-contention workload, a real bottleneck for a hot path with many goroutines hammering the same structure.
+
+The second is a sharded design (several independent `DSU`s or `SkipList`s, each guarding a disjoint key range, picked by a hash of the key), which keeps contention low but reintroduces exactly the kind of cross-shard coordination problem union-find and skip lists were chosen to avoid in the first place.
+
+Neither option is included in the code above, because the theory note never claims either structure is concurrency-safe, and adding locking here would silently suggest a guarantee this teaching implementation does not make.
+
+The benchmark's own numbers are worth reading with one more caveat in mind: `ns/op` measures wall-clock time for the whole labeled inner loop, not CPU time, and on a shared or thermally throttled machine the absolute numbers will drift run to run even though the *relative* gap between union-find and the naive baseline stays stable, because both sub-benchmarks are subject to the same background noise.
+
+That is exactly why the theory note quotes a range ("roughly 300-500× slower") instead of a single fixed multiplier, and why a reader re-running this benchmark on different hardware should expect the order of magnitude to hold even if the exact `ns/op` figures differ.
 
 ## A note on reading the two structures side by side
 
-It is worth being explicit about why this file puts two unrelated data structures in one package instead of two: the theory note treats them as one chapter because both trade a guarantee for simplicity, and keeping the code in one place makes that parallel easy to see while reading — `DSU`'s near-constant amortized cost versus a strict worst-case tree, and `SkipList`'s expected-case height versus a balanced tree's enforced one, are the same shape of trade-off applied to two different problems. In a real codebase this split would almost certainly not survive contact with a second author, since nothing in `KruskalMST` ever calls into `SkipList` or vice versa, and a reviewer unfamiliar with this note's teaching structure would reasonably ask why they share an import path at all. Splitting them into `unionfind` and `skiplist` packages, each with its own `go.mod` if they were ever vendored separately, would be the natural next step the moment this code left a study guide and entered a real project.
+It is worth being explicit about why this file puts two unrelated data structures in one package instead of two: the theory note treats them as one chapter because both trade a guarantee for simplicity, and keeping the code in one place makes that parallel easy to see while reading — `DSU`'s near-constant amortized cost versus a strict worst-case tree, and `SkipList`'s expected-case height versus a balanced tree's enforced one, are the same shape of trade-off applied to two different problems.
+
+In a real codebase this split would almost certainly not survive contact with a second author, since nothing in `KruskalMST` ever calls into `SkipList` or vice versa, and a reviewer unfamiliar with this note's teaching structure would reasonably ask why they share an import path at all.
+
+Splitting them into `unionfind` and `skiplist` packages, each with its own `go.mod` if they were ever vendored separately, would be the natural next step the moment this code left a study guide and entered a real project.
 
 ## Exercises
 
@@ -685,15 +796,31 @@ It is worth being explicit about why this file puts two unrelated data structure
 
 ## Go-specific details checklist, read as a short narrative
 
-Reading the table above top to bottom tells a small story about this module's scope: nothing here talks to the outside world, so there is no `context.Context` to thread through and no `error` type to invent for outcomes that are perfectly normal. Nothing here needs to be generic over types, because both structures are shaped exactly like the one real system (Redis's `ZSET`, Kruskal's integer-indexed graph nodes) the theory note builds toward — generalizing further would be solving a problem nobody in this note actually has. And nothing here is safe for concurrent use, by the same reasoning laid out in "Concurrency and performance notes" above: the theory note's use cases are single-threaded, and Redis's own single-threaded command execution model is what actually keeps a real `ZSET` safe, not an internal lock inside the skip list itself.
+Reading the table above top to bottom tells a small story about this module's scope: nothing here talks to the outside world, so there is no `context.Context` to thread through and no `error` type to invent for outcomes that are perfectly normal.
 
-The one place this module does lean on an idiomatic Go feature is closures — not the `dfs`-style recursive accumulator from the trie note, but small named helper functions (`less`, `naiveConnected`) kept at package scope instead of inlined, specifically so each one can be tested or read in isolation from the method that calls it. That is a minor style choice, not a structural one, and it is called out here mainly to be explicit that "no closures" would have been just as correct a description for the bulk of this file — the comparison logic is the one exception.
+Nothing here needs to be generic over types, because both structures are shaped exactly like the one real system (Redis's `ZSET`, Kruskal's integer-indexed graph nodes) the theory note builds toward — generalizing further would be solving a problem nobody in this note actually has.
+
+And nothing here is safe for concurrent use, by the same reasoning laid out in "Concurrency and performance notes" above: the theory note's use cases are single-threaded, and Redis's own single-threaded command execution model is what actually keeps a real `ZSET` safe, not an internal lock inside the skip list itself.
+
+The one place this module does lean on an idiomatic Go feature is closures — not the `dfs`-style recursive accumulator from the trie note, but small named helper functions (`less`, `naiveConnected`) kept at package scope instead of inlined, specifically so each one can be tested or read in isolation from the method that calls it.
+
+That is a minor style choice, not a structural one, and it is called out here mainly to be explicit that "no closures" would have been just as correct a description for the bulk of this file — the comparison logic is the one exception.
 
 ## Where each exercise points back to the theory
 
-Each exercise above is picked to make one piece of the theory note's reasoning concrete rather than abstract. Removing the rank swap (exercise 1) turns the "union by rank bounds the height" argument from the deep dive into something a reader can watch fail, by re-running the exact benchmark that proved the optimized version fast. Adding a `Rank` method (exercise 2) ties the forest's actual shape back to the `2^r` lower bound on node count per rank, derived in the same deep-dive section. Changing `p` to Redis's real `0.25` (exercise 3) separates the skip list's correctness (which never depends on `p`) from its performance (which does), a distinction the theory note draws but doesn't let a reader verify directly. And a `Len()` method (exercise 4) is the smallest possible addition that still forces engaging with the splice logic in `Insert` and `Delete`, since getting the count wrong by exactly one is the most common bug in exactly that code.
+Each exercise above is picked to make one piece of the theory note's reasoning concrete rather than abstract.
 
-Working through all four in order roughly retraces the theory note's own argument: first confirm the optimizations matter at all (exercise 1), then quantify exactly how much they matter in terms the deep dive already proved (exercise 2), then separate the one skip-list parameter that affects performance from the parts of its contract that never change (exercise 3), and finally extend the implementation with a method that was deliberately left out, the same way a real codebase grows past a first teaching pass. None of the four exercises require changing `DSU`'s or `SkipList`'s public contract in a way that would break the tests above — that is intentional, so a reader can lean on the existing test suite to check their own answers before reading any solution.
+Removing the rank swap (exercise 1) turns the "union by rank bounds the height" argument from the deep dive into something a reader can watch fail, by re-running the exact benchmark that proved the optimized version fast.
+
+Adding a `Rank` method (exercise 2) ties the forest's actual shape back to the `2^r` lower bound on node count per rank, derived in the same deep-dive section.
+
+Changing `p` to Redis's real `0.25` (exercise 3) separates the skip list's correctness (which never depends on `p`) from its performance (which does), a distinction the theory note draws but doesn't let a reader verify directly.
+
+And a `Len()` method (exercise 4) is the smallest possible addition that still forces engaging with the splice logic in `Insert` and `Delete`, since getting the count wrong by exactly one is the most common bug in exactly that code.
+
+Working through all four in order roughly retraces the theory note's own argument: first confirm the optimizations matter at all (exercise 1), then quantify exactly how much they matter in terms the deep dive already proved (exercise 2), then separate the one skip-list parameter that affects performance from the parts of its contract that never change (exercise 3), and finally extend the implementation with a method that was deliberately left out, the same way a real codebase grows past a first teaching pass.
+
+None of the four exercises require changing `DSU`'s or `SkipList`'s public contract in a way that would break the tests above — that is intentional, so a reader can lean on the existing test suite to check their own answers before reading any solution.
 
 A reader who works through all four and wants a fifth check can combine exercises 1 and 2: with the rank swap removed, measure the actual rank the shared root reaches after the same 999 worst-case unions, and confirm it now grows roughly linearly with `n` instead of staying bounded near `log₂ n` — the single clearest piece of evidence that the optimization in "Union, by rank" above is not merely cosmetic.
 

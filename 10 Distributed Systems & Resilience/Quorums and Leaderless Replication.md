@@ -11,7 +11,7 @@ sources:
   - "Kleppmann, Designing Data-Intensive Applications (O'Reilly, 2017), chapter 5, Leaderless Replication"
   - "Apache Cassandra docs: consistency levels, hinted handoff (max_hint_window, default 3 hours), read repair, speculative_retry, nodetool repair"
   - "Riak KV docs: siblings and causal context (dotted version vectors)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Quorums and Leaderless Replication
@@ -25,6 +25,52 @@ updated: 2026-11-04
 > - `R + W > N` makes read and write sets overlap in at least one replica. The usual setting is `N=3, R=W=2`.
 > - Quorums tolerate slow or dead replicas without failover, but they are not consensus and not linearizable.
 > - Classic mistake: calling DynamoDB leaderless. DynamoDB has a leader per partition (Multi-Paxos); Cassandra, Riak and ScyllaDB are the leaderless ones.
+
+## Start here: the basics
+
+**The problem in one story.**
+You keep a shopping cart on 3 database servers so one can die.
+If one server is the "boss" for writes and it dies, nobody can add to cart until a new boss is chosen.
+Instead, let any server accept the write, and call it done once 2 of the 3 have it.
+To read, ask 2 servers and trust the newest answer: one of them must have the latest write.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Replica | One server holding a copy of the data | 3 replicas of key `cart:42` |
+| Leader | One server that every write must go through | A Postgres primary |
+| Leaderless | Any replica accepts reads and writes | Cassandra, Riak |
+| Ack | "I stored it" reply from a replica | 2 acks received |
+| N, W, R | Copies kept, acks needed to write, replies needed to read | `N=3, W=2, R=2` |
+| Version | A tag telling which value is newer | Timestamp or version number |
+| Stale | Old, out-of-date data | A replica that missed the last write |
+| Consistency | Whether every reader sees the latest value | Read right after write sees it |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] -- "write v2" --> A["Replica A: v2"]
+    C -- "write v2" --> B["Replica B: v2"]
+    C -. "missed" .-> X["Replica C: v1"]
+    Rd["Reader asks 2"] --> B
+    Rd --> X
+    B -- "v2 is newest" --> Rd
+```
+
+**Analogy.** A club writes each decision in the notebooks of any 2 of its 3 secretaries; asking any 2 secretaries always reaches at least one who wrote the latest entry.
+Where it breaks: secretaries agree on what "newest" means, but servers with skewed clocks or concurrent writes can disagree, so overlap alone does not give perfect consistency.
+
+**How the rest of this note builds up**
+
+- First, why leaderless replication exists (section 1) and the N, W, R overlap rule (section 2).
+- Then how reads, writes, read repair and hinted handoff work (section 3), with a worked Go example (section 4).
+- Then variants (sloppy quorums, tunable consistency) and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: why quorums are not linearizable, conflict resolution and production tuning (sections 7-8).
+
+> [!tip] Remember
+> If `R + W > N`, every read overlaps the latest completed write, with no leader and no failover needed.
 
 ## 1. Why it exists
 
@@ -117,7 +163,9 @@ flowchart TD
     Handoff --> Done
 ```
 
-The catch: a later read with `R = 2` may ask B and C, which both lack the write. **Sloppy quorums break the overlap guarantee**; they only promise durability on `W` nodes somewhere. Cassandra uses hinted handoff to speed up recovery but still counts only real replicas toward its consistency level (and `ANY` is the only level a hint alone satisfies). Its default `max_hint_window` is 3 hours.
+The catch: a later read with `R = 2` may ask B and C, which both lack the write. **Sloppy quorums break the overlap guarantee**; they only promise durability on `W` nodes somewhere.
+
+Cassandra uses hinted handoff to speed up recovery but still counts only real replicas toward its consistency level (and `ANY` is the only level a hint alone satisfies). Its default `max_hint_window` is 3 hours.
 
 ## 4. Worked example
 
@@ -403,3 +451,8 @@ At scale:
 - **Before this:** [[Replication]], [[Consistent Hashing]], [[CAP and PACELC]]
 - **Next:** [[Clocks and Ordering]], [[CRDTs and Conflict Resolution]], [[Failure Detection, Gossip and Membership]]
 - **Compare with:** [[Consensus - Raft and Paxos]] (majority agreement on an order), [[Wide-Column Stores and Cassandra]] (the main production example), [[Consistency Models]] (what guarantee you actually get)
+
+### Watch on YouTube
+
+- [Quorums - Leaderless Replication Continued / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=DAONthD50g0) · Jordan has no life · 10 min · 18,847 views
+- [Database Replication - Leaderless / Dynamo principles, Failover strategies, Quorums / System Design](https://www.youtube.com/watch?v=rPvpa2WujsI) · udaykiran․tech · 10 min · 341 views

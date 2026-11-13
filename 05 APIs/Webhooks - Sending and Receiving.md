@@ -17,7 +17,7 @@ sources:
   - "OWASP Server-Side Request Forgery Prevention Cheat Sheet"
   - "PostgreSQL 17 docs, JSON Types (jsonb does not keep whitespace or key order)"
   - "Go 1.24 docs, net.Dialer.Control and net/netip"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Webhooks - Sending and Receiving
@@ -31,6 +31,50 @@ updated: 2026-11-02
 > - Every delivery can be duplicated, late, out of order or forged, so dedupe by event id and make the business update idempotent.
 > - Sender rule: write the event in the same transaction as the data change (an outbox), then retry with backoff from a queue.
 > - Classic mistake: doing slow work or calling other services before answering, which causes timeouts and duplicate retries.
+
+## Start here: the basics
+
+**The problem in one story.**
+You order food online and pay with a card.
+The shop does not keep phoning the bank asking "has it gone through yet?".
+Instead, the bank phones the shop the moment the payment succeeds.
+That "call me back when it happens" is a webhook.
+
+**Words you need first.**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Endpoint | A URL on your server that accepts requests | `https://shop.com/webhooks/pay` |
+| Polling | Asking repeatedly whether something changed | "Is payment 42 done?" every 15 s |
+| Event | A record that something happened, with an id and type | `payment.succeeded`, id `evt_1` |
+| HMAC signature | A code computed from the body and a shared secret, proving who sent it | `v1=5257a8...` header |
+| Idempotent | Doing it twice has the same effect as doing it once | Marking an order "paid" twice is fine |
+| Retry with backoff | Trying again later, waiting longer each time | 1 s, 2 s, 4 s, 8 s... |
+| `2xx` status | HTTP success codes | `200 OK`, `204 No Content` |
+| Outbox | A table where events are saved in the same transaction as the data change | Row in `outbox` next to the payment update |
+
+**Picture it.**
+
+```mermaid
+flowchart LR
+    A[Something happens at provider] --> B[Provider queues event]
+    B -->|signed HTTP POST| C[Your endpoint]
+    C -->|verify, store, 2xx fast| B
+    C --> D[Background worker does the real work]
+    B -->|no 2xx: retry later| C
+```
+
+**Analogy.** A webhook is a doorbell: you do not keep opening the door to check for visitors; the visitor rings.
+Where it breaks: a doorbell rings once, but a webhook may ring twice, late, out of order, or be pressed by a stranger, so you check every caller.
+
+**How the rest of this note builds up.**
+- First, polling vs webhooks and the reverse-API mental model (sections 1-2).
+- Then the receive path: raw body, signature, inbox, fast `2xx` (section 3).
+- Then a working Go receiver and sender with tests (section 4).
+- Finally, variants, production rules and the SDE-3 deep dive on SSRF protection, secret rotation, circuit breakers and versioning (sections 5-8).
+
+> [!tip] Remember
+> Verify the raw body, store the event, answer `2xx` fast, and make processing idempotent.
 
 ## 1. Why it exists
 
@@ -83,7 +127,9 @@ sequenceDiagram
 ```
 
 1. **Read the raw bytes** with a size limit. Do not let a framework parse and re-serialise the JSON first: the signature covers bytes, not meaning.
-2. **Verify** the HMAC with a constant-time compare, and check the signed timestamp against a tolerance window (Stripe's libraries default to 5 minutes) to block replays. Stripe signs every retry again with a fresh timestamp, so the window never rejects a legitimate retry; check that your provider does the same before you enforce a window. HMAC itself is covered in [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
+2. **Verify** the HMAC with a constant-time compare, and check the signed timestamp against a tolerance window (Stripe's libraries default to 5 minutes) to block replays.
+   - Stripe signs every retry again with a fresh timestamp, so the window never rejects a legitimate retry; check that your provider does the same before you enforce a window.
+   - HMAC itself is covered in [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
 3. **Persist the raw event** in an inbox table whose primary key is the provider's event id. A duplicate insert does nothing.
 4. **Acknowledge with 2xx** inside the provider's timeout (GitHub allows 10 seconds). Answer `2xx` for duplicates too, or the provider keeps retrying them.
 5. **Process asynchronously.** Workers claim inbox rows, apply them idempotently, and retry failures into a DLQ. The Go service side of this lives in [[Receiving Webhooks Idempotently]].
@@ -468,7 +514,9 @@ Stripe offers both: classic snapshot events and, in its newer event destinations
 ## 7. In production
 
 - **Real systems:**
-	- **Stripe** signs with a timestamp, retries for up to 3 days in live mode with exponential backoff, does not guarantee order and may send the same event twice. Its docs also warn that one change occasionally produces two separate Event objects with different ids, so the business update must be idempotent too (the version or state guard), not only the inbox. Its Events API lists the last 30 days of events, which makes reconciliation easy. Stripe also publishes the IP addresses it sends from, for an allowlist on top of signature checks.
+	- **Stripe** signs with a timestamp, retries for up to 3 days in live mode with exponential backoff, does not guarantee order and may send the same event twice.
+		- Its docs also warn that one change occasionally produces two separate Event objects with different ids, so the business update must be idempotent too (the version or state guard), not only the inbox.
+		- Its Events API lists the last 30 days of events, which makes reconciliation easy. Stripe also publishes the IP addresses it sends from, for an allowlist on top of signature checks.
 	- **GitHub** expects a `2xx` within 10 seconds and does **not** retry failed deliveries automatically; you redeliver them through the UI or API (deliveries from the past 3 days). Payloads are capped at 25 MB. `X-GitHub-Delivery` stays the same on redelivery, so it works as the dedupe key.
 	- **Razorpay** signs the raw body in `X-Razorpay-Signature` and warns against parsing or re-serialising the body before verifying; `x-razorpay-event-id` identifies duplicates.
 	- **Svix** and the Standard Webhooks spec give senders an off-the-shelf signing format and delivery service.
@@ -492,7 +540,11 @@ Stripe offers both: classic snapshot events and, in its newer event destinations
 2. **Status state machine.** Allow only legal transitions (`pending → paid → refunded`, never `paid → pending`).
 3. **Re-fetch.** Treat the event as a hint: call the provider's API and store what it says *now*. This is why thin events exist. It costs one API call per event but cannot apply stale data.
 
-**Secret rotation without downtime.** Senders sign with every active secret and receivers accept any configured secret. Stripe does exactly this: while you roll a secret and keep the old one active (up to 24 hours), each event carries one `v1` signature per secret. With `Verify` from section 4, a receiver configured with only the old or only the new secret accepts a header signed with both; a test checks both cases.
+**Secret rotation without downtime.** Senders sign with every active secret and receivers accept any configured secret.
+
+Stripe does exactly this: while you roll a secret and keep the old one active (up to 24 hours), each event carries one `v1` signature per secret.
+
+With `Verify` from section 4, a receiver configured with only the old or only the new secret accepts a header signed with both; a test checks both cases.
 
 **Why constant-time compare.** `bytes.Equal` returns at the first differing byte. An attacker who can time thousands of requests can learn a valid signature byte by byte. `hmac.Equal` (which uses `crypto/subtle`) always compares every byte.
 
@@ -550,7 +602,13 @@ func NewDeliveryClient(timeout time.Duration) *http.Client {
 }
 ```
 
-`IsGlobalUnicast` in Go still returns true for RFC 1918 addresses, hence the extra `IsPrivate` check. The block list is a minimum, not a complete list: if your network routes NAT64 (`64:ff9b::/96`), unwrap the embedded IPv4 address and check it as well. The test posts to an `httptest` server on `127.0.0.1` and expects `refusing to dial 127.0.0.1`. Redirects are refused because a public URL could redirect to an internal one. Many senders also run the dispatcher in a network segment with no route to internal services, as a second layer.
+`IsGlobalUnicast` in Go still returns true for RFC 1918 addresses, hence the extra `IsPrivate` check.
+
+The block list is a minimum, not a complete list: if your network routes NAT64 (`64:ff9b::/96`), unwrap the embedded IPv4 address and check it as well.
+
+The test posts to an `httptest` server on `127.0.0.1` and expects `refusing to dial 127.0.0.1`.
+
+Redirects are refused because a public URL could redirect to an internal one. Many senders also run the dispatcher in a network segment with no route to internal services, as a second layer.
 
 **Retry schedule.** One reasonable schedule, with ±20% jitter on each wait so that a recovering endpoint is not hit by every queued delivery in the same second. It is a design choice, not a standard:
 
@@ -561,11 +619,18 @@ func NewDeliveryClient(timeout time.Duration) *http.Client {
 
 So the 9th attempt (the 8th retry) happens about 2.9 days after the first, close to Stripe's 3-day window.
 
-**Per-endpoint circuit breaker and auto-disable.** Track consecutive failures per endpoint. After, say, 20 in a row (a design choice), stop sending real deliveries and send one probe at the next retry time; if the endpoint fails for several days, disable it and email the owner. Deliveries for a disabled endpoint stay in the DLQ, so re-enabling plus "replay since" recovers everything.
+**Per-endpoint circuit breaker and auto-disable.** Track consecutive failures per endpoint. After, say, 20 in a row (a design choice):
+
+1. Stop sending real deliveries and send one probe at the next retry time.
+2. If the endpoint fails for several days, disable it and email the owner.
+
+Deliveries for a disabled endpoint stay in the DLQ, so re-enabling plus "replay since" recovers everything.
 
 **Reconciliation.** Run a job (hourly or daily) that lists objects changed at the provider since the last checkpoint and compares them with your state. Anything missing is inserted into the inbox as a synthetic event and flows through the same idempotent worker. This catches events lost to expired retries, disabled endpoints or your own bugs.
 
-**Event versioning.** Put `type`, `id`, `created` and a schema or API version in every envelope. Add fields freely; never change the meaning of an existing field. For a breaking change, emit a new event type or let each endpoint pin a version. Stripe fixes a snapshot event's shape by the API version in force when the event is created, so a later account upgrade never rewrites old events.
+**Event versioning.** Put `type`, `id`, `created` and a schema or API version in every envelope. Add fields freely; never change the meaning of an existing field.
+
+For a breaking change, emit a new event type or let each endpoint pin a version. Stripe fixes a snapshot event's shape by the API version in force when the event is created, so a later account upgrade never rewrites old events.
 
 ## 9. Interview questions
 
@@ -605,3 +670,8 @@ So the 9th attempt (the 8th retry) happens about 2.9 days after the first, close
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Idempotency and Idempotency Keys]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]]
 - **Next:** [[Receiving Webhooks Idempotently]] (the Go service), [[Transactional Outbox and CDC]], [[Dead Letter Queues and Poison Messages]], [[Case Study - Payment System]], [[Case Study - Notification System]]
 - **Compare with:** [[Real-time APIs - WebSocket, SSE and Long Polling]] (push to browsers), [[Queues vs Streams and Broker Comparison]] (push inside one organisation), [[Delivery Semantics and Exactly-Once]]
+
+### Watch on YouTube
+
+- [What is a Webhook? / Webhooks Explained with Azure Functions & GitHub (Real Demo)](https://www.youtube.com/watch?v=kYadEaoK-SY) · TechnoAarambh · real demo of registering and receiving a webhook callback
+- [Webhooks for Beginners – From Polling to Real‑Time Events](https://www.youtube.com/watch?v=bXY7899m6M8) · Ctrl Alt Explain · frames webhooks vs polling, matching the note's sender/receiver model

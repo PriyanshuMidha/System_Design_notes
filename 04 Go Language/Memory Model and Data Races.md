@@ -7,13 +7,15 @@ related: ["[[Concurrency Primitives - Mutex, Semaphore, Atomics]]", "[[select an
 sources:
   - "The Go Memory Model (go.dev/ref/mem), revised for Go 1.19"
   - "Go blog, Thread Sanitizer (race detector) documentation (go.dev/doc/articles/race_detector)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Memory Model and Data Races
 
 > [!summary] TL;DR
-> Without an explicit synchronization point, Go makes no promise that one goroutine's write becomes visible to another goroutine's read, even for something as simple as a `bool`. The **happens-before** relation names the operations (channel ops, mutex Unlock/Lock, `sync.Once`, `WaitGroup`, sequentially-consistent atomics) that create that guarantee; anything shared without one of them is a **data race**, which is undefined behavior, not just an unlikely bad value.
+> Without an explicit synchronization point, Go makes no promise that one goroutine's write becomes visible to another goroutine's read, even for something as simple as a `bool`.
+>
+> The **happens-before** relation names the operations (channel ops, mutex Unlock/Lock, `sync.Once`, `WaitGroup`, sequentially-consistent atomics) that create that guarantee; anything shared without one of them is a **data race**, which is undefined behavior, not just an unlikely bad value.
 
 > [!abstract] Core idea
 > - Compilers and CPUs reorder and cache memory accesses for speed; happens-before edges are the only thing that stops a reordering from being observable.
@@ -21,17 +23,72 @@ updated: 2026-11-07
 > - `go test -race` (ThreadSanitizer) catches races on code paths it actually executes; it proves races exist, it never proves their absence.
 > - "It hasn't crashed in production" is not evidence of safety — that is the benign-race myth, and the compiler is free to change its mind on the next build.
 
+## Start here: the basics
+
+**The problem in one story.**
+Two cashiers share one notebook that counts sales.
+Each reads the number, adds one in their head, and writes it back.
+If both read "10" at the same moment, both write "11", and one sale vanishes.
+In Go, two goroutines touching the same variable without coordination do exactly this, and the rules for when it is safe are called the memory model.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Goroutine | A lightweight concurrent task in Go | `go count()` |
+| Shared variable | Memory that more than one goroutine reads or writes | a global `counter int` |
+| Register / cache | Fast private storage a CPU keeps copies in | CPU keeps `ready` in a register |
+| Reorder | Compiler or CPU running statements in a different order for speed | Write B lands before write A |
+| Synchronization | An action that makes one goroutine's writes visible to another | Mutex unlock, channel send |
+| Happens-before | A guaranteed "A is visible to B" ordering | A send happens-before its receive completes |
+| Data race | Unsynchronized access to the same memory, at least one a write | Two goroutines doing `counter++` |
+| Atomic | A single operation no other goroutine can see half-done | `atomic.Int64.Add(1)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Goroutine A:<br/>write x = 1"] --> S{"Synchronized?<br/>(channel, mutex, atomic)"}
+    S -- "yes" --> OK["Goroutine B<br/>is guaranteed to see 1"]
+    S -- "no" --> RACE["Data race:<br/>B may see anything"]
+```
+
+**Analogy.** Each goroutine has its own notepad and copies to the shared board whenever it likes. A channel send or mutex unlock is a handshake that says "my notepad is now on the board".
+Where it breaks: real notepads never show half-written numbers, but a racy Go slice or interface can be read half-updated.
+
+**How the rest of this note builds up**
+
+- First, why reordering makes sharing hard (section 1) and the private-notepad mental model (section 2).
+- Then the happens-before rules and the Go 1.19 atomics change (section 3).
+- Then worked examples: channel handoff, mutex and atomics, a real race and the race detector's output, `sync.Once` and `WaitGroup` (section 4).
+- Finally the SDE-3 deep dive: torn reads, ThreadSanitizer internals, and the benign-race myth (sections 6-8).
+
+> [!tip] Remember
+> If two goroutines touch the same variable and one writes, connect them with a channel, mutex or atomic, every time.
+
 ## 1. Why it exists
 
-A single CPU core already reorders its own instructions and keeps values in registers and store buffers rather than main memory; compilers reorder and cache loads across statements too, as long as the reordering is invisible to that one goroutine running alone. None of that is wrong on a single thread — the compiler and CPU only promise that *a single goroutine* sees its own operations in program order.
+A single CPU core already reorders its own instructions and keeps values in registers and store buffers rather than main memory; compilers reorder and cache loads across statements too, as long as the reordering is invisible to that one goroutine running alone.
 
-The problem appears the moment two goroutines touch the same variable. Goroutine A might set `ready = true` and expect goroutine B to see it, but without a synchronization point the compiler is free to keep `ready` in a CPU register inside A's loop and never write it back to memory at all, and even if it does write it back, the CPU's cache coherence protocol gives no ordering guarantee relative to any *other* write A made first. Go's memory model exists to draw a line: these specific operations create a cross-goroutine ordering guarantee, and nothing else does.
+None of that is wrong on a single thread — the compiler and CPU only promise that *a single goroutine* sees its own operations in program order.
+
+The problem appears the moment two goroutines touch the same variable.
+
+Goroutine A might set `ready = true` and expect goroutine B to see it. But without a synchronization point the compiler is free to keep `ready` in a CPU register inside A's loop and never write it back to memory at all.
+
+And even if it does write it back, the CPU's cache coherence protocol gives no ordering guarantee relative to any *other* write A made first.
+
+Go's memory model exists to draw a line: these specific operations create a cross-goroutine ordering guarantee, and nothing else does.
 
 ## 2. Mental model
 
-Think of each goroutine as operating on its own private, possibly-stale view of memory, with writes trickling out to a shared store at the compiler and hardware's convenience. A **happens-before edge** is a guarantee that "everything goroutine A did before this point is visible to goroutine B after that point" — a one-way bridge between the two private views, built by a specific synchronizing operation (not by proximity in time, and not by "it usually works").
+Think of each goroutine as operating on its own private, possibly-stale view of memory, with writes trickling out to a shared store at the compiler and hardware's convenience.
 
-If there is no bridge between a write and a read of the same variable from different goroutines, the read is allowed to see garbage, an old value, a value from the middle of a multi-word write, or — in the formal model — nothing coherent at all. The race detector's job is to notice when code reads or writes a location with no such bridge connecting it to a concurrent access.
+A **happens-before edge** is a guarantee that "everything goroutine A did before this point is visible to goroutine B after that point" — a one-way bridge between the two private views, built by a specific synchronizing operation (not by proximity in time, and not by "it usually works").
+
+If there is no bridge between a write and a read of the same variable from different goroutines, the read is allowed to see garbage, an old value, a value from the middle of a multi-word write, or — in the formal model — nothing coherent at all.
+
+The race detector's job is to notice when code reads or writes a location with no such bridge connecting it to a concurrent access.
 
 ## 3. How it works
 
@@ -85,7 +142,9 @@ One easy-to-miss omission: **a goroutine's exit guarantees nothing.** Nothing in
 
 ### Why atomics changed in Go 1.19
 
-Before the 2022 memory-model revision, Go's model said less than the implementation actually provided, leaving atomics in an awkward, under-specified state. Go 1.19 adopted the same sequential-consistency guarantee that C++'s `memory_order_seq_cst` and Java's `volatile` give: every goroutine observes atomic operations on a given location in one single, agreed-upon order, so you can reason about atomic counters and flags the same way you reason about a mutex-protected value, without a separate mental model for "the atomics version."
+Before the 2022 memory-model revision, Go's model said less than the implementation actually provided, leaving atomics in an awkward, under-specified state.
+
+Go 1.19 adopted the same sequential-consistency guarantee that C++'s `memory_order_seq_cst` and Java's `volatile` give: every goroutine observes atomic operations on a given location in one single, agreed-upon order, so you can reason about atomic counters and flags the same way you reason about a mutex-protected value, without a separate mental model for "the atomics version."
 
 ## 4. Worked example
 
@@ -218,7 +277,13 @@ Previous write at 0x00c000112248 by goroutine 8:
 FAIL
 ```
 
-Two things worth noticing in this real run: the detector reported **two separate race pairs** (one shown above) from the same hundred-goroutine fan-out, and the final counter came out `93`, not `100` — seven of the hundred `Add(1)` calls were lost to the unsynchronized read-modify-write. Re-running the same binary a few more times produces a different wrong count each time (94, 90, and so on), never a crash and never an error return — just a silently lower number. That variability *is* the benign-race myth in miniature: **the race detector flags the unsynchronized access itself, not a specific wrong answer**, because there is no specific wrong answer — the access is undefined behavior, and the exact number of lost updates depends on the scheduler's mood on a given run. A race that happens to land on the right number some run is not a counterexample; it is the same undefined behavior producing a different, equally unprincipled result. This test is kept behind a `race_demo` build tag specifically so it never runs as part of the normal `go test -race ./...` suite, which must stay green.
+Two things worth noticing in this real run: the detector reported **two separate race pairs** (one shown above) from the same hundred-goroutine fan-out, and the final counter came out `93`, not `100` — seven of the hundred `Add(1)` calls were lost to the unsynchronized read-modify-write.
+
+Re-running the same binary a few more times produces a different wrong count each time (94, 90, and so on), never a crash and never an error return — just a silently lower number.
+
+That variability *is* the benign-race myth in miniature: **the race detector flags the unsynchronized access itself, not a specific wrong answer**, because there is no specific wrong answer — the access is undefined behavior, and the exact number of lost updates depends on the scheduler's mood on a given run.
+
+A race that happens to land on the right number some run is not a counterexample; it is the same undefined behavior producing a different, equally unprincipled result. This test is kept behind a `race_demo` build tag specifically so it never runs as part of the normal `go test -race ./...` suite, which must stay green.
 
 ### `sync.Once` and `WaitGroup` edges
 
@@ -276,25 +341,54 @@ Each goroutine writes a distinct slice index, so there is no race on `results` i
 
 ## 7. In production
 
-- **Real systems:** Go's own standard library races were a major motivation for shipping a built-in detector (`go test -race`, `go build -race`) rather than leaving it to third-party tools; most production Go services run `-race` in CI and on a small canary deployment because of its runtime cost, and treat any CI race report as a release blocker, not a flaky test.
+- **Real systems:** Go's own standard library races were a major motivation for shipping a built-in detector (`go test -race`, `go build -race`) rather than leaving it to third-party tools.
+
+  Most production Go services run `-race` in CI and on a small canary deployment because of its runtime cost, and treat any CI race report as a release blocker, not a flaky test.
 - **Failure modes → fixes:**
-  - Concurrent writes to a Go map (not just reads racing writes) → the runtime calls `fatalerror` and crashes the whole process immediately, by design — a map has its own internal invariants a race can corrupt past recovery, so this is one of the few races Go refuses to let through silently even without `-race`. Fix: a mutex, `sync.Map`, or sharded maps with a lock per shard.
+  - Concurrent writes to a Go map (not just reads racing writes) → the runtime calls `fatalerror` and crashes the whole process immediately, by design — a map has its own internal invariants a race can corrupt past recovery, so this is one of the few races Go refuses to let through silently even without `-race`.
+
+    Fix: a mutex, `sync.Map`, or sharded maps with a lock per shard.
   - A shared `error` variable written by multiple goroutines in a fan-out → race; use `errgroup.Group` (package `golang.org/x/sync/errgroup`), which synchronizes the stored error for you.
   - Lazy initialization guarded by a plain `if x == nil { x = compute() }` check from multiple goroutines → a race on `x` (and potentially a torn read of a multi-word interface or slice header) → `sync.Once` or `sync.OnceValue` (Go 1.21).
   - Reading request data from a goroutine spawned by an HTTP handler after the handler has already returned → a race against the server reusing or discarding that request's buffers; copy anything you need before the handler returns, or take `context.WithoutCancel` plus an explicit timeout if the work must outlive the request.
   - Double-checked locking written by hand (check without the lock, lock, check again, write) → the first, lock-free check is a race on the field being checked; it needs to be an atomic load or the whole pattern needs to go through `sync.Once`.
-- **The five general fixes for a race**, in order of preference: confinement (only one goroutine ever touches the value — no synchronization needed because there is no sharing); pass ownership through a channel instead of sharing a pointer; a mutex around the invariant; an atomic for a single word; or make the value immutable after construction (safe to share read-only with no synchronization, as long as nothing ever mutates it post-publish).
-- **What to monitor:** CI must fail on any `-race` report, with zero tolerance — there is no such thing as an acceptable rate of detected races. Track whether canary instances running `-race` builds show meaningfully different latency/CPU so the overhead stays bounded. Use the Go `goroutine` profile and `goleak` in tests to catch leaked goroutines left over from races on shutdown signals.
+- **The five general fixes for a race**, in order of preference:
+  1. Confinement (only one goroutine ever touches the value — no synchronization needed because there is no sharing).
+  2. Pass ownership through a channel instead of sharing a pointer.
+  3. A mutex around the invariant.
+  4. An atomic for a single word.
+  5. Or make the value immutable after construction (safe to share read-only with no synchronization, as long as nothing ever mutates it post-publish).
+- **What to monitor:** CI must fail on any `-race` report, with zero tolerance — there is no such thing as an acceptable rate of detected races. Track whether canary instances running `-race` builds show meaningfully different latency/CPU so the overhead stays bounded.
+
+  Use the Go `goroutine` profile and `goleak` in tests to catch leaked goroutines left over from races on shutdown signals.
 
 ## 8. Deep dive
 
-**Torn reads of multi-word values.** A Go `string`, `slice` and `interface` value are each more than one machine word (string: pointer + length; slice: pointer + length + capacity; interface: type word + data word). A race on one of these is not "you might read a slightly stale int" — it is a window where a reader can observe, for example, the *new* pointer paired with the *old* length, producing a slice header that points past the end of its own backing array. That can corrupt memory or crash the process, not just return a wrong-but-harmless value. This is why "benign races" on anything bigger than a single aligned machine word are categorically more dangerous than a torn single-word read.
+**Torn reads of multi-word values.** A Go `string`, `slice` and `interface` value are each more than one machine word (string: pointer + length; slice: pointer + length + capacity; interface: type word + data word).
 
-**"No out-of-thin-air values."** Even though a racing read is allowed to see a stale or inconsistent value, the Go memory model explicitly rules out a read observing a value that was never written by any goroutine, by any ordering. In practice this guarantee matters far less than "do not write racy code in the first place" — it is a backstop for how wild an implementation's behavior is allowed to be, not a safety net you should ever rely on.
+A race on one of these is not "you might read a slightly stale int" — it is a window where a reader can observe, for example, the *new* pointer paired with the *old* length, producing a slice header that points past the end of its own backing array.
 
-**What ThreadSanitizer actually does.** `go test -race` instruments every memory access and goroutine-creation/synchronization event, then uses vector clocks to detect when two accesses to the same location, from different goroutines, have no happens-before edge between them, with at least one being a write. It only sees paths your tests actually execute, under the specific scheduling the runtime happens to choose that run — a race can exist in code for years before `-race` happens to catch it, and a test suite with poor coverage of concurrent code paths gives false confidence. The cost (documented by the Go team as roughly 5-10x memory and 2-20x CPU) is why it runs in CI and canaries rather than on every production replica permanently.
+That can corrupt memory or crash the process, not just return a wrong-but-harmless value. This is why "benign races" on anything bigger than a single aligned machine word are categorically more dangerous than a torn single-word read.
 
-**The benign-race myth, precisely stated.** "It's a race, but the variable is just a flag/counter and the worst case is a stale read, so it's fine" is wrong for three independent reasons: the compiler can legally hoist, cache, or eliminate the racy access entirely in a future build (nothing contractually stops it, because the program is undefined the moment a race occurs); the hardware's behavior under a race is architecture-dependent, so "works on my amd64 laptop" says nothing about arm64 or about a future CPU generation; and some "simple" shared values (interfaces, slices, strings, maps) are not single machine words, so the "worst case" is not actually a stale read but a torn, inconsistent value. Treat every data race as a bug regardless of whether this run's measured output looks fine — the `TestRaceDetectorCatchesRacyCounter` run above is a concrete demonstration: the detector fired, and the counter came out wrong (`93`, not `100`), but a race is just as much a bug on a run where the number happens to land on `100`, because nothing about the language guarantees it will land there again.
+**"No out-of-thin-air values."** Even though a racing read is allowed to see a stale or inconsistent value, the Go memory model explicitly rules out a read observing a value that was never written by any goroutine, by any ordering.
+
+In practice this guarantee matters far less than "do not write racy code in the first place" — it is a backstop for how wild an implementation's behavior is allowed to be, not a safety net you should ever rely on.
+
+**What ThreadSanitizer actually does.** `go test -race` instruments every memory access and goroutine-creation/synchronization event, then uses vector clocks to detect when two accesses to the same location, from different goroutines, have no happens-before edge between them, with at least one being a write.
+
+It only sees paths your tests actually execute, under the specific scheduling the runtime happens to choose that run — a race can exist in code for years before `-race` happens to catch it, and a test suite with poor coverage of concurrent code paths gives false confidence.
+
+The cost (documented by the Go team as roughly 5-10x memory and 2-20x CPU) is why it runs in CI and canaries rather than on every production replica permanently.
+
+**The benign-race myth, precisely stated.** "It's a race, but the variable is just a flag/counter and the worst case is a stale read, so it's fine" is wrong for three independent reasons:
+
+1. The compiler can legally hoist, cache, or eliminate the racy access entirely in a future build (nothing contractually stops it, because the program is undefined the moment a race occurs).
+2. The hardware's behavior under a race is architecture-dependent, so "works on my amd64 laptop" says nothing about arm64 or about a future CPU generation.
+3. Some "simple" shared values (interfaces, slices, strings, maps) are not single machine words, so the "worst case" is not actually a stale read but a torn, inconsistent value.
+
+Treat every data race as a bug regardless of whether this run's measured output looks fine.
+
+The `TestRaceDetectorCatchesRacyCounter` run above is a concrete demonstration: the detector fired, and the counter came out wrong (`93`, not `100`), but a race is just as much a bug on a run where the number happens to land on `100`, because nothing about the language guarantees it will land there again.
 
 ## 9. Interview questions
 
@@ -308,10 +402,14 @@ Each goroutine writes a distinct slice index, so there is no race on `results` i
 > False. `go test -race` only instruments the code paths and goroutine interleavings a given run actually exercises. It proves the presence of a race when it fires; it never proves the absence of one. Weak test coverage of concurrent paths, or a scheduling interleaving the detector's run didn't happen to hit, both let races through undetected.
 
 > [!question]- Why are atomics in Go 1.19+ described as "sequentially consistent," and why does that matter?
-> It means every goroutine agrees on one single global order of atomic operations on a location — the same strength C++'s `memory_order_seq_cst` and Java's `volatile` provide. It matters because it lets you reason about atomic counters and flags with the same intuition as a mutex-protected value, instead of a separate, weaker mental model for "the atomics version" of the code.
+> It means every goroutine agrees on one single global order of atomic operations on a location — the same strength C++'s `memory_order_seq_cst` and Java's `volatile` provide.
+>
+> It matters because it lets you reason about atomic counters and flags with the same intuition as a mutex-protected value, instead of a separate, weaker mental model for "the atomics version" of the code.
 
 > [!question]- Why does a plain `bool` busy-wait loop (`for !done {}`) risk never terminating, not just being slow?
-> Without a happens-before edge connecting the write of `done` to the read, the compiler's single-goroutine view of the loop sees `done` never changing inside it and may legally hoist the read out of the loop or keep it cached in a register, so the loop can spin forever even though another goroutine did write `true` to the variable in memory.
+> Without a happens-before edge connecting the write of `done` to the read, the compiler's single-goroutine view of the loop sees `done` never changing inside it.
+>
+> So it may legally hoist the read out of the loop or keep it cached in a register, and the loop can spin forever even though another goroutine did write `true` to the variable in memory.
 
 > [!question]- Why does Go crash the whole process on a concurrent map write instead of just corrupting data quietly?
 > Go's built-in map has internal invariants (bucket layout, growth state) that a concurrent write can corrupt in ways the runtime cannot safely continue past, so it deliberately calls `fatalerror` and aborts rather than risk silent data corruption. This check runs even without `-race`, unlike ordinary data races on your own variables.
@@ -335,3 +433,8 @@ Each goroutine writes a distinct slice index, so there is no race on `results` i
 - **Before this:** [[Goroutines and Channels]], [[sync Primitives and Atomics]]
 - **Next:** [[Runtime - Goroutine Scheduler (GMP)]], [[Benchmarks, Profiling and Tracing]]
 - **Compare with:** [[Concurrency Primitives - Mutex, Semaphore, Atomics]] (the OS/hardware theory this note's Go-specific guarantees build on)
+
+### Watch on YouTube
+
+- [""go test -race" Under the Hood" by Kavya Joshi](https://www.youtube.com/watch?v=5erqWdlhQLA) · Strange Loop Conference · deep dive into how the race detector proves happens-before violations
+- [Go Data Races: Why Your Tests Pass and Production Doesn't](https://www.youtube.com/watch?v=qJR_m1JMWRc) · Compiled Curiosity · practical intro to why unsynchronized access is undefined behavior

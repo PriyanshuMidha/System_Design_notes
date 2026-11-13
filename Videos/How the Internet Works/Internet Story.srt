@@ -1,0 +1,272 @@
+1
+00:00:02,399 --> 00:00:15,497
+Narrator: This is Ana. She types a web address, and a page appears in under a second. The server might be in another country, owned by a company she never heard of. And no wire runs straight from her laptop to it. So how do her bytes get there?
+
+2
+00:00:15,928 --> 00:00:31,402
+Narrator: Old phone calls solved this with a circuit. A fixed slice of wire, reserved for the whole call, and sitting idle during every silent pause. The internet's designers said no. Instead, every message is cut into small packets, each at most about fifteen hundred bytes.
+
+3
+00:00:31,832 --> 00:00:48,170
+Narrator: Each packet is labelled with where it came from and where it is going. Each router forwards each packet by whatever path looks best right now. And if a link dies mid conversation, the next packet simply takes another road. Meet Pip, one packet, carrying a piece of Ana's request.
+
+4
+00:00:48,600 --> 00:01:03,113
+Narrator: Why is this better? A circuit wastes capacity during silence. Packet switching shares one link among many flows, trading guaranteed bandwidth for better average use. That was the core bet of the early ARPANET, and the internet inherited it.
+
+5
+00:01:06,063 --> 00:01:18,298
+Narrator: Level one. The words. A host is any machine on a network, like Ana's laptop, or a cloud server. A packet is a small chunk of data with an address label. A header is the label bytes stuck on the front.
+
+6
+00:01:18,727 --> 00:01:42,001
+Narrator: An I P address is a number that names a host, like ninety three dot one eighty four dot two sixteen dot thirty four. A port is a number that names a program on that host, like four forty three for H T T P S. A router passes packets toward their destination. A protocol is an agreed set of rules, like T C P, U D P, or H T T P. An I S P connects you to the internet.
+
+7
+00:01:42,432 --> 00:01:51,450
+Narrator: Remember it like this. The I P address finds the machine. The port finds the program. And routers pass each packet one hop at a time.
+
+8
+00:01:54,400 --> 00:02:06,513
+Narrator: Now, how does Pip get labelled? Picture nested envelopes. Ana's app writes a note. Get slash. Then three clerks each put it inside a bigger envelope, and write their own to and from on the outside.
+
+9
+00:02:06,944 --> 00:02:18,217
+Ted: I am Ted, the transport clerk. I add a port number, four forty three, and a sequence number. So the destination knows which program should open this.
+
+10
+00:02:18,647 --> 00:02:25,985
+Ivy: I am Ivy. I add the I P address, from Ana, to the server. My envelope survives the whole trip, every hop.
+
+11
+00:02:26,415 --> 00:02:37,473
+Eli: And I am Eli. I add the Ethernet envelope, with the M A C address of the very next device. Her home router. Not the server.
+
+12
+00:02:37,903 --> 00:03:02,090
+Narrator: This is encapsulation. Going out, every layer adds a header. Coming in, the receiver strips them in exact reverse order, like unstacking nesting dolls. And every header names what comes next. The Ethernet frame has an ether type, saying I P version four, or six, or A R P. The I P header has a protocol field, six for T C P, seventeen for U D P, one for I C M P.
+
+13
+00:03:02,520 --> 00:03:16,433
+Rory: I am Rory, a router. I open only the Ivy envelope. I never open Ted's, so I never see a port, and I never see the H T T P request or the U R L inside.
+
+14
+00:03:16,864 --> 00:03:31,569
+Narrator: That is a common mistake. People say a router reads the request. It does not. Only the two endpoints, and anything that terminates T L S, ever see the request text. A switch opens only Eli's envelope, and nothing deeper.
+
+15
+00:03:32,000 --> 00:03:39,554
+Narrator: And Eli's envelope is thrown away at every hop, and replaced with a new one for the next hop. Ivy's survives the entire trip.
+
+16
+00:03:42,503 --> 00:04:01,050
+Narrator: Level two. How does Rory decide where to send a packet he has never seen? He has a forwarding table. For a destination address, it says which outgoing link, and which next router. He picks the best matching prefix, the longest match, and forwards. No router knows the whole path. Each only needs the next hop.
+
+17
+00:04:01,479 --> 00:04:12,993
+Narrator: The price of this flexibility? Packets can arrive out of order, arrive twice, or not arrive at all. Those are exactly the problems the layers above, mainly T C P, exist to repair.
+
+18
+00:04:15,943 --> 00:04:32,858
+Narrator: You will hear about the seven layers of O S I. That is a teaching reference from the nineteen eighties. No mainstream network stack runs seven separate protocols. What ships inside every operating system is the four layer T C P I P model. Link, Internet, Transport, Application.
+
+19
+00:04:33,288 --> 00:04:48,665
+Narrator: Here is how they line up. O S I layer seven, application, six, presentation, and five, session, all collapse into one application layer. Four is transport. Three is network, which is the internet layer. Two and one, data link and physical, become the link layer.
+
+20
+00:04:49,096 --> 00:05:08,913
+Narrator: So why learn the numbers? Because people use them as shorthand. An L four load balancer sees only I P and port. An L seven proxy actually parses H T T P. Use the four layer model to describe how things really work, and the O S I numbers only as vocabulary. Never invent a session layer protocol in a real diagram.
+
+21
+00:05:11,863 --> 00:05:26,858
+Narrator: How do routers learn routes? Inside one organization, an autonomous system, such as one I S P, routers share routes using interior protocols like O S P F or I S I S. Between different organizations, they speak B G P, the border gateway protocol.
+
+22
+00:05:27,288 --> 00:05:39,737
+Narrator: Think of B G P as word of mouth. Gus, the server's I S P, announces, I can reach this block of addresses. Path, three. A transit provider adds its own name, and repeats it. Path, two, three.
+
+23
+00:05:40,168 --> 00:05:47,985
+Gus: I can reach ninety three dot one eighty four dot two sixteen dot slash twenty four. Path, three.
+
+24
+00:05:48,415 --> 00:05:54,817
+Gwen: Heard. I will repeat it, adding myself. Path, two, three.
+
+25
+00:05:55,247 --> 00:06:07,769
+Narrator: Ana's own I S P hears several routes, and picks one, by shortest path, plus its own policy rules, and installs it in its forwarding table. From then on it forwards that block toward the transit provider, one hop at a time.
+
+26
+00:06:08,199 --> 00:06:17,841
+Narrator: This is why losing one undersea cable reroutes traffic, rather than cutting the internet in half. Neighbours simply stop hearing a route, and switch to the next best.
+
+27
+00:06:18,271 --> 00:06:33,817
+Narrator: The catch. B G P trusts announcements by default. A network that falsely claims someone else's block can hijack their traffic. There is no central authority checking who may announce what. The bolt on fix is called R P K I, route origin validation.
+
+28
+00:06:36,767 --> 00:06:48,569
+Narrator: Ethernet frames carry at most fifteen hundred bytes. That is the M T U, the maximum transmission unit. A packet bigger than any link's M T U must be split, fragmented, or better, never made that big.
+
+29
+00:06:49,000 --> 00:07:06,538
+Narrator: T C P avoids it. At connection setup, it agrees a maximum segment size, so each segment plus its headers fits inside one frame. U D P and I C M P have no such agreement, so they can be fragmented, and if any one fragment is lost, the entire original packet must be resent.
+
+30
+00:07:06,968 --> 00:07:14,689
+Narrator: Path M T U discovery helps. It sends packets marked, do not fragment, and shrinks its guess whenever a router replies, too big.
+
+31
+00:07:15,120 --> 00:07:29,274
+Narrator: And here is the classic outage. A V P N or tunnel adds a header, pushing a normal packet over fifteen hundred bytes. Everything works, except big responses. A confusing symptom, and it traces back to one header field.
+
+32
+00:07:32,223 --> 00:07:58,569
+Narrator: An I P address names a host. A port, a number from zero to sixty five thousand five hundred thirty five, names a program on it. It lives in the T C P or U D P header, not the I P header, which is exactly why a router never sees it. Ports below one thousand twenty four are well known. Eighty is H T T P, four forty three is H T T P S, fifty three is D N S, and on Linux they need root to bind.
+
+33
+00:07:59,000 --> 00:08:11,233
+Sam: I am Sam, the server. I listen on port four forty three. But do not think I can serve only one visitor. The port only says where new connections arrive.
+
+34
+00:08:11,663 --> 00:08:23,322
+Narrator: A socket is the operating system's handle for one end of a connection. And one connection is identified by its five tuple. Protocol, source I P, source port, destination I P, destination port.
+
+35
+00:08:23,752 --> 00:08:43,594
+Narrator: Open two browser tabs to the same site. Same destination address, same destination port, four hundred forty three. What differs is the source port. The operating system picks a different free ephemeral port for each connection, typically thirty two thousand seven hundred sixty eight to sixty thousand nine hundred ninety nine on Linux.
+
+36
+00:08:44,024 --> 00:08:58,538
+Narrator: So tab one uses source port fifty one thousand one, and tab two, fifty one thousand two. Only one field differs, but that is enough. The kernel keys its lookup on the full five tuple, so it can hand each connection's data to the right thread.
+
+37
+00:08:58,967 --> 00:09:09,066
+Narrator: The mistake to avoid. A listening port does not identify a connection. The full five tuple does. That is how one port serves thousands of clients at once.
+
+38
+00:09:12,015 --> 00:09:35,145
+Narrator: Level three. T C P versus U D P. T C P retransmits lost segments, keeps order, and costs a handshake and acknowledgements. Use it when correctness matters more than latency, like H T T P or S S H. U D P guarantees nothing, and has only an eight byte header. Use it when latency matters more than occasional loss, like D N S, video, and the basis of Quick.
+
+39
+00:09:35,576 --> 00:09:54,409
+Narrator: T T L, time to live, is a hop counter in the I P header. Every router subtracts one. At zero the packet is dropped, and an I C M P time exceeded message goes back. It stops routing loops. And traceroute abuses it, sending packets with T T L one, two, three, and recording who replies at each hop.
+
+40
+00:09:54,840 --> 00:10:09,186
+Narrator: Why the five tuple and not just the port? Because millions of clients can reach port four forty three at once. The operating system demultiplexes each incoming segment to the right in memory socket using the full five tuple as the lookup key.
+
+41
+00:10:09,615 --> 00:10:25,162
+Narrator: And anycast is not a special protocol. The same address is announced through B G P from many places, and ordinary shortest path routing sends each client to the nearest. That is how D N S root servers and C D Ns serve one address from dozens of data centres.
+
+42
+00:10:28,111 --> 00:10:36,841
+Narrator: Now the code, in Go. The simplest socket program already shows the five tuple. One side listens, one connects, and each end sees a different pairing.
+
+43
+00:10:37,272 --> 00:10:50,298
+Narrator: Listen on one twenty seven dot zero dot zero dot one, port zero, and the operating system picks any free port. Dial that address. The client side gets an ephemeral source port, and nothing in the code chose it.
+
+44
+00:10:50,727 --> 00:11:05,529
+Narrator: A small function, five tuple, formats exactly what the kernel keys on. The protocol, then the local address, an arrow, then the remote address. And an echo server accepts one connection, reports that tuple on a channel, then copies back everything it reads.
+
+45
+00:11:05,960 --> 00:11:17,282
+Narrator: The test opens two connections to the same listener. Same destination, different source ports. So the two tuples differ, exactly as the model says, and the test passes with the race detector on.
+
+46
+00:11:20,231 --> 00:11:33,546
+Narrator: Three failures to know. An M T U black hole. Large packets vanish silently, because a middle box drops them instead of sending back too big. Lower the interface M T U, or clamp the segment size on the path.
+
+47
+00:11:33,975 --> 00:11:45,250
+Narrator: A B G P leak or hijack. Traffic for a block suddenly goes somewhere wrong. Use route origin validation, and monitoring that alerts on unexpected path changes for your own blocks.
+
+48
+00:11:45,679 --> 00:11:59,546
+Narrator: And port exhaustion. A host that opens huge numbers of outbound connections to one destination runs out of ephemeral ports, about twenty eight thousand by default on Linux. Reuse connections with pooling, or widen the port range.
+
+49
+00:11:59,975 --> 00:12:13,073
+Narrator: What to monitor. Interface M T U mismatches, seen as path M T U discovery failures. B G P session flaps, and path changes for your own blocks. And ephemeral port usage on hosts with many connections.
+
+50
+00:12:13,504 --> 00:12:28,977
+Narrator: Also two deeper points. Packet switching's flexibility costs ordering and reliability, so something above I P must restore them, if the app needs it. And if a hand written raw socket gets an ether type or protocol field wrong, the receiving stack silently drops the packet.
+
+51
+00:12:31,927 --> 00:12:35,162
+Narrator: Interview round. Six questions you will really get.
+
+52
+00:12:35,591 --> 00:12:50,970
+Narrator: One. I P address versus port? An I P address names a host. A port, in the T C P or U D P header, names a program on it. Routers route on I P only. The destination kernel uses the port to hand data to the right process.
+
+53
+00:12:51,399 --> 00:13:07,977
+Narrator: Two. A trap. Explain the O S I model as how the internet actually works. It is a trap, because O S I is a teaching reference. The internet runs the four layer T C P I P model, and layers five to seven all collapse into application. Say that explicitly.
+
+54
+00:13:08,408 --> 00:13:20,881
+Narrator: Three. Why do two tabs to the same site not interfere? Different ephemeral source ports, so the five tuple differs, even though the destination is identical. The kernel demultiplexes on the whole tuple.
+
+55
+00:13:21,312 --> 00:13:35,129
+Narrator: Four. What happens to a packet bigger than the M T U? Without the do not fragment bit, a router fragments it, which is expensive, since losing one fragment loses the whole packet. T C P avoids this by agreeing a segment size at setup.
+
+56
+00:13:35,559 --> 00:13:49,090
+Narrator: Five. How does a router handle a packet it has never seen? It looks up the destination in its forwarding table, built from interior protocols and B G P, picks the longest matching prefix, and forwards it out the matching link.
+
+57
+00:13:49,519 --> 00:14:04,274
+Narrator: Six. What does T T L do, and how does traceroute use it? T T L is a hop counter, decremented by each router, which stops loops. Traceroute sends T T L one, two, three, and records each time exceeded reply to reconstruct the path.
+
+58
+00:14:07,224 --> 00:14:10,385
+Narrator: Let us put it all together, from easy to advanced.
+
+59
+00:14:10,816 --> 00:14:22,905
+Narrator: One. Packets, not circuits. Each packet is routed independently, hop by hop, and no router knows the whole path. That flexibility costs order and reliability, which T C P restores.
+
+60
+00:14:23,336 --> 00:14:30,913
+Narrator: Two. The I P address finds the host. The port finds the program. The five tuple is a connection's true identity.
+
+61
+00:14:31,344 --> 00:14:41,586
+Narrator: Three. Encapsulation adds a header per layer going out, and strips them in reverse coming in. Routers open only the I P header. Switches open only Ethernet.
+
+62
+00:14:42,015 --> 00:14:47,457
+Narrator: Four. O S I is vocabulary. T C P I P's four layers are what runs.
+
+63
+00:14:47,888 --> 00:14:58,514
+Narrator: Five. B G P is organisations announcing reachability by word of mouth. Shortest path and policy win, and nobody checks who is telling the truth, unless R P K I does.
+
+64
+00:14:58,943 --> 00:15:10,529
+Narrator: Six. M T U is about fifteen hundred bytes. T C P agrees a segment size. U D P and I C M P can fragment. T T L stops loops, and traceroute uses it.
+
+65
+00:15:10,960 --> 00:15:19,114
+Narrator: And the one line to keep. The I P address finds the machine, the port finds the program, and routers pass each packet one hop at a time.
+
+66
+00:15:22,063 --> 00:15:41,114
+Narrator: To go deeper, open the note called how the internet works, and its Go note, in your vault. Nothing comes before it. After it, read I P addressing, subnets, N A T and V P C basics, then T C P, and then D N S. Compare it with forward and reverse proxies, where L four and L seven really matter, and with I O models.
+
+67
+00:15:41,543 --> 00:15:45,066
+Ana: Thank you, Pip! The page loaded.
+
+68
+00:15:45,495 --> 00:15:47,217
+Sam: Next!
+

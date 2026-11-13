@@ -8,7 +8,7 @@ sources:
   - "Go 1.22 release notes, net/http ServeMux enhanced routing"
   - "Go 1.24 net/http package docs, Server, ResponseWriter, MaxBytesReader, ResponseController"
   - "Go 1.24 net/http/httptest package docs"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # HTTP Server Fundamentals (net-http)
@@ -22,6 +22,52 @@ updated: 2026-11-07
 > - `http.Server`'s zero-value timeouts are "wait forever". `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout` and `IdleTimeout` all need explicit values; skipping `ReadHeaderTimeout` specifically leaves the server open to a Slowloris attack.
 > - `ResponseWriter` has ordering rules a compiler can't check: set headers before `WriteHeader`, call `WriteHeader` at most once, and an unwritten status defaults to 200 the instant anything is written.
 > - One goroutine serves one HTTP/1.1 connection's requests sequentially; HTTP/2 hands each stream its own goroutine, so true request-level concurrency on one TCP connection is an HTTP/2 property, not an HTTP/1.1 one.
+
+## Start here: the basics
+
+**The problem in one story.**
+A browser asks your server for `GET /invoices/42`.
+Your server must find the right code for that path and method.
+It must send back a status, headers and a body.
+And it must not let one slow or broken client hold resources forever.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HTTP request | A message asking the server to do something | `GET /invoices/42` |
+| Method | The verb of the request | `GET`, `POST`, `DELETE` |
+| Status code | A number saying how it went | `200` OK, `404` Not Found, `405` wrong method |
+| Header | A named extra field on a request or response | `Content-Type: application/json` |
+| Handler | Code that answers one kind of request | `func(w, r)` |
+| Router (mux) | Picks the handler for a method and path | `"GET /invoices/{id}"` → `getInvoice` |
+| Interface | A Go type defined by the methods it has | `http.Handler` has `ServeHTTP` |
+| Goroutine | A cheap, Go-managed concurrent function | One per connection |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] --> S["http.Server<br/>(timeouts)"]
+    S --> M["ServeMux:<br/>match method + path"]
+    M -- "match" --> H["Handler"]
+    M -- "path ok, method wrong" --> E["405 + Allow"]
+    H --> W["ResponseWriter:<br/>headers, status, body"]
+    W --> C
+```
+
+**Analogy.** A front-desk clerk reads each request card and sends it to the right department.
+Where it breaks: a clerk handles one card at a time, but Go serves many connections at once, each in its own goroutine.
+
+**How the rest of this note builds up**
+
+- First, why `net/http` is enough for most services (section 1) and the clerk mental model (section 2).
+- Then the `Handler` interface, Go 1.22 patterns, automatic 405s, `ResponseWriter` rules, limits and `http.Server` timeouts (section 3).
+- Then a full worked server (section 4) and router comparisons (section 5).
+- Finally the SDE-3 deep dive: Slowloris, HTTP/1.1 vs HTTP/2 concurrency, and production tuning (sections 6-8).
+
+> [!tip] Remember
+> Everything is an `http.Handler`; set every server timeout and follow the `ResponseWriter` ordering rules.
 
 ### Whiteboard version
 
@@ -42,15 +88,27 @@ Everything below fills in why each piece of that shape exists and what breaks wh
 
 ## 1. Why it exists
 
-A Go process that wants to answer HTTP requests needs three things: something that decides which function handles a given method and path, something that calls that function with the right arguments, and something that enforces limits on misbehaving clients before a handler ever runs. `net/http` provides all three as small, composable pieces — `ServeMux` for routing, `http.Handler` for "a thing that can answer a request", and `http.Server` for the listener and its limits — rather than one framework object that owns everything.
+A Go process that wants to answer HTTP requests needs three things: something that decides which function handles a given method and path, something that calls that function with the right arguments, and something that enforces limits on misbehaving clients before a handler ever runs.
 
-Concretely: before Go 1.22, `net/http`'s router matched paths only (`"/invoices/"`), so every handler needed its own `if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405) }` check, every path parameter needed manual string splitting or a third-party router, and it was easy to forget the check on one handler while remembering it on nine others. InvoiceOps' old HTTP note had exactly that bug: a hand-rolled method check that the ServeMux itself now does correctly, for free, as long as the registration says which method the pattern is for.
+`net/http` provides all three as small, composable pieces — `ServeMux` for routing, `http.Handler` for "a thing that can answer a request", and `http.Server` for the listener and its limits — rather than one framework object that owns everything.
+
+Concretely: before Go 1.22, `net/http`'s router matched paths only (`"/invoices/"`), so every handler needed its own `if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405) }` check, every path parameter needed manual string splitting or a third-party router, and it was easy to forget the check on one handler while remembering it on nine others.
+
+InvoiceOps' old HTTP note had exactly that bug: a hand-rolled method check that the ServeMux itself now does correctly, for free, as long as the registration says which method the pattern is for.
 
 ## 2. Mental model
 
-A `ServeMux` is a filing clerk holding a stack of index cards, each one reading "if the request's method and path look like *this*, hand it to *that* function". The clerk checks cards in order of specificity — a card for `/invoices/{id}` beats a card for `/invoices/{path...}`, because the first is a more exact match — and if a path matches a card's path but not its method, the clerk doesn't say "no such card"; it says "that path exists, but not with that method", which is exactly what an HTTP 405 with an `Allow` header means.
+A `ServeMux` is a filing clerk holding a stack of index cards, each one reading "if the request's method and path look like *this*, hand it to *that* function".
 
-An `http.Server` is the building the clerk works in. Its timeouts are the building's opening-hours policy: `ReadHeaderTimeout` is how long the door is held open for someone to finish stating their request before being turned away; `WriteTimeout` is how long the clerk will spend handing over an answer before giving up. Without a policy, one slow visitor can occupy the clerk's desk (and the goroutine behind it) forever.
+The clerk checks cards in order of specificity — a card for `/invoices/{id}` beats a card for `/invoices/{path...}`, because the first is a more exact match.
+
+If a path matches a card's path but not its method, the clerk doesn't say "no such card"; it says "that path exists, but not with that method", which is exactly what an HTTP 405 with an `Allow` header means.
+
+An `http.Server` is the building the clerk works in.
+
+Its timeouts are the building's opening-hours policy: `ReadHeaderTimeout` is how long the door is held open for someone to finish stating their request before being turned away; `WriteTimeout` is how long the clerk will spend handing over an answer before giving up.
+
+Without a policy, one slow visitor can occupy the clerk's desk (and the goroutine behind it) forever.
 
 ## 3. How it works
 
@@ -85,7 +143,11 @@ sequenceDiagram
     end
 ```
 
-`net/http` spawns one goroutine per accepted TCP connection. Over HTTP/1.1 without pipelining, requests on that one connection are handled one at a time, in order — a slow handler on request 1 delays request 2 on the *same* connection, but a browser or client opening several connections gets real concurrency across them. HTTP/2 changes this at the protocol level: multiple streams share one TCP connection, and `net/http`'s HTTP/2 support (automatic over TLS) gives each stream its own goroutine, so one slow request no longer head-of-line-blocks the others on that connection (full HTTP/2 and TLS setup is [[TLS, HTTPS and HTTP2 in Go Servers]]'s job).
+`net/http` spawns one goroutine per accepted TCP connection.
+
+Over HTTP/1.1 without pipelining, requests on that one connection are handled one at a time, in order — a slow handler on request 1 delays request 2 on the *same* connection, but a browser or client opening several connections gets real concurrency across them.
+
+HTTP/2 changes this at the protocol level: multiple streams share one TCP connection, and `net/http`'s HTTP/2 support (automatic over TLS) gives each stream its own goroutine, so one slow request no longer head-of-line-blocks the others on that connection (full HTTP/2 and TLS setup is [[TLS, HTTPS and HTTP2 in Go Servers]]'s job).
 
 ### Go 1.22 ServeMux patterns
 
@@ -99,7 +161,9 @@ A pattern is `[METHOD ][HOST]/[PATH]`. Each part is optional except the path:
 | `"GET /{$}"` | GET, path must be exactly `/` — without `{$}`, a bare `"/"` pattern matches *every* unmatched path, since an unqualified trailing slash means "prefix match" |
 | `"api.example.com/v1/invoices"` | a host-qualified pattern, for serving multiple hostnames off one mux |
 
-Precedence is "the most specific pattern wins", not registration order: `/invoices/{id}` is preferred over `/invoices/{path...}` for a request that only the first can match exactly, because a literal segment is more specific than a wildcard, and a wildcard with no trailing `...` is more specific than one with it. Two patterns that could both match the same request with neither more specific than the other is a conflict the mux detects, and it panics at registration time (process startup), not silently at request time — a registration bug surfaces as a crash on boot, which is the earliest and cheapest place for it to surface.
+Precedence is "the most specific pattern wins", not registration order: `/invoices/{id}` is preferred over `/invoices/{path...}` for a request that only the first can match exactly, because a literal segment is more specific than a wildcard, and a wildcard with no trailing `...` is more specific than one with it.
+
+Two patterns that could both match the same request with neither more specific than the other is a conflict the mux detects, and it panics at registration time (process startup), not silently at request time — a registration bug surfaces as a crash on boot, which is the earliest and cheapest place for it to surface.
 
 A plain GET registration also matches `HEAD` automatically: net/http runs the same handler and then discards the body, so a handler doesn't special-case `HEAD` unless it specifically needs to skip work that only matters for the body (an expensive render, for instance).
 
@@ -126,13 +190,17 @@ Three rules, none enforced by the compiler:
 2. **`WriteHeader` is called at most once.** A second call logs `http.Error: superfluous response.WriteHeader call` to stderr and is otherwise ignored; it is not an error the handler itself receives.
 3. **An unwritten response defaults to `200 OK`.** The first `Write` call sends `200` automatically if `WriteHeader` was never called. This is convenient for the common case and a trap for the handler that writes a partial body, hits an error, and then tries to write a different status — the `200` (or whatever was written first) has already gone out.
 
-`http.DetectContentType` is what fills in `Content-Type` when a handler never sets it — it sniffs up to the first 512 bytes of the body. That sniffing is a convenience, not something to depend on for anything security-sensitive: it has misclassified ambiguous payloads before, which is exactly why file-upload handling sniffs content type itself rather than trusting a client-sent header (link [[File Upload Architecture]]).
+`http.DetectContentType` is what fills in `Content-Type` when a handler never sets it — it sniffs up to the first 512 bytes of the body.
+
+That sniffing is a convenience, not something to depend on for anything security-sensitive: it has misclassified ambiguous payloads before, which is exactly why file-upload handling sniffs content type itself rather than trusting a client-sent header (link [[File Upload Architecture]]).
 
 ### Per-request body and time limits
 
 `http.MaxBytesReader(w, r.Body, n)` wraps the request body so reading past `n` bytes returns an `*http.MaxBytesError` instead of continuing to buffer: without it, `json.NewDecoder(r.Body).Decode(&v)` will read as much as the client sends, and a multi-gigabyte body sent to a small JSON endpoint is a cheap way to exhaust memory one connection at a time.
 
-`http.ResponseController` (Go 1.20) gives a single handler its own deadline, tighter or looser than the server-wide `ReadTimeout`/`WriteTimeout`: `rc := http.NewResponseController(w); rc.SetWriteDeadline(time.Now().Add(2*time.Second))` for an endpoint that must respond faster than the rest of the API. `http.TimeoutHandler(h, d, "timed out")` wraps a whole handler so a response that doesn't finish within `d` gets a `503` instead of running unbounded — useful as a blanket backstop around a handler whose own deadline handling can't be trusted yet.
+`http.ResponseController` (Go 1.20) gives a single handler its own deadline, tighter or looser than the server-wide `ReadTimeout`/`WriteTimeout`: `rc := http.NewResponseController(w); rc.SetWriteDeadline(time.Now().Add(2*time.Second))` for an endpoint that must respond faster than the rest of the API.
+
+`http.TimeoutHandler(h, d, "timed out")` wraps a whole handler so a response that doesn't finish within `d` gets a `503` instead of running unbounded — useful as a blanket backstop around a handler whose own deadline handling can't be trusted yet.
 
 ### `http.Server` fields, with values and the failure each one prevents
 
@@ -159,7 +227,9 @@ flowchart TD
 
 ### `ListenAndServe` always returns an error
 
-`srv.ListenAndServe()` (and `ListenAndServeTLS`) blocks until the server stops, then returns a non-nil error — there is no "clean" return value, only a reason it stopped. A listener that failed to bind the port returns that `bind` error. A server asked to stop gracefully via `Server.Shutdown` returns `http.ErrServerClosed`, which is not a failure and must be checked for and ignored rather than logged as one:
+`srv.ListenAndServe()` (and `ListenAndServeTLS`) blocks until the server stops, then returns a non-nil error — there is no "clean" return value, only a reason it stopped. A listener that failed to bind the port returns that `bind` error.
+
+A server asked to stop gracefully via `Server.Shutdown` returns `http.ErrServerClosed`, which is not a failure and must be checked for and ignored rather than logged as one:
 
 ```go
 if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -171,15 +241,27 @@ Treating every non-nil return as a crash means a normal, intentional shutdown lo
 
 ### `DefaultServeMux` is a trap, not a convenience
 
-`http.HandleFunc` (the package-level function, not a method on a mux you created) registers onto `http.DefaultServeMux`, a single mux shared by the whole process. Importing `net/http/pprof` anywhere in a binary's dependency graph registers `/debug/pprof/*` on that same default mux as an `init()` side effect — including transitively, through a dependency that imports it for its own reasons. A service that calls `http.ListenAndServe(addr, nil)` (passing `nil` for the handler means "use `DefaultServeMux`") can end up serving profiling and expvar endpoints on its public port with nobody having written a single line of code that looks like it did that. Always construct a mux with `http.NewServeMux()` and pass it explicitly.
+`http.HandleFunc` (the package-level function, not a method on a mux you created) registers onto `http.DefaultServeMux`, a single mux shared by the whole process.
+
+Importing `net/http/pprof` anywhere in a binary's dependency graph registers `/debug/pprof/*` on that same default mux as an `init()` side effect — including transitively, through a dependency that imports it for its own reasons.
+
+A service that calls `http.ListenAndServe(addr, nil)` (passing `nil` for the handler means "use `DefaultServeMux`") can end up serving profiling and expvar endpoints on its public port with nobody having written a single line of code that looks like it did that.
+
+Always construct a mux with `http.NewServeMux()` and pass it explicitly.
 
 ### Thin handlers
 
-A handler's job is five steps, each of which belongs to its own layer, not inline in the handler: decode the request → validate it → call a service method → map a domain error to an HTTP status → encode the response. The decode/validate/encode steps are [[Request Decoding, Validation and DTOs]]'s job in depth; the status-mapping step is [[Building REST Endpoints]]'s job. This note's handlers inline a simplified version of all five only because they exist to demonstrate routing and the server, not request handling in full.
+A handler's job is five steps, each of which belongs to its own layer, not inline in the handler: decode the request → validate it → call a service method → map a domain error to an HTTP status → encode the response.
+
+The decode/validate/encode steps are [[Request Decoding, Validation and DTOs]]'s job in depth; the status-mapping step is [[Building REST Endpoints]]'s job. This note's handlers inline a simplified version of all five only because they exist to demonstrate routing and the server, not request handling in full.
 
 ### Routers beyond the stdlib
 
-`chi` stays wire-compatible with `net/http` (its handlers are ordinary `http.Handler`s, its router just adds grouped middleware and more route-introspection than the stdlib mux offers) and is a reasonable choice once a service wants subrouters or named route groups the stdlib mux doesn't have. `gin` and `echo` bring their own non-`http.Handler` context type, trading stdlib compatibility for convenience methods. `fiber` is a different thing entirely: it's built on `fasthttp`, not `net/http`, so it is not compatible with any of the stdlib's `http.Handler`-based middleware, and migrating away from it later means rewriting the HTTP layer, not just swapping a router.
+`chi` stays wire-compatible with `net/http` (its handlers are ordinary `http.Handler`s, its router just adds grouped middleware and more route-introspection than the stdlib mux offers) and is a reasonable choice once a service wants subrouters or named route groups the stdlib mux doesn't have.
+
+`gin` and `echo` bring their own non-`http.Handler` context type, trading stdlib compatibility for convenience methods.
+
+`fiber` is a different thing entirely: it's built on `fasthttp`, not `net/http`, so it is not compatible with any of the stdlib's `http.Handler`-based middleware, and migrating away from it later means rewriting the HTTP layer, not just swapping a router.
 
 ## 4. Worked example
 
@@ -718,3 +800,8 @@ func TestServerHasProductionTimeouts(t *testing.T) {
 - **Before this:** [[Backend Request Lifecycle and Layering]]
 - **Next:** [[Building REST Endpoints]], [[Graceful Shutdown and Health Checks]]
 - **Compare with:** [[TLS, HTTPS and HTTP2 in Go Servers]] (TLS termination and HTTP/2 negotiation for the server this note builds), [[REST and HTTP API Design]] (resource and status-code design, as opposed to this note's transport mechanics)
+
+### Watch on YouTube
+
+- [Request Routing with ServeMux (Go 1.22) - Code Examples](https://www.youtube.com/watch?v=tcJYTk7bU7U) · Code & Learn · code walkthrough of the new method/path wildcard routing
+- [GopherCon Europe 2024: Jonathan Amsterdam - HTTP Routing Enhancements](https://www.youtube.com/watch?v=4VSyrJI09K0) · GopherCon Europe · deep dive on the ServeMux routing design from the Go team

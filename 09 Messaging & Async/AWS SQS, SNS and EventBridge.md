@@ -12,13 +12,15 @@ sources:
   - "AWS Lambda Developer Guide: using Lambda with Amazon SQS (batch size, ReportBatchItemFailures, visibility timeout at least six times the function timeout)"
   - "Amazon Kinesis Data Streams Developer Guide: shard limits, retention"
   - "AWS SDK for Go v2: service/sqs v1.34.8"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # AWS SQS, SNS and EventBridge
 
 > [!summary] TL;DR
-> Three managed AWS messaging services. **SQS** is a queue: workers pull messages and delete them when done. **SNS** is a topic: it pushes a copy of each message to every subscriber. **EventBridge** is an event router: it matches events against rules and sends them to targets. Most designs combine them, for example SNS or EventBridge in front of one SQS queue per consumer.
+> Three managed AWS messaging services. **SQS** is a queue: workers pull messages and delete them when done. **SNS** is a topic: it pushes a copy of each message to every subscriber.
+>
+> **EventBridge** is an event router: it matches events against rules and sends them to targets. Most designs combine them, for example SNS or EventBridge in front of one SQS queue per consumer.
 
 > [!abstract] Core idea
 > - SQS: pull, at least once, visibility timeout instead of locks, redrive to a DLQ after `maxReceiveCount` receives. FIFO queues order within a `MessageGroupId`.
@@ -27,9 +29,59 @@ updated: 2026-11-04
 > - None of them gives exactly-once processing end to end. Consumers are idempotent.
 > - For ordered, replayable, high-volume streams use Kinesis or Kafka (MSK) instead.
 
+## Start here: the basics
+
+**The problem in one story.**
+A shop's website takes an order and must send an email, update stock and alert the warehouse.
+Doing all three before replying makes the customer wait, and one slow step can fail the whole order.
+Instead the website drops a note "order 42 placed" into a managed AWS mailbox and replies at once.
+Other programs pick up the note later, each doing its own job, even if one of them was down for a minute.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Message | A small piece of data sent from one program to another | `{"orderId": 42}` |
+| Queue | A line of messages; each is taken by one worker | SQS queue `orders` |
+| Topic | A broadcast point; every subscriber gets a copy | SNS topic `order-placed` |
+| Producer / consumer | The sender / the program that reads and handles messages | Checkout API / email worker |
+| Ack (delete) | The consumer telling the queue "done, remove it" | `DeleteMessage` call |
+| At least once | A message may arrive more than once, never zero times | Same email job seen twice |
+| Idempotent | Doing it twice has the same effect as once | "Set status = paid" |
+| DLQ | A side queue for messages that keep failing | `orders-dlq` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    API["Checkout API"] --> SNS["SNS topic<br/>(copy to all)"]
+    SNS --> Q1["SQS: email queue"]
+    SNS --> Q2["SQS: stock queue"]
+    Q1 --> W1["Email worker"]
+    Q2 --> W2["Stock worker"]
+    EB["EventBridge<br/>(rules route events)"] --> Q2
+```
+
+**Analogy.** SQS is a to-do tray: each worker takes one sheet. SNS is a photocopier that drops a copy in every subscriber's tray. EventBridge is a mail room that reads each envelope and sends it to whoever asked for that kind of letter.
+Where it breaks: a real sheet taken from a tray is gone, but an SQS message only hides for a while and comes back if the worker does not delete it.
+
+**How the rest of this note builds up**
+
+- First, why these services exist (section 1) and the mental model of queue vs topic vs router (section 2).
+- Then how each works: visibility timeout, FIFO groups, filter policies, event patterns (section 3).
+- Then a Go worker with tests and a fake SQS (section 4), and a comparison with Kinesis and Kafka (sections 5-6).
+- Finally the SDE-3 deep dive: production limits, Lambda consumers, why duplicates happen and FIFO throughput (sections 7-8).
+
+> [!tip] Remember
+> SQS holds work for one worker, SNS copies to many, EventBridge routes by content; all are at least once, so make consumers idempotent.
+
 ## 1. Why it exists
 
-An e-commerce backend on AWS wants: (1) a queue for 3 million thumbnail jobs a day from S3 uploads, (2) an `order.placed` event that 5 teams consume, and (3) routing where only orders above ₹50,000 from new customers go to the fraud team. Running RabbitMQ or Kafka for this means EC2 instances, patching, disk alarms, replication and on-call. The managed trio covers all three with no servers: SQS for (1), SNS → SQS fan-out for (2), and an EventBridge rule for (3). You pay per request and the services scale on their own.
+An e-commerce backend on AWS wants: (1) a queue for 3 million thumbnail jobs a day from S3 uploads, (2) an `order.placed` event that 5 teams consume, and (3) routing where only orders above ₹50,000 from new customers go to the fraud team.
+
+Running RabbitMQ or Kafka for this means EC2 instances, patching, disk alarms, replication and on-call. The managed trio covers all three with no servers: SQS for (1), SNS → SQS fan-out for (2), and an EventBridge rule for (3).
+
+You pay per request and the services scale on their own.
 
 What you still own: visibility timeouts, retries, DLQs, idempotent consumers, IAM policies and cost. That is what this note is about.
 
@@ -75,7 +127,9 @@ Key behaviours, with their documented limits:
 - **Retention** 60 s to 14 days, default 4 days. Unprocessed messages are deleted when retention expires, DLQ or not.
 - **Delay** up to 15 minutes per queue (`DelaySeconds`) or per message (standard queues only).
 - **Message size** up to 1 MiB (raised from 256 KiB in August 2025). Larger payloads go to S3 with a pointer in the message (the "claim check" pattern; the SQS Extended Client Library does this).
-- **Redrive policy** `{"deadLetterTargetArn": "...", "maxReceiveCount": 3}`: when a message's receive count exceeds the maximum, SQS moves it to the DLQ. The DLQ must be the same type (FIFO for FIFO) in the same account and region. A **DLQ redrive** task moves messages back to the source after a fix. Design details are in [[Dead Letter Queues and Poison Messages]].
+- **Redrive policy** `{"deadLetterTargetArn": "...", "maxReceiveCount": 3}`: when a message's receive count exceeds the maximum, SQS moves it to the DLQ. The DLQ must be the same type (FIFO for FIFO) in the same account and region.
+
+  A **DLQ redrive** task moves messages back to the source after a fix. Design details are in [[Dead Letter Queues and Poison Messages]].
 
 **Standard vs FIFO queues:**
 
@@ -748,7 +802,9 @@ func TestSNSFanOutWithFilterPolicy(t *testing.T) {
 }
 ```
 
-Run with `go test -race ./sqsfake` (Go 1.24): all 4 tests pass. The FIFO test shows the ordering rule concretely: with `A1`, `A2` in group `acct-A` and `B1` in `acct-B`, the first receive returns `A1` and `B1`; `A2` waits until `A1` is deleted. One simplification: real SQS FIFO can return several messages of the same group in one batch (in order); the model returns one per group per receive, which is stricter but keeps the same ordering guarantee.
+Run with `go test -race ./sqsfake` (Go 1.24): all 4 tests pass. The FIFO test shows the ordering rule concretely: with `A1`, `A2` in group `acct-A` and `B1` in `acct-B`, the first receive returns `A1` and `B1`; `A2` waits until `A1` is deleted.
+
+One simplification: real SQS FIFO can return several messages of the same group in one batch (in order); the model returns one per group per receive, which is stricter but keeps the same ordering guarantee.
 
 ## 5. Variants and comparison
 
@@ -777,7 +833,9 @@ Run with `go test -race ./sqsfake` (Go 1.24): all 4 tests pass. The FIFO test sh
 ## 7. In production
 
 - **Real systems:** S3 event notifications → SQS → workers is the standard upload pipeline ([[AWS 07 - S3]]); SNS → SQS fan-out per microservice; EventBridge as the central bus with one custom bus per domain and cross-account rules; EventBridge Scheduler for reminders and cron.
-- **Lambda as consumer:** the SQS event source mapping polls for you. Batch size up to 10,000 for standard queues (10 for FIFO); a batch size above 10 requires a batching window of at least 1 s. Return partial batch failures (`ReportBatchItemFailures`) so one bad message does not retry the whole batch. AWS recommends a queue visibility timeout of at least six times the function timeout. Use maximum concurrency on the mapping to protect downstreams.
+- **Lambda as consumer:** the SQS event source mapping polls for you. Batch size up to 10,000 for standard queues (10 for FIFO); a batch size above 10 requires a batching window of at least 1 s.
+
+  Return partial batch failures (`ReportBatchItemFailures`) so one bad message does not retry the whole batch. AWS recommends a queue visibility timeout of at least six times the function timeout. Use maximum concurrency on the mapping to protect downstreams.
 - **Failure modes → fixes:**
 	- Visibility timeout below runtime → duplicate parallel processing; raise it above p99 and heartbeat.
 	- Messages land in the DLQ that would have succeeded → `maxReceiveCount` too low for transient errors, or visibility too short; use 3 to 5 and backoff by extending visibility on failure.
@@ -842,3 +900,8 @@ Run with `go test -race ./sqsfake` (Go 1.24): all 4 tests pass. The FIFO test sh
 - **Before this:** [[Queues vs Streams and Broker Comparison]], [[Event-Driven Architecture Basics]], [[Background Jobs and Worker Pools]]
 - **Next:** [[Dead Letter Queues and Poison Messages]], [[Delivery Semantics and Exactly-Once]], [[Message Ordering and Partition Keys]]
 - **Compare with:** [[Kafka and Event Streaming]], [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Scheduled Jobs - Cron to Durable Schedulers]]
+
+### Watch on YouTube
+
+- [AWS SQS vs SNS vs EventBridge - When to Use What?](https://www.youtube.com/watch?v=RoKAEzdcr7k) · Be A Better Dev · 22 min · 291,832 views
+- [AWS SNS Vs SQS Vs EventBridge In 2024 / When To Use What?](https://www.youtube.com/watch?v=jXQhaJIxLnE) · Cloud With Raj · 16 min · 19,346 views

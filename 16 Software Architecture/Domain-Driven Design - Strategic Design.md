@@ -9,7 +9,7 @@ sources:
   - "Vaughn Vernon, Implementing Domain-Driven Design (2013)"
   - "Alberto Brandolini, Introducing EventStorming (2021)"
   - "Martin Fowler, BoundedContext (martinfowler.com, 2014)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Domain-Driven Design - Strategic Design
@@ -25,7 +25,9 @@ updated: 2026-11-07
 
 ### Whiteboard version
 
-InvoiceOps has a `Billing` context (draft, send, cancel an invoice) and an `Accounting` context (post a ledger entry once money has actually moved). Both use the word "invoice", but they mean different things: Billing's invoice is mutable until paid; Accounting's is an immutable fact recorded after the money event. Mapping that directly onto one shared `Invoice` struct would force Accounting's immutability rule and Billing's draft/cancel rule onto the same type — a model that satisfies neither context well.
+InvoiceOps has a `Billing` context (draft, send, cancel an invoice) and an `Accounting` context (post a ledger entry once money has actually moved). Both use the word "invoice", but they mean different things: Billing's invoice is mutable until paid; Accounting's is an immutable fact recorded after the money event.
+
+Mapping that directly onto one shared `Invoice` struct would force Accounting's immutability rule and Billing's draft/cancel rule onto the same type — a model that satisfies neither context well.
 
 ```mermaid
 flowchart LR
@@ -40,15 +42,62 @@ flowchart LR
 
 Billing stays free to add a `partially_paid` status tomorrow without Accounting's ledger model ever needing to change — the anticorruption layer (ACL) absorbs that, translating only "an invoice just became Paid" into "post this fact", and nothing else crosses the boundary.
 
+## Start here: the basics
+
+**The problem in one story.**
+Billing says an "invoice" can be edited until it is paid.
+Accounting says an "invoice" is a fixed record that never changes.
+Both teams share one `Invoice` struct and keep breaking each other.
+Strategic DDD says: these are two models, give each its own boundary.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Domain | The business area the software serves | Invoicing for freelancers |
+| Model | The code's simplified version of business ideas | `Invoice` struct with its rules |
+| Bounded context | A boundary where each word has one meaning | Billing context, Accounting context |
+| Subdomain | One part of the business (core, supporting or generic) | Core: billing; generic: email sending |
+| Ubiquitous language | Shared words used by experts and code alike | "overdue" means the same in chat and code |
+| Upstream / downstream | Who supplies data and who depends on it | Billing upstream, Accounting downstream |
+| Anticorruption layer (ACL) | A translator that protects one model from another | Paid invoice becomes a `LedgerEntry` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Billing context<br/>Invoice: editable"] -- "event: invoice paid" --> ACL["ACL<br/>(translator)"]
+    ACL --> A["Accounting context<br/>LedgerEntry: fixed"]
+```
+
+**Analogy.** Countries on a map: "football" means different games in the US and the UK, and each country is right inside its own borders. Trade between them needs translators.
+Where it breaks: countries rarely redraw borders; bounded contexts get split and merged as the business learns.
+
+**How the rest of this note builds up**
+
+- First, why one shared model fails (section 1) and the countries mental model (section 2).
+- Then bounded contexts, subdomains, ubiquitous language, context-map patterns and EventStorming (section 3).
+- Then a worked InvoiceOps context map (section 4) and variants (section 5).
+- Finally the SDE-3 view: trade-offs, production pitfalls, and mapping contexts to teams and services (sections 6-8).
+
+> [!tip] Remember
+> One word, one meaning, per bounded context; translate at the borders.
+
 ## 1. Why it exists
 
-A single shared `Invoice` type, used by every team and every context in a growing company, accumulates fields for every context's needs: a `discount_reason` field Sales needs, a `gl_account` field Accounting needs, a `dunning_level` field Collections needs. Every team is afraid to change it because every other team also depends on it, so it grows forever and nobody owns it cleanly — the classic anemic, bloated domain model that forms around one "God object" shared by an entire company.
+A single shared `Invoice` type, used by every team and every context in a growing company, accumulates fields for every context's needs: a `discount_reason` field Sales needs, a `gl_account` field Accounting needs, a `dunning_level` field Collections needs.
 
-Strategic DDD's answer is not "one correct model" but "as many models as there are genuinely distinct ways of thinking about the business, each kept inside its own boundary". Billing's invoice, Accounting's ledger entry, and Collections' dunning case can all legitimately describe the same real-world paper document without being the same type in code — because each team's rules about it really are different, and forcing one shared type hides that instead of expressing it.
+Every team is afraid to change it because every other team also depends on it, so it grows forever and nobody owns it cleanly — the classic anemic, bloated domain model that forms around one "God object" shared by an entire company.
+
+Strategic DDD's answer is not "one correct model" but "as many models as there are genuinely distinct ways of thinking about the business, each kept inside its own boundary".
+
+Billing's invoice, Accounting's ledger entry, and Collections' dunning case can all legitimately describe the same real-world paper document without being the same type in code — because each team's rules about it really are different, and forcing one shared type hides that instead of expressing it.
 
 ## 2. Mental model
 
-Picture the business domain as a country, and bounded contexts as the countries on the map, each with its **own language** for the same underlying concepts — the way "football" means two different sports depending on which country you're in. A context map is the diplomatic relations between those countries: who is upstream (sets the terms), who is downstream (adapts to them), and who translates at the border.
+Picture the business domain as a country, and bounded contexts as the countries on the map, each with its **own language** for the same underlying concepts — the way "football" means two different sports depending on which country you're in.
+
+A context map is the diplomatic relations between those countries: who is upstream (sets the terms), who is downstream (adapts to them), and who translates at the border.
 
 The key discipline: **the language changes at the boundary, and that's fine.** A word crossing a context boundary is expected to be translated, not preserved. Trying to keep one universal vocabulary company-wide is what produces the bloated shared model in the first place.
 
@@ -91,7 +140,11 @@ Subdomains (problem space) and bounded contexts (solution space) are not forced 
 
 ### 3.3 Ubiquitous language
 
-Inside a bounded context, the team and the code use exactly the same words, with exactly the same meaning, in conversation, in the ticket tracker, and in the type names. If a product manager says "an invoice is **overdue** once the due date passes and no payment has posted", the code has a state (or a method) literally named `Overdue`, not `status == 3` or `isLate()`. The language is "ubiquitous" because it crosses every artifact — conversation, docs, code — inside that one context; it is explicitly *not* meant to cross into another context unchanged.
+Inside a bounded context, the team and the code use exactly the same words, with exactly the same meaning, in conversation, in the ticket tracker, and in the type names.
+
+If a product manager says "an invoice is **overdue** once the due date passes and no payment has posted", the code has a state (or a method) literally named `Overdue`, not `status == 3` or `isLate()`.
+
+The language is "ubiquitous" because it crosses every artifact — conversation, docs, code — inside that one context; it is explicitly *not* meant to cross into another context unchanged.
 
 ### 3.4 Context map: naming the relationships
 
@@ -121,11 +174,15 @@ flowchart LR
 | **Open host service / published language (OHS/PL)** | Upstream publishes a stable, documented interface (often an event schema) for many downstreams to consume | Billing publishes `InvoicePaid`/`InvoiceOverdue` domain events that Notifications, Accounting and Analytics all subscribe to |
 | **Separate ways** | No integration at all; duplicating a little logic is cheaper than coordinating | A reporting sandbox recomputes totals itself instead of calling Billing |
 
-A shared kernel is not the same mistake as the company-wide `shared` package this note warns against in the deep dive below: a kernel is a small, named, jointly-reviewed slice (one value type, one event schema) that both teams explicitly choose to co-own, while an undisciplined `shared` package accretes every type any context happened to need and nobody owns the cost of changing it. If the "shared" surface grows past a handful of types, or one team starts changing it without the other, it has stopped being a kernel and become the anti-pattern.
+A shared kernel is not the same mistake as the company-wide `shared` package this note warns against in the deep dive below: a kernel is a small, named, jointly-reviewed slice (one value type, one event schema) that both teams explicitly choose to co-own, while an undisciplined `shared` package accretes every type any context happened to need and nobody owns the cost of changing it.
+
+If the "shared" surface grows past a handful of types, or one team starts changing it without the other, it has stopped being a kernel and become the anti-pattern.
 
 ### 3.5 EventStorming (how teams find these boundaries)
 
-EventStorming is a workshop format, not a diagram notation: domain experts and engineers stand at a wall covered in paper (physical or virtual) and populate it with orange sticky notes for **domain events** ("Invoice Sent", "Payment Received", "Invoice Overdue") in the order they happen, then add commands (blue), actors (yellow), and external systems (pink) around them. Clusters of events that share vocabulary and change together, with clear "but here the word means something else" seams between clusters, are where bounded-context boundaries get proposed — the technique turns "where should the boundary go?" from an architectural guess into something the whole room can see and argue about together, before any code exists.
+EventStorming is a workshop format, not a diagram notation: domain experts and engineers stand at a wall covered in paper (physical or virtual) and populate it with orange sticky notes for **domain events** ("Invoice Sent", "Payment Received", "Invoice Overdue") in the order they happen, then add commands (blue), actors (yellow), and external systems (pink) around them.
+
+Clusters of events that share vocabulary and change together, with clear "but here the word means something else" seams between clusters, are where bounded-context boundaries get proposed — the technique turns "where should the boundary go?" from an architectural guess into something the whole room can see and argue about together, before any code exists.
 
 ## 4. Worked example
 
@@ -363,3 +420,8 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 - **Before this:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Domain-Driven Design - Tactical Patterns in Go]]
 - **Compare with:** [[Monolith vs Microservices]] (context boundary vs deployment boundary), [[Modular Monolith]] (bounded contexts without a network boundary), [[API Gateway and BFF]] (where an open host service is often exposed to external consumers)
+
+### Watch on YouTube
+
+- [Strategic Domain-Driven Design by Nick Tune #AgileIndia2019](https://www.youtube.com/watch?v=hNW8bdTw_IU) · ConfEngine · 45 min · 6,734 views
+- [Domain Driven Design: What You Need To Know](https://www.youtube.com/watch?v=4rhzdZIDX_k) · Alex Hyett · 8 min · 297,098 views

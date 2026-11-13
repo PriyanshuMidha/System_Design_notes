@@ -8,7 +8,7 @@ sources:
   - "AWS ECS Developer Guide, Task Definitions, Services and Clusters"
   - "AWS ECS Developer Guide, Amazon ECS deployment circuit breaker"
   - "AWS ECR User Guide, Image Scanning and Lifecycle Policies"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 05 - ECS, Fargate and ECR
@@ -22,9 +22,60 @@ updated: 2026-11-07
 > - Fargate vs EC2 launch type is the same compute-choice trade-off as the rest of 13: who patches the host.
 > - Rolling deployments and the deployment circuit breaker are what make `ecs update-service` safe to run without a human watching it.
 
+## Start here: the basics
+
+**The problem in one story.**
+You packed your Go API into a Docker image on your laptop, and it works.
+Now it must run on servers, three copies at once, and come back by itself if one crashes at 2 a.m.
+Doing that by hand with SSH and `docker run` breaks the moment you sleep or a machine dies.
+ECR stores your images safely, and ECS keeps the right number of copies running for you; Fargate even hides the servers.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Container image | A frozen package of your app and its dependencies | `orders-api:v42` |
+| Registry | A storage service for images you push and pull | ECR, Docker Hub |
+| Task definition | A JSON blueprint: which image, CPU, memory, ports, roles | `orders-api:7` (revision 7) |
+| Task | One running copy of a task definition | One container group serving traffic |
+| Service | Keeps N tasks running and replaces dead ones | "Always run 3 tasks" |
+| Health check | A URL the system calls to see if a copy is OK | `GET /readyz` returns 200 |
+| Rolling deployment | Replacing old copies with new ones a few at a time | Swap v41 to v42 without downtime |
+| Fargate | AWS runs the host machine; you only define tasks | No EC2 instances to patch |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    DEV["docker push"] --> ECR["ECR<br/>(image store)"]
+    ECR --> TD["Task definition<br/>(blueprint)"]
+    TD --> SVC["Service<br/>desired = 3"]
+    SVC --> T1["Task 1"]
+    SVC --> T2["Task 2"]
+    SVC --> T3["Task 3"]
+    ALB["Load balancer"] --> T1 & T2 & T3
+```
+
+**Analogy.** ECR is a recipe book, the task definition is one recipe, a task is one dish cooked from it, and the service is a head chef who always keeps three dishes on the counter and remakes any that get dropped.
+Where it breaks: a chef can taste a dish, but ECS only knows a task is "good" through the health check you define.
+
+**How the rest of this note builds up**
+
+- First, why ECS and ECR exist (section 1) and the four nested ideas: ECR, task definition, task, service (section 2).
+- Then how networking, rolling deployments, the circuit breaker and Fargate vs EC2 launch type work (section 3).
+- Then an ECS-ready Go service with health probes and graceful shutdown (section 4), and comparisons (section 5).
+- Finally the SDE-3 view: trade-offs, production practice, deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> ECR stores the image, the task definition describes it, a task runs it, and the service keeps N healthy copies alive.
+
 ## 1. Why it exists
 
-A container image sitting on your laptop does nothing for users. You need somewhere durable and access-controlled to store it (ECR), and something that keeps a target number of copies of it running, replaces ones that crash, and routes traffic to only the healthy ones (ECS). Doing this by hand — SSH to a box, `docker run`, watch it, restart it when it dies — does not survive a host failure, does not scale past one person's attention, and has no audit trail for who deployed what.
+A container image sitting on your laptop does nothing for users. You need somewhere durable and access-controlled to store it (ECR).
+
+You also need something that keeps a target number of copies of it running, replaces ones that crash, and routes traffic to only the healthy ones (ECS).
+
+Doing this by hand — SSH to a box, `docker run`, watch it, restart it when it dies — does not survive a host failure, does not scale past one person's attention, and has no audit trail for who deployed what.
 
 ECS solves the "keep N copies running" problem with a **service**, which continuously reconciles the actual running task count against the desired count — the same control-loop idea Kubernetes uses, applied through AWS's own, simpler API.
 
@@ -64,7 +115,9 @@ flowchart TB
     EP -. "PrivateLink, no NAT needed" .-> ECR
 ```
 
-Each task runs in **awsvpc** networking mode: it gets its own elastic network interface and its own security group, as if it were a small EC2 instance, instead of sharing the host's network namespace. That is what lets the ALB target group use **ip** target type (routing straight to the task's ENI IP) and what lets you scope a security group per task rather than per host.
+Each task runs in **awsvpc** networking mode: it gets its own elastic network interface and its own security group, as if it were a small EC2 instance, instead of sharing the host's network namespace.
+
+That is what lets the ALB target group use **ip** target type (routing straight to the task's ENI IP) and what lets you scope a security group per task rather than per host.
 
 ### Pulling the image
 
@@ -111,7 +164,9 @@ sequenceDiagram
     end
 ```
 
-`minimumHealthyPercent` and `maximumPercent` control how aggressively this happens: the common default (100/200) keeps all old tasks running while launching up to a full second set of new ones, so capacity never drops during the swap. The **deployment circuit breaker** watches for new tasks repeatedly failing to reach a healthy state and automatically rolls the service back to the last working task definition instead of looping forever.
+`minimumHealthyPercent` and `maximumPercent` control how aggressively this happens: the common default (100/200) keeps all old tasks running while launching up to a full second set of new ones, so capacity never drops during the swap.
+
+The **deployment circuit breaker** watches for new tasks repeatedly failing to reach a healthy state and automatically rolls the service back to the last working task definition instead of looping forever.
 
 ## 4. Worked example
 
@@ -128,7 +183,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 ### Full version
 
-A minimal ECS-ready Go HTTP service with a liveness probe (`/healthz`, always 200 while the process is alive), a readiness probe (`/readyz`, the one the ALB target-group health check polls), and a graceful `Shutdown` that flips readiness off before draining. This is what task definitions wire up as the ALB health-check path plus a `stopTimeout` long enough to let `Shutdown` finish.
+A minimal ECS-ready Go HTTP service with a liveness probe (`/healthz`, always 200 while the process is alive), a readiness probe (`/readyz`, the one the ALB target-group health check polls), and a graceful `Shutdown` that flips readiness off before draining.
+
+This is what task definitions wire up as the ALB health-check path plus a `stopTimeout` long enough to let `Shutdown` finish.
 
 ```go
 // Package ecsapp shows the shutdown sequence an ECS/Fargate task must
@@ -324,3 +381,8 @@ The old table's "Task | running container instance" line was wrong: a task is a 
 - **Before this:** [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]], [[Docker 02 - Images, Layers and Containers]]
 - **Next:** [[AWS 06 - Load Balancing (ALB vs NLB)]], [[Autoscaling]]
 - **Compare with:** [[Kubernetes Fundamentals]] (the orchestrator alternative), [[Deployment Strategies - Rolling, Blue-Green, Canary]] (deploy-level strategy this note's rolling deployment is one instance of), [[Secrets Management]] (how task-definition secrets are stored and rotated)
+
+### Watch on YouTube
+
+- [Containers on AWS Overview: ECS / EKS / Fargate / ECR](https://www.youtube.com/watch?v=AYAh6YDXuho) · TechWorld with Nana · 25 min · 645,626 views
+- [AWS ECS Fargate / Deploy ECR custom docker image into ECS Fargate / Amazon ECS Fargate / JMSTechHome](https://www.youtube.com/watch?v=_WVIAv1ryJI) · YB Madhu Sudhan Reddy · 31 min · 6,216 views

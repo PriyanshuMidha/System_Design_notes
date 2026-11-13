@@ -11,7 +11,7 @@ sources:
   - "AWS SDK for Go v2 docs: s3.PresignClient, manager.Uploader, s3 multipart upload"
   - "AWS S3 User Guide: presigned URLs, POST policy conditions, S3 Lifecycle rules for incomplete multipart uploads"
   - "tus resumable upload protocol (tus.io)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # File Uploads and Object Storage
@@ -24,6 +24,50 @@ updated: 2026-11-07
 > - `http.MaxBytesReader` plus streaming (`r.MultipartReader()` + `io.Copy`) means a 2 GB upload never sits fully in your server's RAM or a temp file it didn't ask for.
 > - A **presigned URL** lets a browser `PUT` or `POST` a file straight to S3; your API server only issues the URL and later confirms the object landed. This is the production default for anything beyond a few megabytes — it removes your server from the data path entirely.
 > - An attachment is a **row with a lifecycle** (`pending → scanned → available`), not just a file: the row exists before the bytes are durable and before a virus scan clears them, so a crash mid-upload or a flagged file is visible state, not a silent gap.
+
+## Start here: the basics
+
+**The problem in one story.**
+A user attaches a PDF invoice to their account.
+The file could be 2 KB or 2 GB, and its name or type could be a lie.
+If your server loads the whole file into memory, a few big uploads crash it.
+So you stream it, check it, and store it in object storage like S3, not on the server's disk.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Upload | Sending a file from a client to a server | Browser sends `invoice.pdf` |
+| Multipart form | An HTTP body format that carries files and fields together | `Content-Type: multipart/form-data` |
+| Stream | Process data piece by piece instead of all at once | `io.Copy` in 32 KB chunks |
+| `Content-Type` | A header that claims what kind of data this is | `application/pdf` |
+| Object storage | A service that stores files by key | S3 bucket `invoices/abc123` |
+| Presigned URL | A time-limited link that lets a client upload straight to S3 | Valid for 15 minutes |
+| Path traversal | Using `../` in a name to escape a folder | `../../etc/passwd` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Browser"] -- "1. ask for URL" --> A["Your API"]
+    A -- "2. presigned URL" --> B
+    B -- "3. PUT file" --> S3[("S3")]
+    B -- "4. confirm" --> A
+    A --> R["Attachment row:<br/>pending → available"]
+```
+
+**Analogy.** Instead of carrying a heavy parcel through your office, you give the courier a one-time pass to the warehouse.
+Where it breaks: a pass for a warehouse is not a signed cryptographic URL that expires on its own.
+
+**How the rest of this note builds up**
+
+- First, why naive uploads fail (section 1) and the mental model (section 2).
+- Then how size limits, streaming, content sniffing and presigned URLs work (section 3).
+- Then a full worked example with an attachment lifecycle (section 4) and variants (section 5).
+- Finally the SDE-3 deep dive: virus scanning, orphaned objects, and production concerns (sections 6-8).
+
+> [!tip] Remember
+> Never trust the client's name, type or size; stream with a limit, or let the client upload straight to S3.
 
 ### Whiteboard version
 
@@ -46,7 +90,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-This "works" on a demo but fails in production three separate ways: `r.FormFile` calls `ParseMultipartForm` internally, which buffers up to `maxMemory` bytes of **every** part in RAM before spilling the rest to a temp file — not just this one field; nothing checks that the bytes are actually a file type you accept; and `os.Create("/uploads/" + key)` trusts that `key` never contains a path separator, which is fine here only because `randomKey()` is trusted, but the pattern itself has no sandbox. The full version below fixes all three and adds the production path: presigned direct-to-S3 uploads.
+This "works" on a demo but fails in production three separate ways:
+
+1. `r.FormFile` calls `ParseMultipartForm` internally, which buffers up to `maxMemory` bytes of **every** part in RAM before spilling the rest to a temp file — not just this one field.
+2. Nothing checks that the bytes are actually a file type you accept.
+3. `os.Create("/uploads/" + key)` trusts that `key` never contains a path separator, which is fine here only because `randomKey()` is trusted, but the pattern itself has no sandbox.
+
+The full version below fixes all three and adds the production path: presigned direct-to-S3 uploads.
 
 ## 1. Why it exists
 
@@ -121,7 +171,9 @@ stateDiagram-v2
     available --> [*]
 ```
 
-A presigned PUT URL is not a password-protected link; it is a normal S3 request with its authorization baked into the query string (`X-Amz-Signature`, `X-Amz-Expires`, …), computed by signing locally with the server's credentials. Anyone holding the URL before it expires can perform exactly the one operation it authorizes (e.g. `PutObject` on that one key, with that one `Content-Type`), which is why the expiry is short (minutes, not hours) and why `confirm` still calls `HeadObject` server-side rather than trusting the browser's say-so.
+A presigned PUT URL is not a password-protected link; it is a normal S3 request with its authorization baked into the query string (`X-Amz-Signature`, `X-Amz-Expires`, …), computed by signing locally with the server's credentials.
+
+Anyone holding the URL before it expires can perform exactly the one operation it authorizes (e.g. `PutObject` on that one key, with that one `Content-Type`), which is why the expiry is short (minutes, not hours) and why `confirm` still calls `HeadObject` server-side rather than trusting the browser's say-so.
 
 ## 4. Worked example
 
@@ -491,7 +543,11 @@ func TestPresignPut_SignsLocallyWithoutNetwork(t *testing.T) {
 }
 ```
 
-**Measured:** built in a scratch module (`uploadsdemo`, Go 1.24.4, `github.com/aws/aws-sdk-go-v2/service/s3` v1.71.0) and run with `go vet` and `go test -race`. All 4 tests shown above passed, including the disguised-script rejection (415), the oversized-body rejection (413), the decompression-bomb guard (100×100 PNG accepted, 10,000×10,000 PNG rejected), and the presigned URL containing a real `X-Amz-Signature` and a 900-second (`15m`) `X-Amz-Expires`, computed entirely offline. The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go-v2` calls, but presigning is pure local computation — the test needs no live S3 endpoint or credentials.
+**Measured:** built in a scratch module (`uploadsdemo`, Go 1.24.4, `github.com/aws/aws-sdk-go-v2/service/s3` v1.71.0) and run with `go vet` and `go test -race`.
+
+All 4 tests shown above passed, including the disguised-script rejection (415), the oversized-body rejection (413), the decompression-bomb guard (100×100 PNG accepted, 10,000×10,000 PNG rejected), and the presigned URL containing a real `X-Amz-Signature` and a 900-second (`15m`) `X-Amz-Expires`, computed entirely offline.
+
+The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go-v2` calls, but presigning is pure local computation — the test needs no live S3 endpoint or credentials.
 
 ## 5. Variants and comparison
 
@@ -568,3 +624,8 @@ func TestPresignPut_SignsLocallyWithoutNetwork(t *testing.T) {
 - **Before this:** [[Building REST Endpoints]], [[Request Decoding, Validation and DTOs]]
 - **Next:** [[Observability in Go Services]], [[Database Access (database-sql, pgx, sqlc)]]
 - **Compare with:** [[File Upload Architecture]] (the architecture and tradeoffs this note implements in Go), [[Secrets Management]] (storing the S3/bucket credentials this note's client uses)
+
+### Watch on YouTube
+
+- [#76 Golang - Upload Files to S3 & Serve with Presigned URLs](https://www.youtube.com/watch?v=1p86t2RSHuU) · codeHeim · Go-specific walkthrough of streaming uploads and presigned URLs
+- [A Guide to S3 Pre-Signed URLs: What They Are and How They Work](https://www.youtube.com/watch?v=ITSFLfqWy8o) · Forward Networks · short conceptual explainer of presigned URL mechanics

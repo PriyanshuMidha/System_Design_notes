@@ -8,7 +8,7 @@ sources:
   - "log/slog package docs (Go 1.21+): Logger, Handler, JSONHandler, LogValuer"
   - "OpenTelemetry specification, Logs Data Model and Bridge API"
   - "Google SRE Book, ch. 6: Monitoring Distributed Systems (logs vs metrics)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Structured Logging
@@ -22,6 +22,50 @@ updated: 2026-11-07
 > - A field should be unloggable by construction when it must never appear: implement `slog.LogValuer` on the type and it always renders as `[REDACTED]`, no matter who logs the struct that holds it.
 > - The fields worth standardizing across every service are the ones that let you filter and join: `trace_id`, `request_id`, `service`, and a few domain fields — not an unbounded dump of every variable in scope.
 
+## Start here: the basics
+
+**The problem in one story.**
+A customer says "my payment failed at about 3 p.m.".
+Your server printed a million lines like `user 42 paid 19.99` that day.
+To find the right one you grep and guess, because each line is a free-form sentence.
+Structured logging writes each line as named fields, so you can just ask "show `event=payment` where `user_id=42`".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Log line | One record a program writes about something that happened | `payment failed` |
+| Log level | How serious the line is | `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| Key-value pair | A named field and its value | `user_id=42` |
+| JSON | A text format for named fields | `{"user_id":42}` |
+| Log aggregator | A tool that collects and searches logs from all servers | Loki, Elasticsearch |
+| `slog` | Go's standard structured logging package | `slog.Info("paid", "user_id", 42)` |
+| Trace ID | One ID shared by every log of a single request | `trace_id=abc123` |
+| PII | Personal data that must not leak | Email, card number |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Code calls<br/>slog.Info(msg, fields)"] --> H["Handler<br/>(JSON)"]
+    H --> O["stdout:<br/>{level, msg, user_id...}"]
+    O --> AG["Log aggregator"]
+    AG --> Q["Query:<br/>user_id=42 AND level=ERROR"]
+```
+
+**Analogy.** A printf log is a diary entry; a structured log is a row in a spreadsheet. You can sort and filter a spreadsheet, but you can only read a diary.
+Where it breaks: a spreadsheet has fixed columns, while log fields can differ per line, so teams must agree on common field names.
+
+**How the rest of this note builds up**
+
+- First, why structured logs exist (section 1) and the "rows, not sentences" model (section 2).
+- Then how `log/slog` works: levels, attributes, handlers, redaction (section 3), with a worked Go example (section 4).
+- Then other libraries, trade-offs and production practice like sampling and cost (sections 5-7).
+- Finally the SDE-3 deep dive and interview questions (sections 8-9).
+
+> [!tip] Remember
+> Log events as named fields, not sentences, so a machine can filter them and a trace ID can join them.
+
 ### Whiteboard version
 
 ```go
@@ -34,7 +78,9 @@ One call, one JSON object, one event. Everything below adds what production need
 
 ## 1. Why it exists
 
-A `printf` log line like `log.Printf("payment failed for order %d: %v", orderID, err)` is fine to read once, by eye, in a terminal. It fails the moment you need to answer "how many payment failures happened for tenant `acme` in the last hour, broken down by error code" — that requires parsing the sentence back apart with a regex that breaks the next time someone tweaks the wording.
+A `printf` log line like `log.Printf("payment failed for order %d: %v", orderID, err)` is fine to read once, by eye, in a terminal.
+
+It fails the moment you need to answer "how many payment failures happened for tenant `acme` in the last hour, broken down by error code" — that requires parsing the sentence back apart with a regex that breaks the next time someone tweaks the wording.
 
 A structured log line for the same event —
 
@@ -46,7 +92,9 @@ A structured log line for the same event —
 
 ## 2. Mental model
 
-Think of `printf` logging as handwriting a diary entry and structured logging as filling in a form. The diary entry is natural to write and read once, but a thousand diary entries can only be searched by reading them. A thousand filled-in forms can be filtered, sorted, counted and joined — because every entry put the same fact in the same named box.
+Think of `printf` logging as handwriting a diary entry and structured logging as filling in a form. The diary entry is natural to write and read once, but a thousand diary entries can only be searched by reading them.
+
+A thousand filled-in forms can be filtered, sorted, counted and joined — because every entry put the same fact in the same named box.
 
 `log/slog`'s job is to make filling in that form as easy as calling a function: `logger.Info(msg, key1, val1, key2, val2, ...)` builds one structured record; the `Handler` decides how it's rendered (JSON for machines, a human-readable line for a local terminal) and where it goes.
 
@@ -232,7 +280,9 @@ The agent is where redaction rules, batching and drop rules for low-value lines 
 | Audit logs | A separate, append-only, long-retention stream of who-did-what | Compliance, security review, "who changed this invoice" | Must be tamper-evident and kept far longer than app logs |
 
 > [!tip] Log or metric?
-> If the question is "how many/how often," it's a metric — cheaper to store and query at scale. If the question is "show me exactly what happened on this one request," it's a log. Don't log a counter you could aggregate as a metric instead (e.g. don't log every cache hit just to count the hit rate), and don't try to reconstruct per-event detail from a metric's aggregates — it can't be done.
+> If the question is "how many/how often," it's a metric — cheaper to store and query at scale. If the question is "show me exactly what happened on this one request," it's a log.
+>
+> Don't log a counter you could aggregate as a metric instead (e.g. don't log every cache hit just to count the hit rate), and don't try to reconstruct per-event detail from a metric's aggregates — it can't be done.
 
 ## 6. Trade-offs and when not to use
 
@@ -253,7 +303,9 @@ The agent is where redaction rules, batching and drop rules for low-value lines 
 
 ## 8. Deep dive
 
-- **The pipeline.** `stdout` (JSON lines) → a log-shipping agent (Fluent Bit, Vector, or the OpenTelemetry Collector's filelog/stdout receiver) → a backend (Loki, Elasticsearch, CloudWatch Logs) → retention tiers (7–14 days hot/searchable, longer cold storage for compliance). Shipping from `stdout` rather than writing to a file directly is standard in containerized deployments: the container runtime already captures `stdout`, so the agent only needs to tail it.
+- **The pipeline.** `stdout` (JSON lines) → a log-shipping agent (Fluent Bit, Vector, or the OpenTelemetry Collector's filelog/stdout receiver) → a backend (Loki, Elasticsearch, CloudWatch Logs) → retention tiers (7–14 days hot/searchable, longer cold storage for compliance).
+
+  Shipping from `stdout` rather than writing to a file directly is standard in containerized deployments: the container runtime already captures `stdout`, so the agent only needs to tail it.
 - **Hot-path cost.** Every `slog` call with attributes allocates: `slog.Attr` values and the `[]any` varargs slice both cost. For very hot paths (millions of calls/second), prefer the `LogAttrs` method with pre-built `slog.Attr` values over the variadic `Info(msg, "k", v, ...)` form, and consider sampling (log 1 in N successful requests at `Info`, but always log every `Error`).
 - **Runtime level switching.** `slog.HandlerOptions{Level: levelVar}` where `levelVar` is an `*slog.LevelVar` lets an operator flip a running process from `Info` to `Debug` via an internal admin endpoint during an incident, then flip it back — without a restart or redeploy.
 - **The `otelslog` bridge.** Rather than manually pulling `trace_id`/`span_id` out of `context` at every log call, the OTel `otelslog` handler wraps your base handler and reads the active span from context automatically, attaching the IDs to every record — the same correlation as `## 3`'s manual middleware, done once at the handler level instead of per request.
@@ -295,3 +347,7 @@ The agent is where redaction rules, batching and drop rules for low-value lines 
 - **Before this:** [[Observability Fundamentals]]
 - **Next:** [[Metrics and Prometheus]], [[Distributed Tracing with OpenTelemetry]]
 - **Compare with:** [[Observability in Go Services]] (the full Go wiring across logs, metrics and traces together)
+
+### Watch on YouTube
+
+- [Stripe's Smarter Approach to Structured Logging - Canonical Log Lines](https://www.youtube.com/watch?v=9XJtEzmzG3g) · Arpit Bhayani · 7 min · 38,159 views

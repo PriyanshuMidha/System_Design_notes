@@ -10,13 +10,15 @@ sources:
   - "WhatsApp engineering blog, 1 million is so 2011 (2012): over 2 million TCP connections on one server"
   - "Signal protocol documentation (Double Ratchet, X3DH) and WhatsApp Encryption Overview whitepaper (Sender Keys for groups, per-device keys)"
   - "RFC 6455, The WebSocket Protocol"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Chat System
 
 > [!summary] TL;DR
-> A chat system delivers messages between users in real time over long-lived connections, stores them so they can be read later on any device, and shows extras such as delivery receipts, typing indicators and online status. The core pieces are stateful connection servers (gateways), a registry that says which gateway each user is connected to, a message store partitioned by conversation, and push notifications for offline users.
+> A chat system delivers messages between users in real time over long-lived connections, stores them so they can be read later on any device, and shows extras such as delivery receipts, typing indicators and online status.
+>
+> The core pieces are stateful connection servers (gateways), a registry that says which gateway each user is connected to, a message store partitioned by conversation, and push notifications for offline users.
 
 > [!abstract] Core idea
 > - Each device keeps one WebSocket open to a **gateway**; a **session registry** (user → gateways) tells the system where to deliver.
@@ -25,9 +27,54 @@ updated: 2026-11-04
 > - Each device remembers the last sequence it has seen (a **sync cursor**) and asks for everything after it when it reconnects.
 > - Small groups copy each message to every member's gateway (write fan-out); huge channels let members fetch on read.
 
+## Start here: the basics
+
+**The problem in one story.**
+Alice types "on my way" and hits send. Bob's phone should buzz within a second.
+If Bob's phone is off, he should still see the message when he opens the app tomorrow, on his laptop too.
+Messages must appear in the same order for both of them, and a retry must never create a duplicate.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| WebSocket | A connection that stays open so the server can push data any time | Phone keeps one socket to the server |
+| Gateway | A server that holds many users' open connections | Gateway 7 holds 500k sockets |
+| Session registry | A lookup of which gateway each user is connected to | `bob → gw-7` |
+| Sequence number | A counter giving each message its place in a chat | Messages 41, 42, 43 |
+| Ack | A reply saying "I got it" | Server returns "sent" to Alice |
+| Push notification | An alert sent through Apple/Google when the app is closed | "Alice: on my way" on the lock screen |
+| Fan-out | Copying one message to many receivers | A group message to 50 members |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Alice's phone"] --> G1["Gateway A"]
+    G1 --> M["Message service:<br/>number + store"]
+    M --> R["Registry:<br/>where is Bob?"]
+    R --> G2["Gateway B"] --> B["Bob's phone"]
+    R -- "offline" --> PN["Push notification"]
+```
+
+**Analogy.** A post office: stamp each letter with the next number, file a copy, then deliver to the counter where the recipient stands (section 2 expands this).
+Where it breaks: a post office does not care about one-second delivery; chat needs open connections and live routing to feel instant.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the high-level design with send and sync paths (section 3), and estimates, API, data model and Go code (section 4).
+- Then variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production concerns, sequence numbers, presence at scale and multi-device with encryption (sections 7-8).
+
+> [!tip] Remember
+> One open socket per device, a per-conversation sequence number, a client message ID for dedupe, and a cursor to catch up.
+
 ## 1. Why it exists - requirements
 
-Polling an HTTP endpoint every 2 seconds for new messages wastes almost every request: with 20 M connected users that is 10 M requests per second that mostly return nothing, and messages still arrive up to 2 seconds late. A chat system keeps a connection open so the server can push a message the moment it is stored. See [[Real-time APIs - WebSocket, SSE and Long Polling]] for the protocol choice.
+Polling an HTTP endpoint every 2 seconds for new messages wastes almost every request: with 20 M connected users that is 10 M requests per second that mostly return nothing, and messages still arrive up to 2 seconds late.
+
+A chat system keeps a connection open so the server can push a message the moment it is stored. See [[Real-time APIs - WebSocket, SSE and Long Polling]] for the protocol choice.
 
 **Functional requirements**
 - One-to-one chats and group chats (up to, say, 1,000 members).
@@ -47,7 +94,11 @@ Polling an HTTP endpoint every 2 seconds for new messages wastes almost every re
 
 ## 2. Mental model
 
-Think of a **post office with branch counters**. Every user stands at one counter (a gateway). The central post office (the message service) stamps each letter with the next number for that conversation, files a copy in the archive (the message store), then looks up in a directory (the session registry) which counters the recipients are standing at and sends the letter there. If a recipient is not standing at any counter, the post office sends a postcard (a push notification) telling them to come and collect.
+Think of a **post office with branch counters**.
+
+Every user stands at one counter (a gateway). The central post office (the message service) stamps each letter with the next number for that conversation, files a copy in the archive (the message store), then looks up in a directory (the session registry) which counters the recipients are standing at and sends the letter there.
+
+If a recipient is not standing at any counter, the post office sends a postcard (a push notification) telling them to come and collect.
 
 Terms used below:
 - **Gateway:** a server holding many WebSocket connections. It is *stateful*: it knows which sockets belong to which users.
@@ -78,7 +129,13 @@ flowchart LR
     MS --> HIST["History API (REST)"]
 ```
 
-**Send path.** Alice's phone sends a `send` event to its gateway. The message service assigns the next sequence number for the conversation, writes the message, and only then acks Alice ("sent"). It publishes `MessageStored` to Kafka keyed by `conversation_id`, so all events for one conversation stay in order in one partition (see [[Message Ordering and Partition Keys]]). Delivery workers look up each member's live gateways and forward the message; members with no live session get a push notification.
+**Send path.** Alice's phone sends a `send` event to its gateway.
+
+The message service assigns the next sequence number for the conversation, writes the message, and only then acks Alice ("sent").
+
+It publishes `MessageStored` to Kafka keyed by `conversation_id`, so all events for one conversation stay in order in one partition (see [[Message Ordering and Partition Keys]]).
+
+Delivery workers look up each member's live gateways and forward the message; members with no live session get a push notification.
 
 ```mermaid
 sequenceDiagram
@@ -243,7 +300,11 @@ The session registry is in Redis: `sess:{user_id}` is a hash of `device_id → g
 
 ### Ordering and idempotent send in Go
 
-This models the message service's write path for one shard: a per-conversation counter gives a gapless order, and `(sender, client_msg_id)` makes resends harmless. In production the counter lives with the conversation's owner shard and the dedupe key in the store; the logic is the same. It compiles and passes `go vet` and `go test -race` on Go 1.24, with an injected clock.
+This models the message service's write path for one shard: a per-conversation counter gives a gapless order, and `(sender, client_msg_id)` makes resends harmless.
+
+In production the counter lives with the conversation's owner shard and the dedupe key in the store; the logic is the same.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24, with an injected clock.
 
 ```go
 // Package chat models the message service's write path for one shard:
@@ -422,13 +483,23 @@ The gapless sequence is what lets a device detect a missed message: if it holds 
 
 ## 8. Deep dive
 
-**Where the sequence number comes from.** A single global counter would be a bottleneck, so the counter is per conversation and owned by one place: the message service instance that owns the conversation's shard (routed by `conversation_id` with [[Consistent Hashing]]), or an atomic increment in a store such as Redis `INCR conv_seq:{c9}`. If the counter lives outside the message store, write it and the message in a way that cannot leave a gap: take the number, write the message, and if the write fails, retry with the same number rather than taking a new one.
+**Where the sequence number comes from.** A single global counter would be a bottleneck, so the counter is per conversation and owned by one place: the message service instance that owns the conversation's shard (routed by `conversation_id` with [[Consistent Hashing]]), or an atomic increment in a store such as Redis `INCR conv_seq:{c9}`.
+
+If the counter lives outside the message store, write it and the message in a way that cannot leave a gap: take the number, write the message, and if the write fails, retry with the same number rather than taking a new one.
 
 **Group fan-out cost.** For a 500-member group with 20% online, each message is 100 gateway deliveries plus 400 unread-count updates and possibly 400 push notifications. Push notifications for busy groups are usually collapsed ("12 new messages in Trip") and rate-limited per user. Typing indicators in big groups are sampled or switched off.
 
-**Presence.** Each device sends a heartbeat every 30 seconds; the registry key expires after about 90 seconds without one, at which point the user is offline and `last_seen` is written. Broadcasting every status change to every contact is the expensive part: a user with 500 contacts going online creates 500 events. Mitigations: only push presence to users who currently have a conversation with that person open, batch changes every few seconds, and let clients fetch presence on demand.
+**Presence.** Each device sends a heartbeat every 30 seconds; the registry key expires after about 90 seconds without one, at which point the user is offline and `last_seen` is written.
 
-**Multi-device.** Each device has its own row in `device_cursors` and its own entries in the registry. A message is delivered to every live device of each member, and to the sender's other devices too, so the laptop shows what the phone sent. With end-to-end encryption, each device has its own key pair, so the sender's device encrypts once per recipient device (or uses a group sender key), and a new device cannot read old history unless an existing device transfers it.
+Broadcasting every status change to every contact is the expensive part: a user with 500 contacts going online creates 500 events.
+
+Mitigations: only push presence to users who currently have a conversation with that person open, batch changes every few seconds, and let clients fetch presence on demand.
+
+**Multi-device.** Each device has its own row in `device_cursors` and its own entries in the registry.
+
+A message is delivered to every live device of each member, and to the sender's other devices too, so the laptop shows what the phone sent.
+
+With end-to-end encryption, each device has its own key pair, so the sender's device encrypts once per recipient device (or uses a group sender key), and a new device cannot read old history unless an existing device transfers it.
 
 **What end-to-end encryption removes from the server.** The server still routes, stores ciphertext, counts, and sends push notifications, but it cannot search messages, show content previews in push payloads, run content moderation or generate link previews. Those move to the clients.
 
@@ -473,3 +544,8 @@ A 45-minute script:
 - **Before this:** [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Scaling WebSockets]], [[Wide-Column Stores and Cassandra]], [[Unique ID Generation]]
 - **Next:** [[Case Study - Ticket Booking]], [[Case Study - Notification System]]
 - **Compare with:** [[Case Study - News Feed]] (fan-out of posts rather than messages), [[Pub-Sub Message Queue]] (class-level design of topics and subscribers), [[Notification Service]] (LLD twin for the push path), [[Kafka and Event Streaming]]
+
+### Watch on YouTube
+
+- [WHATSAPP System Design: Chat Messaging Systems for Interviews](https://www.youtube.com/watch?v=vvhC64hQZMk) · Gaurav Sen · 25 min · 2,110,847 views
+- [FAANG System Design Interview: Design A Chat System (WhatsApp, Facebook Messenger, Discord, Slack)](https://www.youtube.com/watch?v=okrR1KXNLtA) · ByteByteGo · 8 min · 102,951 views

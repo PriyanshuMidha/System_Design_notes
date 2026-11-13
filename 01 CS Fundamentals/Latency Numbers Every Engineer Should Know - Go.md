@@ -8,13 +8,22 @@ related: ["[[Latency Numbers Every Engineer Should Know]]", "[[How the Internet 
 sources:
   - "Jeff Dean, 'Numbers Everyone Should Know' (Google, ~2010)"
   - "Preshing on Programming, 'Numbers Every Programmer Should Know' (community-maintained update of Dean's figures)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Latency Numbers Every Engineer Should Know - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Latency Numbers Every Engineer Should Know]]: a percentile function used the same way real APM dashboards compute p50/p95/p99, a formula that proves why fan-out makes the tail worse than any single dependency, and Little's Law as three lines of Go.
+
+## Before the code
+
+- **Package and exported functions**: a capitalized name like `Percentile` is visible outside the package `latency`.
+- **Slices (`[]float64`)**: a growable view over an array; passing one shares the same backing data, which is why sorting in place affects the caller.
+- **`sort.Float64s`**: standard-library sort for a `[]float64`, ascending, in place.
+- **`append([]float64{}, s...)`**: the idiom for copying a slice into a fresh one.
+- **`testing` package**: functions named `TestXxx(t *testing.T)` run under `go test`; `t.Fatalf` fails the test.
+- **What to run**: `go vet ./... && go test -race -v ./...` inside the module folder.
 
 ## What this code shows
 
@@ -35,13 +44,18 @@ flowchart LR
 
 - Go 1.24. No external dependencies: everything is the standard library (`sort`).
 - Layout: a single-package module `latency` with `latency.go` and `latency_test.go`.
-- Run it with `go vet ./... && go test -race -v ./...`. No external service is needed; every measurement in this note comes from this code running on commodity hardware, not from a live network or database.
+- Run it with `go vet ./... && go test -race -v ./...`.
+- No external service is needed; every measurement in this note comes from this code running on commodity hardware, not from a live network or database.
 
 ## Code
 
 ### Step 1: percentiles from a batch of samples
 
-**Concept.** The theory note explains why p99 matters more than the average ([[Latency Numbers Every Engineer Should Know#p50, p95, p99: why the average lies]]): a handful of slow requests can hide inside a healthy-looking mean. `Percentile` is the computation behind that claim — the same nearest-rank-with-interpolation method Go's own benchmarking tools and most APM agents use. The alternative is a true histogram (fixed or exponential buckets), which scales to millions of samples without sorting them all, but is overkill for the batch sizes this note works with; sorting and interpolating is simpler and exact for a few thousand samples.
+**Concept.** The theory note explains why p99 matters more than the average ([[Latency Numbers Every Engineer Should Know#p50, p95, p99: why the average lies]]): a handful of slow requests can hide inside a healthy-looking mean.
+
+`Percentile` is the computation behind that claim — the same nearest-rank-with-interpolation method Go's own benchmarking tools and most APM agents use.
+
+The alternative is a true histogram (fixed or exponential buckets), which scales to millions of samples without sorting them all, but is overkill for the batch sizes this note works with; sorting and interpolating is simpler and exact for a few thousand samples.
 
 ```go
 package latency
@@ -79,7 +93,8 @@ func Percentile(samples []float64, p float64) float64 {
 1. An empty batch returns `0` rather than panicking on an out-of-range index — callers with no data yet (a brand-new counter) get a harmless zero instead of a crash.
 2. `sort.Float64s` sorts the samples in place; callers who need the unsorted order back should pass a copy, which is exactly what the tests below do.
 3. `p <= 0` and `p >= 100` are handled directly, because the interpolation formula below would otherwise need an extra bounds check on every call for these two common edge cases.
-4. `rank` converts a percentile (0–100) into a fractional index into the sorted slice. `lo` and `hi` are the two samples the real rank falls between; `frac` is how far between them it falls, and the return value linearly interpolates between the two.
+4. `rank` converts a percentile (0–100) into a fractional index into the sorted slice. `lo` and `hi` are the two samples the real rank falls between.
+5. `frac` is how far between them it falls, and the return value linearly interpolates between the two.
 
 ```mermaid
 flowchart LR
@@ -90,7 +105,11 @@ flowchart LR
 
 ### Step 2: why fan-out makes the tail worse
 
-**Concept.** This is the probability argument behind "the aggregator's tail is worse than any single dependency's tail" ([[Latency Numbers Every Engineer Should Know#Why fan-out makes the tail worse, not just the average]]). The alternative to a closed-form formula is a Monte Carlo simulation (draw `n` random outcomes many times and count how often at least one is slow) — that works too, but the formula below is exact and instant, because "at least one of n independent events happens" has a direct algebraic form.
+**Concept.** This is the probability argument behind "the aggregator's tail is worse than any single dependency's tail" ([[Latency Numbers Every Engineer Should Know#Why fan-out makes the tail worse, not just the average]]).
+
+The alternative to a closed-form formula is a Monte Carlo simulation (draw `n` random outcomes many times and count how often at least one is slow).
+
+That works too, but the formula below is exact and instant, because "at least one of n independent events happens" has a direct algebraic form.
 
 ```go
 // FanOutP99 estimates the probability that at least one of n parallel
@@ -118,7 +137,9 @@ func FanOutP99(n int) float64 {
 
 ### Step 3: Little's Law in three lines
 
-**Concept.** `L = λW` ties concurrency to arrival rate and time-in-system ([[Latency Numbers Every Engineer Should Know#Little's Law connects concurrency to the ladder]]). There is no real alternative implementation to discuss here — the formula is the whole algorithm — so the only design choice is the signature: taking `lambdaPerSec` and `wSeconds` as separate named parameters instead of a single struct keeps call sites self-documenting (`LittlesLaw(1000, 0.05)` reads naturally next to its doc comment).
+**Concept.** `L = λW` ties concurrency to arrival rate and time-in-system ([[Latency Numbers Every Engineer Should Know#Little's Law connects concurrency to the ladder]]).
+
+There is no real alternative implementation to discuss here — the formula is the whole algorithm — so the only design choice is the signature: taking `lambdaPerSec` and `wSeconds` as separate named parameters instead of a single struct keeps call sites self-documenting (`LittlesLaw(1000, 0.05)` reads naturally next to its doc comment).
 
 ```go
 // LittlesLaw returns the average number of in-flight requests L, given the
@@ -130,7 +151,9 @@ func LittlesLaw(lambdaPerSec, wSeconds float64) float64 {
 }
 ```
 
-**How it works.** A direct translation of the formula: multiply the rate of arrivals by how long each one stays, and the product is the average number present at any instant — no loop, no state, because the law holds for any stable queue regardless of its arrival or service distribution.
+**How it works.** A direct translation of the formula: multiply the rate of arrivals by how long each one stays, and the product is the average number present at any instant.
+
+There is no loop, no state, because the law holds for any stable queue regardless of its arrival or service distribution.
 
 ## Design decisions
 
@@ -202,7 +225,9 @@ func TestPercentileTailIsWorseThanMedian(t *testing.T) {
 }
 ```
 
-**How it works.** `append([]float64{}, samples...)` copies the slice before each call, since `Percentile` sorts in place — without the copy, the second call would operate on an already-sorted slice from the first call, which happens to still be correct here but would be fragile against future changes.
+**How it works.** `append([]float64{}, samples...)` copies the slice before each call, since `Percentile` sorts in place.
+
+Without the copy, the second call would operate on an already-sorted slice from the first call, which happens to still be correct here but would be fragile against future changes.
 
 **If it fails.** `p99 <= p50` would mean the rank-to-index conversion is not actually scaling with `p`, which usually points to a hardcoded index or a swapped `p`/`100-p`.
 
@@ -234,7 +259,9 @@ func TestFanOutP99GrowsWithN(t *testing.T) {
 }
 ```
 
-**How it works.** The `n=1` case is a sanity check against the formula's own definition, independent of any approximation. The monotonicity check (`50` vs `51`) catches a sign error or an inverted formula that might still happen to pass the `n=1` and `n=100` checks by coincidence.
+**How it works.** The `n=1` case is a sanity check against the formula's own definition, independent of any approximation.
+
+The monotonicity check (`50` vs `51`) catches a sign error or an inverted formula that might still happen to pass the `n=1` and `n=100` checks by coincidence.
 
 **If it fails.** `FanOutP99(1) != 0.01` means `pFast` was changed or the loop runs zero or two times instead of once. A non-monotonic result means the formula was inverted (returning `allFast` instead of `1 - allFast`, for example).
 
@@ -290,8 +317,10 @@ ok  	latency	1.440s
 
 ## Pitfalls in the code
 
-- **`Percentile` sorts its argument in place.** Calling it twice on the same slice for two different percentiles is harmless (it is already sorted the second time), but calling it on a slice you still need in its original order elsewhere will silently reorder it — copy first, as `TestPercentileTailIsWorseThanMedian` does.
-- **`FanOutP99` assumes independence.** Real downstream calls often share a bottleneck (the same database, the same network link), so the true probability of "at least one is slow" is usually higher than this formula predicts, not lower — treat the output as a floor, not a precise forecast.
+- **`Percentile` sorts its argument in place.** Calling it twice on the same slice for two different percentiles is harmless (it is already sorted the second time).
+  - But calling it on a slice you still need in its original order elsewhere will silently reorder it — copy first, as `TestPercentileTailIsWorseThanMedian` does.
+- **`FanOutP99` assumes independence.** Real downstream calls often share a bottleneck (the same database, the same network link).
+  - So the true probability of "at least one is slow" is usually higher than this formula predicts, not lower — treat the output as a floor, not a precise forecast.
 - **`LittlesLaw` assumes a stable system.** If arrivals exceed capacity for a sustained period, the queue grows without bound and the formula's "average in flight" stops being a meaningful, finite number — it describes steady state, not an overloaded one.
 
 ## Exercises

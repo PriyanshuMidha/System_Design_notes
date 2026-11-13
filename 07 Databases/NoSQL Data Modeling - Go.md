@@ -12,13 +12,22 @@ sources:
   - "AWS DynamoDB Developer Guide: partition limits (3,000 RCU and 1,000 WCU per partition), 400 KB item size, Query 1 MB page and LastEvaluatedKey, Limit applied before FilterExpression, GSIs eventually consistent, LSI 10 GB item collection limit and LSIs only at table creation, TransactWriteItems (up to 100 actions, 4 MB, two underlying writes per item), read/write capacity unit sizes (4 KB / 1 KB)"
   - "Rick Houlihan, Advanced Design Patterns for DynamoDB (AWS re:Invent 2018, DAT401)"
   - "Alex DeBrie, The DynamoDB Book (2020)"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # NoSQL Data Modeling - Go
 
 > [!summary] TL;DR
 > This note holds the runnable code behind [[NoSQL Data Modeling]]: a key builder and an in-memory `Query` for a DynamoDB single table (prefix queries, pagination with a cursor, an overloaded GSI, write sharding), plus the MongoDB invoice document and the atomic payment update written out in full.
+
+## Before the code
+
+- **String keys**: plain functions build DynamoDB keys such as `WS#acme` and `INV#2026-11#0042`.
+- **`sort` and `strings`**: the in-memory table keeps items in sort-key order and matches prefixes, like a real `Query`.
+- **Cursor pagination**: `Query` returns at most `limit` items and a cursor to continue from.
+- **`hash/fnv`**: spreads one hot key over several partition keys in a stable way.
+- **`package main`**: a small program prints the whiteboard example.
+- **Run**: `go vet ./... && go test -race ./...`, and `go run ./cmd` for the whiteboard.
 
 ## What this code shows
 
@@ -59,7 +68,11 @@ The code has two halves. The first half (steps 1 to 3) is the design on paper: t
 
 ### Step 1: the whiteboard program
 
-**Concept.** The central rule of [[NoSQL Data Modeling#3.1 Step 1: list the access patterns]] is that you list the reads first and derive the keys from them. This program prints the key each access pattern would use, so the design can be checked at a glance before any table exists. The alternative is to design entities first and discover the queries later, which is how you end up with scans; we chose to start from the queries because a DynamoDB `Query` can only touch one partition key.
+**Concept.** The central rule of [[NoSQL Data Modeling#3.1 Step 1: list the access patterns]] is that you list the reads first and derive the keys from them.
+
+This program prints the key each access pattern would use, so the design can be checked at a glance before any table exists.
+
+The alternative is to design entities first and discover the queries later, which is how you end up with scans; we chose to start from the queries because a DynamoDB `Query` can only touch one partition key.
 
 ```go
 package main
@@ -94,7 +107,11 @@ func main() {
 
 ### Step 2: the invoice document in MongoDB
 
-**Concept.** [[NoSQL Data Modeling#3.2 MongoDB: embed or reference]] says to embed what is read together and bounded in size. An invoice has a few line items and a few payments, so both are embedded; the client is only copied as a small extended reference (`_id` and `name`), because the full client changes independently ([[NoSQL Data Modeling#3.3 MongoDB design patterns]]). `total_minor` and `paid_minor` are computed fields stored on write so a list screen never sums arrays. The alternative, one collection per entity joined with `$lookup`, would cost several reads per screen.
+**Concept.** [[NoSQL Data Modeling#3.2 MongoDB: embed or reference]] says to embed what is read together and bounded in size.
+
+An invoice has a few line items and a few payments, so both are embedded; the client is only copied as a small extended reference (`_id` and `name`), because the full client changes independently ([[NoSQL Data Modeling#3.3 MongoDB design patterns]]).
+
+`total_minor` and `paid_minor` are computed fields stored on write so a list screen never sums arrays. The alternative, one collection per entity joined with `$lookup`, would cost several reads per screen.
 
 ```json
 {
@@ -140,7 +157,11 @@ flowchart TD
 
 ### Step 3: recording a payment in one atomic write
 
-**Concept.** AP6 in [[NoSQL Data Modeling#3.6 Transactions in both stores]] is "record a payment". Because the payment lives inside the invoice document, one update changes the array and the running total together, and MongoDB guarantees a single-document write is atomic, so no multi-document transaction is needed. The filter carries a guard: the update only matches when no payment with this `provider_ref` exists, which turns a retried webhook into a no-op. The alternative, a separate payments collection, would need a transaction to keep `paid_minor` consistent.
+**Concept.** AP6 in [[NoSQL Data Modeling#3.6 Transactions in both stores]] is "record a payment".
+
+Because the payment lives inside the invoice document, one update changes the array and the running total together, and MongoDB guarantees a single-document write is atomic, so no multi-document transaction is needed.
+
+The filter carries a guard: the update only matches when no payment with this `provider_ref` exists, which turns a retried webhook into a no-op. The alternative, a separate payments collection, would need a transaction to keep `paid_minor` consistent.
 
 ```json
 {
@@ -174,7 +195,11 @@ sequenceDiagram
 
 ### Step 4: the item, the key builders and the table type
 
-**Concept.** [[NoSQL Data Modeling#3.5 Single-table design]] stores several entity types in one table and tells them apart by key prefixes such as `WS#`, `INV#` and `PAY#`. The key builders below are plain functions so that every caller produces exactly the same strings; a typo in a prefix would silently create an unreachable item. The alternative is to build keys inline with string concatenation at each call site, which is where the bugs come from. `Item` has two generic index attributes (`GSI1PK`, `GSI1SK`) because an overloaded GSI reuses the same attribute for different entities.
+**Concept.** [[NoSQL Data Modeling#3.5 Single-table design]] stores several entity types in one table and tells them apart by key prefixes such as `WS#`, `INV#` and `PAY#`.
+
+The key builders below are plain functions so that every caller produces exactly the same strings; a typo in a prefix would silently create an unreachable item.
+
+The alternative is to build keys inline with string concatenation at each call site, which is where the bugs come from. `Item` has two generic index attributes (`GSI1PK`, `GSI1SK`) because an overloaded GSI reuses the same attribute for different entities.
 
 ```go
 // Package dynkeys builds DynamoDB single-table keys for InvoiceOps and
@@ -235,7 +260,9 @@ func PaymentSK(paidAt, paymentID string) string {
 
 ### Step 5: write sharding
 
-**Concept.** A single partition accepts at most 1,000 write capacity units per second ([[NoSQL Data Modeling#3.4 DynamoDB: partition key, sort key and indexes]]). When one logical key is too hot, you append a shard number to the partition key so writes spread over `n` partitions. Hashing the write key, rather than using a random number, makes the shard choice repeatable, so the same event always lands in the same shard. The price is that readers must query all `n` keys and merge.
+**Concept.** A single partition accepts at most 1,000 write capacity units per second ([[NoSQL Data Modeling#3.4 DynamoDB: partition key, sort key and indexes]]). When one logical key is too hot, you append a shard number to the partition key so writes spread over `n` partitions.
+
+Hashing the write key, rather than using a random number, makes the shard choice repeatable, so the same event always lands in the same shard. The price is that readers must query all `n` keys and merge.
 
 ```go
 // ShardedPK spreads one hot logical key over n partition keys
@@ -263,7 +290,9 @@ flowchart LR
 
 ### Step 6: the in-memory table and Put
 
-**Concept.** `Table` stands in for one DynamoDB table so we can run queries without AWS. A real table is keyed by `(PK, SK)` and `PutItem` with an existing key replaces the whole item; `Put` copies that behaviour. We use a slice and a linear scan because clarity matters more than speed here; a map keyed by `PK+SK` would be faster but would hide the sorted-order idea that `Query` needs to show.
+**Concept.** `Table` stands in for one DynamoDB table so we can run queries without AWS. A real table is keyed by `(PK, SK)` and `PutItem` with an existing key replaces the whole item; `Put` copies that behaviour.
+
+We use a slice and a linear scan because clarity matters more than speed here; a map keyed by `PK+SK` would be faster but would hide the sorted-order idea that `Query` needs to show.
 
 ```go
 // Table is an in-memory stand-in for one DynamoDB table.
@@ -289,7 +318,11 @@ func (t *Table) Put(it Item) {
 
 ### Step 7: Query with a cursor
 
-**Concept.** [[NoSQL Data Modeling#4.2 The same invoice in DynamoDB, with pagination]] explains that a `Query` reads one partition, in sort-key order, one page at a time, and returns `LastEvaluatedKey` when more remains. This function does the same on the stand-in: filter by partition and prefix, skip everything at or before the cursor, sort, then cut a page. Returning the last sort key as the cursor is the simplest cursor that works for one partition; real DynamoDB returns a map of key attributes.
+**Concept.** [[NoSQL Data Modeling#4.2 The same invoice in DynamoDB, with pagination]] explains that a `Query` reads one partition, in sort-key order, one page at a time, and returns `LastEvaluatedKey` when more remains.
+
+This function does the same on the stand-in: filter by partition and prefix, skip everything at or before the cursor, sort, then cut a page.
+
+Returning the last sort key as the cursor is the simplest cursor that works for one partition; real DynamoDB returns a map of key attributes.
 
 ```go
 // Query returns up to limit items with this PK whose SK starts with
@@ -331,7 +364,11 @@ sequenceDiagram
 
 ### Step 8: the overloaded GSI query
 
-**Concept.** [[NoSQL Data Modeling#3.4 DynamoDB: partition key, sort key and indexes]] describes a global secondary index as a second sort order of the same items. Overloading means one index serves several entities: the client row and each of its invoices share `GSI1PK = CLIENT#c_1`, so one query returns "the client and its invoices". The alternative is one index per entity, which costs more write capacity because each index is written on every change.
+**Concept.** [[NoSQL Data Modeling#3.4 DynamoDB: partition key, sort key and indexes]] describes a global secondary index as a second sort order of the same items.
+
+Overloading means one index serves several entities: the client row and each of its invoices share `GSI1PK = CLIENT#c_1`, so one query returns "the client and its invoices".
+
+The alternative is one index per entity, which costs more write capacity because each index is written on every change.
 
 ```go
 // QueryGSI1 is the same read against the overloaded index.
@@ -471,7 +508,9 @@ func TestGSIOverloadingServesClientView(t *testing.T) {
 }
 ```
 
-**If it fails.** A count other than 5 means the entities are not sharing the index key, so the client screen would need several queries. A different first key means the index sort order is wrong. Note that `META` sorts after `INV#...` because `I` is less than `M` in byte order, so the oldest invoice, not the client row, comes first.
+**If it fails.** A count other than 5 means the entities are not sharing the index key, so the client screen would need several queries. A different first key means the index sort order is wrong.
+
+Note that `META` sorts after `INV#...` because `I` is less than `M` in byte order, so the oldest invoice, not the client row, comes first.
 
 ### TestShardedPKIsStableAndSpread
 

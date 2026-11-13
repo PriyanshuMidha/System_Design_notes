@@ -11,7 +11,7 @@ sources:
   - "RFC 9700, Best Current Practice for OAuth 2.0 Security"
   - "SPIFFE specification and SPIFFE ID, spiffe.io"
   - "OWASP Password Storage Cheat Sheet"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Service-to-Service Auth - API Keys, HMAC, mTLS
@@ -26,6 +26,49 @@ updated: 2026-11-07
 > - mTLS moves identity into the TLS handshake itself: both sides present certificates, so every connection — not just every request — is authenticated.
 > - SPIFFE standardizes *what* a workload's certificate identity looks like (`spiffe://trust-domain/workload`) so a mesh of services can issue and trust short-lived certificates automatically.
 > - Classic mistake: treating a static API key as if it were a session token — it never expires, so a leaked key is a leaked identity until someone notices and rotates it.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your orders service calls the payments service.
+No human logs in, yet payments must know the caller really is orders.
+Without a check, any program on the network could ask payments to refund money.
+This note covers the three common ways machines prove who they are to each other.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Service | A program that answers requests from other programs | `payments-svc` |
+| API key | A long random string sent with each request | `X-API-Key: sk_live_...` |
+| HMAC | A signature made from the message plus a shared secret | `HMAC-SHA256(secret, body)` |
+| Replay attack | Re-sending a captured valid request | Repeating a refund call twice |
+| Timestamp / nonce | Values that make each request unique and fresh | `X-Timestamp`, a random ID |
+| TLS certificate | A signed file binding a public key to a name | `CN=orders.internal` |
+| mTLS | TLS where both sides show certificates | Orders and payments both verify each other |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    O["orders-svc"] -- "API key" --> P["payments-svc"]
+    O -- "HMAC signature<br/>of request" --> P
+    O -- "mTLS: both show<br/>certificates" --> P
+    P --> V{"Verify caller<br/>then authorize"}
+```
+
+**Analogy.** Getting into an office. An API key is a password at the door; HMAC is signing every note you pass in with ink only you and reception have; mTLS is both you and reception showing ID badges issued by the same company.
+Where it breaks: office badges are checked once at the door; services must check every single request, because there is no door.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then how API keys, HMAC signing and mTLS each work (section 3) and Go code for all three (section 4).
+- Then a side-by-side comparison (section 5).
+- Finally the SDE-3 deep dive: key rotation, replay windows, certificate lifetimes and service mesh identity (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> API keys say "I know the secret", HMAC proves this exact request wasn't changed, mTLS proves identity at the connection.
 
 ## 1. Why it exists
 
@@ -112,13 +155,19 @@ sequenceDiagram
     P-->>M: 401 signature does not match: wrong secret or tampered request
 ```
 
-Signing the **timestamp** bounds how long a captured request stays valid — typically a few minutes, matched to realistic clock skew between services. Signing the **body** means any edit, even to a single byte, breaks the signature, so a man-in-the-middle cannot alter amounts or fields and keep the original signature valid. Neither check alone is enough: a signature without a timestamp can be replayed forever; a timestamp without a signature can be forged outright.
+Signing the **timestamp** bounds how long a captured request stays valid — typically a few minutes, matched to realistic clock skew between services. Signing the **body** means any edit, even to a single byte, breaks the signature, so a man-in-the-middle cannot alter amounts or fields and keep the original signature valid.
+
+Neither check alone is enough: a signature without a timestamp can be replayed forever; a timestamp without a signature can be forged outright.
 
 ### mTLS and SPIFFE
 
-In ordinary (server-only) TLS, the client verifies the server's certificate but the server has no cryptographic idea who the client is beyond its IP. **Mutual TLS** adds a second certificate check in the other direction: the server also requests and verifies a client certificate during the handshake, so both sides authenticate before a single application byte is exchanged. The handshake mechanics themselves — the key exchange, cipher negotiation, certificate chain validation — belong to [[TLS and HTTPS]]; what matters here is the extra step mTLS adds and what identity it carries.
+In ordinary (server-only) TLS, the client verifies the server's certificate but the server has no cryptographic idea who the client is beyond its IP. **Mutual TLS** adds a second certificate check in the other direction: the server also requests and verifies a client certificate during the handshake, so both sides authenticate before a single application byte is exchanged.
 
-A raw X.509 certificate's subject (`CN=payments.internal`) is just a string with no standard shape for "which service, in which trust domain, run by which platform." **SPIFFE** (Secure Production Identity Framework for Everyone) standardizes that shape as a URI: `spiffe://acme.internal/ns/payments/sa/payments-service`. A SPIFFE-aware platform (commonly SPIRE as the issuer) hands every workload a short-lived X.509 certificate (an "SVID") carrying that URI as a Subject Alternative Name, rotated automatically every few hours — so compromise of one certificate has a short blast radius, with no manual rotation step.
+The handshake mechanics themselves — the key exchange, cipher negotiation, certificate chain validation — belong to [[TLS and HTTPS]]; what matters here is the extra step mTLS adds and what identity it carries.
+
+A raw X.509 certificate's subject (`CN=payments.internal`) is just a string with no standard shape for "which service, in which trust domain, run by which platform." **SPIFFE** (Secure Production Identity Framework for Everyone) standardizes that shape as a URI: `spiffe://acme.internal/ns/payments/sa/payments-service`.
+
+A SPIFFE-aware platform (commonly SPIRE as the issuer) hands every workload a short-lived X.509 certificate (an "SVID") carrying that URI as a Subject Alternative Name, rotated automatically every few hours — so compromise of one certificate has a short blast radius, with no manual rotation step.
 
 ```mermaid
 sequenceDiagram
@@ -136,7 +185,9 @@ sequenceDiagram
 
 ### JWT client assertions
 
-RFC 7523 defines a fourth option, mainly for authenticating to an OAuth token endpoint without ever sending a shared secret over the wire: the calling service signs a short-lived JWT with its own private key and sends that JWT as the credential (`client_assertion`). The authorization server verifies it against the client's previously-registered public key (or JWKS). This is the `private_key_jwt` method mentioned in [[OAuth 2.0 and OpenID Connect]]'s deep dive, and RFC 9700 recommends it over a plain `client_secret` for exactly this reason: a leaked assertion is useless after its short `exp`, while a leaked `client_secret` is valid until manually rotated.
+RFC 7523 defines a fourth option, mainly for authenticating to an OAuth token endpoint without ever sending a shared secret over the wire: the calling service signs a short-lived JWT with its own private key and sends that JWT as the credential (`client_assertion`).
+
+The authorization server verifies it against the client's previously-registered public key (or JWKS). This is the `private_key_jwt` method mentioned in [[OAuth 2.0 and OpenID Connect]]'s deep dive, and RFC 9700 recommends it over a plain `client_secret` for exactly this reason: a leaked assertion is useless after its short `exp`, while a leaked `client_secret` is valid until manually rotated.
 
 ## 4. Worked example
 
@@ -499,3 +550,8 @@ func TestHMACRejectsTamperedBody(t *testing.T) {
 - **Before this:** [[OAuth 2.0 and OpenID Connect]], [[JWT - Structure, Validation and Pitfalls]]
 - **Next:** [[API Abuse and Bot Protection]]; for Go implementation see [[Authentication and Authorization in Go]] and [[Secure Coding for Go Services]]
 - **Compare with:** [[OAuth 2.0 and OpenID Connect]] (user-present delegated access vs machine-to-machine identity), [[TLS and HTTPS]] (the handshake mTLS builds on), [[Webhooks - Sending and Receiving]] (HMAC signing applied to inbound webhook deliveries)
+
+### Watch on YouTube
+
+- [API Authentication EXPLAINED! 🔐 OAuth vs JWT vs API Keys 🚀](https://www.youtube.com/watch?v=GcVtElYa17s) · SoftsWeb · 9 min · 682,551 views
+- [OAuth vs JWT vs API Keys vs mTLS: Why One Request Uses Three](https://www.youtube.com/watch?v=XFIujZGk6tY) · The Control Plane · 5 min · 66 views

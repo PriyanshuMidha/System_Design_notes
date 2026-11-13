@@ -9,7 +9,7 @@ sources:
   - "Go 1.24 release notes: crypto/rand.Text"
   - "Go 1.20 release notes: fmt.Errorf with several %w verbs"
   - "PostgreSQL 17 docs: UPDATE, CREATE INDEX (partial indexes), INSERT ... ON CONFLICT"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Movie Ticket Booking
@@ -23,6 +23,46 @@ updated: 2026-11-02
 > - Holds expire after a TTL (time to live); an expired hold counts as free right away, and a sweeper cleans it up.
 > - Payment confirmation is idempotent by payment ID. A payment that arrives after its hold expired queues one refund in an outbox (a list of pending side effects saved in the same step and sent later by a relay); it never takes seats back.
 > - Classic mistake: locking seats one by one, so a failure halfway leaves a partial hold.
+
+## Start here: the basics
+
+**The problem in one story.** A big film opens and thousands of people try to book seats at once. You pick seats C5 and C6 and go to pay. While you pay, nobody else should be able to take those seats. If you never pay, they must come back for others after a few minutes.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Show | One screening of a movie at one time | Dune, Screen 2, 7 pm |
+| ShowSeat | One seat for one show (holds the state) | C5 for the 7 pm show |
+| Hold (lock) | A short reservation while you pay | C5 and C6 held for 10 minutes |
+| TTL (time to live) | How long something stays valid | Hold expires after 10 minutes |
+| All-or-nothing (atomic) | Either every step happens or none does | Lock both seats, or neither |
+| Idempotent | Doing it twice has the same effect as once | Same payment callback twice books once |
+| Webhook | The payment gateway calling your server back | "Payment P1 succeeded" |
+| Refund outbox | A saved list of refunds sent later with retries | Late payment queued for refund |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+  [*] --> Available
+  Available --> Locked: user holds seat
+  Locked --> Booked: payment confirmed
+  Locked --> Available: hold expires or fails
+  Booked --> [*]
+```
+
+**Analogy.** A shop assistant puts items aside behind the counter while you go to the cash machine; if you are not back in 10 minutes, the items go back on the shelf. Where it breaks: a real shop has one assistant, while a booking system has many servers racing for the same seat, so the "put aside" step must be atomic.
+
+**How the rest of this note builds up**
+
+- First the problem, requirements and actors (Steps 1-2), then entities like `Seat` vs `ShowSeat` (Steps 3-4).
+- Then APIs and storage with the conditional `UPDATE` (Steps 5-6) and patterns (Step 7).
+- Then the Go code and tests (Step 8): `LockSeats`, `ConfirmBooking`, late-payment refunds.
+- Finally the SDE-3 depth: edge cases, trade-offs (waiting room, per-show locks) and interview questions.
+
+> [!tip] Remember
+> State lives on ShowSeat; lock all seats or none; a late payment gets a refund, never the seats.
 
 ## Problem statement
 
@@ -42,7 +82,9 @@ booking. Expired locks must be released. Two users must never book the same seat
 6. Add the late-payment refund outbox and the PostgreSQL version of the lock.
 7. Test concurrent locking, expiry, duplicate callbacks and late payment.
 
-It tests one thing above all: **no double booking** under heavy concurrency, which needs atomic, all-or-nothing multi-seat locking with a time to live (TTL). It also tests the seat state machine, idempotent payment callbacks, the late-payment refund path, and modeling `ShowSeat` apart from `Seat`. Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
+It tests one thing above all: **no double booking** under heavy concurrency, which needs atomic, all-or-nothing multi-seat locking with a time to live (TTL). It also tests the seat state machine, idempotent payment callbacks, the late-payment refund path, and modeling `ShowSeat` apart from `Seat`.
+
+Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
 ## Step 1: Clarify requirements
 
@@ -159,7 +201,9 @@ classDiagram
     Refund ..> Refunder : sent via
 ```
 
-Composition: a theater owns its screens, a screen owns its seats, and a show owns its show-seats. Association: a show refers to a movie and a screen; a show-seat refers to a physical seat; a hold points at the show-seats it locks; a booking is created from a hold. One hold can receive several payments (a retry with a new payment ID, a double charge); at most one confirms the booking and every other one gets exactly one refund, keyed by payment ID. Dependencies on `PricingStrategy` and `Refunder` are interfaces, so Strategy and Adapter can swap them.
+Composition: a theater owns its screens, a screen owns its seats, and a show owns its show-seats. Association: a show refers to a movie and a screen; a show-seat refers to a physical seat; a hold points at the show-seats it locks; a booking is created from a hold.
+
+One hold can receive several payments (a retry with a new payment ID, a double charge); at most one confirms the booking and every other one gets exactly one refund, keyed by payment ID. Dependencies on `PricingStrategy` and `Refunder` are interfaces, so Strategy and Adapter can swap them.
 
 ```mermaid
 stateDiagram-v2
@@ -255,7 +299,9 @@ VALUES ($1, $2, 'hold expired')
 ON CONFLICT (payment_id) DO NOTHING;
 ```
 
-The conditional `UPDATE` is an atomic check-and-set: the row locks it takes last only until the transaction commits, and the hold itself (`state = 'locked'` with an expiry) is the application-level reservation that lasts 10 minutes. The trade-off against version-number checks is in [[Locking - Optimistic vs Pessimistic]]. A repository port hides all of this from the service ([[Repository and Unit of Work]]):
+The conditional `UPDATE` is an atomic check-and-set: the row locks it takes last only until the transaction commits, and the hold itself (`state = 'locked'` with an expiry) is the application-level reservation that lasts 10 minutes.
+
+The trade-off against version-number checks is in [[Locking - Optimistic vs Pessimistic]]. A repository port hides all of this from the service ([[Repository and Unit of Work]]):
 
 ```go
 package booking
@@ -369,9 +415,13 @@ sequenceDiagram
 
 How the main paths work:
 
-1. **`LockSeats`** rejects empty input and a cancelled context, then takes the mutex. Phase 1 only checks: each seat exists, is not repeated, and is free (`Available`, or `Locked` by an expired hold: lazy expiry, so correctness never waits for the sweeper). Any failure returns before anything changed. Phase 2 creates the hold with a **random ID** from `crypto/rand.Text` (Go 1.24, at least 128 bits of randomness), marks every seat, and prices each one with the strategy.
+1. **`LockSeats`** rejects empty input and a cancelled context, then takes the mutex. Phase 1 only checks: each seat exists, is not repeated, and is free (`Available`, or `Locked` by an expired hold: lazy expiry, so correctness never waits for the sweeper).
+
+   Any failure returns before anything changed. Phase 2 creates the hold with a **random ID** from `crypto/rand.Text` (Go 1.24, at least 128 bits of randomness), marks every seat, and prices each one with the strategy.
 2. **`ConfirmBooking`** returns the stored booking for a known payment ID (webhooks are retried) and `ErrRefundQueued` for a payment already sent to the outbox. Otherwise it verifies every seat is still `Locked` by **this** hold and not expired; a seat can expire and be re-locked by someone else, so the hold ID check matters.
-3. **Late payment → refund.** If the hold is gone or expired, `ConfirmBooking` releases only what the hold still owns, writes one `Refund` row keyed by payment ID, and returns an error wrapping both causes. The gateway is never called under the mutex: `ProcessRefunds` copies pending rows, calls the gateway outside the lock, and marks successes. A failed call stays pending and the next tick retries it.
+3. **Late payment → refund.** If the hold is gone or expired, `ConfirmBooking` releases only what the hold still owns, writes one `Refund` row keyed by payment ID, and returns an error wrapping both causes.
+
+   The gateway is never called under the mutex: `ProcessRefunds` copies pending rows, calls the gateway outside the lock, and marks successes. A failed call stays pending and the next tick retries it.
 4. **Amount check.** A success webhook whose amount differs from the hold amount never books: the payment is queued for refund and the hold stays, so a correct payment can still confirm it before the TTL.
 5. **`SeatState`** returns an error for an unknown show or seat; a direct `s.seats[show][seat].state` lookup would dereference a nil pointer and panic. It also applies lazy expiry, so the seat map never shows a dead hold as taken.
 
@@ -985,15 +1035,30 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 | Notify the user after booking | Publish `booking.confirmed`; [[Observer and Event Bus]] subscribers send SMS, email and the ticket QR |
 | Seat rules (no single-seat gap) | A validation chain before the lock ([[Chain of Responsibility and Pipelines]]) |
 
-**Virtual waiting room (described, not modeled).** When a hot show opens, far more users arrive than the seat service can serve. A gate in front of the booking pages gives each arriving user a signed token holding a queue position. A releaser admits tokens at a fixed rate (for example a few thousand users per minute, an estimate tuned per event), and only admitted tokens may call `LockSeats`. Everyone else sees their position. The waiting room protects the lock path from overload and makes the order fair (first come, first admitted) instead of rewarding whoever retries fastest. The system-level version is in [[Case Study - Ticket Booking]].
+**Virtual waiting room (described, not modeled).** When a hot show opens, far more users arrive than the seat service can serve. A gate in front of the booking pages gives each arriving user a signed token holding a queue position.
 
-Choices made: one in-memory mutex (simple and obviously correct; per-show locks or the database are the scale answer); pessimistic holds before payment, because users hate paying and then losing seats; lazy expiry plus a sweeper, so correctness never depends on job timing; idempotency on the payment ID, which the gateway reuses on retries; the price computed at lock time and stored on the hold, so what the user saw is what they pay; refunds through an outbox, so a gateway outage never loses a refund and never blocks the seat lock.
+A releaser admits tokens at a fixed rate (for example a few thousand users per minute, an estimate tuned per event), and only admitted tokens may call `LockSeats`.
+
+Everyone else sees their position. The waiting room protects the lock path from overload and makes the order fair (first come, first admitted) instead of rewarding whoever retries fastest. The system-level version is in [[Case Study - Ticket Booking]].
+
+Choices made:
+
+- one in-memory mutex (simple and obviously correct; per-show locks or the database are the scale answer)
+- pessimistic holds before payment, because users hate paying and then losing seats
+- lazy expiry plus a sweeper, so correctness never depends on job timing
+- idempotency on the payment ID, which the gateway reuses on retries
+- the price computed at lock time and stored on the hold, so what the user saw is what they pay
+- refunds through an outbox, so a gateway outage never loses a refund and never blocks the seat lock
 
 ## Drawing
 
 ![[Movie Ticket Booking LLD Drawing.excalidraw]]
 
-The drawing shows the entities (Theater, Screen, Seat, Movie, Show, ShowSeat, Hold, Booking with the pricing and payment interfaces), the lock → pay → confirm flow with its red failure branches (seat taken → 409, payment failed → release, payment after expiry → refund), the seat state machine, and the `show_seats`, `bookings` and `booking_seats` tables with their key constraints. Redraw from memory: Seat versus ShowSeat, the three states with five transitions, the late-payment branch into the refund outbox, and the conditional `UPDATE` plus the two unique constraints.
+The drawing shows the entities (Theater, Screen, Seat, Movie, Show, ShowSeat, Hold, Booking with the pricing and payment interfaces).
+
+It also shows the lock → pay → confirm flow with its red failure branches (seat taken → 409, payment failed → release, payment after expiry → refund), the seat state machine, and the `show_seats`, `bookings` and `booking_seats` tables with their key constraints.
+
+Redraw from memory: Seat versus ShowSeat, the three states with five transitions, the late-payment branch into the refund outbox, and the conditional `UPDATE` plus the two unique constraints.
 
 ## Interview questions
 
@@ -1018,7 +1083,11 @@ The drawing shows the entities (Theater, Screen, Seat, Movie, Show, ShowSeat, Ho
 ## Interview explanation
 
 ```text
-The core entity is ShowSeat, one row per seat per show, with three states: available, locked and booked. State lives there, not on the physical Seat. LockSeats checks every requested seat and then locks all of them in one critical section, or in one transaction with a conditional UPDATE, so a multi-seat hold is all-or-nothing and two users can never hold the same seat. Each hold has a random ID and a TTL; an expired hold counts as free on every read and lock, and a sweeper tidies it up. The payment webhook calls ConfirmBooking, which is idempotent on the payment ID, checks the paid amount, and verifies every seat is still held by that exact hold before flipping them to booked. A payment that arrives too late never steals seats back: it writes one refund row keyed by the payment ID, and a relay sends it to the gateway outside the lock, with retries. A partial unique index on active booking seats is the final guarantee against double booking.
+The core entity is ShowSeat, one row per seat per show, with three states: available, locked and booked. State lives there, not on the physical Seat. LockSeats checks every requested seat and then locks all of them in one critical section, or in one transaction with a conditional UPDATE, so a multi-seat hold is all-or-nothing and two users can never hold the same seat.
+
+Each hold has a random ID and a TTL; an expired hold counts as free on every read and lock, and a sweeper tidies it up. The payment webhook calls ConfirmBooking, which is idempotent on the payment ID, checks the paid amount, and verifies every seat is still held by that exact hold before flipping them to booked.
+
+A payment that arrives too late never steals seats back: it writes one refund row keyed by the payment ID, and a relay sends it to the gateway outside the lock, with retries. A partial unique index on active booking seats is the final guarantee against double booking.
 ```
 
 ## Cheat sheet
@@ -1036,3 +1105,8 @@ The core entity is ShowSeat, one row per seat per show, with three states: avail
 - **Before this:** [[State Machines in Go]], [[Concurrency for LLD]], [[Circuit Breaker]]
 - **Next:** [[Splitwise Expense Sharing]], [[Hotel Booking]] (the same hold pattern over date ranges)
 - **Compare with:** [[Case Study - Ticket Booking]] (the system-level design), [[Case Study - Payment System]] (webhooks and refunds), [[Locking - Optimistic vs Pessimistic]]
+
+### Watch on YouTube
+
+- [System Design of a Ticket Booking System: BookMyShow](https://www.youtube.com/watch?v=ohdu6TUoE5s) · Gaurav Sen · 77 min · 46,761 views
+- [BookMyShow Low level design with code & Concurrency / Movie Ticket Booking System Design #lld #easy](https://www.youtube.com/watch?v=t2FiaSThCw8) · Mrunmai Dahare · 33 min · 26,007 views

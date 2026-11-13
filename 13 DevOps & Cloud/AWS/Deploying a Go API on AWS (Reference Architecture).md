@@ -11,7 +11,7 @@ sources:
   - "AWS Elastic Load Balancing, Application Load Balancer health checks"
   - "AWS Pricing, NAT Gateway, Fargate, RDS (accessed 2026-11-07)"
   - "AWS Backup / RDS automated backups documentation, point-in-time recovery"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Deploying a Go API on AWS (Reference Architecture)
@@ -26,9 +26,59 @@ updated: 2026-11-07
 > - Secrets and config are **injected at deploy time** (ECS task definition + Secrets Manager/SSM), never baked into the image.
 > - Classic mistake: architecture diagrams that stop at "and then it's deployed," skipping the AZ layout, the security-group chain, and what happens when any one box dies.
 
+## Start here: the basics
+
+**The problem in one story.**
+You built a Go API that works on your laptop.
+Now real users must reach it over the internet, safely, and it must keep working if one machine or data center dies.
+You need a front door, servers, a database, secrets, and logs, wired together correctly.
+This note shows the standard AWS layout for that.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Container image | Your app packed with everything it needs to run | A Docker image in ECR |
+| ECS / Fargate | AWS service that runs containers without you managing servers | Runs 3 copies of your API |
+| ALB | Load balancer that spreads web traffic | Sends each request to a healthy task |
+| VPC / subnet | Your private network and its slices | Public subnet for ALB, private for app |
+| Security group | A firewall attached to a resource | DB only accepts the app's traffic |
+| Availability Zone (AZ) | A separate data center group | Two AZs = survive one failing |
+| Secrets Manager | Safe store for passwords and keys | DB password injected at start |
+| Health check | A regular "are you alive?" request | `GET /healthz` returns 200 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Users"] --> DNS["Route 53"]
+    DNS --> ALB["ALB (public)"]
+    ALB --> T1["ECS task, AZ A"]
+    ALB --> T2["ECS task, AZ B"]
+    T1 --> DB["RDS (Multi-AZ)"]
+    T2 --> DB
+    SM["Secrets Manager"] -.-> T1
+    SM -.-> T2
+```
+
+**Analogy.** It's a restaurant: the host (ALB) seats guests, several cooks in two kitchens (tasks in two AZs) cook, the pantry (database) is locked so only cooks get in (security groups), and recipes with secret ingredients are handed out at shift start (secrets injection).
+Where it breaks: a restaurant can't instantly clone cooks, but autoscaling can add tasks in about a minute.
+
+**How the rest of this note builds up**
+
+- First, why a reference architecture matters and the mental model of the request path (sections 1-2).
+- Then how each box works: networking, security-group chain, ECS, ALB, RDS, secrets, observability (section 3).
+- Then a full worked example and variants like Lambda or EKS (sections 4-6).
+- Finally the SDE-3 deep dive: AZ failure, RPO/RTO, and production readiness (sections 7-9).
+
+> [!tip] Remember
+> Every box in the diagram can fail, so every box needs a copy in another AZ and a health check in front.
+
 ## 1. Why it exists
 
-A single EC2 instance running a Go binary works until it doesn't: the instance's AZ has a power event, or the process crashes, or traffic triples during a sale, and there is no plan B. This note is the plan B, assembled in advance: every AWS note this folder covers ([[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]] through [[AWS 10 - CloudWatch]]) is one piece of this diagram, and this note is where they're wired together into something a team can actually run in production.
+A single EC2 instance running a Go binary works until it doesn't: the instance's AZ has a power event, or the process crashes, or traffic triples during a sale, and there is no plan B.
+
+This note is the plan B, assembled in advance: every AWS note this folder covers ([[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]] through [[AWS 10 - CloudWatch]]) is one piece of this diagram, and this note is where they're wired together into something a team can actually run in production.
 
 Concretely, this reference architecture answers five questions an interviewer — or an incident — will ask: Where does a request go on the happy path? What happens when one AZ disappears? Where do secrets come from? How does a bad deploy get undone? And roughly what does this cost per month?
 
@@ -87,7 +137,11 @@ flowchart TB
     Appb --> CW
 ```
 
-Public subnets (one per AZ) hold only the ALB and NAT gateways. Private subnets hold the ECS tasks: no public IP, outbound internet only through the NAT gateway (needed for pulling from public package registries or calling third-party APIs; **ECR and S3 are reached via VPC endpoints instead**, avoiding NAT entirely for those). Isolated subnets hold RDS and ElastiCache, with no route to the internet in either direction. See [[AWS 03 - VPC Networking]] for subnet/route-table mechanics this diagram assumes.
+Public subnets (one per AZ) hold only the ALB and NAT gateways.
+
+Private subnets hold the ECS tasks: no public IP, outbound internet only through the NAT gateway (needed for pulling from public package registries or calling third-party APIs; **ECR and S3 are reached via VPC endpoints instead**, avoiding NAT entirely for those).
+
+Isolated subnets hold RDS and ElastiCache, with no route to the internet in either direction. See [[AWS 03 - VPC Networking]] for subnet/route-table mechanics this diagram assumes.
 
 ### Security-group chain
 
@@ -99,11 +153,15 @@ flowchart LR
     AppSG -- "6379" --> CacheSG["Cache security group<br/>ingress: App-SG only"]
 ```
 
-Each security group names the **previous group as its allowed source**, not a CIDR range — so adding a new app task never requires editing the database's rules, and nothing can reach the database except traffic that already passed through the app tier. A Network ACL at the subnet boundary is a second, stateless layer most teams leave at its default-allow setting and rely on security groups for the real enforcement, per the [[AWS 03 - VPC Networking]] discussion of SG vs NACL.
+Each security group names the **previous group as its allowed source**, not a CIDR range — so adding a new app task never requires editing the database's rules, and nothing can reach the database except traffic that already passed through the app tier.
+
+A Network ACL at the subnet boundary is a second, stateless layer most teams leave at its default-allow setting and rely on security groups for the real enforcement, per the [[AWS 03 - VPC Networking]] discussion of SG vs NACL.
 
 ### Config, secrets, and health checks
 
-The ECS task definition pulls plain config from environment variables set directly in the task definition (region, log level, feature flags) and secrets (DB password, API keys) from AWS Secrets Manager or SSM Parameter Store **by reference** — the task execution role is granted `secretsmanager:GetSecretValue` for exactly those ARNs, and the value is injected into the container's environment at start time, never written to the image or to Terraform state in plaintext. See [[Secrets Management]] for the rotation and access-pattern details this reuses rather than repeats.
+The ECS task definition pulls plain config from environment variables set directly in the task definition (region, log level, feature flags) and secrets (DB password, API keys) from AWS Secrets Manager or SSM Parameter Store **by reference** — the task execution role is granted `secretsmanager:GetSecretValue` for exactly those ARNs, and the value is injected into the container's environment at start time, never written to the image or to Terraform state in plaintext.
+
+See [[Secrets Management]] for the rotation and access-pattern details this reuses rather than repeats.
 
 Health checks exist at two layers with different meanings:
 - **Liveness** (the container's own `HEALTHCHECK`, or ECS container health check): "is the process alive enough to keep running," restarts the container if it fails.
@@ -111,7 +169,9 @@ Health checks exist at two layers with different meanings:
 
 ### Scaling, observability, CI/CD and rollback
 
-ECS service auto scaling adds tasks on a target-tracking policy (CPU, or `ALBRequestCountPerTarget`); RDS read replicas and ElastiCache absorb read and cache load separately from compute scaling. Every layer reports into CloudWatch — see [[AWS 10 - CloudWatch]] for the metrics/alarms/EMF mechanics this architecture relies on for its alarms and dashboards, and [[Distributed Tracing with OpenTelemetry]] for request-level tracing across the ALB → ECS → RDS hops.
+ECS service auto scaling adds tasks on a target-tracking policy (CPU, or `ALBRequestCountPerTarget`); RDS read replicas and ElastiCache absorb read and cache load separately from compute scaling.
+
+Every layer reports into CloudWatch — see [[AWS 10 - CloudWatch]] for the metrics/alarms/EMF mechanics this architecture relies on for its alarms and dashboards, and [[Distributed Tracing with OpenTelemetry]] for request-level tracing across the ALB → ECS → RDS hops.
 
 CI/CD builds one container image per commit, pushes it to ECR, and updates the ECS service to a new task definition revision; [[CI-CD Pipelines (GitHub Actions for Go)]] covers the pipeline itself, [[Deployment Strategies - Rolling, Blue-Green, Canary]] covers how traffic shifts to the new revision, and [[Rollback and Safe Migrations]] covers undoing a bad deploy and the database-migration ordering that makes rollback safe in the first place.
 
@@ -129,7 +189,9 @@ flowchart LR
 
 ### A concrete failover: RDS Multi-AZ, numbers and code
 
-**Numbers (documented, AWS RDS User Guide):** an RDS Multi-AZ failover — triggered by an AZ outage, a patch, or a manual failover test — typically completes in **60-120 seconds**, during which the writer endpoint's DNS name resolves to nothing healthy. A Go API holding a connection pool to that endpoint sees every in-flight query fail and every new connection attempt refused until DNS re-resolves to the promoted standby.
+**Numbers (documented, AWS RDS User Guide):** an RDS Multi-AZ failover — triggered by an AZ outage, a patch, or a manual failover test — typically completes in **60-120 seconds**, during which the writer endpoint's DNS name resolves to nothing healthy.
+
+A Go API holding a connection pool to that endpoint sees every in-flight query fail and every new connection attempt refused until DNS re-resolves to the promoted standby.
 
 The fix is not "catch the error and give up" — it's a **bounded retry with backoff**, so the app self-heals the moment the standby promotes instead of needing a restart. This compiles and passes `go vet` and `go test -race` on Go 1.24:
 
@@ -252,7 +314,9 @@ func TestConnectWithBackoffGivesUpAfterMaxAttempts(t *testing.T) {
 }
 ```
 
-Both tests pass (`go test -race ./resiliency/...`), including a third test that confirms the retry loop stops within one attempt of context cancellation (e.g. the task receiving ECS's `SIGTERM` during a deploy) rather than continuing to retry into a shutdown — the cancellation check runs at the top of each attempt, so at most one more dial-and-sleep happens after `ctx` is cancelled, not an unbounded number. The schedule itself (200ms, 400ms, 800ms, ... capped at 20s, ±20% jitter) matters as much as the retry count: without jitter, every task in the service reconnects in lockstep and re-creates the exact connection storm the backoff was meant to avoid.
+Both tests pass (`go test -race ./resiliency/...`), including a third test that confirms the retry loop stops within one attempt of context cancellation (e.g. the task receiving ECS's `SIGTERM` during a deploy) rather than continuing to retry into a shutdown — the cancellation check runs at the top of each attempt, so at most one more dial-and-sleep happens after `ctx` is cancelled, not an unbounded number.
+
+The schedule itself (200ms, 400ms, 800ms, ... capped at 20s, ±20% jitter) matters as much as the retry count: without jitter, every task in the service reconnects in lockstep and re-creates the exact connection storm the backoff was meant to avoid.
 
 ### Rough monthly cost (estimate, ap-south-1, 2026-11, illustrative traffic)
 
@@ -326,38 +390,60 @@ These are the failures that show up first when a new service goes to this archit
   - **Database failover:** covered above; the same backoff pattern should wrap every external call this service's dependents might make to it, not just this service's own calls to RDS.
   - **NAT gateway data spike:** a misbehaving dependency or a missed VPC endpoint can turn routine traffic into a large, unexpected bill; alarm on NAT gateway `BytesOutToDestination` the same way you'd alarm on an error rate.
 - **What to monitor:** ALB target health (how many tasks are actually `healthy`), p50/p95/p99 latency at the ALB and at the database, ECS service running-vs-desired task count, RDS replica lag and failover events, NAT gateway bytes processed, and CloudWatch's own ingest volume (see [[AWS 10 - CloudWatch]]).
-- **Backups and DR:** RDS automated backups + point-in-time recovery (PITR) cover "restore to any second in the last N days"; cross-region snapshot copies cover "the whole region is gone," with an explicit **RPO** (how much data you can afford to lose — typically bounded by snapshot/replication frequency) and **RTO** (how long restoring takes) written down and tested, not assumed. S3 versioning plus cross-region replication covers object storage the same way.
+- **Backups and DR:** RDS automated backups + point-in-time recovery (PITR) cover "restore to any second in the last N days"; cross-region snapshot copies cover "the whole region is gone," with an explicit **RPO** (how much data you can afford to lose — typically bounded by snapshot/replication frequency) and **RTO** (how long restoring takes) written down and tested, not assumed.
+
+  S3 versioning plus cross-region replication covers object storage the same way.
 - **Dev/staging/prod parity:** the same Terraform modules (see [[Infrastructure as Code with Terraform]]) provision all three environments with different variable values (instance sizes, `desired_count`, Multi-AZ on/off for dev) — never a hand-maintained, drifted-apart staging environment that "mostly" matches prod.
 
 ## 8. Deep dive
 
-- **Why the standby doesn't take read traffic:** an RDS Multi-AZ standby (the classic, non-cluster form) is a synchronous replication target purely for failover, not a readable replica — reading from it isn't possible. If you need both HA failover and extra read capacity, add asynchronous **read replicas** alongside the Multi-AZ pair, or move to **Multi-AZ DB clusters**, which do expose a readable secondary; see [[AWS 08 - RDS and Aurora]] for the full comparison.
-- **Why ECR/S3/Logs get VPC endpoints but general internet access still needs a NAT gateway:** a VPC endpoint is a private, in-VPC route to one specific AWS service's API, with no public IP or internet gateway involved — cheaper and more isolated, but only exists for services AWS has published an endpoint for. Anything the app calls that isn't an AWS service (a third-party payment API, a public package registry at build time) has no endpoint and must route out through the NAT gateway.
+- **Why the standby doesn't take read traffic:** an RDS Multi-AZ standby (the classic, non-cluster form) is a synchronous replication target purely for failover, not a readable replica — reading from it isn't possible.
+
+  If you need both HA failover and extra read capacity, add asynchronous **read replicas** alongside the Multi-AZ pair, or move to **Multi-AZ DB clusters**, which do expose a readable secondary; see [[AWS 08 - RDS and Aurora]] for the full comparison.
+- **Why ECR/S3/Logs get VPC endpoints but general internet access still needs a NAT gateway:** a VPC endpoint is a private, in-VPC route to one specific AWS service's API, with no public IP or internet gateway involved — cheaper and more isolated, but only exists for services AWS has published an endpoint for.
+
+  Anything the app calls that isn't an AWS service (a third-party payment API, a public package registry at build time) has no endpoint and must route out through the NAT gateway.
 - **Readiness vs liveness under load, not just at startup:** a task under heavy GC pressure or a database connection-pool exhaustion event can still answer a trivial liveness ping while genuinely unable to serve real requests — a readiness check worth trusting exercises a cheap but real dependency (e.g. `SELECT 1` with a short timeout), not just "process is running."
 - **Cost vs availability isn't binary:** Single-AZ NAT (one gateway instead of two) halves the NAT cost at the price of all AZ-b egress traffic crossing an AZ boundary to reach AZ-a's NAT gateway during normal operation, and losing egress entirely if AZ-a goes down — a real trade-off some teams accept for non-critical environments and reject for production.
 
 ## 9. Interview questions
 
 > [!question]- Walk me through what happens to a request from DNS lookup to database read.
-> Route 53 resolves the domain to the ALB (optionally via CloudFront first). The ALB's listener matches the request to a target group and forwards it to a healthy ECS Fargate task in one of the private subnets. The Go process handles the request, querying RDS through the database security group (only reachable from the app security group) and optionally reading from ElastiCache first. Logs and metrics flow to CloudWatch throughout.
+> Route 53 resolves the domain to the ALB (optionally via CloudFront first). The ALB's listener matches the request to a target group and forwards it to a healthy ECS Fargate task in one of the private subnets.
+>
+> The Go process handles the request, querying RDS through the database security group (only reachable from the app security group) and optionally reading from ElastiCache first. Logs and metrics flow to CloudWatch throughout.
 
 > [!question]- An entire Availability Zone goes dark. What keeps the service up, and what doesn't?
-> The ALB stops routing to the dead AZ's targets automatically via health checks; the surviving AZ's ECS tasks keep serving (assuming `desired_count` and autoscaling account for one AZ's capacity disappearing). RDS fails over to its standby in the surviving AZ within roughly 60-120 seconds, during which the app must retry connections with backoff rather than treat the first failure as fatal. What doesn't survive automatically: anything pinned to a single AZ by configuration mistake, like a Multi-AZ-disabled RDS instance or a security group that only allowlists one AZ's subnet.
+> The ALB stops routing to the dead AZ's targets automatically via health checks; the surviving AZ's ECS tasks keep serving (assuming `desired_count` and autoscaling account for one AZ's capacity disappearing).
+>
+> RDS fails over to its standby in the surviving AZ within roughly 60-120 seconds, during which the app must retry connections with backoff rather than treat the first failure as fatal.
+>
+> What doesn't survive automatically: anything pinned to a single AZ by configuration mistake, like a Multi-AZ-disabled RDS instance or a security group that only allowlists one AZ's subnet.
 
 > [!question]- Where do database credentials live, and how do they get into the running container?
-> Not in the image, not in the task definition's plain environment variables, and not in Terraform state in plaintext. They live in Secrets Manager (or SSM Parameter Store), referenced by ARN in the ECS task definition's `secrets` block; the task execution role is granted read access to exactly that secret, and ECS injects the resolved value into the container's environment at start time.
+> Not in the image, not in the task definition's plain environment variables, and not in Terraform state in plaintext.
+>
+> They live in Secrets Manager (or SSM Parameter Store), referenced by ARN in the ECS task definition's `secrets` block; the task execution role is granted read access to exactly that secret, and ECS injects the resolved value into the container's environment at start time.
 
 > [!question]- Trap: "We have an ALB and auto scaling, so we're highly available." What's missing from that claim?
 > Compute HA alone doesn't cover the database: if RDS isn't Multi-AZ, losing its AZ takes down every app task's only data store regardless of how many app replicas exist across AZs. High availability has to be designed layer by layer — compute, database, cache, and the network path between them — not assumed from one layer's redundancy.
 
 > [!question]- Why does a NAT gateway bill matter here, and how do you avoid most of it?
-> NAT gateways charge both an hourly fee and per-GB of data processed, and by default all of a private-subnet task's outbound traffic — including pulling container images from ECR — routes through it. VPC endpoints for ECR, S3, and CloudWatch Logs give those services a private, in-VPC path that bypasses NAT entirely for that traffic, which is usually the majority of it.
+> NAT gateways charge both an hourly fee and per-GB of data processed, and by default all of a private-subnet task's outbound traffic — including pulling container images from ECR — routes through it.
+>
+> VPC endpoints for ECR, S3, and CloudWatch Logs give those services a private, in-VPC path that bypasses NAT entirely for that traffic, which is usually the majority of it.
 
 > [!question]- How does a bad deploy get detected and undone automatically?
-> The ECS deployment circuit breaker watches new tasks' health checks during a rolling deployment; if too many fail, it stops the rollout and rolls the service back to the previous task definition revision without a human needing to intervene first, though an alarm should still page so someone investigates why. See [[Rollback and Safe Migrations]] for the added care a database migration needs so this automatic rollback doesn't leave schema and code out of sync.
+> The ECS deployment circuit breaker watches new tasks' health checks during a rolling deployment; if too many fail, it stops the rollout and rolls the service back to the previous task definition revision without a human needing to intervene first, though an alarm should still page so someone investigates why.
+>
+> See [[Rollback and Safe Migrations]] for the added care a database migration needs so this automatic rollback doesn't leave schema and code out of sync.
 
 > [!question]- What's your RPO and RTO for this architecture, and how would you lower them?
-> RPO (how much data you can lose) is bounded by your backup/replication frequency — RDS automated backups with PITR gets this down to seconds for in-region loss, but cross-region DR is bounded by your cross-region snapshot or replication cadence, often minutes to hours. RTO (how long recovery takes) is bounded by how long restoring a snapshot or promoting a cross-region replica takes, plus DNS cutover time. Lowering either costs more: tighter backup cadence, a warm cross-region standby instead of cold snapshots, and lower Route 53 TTLs ahead of time so a DNS failover actually takes effect quickly.
+> RPO (how much data you can lose) is bounded by your backup/replication frequency — RDS automated backups with PITR gets this down to seconds for in-region loss, but cross-region DR is bounded by your cross-region snapshot or replication cadence, often minutes to hours.
+>
+> RTO (how long recovery takes) is bounded by how long restoring a snapshot or promoting a cross-region replica takes, plus DNS cutover time.
+>
+> Lowering either costs more: tighter backup cadence, a warm cross-region standby instead of cold snapshots, and lower Route 53 TTLs ahead of time so a DNS failover actually takes effect quickly.
 
 ## 10. Cheat sheet
 
@@ -375,3 +461,8 @@ These are the failures that show up first when a new service goes to this archit
 - **Before this:** [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]], [[AWS 02 - IAM]], [[AWS 03 - VPC Networking]], [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]], [[AWS 05 - ECS, Fargate and ECR]], [[AWS 06 - Load Balancing (ALB vs NLB)]], [[AWS 07 - S3]], [[AWS 08 - RDS and Aurora]], [[AWS 09 - Route 53 and ACM]], [[AWS 10 - CloudWatch]], [[Infrastructure as Code with Terraform]]
 - **Next:** [[CI-CD Pipelines (GitHub Actions for Go)]], [[Deployment Strategies - Rolling, Blue-Green, Canary]], [[Rollback and Safe Migrations]]
 - **Compare with:** [[Kubernetes Fundamentals]] (EKS as the compute layer instead of ECS Fargate), [[Secrets Management]] (the full secrets lifecycle this note only injects), [[Containerizing Go Services]] (what's actually running inside each ECS task)
+
+### Watch on YouTube
+
+- [Go and AWS - Code and Deploy a Serverless API](https://www.youtube.com/watch?v=zHcef4eHOc8) · freeCodeCamp.org · 104 min · 93,187 views
+- [Deploying Fleet on AWS using our Terraform reference architecture](https://www.youtube.com/watch?v=vMcP0tM6g_o) · Fleet · 11 min · 1,167 views

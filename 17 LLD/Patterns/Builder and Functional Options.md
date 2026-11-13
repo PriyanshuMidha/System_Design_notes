@@ -13,7 +13,7 @@ sources:
   - "zap docs: Option, Logger.WithOptions"
   - "OpenTelemetry Go SDK docs: sdktrace.NewTracerProvider and TracerProviderOption"
   - "pgx v5 docs: Identifier.Sanitize"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Builder and Functional Options
@@ -26,6 +26,49 @@ updated: 2026-11-02
 > - Functional options are small functions (`WithTimeout(3*time.Second)`) that each change one field of the object being built.
 > - The rule that matters: validate once, after all options are applied, and return an error instead of a half-built object.
 > - Classic mistake: a positional constructor like `New("", 0, 3, nil)` where nobody can tell which zero means "default".
+
+## Start here: the basics
+
+**The problem in one story.**
+You order a pizza. Most people want the default: medium, regular crust.
+Some people change one thing, like "extra cheese".
+It would be silly to make every customer list all 15 settings just to change one.
+This note is about letting callers set only what they care about, with safe defaults for the rest.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Constructor | A function that creates and returns a ready value | `NewAPIClient(...)` |
+| Default | The value used when the caller says nothing | timeout = 5s |
+| Struct | A Go type that groups named fields | `type Config struct{ Timeout time.Duration }` |
+| Zero value | What a Go field holds if never set | `0`, `""`, `nil` |
+| Variadic parameter | A function argument that takes any number of values | `func New(opts ...Option)` |
+| Closure | A function that remembers variables from where it was made | `func(c *Client){ c.timeout = d }` |
+| Validation | Checking the final settings make sense | reject a negative timeout |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D["Defaults"] --> O["Apply options<br/>WithTimeout, WithRetries"]
+    O --> V{"Validate once"}
+    V -- "ok" --> R["Ready object"]
+    V -- "bad" --> E["Error, no object"]
+```
+
+**Analogy.** Ordering a pizza: the menu sets defaults and you only say what to change.
+Where it breaks: a pizza shop will not refuse your order for a bad combination, but a Go constructor should return an error.
+
+**How the rest of this note builds up**
+
+- First, why positional constructors hurt and the mental model (sections 1-2).
+- Then how config structs, functional options and chained builders work, with a full Go example (sections 3-4).
+- Then how to choose between the three shapes and their trade-offs (sections 5-6).
+- Finally the SDE-3 view: production use, the deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Start from defaults, let the caller change only what differs, validate once, and return an error instead of a half-built object.
 
 ## 1. Why it exists
 
@@ -625,3 +668,7 @@ What to notice:
 - **Before this:** [[Structs, Methods and Embedding]], [[Error Handling]], [[Factory and Abstract Factory]]
 - **Next:** [[Singleton and sync.Once]]
 - **Compare with:** [[Configuration and Secrets]], [[Calling External APIs]], [[Testing in Go]]
+
+### Watch on YouTube
+
+- [Go (Golang) Functional Options Pattern](https://www.youtube.com/watch?v=5ZZwmMI897c) · Golang Cafe · 12 min · 8,490 views

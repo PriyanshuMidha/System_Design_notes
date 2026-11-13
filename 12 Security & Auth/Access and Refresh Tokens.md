@@ -9,7 +9,7 @@ sources:
   - "RFC 9700, Best Current Practice for OAuth 2.0 Security"
   - "OAuth 2.1 draft, Refresh Token Protection (rotation with reuse detection)"
   - "OWASP API Security Top 10 2023, API2 Broken Authentication"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Access and Refresh Tokens
@@ -23,15 +23,65 @@ updated: 2026-11-07
 > - Store the refresh token in an `HttpOnly`, `Secure`, `SameSite` cookie scoped to the refresh path, or in platform-secure storage on mobile — never in `localStorage`, which any XSS payload can read.
 > - This is a session-management pattern, not a JWT-only one: the access token is often (but not necessarily) a JWT; the refresh token is normally an opaque random string looked up server-side.
 
+## Start here: the basics
+
+**The problem in one story.**
+You log into a shopping app on your phone.
+You do not want to type your password every 10 minutes, so the app must remember you.
+But if someone steals that "remember me" proof, they could act as you for weeks.
+The fix: one short-lived pass for everyday calls and one long-lived pass used only to get fresh short ones.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Token | A string the server gives you that proves you logged in | `eyJhbGciOi...` or `r_8f3a...` |
+| Access token | Short-lived token sent with every API call | Valid for 10 minutes |
+| Refresh token | Long-lived token used only to get a new access token | Valid for 30 days |
+| Expiry | The time after which a token stops working | `exp = 09:10` |
+| Revoke | The server marking a token as dead before it expires | Logging out kills the refresh token |
+| Cookie (`HttpOnly`) | Browser-stored value that page JavaScript cannot read | Refresh token stored safely from XSS |
+| XSS | Attacker script running inside your page | Script reading `localStorage` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    L["Login"] --> T["Access token (10 min)<br/>+ Refresh token (30 days)"]
+    T --> API["Call API with<br/>access token"]
+    API -- "expired" --> R["POST /refresh<br/>with refresh token"]
+    R --> N["New access token<br/>+ new refresh token"]
+    N --> API
+```
+
+**Analogy.** A hotel gives you a room key card that works for one day (access token) and keeps your booking at the front desk (refresh token). When the card stops working, the desk checks your booking and prints a new card.
+Where it breaks: a hotel desk sees your face; a refresh endpoint only sees the token, so rotation and reuse detection are needed to notice a thief.
+
+**How the rest of this note builds up**
+
+- First, why one token cannot be both short and convenient (section 1) and the two-token mental model (section 2).
+- Then issuing and refreshing, rotation with reuse detection, and where each client stores tokens (section 3).
+- Then a Go implementation with tests (section 4) and a comparison of variants (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production failure modes, race conditions on refresh and revocation (sections 6-8).
+
+> [!tip] Remember
+> Short access token for every call, long refresh token for one endpoint, and rotate the refresh token each time so a replay exposes theft.
+
 ## 1. Why it exists
 
-A single long-lived token is a single point of failure: make it short enough to limit a theft's damage, and users re-authenticate every few minutes; make it long enough to be convenient, and a stolen token works for days. Two tokens resolve the conflict: the access token (what every request actually carries) stays short, and the refresh token (presented rarely, only to a single trusted endpoint) carries the convenience.
+A single long-lived token is a single point of failure: make it short enough to limit a theft's damage, and users re-authenticate every few minutes; make it long enough to be convenient, and a stolen token works for days.
 
-A concrete scenario: a mobile app with a 10-minute access token and a 30-day refresh token lets a user stay logged in for a month without re-entering a password, while a leaked access token — say, captured in a proxy log — is worthless 10 minutes later. The refresh token is the one credential that must survive theft detection, which is what rotation is for.
+Two tokens resolve the conflict: the access token (what every request actually carries) stays short, and the refresh token (presented rarely, only to a single trusted endpoint) carries the convenience.
+
+A concrete scenario: a mobile app with a 10-minute access token and a 30-day refresh token lets a user stay logged in for a month without re-entering a password, while a leaked access token — say, captured in a proxy log — is worthless 10 minutes later.
+
+The refresh token is the one credential that must survive theft detection, which is what rotation is for.
 
 ## 2. Mental model
 
-Think of a **hotel key card system with a front-desk reissue**. The access token is the card in your pocket: it works at your room door for a limited time window before it's deactivated by the lock's clock. The refresh token is your reservation confirmation at the front desk: present it, and the desk clerk deactivates your old card and hands you a freshly coded one. If someone steals your reservation confirmation and tries to use it *after* you already picked up your new card, the front desk notices a confirmation being used twice and locks the whole reservation — forcing everyone holding a card under it to come back to the desk and prove who they are again.
+Think of a **hotel key card system with a front-desk reissue**. The access token is the card in your pocket: it works at your room door for a limited time window before it's deactivated by the lock's clock.
+
+The refresh token is your reservation confirmation at the front desk: present it, and the desk clerk deactivates your old card and hands you a freshly coded one. If someone steals your reservation confirmation and tries to use it *after* you already picked up your new card, the front desk notices a confirmation being used twice and locks the whole reservation — forcing everyone holding a card under it to come back to the desk and prove who they are again.
 
 ## 3. How it works
 
@@ -356,3 +406,8 @@ func TestReuseDetectionRevokesFamily(t *testing.T) {
 - **Before this:** [[JWT - Structure, Validation and Pitfalls]], [[Sessions and Cookies]]
 - **Next:** [[OAuth 2.0 and OpenID Connect]]
 - **Compare with:** [[Authentication and Authorization in Go]] (wiring the refresh endpoint and middleware), [[Secrets Management]] (protecting the hashing/signing keys involved)
+
+### Watch on YouTube
+
+- [What are JWT Access token & Refresh token and why we need them? / Understanding JWT Tokens...](https://www.youtube.com/watch?v=ahDQI7msr0A) · Rahul Ahire · 9 min · 73,529 views
+- [What is the difference between Access Tokens & Refresh Tokens? OAuth 2.0 & OIDC (OpenID Connect)](https://www.youtube.com/watch?v=PX90GNc7xo8) · Ubisecure · 3 min · 29,524 views

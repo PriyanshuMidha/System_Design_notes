@@ -13,13 +13,23 @@ sources:
   - "CockroachDB docs: Architecture overview, Transaction layer, Transaction retry error reference, Follower reads, range_max_bytes default 512 MiB, --max-offset default 500ms"
   - "YugabyteDB docs: DocDB sharding (hash and range), transaction isolation levels"
   - "AWS docs: Amazon Aurora DSQL concurrency control"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Distributed SQL - Go
 
 > [!summary] TL;DR
 > Three small Go building blocks that a distributed SQL client or gateway relies on: a hybrid logical clock, a range router that finds and splits ranges, and a retry loop for `40001` errors. Each one is tested with `go test -race`. The concepts are explained in [[Distributed SQL]].
+
+## Before the code
+
+- **`sync.Mutex`**: guards the clock's state so concurrent `Now` and `Update` calls never go backwards.
+- **Function values** (`physNow func() int64`): the wall clock is injected, so tests can freeze or rewind time.
+- **Small interfaces** (`interface{ SQLState() string }`): matches any driver error that exposes a SQL state code like `40001`.
+- **`errors.As` and `errors.Join`**: unwrap an error to find the SQL state, and combine the database error with a context error.
+- **`context.Context` and `time.After` with `select`**: the retry loop sleeps with backoff but stops early if the request is cancelled.
+- **Goroutines and `sync.WaitGroup`**: one test hammers the clock from many goroutines under `-race`.
+- **What to run:** `go vet ./... && go test -race ./...`; the pgx snippet in step 4 is shown only, not compiled.
 
 ## What this code shows
 
@@ -40,7 +50,9 @@ flowchart LR
     fn -.->|"40001 or 40P01"| rt
 ```
 
-The three pieces are independent. A real database wires the router and the clock inside its own nodes; the retry loop is the part that your application owns. They are shown together because each solves one of the three problems that a distributed SQL database creates: where does a key live, what time is it across machines, and what do I do when the database asks me to try again.
+The three pieces are independent. A real database wires the router and the clock inside its own nodes; the retry loop is the part that your application owns.
+
+They are shown together because each solves one of the three problems that a distributed SQL database creates: where does a key live, what time is it across machines, and what do I do when the database asks me to try again.
 
 ## Setup
 
@@ -58,7 +70,13 @@ go test -race ./...
 
 ### Step 1: hybrid logical clock
 
-**Concept.** Ordering events across machines needs timestamps that respect cause and effect. Physical clocks drift apart, and a message can arrive "before" it was sent according to the receiver's clock. A hybrid logical clock (HLC, [[Distributed SQL#An HLC keeps cause before effect]]) fixes this with no special hardware: a timestamp is wall-clock nanoseconds plus a small logical counter. The clock never goes backwards, and when it receives a remote timestamp it jumps ahead of it. The alternative is Spanner's TrueTime, which needs atomic clocks and commit wait ([[Distributed SQL#Commit wait in Spanner]]), or a central timestamp oracle that adds a network hop to every transaction ([[Distributed SQL#Timestamps: TrueTime vs HLC vs a timestamp oracle]]). HLC was chosen because it needs only the standard library and ordinary NTP-synced clocks.
+**Concept.** Ordering events across machines needs timestamps that respect cause and effect. Physical clocks drift apart, and a message can arrive "before" it was sent according to the receiver's clock.
+
+A hybrid logical clock (HLC, [[Distributed SQL#An HLC keeps cause before effect]]) fixes this with no special hardware: a timestamp is wall-clock nanoseconds plus a small logical counter. The clock never goes backwards, and when it receives a remote timestamp it jumps ahead of it.
+
+The alternative is Spanner's TrueTime, which needs atomic clocks and commit wait ([[Distributed SQL#Commit wait in Spanner]]), or a central timestamp oracle that adds a network hop to every transaction ([[Distributed SQL#Timestamps: TrueTime vs HLC vs a timestamp oracle]]).
+
+HLC was chosen because it needs only the standard library and ordinary NTP-synced clocks.
 
 First, the timestamp type and its ordering:
 
@@ -183,7 +201,11 @@ sequenceDiagram
 
 ### Step 2: range router
 
-**Concept.** A distributed SQL table is a sorted key space cut into contiguous ranges, each replicated by its own Raft group ([[Distributed SQL#Range sharding with Raft per range]]). A gateway node must find the range that owns a key before it can send the request to that range's leaseholder. The router in this step is that range cache in miniature: a sorted slice of ranges plus a binary search. Ranges also split when they grow too big or too hot ([[Distributed SQL#Range splits]]). Hash sharding is the alternative; it spreads load evenly but makes range scans impossible, whereas sorted ranges keep neighbouring keys together and make scans cheap.
+**Concept.** A distributed SQL table is a sorted key space cut into contiguous ranges, each replicated by its own Raft group ([[Distributed SQL#Range sharding with Raft per range]]).
+
+A gateway node must find the range that owns a key before it can send the request to that range's leaseholder. The router in this step is that range cache in miniature: a sorted slice of ranges plus a binary search.
+
+Ranges also split when they grow too big or too hot ([[Distributed SQL#Range splits]]). Hash sharding is the alternative; it spreads load evenly but makes range scans impossible, whereas sorted ranges keep neighbouring keys together and make scans cheap.
 
 ```mermaid
 flowchart LR
@@ -292,7 +314,13 @@ flowchart LR
 
 ### Step 3: retry loop
 
-**Concept.** Distributed SQL databases run at SERIALIZABLE and detect conflicts optimistically, so a transaction can be told to restart with SQLSTATE `40001` ([[Distributed SQL#Isolation and retries]]). The database cannot retry for you because it does not know what your application code did between statements, so the client wraps the whole transaction in a retry loop. The loop must retry only errors that retrying can fix, wait with capped exponential backoff and full jitter so that many clients do not collide again at the same instant, and stop when the context is cancelled. An alternative is a driver-level retry of single statements, which is wrong for a multi-statement transaction because earlier statements would be lost.
+**Concept.** Distributed SQL databases run at SERIALIZABLE and detect conflicts optimistically, so a transaction can be told to restart with SQLSTATE `40001` ([[Distributed SQL#Isolation and retries]]).
+
+The database cannot retry for you because it does not know what your application code did between statements, so the client wraps the whole transaction in a retry loop.
+
+The loop must retry only errors that retrying can fix, wait with capped exponential backoff and full jitter so that many clients do not collide again at the same instant, and stop when the context is cancelled.
+
+An alternative is a driver-level retry of single statements, which is wrong for a multi-statement transaction because earlier statements would be lost.
 
 ```mermaid
 flowchart TD
@@ -379,7 +407,11 @@ func RunTx(ctx context.Context, maxAttempts int, fn func(ctx context.Context) er
 
 ### Step 4: using `RunTx` with pgx
 
-**Concept.** The loop above is useful only if the closure begins and commits its own transaction. If the closure reused an outer transaction, a retry would resume inside an aborted transaction and fail again. `pgx.BeginTxFunc` fits this shape: it begins, runs the function, and commits or rolls back. The business outcome "invoice was already paid" is returned as a plain error that `Retryable` does not recognise, so it stops the loop at once. This block needs pgx and a running database, so it is shown but not compiled in the tested module.
+**Concept.** The loop above is useful only if the closure begins and commits its own transaction. If the closure reused an outer transaction, a retry would resume inside an aborted transaction and fail again.
+
+`pgx.BeginTxFunc` fits this shape: it begins, runs the function, and commits or rolls back. The business outcome "invoice was already paid" is returned as a plain error that `Retryable` does not recognise, so it stops the loop at once.
+
+This block needs pgx and a running database, so it is shown but not compiled in the tested module.
 
 ```go
 err := distsql.RunTx(ctx, 5, func(ctx context.Context) error {

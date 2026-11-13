@@ -13,13 +13,15 @@ sources:
   - "Netflix Tech Blog, Completing the Netflix Cloud Migration (2016)"
   - "Twelve-Factor App, https://12factor.net (processes are stateless and share-nothing)"
   - "Burns et al., Borg, Omega, and Kubernetes (ACM Queue 2016)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Choosing Compute, Scaling and Deployment - Decision Guide
 
 > [!summary] TL;DR
-> In an HLD round the compute question is "where does my code run, how many copies, and how does it grow?". Start with the simplest thing that meets the load (one well-built service on containers behind a load balancer), keep the app stateless so you can add copies, and move to Kubernetes, serverless or microservices only when a concrete requirement forces it.
+> In an HLD round the compute question is "where does my code run, how many copies, and how does it grow?".
+>
+> Start with the simplest thing that meets the load (one well-built service on containers behind a load balancer), keep the app stateless so you can add copies, and move to Kubernetes, serverless or microservices only when a concrete requirement forces it.
 
 > [!abstract] Core idea
 > - **Compute**: VMs for full control and odd workloads, containers (ECS/Fargate) for most services, Kubernetes when you run many services and need its ecosystem, serverless for spiky or event-driven work.
@@ -27,6 +29,53 @@ updated: 2026-11-09
 > - **Scaling**: scale up while it is cheap and simple, scale out for the real ceiling and for availability. Stateless services scale by adding copies; state moves to a database, cache or queue.
 > - **Autoscale** on a signal that leads to pain (CPU, requests per pod, queue depth), not one that lags.
 > - **Multi-region** only for latency or disaster-recovery targets that one region cannot meet, because it multiplies cost and data complexity.
+
+## Start here: the basics
+
+**The problem in one story.**
+You wrote a food ordering service and it runs on one server.
+Then a sale brings 10 times the usual traffic and the server falls over.
+You must decide where the code runs (a server, a container, a function), how many copies run, and how new versions go out without breaking things.
+This guide helps you pick the simplest option that survives the load.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| VM (virtual machine) | A rented computer with its own OS | One EC2 instance |
+| Container | Your app plus its libraries, packed to run anywhere | A Docker image of the API |
+| Kubernetes | A system that runs and restarts many containers for you | 40 pods across 6 nodes |
+| Serverless | You upload a function; the cloud runs copies on demand | AWS Lambda resizing images |
+| Load balancer | Spreads requests across copies of a service | 3,500 RPS split over 8 pods |
+| Stateless | A copy keeps no user data in memory between requests | Any pod can serve any user |
+| Scale up / scale out | Bigger machine / more machines | 8 to 32 cores / 4 to 12 pods |
+| Autoscaling | Adding or removing copies automatically by a signal | Add pods when CPU > 60% |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U[Users] --> LB[Load balancer]
+    LB --> P1[Copy 1]
+    LB --> P2[Copy 2]
+    LB --> P3[Copy 3 added by autoscaler]
+    P1 --> DB[(Database holds the state)]
+    P2 --> DB
+    P3 --> DB
+```
+
+**Analogy.** A restaurant kitchen: at rush hour you add more cooks (scale out) or buy a bigger stove (scale up). Recipes live in a shared book, so any cook can make any dish (stateless).
+Where it breaks: new cooks take minutes to arrive, while software copies can start in seconds, or suffer a cold start delay.
+
+**How the rest of this note builds up**
+
+- First, why it exists and the mental model (sections 1-2).
+- Then each decision (section 3): compute options, VMs vs containers, Kubernetes, serverless limits, monolith vs microservices, scaling, state, autoscaling, multi-region, deployment.
+- Then a worked example and comparison tables (sections 4-5).
+- Finally the SDE-3 deep dive (section 8): scale-up for databases, Kubernetes requests and limits, cold starts, headroom arithmetic and stateful workloads.
+
+> [!tip] Remember
+> Start simple and stateless, add copies to scale, and add Kubernetes, serverless or microservices only when a real need forces it.
 
 ## 1. Why it exists
 
@@ -133,7 +182,11 @@ If none hold, ECS on Fargate is less work. See [[Kubernetes Fundamentals]] and [
 
 **In plain words.** You upload a function; the provider runs copies when events arrive and scales them for you.
 
-**Limits to quote.** AWS Lambda has a maximum timeout of 15 minutes and a default account concurrency limit of 1,000 per Region (raisable). Cold starts add latency on the first request to a new instance. Each concurrent request uses its own instance, so a database with 100 connections can be exhausted by 1,000 concurrent functions unless you use a proxy or pool.
+**Limits to quote.** AWS Lambda has a maximum timeout of 15 minutes and a default account concurrency limit of 1,000 per Region (raisable).
+
+Cold starts add latency on the first request to a new instance.
+
+Each concurrent request uses its own instance, so a database with 100 connections can be exhausted by 1,000 concurrent functions unless you use a proxy or pool.
 
 ```mermaid
 sequenceDiagram
@@ -424,7 +477,12 @@ Provisioned concurrency keeps warm instances ready (you pay for them), smaller d
 
 ### 8.4 Capacity headroom arithmetic
 
-If one pod handles 600 RPS at the p99 target and peak is 3,500 RPS, you need ceil(3500/600) = 6 pods. Add 30% headroom for deploys and failures: 8 pods. With 3 AZs, lose one AZ and you still need 6, so 9 pods spread 3-3-3 survive an AZ outage with 6 left. This N+1 or AZ-loss sizing is what interviewers want to hear. See [[Back-of-the-Envelope Estimation]].
+If one pod handles 600 RPS at the p99 target and peak is 3,500 RPS, you need ceil(3500/600) = 6 pods.
+
+1. Add 30% headroom for deploys and failures: 8 pods.
+2. With 3 AZs, lose one AZ and you still need 6, so 9 pods spread 3-3-3 survive an AZ outage with 6 left.
+
+This N+1 or AZ-loss sizing is what interviewers want to hear. See [[Back-of-the-Envelope Estimation]].
 
 ### 8.5 Stateful workloads on Kubernetes
 
@@ -497,3 +555,8 @@ StatefulSets give stable identity and storage, but running a database on Kuberne
 - Resilience: [[Multi-Region Architecture]], [[High Availability and Failover]], [[Cloud Native and the 12-Factor App]]
 - Deploy: [[Deployment Strategies - Rolling, Blue-Green, Canary]], [[Feature Flags]], [[Rollback and Safe Migrations]]
 - Next: [[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]]
+
+### Watch on YouTube
+
+- [Choosing the Right Approach for Scaling Your Application](https://www.youtube.com/watch?v=Az74cD5q4u0) · Caploitte · 4 min · 348 views
+- [Kubernetes Day 8 / Deployment Explained Step-by-Step / Rollout, Rollback, Scaling & CKA Practice](https://www.youtube.com/watch?v=W9ZnUexlXuU) · DevOpsFusion · 27 min · 349 views

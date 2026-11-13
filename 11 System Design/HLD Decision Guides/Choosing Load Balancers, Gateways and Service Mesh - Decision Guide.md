@@ -16,7 +16,7 @@ sources:
   - "Lyft Engineering, Envoy: the open source edge and service proxy (2016, created at Lyft)"
   - "Netflix Tech Blog, Open Sourcing Zuul 2 (2018) and Netflix Edge Gateway"
   - "gRPC docs, Load Balancing in gRPC (long-lived HTTP/2 connections need L7 or client-side balancing)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Choosing Load Balancers, Gateways and Service Mesh - Decision Guide
@@ -30,6 +30,55 @@ updated: 2026-11-09
 > - **API gateway** is the front door for external clients; **BFF** is a gateway shaped per client; **service mesh** controls service-to-service traffic.
 > - Algorithm: round robin for equal backends and short requests, least request for uneven work, consistent hash when the key must stick.
 > - Default answer: managed L7 (ALB) at the edge, an API gateway only if you need its features, and no mesh until pain proves you need one.
+
+## Start here: the basics
+
+**The problem in one story**
+
+A popular shop opens one checkout counter. A queue forms out the door.
+The owner opens ten counters and puts a greeter at the entrance who points each shopper to a free counter.
+If one counter closes, the greeter stops sending people there.
+A load balancer is that greeter for web requests.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Server / backend | A machine that runs your app and answers requests | One of 10 copies of the order service |
+| Request | One message a client sends and waits on | `GET /menu` |
+| DNS | The internet's phone book: name to IP address | `api.shop.com` → `52.1.2.3` |
+| L4 (transport layer) | Routing that only sees IP and port, not the content | Forward any TCP connection on port 443 |
+| L7 (application layer) | Routing that reads the HTTP request itself | Send `/images/*` to the image service |
+| Health check | A periodic "are you alive?" ping to each backend | Call `/healthz` every 5 seconds |
+| Gateway | A front door that adds auth, rate limits, routing | Reject requests with no valid token |
+| Service mesh | Small proxies beside each service that handle calls between services | Envoy sidecar adds retries and mTLS |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U[Users] --> D[DNS]
+    D --> LB[Load balancer]
+    LB --> GW[API gateway]
+    GW --> S1[Service A]
+    GW --> S2[Service B]
+    S1 -. mesh sidecars .- S2
+```
+
+**Analogy**
+
+A load balancer is the greeter at a busy shop sending each shopper to an open counter.
+Where it breaks: a greeter cannot hold a phone call open for an hour, but an L4 balancer can keep one long connection pinned to one backend, which is why gRPC needs care.
+
+**How the rest of this note builds up**
+
+- First, why balancing exists and a mental model of the layers (sections 1-2).
+- Then how DNS, L4, L7, gateways, BFFs and algorithms work (section 3), with a worked example (section 4).
+- Next, the comparison tables, trade-offs and production lessons (sections 5-7).
+- Finally, the SDE-3 deep dive on power of two choices, health checks, timeouts, stickiness and the mesh retry trap, plus drills and interview questions (sections 8-12).
+
+> [!tip] Remember
+> Start with one managed L7 balancer; add a gateway or a mesh only when a real need names it.
 
 ## 1. Why it exists
 
@@ -462,3 +511,8 @@ Mesh retries are easy to enable globally. With 3 layers each retrying 3 times, o
 - Resilience: [[Circuit Breaker]], [[Timeouts, Retries and Backoff]], [[Graceful Shutdown and Health Checks]]
 - Architecture: [[Monolith vs Microservices]]
 - Before this guide: [[Choosing Compute, Scaling and Deployment - Decision Guide]]
+
+### Watch on YouTube
+
+- [Istio & Service Mesh - simply explained in 15 mins](https://www.youtube.com/watch?v=16fgzklcF7Y) · TechWorld with Nana · 16 min · 829,846 views
+- [Istio Service Mesh Explained](https://www.youtube.com/watch?v=6zDrLvpfCK4) · IBM Technology · 5 min · 217,723 views

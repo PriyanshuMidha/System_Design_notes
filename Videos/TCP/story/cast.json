@@ -1,0 +1,9 @@
+{
+  "N":    {"voice": "en-US-EmmaMultilingualNeural", "rate": 4,  "pitch": 0,  "volume": 0},
+  "TARA": {"voice": "en-US-AriaNeural",             "rate": 4,  "pitch": 0,  "volume": 0},
+  "REMY": {"voice": "en-US-ChristopherNeural",      "rate": 6,  "pitch": 3,  "volume": 0},
+  "REX":  {"voice": "en-US-GuyNeural",              "rate": -4, "pitch": -4, "volume": 0},
+  "CORA": {"voice": "en-AU-NatashaNeural",          "rate": 2,  "pitch": 1,  "volume": 0},
+  "NATE": {"voice": "en-GB-RyanNeural",             "rate": -2, "pitch": -2, "volume": 0},
+  "KIP":  {"voice": "en-US-RogerNeural",            "rate": -4, "pitch": -4, "volume": 0}
+}

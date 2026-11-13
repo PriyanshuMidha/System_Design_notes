@@ -10,13 +10,22 @@ sources:
   - "Love, Linux Kernel Development, 3rd ed., ch. 5 (system calls)"
   - "Go runtime source, runtime/sys_linux_amd64.s and runtime/proc.go (entersyscall/exitsyscall), Go 1.24"
   - "strace(1) man page"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # System Calls and User vs Kernel Mode - Go
 
 > [!summary] TL;DR
 > This code measures the real cost of a genuine, always-trapping system call (`write` to `/dev/null`), contrasts it with a syscall-shaped library call that may be cached (`os.Getpid`), and with a pure userspace function call that touches the kernel at all. It gives the three numbers [[System Calls and User vs Kernel Mode]] reasons about.
+
+## Before the code
+
+- **`syscall` package** (`syscall.Write`): calls the raw OS system call directly, skipping `os.File`'s extra layers, so the measured cost is the kernel crossing.
+- **`os` package** (`os.Getpid`): a syscall-shaped library call that may be cached and never trap.
+- **Timing with `time.Since`**: measure many calls in a loop and divide, because one call is too fast to time alone.
+- **Functions returning `time.Duration`**: costs come back as typed durations (nanoseconds), not raw integers.
+- **Tests that compare, not assert exact numbers**: the test checks "a syscall is slower than a pure function call", which holds on any machine.
+- **What to run:** `go vet ./... && go test -race ./...` inside the module; add `-v -run TestWriteSyscallCost` to see timings.
 
 ## What this code shows
 
@@ -258,7 +267,9 @@ PASS
 ok  	syscalls	1.420s
 ```
 
-Reading this output: the test passes silently, meaning the real trap (`write` to `/dev/null`) measured strictly more expensive than the pure arithmetic call across this run's 10,000 iterations — consistent with (though not identical in magnitude to) the headline measurement in the theory note's worked example (~420–550 ns for the trap vs. ~0–1 ns for the pure call). `-race` reports no data races, which is expected: this code is entirely single-goroutine, with no shared mutable state other than the package-level `sink` variable, which only this goroutine ever touches.
+Reading this output: the test passes silently, meaning the real trap (`write` to `/dev/null`) measured strictly more expensive than the pure arithmetic call across this run's 10,000 iterations — consistent with (though not identical in magnitude to) the headline measurement in the theory note's worked example (~420–550 ns for the trap vs. ~0–1 ns for the pure call).
+
+`-race` reports no data races, which is expected: this code is entirely single-goroutine, with no shared mutable state other than the package-level `sink` variable, which only this goroutine ever touches.
 
 ## Pitfalls in the code
 

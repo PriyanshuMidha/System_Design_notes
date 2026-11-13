@@ -1,0 +1,436 @@
+1
+00:00:02,399 --> 00:00:18,762
+Narrator: Packet City, ten o'clock at night. A hospital across the city needs a fifty page patient report, before midnight. But the only service is the postal road, and the post office takes only postcards. Tara, the dispatcher, cuts the report into five hundred postcards, and sends them.
+
+2
+00:00:19,192 --> 00:00:30,513
+Tara: I am Tara. Remy, watch the road. Some postcards will get lost. Some will arrive twice. And they will show up in random order.
+
+3
+00:00:30,943 --> 00:00:34,706
+Remy: Then how does the hospital ever read the pages in the right order?
+
+4
+00:00:35,235 --> 00:00:45,021
+Narrator: That is exactly what T C P does. It numbers the postcards, asks, which ones did you get, and resends the missing ones, so the reader sees the pages in order.
+
+5
+00:00:45,451 --> 00:01:01,814
+Narrator: The words first. A segment is one small chunk of data, about fourteen hundred sixty bytes. I P is the layer that moves packets between machines, with no promises. A port names one program. A socket is what the program uses to send and receive, in Go, a net dot conn.
+
+6
+00:01:02,243 --> 00:01:17,933
+Narrator: An A C K says, I got data up to here. A R T T is the round trip time, send something, get the reply, forty milliseconds, Mumbai to Singapore. A buffer is memory where received bytes wait to be read. And a window is how many bytes may be sent before waiting for an A C K.
+
+7
+00:01:18,364 --> 00:01:29,013
+Tara: Think of a phone call. The listener keeps saying, got it up to page twelve, and, slow down, my notebook is full. And I repeat anything not confirmed.
+
+8
+00:01:31,963 --> 00:01:47,965
+Narrator: Why does T C P exist? I P alone promises nothing. A packet can be dropped, duplicated, or delivered out of order, and I P has no idea what a connection even is. An application would have to invent its own sequence numbers, timeouts and retransmission from scratch.
+
+9
+00:01:48,396 --> 00:02:09,605
+Narrator: T C P, defined in R F C seven ninety three, updated by R F C ninety two ninety three, is the standard library for that problem. It gives every byte stream three guarantees. Reliable delivery, lost segments are retransmitted. Ordering, bytes arrive in the order sent. And flow control, a fast sender cannot flood a slow receiver.
+
+10
+00:02:10,036 --> 00:02:18,093
+Narrator: A fourth mechanism, congestion control, is not a guarantee to the application at all. It protects the network from the senders using it.
+
+11
+00:02:18,524 --> 00:02:27,710
+Narrator: In practice, a client opens a connection to port four forty three, and from then on a write either arrives byte for byte and in order, or the connection is torn down with an error.
+
+12
+00:02:30,659 --> 00:02:50,069
+Narrator: The model. Think of T C P as a conversation with a running tally, not a stack of labelled parcels. Each side keeps a counter. A segment does not say, this is parcel seven. It says, this segment starts at byte one million four hundred sixty thousand and one, and by the way, I have received everything up to byte nine hundred eighty thousand from you.
+
+13
+00:02:50,500 --> 00:03:00,765
+Rex: I am Rex, the clerk at the hospital. My receive window is my ears. I can still take fifty more words, before you must pause.
+
+14
+00:03:01,195 --> 00:03:17,557
+Cora: And I am Cora, the warden of the shared road. The congestion window is my number, how much the road can carry before postcards start going missing. And nobody tells Tara my number. She has to find it by trial and error.
+
+15
+00:03:17,987 --> 00:03:31,493
+Narrator: Remember. Two separate limits gate every byte. The receive window protects the listener's ears. The congestion window protects the shared room. The sender may keep at most the smaller of the two unacknowledged in flight.
+
+16
+00:03:34,443 --> 00:03:48,909
+Narrator: Before any postcard moves, Tara and Rex must agree to talk. The three way handshake. Both sides pick a random initial sequence number, so numbers are not predictable across connections. An old security requirement, not just bookkeeping.
+
+17
+00:03:49,340 --> 00:03:55,526
+Tara: Rex, I am ready. Sin. My first number is one thousand.
+
+18
+00:03:55,955 --> 00:04:06,725
+Rex: Heard you. I acknowledge, next I expect one thousand one. And here is my own sin. My first number is five thousand.
+
+19
+00:04:07,156 --> 00:04:13,629
+Tara: Got it. Ack, next I expect five thousand one. We are connected.
+
+20
+00:04:14,060 --> 00:04:29,317
+Narrator: Both sides are now established. Ack equals one thousand one means, I have received everything through byte one thousand, send byte one thousand one next. The first sin consumes one sequence number itself. Syns and fins each count as one byte for accounting.
+
+21
+00:04:29,747 --> 00:04:39,798
+Narrator: Why three segments, not four? Because the second one, sin ack, combines, I acknowledge your sin, with, here is my own sin, in one segment. The first data may even ride on the third.
+
+22
+00:04:40,228 --> 00:04:55,461
+Narrator: The cost is real. Hidden inside every dial, a full handshake costs one round trip, tens of milliseconds across regions, before any data moves. On this machine, over loopback, a connect, write, echo and read took three hundred thirty one microseconds.
+
+23
+00:04:58,411 --> 00:05:10,237
+Narrator: Now the road. Every byte has a sequence number. And every A C K carries the next byte the receiver expects. A cumulative A C K, I have everything up to here, not, I have this specific segment.
+
+24
+00:05:10,668 --> 00:05:21,701
+Rex: Postcards one to two thousand arrived. One more, three thousand to four thousand, arrived too. But two thousand to three thousand is missing.
+
+25
+00:05:22,132 --> 00:05:38,877
+Narrator: Modern stacks add S A C K, selective acknowledgement. The receiver can report ranges it has, I have one thousand to one thousand nine hundred ninety nine, and three thousand to three thousand nine hundred ninety nine, still missing the middle. So the sender resends only the gap, not everything after it.
+
+26
+00:05:39,307 --> 00:05:57,302
+Narrator: A segment is resent for one of two reasons. First, the retransmission timer, the R T O, fires before its A C K arrives. It is computed from the measured round trip time and its variance, never a fixed number. R T O equals smoothed R T T plus four times R T T variance, with a floor.
+
+27
+00:05:57,732 --> 00:06:18,437
+Narrator: An example. Smoothed round trip, forty milliseconds. Variance, ten. So R T O is forty plus four times ten, eighty milliseconds. If an A C K has not arrived in eighty milliseconds, Tara assumes loss, and resends. T C P has no negative acknowledgement. The absence of an A C K is the loss signal.
+
+28
+00:06:18,867 --> 00:06:32,110
+Narrator: Second reason. Three duplicate A C Ks for the same byte. The receiver keeps saying, I have up to byte X, as new data arrives beyond a gap. That triggers fast retransmit, without waiting for the slower timer.
+
+29
+00:06:32,540 --> 00:06:38,437
+Tara: Three duplicate acks. Resend two thousand to three thousand, now.
+
+30
+00:06:38,867 --> 00:06:53,934
+Narrator: The mistake to avoid. A plain A C K does not mean, I received segment N. It is cumulative, everything up through this byte. Only S A C K reports specific ranges. A sender that sees duplicates cannot tell which segment arrived.
+
+31
+00:06:56,884 --> 00:07:08,637
+Narrator: Flow control. In every A C K, the receiver advertises a window size, how many more bytes past the A C Ked point it can buffer. The sender may have at most that many unacknowledged bytes in flight.
+
+32
+00:07:09,067 --> 00:07:16,838
+Rex: My notebook is filling up. I read slowly. Window, only two thousand bytes.
+
+33
+00:07:17,267 --> 00:07:29,526
+Narrator: As the receiver's application reads data out of the buffer, the window grows back, a window update. If a slow consumer lets the buffer fill, the window shrinks toward zero. At zero, the sender must stop.
+
+34
+00:07:29,956 --> 00:07:37,437
+Tara: Zero window. I will wait, and every so often send a one byte probe, until Rex has room again.
+
+35
+00:07:37,867 --> 00:07:48,014
+Narrator: That is a zero window probe. In the Go code, the window is just three numbers. The next byte to send, the oldest byte not yet acknowledged, and the receiver's window.
+
+36
+00:07:50,963 --> 00:08:06,653
+Narrator: Flow control alone would let a sender on a fast L A N flood a congested link, to a receiver with plenty of buffer. So congestion control adds a second limit, the congestion window, c w n d, which the sender estimates for itself, from the network's behaviour.
+
+37
+00:08:07,084 --> 00:08:19,701
+Cora: Start small. Slow start. One segment. Every round trip, double it. Two, four, eight, sixteen, thirty two, sixty four.
+
+38
+00:08:20,132 --> 00:08:33,494
+Narrator: An unused connection knows nothing about the path, so doubling finds the right order of magnitude in a few round trips, not thousands. Slow start runs until c w n d crosses the slow start threshold, s s thresh, or a loss occurs.
+
+39
+00:08:33,923 --> 00:08:45,725
+Cora: At sixty four, you reach the threshold. Now slow down. Add just one segment per round trip. Sixty five, sixty six, sixty seven.
+
+40
+00:08:46,155 --> 00:08:55,317
+Narrator: That is congestion avoidance. Additive increase, about one segment per round trip, probing carefully near a ceiling the sender half remembers from last time.
+
+41
+00:08:55,748 --> 00:08:58,717
+Cora: And a segment is lost at seventy.
+
+42
+00:08:59,148 --> 00:09:23,429
+Narrator: Three duplicate A C Ks arrive, fast retransmit fires. The threshold is set to half the window, seventy over two, thirty five. And the window drops. To one on a timeout, or to the threshold on a fast retransmit. This is multiplicative decrease. Slow start begins again, but this time it stops doubling at thirty five, not sixty four. The connection remembers roughly where the last loss happened.
+
+43
+00:09:23,860 --> 00:09:45,070
+Narrator: That was classic loss based control, Reno, from R F C fifty six eighty one. Linux today defaults to CUBIC, which replaces the linear growth with a cubic function of time since the last loss. Fast growth right after a loss, flattening near the previous loss point, then faster again if no new loss occurs. Better for long distance, high bandwidth paths.
+
+44
+00:09:45,500 --> 00:10:07,166
+Narrator: And then B B R, from Google, used inside Linux and on Google Cloud and YouTube paths. B B R rejects waiting for loss entirely. Loss based control treats every drop as congestion, a poor fit for big buffers, where packets queue for hundreds of milliseconds before anything drops. That is bufferbloat. Or for lossy Wi Fi and satellite, where loss is just noise.
+
+45
+00:10:07,596 --> 00:10:21,389
+Narrator: B B R continuously models two numbers, the bottleneck's delivery rate, and the path's minimum round trip time. It paces the window and the sending rate from that model, and probes periodically for more bandwidth, and for a lower round trip.
+
+46
+00:10:21,820 --> 00:10:41,494
+Narrator: An interview trap. Flow control and congestion control are two different windows solving two different problems. Flow control protects the receiver's buffer. Congestion control protects the network path. The sender's effective window is the minimum of the two. A fast network with a slow reader is limited by the receive window.
+
+47
+00:10:44,443 --> 00:11:00,950
+Nate: I am Nate, the packer. Nagle's algorithm. If a postcard is already on its way, I hold your next small one, and pack it with the following. Fewer, bigger parcels. A little latency, in exchange.
+
+48
+00:11:01,379 --> 00:11:19,494
+Narrator: That is Nagle's algorithm, from R F C eight ninety six. But combined with delayed A C Ks, where the receiver waits up to forty to five hundred milliseconds, hoping to piggyback on a reply, the two can stack, and add real latency to small request and response exchanges. A known anti pattern.
+
+49
+00:11:19,923 --> 00:11:25,317
+Tara: For an urgent request, Nate, send it now. Set no delay.
+
+50
+00:11:25,748 --> 00:11:39,254
+Narrator: In Go, set no delay true, or the socket option T C P no delay, disables Nagle, so small writes leave immediately. Interactive and R P C style protocols, like H T T P, Redis, and g R P C, typically want this.
+
+51
+00:11:39,683 --> 00:11:56,549
+Kip: I am Kip, the night watchman. A connection sitting idle looks the same whether the peer is fine, crashed, or behind a network device that silently forgot the connection. Nobody sends anything, so nobody notices.
+
+52
+00:11:56,980 --> 00:12:13,990
+Narrator: Keepalive makes the operating system send periodic empty probes after an idle period. With no reply after the configured retries, the connection is closed. In Go, since version one twenty three, the dialer's keep alive config exposes the idle time, the interval, and the retry count.
+
+53
+00:12:14,419 --> 00:12:24,038
+Narrator: And remember. Keepalive is a transport level heartbeat. It says nothing about whether the application is healthy. Only whether the peer still acknowledges.
+
+54
+00:12:26,988 --> 00:12:38,741
+Narrator: The delivery is complete. Closing takes four segments. Either side can close independently, because T C P is full duplex. Closing lets a side say, I am done sending, while it can still receive.
+
+55
+00:12:39,172 --> 00:12:42,597
+Tara: Fin. I have sent everything.
+
+56
+00:12:43,028 --> 00:12:49,645
+Rex: Ack. And I have a few last words. Then, fin from me too.
+
+57
+00:12:50,076 --> 00:12:54,701
+Tara: Ack. Goodbye. And now I wait.
+
+58
+00:12:55,131 --> 00:13:10,942
+Narrator: The four way close is not three, because the two directions finish separately, so the other side's ack and fin cannot always combine. The side that sends the last A C K, the active closer, parks in time wait for twice the maximum segment lifetime, commonly sixty seconds on Linux.
+
+59
+00:13:11,371 --> 00:13:23,725
+Narrator: Not out of caution. A duplicate, delayed fin from the peer must still find a socket there to re acknowledge. And old duplicate segments from this connection must expire, before the same four tuple is reused.
+
+60
+00:13:24,155 --> 00:13:37,926
+Narrator: Operationally, a busy host making many short connections can pile up time wait sockets, and exhaust ephemeral ports. The standard fix is connection pooling and keep alive reuse, plus S O reuse address where appropriate.
+
+61
+00:13:40,875 --> 00:13:52,629
+Narrator: T C P's ordering guarantee is also its cost. The receiving application cannot read byte ten thousand until byte nine thousand nine hundred ninety nine has arrived, even if ten thousand arrived first.
+
+62
+00:13:53,059 --> 00:14:09,518
+Narrator: One lost segment stalls every stream multiplexed on that one connection. That is exactly why H T T P two, which multiplexes many requests over one T C P connection, can have one lost packet stall every request behind it. Quick, over U D P, is the fix.
+
+63
+00:14:09,947 --> 00:14:13,350
+Remy: So one write on one side is one read on the other?
+
+64
+00:14:13,879 --> 00:14:35,282
+Tara: No. T C P delivers an ordered byte stream, not framed messages. One large write can arrive split across several reads. Several small writes, especially with Nagle, can arrive as a single read. Any protocol that needs message boundaries, like H T T P, must frame them itself.
+
+65
+00:14:38,231 --> 00:14:53,490
+Narrator: Tara checks a live connection, with s s dash t i n. It shows the congestion control in use, cubic. C w n d forty segments, about fifty eight kilobytes allowed in flight. S s thresh twenty eight, which shows a previous loss already happened.
+
+66
+00:14:53,919 --> 00:15:10,642
+Narrator: R T T three point four milliseconds, with variance one point one. R T O two hundred four. M S S fourteen forty eight. Bytes sent, bytes retransmitted, bytes acknowledged. The ratio of retransmitted to sent is the retransmission rate, a first health signal.
+
+67
+00:15:11,072 --> 00:15:39,001
+Narrator: And a table of the choices. Reno, additive increase, multiplicative decrease on any loss, a legacy baseline. Cubic, a cubic function of time since the last loss, the Linux default. B B R, models bandwidth and minimum round trip, best on lossy or bufferbloated links, but it can be aggressive toward loss based flows sharing a bottleneck. And Vegas, which infers congestion from round trip growth before any loss, a research algorithm, rarely deployed.
+
+68
+00:15:41,951 --> 00:16:02,706
+Narrator: The trade offs. Ordering is a liability, one lost packet stalls everything behind it. The handshake and slow start both cost time before a connection reaches full speed. For a one shot, latency critical, loss tolerant payload, a game position, a live video frame, T C P's guarantees are pure overhead. U D P, or Quick's zero round trip resumption, fit better.
+
+69
+00:16:03,135 --> 00:16:21,298
+Narrator: And congestion control is fair by design, it will not let one flow dominate a shared link. Exactly wrong for one operator's own private backbone, where the goal is to use all known available capacity from day one. Some C D Ns and private networks run tuned or custom congestion control for that reason.
+
+70
+00:16:21,727 --> 00:16:44,018
+Narrator: Four production failures. Bufferbloat, deep buffers delay loss signals for seconds. Fix with B B R's round trip model, or active queue management on the bottleneck. Incast, many servers answer at once, overflow a switch buffer, and cause synchronised loss and timeouts. Fix with smaller datacentre timeouts, or request pacing and jitter.
+
+71
+00:16:44,447 --> 00:17:00,450
+Narrator: Time wait exhaustion on a host making many short outbound connections. Use pooling and keep alive reuse. And silent peer death behind a stateful N A T or firewall. Tune keepalive, so a dead connection is detected and closed, instead of hanging forever.
+
+72
+00:17:00,879 --> 00:17:17,410
+Narrator: What to monitor. The retransmission rate, bytes retransmitted over bytes sent. Round trip time and its variance. The current window, and whether it is loss limited. The count of sockets stuck in time wait and close wait. And listen backlog drops on a socket under load.
+
+73
+00:17:20,359 --> 00:17:41,521
+Narrator: A few deeper points. First, why is the A C K cumulative by default? One number, everything up to here, is cheap to generate and process. But one lost segment in a burst makes every later segment look out of order, even though they arrived. S A C K, from R F C twenty eighteen, is the patch, extra options naming the exact ranges received.
+
+74
+00:17:41,951 --> 00:18:00,857
+Narrator: Second, why is slow start exponential? An unused connection has no information about the path. Doubling finds the right order of magnitude in about log of capacity round trips, instead of capacity round trips. The cost is that slow start can itself cause the first loss, which is why the threshold exists, to remember roughly where the last loss happened.
+
+75
+00:18:01,288 --> 00:18:19,569
+Narrator: Third, why B B R does not wait for loss. Over a path with deep buffers, by the time a packet drops, the sender has been overshooting the real rate for a while, and the buffer was just adding queueing delay. B B R targets the bandwidth delay product, as much in flight as the pipe can hold, not as much as the deepest buffer can hold.
+
+76
+00:18:20,000 --> 00:18:40,705
+Narrator: Fourth, Nagle times delayed A C K. A small request is held by Nagle, because data is in flight, while the reply's A C K is held by delayed A C K, waiting to piggyback. The timers compound into tens to hundreds of milliseconds. That is a request response latency problem, not a throughput one. Bulk transfers are barely affected.
+
+77
+00:18:41,135 --> 00:19:01,673
+Narrator: And last, M S S and path M T U. The maximum segment size is negotiated at the handshake, from each side's M T U. But a smaller M T U in the middle, a V P N, a tunnel, is not visible then. Path M T U discovery, sending with the do not fragment bit, and backing off on an I C M P too big reply, catches it after the fact.
+
+78
+00:19:04,624 --> 00:19:11,650
+Narrator: Now the code, in Go. Three small pieces. The window, the sender's congestion state machine, and a real socket.
+
+79
+00:19:12,079 --> 00:19:30,026
+Narrator: The window has three fields. Next sequence, the oldest unacknowledged byte, and the receiver's window. Can send computes in flight, next minus unacked, then room, the receive window minus in flight, never below zero. On an ack, the window slides forward, and takes the receiver's latest advertised window.
+
+80
+00:19:30,455 --> 00:19:45,089
+Narrator: The sender holds the congestion window, in segments, the threshold, and a flag for slow start. It starts at one, with a threshold of sixty four. On each round trip's acks, if the window is below the threshold, it doubles. Otherwise, it adds one.
+
+81
+00:19:45,519 --> 00:20:01,210
+Narrator: On loss, the threshold becomes half the window, never below two, and the window resets to one. Reno style multiplicative decrease, back to slow start. The tests prove it. Slow start, then congestion avoidance, and a loss that halves the threshold and resets the window.
+
+82
+00:20:01,640 --> 00:20:21,769
+Narrator: And the real socket. Serve accepts one connection, tunes it with no delay and keepalive, and echoes back what it reads. Dial and round trip connects, writes, reads, and returns the elapsed time. The handshake is hidden inside the dial. The test measured three hundred thirty one microseconds on loopback, and passes with the race detector on.
+
+83
+00:20:24,720 --> 00:20:29,009
+Remy: Tara, test me. Seven questions you will really get.
+
+84
+00:20:29,440 --> 00:20:33,586
+Remy: Why three segments for the handshake, and four for the close?
+
+85
+00:20:34,115 --> 00:20:48,605
+Tara: The handshake needs three, because the second segment combines, I acknowledge your sin, with, here is my own. The close cannot combine, because T C P is full duplex, and either side may still have data after announcing it is done.
+
+86
+00:20:49,036 --> 00:20:51,766
+Remy: What is time wait protecting against?
+
+87
+00:20:52,296 --> 00:21:06,018
+Tara: A delayed duplicate fin must still find a socket to re acknowledge, and old segments must expire before the same four tuple is reused. Operationally, many short connections pile up time wait sockets, so pool them.
+
+88
+00:21:06,448 --> 00:21:09,586
+Remy: Flow control versus congestion control?
+
+89
+00:21:10,115 --> 00:21:22,685
+Tara: Flow control protects the receiver, it is the advertised window. Congestion control protects the network, it is the sender's estimate, c w n d. The sender obeys the smaller.
+
+90
+00:21:23,115 --> 00:21:28,869
+Remy: A big c w n d, but low throughput. What do I check first?
+
+91
+00:21:29,400 --> 00:21:39,882
+Tara: The receive window. A slow reading app, or a small socket buffer, caps it however much room the network has. S s dash t i shows both.
+
+92
+00:21:40,311 --> 00:21:43,018
+Remy: Does one write always become one read?
+
+93
+00:21:43,548 --> 00:21:52,950
+Tara: No. It is a byte stream. Writes can split or coalesce. Protocols needing message boundaries must frame them.
+
+94
+00:21:53,380 --> 00:21:57,190
+Remy: Why choose B B R over cubic, and what is the risk?
+
+95
+00:21:57,720 --> 00:22:10,938
+Tara: B B R keeps queueing delay low, and recovers bandwidth faster on lossy or bufferbloated paths. The risk is fairness. It can take a larger share of a shared bottleneck from a competing cubic flow.
+
+96
+00:22:11,367 --> 00:22:14,865
+Remy: What does Nagle trade off, and when do I disable it?
+
+97
+00:22:15,395 --> 00:22:25,349
+Tara: A little latency for fewer, larger packets. Disable it for small request response protocols, where I would rather pay a few extra packets than wait.
+
+98
+00:22:28,299 --> 00:22:35,326
+Narrator: Eleven fifty eight. The last postcard arrives. Rex reads all fifty pages, in order, with two minutes to spare.
+
+99
+00:22:35,756 --> 00:22:42,349
+Rex: Complete. Every page, in order. Not one missing.
+
+100
+00:22:42,779 --> 00:22:53,862
+Narrator: So, in short. T C P numbers every byte, waits for acks, resends what is missing, and limits how much is in flight, so neither the receiver, nor the network, gets flooded.
+
+101
+00:22:54,291 --> 00:23:03,261
+Narrator: One. The handshake. Sin, sin ack, ack, exchanging initial sequence numbers. The close is four segments, and the active closer waits in time wait.
+
+102
+00:23:03,692 --> 00:23:14,342
+Narrator: Two. Acks are cumulative. S A C K adds precise gap reporting. Resend on the R T O timer, from measured round trip plus variance, or on three duplicate acks.
+
+103
+00:23:14,771 --> 00:23:24,029
+Narrator: Three. Flow control is the receiver's window. Congestion control is the sender's c w n d. The effective window is the minimum of the two.
+
+104
+00:23:24,460 --> 00:23:38,397
+Narrator: Four. Slow start doubles to the threshold, then congestion avoidance adds one per round trip. Loss halves the threshold. Cubic is the Linux default. B B R models bandwidth and round trip, instead of waiting for loss.
+
+105
+00:23:38,827 --> 00:23:51,134
+Narrator: Five. Nagle batches small writes, and no delay disables it. Keepalive finds a silently dead peer, not an unhealthy app. And one lost segment blocks everything behind it on that connection.
+
+106
+00:23:51,564 --> 00:23:59,789
+Narrator: And the one line to keep. T C P numbers every byte, waits for ACKs, resends what is missing, and limits what is in flight.
+
+107
+00:24:02,740 --> 00:24:25,534
+Narrator: To go deeper, open the T C P note, and its Go note, in your vault. Before it, read how the internet works. After it, U D P and Quick, T L S and H T T P S, and H T T P fundamentals. Compare it with forward and reverse proxies, where an L four proxy works at exactly this layer, and the network debugging toolkit, for reading s s and tcpdump output.
+
+108
+00:24:25,963 --> 00:24:27,854
+Remy: We made it, Tara.
+
+109
+00:24:28,284 --> 00:24:30,173
+Tara: Next delivery.
+

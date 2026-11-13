@@ -8,7 +8,7 @@ sources:
   - "Docker docs, Storage overview (volumes, bind mounts, tmpfs — Docker Engine 27)"
   - "Docker docs, `docker volume` CLI reference"
   - "Docker Compose docs, `compose down -v` and volume lifecycle"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 06 - Volumes and Bind Mounts
@@ -23,17 +23,72 @@ updated: 2026-11-07
 > - **tmpfs** is memory-backed, never touches disk, and disappears the moment the container stops.
 > - Classic mistake: believing a bind mount is a backup. Deleting a file inside the container deletes it on the host too, in both directions, in real time.
 
+## Start here: the basics
+
+**The problem in one story**
+
+You run Postgres in a container and add a week of test data.
+A newer Postgres image comes out, so you delete the old container and start a new one.
+The new database is empty. The tables lived inside the old container and were deleted with it.
+This note is about where container data should live so it survives.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Filesystem | How files and folders are organised on a disk | `/var/lib/postgresql/data` |
+| Mount | Attaching a folder or disk so it appears at a path | Plug a USB drive, it shows at `/mnt/usb` |
+| Writable layer | The container's own scratch storage on top of the image | Files written with no mount land here |
+| Ephemeral | Temporary; deleted when its owner goes away | Writable layer dies on `docker rm` |
+| RAM | Fast memory that is wiped when power or the process stops | tmpfs stores files in RAM |
+| UID / GID | The numeric user and group IDs Linux uses for file ownership | `1000:1000` |
+| Backup | A separate, second copy of data | A `.tar.gz` of the data folder |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Container"] --> WL["Writable layer<br/>dies with container"]
+    C --> V[("Named volume<br/>Docker-managed, survives")]
+    C --> B["Bind mount<br/>your host folder, live view"]
+    C --> T("tmpfs<br/>RAM, gone at stop")
+```
+
+**Analogy**
+
+The container is a hotel room: anything left in the room is cleared at checkout (writable layer); a named volume is a locker the hotel keeps for you; a bind mount is a door into your own house; tmpfs is a note on a whiteboard.
+Where it breaks: a real door into your house does not let the guest delete your furniture remotely and instantly, but a bind mount does exactly that.
+
+**How the rest of this note builds up**
+
+- First, why the writable layer is disposable and the mental model of the four storage kinds.
+- Then `-v` vs `--mount`, anonymous volumes, and a decision tree for picking one.
+- Then worked examples: Compose mounts, `down` vs `down -v`, backup/restore, UID mismatches.
+- Finally the SDE-3 deep dive on kernel bind mounts, volume drivers and user-namespace remapping.
+
+> [!tip] Remember
+> Data you care about goes on a named volume; a bind mount is a live window, never a backup.
+
 ## 1. Why it exists
 
-Every container starts from its image's read-only layers plus one new, empty writable layer (see [[Docker 02 - Images, Layers and Containers]]). Anything the running process writes — log files, uploaded files, a database's data directory — lands in that writable layer. `docker rm` deletes the container and that writable layer together, intentionally: containers are meant to be disposable and replaceable from the same image at any time.
+Every container starts from its image's read-only layers plus one new, empty writable layer (see [[Docker 02 - Images, Layers and Containers]]). Anything the running process writes — log files, uploaded files, a database's data directory — lands in that writable layer.
 
-That is exactly backwards for stateful data. A Postgres container that stores its actual table files only in its writable layer loses the entire database the moment someone runs `docker rm` to replace it with a newer image — which is routine during a deploy. Docker's storage options exist to put data *outside* the container's own lifecycle, so the container can be destroyed and recreated freely while the data survives.
+`docker rm` deletes the container and that writable layer together, intentionally: containers are meant to be disposable and replaceable from the same image at any time.
 
-The old note on this topic (`DOCKER Volums`) got the mental model backwards in exactly the way that causes real incidents: it described a bind mount as "a backup if the docker is deleted" — but a bind mount is a live view of a host folder, not a copy. Deleting a file from inside the container deletes it from the host folder too, instantly, in both directions. There is no snapshot, no second copy, and no protection against `rm -rf` run inside the container.
+That is exactly backwards for stateful data. A Postgres container that stores its actual table files only in its writable layer loses the entire database the moment someone runs `docker rm` to replace it with a newer image — which is routine during a deploy.
+
+Docker's storage options exist to put data *outside* the container's own lifecycle, so the container can be destroyed and recreated freely while the data survives.
+
+The old note on this topic (`DOCKER Volums`) got the mental model backwards in exactly the way that causes real incidents: it described a bind mount as "a backup if the docker is deleted" — but a bind mount is a live view of a host folder, not a copy.
+
+Deleting a file from inside the container deletes it from the host folder too, instantly, in both directions. There is no snapshot, no second copy, and no protection against `rm -rf` run inside the container.
 
 ## 2. Mental model
 
-The container's writable layer is a sheet of paper taped to a whiteboard: erase the whiteboard (`docker rm`) and the paper goes with it. A **named volume** is a filing cabinet in a separate room that Docker manages — the container has a key to one specific drawer, and that drawer exists independently of any particular container holding the key. A **bind mount** is not a cabinet at all; it's a window cut directly into a specific room of the host's own filesystem — whatever is on the other side of that window is what you see and change, with no Docker management in between. **tmpfs** is a whiteboard that was never paper in the first place: it's RAM, and it's gone the instant the container stops, by design.
+- The container's **writable layer** is a sheet of paper taped to a whiteboard: erase the whiteboard (`docker rm`) and the paper goes with it.
+- A **named volume** is a filing cabinet in a separate room that Docker manages — the container has a key to one specific drawer, and that drawer exists independently of any particular container holding the key.
+- A **bind mount** is not a cabinet at all; it's a window cut directly into a specific room of the host's own filesystem — whatever is on the other side of that window is what you see and change, with no Docker management in between.
+- **tmpfs** is a whiteboard that was never paper in the first place: it's RAM, and it's gone the instant the container stops, by design.
 
 ## 3. How it works
 
@@ -78,11 +133,23 @@ docker run --mount type=bind,source="$(pwd)/src",target=/app/src myapp
 docker run --mount type=tmpfs,target=/tmp/cache,tmpfs-size=100m myapp
 ```
 
-`-v` decides volume vs bind mount purely by whether the source looks like a path or a plain name — a common source of surprise when a typo turns an intended volume name into an unintended relative-path bind mount to a folder that doesn't exist yet (Docker creates it, silently, as an empty directory). `--mount` requires the `type=` to be explicit, which is why Docker's own docs recommend it for anything beyond a quick throwaway `docker run`.
+`-v` decides volume vs bind mount purely by whether the source looks like a path or a plain name.
+
+That is a common source of surprise when a typo turns an intended volume name into an unintended relative-path bind mount to a folder that doesn't exist yet (Docker creates it, silently, as an empty directory).
+
+`--mount` requires the `type=` to be explicit, which is why Docker's own docs recommend it for anything beyond a quick throwaway `docker run`.
 
 ### Anonymous volumes and image-declared `VOLUME`
 
-A Dockerfile can declare `VOLUME /var/lib/postgresql/data`, which causes every container from that image to get an **anonymous volume** mounted there automatically, even with no `-v` flag at all. This is how official images like `postgres` and `mongo` guarantee their data directory is never silently left in the ephemeral writable layer if you forget to mount something yourself. The cost: anonymous volumes have a random name (visible with `docker volume ls`), are easy to forget about, and `docker volume prune` deletes any volume not currently attached to a running or stopped container — including an anonymous one from a container you already removed, if you didn't first copy the data out.
+A Dockerfile can declare `VOLUME /var/lib/postgresql/data`, which causes every container from that image to get an **anonymous volume** mounted there automatically, even with no `-v` flag at all.
+
+This is how official images like `postgres` and `mongo` guarantee their data directory is never silently left in the ephemeral writable layer if you forget to mount something yourself.
+
+The cost:
+
+- Anonymous volumes have a random name (visible with `docker volume ls`).
+- They are easy to forget about.
+- `docker volume prune` deletes any volume not currently attached to a running or stopped container — including an anonymous one from a container you already removed, if you didn't first copy the data out.
 
 ### Choosing the right one
 
@@ -135,7 +202,11 @@ volumes:
   pg-data:
 ```
 
-Running `docker compose down` stops and removes the containers and the default network but **leaves `pg-data` in place** — the next `docker compose up` reattaches to the same data. Running `docker compose down -v` additionally removes every named volume declared in the file, which deletes the database data permanently. This single flag is the most common cause of "I ran one Compose command and lost my local database," and it is also, deliberately, the fastest way to get a clean slate when that's what you actually want.
+Running `docker compose down` stops and removes the containers and the default network but **leaves `pg-data` in place** — the next `docker compose up` reattaches to the same data.
+
+Running `docker compose down -v` additionally removes every named volume declared in the file, which deletes the database data permanently.
+
+This single flag is the most common cause of "I ran one Compose command and lost my local database," and it is also, deliberately, the fastest way to get a clean slate when that's what you actually want.
 
 ### Backing up and restoring a named volume
 
@@ -156,7 +227,9 @@ docker run --rm \
   busybox tar xzf /backup/pg-data-2026-11-07.tar.gz -C /data
 ```
 
-The throwaway `busybox` container never runs the actual database; it only exists long enough to copy bytes, and `--rm` removes it immediately after. This is the generic mechanism — see [[Replication]] for Postgres-specific backup strategies (`pg_dump`, WAL archiving) that are usually a better fit for a real production database than tarring the raw data directory.
+The throwaway `busybox` container never runs the actual database; it only exists long enough to copy bytes, and `--rm` removes it immediately after.
+
+This is the generic mechanism — see [[Replication]] for Postgres-specific backup strategies (`pg_dump`, WAL archiving) that are usually a better fit for a real production database than tarring the raw data directory.
 
 ### Ownership mismatches on bind mounts
 
@@ -166,7 +239,14 @@ $ ls -ln data
 # -rw-r--r-- 1 1000 1000 … seed.json
 ```
 
-A bind mount preserves the host filesystem's UID/GID exactly as-is; it does not remap them. If the container process runs as UID 999 (common for official database images) and the host folder is owned by your own user (commonly UID 501 or 1000), the container sees permission-denied errors writing to a folder that looks, from the host's `ls -l`, like it should be writable — because "writable" depends on whose UID is asking. The fix is either to `chown` the host folder to match the container's UID ahead of time, or to run the container with `--user $(id -u):$(id -g)` so it writes as your own UID in the first place.
+A bind mount preserves the host filesystem's UID/GID exactly as-is; it does not remap them.
+
+If the container process runs as UID 999 (common for official database images) and the host folder is owned by your own user (commonly UID 501 or 1000), the container sees permission-denied errors writing to a folder that looks, from the host's `ls -l`, like it should be writable — because "writable" depends on whose UID is asking.
+
+The fix is either:
+
+1. `chown` the host folder to match the container's UID ahead of time, or
+2. run the container with `--user $(id -u):$(id -g)` so it writes as your own UID in the first place.
 
 ## 5. Variants and comparison
 
@@ -238,3 +318,7 @@ A bind mount preserves the host filesystem's UID/GID exactly as-is; it does not 
 - **Before this:** [[Docker 01 - Why Containers]], [[Docker 02 - Images, Layers and Containers]]
 - **Next:** [[Docker 07 - Docker Compose for Local Development]]
 - **Compare with:** [[Containerizing Go Services]] (where container-local storage choices end and a Go service's own data-layer concerns begin), [[Replication]] (database-native backup and replication, a better fit than tarring a raw data directory for anything that matters in production)
+
+### Watch on YouTube
+
+- [Docker Volumes explained in 6 minutes](https://www.youtube.com/watch?v=p2PH_YPCsis) · TechWorld with Nana · 6 min · 351,473 views

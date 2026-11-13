@@ -10,7 +10,7 @@ sources:
   - "Laws of Reflection, go.dev/blog/laws-of-reflection"
   - "Go spec, Package unsafe (go.dev/ref/spec#Package_unsafe)"
   - "cmd/vet unsafeptr analyzer docs (pkg.go.dev/cmd/vet)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Reflection and unsafe
@@ -24,11 +24,58 @@ updated: 2026-11-07
 > - A `reflect.Value` is only **settable** when it was reached by dereferencing a pointer (`reflect.ValueOf(&x).Elem()`) — a `Value` built straight from a copy, like `reflect.ValueOf(x)`, can be read but never written.
 > - `unsafe.Pointer` is the only type that can convert between `*T` and `uintptr`; the conversion back to a pointer must happen in the same expression as the arithmetic, because the garbage collector can move or scan memory between statements and a bare `uintptr` is invisible to it.
 
+## Start here: the basics
+
+**The problem in one story.**
+You write a function that must save any struct to JSON: users, orders, products.
+You can't write one function per type, because you don't even know the types yet.
+Reflection lets code ask at run time: "what type is this, what fields does it have, what are their tags?"
+`unsafe` goes further: it lets you skip Go's type checks and touch raw memory, at your own risk.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Type | The kind of a value, known to the compiler | `int`, `User`, `[]string` |
+| `interface{}` / `any` | A box that can hold a value of any type | `var v any = 42` |
+| Reflection | Inspecting types and values while the program runs | `reflect.TypeOf(v)` gives `int` |
+| Struct tag | A text label on a struct field, read by libraries | `` `json:"name"` `` |
+| Settable | A reflected value you are allowed to change | Needs a pointer plus `.Elem()` |
+| `unsafe.Pointer` | A pointer with no type, which bypasses safety checks | Reading a struct's raw bytes |
+| Garbage collector (GC) | Runtime part that frees unused memory | Can move stacks, so raw addresses go stale |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    V["Any value<br/>(in an any box)"] --> R["reflect.TypeOf /<br/>reflect.ValueOf"]
+    R --> T["Type info:<br/>name, fields, tags"]
+    R --> VV["Value: read it,<br/>set it if settable"]
+    V -. "escape hatch" .-> U["unsafe.Pointer:<br/>raw memory, no checks"]
+```
+
+**Analogy.** Reflection is an X-ray of a sealed parcel: you see what's inside without the label telling you.
+`unsafe` is cutting the parcel open with a knife. Where it breaks: an X-ray never changes the parcel, but reflection can also set values.
+
+**How the rest of this note builds up**
+
+- First, why reflection exists (encoding/json, ORMs) and the Type/Value mental model (sections 1-2).
+- Then the rules: settability and `unsafe.Pointer`'s valid conversions (section 3).
+- Then worked examples: reading tags, setting fields, failure modes (section 4).
+- Finally the SDE-3 deep dive: cost vs code generation and generics, production use, interview questions (sections 5-9).
+
+> [!tip] Remember
+> Reflection reads types at run time and is slow but safe; `unsafe` is fast but every rule is on you.
+
 ## 1. Why it exists
 
-`encoding/json` must encode `Invoice`, `User`, and any other exported struct a caller defines, in a library written before any of those types existed. There is no way to write `func encode(i Invoice) string` in advance for a type the library has never heard of — the only way to read "whatever fields this struct has, and what their JSON tags say to rename them to" is to ask the type itself, at run time. That is reflection: `reflect.ValueOf(v).Type().Field(i).Tag.Get("json")` reads a field's tag with no compile-time knowledge of what field it is.
+`encoding/json` must encode `Invoice`, `User`, and any other exported struct a caller defines, in a library written before any of those types existed. There is no way to write `func encode(i Invoice) string` in advance for a type the library has never heard of — the only way to read "whatever fields this struct has, and what their JSON tags say to rename them to" is to ask the type itself, at run time.
 
-`unsafe` solves an unrelated problem: converting between two in-memory representations without the compiler's usual copy. A function that parses a large file into lines wants to hand each line to its caller as a `string` without copying every byte out of the `[]byte` it already read into memory — ordinarily impossible, because Go treats `string` and `[]byte` as different, independently-owned memory. `unsafe.String` reinterprets the same bytes as a `string` with zero bytes copied, at the cost of a promise the compiler cannot check: that the underlying bytes will never be mutated again, because callers everywhere assume a `string` is immutable.
+That is reflection: `reflect.ValueOf(v).Type().Field(i).Tag.Get("json")` reads a field's tag with no compile-time knowledge of what field it is.
+
+`unsafe` solves an unrelated problem: converting between two in-memory representations without the compiler's usual copy. A function that parses a large file into lines wants to hand each line to its caller as a `string` without copying every byte out of the `[]byte` it already read into memory — ordinarily impossible, because Go treats `string` and `[]byte` as different, independently-owned memory.
+
+`unsafe.String` reinterprets the same bytes as a `string` with zero bytes copied, at the cost of a promise the compiler cannot check: that the underlying bytes will never be mutated again, because callers everywhere assume a `string` is immutable.
 
 ## 2. Mental model
 
@@ -80,7 +127,9 @@ flowchart TD
     Q2 -- "yes" --> R3["CanSet() == true\nv.Set(...) works"]
 ```
 
-`reflect.ValueOf(someStruct)` copies `someStruct` into the `any` parameter the same way passing it to any other function would, so writing through that `Value` would only mutate the copy — the reflect package refuses it outright rather than silently doing nothing useful. `reflect.ValueOf(&someStruct).Elem()` instead holds a `Value` that knows it was reached through a pointer, so writes go to the original. Unexported fields stay unsettable either way: reflection cannot bypass Go's own exportedness rule, by design — see `TestSetViaPointer`'s two failure cases below.
+`reflect.ValueOf(someStruct)` copies `someStruct` into the `any` parameter the same way passing it to any other function would, so writing through that `Value` would only mutate the copy — the reflect package refuses it outright rather than silently doing nothing useful.
+
+`reflect.ValueOf(&someStruct).Elem()` instead holds a `Value` that knows it was reached through a pointer, so writes go to the original. Unexported fields stay unsettable either way: reflection cannot bypass Go's own exportedness rule, by design — see `TestSetViaPointer`'s two failure cases below.
 
 ### `unsafe.Pointer`'s valid conversions
 
@@ -95,7 +144,9 @@ flowchart LR
     UP -. "illegal: stored across a statement,\nthen converted back later" .-> Danger["flagged by go vet's unsafeptr check"]
 ```
 
-The reason a stored `uintptr` is unsafe: it is just an integer to the garbage collector, carrying no information that it used to be a pointer. If a GC cycle or a goroutine's stack growth moves the object between the `uintptr` conversion and a later use, the integer now points at garbage or at someone else's data. Keeping the arithmetic and the conversion back to `unsafe.Pointer` in one expression means no GC safepoint can land in between.
+The reason a stored `uintptr` is unsafe: it is just an integer to the garbage collector, carrying no information that it used to be a pointer. If a GC cycle or a goroutine's stack growth moves the object between the `uintptr` conversion and a later use, the integer now points at garbage or at someone else's data.
+
+Keeping the arithmetic and the conversion back to `unsafe.Pointer` in one expression means no GC safepoint can land in between.
 
 ## 4. Worked example
 
@@ -198,7 +249,9 @@ func TestDeepEqualNilVsEmptySlice(t *testing.T) {
 }
 ```
 
-**Measured:** PASS — `reflect.DeepEqual` treats a `nil` slice and a zero-length non-nil slice as unequal, even though both have length 0 and iterate zero times, because `DeepEqual` compares the slice header's nilness before it compares contents. This is exactly the gotcha behind "my test asserts `DeepEqual(got, []Invoice{})` and it fails even though both are empty" — `got` came back `nil` (no `make`, no `append`), not `[]Invoice{}`.
+**Measured:** PASS — `reflect.DeepEqual` treats a `nil` slice and a zero-length non-nil slice as unequal, even though both have length 0 and iterate zero times, because `DeepEqual` compares the slice header's nilness before it compares contents.
+
+This is exactly the gotcha behind "my test asserts `DeepEqual(got, []Invoice{})` and it fails even though both are empty" — `got` came back `nil` (no `make`, no `append`), not `[]Invoice{}`.
 
 ### Why reflection is slower than codegen
 
@@ -234,7 +287,9 @@ func EncodeDirect(e Event) string {
 | `EncodeReflect` | 157–177 | 88 | 6 |
 | `EncodeDirect` | 52–61 | 36 | 2 |
 
-The reflection path is about 3× slower and allocates 3× more per call. Every `f.Kind()` switch, every `rt.Field(i)` lookup, and `reflect.ValueOf(e)` itself (boxing `e` into an interface) cost real work the compiler cannot inline away, because the field being read is not known until run time. This is the whole reason `encoding/json` ships a `Marshaler` escape hatch and why wire-format-heavy services often reach for a codegen tool once the reflection path shows up in a CPU profile (see [[Benchmarks, Profiling and Tracing]]).
+The reflection path is about 3× slower and allocates 3× more per call. Every `f.Kind()` switch, every `rt.Field(i)` lookup, and `reflect.ValueOf(e)` itself (boxing `e` into an interface) cost real work the compiler cannot inline away, because the field being read is not known until run time.
+
+This is the whole reason `encoding/json` ships a `Marshaler` escape hatch and why wire-format-heavy services often reach for a codegen tool once the reflection path shows up in a CPU profile (see [[Benchmarks, Profiling and Tracing]]).
 
 ### `unsafe`: struct layout and zero-copy conversions
 
@@ -270,7 +325,9 @@ func TestHeaderLayout(t *testing.T) {
 }
 ```
 
-**Measured:** PASS on darwin/arm64 (Go 1.24.4) — `Header` is 16 bytes, 8-byte aligned; `Version` (an `int32`) is placed right after the `bool`, inside the padding the compiler already owed `int64`-alignment, rather than growing the struct further. This is exactly why "put your `bool` fields together and your 8-byte fields together" shrinks structs: the compiler cannot reorder your fields for you, but it does insert padding to keep each field aligned to its own size.
+**Measured:** PASS on darwin/arm64 (Go 1.24.4) — `Header` is 16 bytes, 8-byte aligned; `Version` (an `int32`) is placed right after the `bool`, inside the padding the compiler already owed `int64`-alignment, rather than growing the struct further.
+
+This is exactly why "put your `bool` fields together and your 8-byte fields together" shrinks structs: the compiler cannot reorder your fields for you, but it does insert padding to keep each field aligned to its own size.
 
 ```go
 // BytesToStringNoCopy reinterprets b's bytes as a string with zero copying.
@@ -329,13 +386,27 @@ func StringToBytesNoCopy(s string) []byte {
 
 ## 8. Deep dive
 
-**Why reflection cannot be as fast as direct code, structurally.** Every `reflect.ValueOf(x)` call boxes `x` into an interface (if it was not one already) — a heap allocation when `x` does not already fit in a word and escape analysis cannot prove otherwise (see [[Pointers, Values and Escape Analysis]]). Every subsequent `.Field(i)`, `.Kind()`, and type-specific accessor (`.Int()`, `.String()`) is a function call through `reflect`'s internal `rtype`/`abi.Type` metadata, not a direct memory offset the compiler computed at build time — none of it can be inlined, because which field and which accessor to call is a run-time decision. The benchmark above (3× slower, 3× the allocations, for a 3-field struct) is the compounding of exactly these costs; the gap grows, not shrinks, on larger structs.
+**Why reflection cannot be as fast as direct code, structurally.** Every `reflect.ValueOf(x)` call boxes `x` into an interface (if it was not one already) — a heap allocation when `x` does not already fit in a word and escape analysis cannot prove otherwise (see [[Pointers, Values and Escape Analysis]]).
 
-**The six valid `unsafe.Pointer` conversion patterns**, named precisely because the compiler enforces only these: `*T1 → unsafe.Pointer → *T2` (reinterpret a pointer's pointee type); `unsafe.Pointer → uintptr` for printing or hashing (the resulting uintptr must not be converted back into a pointer); `unsafe.Pointer → uintptr → arithmetic → unsafe.Pointer`, all in one expression (the pattern `AdvancePointer` uses); a `uintptr` returned by `syscall.Syscall` representing a pointer, converted back immediately; `reflect.Value.Pointer()`/`UnsafeAddr()` results, used the same way; and converting a `unsafe.Pointer` to and from a `reflect.Value` via `reflect.NewAt`. Anything outside these six is either a compile error or, worse, legal Go that `go vet -unsafeptr` exists specifically to flag.
+Every subsequent `.Field(i)`, `.Kind()`, and type-specific accessor (`.Int()`, `.String()`) is a function call through `reflect`'s internal `rtype`/`abi.Type` metadata, not a direct memory offset the compiler computed at build time — none of it can be inlined, because which field and which accessor to call is a run-time decision.
 
-**`uintptr` hazards in depth.** A `uintptr` is just an integer — the runtime's garbage collector does not scan it, trace it, or know it ever pointed at a live object. Go's garbage collector and goroutine stack growth can both relocate objects (stacks are copied on growth; the GC itself does not currently move the heap, but nothing in the language spec promises it never will). If code stores a `uintptr` derived from a pointer, does something else, and converts it back to a pointer later, the object it pointed to may have moved or been collected in between, so the conversion yields garbage. Keeping the conversion and the arithmetic inside a single expression — `unsafe.Pointer(uintptr(p) + offset)` — guarantees no safepoint can land between the two conversions, because the compiler treats that whole expression as one atomic unit for this purpose. `runtime.KeepAlive(p)` is the matching tool when a pointer must stay alive past its last normal use, so the GC does not collect what it points to while `unsafe`-derived data about it is still in use.
+The benchmark above (3× slower, 3× the allocations, for a 3-field struct) is the compounding of exactly these costs; the gap grows, not shrinks, on larger structs.
 
-**cgo call cost and its static-linking impact.** A cgo call does not run like a normal Go function call: the calling goroutine must switch from the Go calling convention and its segmented/growable stack to the C calling convention on a fixed-size stack, which historically meant locking the calling goroutine to its OS thread (`M`) for the duration of the call so the Go scheduler does not try to run other goroutines on a stack a C function is using. This has measurably more overhead than a plain Go function call — commonly cited at tens of nanoseconds of fixed overhead per call, which matters if cgo is on a hot path called millions of times, not if it wraps a single expensive operation like a compression library call. Separately, `CGO_ENABLED=1` (the default when a C toolchain is present) means packages like `net` and `os/user` prefer the cgo-based resolver, which dynamically links libc — so a binary built with cgo enabled is not a fully static binary even with `-extldflags -static` unless you explicitly set `CGO_ENABLED=0`, which is why minimal container images (`FROM scratch`) typically build Go binaries with cgo disabled.
+**The six valid `unsafe.Pointer` conversion patterns**, named precisely because the compiler enforces only these: `*T1 → unsafe.Pointer → *T2` (reinterpret a pointer's pointee type); `unsafe.Pointer → uintptr` for printing or hashing (the resulting uintptr must not be converted back into a pointer); `unsafe.Pointer → uintptr → arithmetic → unsafe.Pointer`, all in one expression (the pattern `AdvancePointer` uses); a `uintptr` returned by `syscall.Syscall` representing a pointer, converted back immediately; `reflect.Value.Pointer()`/`UnsafeAddr()` results, used the same way; and converting a `unsafe.Pointer` to and from a `reflect.Value` via `reflect.NewAt`.
+
+Anything outside these six is either a compile error or, worse, legal Go that `go vet -unsafeptr` exists specifically to flag.
+
+**`uintptr` hazards in depth.** A `uintptr` is just an integer — the runtime's garbage collector does not scan it, trace it, or know it ever pointed at a live object. Go's garbage collector and goroutine stack growth can both relocate objects (stacks are copied on growth; the GC itself does not currently move the heap, but nothing in the language spec promises it never will).
+
+If code stores a `uintptr` derived from a pointer, does something else, and converts it back to a pointer later, the object it pointed to may have moved or been collected in between, so the conversion yields garbage.
+
+Keeping the conversion and the arithmetic inside a single expression — `unsafe.Pointer(uintptr(p) + offset)` — guarantees no safepoint can land between the two conversions, because the compiler treats that whole expression as one atomic unit for this purpose.
+
+`runtime.KeepAlive(p)` is the matching tool when a pointer must stay alive past its last normal use, so the GC does not collect what it points to while `unsafe`-derived data about it is still in use.
+
+**cgo call cost and its static-linking impact.** A cgo call does not run like a normal Go function call: the calling goroutine must switch from the Go calling convention and its segmented/growable stack to the C calling convention on a fixed-size stack, which historically meant locking the calling goroutine to its OS thread (`M`) for the duration of the call so the Go scheduler does not try to run other goroutines on a stack a C function is using.
+
+This has measurably more overhead than a plain Go function call — commonly cited at tens of nanoseconds of fixed overhead per call, which matters if cgo is on a hot path called millions of times, not if it wraps a single expensive operation like a compression library call. Separately, `CGO_ENABLED=1` (the default when a C toolchain is present) means packages like `net` and `os/user` prefer the cgo-based resolver, which dynamically links libc — so a binary built with cgo enabled is not a fully static binary even with `-extldflags -static` unless you explicitly set `CGO_ENABLED=0`, which is why minimal container images (`FROM scratch`) typically build Go binaries with cgo disabled.
 
 ## 9. Interview questions
 
@@ -378,3 +449,8 @@ func StringToBytesNoCopy(s string) []byte {
 - **Before this:** [[Interfaces]], [[Structs, Methods and Embedding]], [[Generics and Iterators]]
 - **Next:** [[Benchmarks, Profiling and Tracing]], [[Runtime - Memory Allocator and Garbage Collector]]
 - **Compare with:** [[Generics and Iterators]] (compile-time polymorphism vs reflection's run-time one), [[Arrays, Slices and Maps (with internals)]] (why hardcoding unsafe offsets into map internals breaks across Go versions)
+
+### Watch on YouTube
+
+- [Go Class: 33 Reflection](https://www.youtube.com/watch?v=T2fqLam1iuk) · Matt KØDVB · thorough walkthrough of reflect.Type/reflect.Value mechanics
+- [Go Unsafe Package: Unleash Low-Level Power (But Beware!) ⚠️](https://www.youtube.com/watch?v=1WG2zyOWTkQ) · CodeLucky · intro to unsafe.Pointer and its risks

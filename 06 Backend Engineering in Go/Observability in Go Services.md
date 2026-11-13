@@ -10,7 +10,7 @@ sources:
   - "OpenTelemetry Go SDK docs: TracerProvider, SpanProcessor, Sampler (ParentBased, TraceIDRatioBased)"
   - "W3C Trace Context specification (traceparent header)"
   - "OpenTelemetry semantic conventions v1.26.0"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Observability in Go Services
@@ -23,6 +23,51 @@ updated: 2026-11-07
 > - A metric's **label values must come from a closed, small set** (a route pattern, an HTTP method, a status class) — never from something that grows without bound (a user ID, a raw path, a trace ID). Prometheus stores one time series per unique label combination; an unbounded label is an unbounded memory leak with a delay.
 > - A trace only stays one trace across a process boundary if its **context is explicitly carried**: HTTP and gRPC get this from `otelhttp`/`otelgrpc` automatically, but a message queue or background job needs the trace context injected into message headers by hand and extracted on the other side.
 > - `log/slog`'s `LogValuer` interface is how you make a field unloggable by construction — a secret type that always renders as `[REDACTED]` cannot leak just because someone logged the struct that holds it.
+
+## Start here: the basics
+
+**The problem in one story.**
+A customer says "I paid, but my invoice still says pending."
+Your request went through a web handler, a database, a queue and a background worker.
+Without good records you are guessing which step broke.
+Observability is leaving enough clues behind that you can find out without guessing.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Log | A written record of one event | `{"msg":"invoice paid","id":42}` |
+| Structured log | A log as key-value fields, not free text | JSON lines from `log/slog` |
+| Metric | A number tracked over time | Requests per second, p99 latency |
+| Label | A tag that splits a metric into series | `method="POST"`, `status="5xx"` |
+| Cardinality | How many distinct values a label can take | Status class: 5; user ID: millions |
+| Trace | The path and timing of one request across services | HTTP 120 ms → DB 80 ms → queue 5 ms |
+| Span | One timed step inside a trace | "SELECT invoice" took 80 ms |
+| Trace ID | The ID shared by every span and log of one request | `4bf92f35...` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    REQ["One request"] --> L["Logs:<br/>what happened"]
+    REQ --> M["Metrics:<br/>how many, how fast"]
+    REQ --> T["Traces:<br/>where time went"]
+    L -. "shared trace ID" .- T
+    M --> D["Dashboards and alerts"]
+```
+
+**Analogy.** A hospital: the patient's chart notes are logs, the ward's vital-sign monitors are metrics, and the patient's wristband ID that links every test result is the trace ID.
+Where it breaks: a hospital never "runs out of memory" from too many wristband types, but a metric with an unbounded label really does.
+
+**How the rest of this note builds up**
+
+- First, the smallest whiteboard handler, then why each signal earns its place (section 1) and the mental model (section 2).
+- Then how logs, metrics and traces are wired in Go (section 3).
+- Then a full worked example: `slog`, Prometheus, OpenTelemetry across HTTP, DB and a queue (section 4).
+- Finally the SDE-3 deep dive: trade-offs, production failures, cardinality and context propagation (sections 5-8).
+
+> [!tip] Remember
+> Logs say what, metrics say how much, traces say where; the trace ID ties them together.
 
 ### Whiteboard version
 
@@ -37,11 +82,20 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-This gets the shape right but misses almost everything production needs: the path is unbounded cardinality for a metric (fine for a log, not for Prometheus), there's no status code, no metric is actually recorded, and `r.Context()` carries a trace ID only if something upstream put one there — which is the whole second half of this note.
+This gets the shape right but misses almost everything production needs:
+
+- the path is unbounded cardinality for a metric (fine for a log, not for Prometheus),
+- there's no status code,
+- no metric is actually recorded,
+- and `r.Context()` carries a trace ID only if something upstream put one there — which is the whole second half of this note.
 
 ## 1. Why it exists
 
-InvoiceOps's payment webhook handler calls four things in sequence: verify the provider's signature, check for a duplicate event in Postgres, update the invoice, and publish a status change onto a queue a worker will pick up. When a customer reports "my invoice says paid but the dashboard still shows pending," the question is **where**, in that chain, time or logic went wrong — and that chain spans an HTTP handler, a database query, and an asynchronous worker running in a different goroutine (or a different process entirely) minutes later.
+InvoiceOps's payment webhook handler calls four things in sequence: verify the provider's signature, check for a duplicate event in Postgres, update the invoice, and publish a status change onto a queue a worker will pick up.
+
+When a customer reports "my invoice says paid but the dashboard still shows pending," the question is **where**, in that chain, time or logic went wrong.
+
+That chain spans an HTTP handler, a database query, and an asynchronous worker running in a different goroutine (or a different process entirely) minutes later.
 
 Three concrete gaps show why each signal in this note earns its place:
 
@@ -395,7 +449,9 @@ func StartProductionTracing(ctx context.Context, collectorEndpoint, serviceName,
 }
 ```
 
-`StartProductionTracing` compiles against the real `otlptracegrpc` client and is covered by `go vet`, but — unlike the rest of this section — no test below calls it: doing so would need a live OTel Collector (or a fake gRPC server standing in for one) listening on `collectorEndpoint`, which this note doesn't stand up. Treat it as reviewed for shape and API correctness, not as integration-tested; a real service should still smoke-test it once against its actual collector sidecar before relying on it.
+`StartProductionTracing` compiles against the real `otlptracegrpc` client and is covered by `go vet`, but — unlike the rest of this section — no test below calls it: doing so would need a live OTel Collector (or a fake gRPC server standing in for one) listening on `collectorEndpoint`, which this note doesn't stand up.
+
+Treat it as reviewed for shape and API correctness, not as integration-tested; a real service should still smoke-test it once against its actual collector sidecar before relying on it.
 
 Tests. The trace-context ones are the load-bearing proof for this note: that a log line picks up a real trace ID, that a secret never appears in a log line, and — the part that's easy to get wrong — that a trace survives a hop through a queue with no shared Go context at all:
 
@@ -574,3 +630,8 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 - **Before this:** [[Building REST Endpoints]], [[Receiving Webhooks Idempotently]]
 - **Next:** [[Scheduled Jobs]], [[Graceful Shutdown and Health Checks]]
 - **Compare with:** [[Observability Fundamentals]], [[Structured Logging]], [[Metrics and Prometheus]], [[Distributed Tracing with OpenTelemetry]] (the vendor/protocol-agnostic concepts this note instruments in Go)
+
+### Watch on YouTube
+
+- [Go's Built-in Package for Better Logging (using slog)](https://www.youtube.com/watch?v=_mqB7LLgwgs) · Better Stack · focused intro to structured logging with log/slog
+- [Observability made painless: Go, Otel & LGTM stack - Haseeb Majid](https://www.youtube.com/watch?v=t3Xz-IrxNwk) · GopherCon UK · conference talk tying logs, metrics and traces together in Go

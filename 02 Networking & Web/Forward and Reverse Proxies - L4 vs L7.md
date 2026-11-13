@@ -9,7 +9,7 @@ sources:
   - "RFC 7239, Forwarded HTTP Extension"
   - "HAProxy docs, PROXY protocol specification"
   - "Envoy docs, Architecture overview"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Forward and Reverse Proxies - L4 vs L7
@@ -22,6 +22,51 @@ updated: 2026-11-09
 > - Reverse proxy: the server's agent, standing in front of one or more backends, usually for TLS termination, routing, and protecting the origin.
 > - L4 forwards bytes by IP:port (or passes TLS through using the SNI hostname) without understanding HTTP; L7 terminates the connection and reads the request to route it.
 > - Classic mistake: trusting an inbound `X-Forwarded-For` header from the client itself. Only a header appended by a proxy **you control** is trustworthy.
+
+## Start here: the basics
+
+**The problem in one story.**
+You type `shop.com` and get a page.
+Behind that name are ten servers, not one.
+You never see them; one machine in front takes your request and hands it to a free server.
+That machine in the middle is a proxy.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Client | The program asking for something | Your browser |
+| Server / backend | The program answering | The orders service |
+| IP address and port | Where a program listens on a network | `10.0.0.5:8080` |
+| TCP connection | A reliable two-way byte pipe between two programs | Browser to server on port 443 |
+| HTTP request | A message like "GET /orders" with headers | `GET /users/7 Host: api.example.com` |
+| TLS | Encryption wrapped around the connection | The padlock in the browser |
+| Header | A name/value line attached to a request | `X-Forwarded-For: 203.0.113.9` |
+| L4 / L7 | Network layers: L4 = connections and ports, L7 = the HTTP message | L4 sees "port 443", L7 sees "/orders" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User"] --> FP["Forward proxy<br/>(speaks for the client)"]
+    FP --> I["Internet"]
+    I --> RP["Reverse proxy<br/>(speaks for the server)"]
+    RP --> A["Backend A"]
+    RP --> B["Backend B"]
+```
+
+**Analogy.** A forward proxy is your personal assistant who makes calls for you, so the other side sees the assistant's number. A reverse proxy is a company receptionist who answers every call and transfers it to the right desk.
+Where it breaks: a receptionist cannot read a sealed letter, but an L7 proxy that holds the TLS key can open and inspect every request.
+
+**How the rest of this note builds up**
+
+- First, why proxies exist (section 1) and the forward vs reverse mental model (section 2).
+- Then how each works (section 3), including the L4 vs L7 split and HTTPS interception.
+- Then forwarded headers, PROXY protocol, connection pooling and timeouts.
+- Finally the SDE-3 deep dive: trusting `X-Forwarded-For`, sidecars and service meshes, and interview traps.
+
+> [!tip] Remember
+> Forward proxy hides the client, reverse proxy hides the server; L4 moves bytes, L7 reads requests.
 
 ## 1. Why it exists
 
@@ -58,7 +103,13 @@ flowchart LR
 
 ### Forward proxy
 
-The client is configured (by OS proxy settings, or a PAC file pushed by IT) to send every outbound request to the forward proxy instead of directly to the destination. For plain HTTP, the proxy sees the full request and can inspect, filter, or cache it. For HTTPS, the client instead issues an HTTP `CONNECT` request naming the destination host and port; the proxy opens a raw TCP tunnel to that destination and from then on just relays encrypted bytes in both directions, blind to their content — unless the organization also deploys its own CA certificate on every device and the proxy performs a deliberate TLS interception (terminating the client's TLS, inspecting the plaintext, and re-encrypting to the real destination with a certificate it mints on the fly, signed by that internal CA).
+The client is configured (by OS proxy settings, or a PAC file pushed by IT) to send every outbound request to the forward proxy instead of directly to the destination.
+
+For plain HTTP, the proxy sees the full request and can inspect, filter, or cache it.
+
+For HTTPS, the client instead issues an HTTP `CONNECT` request naming the destination host and port; the proxy opens a raw TCP tunnel to that destination and from then on just relays encrypted bytes in both directions, blind to their content.
+
+The exception is when the organization also deploys its own CA certificate on every device and the proxy performs a deliberate TLS interception (terminating the client's TLS, inspecting the plaintext, and re-encrypting to the real destination with a certificate it mints on the fly, signed by that internal CA).
 
 **Measured**, this session is itself running behind exactly such a TLS-inspecting corporate forward proxy (`openssl s_client` and `curl` from this sandbox, 2026-11-06):
 
@@ -70,7 +121,11 @@ Protocol  : TLSv1.3
 Cipher    : AEAD-AES256-GCM-SHA384
 ```
 
-The certificate for `developer.mozilla.org` is signed by **Zscaler**, not by Fastly's real CA. The forward proxy intercepted the handshake, presented its own certificate (trusted because the corporate root CA is installed on this machine), and re-established its own TLS connection onward to the real destination. This is the textbook shape of corporate HTTPS inspection: two separate TLS connections stitched together at the proxy, with the client only ever seeing the proxy's certificate.
+The certificate for `developer.mozilla.org` is signed by **Zscaler**, not by Fastly's real CA.
+
+The forward proxy intercepted the handshake, presented its own certificate (trusted because the corporate root CA is installed on this machine), and re-established its own TLS connection onward to the real destination.
+
+This is the textbook shape of corporate HTTPS inspection: two separate TLS connections stitched together at the proxy, with the client only ever seeing the proxy's certificate.
 
 ```mermaid
 flowchart LR
@@ -103,7 +158,9 @@ A reverse proxy terminates the client's connection and makes its own, separate c
 | Typical tools | A network load balancer (AWS NLB), `iptables`/IPVS, raw TCP proxies | Nginx, Envoy, HAProxy (L7 mode), API gateways |
 | Use when | You don't need to inspect HTTP, need raw throughput, or must preserve end-to-end TLS (the backend terminates it, not the proxy) | You need routing, header/body manipulation, WAF rules, or per-path policy |
 
-L4 can still make a routing-ish decision without decrypting: it reads the **SNI** (Server Name Indication) field, sent unencrypted in the TLS ClientHello specifically so a middlebox can see which hostname the client wants, and picks a backend based on that name alone — this is how one L4 listener can front multiple TLS-terminating backends without ever touching the key material. The deeper algorithms for *which* backend instance gets picked (round robin, least connections, consistent hashing) are covered in [[Load Balancing]]; this note is only about the proxying layer itself.
+L4 can still make a routing-ish decision without decrypting: it reads the **SNI** (Server Name Indication) field, sent unencrypted in the TLS ClientHello specifically so a middlebox can see which hostname the client wants, and picks a backend based on that name alone — this is how one L4 listener can front multiple TLS-terminating backends without ever touching the key material.
+
+The deeper algorithms for *which* backend instance gets picked (round robin, least connections, consistent hashing) are covered in [[Load Balancing]]; this note is only about the proxying layer itself.
 
 ```mermaid
 flowchart TD
@@ -138,9 +195,15 @@ flowchart LR
 
 **Example:** with the header above and `trustedHops = 2`, the real client IP is `203.0.113.9` — the second-from-right entry, since `10.0.0.5` is this proxy's own append and `203.0.113.9` is the one appended by the proxy you trust just before it. `attacker-spoofed` is discarded outright.
 
-If there's exactly one reverse proxy you control in front of the backend, `trustedHops` is 1: take the last entry, ignore everything before it. If the request also passed through an upstream CDN before your own reverse proxy, `trustedHops` is 2, and so on — this number is a fact about **your own infrastructure's topology**, never something inferred from the request. The `TrustedClientIP` function implementing this rule, with its test, is in [[Forward and Reverse Proxies - L4 vs L7 - Go]].
+If there's exactly one reverse proxy you control in front of the backend, `trustedHops` is 1: take the last entry, ignore everything before it.
 
-**PROXY protocol** (originated by HAProxy) solves a related but different problem: when an L4 proxy forwards a raw TCP connection, the backend sees the proxy's IP as the connection's source and has no HTTP headers to fall back on at all. PROXY protocol prepends a small, fixed-format header (the real source/destination IP and port) to the byte stream before the real payload, so even a non-HTTP backend (or an L4 hop in front of an L7 proxy) can learn the original client address.
+If the request also passed through an upstream CDN before your own reverse proxy, `trustedHops` is 2, and so on — this number is a fact about **your own infrastructure's topology**, never something inferred from the request.
+
+The `TrustedClientIP` function implementing this rule, with its test, is in [[Forward and Reverse Proxies - L4 vs L7 - Go]].
+
+**PROXY protocol** (originated by HAProxy) solves a related but different problem: when an L4 proxy forwards a raw TCP connection, the backend sees the proxy's IP as the connection's source and has no HTTP headers to fall back on at all.
+
+PROXY protocol prepends a small, fixed-format header (the real source/destination IP and port) to the byte stream before the real payload, so even a non-HTTP backend (or an L4 hop in front of an L7 proxy) can learn the original client address.
 
 ### Timeouts, and why a proxy gives you two different error codes
 
@@ -157,7 +220,9 @@ A reverse proxy has timeouts on both of its legs — client-facing and backend-f
 
 ### Upstream keepalive
 
-Opening a new TCP (and TLS) connection per request to the backend wastes a handshake on every single request. A reverse proxy keeps a **pool** of already-connected, idle connections to each backend and reuses them (`Keep-Alive`/HTTP persistent connections), sized to roughly match the backend's own concurrency so the pool neither starves (too few, so requests queue for a free connection) nor exhausts the backend's own connection limits (too many).
+Opening a new TCP (and TLS) connection per request to the backend wastes a handshake on every single request.
+
+A reverse proxy keeps a **pool** of already-connected, idle connections to each backend and reuses them (`Keep-Alive`/HTTP persistent connections), sized to roughly match the backend's own concurrency so the pool neither starves (too few, so requests queue for a free connection) nor exhausts the backend's own connection limits (too many).
 
 ### Body limits, and proxying non-HTTP/1.1 traffic
 
@@ -189,7 +254,9 @@ flowchart LR
     CP -.-> SideB
 ```
 
-**Example:** Service A's code calls `http://localhost:15001/orders`, believing it's talking directly to Service B. In reality its sidecar intercepts that call, establishes an mTLS connection to Service B's sidecar, retries on a transient failure according to the control plane's policy, and only then hands the request to Service B's own application code — none of which Service A's code had to implement itself.
+**Example:** Service A's code calls `http://localhost:15001/orders`, believing it's talking directly to Service B.
+
+In reality its sidecar intercepts that call, establishes an mTLS connection to Service B's sidecar, retries on a transient failure according to the control plane's policy, and only then hands the request to Service B's own application code — none of which Service A's code had to implement itself.
 
 A control plane configures every sidecar's routing, retries, timeouts, and mTLS certificates centrally — this is what a **service mesh** (Istio, Linkerd) is. It moves cross-cutting proxy concerns (retries, mTLS, observability) out of application code, at the cost of an extra network hop per call and real operational complexity.
 
@@ -339,3 +406,8 @@ sequenceDiagram
 - **Next:** [[Nginx]], [[TLS and HTTPS]]
 - **Compare with:** [[Load Balancing]] (the algorithms that decide *which* backend instance, once a proxy decides to forward), [[API Gateway and BFF]] (the API-specific policy layer, often built on the same proxy software), [[CDN and Edge]] (a globally distributed reverse-proxy tier specialized for caching)
 - **Code:** [[Forward and Reverse Proxies - L4 vs L7 - Go]]
+
+### Watch on YouTube
+
+- [Layer 4 vs Layer 7 Proxying In Details Explained with Examples](https://www.youtube.com/watch?v=ylkAc9wmKhc) · Hussein Nasser · deep dive on L4 vs L7 proxying distinction the note is built around
+- [Proxy vs Reverse Proxy vs Load Balancer / Simply Explained](https://www.youtube.com/watch?v=xo5V9g9joFs) · TechWorld with Nana · clear visual comparison of forward proxy vs reverse proxy roles

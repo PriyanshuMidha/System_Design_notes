@@ -8,7 +8,7 @@ sources:
   - "Go 1.24 net/http package docs, Server.Shutdown and Server.RegisterOnShutdown"
   - "Kubernetes docs, Pod Lifecycle (termination sequence, terminationGracePeriodSeconds)"
   - "Kubernetes docs, Configure Liveness, Readiness and Startup Probes"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Graceful Shutdown and Health Checks
@@ -22,6 +22,51 @@ updated: 2026-11-07
 > - `main` must wait for `Server.Shutdown` to return, not for `ListenAndServe` — `ListenAndServe` returns `http.ErrServerClosed` the instant `Shutdown` is called, long before the drain finishes.
 > - Liveness, readiness and startup are three different questions; answering the wrong one gets a healthy pod killed or a broken pod sent traffic.
 > - Everything here is bounded by a deadline. A drain that can hang forever is worse than a hard kill.
+
+## Start here: the basics
+
+**The problem in one story.**
+You deploy a new version of your API.
+The old copy is told to stop while it is still answering requests.
+If it just dies, users see errors mid-request.
+A graceful shutdown stops new traffic first, finishes current work, then exits.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Signal | A short message the OS sends to a process | `SIGTERM` = please stop |
+| `SIGKILL` | A stop that cannot be caught or delayed | `kill -9` |
+| Drain | Let in-flight requests finish, accept no new ones | Wait for 3 open requests |
+| `context.Context` | A value that tells code to stop or time out | Cancelled on `SIGTERM` |
+| Health check / probe | An HTTP endpoint a platform calls to ask "are you OK?" | `GET /healthz` |
+| Liveness | "Is the process stuck? Restart it if so." | Deadlocked server fails it |
+| Readiness | "Should this copy get traffic right now?" | False during shutdown |
+| Pod | Kubernetes' unit that runs your container | `invoice-api-7f9c` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    K["SIGTERM"] --> R["Readiness = false"]
+    R --> N["No new traffic"]
+    N --> D["Shutdown():<br/>drain in-flight"]
+    D -- "done" --> E["Exit 0"]
+    D -- "deadline hit" --> F["Force close"]
+```
+
+**Analogy.** A shop at closing time flips the sign to "Closed", serves the people already inside, then locks up.
+Where it breaks: a shop can wait for slow customers, but a server has a hard deadline before the platform sends `SIGKILL`.
+
+**How the rest of this note builds up**
+
+- First, why abrupt stops hurt (section 1) and the mental model (section 2).
+- Then signals, the shutdown sequence, the `ListenAndServe`/`Shutdown` ordering bug, hijacked connections and gRPC (section 3).
+- Then a full worked example with probes (section 4) and comparisons (section 5).
+- Finally the SDE-3 deep dive: Kubernetes timing, probe mistakes and production failures (sections 6-8).
+
+> [!tip] Remember
+> On `SIGTERM`: fail readiness, drain with a deadline, wait for `Shutdown` to return, then exit.
 
 ### Whiteboard version
 
@@ -59,7 +104,11 @@ Graceful shutdown is the process cooperating with that race: stop taking new wor
 
 ## 2. Mental model
 
-Think of the pod as a restaurant closing for the night. Flipping the sign to "closed" (readiness → false) happens the instant the decision is made — no new customers are seated. Existing tables keep eating because they already ordered (in-flight requests drain). The kitchen finishes the orders already on the pass (in-flight jobs finish) but refuses new ones. Only once the last table pays the bill does staff lock the door and leave (process exits) — and if the night manager tells them a hard deadline, they will interrupt a half-finished order rather than stay past closing (shutdown deadline).
+Think of the pod as a restaurant closing for the night. Flipping the sign to "closed" (readiness → false) happens the instant the decision is made — no new customers are seated. Existing tables keep eating because they already ordered (in-flight requests drain).
+
+The kitchen finishes the orders already on the pass (in-flight jobs finish) but refuses new ones.
+
+Only once the last table pays the bill does staff lock the door and leave (process exits) — and if the night manager tells them a hard deadline, they will interrupt a half-finished order rather than stay past closing (shutdown deadline).
 
 The crash case is different: it is the building catching fire. There is no graceful anything — the staff and customers leave however they can, and the only thing that saves the night is that every order was already written on a ticket (idempotent, at-least-once processing), not held only in a chef's head.
 
@@ -73,7 +122,9 @@ The crash case is different: it is the building catching fire. There is no grace
 | `SIGINT` | Ctrl-C in a terminal | yes | same intent, interactive |
 | `SIGKILL` | Kubernetes after the grace period, OOM killer | no | immediate, unconditional process death |
 
-`SIGKILL` and an OOM kill cannot be intercepted by any Go code — there is no handler, no deferred function, nothing. Graceful shutdown only ever covers the first two rows. Surviving the third row is a different problem, solved by making every unit of work idempotent and safe to retry (link [[Idempotency and Idempotency Keys]]), not by code in this note.
+`SIGKILL` and an OOM kill cannot be intercepted by any Go code — there is no handler, no deferred function, nothing. Graceful shutdown only ever covers the first two rows.
+
+Surviving the third row is a different problem, solved by making every unit of work idempotent and safe to retry (link [[Idempotency and Idempotency Keys]]), not by code in this note.
 
 ### The shutdown sequence
 
@@ -107,7 +158,9 @@ go srv.ListenAndServe()
 os.Exit(0) // WRONG: exits before Shutdown has even been called
 ```
 
-exits before any draining happens at all. The correct shape calls `Shutdown` from the goroutine that owns the ctx, and has `main` wait for that call — not for `ListenAndServe` — to return. The code in [4. Worked example](#4-worked-example) does exactly this: `ListenAndServe` runs in its own goroutine and reports its *own* exit through a channel, while the main `Run` goroutine blocks on `ctx.Done()`, then calls `Shutdown`, then drains workers, then returns.
+exits before any draining happens at all. The correct shape calls `Shutdown` from the goroutine that owns the ctx, and has `main` wait for that call — not for `ListenAndServe` — to return. The code in [4.
+
+Worked example](#4-worked-example) does exactly this: `ListenAndServe` runs in its own goroutine and reports its *own* exit through a channel, while the main `Run` goroutine blocks on `ctx.Done()`, then calls `Shutdown`, then drains workers, then returns.
 
 ### Hijacked connections Shutdown does not drain
 
@@ -558,3 +611,8 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 - **Before this:** [[HTTP Server Fundamentals (net-http)]], [[Context Package]]
 - **Next:** [[Background Workers and Job Queues]], [[Observability in Go Services]]
 - **Compare with:** [[Load Shedding and Graceful Degradation]] (rejecting work under overload, a different trigger than shutdown), [[Timeouts, Retries and Backoff]] (bounding the client side of a drained request)
+
+### Watch on YouTube
+
+- [Golang Microservices: Graceful Shutdown](https://www.youtube.com/watch?v=VXxe7-b5euo) · Mario Carrion · covers Go HTTP shutdown plus Kubernetes/deployment context
+- [HTTP Server Graceful Shutdown with Error Groups](https://www.youtube.com/watch?v=S6QFZfCLMyo) · Code & Learn · hands-on code pattern for draining a server on signal

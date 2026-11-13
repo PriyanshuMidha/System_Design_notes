@@ -8,7 +8,7 @@ sources:
   - "Kusupati et al., Matryoshka Representation Learning (NeurIPS 2022)"
   - "Reimers & Gurevych, Sentence-BERT (EMNLP 2019) — symmetric vs asymmetric encoders"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Embeddings
@@ -22,15 +22,66 @@ updated: 2026-11-07
 > - Cosine similarity (or dot product, on normalized vectors) is the standard distance; it ignores vector length and compares direction only.
 > - Dimensions, quantization and chunk size are storage and latency knobs you tune by measuring recall@k on your own queries, not by guessing.
 
+## Start here: the basics
+
+**The problem in one story.**
+A user searches your help center for "money back".
+The right article is titled "Refund policy" and never says "money back".
+Keyword search misses it. Embeddings turn both texts into numbers that land close together, so the search finds it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Vector | An ordered list of numbers | `[0.12, -0.40, 0.88]` |
+| Dimension | How many numbers are in the vector | 768 or 1,536 |
+| Embedding model | A model that turns text into a vector | Text in, 1,536 floats out |
+| Similarity | A score for how close two vectors are | Cosine 0.92 = very similar |
+| Cosine similarity | Compares direction of two vectors, ignores length | Same direction = 1.0 |
+| Normalize | Scale a vector to length 1 | Then dot product = cosine |
+| Recall@k | Share of right answers found in the top k results | 9 of 10 found in top 5 = 0.9 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    T1["Refund policy"] --> E["Embedding model"]
+    T2["money back"] --> E
+    E --> V1["vector A"]
+    E --> V2["vector B"]
+    V1 --> S{"Close?<br/>(cosine)"}
+    V2 --> S
+    S --> R["Match found"]
+```
+
+**Analogy.** Embeddings are like map coordinates for meaning. "Refund" and "money back" are in the same neighbourhood; "banana" is in another city.
+Where it breaks: a real map has 2 dimensions you can see; embeddings have hundreds, and each model draws its own map, so vectors from two models cannot be compared.
+
+**How the rest of this note builds up**
+
+- First, why embeddings exist (section 1) and the "meaning as a point in space" model (section 2).
+- Then how models are trained and used, similarity metrics, dimensions and quantization (section 3).
+- Then a Go worked example (section 4) and model comparisons and trade-offs (sections 5-6).
+- Finally production concerns like model versioning, the SDE-3 deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Same model for index and query, compare by cosine, and tune by measuring recall on your own queries.
+
 ## 1. Why it exists
 
 You're building search over 50,000 internal support articles. Keyword search for "cancel my subscription" misses an article titled "How to close your account" — zero shared words, same intent. A customer searching "car insurance" should also find a document that only ever says "vehicle protection plan." No amount of synonym lists scales to every paraphrase a user might type.
 
-Embeddings solve this by representing meaning as geometry instead of as exact tokens. A sentence encoder maps `"car insurance"` and `"vehicle protection plan"` to vectors that are close together (**measured on a representative sentence-embedding model: cosine similarity ≈ 0.82**, vendor-reported figures on comparable paraphrase pairs typically land in the 0.75–0.90 range), while `"car insurance"` and `"banana bread recipe"` land far apart (cosine similarity ≈ 0.05–0.15, representative range). Search becomes "which stored vectors are nearest to the query vector," a well-studied geometric problem instead of a brittle string-matching one.
+Embeddings solve this by representing meaning as geometry instead of as exact tokens.
+
+A sentence encoder maps `"car insurance"` and `"vehicle protection plan"` to vectors that are close together (**measured on a representative sentence-embedding model: cosine similarity ≈ 0.82**, vendor-reported figures on comparable paraphrase pairs typically land in the 0.75–0.90 range), while `"car insurance"` and `"banana bread recipe"` land far apart (cosine similarity ≈ 0.05–0.15, representative range).
+
+Search becomes "which stored vectors are nearest to the query vector," a well-studied geometric problem instead of a brittle string-matching one.
 
 ## 2. Mental model
 
-Imagine every document and every possible query as a dot somewhere in a space with hundreds or thousands of dimensions — far too many to draw, but the 2-D intuition still holds. Dots near each other mean similar meaning; the model's entire job during training is to pull dots with related meaning together and push unrelated dots apart. A search is just: embed the query, drop it into the same space, and find its nearest neighbors.
+Imagine every document and every possible query as a dot somewhere in a space with hundreds or thousands of dimensions — far too many to draw, but the 2-D intuition still holds.
+
+Dots near each other mean similar meaning; the model's entire job during training is to pull dots with related meaning together and push unrelated dots apart. A search is just: embed the query, drop it into the same space, and find its nearest neighbors.
 
 ```mermaid
 flowchart LR
@@ -60,7 +111,9 @@ flowchart LR
 
 ### Training: contrastive learning
 
-Embedding models are trained with **contrastive learning**: feed the model pairs known to be related (a question and its correct answer, two paraphrases, a document and a search query that should find it) alongside unrelated pairs, and adjust the model so related pairs end up with high cosine similarity and unrelated pairs end up near zero or negative. This is why embeddings capture task-relevant similarity (does this answer this question?) rather than surface similarity (do these share words?) — the training signal is "useful for retrieval," not "looks alike."
+Embedding models are trained with **contrastive learning**: feed the model pairs known to be related (a question and its correct answer, two paraphrases, a document and a search query that should find it) alongside unrelated pairs, and adjust the model so related pairs end up with high cosine similarity and unrelated pairs end up near zero or negative.
+
+This is why embeddings capture task-relevant similarity (does this answer this question?) rather than surface similarity (do these share words?) — the training signal is "useful for retrieval," not "looks alike."
 
 ### Dense vs sparse
 
@@ -85,7 +138,11 @@ Normalizing every vector to unit length at write time means dot product and cosi
 
 ### Symmetric vs asymmetric retrieval
 
-A **symmetric** model assumes the query and the thing it's matched against are the same kind of text (paraphrase search: "is this sentence similar to that sentence?"). An **asymmetric** model assumes a short query is matched against a longer passage (search: "does this paragraph answer this question?") and is trained with separate query and document encoders, or with a single encoder plus different instruction prefixes (`"query: ..."` vs `"document: ..."`) that tell it which role the text is playing. Using the wrong role prefix, or swapping query/document text through the wrong encoder, measurably degrades retrieval — check whether your chosen model needs these prefixes before indexing anything.
+A **symmetric** model assumes the query and the thing it's matched against are the same kind of text (paraphrase search: "is this sentence similar to that sentence?").
+
+An **asymmetric** model assumes a short query is matched against a longer passage (search: "does this paragraph answer this question?") and is trained with separate query and document encoders, or with a single encoder plus different instruction prefixes (`"query: ..."` vs `"document: ..."`) that tell it which role the text is playing.
+
+Using the wrong role prefix, or swapping query/document text through the wrong encoder, measurably degrades retrieval — check whether your chosen model needs these prefixes before indexing anything.
 
 ### Re-embedding migration
 
@@ -520,3 +577,8 @@ ok  	embed	1.51s
 - **Before this:** [[LLM Fundamentals]]
 - **Next:** [[Vector Databases and ANN Indexes]], [[Keyword, Semantic and Hybrid Search]], [[RAG Pipeline]]
 - **Compare with:** [[Partitioning and Sharding]] (sharding an index by tenant or vector range is the same trade-off as sharding any other datastore)
+
+### Watch on YouTube
+
+- [What are Word Embeddings?](https://www.youtube.com/watch?v=wgfSDrqYMJ4) · IBM Technology · 8 min · 306,149 views
+- [Vectoring Words (Word Embeddings) - Computerphile](https://www.youtube.com/watch?v=gQddtTdmG_8) · Computerphile · 16 min · 337,173 views

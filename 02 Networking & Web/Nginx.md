@@ -8,7 +8,7 @@ sources:
   - "nginx.org docs, Beginner's Guide and ngx_http_core_module"
   - "nginx.org docs, ngx_http_limit_req_module and ngx_http_upstream_module"
   - "Kubernetes blog, Ingress NGINX: Statement from the Kubernetes Steering and Security Response Committees (2026-01-29)"
-updated: 2026-11-06
+updated: 2026-11-13
 ---
 
 # Nginx
@@ -22,9 +22,55 @@ updated: 2026-11-06
 > - A `location /api/` block with `proxy_pass` forwards to an `upstream` pool of backend servers, with its own balancing method, health checks, and timeouts.
 > - Classic mistake: assuming `proxy_read_timeout`'s 60-second default is "the request timeout." It's specifically the time between two reads from the backend — a single slow endpoint needs its own override, not a global one.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your web app runs on one server, and 10,000 people open it at once.
+Many of them are on slow phones, so each request trickles in slowly.
+If the server parks one worker per visitor, it runs out of memory waiting on slow phones.
+Nginx sits in front, juggles all those slow visitors cheaply, and hands finished requests to your app.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Web server | A program that answers HTTP requests | Nginx returning `index.html` |
+| Reverse proxy | A server that receives requests and forwards them to your real app | Nginx passing `/api/` to a Go service on port 8080 |
+| Upstream / backend | The servers nginx forwards requests to | Three Go app instances |
+| Process / thread | A running program / one line of execution inside it | One nginx worker = one process with one thread |
+| Connection | An open network link between a client and a server | One browser tab talking to nginx |
+| Event loop | A loop that handles whichever connection is ready next, never waiting on one | Worker serving 5,000 sockets in turn |
+| Timeout | How long to wait before giving up | `proxy_read_timeout 60s` |
+| Load balancer | Spreads requests across several backends | Round-robin across 3 servers |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Many users<br/>(browsers, phones)"] --> N["Nginx<br/>(few workers)"]
+    N -- "/static/" --> F["Files on disk"]
+    N -- "/api/" --> B1["App server 1"]
+    N -- "/api/" --> B2["App server 2"]
+```
+
+**Analogy.** Nginx is a hotel receptionist who greets every guest, answers easy questions (static files) directly, and sends the rest to the right department (backends).
+Where it breaks: one receptionist talks to one guest at a time, while one nginx worker keeps thousands of conversations open and switches between them in microseconds.
+
+**How the rest of this note builds up**
+
+- First, why nginx exists (the C10K problem, section 1) and the master/worker mental model (section 2).
+- Then how it works: workers and `epoll`, the `http` → `server` → `location` config tree, location matching, upstreams, timeouts and rate limiting (section 3).
+- Then a worked config (section 4), comparisons and trade-offs (sections 5-6).
+- Finally the SDE-3 material: production pitfalls, the `epoll` and micro-caching deep dive, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Nginx is a cheap front door: a few workers juggle many connections and route each request to files or backends.
+
 ## 1. Why it exists
 
-A traditional thread-per-connection web server needs one OS thread (with its own stack, typically megabytes) for every open connection. At 10,000 concurrent slow clients — the classic "C10K problem" — that's gigabytes of thread stacks and brutal context-switching overhead, most of it spent on connections that are simply idle, waiting on a slow network.
+A traditional thread-per-connection web server needs one OS thread (with its own stack, typically megabytes) for every open connection.
+
+At 10,000 concurrent slow clients — the classic "C10K problem" — that's gigabytes of thread stacks and brutal context-switching overhead, most of it spent on connections that are simply idle, waiting on a slow network.
 
 Nginx was built specifically to answer the C10K problem: a fixed small number of worker processes (often one per CPU core), each managing tens of thousands of connections through a non-blocking event loop, so idle connections cost memory for a small connection-state struct, not an entire OS thread.
 
@@ -39,9 +85,15 @@ accept-ranges: bytes
 
 ## 2. Mental model
 
-Picture a restaurant with one head chef (the **master process**) who doesn't cook, and a handful of line cooks (**worker processes**). Each line cook doesn't wait idle for one order to fully finish before starting the next — they check on many dishes at once, moving to whichever one is ready for the next step (an event loop), instead of one cook per customer standing around while a dish simmers.
+Picture a restaurant with one head chef (the **master process**) who doesn't cook, and a handful of line cooks (**worker processes**).
 
-**Where the analogy breaks down:** a real line cook can only physically stand at one station at a time, so the "many dishes at once" part is really "switching between dishes very fast, one at a time." An nginx worker does exactly that too — one OS thread, switching between ready sockets — so the analogy is accurate on that point. Where it breaks down is staffing: a restaurant can't usually hire a fractional cook, but `worker_processes auto` picks a whole number of workers equal to the CPU core count with no such constraint, and nginx can run with just one worker handling every connection if asked to.
+Each line cook doesn't wait idle for one order to fully finish before starting the next — they check on many dishes at once, moving to whichever one is ready for the next step (an event loop), instead of one cook per customer standing around while a dish simmers.
+
+**Where the analogy breaks down:** a real line cook can only physically stand at one station at a time, so the "many dishes at once" part is really "switching between dishes very fast, one at a time."
+
+An nginx worker does exactly that too — one OS thread, switching between ready sockets — so the analogy is accurate on that point.
+
+Where it breaks down is staffing: a restaurant can't usually hire a fractional cook, but `worker_processes auto` picks a whole number of workers equal to the CPU core count with no such constraint, and nginx can run with just one worker handling every connection if asked to.
 
 > [!tip] Remember
 > One **master** that never touches traffic, N **workers** that do all the work, each one juggling many connections by switching between whichever is ready next — never one worker per connection.
@@ -61,7 +113,8 @@ flowchart TD
 ```
 
 - The **master** process never handles a request. It reads and validates config, opens the listening sockets, and spawns, monitors, and reloads workers.
-- Each **worker** runs a single OS thread with its own event loop built on `epoll` (Linux) — see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] for how `epoll` itself works. The worker registers interest in many sockets at once and the kernel tells it which ones are ready, so one worker thread services many connections without ever blocking on a single slow one.
+- Each **worker** runs a single OS thread with its own event loop built on `epoll` (Linux) — see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] for how `epoll` itself works.
+  The worker registers interest in many sockets at once and the kernel tells it which ones are ready, so one worker thread services many connections without ever blocking on a single slow one.
 - `worker_connections` caps how many simultaneous connections one worker will hold open; `worker_processes` (commonly `auto`, meaning one per detected CPU core) sets how many workers run. The product of the two is nginx's practical connection ceiling on one machine.
 - `nginx -s reload` sends the master a signal to re-read config and spawn **new** workers with the new config while **old** workers finish their current connections and then exit — a graceful, zero-downtime config change with no dropped connections.
 
@@ -96,7 +149,11 @@ http {
 - `server` is one virtual host: it listens on a port and matches a `server_name` (or several), much like one tenant of the whole nginx instance.
 - `location` matches a request's URL path within a `server` and decides how to handle it: proxy it, serve a static file, redirect it, or something else.
 
-**In plain words:** think of the config as a filing system with three drawers nested inside each other. The outer drawer (`http`) holds settings every site in this nginx instance shares. Inside it, one folder per website (`server`) holds that site's own settings. Inside each folder, one index card per URL pattern (`location`) says exactly what to do when a request for that pattern arrives.
+**In plain words:** think of the config as a filing system with three drawers nested inside each other.
+
+- The outer drawer (`http`) holds settings every site in this nginx instance shares.
+- Inside it, one folder per website (`server`) holds that site's own settings.
+- Inside each folder, one index card per URL pattern (`location`) says exactly what to do when a request for that pattern arrives.
 
 ```mermaid
 flowchart TB
@@ -181,7 +238,11 @@ server {
 | IP hash | `ip_hash` | Same client IP always maps to the same server (session stickiness, at the cost of uneven load if client IPs aren't evenly distributed) |
 | Generic consistent hash | `hash $request_uri consistent` | A custom key (e.g. the URI) maps consistently to a server, minimizing remapping when a server is added or removed — see [[Consistent Hashing]] |
 
-**Health checks**: open-source nginx only does **passive** checks — `max_fails` failed attempts within `fail_timeout` marks a server temporarily down, and traffic stops going to it until `fail_timeout` elapses and it's tried again. **Active** health checks (proactively probing a `/health` endpoint on a timer, independent of real traffic) are an NGINX Plus (commercial) feature; open-source deployments typically pair nginx with an external health-checking sidecar or rely on the orchestrator (Kubernetes readiness probes) instead.
+**Health checks**: open-source nginx only does **passive** checks.
+
+- `max_fails` failed attempts within `fail_timeout` marks a server temporarily down, and traffic stops going to it until `fail_timeout` elapses and it's tried again.
+- **Active** health checks (proactively probing a `/health` endpoint on a timer, independent of real traffic) are an NGINX Plus (commercial) feature.
+- Open-source deployments typically pair nginx with an external health-checking sidecar or rely on the orchestrator (Kubernetes readiness probes) instead.
 
 ### Timeouts and buffering
 
@@ -196,7 +257,11 @@ proxy_buffers 8 8k;                  # buffers for the response body
 proxy_busy_buffers_size 16k;
 ```
 
-`proxy_read_timeout` is not one deadline for the whole request — it resets on every chunk of data nginx receives from the upstream. A backend that streams a few bytes every 20 seconds for 5 minutes never trips a 30-second `proxy_read_timeout`, because each new chunk restarts the clock; a backend that goes fully silent for 31 seconds does. This is exactly why a single misconfigured timeout produces the two different failures described in [[Forward and Reverse Proxies - L4 vs L7]]: nginx returns **502** if the upstream connection is refused or reset, and **504** if the connection succeeded but a read or connect timeout fires waiting on it.
+`proxy_read_timeout` is not one deadline for the whole request — it resets on every chunk of data nginx receives from the upstream.
+
+A backend that streams a few bytes every 20 seconds for 5 minutes never trips a 30-second `proxy_read_timeout`, because each new chunk restarts the clock; a backend that goes fully silent for 31 seconds does.
+
+This is exactly why a single misconfigured timeout produces the two different failures described in [[Forward and Reverse Proxies - L4 vs L7]]: nginx returns **502** if the upstream connection is refused or reset, and **504** if the connection succeeded but a read or connect timeout fires waiting on it.
 
 `proxy_buffering` lets nginx read the upstream's entire response (up to the buffer limits) before forwarding it to a slow client, freeing the upstream connection quickly; turning it off (`proxy_buffering off`) is needed for real-time streaming responses (e.g. server-sent events) where the client must see each chunk as it arrives, not after nginx has buffered the whole thing.
 
@@ -250,7 +315,11 @@ server {
 
 **In plain words:** imagine a bucket with a small hole in the bottom that lets water (requests) drain out at a fixed rate, no matter how fast water is poured in. Pour in faster than it drains, and the bucket fills; pour in faster still, and it overflows — those overflow requests are the ones nginx rejects.
 
-- `limit_req` implements this **leaky bucket**: requests drain at `rate` (here 10 per second per client IP); `burst` allows a short spike above that rate to queue instead of being rejected immediately, and `nodelay` serves burst requests immediately instead of artificially spacing them out to the steady rate (trading smoothness for lower latency on the burst). Without `nodelay`, queued burst requests are delayed to fit the steady rate rather than rejected. Once both the steady rate and the burst allowance are exceeded, nginx returns `503` by default.
+- `limit_req` implements this **leaky bucket**: requests drain at `rate` (here 10 per second per client IP).
+  - `burst` allows a short spike above that rate to queue instead of being rejected immediately.
+  - `nodelay` serves burst requests immediately instead of artificially spacing them out to the steady rate (trading smoothness for lower latency on the burst).
+  - Without `nodelay`, queued burst requests are delayed to fit the steady rate rather than rejected.
+  - Once both the steady rate and the burst allowance are exceeded, nginx returns `503` by default.
 - `limit_conn` caps simultaneous **open connections** per key, independent of request rate — useful against a client opening many slow, long-lived connections rather than sending many fast requests.
 - The underlying algorithms, and how to make a rate limiter work correctly across many nginx instances rather than per-instance, are covered in [[Rate Limiting - Algorithms and Distributed Design]]; this note only covers nginx's own directives.
 
@@ -262,7 +331,12 @@ flowchart LR
     Bucket -- "over rate + burst" --> Reject["503 Service Unavailable"]
 ```
 
-**Example, with numbers:** `rate=10r/s, burst=20, nodelay`. A client that suddenly sends 25 requests in the same instant gets the first 20 served immediately (the burst allowance, released without delay because of `nodelay`), and the remaining 5 rejected with `503` — none of the 20 are throttled to the 10/s steady rate, because `nodelay` is set; without it, those same 20 would be let through but spaced out to arrive no faster than 10 per second.
+**Example, with numbers:** `rate=10r/s, burst=20, nodelay`. A client that suddenly sends 25 requests in the same instant:
+
+- The first 20 are served immediately (the burst allowance, released without delay because of `nodelay`).
+- The remaining 5 are rejected with `503`.
+- None of the 20 are throttled to the 10/s steady rate, because `nodelay` is set.
+- Without `nodelay`, those same 20 would be let through but spaced out to arrive no faster than 10 per second.
 
 > [!tip] Remember
 > `limit_req` paces *request rate* per key; `limit_conn` caps *simultaneous connections* per key. A client sending one request per minute over 50 open connections trips `limit_conn`, not `limit_req` — they defend against different attack shapes.
@@ -403,10 +477,14 @@ sequenceDiagram
 
 ## 8. Deep dive
 
-- **Why `epoll` beats a thread-per-connection or naive `select`/`poll` model at scale.** `select`/`poll` require the kernel to rescan the *entire* set of watched file descriptors on every call, an O(n) cost per check regardless of how many are actually ready; `epoll` keeps the watched set registered in the kernel and only returns the subset that's actually ready, making each check proportional to the number of ready events, not the number of watched connections — the mechanism itself lives in [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]].
+- **Why `epoll` beats a thread-per-connection or naive `select`/`poll` model at scale.** `select`/`poll` require the kernel to rescan the *entire* set of watched file descriptors on every call, an O(n) cost per check regardless of how many are actually ready.
+
+  `epoll` keeps the watched set registered in the kernel and only returns the subset that's actually ready, making each check proportional to the number of ready events, not the number of watched connections — the mechanism itself lives in [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]].
 - **Why `worker_processes auto` is usually right, but not always.** One worker per core avoids both under-utilization (fewer workers than cores) and unnecessary context-switching between workers contending for the same core. On a machine also running other CPU-heavy processes, pinning worker count below the core count (and using `worker_cpu_affinity`) can reduce contention and tail latency.
 - **Why `keepalive` in the `upstream` block needs `proxy_http_version 1.1` specifically.** HTTP/1.0 has no persistent-connection concept by default; without bumping the proxy-to-upstream protocol version to 1.1, nginx cannot keep that backend connection open for reuse regardless of the `keepalive` directive's value — the directive sets the pool size, but the protocol version is what makes pooling possible at all.
-- **Micro-caching's narrow safety window.** A `proxy_cache_valid 200 5s` micro-cache is safe for public, non-personalized responses, but caching anything that varies per user (even for 5 seconds) at the reverse-proxy layer risks exactly the private-data-leak failure mode covered for CDNs in [[CDN and Edge]] — the cache key must include every dimension the response actually varies on, same rule, smaller blast radius.
+- **Micro-caching's narrow safety window.** A `proxy_cache_valid 200 5s` micro-cache is safe for public, non-personalized responses.
+
+  But caching anything that varies per user (even for 5 seconds) at the reverse-proxy layer risks exactly the private-data-leak failure mode covered for CDNs in [[CDN and Edge]] — the cache key must include every dimension the response actually varies on, same rule, smaller blast radius.
 
 ## 9. Interview questions
 
@@ -445,3 +523,7 @@ sequenceDiagram
 - **Before this:** [[Forward and Reverse Proxies - L4 vs L7]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Next:** [[TLS and HTTPS]], [[What Happens When You Type a URL]]
 - **Compare with:** [[Load Balancing]] (the balancing algorithms in general, beyond nginx's own directives), [[Rate Limiting - Algorithms and Distributed Design]] (the algorithms behind `limit_req`, and making them work across many nginx instances), [[CDN and Edge]] (the same micro-caching and request-collapsing ideas, applied globally)
+
+### Watch on YouTube
+
+- [Nginx as a reverse proxy  - A closer look at Nginx worker processes and worker connections](https://www.youtube.com/watch?v=ODxw1QWpdEM) · Alternative Degree · goes into the worker-process/event-loop internals the note covers, not just setup steps

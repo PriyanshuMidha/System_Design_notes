@@ -8,7 +8,7 @@ sources:
   - "react.dev, Passing Data Deeply with Context"
   - "react.dev, Scaling Up with Reducer and Context"
   - "Redux Toolkit docs (redux-toolkit.js.org), createSlice and RTK Query"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # React State Management - Props, Context, Redux
@@ -21,6 +21,50 @@ updated: 2026-11-04
 > - **Context** solves the drilling problem, not the "this is global state" problem: any component that calls `useContext` re-renders whenever the Provider's `value` changes, even if only one field in that value changed.
 > - The Context `defaultValue` (the argument to `createContext`) only applies to a component that renders with **no Provider above it at all** — it is not a fallback for "Provider rendered without a `value` prop," which instead gives you `undefined`.
 > - **Redux** (and similar stores) exist for state genuinely shared across distant, unrelated parts of the UI — not as a replacement for `useState` on state that one component tree owns.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app has a dark-mode switch in the settings page.
+The header, sidebar and buttons all need to know the current theme.
+Passing it by hand through every component in between is tedious.
+React offers three ways to share data: props (hand it down), Context (broadcast it), or a store like Redux (one shared box everyone subscribes to).
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Component tree | Components nested inside each other | `App > Layout > Header` |
+| Props | Data a parent hands to its child | `<Header theme="dark" />` |
+| State | Data a component owns and can change | `useState('dark')` |
+| Re-render | React calling a component again to refresh its UI | the header redraws after a theme change |
+| Prop drilling | Passing a prop through layers that do not use it | `Layout` passing `theme` it never reads |
+| Store | One central object holding shared app state | a Redux store with `cart` and `user` |
+| Selector | A function picking one slice of the store | `s => s.cart.count` |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    A["App (owns theme)"] -- "props" --> L["Layout"]
+    L -- "props" --> H["Header"]
+    A -. "Context: skip the middle" .-> B["Button"]
+    ST[("Redux store")] -. "useSelector" .-> H
+    ST -. "useSelector" .-> B
+```
+
+**Analogy.** Props are passing a note hand to hand; Context is a PA announcement to the whole floor; a store is a notice board where each person reads only their own section.
+Where it breaks: a PA announcement makes everyone stop and listen, and Context really does re-render every consumer, even ones that do not care about the change.
+
+**How the rest of this note builds up**
+
+- First, why prop drilling hurts (section 1) and the mental model of three sharing tools (section 2).
+- Then composition, the Context default-value rule, Context's re-render cost, and Redux Toolkit's data flow (section 3).
+- Then async server data and choosing between props, Context and a store (section 4).
+- Finally the SDE-3 deep dive: trade-offs, production patterns and the stale memoized Context bug (sections 5-8).
+
+> [!tip] Remember
+> Start with props; use Context to skip layers; use a store only when distant parts of the app share state that changes often.
 
 ### Whiteboard version
 
@@ -50,7 +94,11 @@ function ThemedButton() {
 
 ## 1. Why it exists
 
-A counter owned by one component needs nothing but `useState`. The moment two sibling components need to share and both update one piece of state, that state has to move up to their common ancestor (**lifting state up**) and come back down as props — and the more layers between the ancestor and the consumer, the more components end up receiving a prop they never read, just to pass it on.
+A counter owned by one component needs nothing but `useState`.
+
+The moment two sibling components need to share and both update one piece of state, that state has to move up to their common ancestor (**lifting state up**) and come back down as props.
+
+The more layers between the ancestor and the consumer, the more components end up receiving a prop they never read, just to pass it on.
 
 ```jsx
 function App() {
@@ -147,7 +195,11 @@ The default argument to `createContext` is a fallback for "there is no Provider 
 
 ### Context's re-render cost
 
-**In plain words:** Context and a store like Redux solve a similar-sounding problem ("let a distant component read some shared state") in opposite ways when it comes to re-rendering. Context is like a single office-wide announcement over the PA system — everyone within earshot stops what they're doing to listen, even if the announcement wasn't relevant to them. A store with selectors is like each person subscribing only to the specific notice board they care about.
+**In plain words:** Context and a store like Redux solve a similar-sounding problem ("let a distant component read some shared state") in opposite ways when it comes to re-rendering.
+
+Context is like a single office-wide announcement over the PA system — everyone within earshot stops what they're doing to listen, even if the announcement wasn't relevant to them.
+
+A store with selectors is like each person subscribing only to the specific notice board they care about.
 
 Every component that calls `useContext(SomeContext)` re-renders whenever that Provider's `value` changes — by reference, not by deep comparison. Two common mistakes make this worse than it needs to be:
 
@@ -168,7 +220,9 @@ flowchart TD
     end
 ```
 
-**Example:** `AppContext` broadcasts `{ user, theme }`. `theme` changes from `"light"` to `"dark"`. Every component reading `useContext(AppContext)` — including `UserMenu`, which only ever reads `user` and never looks at `theme` — re-renders, because the *value object as a whole* got a new reference. In the Redux version, `SettingsPanel`'s `useSelector(s => s.settings)` simply isn't called again, because the `settings` slice of the store object didn't change.
+**Example:** `AppContext` broadcasts `{ user, theme }`. `theme` changes from `"light"` to `"dark"`. Every component reading `useContext(AppContext)` — including `UserMenu`, which only ever reads `user` and never looks at `theme` — re-renders, because the *value object as a whole* got a new reference.
+
+In the Redux version, `SettingsPanel`'s `useSelector(s => s.settings)` simply isn't called again, because the `settings` slice of the store object didn't change.
 
 **Why it matters:** In a small app this difference is invisible. In a large one — a dashboard with many widgets reading one shared Context — a single frequently-changing field (a live search query, a websocket tick) dragged into that same Context object means *every* consumer re-renders on *every* tick, even widgets with nothing to do with that field.
 
@@ -243,7 +297,9 @@ function Counter() {
 
 `useSelector` only re-renders `Counter` when the specific slice it reads (`state.counter.value`) changes — a sibling component selecting `state.settings` is untouched, which is the opposite of the "any change re-renders every consumer" behaviour plain Context has with one big object.
 
-Reducers in Redux must stay **pure**: no side effects, no random values, no mutating arguments directly (Redux Toolkit's `createSlice` uses Immer so code that *looks* like direct mutation — `state.value += 1` — actually produces a new, structurally-shared state object behind the scenes). This purity is what makes time-travel debugging in Redux DevTools possible: every past state is just the result of replaying actions.
+Reducers in Redux must stay **pure**: no side effects, no random values, no mutating arguments directly (Redux Toolkit's `createSlice` uses Immer so code that *looks* like direct mutation — `state.value += 1` — actually produces a new, structurally-shared state object behind the scenes).
+
+This purity is what makes time-travel debugging in Redux DevTools possible: every past state is just the result of replaying actions.
 
 ### Async state and server data
 
@@ -286,7 +342,9 @@ flowchart TD
     Q3 -- "No, it's UI state" --> Store["Redux / Zustand<br/>(store with selectors)"]
 ```
 
-**Example:** A shopping cart's item count needs to show up in the header, the cart page and a checkout summary — three distant, unrelated parts of the tree, and it changes often as items are added. That combination (distant + changes often) points at a store with selectors, not Context, so adding an item only re-renders the few components actually reading the cart slice.
+**Example:** A shopping cart's item count needs to show up in the header, the cart page and a checkout summary — three distant, unrelated parts of the tree, and it changes often as items are added.
+
+That combination (distant + changes often) points at a store with selectors, not Context, so adding an item only re-renders the few components actually reading the cart slice.
 
 **Why it matters:** Picking Context for frequently-changing, widely-read state (like the cart example) silently makes every consumer re-render on every add-to-cart click — a performance bug that's invisible in development with a small cart and only shows up as the app grows.
 
@@ -315,7 +373,11 @@ flowchart TD
 
 ### Why a memoized Context value still looks "stale" when done wrong
 
-**In plain words:** A common bug report is "I updated the Context value, but my component still shows the old data." The cause is almost always that the *dependency list* passed to `useMemo` is missing the field that actually changed, so `useMemo` keeps returning its old cached object — the Provider re-rendered, but the `value` it handed out never actually changed reference.
+**In plain words:** A common bug report is "I updated the Context value, but my component still shows the old data."
+
+The cause is almost always that the *dependency list* passed to `useMemo` is missing the field that actually changed, so `useMemo` keeps returning its old cached object.
+
+The Provider re-rendered, but the `value` it handed out never actually changed reference.
 
 **Picture it:**
 
@@ -392,3 +454,8 @@ sequenceDiagram
 - **Before this:** [[React Fundamentals - Components, JSX, Props, State]], [[React Hooks]], [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]
 - **Next:** [[React Routing and Rendering Strategies - CSR, SSR, SSG]]
 - **Compare with:** [[React Routing and Rendering Strategies - CSR, SSR, SSG]] (where shared state lives across route changes)
+
+### Watch on YouTube
+
+- [React State Management: Redux vs Zustand vs Context API vs MobX (Beginner's Guide)](https://www.youtube.com/watch?v=6yhmDOrjA-w) · CodeLucky · compares Context vs Redux and when to reach for each
+- [🔴 React Context API Crash Course / Context API vs Redux 🚀](https://www.youtube.com/watch?v=HcMlkGD9dlA) · Milon27 · hands-on crash course contrasting Context with Redux

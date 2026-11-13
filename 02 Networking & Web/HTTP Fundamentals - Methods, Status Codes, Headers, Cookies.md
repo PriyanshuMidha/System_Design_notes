@@ -9,7 +9,7 @@ sources:
   - "RFC 9111, HTTP Caching"
   - "RFC 6265bis (draft), HTTP State Management Mechanism (Set-Cookie attributes)"
   - "MDN Web Docs, HTTP response status codes"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HTTP Fundamentals - Methods, Status Codes, Headers, Cookies
@@ -33,9 +33,55 @@ flowchart LR
 
 One request, one response, nothing remembered in between — that last part ("nothing remembered") is the single idea everything else in this note builds on.
 
+## Start here: the basics
+
+**The problem in one story.**
+You open a shopping app and tap "My orders".
+Your phone has to ask a far-away computer for that list, and the computer has to answer.
+Both sides were built by different people, in different languages.
+HTTP is the shared set of rules that lets any app ask and any server answer.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Client | The program that asks | Your browser or a Go `http.Client` |
+| Server | The program that answers | A Go service listening on port 8080 |
+| Request | One message from client to server | `GET /orders/42` |
+| Response | The server's reply to one request | `200 OK` plus the order as JSON |
+| Header | A `Name: value` line of extra info | `Content-Type: application/json` |
+| Body | The actual data carried by a message | The JSON text of an order |
+| Status code | A 3-digit number saying what happened | `404` = not found |
+| Cookie | A small value the browser stores and sends back each time | `session=abc123` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] -- "Request:<br/>method + path + headers + body" --> S["Server"]
+    S -- "Response:<br/>status + headers + body" --> C
+    S -. "Set-Cookie" .-> C
+    C -. "Cookie (next request)" .-> S
+```
+
+**Analogy.** Ordering at a restaurant counter: you say what you want (method and path), add notes like "no onions" (headers), and get a tray back with a receipt saying "done" or "sold out" (status code).
+Where it breaks: the counter staff forget you the moment you leave; HTTP itself remembers nothing, so cookies or tokens must carry who you are on every request.
+
+**How the rest of this note builds up**
+
+- First, why a shared protocol exists (section 1) and the letter-and-receipt mental model (section 2).
+- Then the request and response anatomy, methods (safe vs idempotent) and status codes.
+- Next the headers that matter most, conditional requests, cookies and keep-alive.
+- Finally the SDE-3 deep dive: 400 vs 422, why safety lets infrastructure retry, idempotency as end state, and chunked transfer.
+
+> [!tip] Remember
+> HTTP = ask with a method and path, answer with a status code; nothing is remembered between requests unless a cookie or token carries it.
+
 ## 1. Why it exists
 
-Imagine every website invented its own private way of asking for a page and its own private way of saying "found it" or "not found" — a browser built for one site couldn't talk to any other. Before **HTTP** (HyperText Transfer Protocol — a shared, text-readable request/response vocabulary any client and any server can speak regardless of what they're written in), every service that wanted to serve documents over a network invented its own protocol: its own way to ask for a resource, its own way to signal success or failure, its own framing.
+Imagine every website invented its own private way of asking for a page and its own private way of saying "found it" or "not found" — a browser built for one site couldn't talk to any other.
+
+Before **HTTP** (HyperText Transfer Protocol — a shared, text-readable request/response vocabulary any client and any server can speak regardless of what they're written in), every service that wanted to serve documents over a network invented its own protocol: its own way to ask for a resource, its own way to signal success or failure, its own framing.
 
 HTTP (originally defined in RFC 1945, now specified across RFC 9110–9114) standardized that exchange into one shape. A browser from 1996 and a Go server written today still agree on what `GET /index.html HTTP/1.1` means.
 
@@ -46,9 +92,19 @@ HTTP (originally defined in RFC 1945, now specified across RFC 9110–9114) stan
 
 ## 2. Mental model
 
-**In plain words:** a request is a short, structured letter. The first line says what you want and from where (`GET /orders/42`), a block of headers gives context (who you are, what formats you accept, whether you have a cached copy already), and an optional body carries data for the server to act on. A response mirrors the shape back: a status line says what happened, headers give metadata about the reply, and an optional body carries the result.
+**In plain words:** a request is a short, structured letter.
 
-**Analogy:** think of it like sending a letter to a post office counter and getting a receipt back. You write what you want on the front (the request line), attach any supporting notes (headers), maybe include a form to fill out (the body). The clerk hands back a receipt stating what happened (status line), any stamps or notices (response headers), and maybe the item you asked for (response body). Where the analogy breaks down: the clerk has no memory of you from your last visit — **statelessness** is part of the HTTP model, not an accident. Anything that needs to persist across requests — login state, a shopping cart — has to ride along in every request, usually via a cookie or a token, because the protocol itself remembers nothing between them.
+The first line says what you want and from where (`GET /orders/42`), a block of headers gives context (who you are, what formats you accept, whether you have a cached copy already), and an optional body carries data for the server to act on.
+
+A response mirrors the shape back: a status line says what happened, headers give metadata about the reply, and an optional body carries the result.
+
+**Analogy:** think of it like sending a letter to a post office counter and getting a receipt back. You write what you want on the front (the request line), attach any supporting notes (headers), maybe include a form to fill out (the body).
+
+The clerk hands back a receipt stating what happened (status line), any stamps or notices (response headers), and maybe the item you asked for (response body).
+
+Where the analogy breaks down: the clerk has no memory of you from your last visit — **statelessness** is part of the HTTP model, not an accident.
+
+Anything that needs to persist across requests — login state, a shopping cart — has to ride along in every request, usually via a cookie or a token, because the protocol itself remembers nothing between them.
 
 ```mermaid
 flowchart TB
@@ -102,7 +158,9 @@ $ curl -v http://127.0.0.1:8099/items/1
 
 ### Methods: safe and idempotent are two different properties
 
-**In plain words:** two separate promises hide behind every HTTP method's name. **Safe** means a method must never change server state — a crawler, a prefetcher, or a browser's back button can call it freely. **Idempotent** means calling it N times has the same effect on server state as calling it once (though the *response* can still legitimately differ — a second `DELETE` of an already-gone resource still ends with it gone, even if the first call returned `200` and the second `404` or `204` depending on API design).
+**In plain words:** two separate promises hide behind every HTTP method's name. **Safe** means a method must never change server state — a crawler, a prefetcher, or a browser's back button can call it freely.
+
+**Idempotent** means calling it N times has the same effect on server state as calling it once (though the *response* can still legitimately differ — a second `DELETE` of an already-gone resource still ends with it gone, even if the first call returned `200` and the second `404` or `204` depending on API design).
 
 **Picture it:**
 
@@ -299,7 +357,9 @@ Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cooki
 - **Why 422 exists separately from 400 at all.** RFC 9110 defines 400 generically as "the server cannot or will not process the request due to something perceived as a client error," which technically covers everything from broken JSON to a business-rule violation — 422 (from WebDAV, RFC 4918, widely reused outside WebDAV) gives APIs a way to distinguish "your request is malformed" from "your request is well-formed but fails validation," which matters because client code often reacts differently (a 400 usually means a client bug; a 422 usually means user input needs correcting).
 - **Why safe methods matter beyond "don't delete things."** Safety is what lets infrastructure the request author never thought about — browser prefetchers, crawlers, CDNs, retry logic in HTTP client libraries — treat `GET`/`HEAD`/`OPTIONS` as free to issue speculatively or repeatedly. Breaking that contract (a `GET` with a side effect) causes bugs far from the code that violated it.
 - **Idempotency is about end state, not about the response being identical.** A second `DELETE /items/42` after the first succeeded can legitimately return `404` instead of repeating `204` — the method is still idempotent because the *server state* (item 42 does not exist) is the same either way. Confusing "same response" with "idempotent" is a common interview slip.
-- **Why `Content-Length` and chunked transfer both exist.** `Content-Length` requires knowing the full body size before sending the first byte, which doesn't work for a response generated as a stream (e.g. a long-running export). `Transfer-Encoding: chunked` lets the server send the body in pieces of unknown total length up front, each prefixed with its own size, terminated by a zero-length chunk — HTTP/2 and HTTP/3 replace this mechanism with their own binary framing, which doesn't need chunking at all.
+- **Why `Content-Length` and chunked transfer both exist.** `Content-Length` requires knowing the full body size before sending the first byte, which doesn't work for a response generated as a stream (e.g. a long-running export).
+
+  `Transfer-Encoding: chunked` lets the server send the body in pieces of unknown total length up front, each prefixed with its own size, terminated by a zero-length chunk — HTTP/2 and HTTP/3 replace this mechanism with their own binary framing, which doesn't need chunking at all.
 
 ## 9. Interview questions
 
@@ -310,19 +370,27 @@ Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cooki
 > 401 means the request itself lacks valid credentials — the server can't tell who's asking, or the credentials it got are invalid/expired. 403 means the server knows exactly who's asking and that identity is simply not allowed to do this. A valid, logged-in user hitting an admin-only route gets 403, not 401.
 
 > [!question]- What's the practical difference between 400 and 422, and does it matter?
-> 400 says the request couldn't even be understood — malformed JSON, wrong content type, missing required structure. 422 says the request was understood perfectly but fails a business or semantic rule (an end date before a start date, a duplicate email). It matters for client error handling: a 400 usually signals a client bug to fix in code; a 422 usually signals a user-facing validation message to show.
+> 400 says the request couldn't even be understood — malformed JSON, wrong content type, missing required structure. 422 says the request was understood perfectly but fails a business or semantic rule (an end date before a start date, a duplicate email).
+>
+> It matters for client error handling: a 400 usually signals a client bug to fix in code; a 422 usually signals a user-facing validation message to show.
 
 > [!question]- A client gets intermittent 502s and 504s from the same endpoint. What's the first thing you'd check?
-> Whether the upstream is actually responding at all. 504 means the gateway never got a response in time (a timeout, possibly an overloaded or hung upstream); 502 means the upstream *did* respond, just with something the gateway couldn't parse as a valid HTTP response. Check upstream latency/health for 504s, and the upstream's actual raw response (or a crash/panic mid-response) for 502s.
+> Whether the upstream is actually responding at all. 504 means the gateway never got a response in time (a timeout, possibly an overloaded or hung upstream); 502 means the upstream *did* respond, just with something the gateway couldn't parse as a valid HTTP response.
+>
+> Check upstream latency/health for 504s, and the upstream's actual raw response (or a crash/panic mid-response) for 502s.
 
 > [!question]- Trap: is `PATCH` always non-idempotent, and is `PUT` always idempotent?
-> No to both, in practice. `PUT` is idempotent by definition (it replaces the whole resource with the given representation), but a buggy implementation that, say, appends to a log on every `PUT` would violate that contract. `PATCH` is usually not idempotent because partial-update documents often describe relative changes (`increment`), but a `PATCH` body that sets absolute values (`{"status":"shipped"}`) is idempotent in practice even though the method itself makes no such promise.
+> No to both, in practice. `PUT` is idempotent by definition (it replaces the whole resource with the given representation), but a buggy implementation that, say, appends to a log on every `PUT` would violate that contract.
+>
+> `PATCH` is usually not idempotent because partial-update documents often describe relative changes (`increment`), but a `PATCH` body that sets absolute values (`{"status":"shipped"}`) is idempotent in practice even though the method itself makes no such promise.
 
 > [!question]- Why does HTTP need both `Secure` and `HttpOnly` on a cookie — isn't one enough?
 > They block different attacks. `Secure` stops the cookie from ever being sent over plain HTTP, where a network observer could read it. `HttpOnly` stops client-side JavaScript from reading the cookie at all, which blocks an XSS payload from exfiltrating it even if the attacker got arbitrary script execution on the page. Either alone leaves the other attack path open.
 
 > [!question]- What problem does `SameSite` solve, and what's the trade-off of `Strict` versus `Lax`?
-> It controls whether a cookie is attached to a request that originated from a different site, which is the mechanism CSRF relies on (a malicious site makes your browser send a request to your bank, cookie included). `Strict` never sends the cookie cross-site, which is safest but breaks things like clicking a link from an email and landing already logged in; `Lax` (the modern browser default) allows the cookie on top-level navigations (clicking a link) but not on embedded cross-site requests (an image, a form auto-submit), balancing security and usability.
+> It controls whether a cookie is attached to a request that originated from a different site, which is the mechanism CSRF relies on (a malicious site makes your browser send a request to your bank, cookie included).
+>
+> `Strict` never sends the cookie cross-site, which is safest but breaks things like clicking a link from an email and landing already logged in; `Lax` (the modern browser default) allows the cookie on top-level navigations (clicking a link) but not on embedded cross-site requests (an image, a form auto-submit), balancing security and usability.
 
 ## 10. Cheat sheet
 
@@ -341,3 +409,8 @@ Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cooki
 - **Next:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[REST and HTTP API Design]]
 - **Compare with:** [[Sessions and Cookies]] (cookies as a session mechanism, in depth), [[Idempotency and Idempotency Keys]] (handling non-idempotent retries), [[CORS and Same-Origin Policy]] and [[CSRF, XSS and Security Headers]] (the security side of cookies and headers)
 - **Runnable code:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies - Go]]
+
+### Watch on YouTube
+
+- [How websites and HTTP work? Web Basics Crash Course](https://www.youtube.com/watch?v=iD2fgC74ZtA) · Mehul Mohan · covers methods, status codes, headers and cookies together in one crash course
+- [HTTP Fundamentals in 10 Minutes](https://www.youtube.com/watch?v=qv5-5hhsKpE) · The Cyber Mentors · fast 10-minute recap good for pre-interview review

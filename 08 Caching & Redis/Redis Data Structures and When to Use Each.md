@@ -12,7 +12,7 @@ sources:
   - "redis.io docs, Streams; Redis 8 release notes (JSON, vector sets)"
   - "redis.io docs, Hash field expiration (HEXPIRE, since 7.4)"
   - "Measured on Redis 8.2.1: OBJECT ENCODING, MEMORY USAGE, INFO memory deltas; Go tests against port 6392"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis Data Structures and When to Use Each
@@ -27,6 +27,53 @@ updated: 2026-11-04
 > - Every type has O(N) commands (`HGETALL`, `SMEMBERS`, `LRANGE 0 -1`) that become dangerous when the key is big.
 > - Classic mistake: storing a whole object as one JSON string and rewriting it to change one field, or storing each field as its own top-level key.
 
+## Start here: the basics
+
+**The problem in one story.**
+You build a game and need a leaderboard: "what rank is player 42?"
+If you store scores as plain text, your app must download all 2 million scores and sort them.
+Redis has a sorted set that keeps scores in order and answers the rank directly.
+Picking the right Redis type turns a slow job into one fast command.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Key | The name you store a value under | `leaderboard` |
+| String | One value: text, number or bytes | `SET views 10` |
+| Hash | A small map of fields inside one key | `HSET user:7 name Ravi` |
+| List | Ordered items you push and pop at the ends | `LPUSH feed post1` |
+| Set | Unique members, no order | `SADD tags go` |
+| Sorted set | Unique members each with a score, kept sorted | `ZADD lb 900 p42` |
+| O(log N) | Time grows slowly as data grows | Find rank among 2 M scores |
+| Encoding | How Redis lays the value out in memory | Small hash = compact listpack |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Q["What will you ask?"] --> A{"Question type"}
+    A -- "one value / counter" --> S["String"]
+    A -- "object fields" --> H["Hash"]
+    A -- "latest N items" --> L["List"]
+    A -- "unique members" --> SE["Set"]
+    A -- "ranked / by time" --> Z["Sorted set"]
+    A -- "approx count" --> HL["HyperLogLog"]
+```
+
+**Analogy.** A kitchen has a jar, a spice rack, a queue of order tickets and a ranked menu board; you pick the container by how you will use it.
+Where it breaks: in a kitchen you can see everything at once; in Redis, reading a huge container in one O(N) command stalls the whole server.
+
+**How the rest of this note builds up**
+
+- First, why typed structures exist (section 1) and the "pick by the question" mental model (sections 2-3.1).
+- Then each type one by one and its compact small-value encodings (sections 3.2-3.3).
+- Then measured memory comparisons and Go code (section 4), plus trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: sorted set internals, HyperLogLog, geo as a sorted set, field-level TTL (section 8).
+
+> [!tip] Remember
+> Start from the question you will ask, then pick the Redis type whose command answers it in O(1) or O(log N).
+
 ## 1. Why it exists
 
 A ticketing app needs five features on top of its database:
@@ -37,7 +84,9 @@ A ticketing app needs five features on top of its database:
 4. Count unique visitors per event page, for 50,000 pages.
 5. Find drivers within 5 km of a venue.
 
-If everything is a plain string, each feature fights the storage: you read and rewrite a JSON blob to change one field, sort 2 million scores in your app to find one rank, and keep 50,000 sets of visitor IDs that use gigabytes. Redis offers a different structure for each shape of question, with the work done inside the server in O(1) or O(log N).
+If everything is a plain string, each feature fights the storage: you read and rewrite a JSON blob to change one field, sort 2 million scores in your app to find one rank, and keep 50,000 sets of visitor IDs that use gigabytes.
+
+Redis offers a different structure for each shape of question, with the work done inside the server in O(1) or O(log N).
 
 ## 2. Mental model
 
@@ -143,7 +192,9 @@ Measured on Redis 8.2 by `INFO memory` before and after loading 10,000 users wit
 
 `INFO memory` deltas include keyspace hash-table resizing, so they move by tens of percent between runs (another run gave 1,371,584 bytes for the hash layout); compare layouts within one run.
 
-`MEMORY USAGE` for a single user gave the same ranking: 112 bytes across three string keys, 80 bytes for the JSON string, 64 bytes for the listpack hash. Per-key overhead (the keyspace entry, the object header, the allocator) is what makes the first layout expensive. The hash and JSON layouts tie on memory in this test, and the hash wins on partial updates and `HINCRBY`.
+`MEMORY USAGE` for a single user gave the same ranking: 112 bytes across three string keys, 80 bytes for the JSON string, 64 bytes for the listpack hash.
+
+Per-key overhead (the keyspace entry, the object header, the allocator) is what makes the first layout expensive. The hash and JSON layouts tie on memory in this test, and the hash wins on partial updates and `HINCRBY`.
 
 ### Memory: exact vs approximate uniques
 
@@ -377,11 +428,17 @@ Members with equal scores are ordered by member bytes, so ties are deterministic
 
 ### 8.2 HyperLogLog in one paragraph
 
-Each item is hashed. The hash's low bits pick one of 16,384 registers; the rest of the bits give the length of the run of zero bits. Each register keeps the maximum it has seen. Long runs of zeros are rare, so the maxima estimate how many distinct items were hashed, and averaging over 16,384 registers (with a harmonic mean and corrections) gives the ~0.81% error. 16,384 registers × 6 bits = 12 KB. Small HLLs use a sparse encoding and are much smaller. Two HLLs merge by taking the register-wise maximum, which is why `PFCOUNT a b` gives the union.
+Each item is hashed. The hash's low bits pick one of 16,384 registers; the rest of the bits give the length of the run of zero bits. Each register keeps the maximum it has seen.
+
+Long runs of zeros are rare, so the maxima estimate how many distinct items were hashed, and averaging over 16,384 registers (with a harmonic mean and corrections) gives the ~0.81% error.
+
+16,384 registers × 6 bits = 12 KB. Small HLLs use a sparse encoding and are much smaller. Two HLLs merge by taking the register-wise maximum, which is why `PFCOUNT a b` gives the union.
 
 ### 8.3 Geo is a sorted set
 
-`GEOADD` converts (longitude, latitude) into a 52-bit interleaved geohash and stores it as the score. Points close together share score prefixes, so a radius search becomes a few score-range scans on the neighbouring geohash boxes, followed by an exact distance filter. Measured on Redis 8.2: three drivers added with `GEOADD`; `GEOSEARCH drivers FROMLONLAT 73.8567 18.5204 BYRADIUS 5 km ASC WITHDIST` returned `d1 0.0002` and `d2 2.6794`, and left out `d3` (about 9 km away). `TYPE drivers` returned `zset`, so `ZREM` removes a driver.
+`GEOADD` converts (longitude, latitude) into a 52-bit interleaved geohash and stores it as the score. Points close together share score prefixes, so a radius search becomes a few score-range scans on the neighbouring geohash boxes, followed by an exact distance filter.
+
+Measured on Redis 8.2: three drivers added with `GEOADD`; `GEOSEARCH drivers FROMLONLAT 73.8567 18.5204 BYRADIUS 5 km ASC WITHDIST` returned `d1 0.0002` and `d2 2.6794`, and left out `d3` (about 9 km away). `TYPE drivers` returned `zset`, so `ZREM` removes a driver.
 
 ### 8.4 Field-level TTL
 
@@ -423,3 +480,8 @@ Before Redis 7.4 only whole keys could expire. Since 7.4, `HEXPIRE`, `HPEXPIRE` 
 - **Before this:** [[Redis Fundamentals]], [[Redis Hands-on Setup with Go]]
 - **Next:** [[Redis Use Cases]], [[Case Study - Leaderboard and Top-K]]
 - **Compare with:** [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Hash Tables and Go Maps]]
+
+### Watch on YouTube
+
+- [Redis Sorted Sets Explained](https://www.youtube.com/watch?v=MUKlxdBQZ7g) · Redis · official Redis channel explaining sorted sets, used for ranking/time-ordering per the note
+- [Redis Hashes Explained](https://www.youtube.com/watch?v=-KdITaRkQ-U) · Redis · official Redis channel explaining hashes, used for object storage per the note

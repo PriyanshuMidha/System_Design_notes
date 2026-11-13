@@ -8,7 +8,7 @@ sources:
   - "IEEE 754-2019, Standard for Floating-Point Arithmetic"
   - "The Unicode Standard, Version 15.0 (UTF-8 encoding, Ch. 3)"
   - "The Go Programming Language Specification (string, rune, byte types)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Number Representation and Text Encoding
@@ -23,9 +23,56 @@ updated: 2026-11-09
 > - Endianness is the byte order used to store a multi-byte number; it matters whenever bytes cross a machine boundary (network, file formats).
 > - In Go, a `string` is a read-only sequence of bytes, `len()` always counts bytes, and a `rune` is one Unicode code point — these three can disagree for any non-ASCII text.
 
+## Start here: the basics
+
+**The problem in one story.**
+You build a shop app. A cart shows $0.10 + $0.20 and your code checks "is it $0.30?" — it says no.
+A visitor counter climbs past a limit and suddenly shows a negative number.
+A user types "café" and your 4-letter limit says it is 5 long.
+None of these crash. They are all about how bits are read as numbers and letters.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Bit / byte | A 0-or-1; a byte is 8 bits | `01000001` is one byte |
+| Integer type | A whole-number type with a fixed size | `int8` holds -128 to 127 |
+| Overflow | A result too big for its type | `int8` 127 + 1 |
+| Float | A number with a fractional part, stored approximately | `0.1` as `float64` |
+| Encoding | A rule turning bits into numbers or characters | UTF-8 turns `é` into 2 bytes |
+| Code point | Unicode's number for one character | `A` is U+0041 |
+| Byte order (endianness) | Which byte of a big number comes first | `01 02 03 04` vs `04 03 02 01` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Same bits in memory"] --> I["Read as integer<br/>(two's complement)"]
+    B --> F["Read as float<br/>(IEEE 754)"]
+    B --> T["Read as text<br/>(UTF-8)"]
+    I --> W["Can wrap on overflow"]
+    F --> A["Can round"]
+    T --> C["Bytes != characters"]
+```
+
+**Analogy.** Bits are like Morse code dots and dashes: the same signal means different things depending on which codebook you use.
+Where it breaks: Morse operators agree on one codebook, but a program can read the same bytes with the wrong rule and get no error at all.
+
+**How the rest of this note builds up**
+
+- First, three real bugs (section 1) and simple mental models (section 2).
+- Then how each encoding works: two's complement, IEEE 754, money, endianness, UTF-8 and Go strings (section 3).
+- Then a traced example and comparison tables (sections 4-5).
+- Finally the SDE-3 view: trade-offs, production failures, and the deep dive on why these designs won (sections 6-8).
+
+> [!tip] Remember
+> Bits have no meaning on their own; the type you read them with decides the number or letter you get.
+
 ## 1. Why it exists
 
-Every value in a running program — an `int32` counter, a `float64` price, a UTF-8 log line — is ultimately just bits in memory. The CPU and the language runtime agree on an **encoding**: a rule for turning those bits into a number or a character. Three real bugs show why this matters:
+Every value in a running program — an `int32` counter, a `float64` price, a UTF-8 log line — is ultimately just bits in memory.
+
+The CPU and the language runtime agree on an **encoding**: a rule for turning those bits into a number or a character. Three real bugs show why this matters:
 
 1. A counter declared as `int8` increments past 127 and silently becomes `-128` instead of erroring — no panic, no warning, just wrong data from that point on.
 2. A price calculation adds `0.10 + 0.20` as `float64` and compares the result to `0.30`, and the comparison fails, because `0.1`, `0.2`, and `0.3` are all *approximations* in binary floating point.
@@ -38,11 +85,17 @@ All three are the direct, mechanical consequence of how numbers and text are rep
 
 ## 2. Mental model
 
-Think of an integer's bits as an odometer with a fixed number of digits: once it hits its maximum, the next increment rolls it back to the minimum (or to zero, for unsigned), silently, exactly like a car's mechanical odometer rolling over from `999999` to `000000`. **Two's complement** is just the specific rule for where "negative" sits on that odometer: the top half of the range (by bit pattern) is defined to mean negative numbers, chosen so that addition and subtraction work with the same circuitry as for unsigned numbers.
+Think of an integer's bits as an odometer with a fixed number of digits. Once it hits its maximum, the next increment rolls it back to the minimum (or to zero, for unsigned), silently, exactly like a car's mechanical odometer rolling over from `999999` to `000000`.
 
-Think of an IEEE 754 float as scientific notation with a fixed, finite number of significant binary digits: you can represent `1.5 x 2^3` exactly, but you cannot represent `0.1` exactly any more than you can write `1/3` exactly in decimal — you always get a terminating approximation, and arithmetic on approximations accumulates error.
+**Two's complement** is just the specific rule for where "negative" sits on that odometer: the top half of the range (by bit pattern) is defined to mean negative numbers, chosen so that addition and subtraction work with the same circuitry as for unsigned numbers.
 
-Think of a Go `string` as a shipping container of raw bytes with a label: the label (`string` type) tells you it's probably UTF-8 text, but `len()` tells you the container's byte weight, not how many distinct "items" (characters) are inside — to count items you have to actually open the container and decode it. The analogy breaks down in one place: a shipping container's weight is a property of the container, but a string's byte length also depends on *what characters* it contains, not just how many — two four-character strings can have different `len()`.
+Think of an IEEE 754 float as scientific notation with a fixed, finite number of significant binary digits.
+
+You can represent `1.5 x 2^3` exactly, but you cannot represent `0.1` exactly any more than you can write `1/3` exactly in decimal. You always get a terminating approximation, and arithmetic on approximations accumulates error.
+
+Think of a Go `string` as a shipping container of raw bytes with a label. The label (`string` type) tells you it's probably UTF-8 text, but `len()` tells you the container's byte weight, not how many distinct "items" (characters) are inside — to count items you have to actually open the container and decode it.
+
+The analogy breaks down in one place: a shipping container's weight is a property of the container, but a string's byte length also depends on *what characters* it contains, not just how many — two four-character strings can have different `len()`.
 
 ## 3. How it works
 
@@ -50,7 +103,9 @@ Think of a Go `string` as a shipping container of raw bytes with a label: the la
 
 In plain words: an integer type can only hold so many values. When arithmetic would produce a value outside that range, Go does not stop and complain — it wraps around to the other end of the range, as if the number were written on a circular dial.
 
-An `n`-bit two's complement integer represents the range `-2^(n-1)` to `2^(n-1)-1`. Negation is "invert all bits, add 1." Addition and subtraction use ordinary binary adder circuitry regardless of sign — that uniformity is the entire reason two's complement won over older signed-magnitude schemes (more in the deep dive).
+An `n`-bit two's complement integer represents the range `-2^(n-1)` to `2^(n-1)-1`. Negation is "invert all bits, add 1."
+
+Addition and subtraction use ordinary binary adder circuitry regardless of sign — that uniformity is the entire reason two's complement won over older signed-magnitude schemes (more in the deep dive).
 
 ```mermaid
 flowchart LR
@@ -60,7 +115,9 @@ flowchart LR
     end
 ```
 
-**Example.** `var x int8 = 127; x++` gives `-128`, with no panic and no compiler warning (confirmed by the test in the Go note). A request-counter field declared as `int8` that should never exceed 100 looks safe during testing, but under real load it silently wraps the moment it crosses 127 — the bug only shows up in production, at a volume the test never reached.
+**Example.** `var x int8 = 127; x++` gives `-128`, with no panic and no compiler warning (confirmed by the test in the Go note).
+
+A request-counter field declared as `int8` that should never exceed 100 looks safe during testing, but under real load it silently wraps the moment it crosses 127 — the bug only shows up in production, at a volume the test never reached.
 
 > [!warning] Common mistake
 > Believing Go checks overflow "at least in debug builds," the way some languages do. Go never checks integer overflow for its built-in arithmetic operators, in any build mode, for any integer type.
@@ -72,7 +129,9 @@ flowchart LR
 
 In plain words: a float is stored as a sign, an exponent, and a fraction — much like scientific notation (`1.5 x 10^3`) but in binary. Only numbers that are exact sums of powers of two can be stored exactly; everything else is rounded to the nearest representable value.
 
-A `float64` stores a sign bit, an 11-bit exponent, and a 52-bit mantissa (fraction), representing a value as `(-1)^sign x 1.mantissa x 2^(exponent-bias)`. Because the mantissa is binary, only sums of powers of two are exact — `0.5`, `0.25`, `0.125` are exact, but `0.1` is a repeating binary fraction (like `1/3` in decimal) and gets silently rounded to the nearest representable value.
+A `float64` stores a sign bit, an 11-bit exponent, and a 52-bit mantissa (fraction), representing a value as `(-1)^sign x 1.mantissa x 2^(exponent-bias)`.
+
+Because the mantissa is binary, only sums of powers of two are exact — `0.5`, `0.25`, `0.125` are exact, but `0.1` is a repeating binary fraction (like `1/3` in decimal) and gets silently rounded to the nearest representable value.
 
 ```mermaid
 flowchart LR
@@ -92,7 +151,9 @@ flowchart LR
 
 In plain words: because float rounding error compounds across many additions, financial systems represent money as an integer count of the smallest unit (cents, or even smaller for some currencies) or as an arbitrary-precision decimal type, never as a binary float.
 
-**Example.** `$0.10 + $0.20` as `10 + 20` cents is exactly `30` cents, with zero rounding risk, because integer arithmetic in a given range is exact — there's no approximation step at all. The same computation as `float64` dollars, `0.10 + 0.20`, yields `0.30000000000000004`, which fails an `== 0.30` check.
+**Example.** `$0.10 + $0.20` as `10 + 20` cents is exactly `30` cents, with zero rounding risk, because integer arithmetic in a given range is exact — there's no approximation step at all.
+
+The same computation as `float64` dollars, `0.10 + 0.20`, yields `0.30000000000000004`, which fails an `== 0.30` check.
 
 > [!tip] Remember
 > Money math should never touch a binary float: use integer minor units (cents) when values fit comfortably in range, or an arbitrary-precision decimal type when they don't.
@@ -101,7 +162,9 @@ In plain words: because float rounding error compounds across many additions, fi
 
 In plain words: a number bigger than one byte has to be stored as several bytes in some order. Two conventions exist for that order, and they disagree.
 
-A multi-byte value like a 4-byte `uint32` can be stored with its most-significant byte first (**big-endian**, "network byte order," used by TCP/IP headers) or its least-significant byte first (**little-endian**, native on x86-64 and most ARM configurations in their default mode). The bits of the number are identical either way — only the order they're laid out in memory or on the wire differs.
+A multi-byte value like a 4-byte `uint32` can be stored with its most-significant byte first (**big-endian**, "network byte order," used by TCP/IP headers) or its least-significant byte first (**little-endian**, native on x86-64 and most ARM configurations in their default mode).
+
+The bits of the number are identical either way — only the order they're laid out in memory or on the wire differs.
 
 ```mermaid
 flowchart TB
@@ -109,7 +172,10 @@ flowchart TB
     V --> BE["Big-endian bytes:<br/>01 02 03 04"]
 ```
 
-**Example.** A service reads a 4-byte length prefix off a TCP socket. If it decodes the bytes using the host's native (little-endian, on x86-64) order instead of the protocol's documented big-endian order, a length of `0x00000104` (260) is misread as `0x04010000` (67,174,400) — a catastrophic, silent misparse, not a crash.
+**Example.** A service reads a 4-byte length prefix off a TCP socket. If it decodes the bytes using the host's native (little-endian, on x86-64) order instead of the protocol's documented big-endian order:
+
+- a length of `0x00000104` (260) is misread as `0x04010000` (67,174,400);
+- this is a catastrophic, silent misparse, not a crash.
 
 > [!tip] Remember
 > Endianness matters the moment bytes cross a boundary between systems that might disagree — always decode using the *format's* documented byte order, never assume the host's native order.
@@ -118,7 +184,9 @@ flowchart TB
 
 In plain words: computers originally only had enough bits to represent English letters and a few symbols. Unicode extends that to every character in every script, and UTF-8 is the specific byte-level trick that makes the new, much bigger alphabet backward-compatible with the old one.
 
-ASCII assigns 128 characters to 7-bit codes — enough for English text, nothing else. Unicode assigns a numeric **code point** to every character in every script (over 1.1 million possible code points). UTF-8 is the encoding that turns a code point into 1–4 bytes: code points 0–127 (ASCII) encode as a single byte identical to ASCII (this backward compatibility is why UTF-8 won), while non-ASCII characters take 2–4 bytes.
+- **ASCII** assigns 128 characters to 7-bit codes — enough for English text, nothing else.
+- **Unicode** assigns a numeric **code point** to every character in every script (over 1.1 million possible code points).
+- **UTF-8** is the encoding that turns a code point into 1–4 bytes: code points 0–127 (ASCII) encode as a single byte identical to ASCII (this backward compatibility is why UTF-8 won), while non-ASCII characters take 2–4 bytes.
 
 ```mermaid
 flowchart LR
@@ -127,7 +195,9 @@ flowchart LR
     CP2["code point U+1F600 emoji"] --> B4["4 bytes"]
 ```
 
-**Example.** The letter `A` (U+0041) is 1 byte in UTF-8, identical to its ASCII byte. The accented `e` in "café" (U+00E9) is 2 bytes. A smiley emoji (U+1F600) is 4 bytes. All three are single "characters" to a human, but 1, 2 and 4 bytes respectively to anything measuring `len()`.
+**Example.** The letter `A` (U+0041) is 1 byte in UTF-8, identical to its ASCII byte. The accented `e` in "café" (U+00E9) is 2 bytes. A smiley emoji (U+1F600) is 4 bytes.
+
+All three are single "characters" to a human, but 1, 2 and 4 bytes respectively to anything measuring `len()`.
 
 > [!tip] Remember
 > UTF-8 is backward-compatible with ASCII by design — every plain-English byte is already valid UTF-8 — which is a large part of why it won over UTF-16 and UTF-32 as the default text encoding.
@@ -136,7 +206,13 @@ flowchart LR
 
 In plain words: Go gives you three different ways to look at text, and they count differently. Knowing which one a given piece of code is using is the whole trick.
 
-A Go `string` is an **immutable sequence of bytes** that is conventionally, but not enforced to be, valid UTF-8. `[]byte` is a mutable byte slice — converting `string` <-> `[]byte` copies the underlying bytes. A `rune` is Go's name for `int32` used to hold a single Unicode code point. **`len(s)` on a string always counts bytes**, never characters; `for range s` decodes UTF-8 one rune at a time, so a loop over a string with emoji or accented characters visits fewer iterations than `len(s)` would suggest.
+- A Go `string` is an **immutable sequence of bytes** that is conventionally, but not enforced to be, valid UTF-8.
+- `[]byte` is a mutable byte slice — converting `string` <-> `[]byte` copies the underlying bytes.
+- A `rune` is Go's name for `int32` used to hold a single Unicode code point.
+
+**`len(s)` on a string always counts bytes**, never characters.
+
+`for range s` decodes UTF-8 one rune at a time, so a loop over a string with emoji or accented characters visits fewer iterations than `len(s)` would suggest.
 
 ```mermaid
 flowchart TB
@@ -144,7 +220,9 @@ flowchart TB
     S -->|"for range s"| R1["c (1 byte)"] --> R2["a (1 byte)"] --> R3["f (1 byte)"] --> R4["é (2 bytes, 1 rune)"]
 ```
 
-**Example.** `café` looks like 4 characters. `len("café")` in Go returns `5`, because `é` (U+00E9) encodes as 2 UTF-8 bytes while `c`, `a`, `f` each encode as 1 byte: `1+1+1+2 = 5`. Any code that assumes `len(s)` equals "number of characters a user would count" breaks on this string.
+**Example.** `café` looks like 4 characters. `len("café")` in Go returns `5`, because `é` (U+00E9) encodes as 2 UTF-8 bytes while `c`, `a`, `f` each encode as 1 byte: `1+1+1+2 = 5`.
+
+Any code that assumes `len(s)` equals "number of characters a user would count" breaks on this string.
 
 > [!warning] Common mistake
 > Indexing a Go string by position (`s[i]`) expecting the i-th *character*. `s[i]` gives you the i-th *byte*, which for non-ASCII text is frequently the middle of a multi-byte character, not a usable character at all.
@@ -156,11 +234,23 @@ flowchart TB
 
 ### Whiteboard version
 
-Trace `StringLens("café")` by hand: the string's bytes are `c` (0x63), `a` (0x61), `f` (0x66), then the 2-byte UTF-8 encoding of `é` (0xC3 0xA9). `len()` walks the raw byte slice and counts 5. `for range` decodes UTF-8 as it walks: it sees `c`, `a`, `f` as three separate one-byte runes, then recognizes `0xC3 0xA9` together as one two-byte rune (`é`), for a total of 4 runes. The byte count and the rune count disagree by exactly one, which is the number of multi-byte characters in the string.
+Trace `StringLens("café")` by hand:
+
+1. The string's bytes are `c` (0x63), `a` (0x61), `f` (0x66), then the 2-byte UTF-8 encoding of `é` (0xC3 0xA9).
+2. `len()` walks the raw byte slice and counts 5.
+3. `for range` decodes UTF-8 as it walks: it sees `c`, `a`, `f` as three separate one-byte runes, then recognizes `0xC3 0xA9` together as one two-byte rune (`é`), for a total of 4 runes.
+
+The byte count and the rune count disagree by exactly one, which is the number of multi-byte characters in the string.
 
 Runnable Go version: [[Number Representation and Text Encoding - Go]].
 
-**Measured** (this code, Go 1.24.4, darwin/arm64, 2026-11-06): `AddInt8Wrapping(127, 1) = -128`, `FloatsAreApproximate(0.1, 0.2, 0.3) = false`, `StringLens("café") = (5, 4)` — all three confirm the mechanisms described above, not just claimed behavior.
+**Measured** (this code, Go 1.24.4, darwin/arm64, 2026-11-06):
+
+- `AddInt8Wrapping(127, 1) = -128`
+- `FloatsAreApproximate(0.1, 0.2, 0.3) = false`
+- `StringLens("café") = (5, 4)`
+
+All three confirm the mechanisms described above, not just claimed behavior.
 
 ## 5. Variants and comparison
 
@@ -249,3 +339,8 @@ Runnable Go version: [[Number Representation and Text Encoding - Go]].
 - **Next:** [[Arrays and Dynamic Arrays (Go Slices)]], [[Complexity Analysis - Big-O and Amortized Cost]]
 - **Compare with:** [[Memory Hierarchy and CPU Caches]] (how these bit patterns physically sit in cache lines and memory)
 - **Go code:** [[Number Representation and Text Encoding - Go]]
+
+### Watch on YouTube
+
+- [How computers store decimal numbers - IEEE754 Explained](https://www.youtube.com/watch?v=bR8OT6dpGps) · NCOT Technology · clear explanation of float bit layout and why 0.1 isn't exact
+- [IEEE 754: Introduction to Floating Point Format](https://www.youtube.com/watch?v=owtK58XiPGo) · Creel · step-by-step intro to sign/exponent/mantissa encoding

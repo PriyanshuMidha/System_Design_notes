@@ -10,7 +10,7 @@ sources:
   - "Go 1.21 release notes: sync.OnceFunc/OnceValue/OnceValues, context.WithoutCancel"
   - "Go 1.20 release notes: net/http/httputil ReverseProxy Rewrite hook"
   - "grpc-go docs: generated client stubs and ClientConn.Invoke"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Proxy
@@ -23,6 +23,49 @@ updated: 2026-11-02
 > - It decides whether, when and how a call reaches the real object: caching, access checks, lazy creation, remote calls.
 > - The rule that matters: the caller cannot tell a proxy from the real thing, so it is added at wiring time without changing callers.
 > - Classic mistake: a cache proxy that lets many concurrent misses all hit the backend at once (a cache stampede).
+
+## Start here: the basics
+
+**The problem in one story.**
+You call a busy doctor's office. A receptionist answers in the doctor's place.
+Sometimes they already know the answer, sometimes they check your appointment first, and sometimes they put you through.
+You asked the same question either way. A proxy is that receptionist in code.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Interface | A method list that both real object and proxy satisfy | `type Catalog interface { Get(ctx, id) }` |
+| Subject | The real object the proxy stands in front of | The HTTP catalog client |
+| Cache | Saved answers reused instead of calling again | Product 7 stored for 60 s |
+| TTL | How long a cached answer stays valid | `ttl = time.Minute` |
+| Cache stampede | Many requests miss at once and all hit the backend | 300 misses -> 300 calls |
+| singleflight | Merge concurrent identical calls into one | 100 misses -> 1 backend call |
+| Context | Request-scoped values and cancellation in Go | `ctx` carrying the caller's scopes |
+| Composition root | The place in `main` where objects are wired | `cat := NewCachingProxy(realClient)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Cart code"] --> A["Protection proxy<br/>(access check)"]
+    A --> K["Caching proxy<br/>(TTL + singleflight)"]
+    K --> R["Real catalog client"]
+    R --> N["Catalog service<br/>over network"]
+```
+
+**Analogy.** A receptionist in front of an expert: same questions, but they may answer from notes, refuse you, or call the expert.
+Where it breaks: you can see a receptionist; in code the caller must truly be unable to tell, so the proxy must keep the exact same behaviour and errors.
+
+**How the rest of this note builds up**
+
+- First, why proxies exist for the cart and catalog (section 1) and the receptionist mental model (section 2).
+- Then the structure of protection, caching, virtual and remote proxies, with a whiteboard version (section 3).
+- Then a runnable worked example with a stampede test (section 4) and a Proxy vs Decorator vs Adapter comparison (section 5).
+- Finally the SDE-3 depth: trade-offs, production use, the deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Same interface, different control: a proxy decides whether, when and how the call reaches the real thing.
 
 ## 1. Why it exists
 
@@ -38,7 +81,11 @@ The cart code depends on a `Catalog` interface. If every control implements that
 
 ## 2. Mental model
 
-A proxy is a **receptionist in front of an expert**. You ask the receptionist exactly the question you would ask the expert. The receptionist may answer from a sheet of recent answers (caching), refuse you because you have no badge (protection), call the expert only once the first question arrives (lazy), or phone an expert in another city (remote). You cannot tell from the answer which of these happened.
+A proxy is a **receptionist in front of an expert**. You ask the receptionist exactly the question you would ask the expert.
+
+The receptionist may answer from a sheet of recent answers (caching), refuse you because you have no badge (protection), call the expert only once the first question arrives (lazy), or phone an expert in another city (remote).
+
+You cannot tell from the answer which of these happened.
 
 Two rules define it:
 
@@ -162,7 +209,11 @@ func main() {
 
 ## 4. Worked example
 
-One `package main` with three proxies over one subject: protection (scope check from the context), caching (RWMutex, TTL, negative caching, which also caches "not found" for a short time, singleflight, invalidation, hit and miss counters) and virtual (lazy creation with `sync.OnceValues`, Go 1.21+). It compiles with Go 1.24 and passes `go vet` and `go test -race`. The only dependency is `golang.org/x/sync`. On Go 1.24 pin the version you tested with, `go get golang.org/x/sync@v0.19.0`: newer x/sync releases can raise their minimum Go version (as of November 2026 they require Go 1.25+), and then a bare `go get` makes the go command switch to a newer toolchain.
+One `package main` with three proxies over one subject: protection (scope check from the context), caching (RWMutex, TTL, negative caching, which also caches "not found" for a short time, singleflight, invalidation, hit and miss counters) and virtual (lazy creation with `sync.OnceValues`, Go 1.21+).
+
+It compiles with Go 1.24 and passes `go vet` and `go test -race`. The only dependency is `golang.org/x/sync`.
+
+On Go 1.24 pin the version you tested with, `go get golang.org/x/sync@v0.19.0`: newer x/sync releases can raise their minimum Go version (as of November 2026 they require Go 1.25+), and then a bare `go get` makes the go command switch to a newer toolchain.
 
 ```go
 // Command proxy puts three proxies in front of one product catalog:
@@ -658,3 +709,8 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 - **Before this:** [[Interfaces]], [[Design Patterns Overview and Chooser]], [[Decorator and Middleware]]
 - **Next:** [[Facade (vs Mediator)]], [[Caching Patterns]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]
 - **Compare with:** [[Decorator and Middleware]] (adds behaviour, never skips the call), [[Adapter]] (changes the interface), [[Forward and Reverse Proxies - L4 vs L7]] (the network-level proxy), [[Singleton and sync.Once]] (the once-only building block)
+
+### Watch on YouTube
+
+- [Proxy vs Reverse Proxy (Real-world Examples)](https://www.youtube.com/watch?v=4NB0NDtOwIQ) · ByteByteGo · 5 min · 852,873 views
+- [Proxy vs Reverse Proxy vs Load Balancer / Simply Explained](https://www.youtube.com/watch?v=xo5V9g9joFs) · TechWorld with Nana · 13 min · 756,017 views

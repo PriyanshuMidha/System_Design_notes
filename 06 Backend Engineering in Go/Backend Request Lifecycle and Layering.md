@@ -6,14 +6,16 @@ related: ["[[Service Project Layout and Wiring]]", "[[HTTP Server Fundamentals (
 sources:
   - "net/http package docs (Go 1.24)"
   - "Go 1.22 release notes, enhanced ServeMux routing"
-updated: 2026-11-07
+updated: 2026-11-13
 status: reviewed
 ---
 
 # Backend Request Lifecycle and Layering
 
 > [!summary] TL;DR
-> A backend request moves through a fixed pipeline: the network accepts the connection, a router picks a handler, a chain of middleware runs first, then a handler/service/repository split does the actual work, and a response comes back out through the same chain. Knowing this pipeline by name is what lets you say exactly where validation, auth, logging and error handling belong.
+> A backend request moves through a fixed pipeline: the network accepts the connection, a router picks a handler, a chain of middleware runs first, then a handler/service/repository split does the actual work, and a response comes back out through the same chain.
+>
+> Knowing this pipeline by name is what lets you say exactly where validation, auth, logging and error handling belong.
 
 > [!abstract] Core idea
 > - Every request passes through the same five stages: transport → routing → middleware → handler/service/repository → response.
@@ -22,17 +24,69 @@ status: reviewed
 > - A domain error (e.g. "invoice is void") is just a Go error until the handler maps it to an HTTP status; the service layer never imports `net/http`.
 > - Production backends add observability (request ID, logs, metrics) and graceful shutdown around this pipeline, not inside the business logic.
 
+## Start here: the basics
+
+**The problem in one story.** You post a letter to pay a bill.
+It goes through the post office, a sorting room, a clerk who reads it, an accountant who decides, and a filing cabinet.
+Then a receipt comes back the same way.
+A web request is that letter, and each room has one clear job.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Request | A message a client sends to the server | `POST /payments` with a JSON body |
+| Router | Picks which code handles a URL and method | `/payments` goes to `CreatePayment` |
+| Middleware | Code that runs around every handler | Logging, auth, rate limiting |
+| Handler | Turns HTTP into Go values and back | Decodes JSON into a `PaymentInput` struct |
+| Service | Holds the business rules | "A void invoice cannot be paid" |
+| Repository | The only layer that talks SQL | `INSERT INTO payments ...` |
+| `context.Context` | Carries deadline and request data through all layers | A 2-second timeout stops a slow query |
+| Status code | Number saying how the request went | 400 bad input, 502 provider down |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C[Client] --> T[Transport]
+    T --> R[Router]
+    R --> M[Middleware]
+    M --> H[Handler]
+    H --> S[Service]
+    S --> P[Repository]
+    P --> DB[(Database)]
+```
+
+**Analogy.** It is like airport security: each checkpoint can stop you and send you back, and only cleared passengers reach the gate.
+Where it breaks: in a real airport you do not come back through the same checkpoints; a response does pass back out through the middleware chain.
+
+**How the rest of this note builds up**
+
+- First, why a fixed pipeline stops every endpoint reinventing auth and errors (sections 1-2).
+- Then each stage, from transport to response, with a sequence diagram (section 3).
+- Then `POST /payments` end to end in code (section 4).
+- Finally, the SDE-3 deep dive on variants, trade-offs and production concerns (sections 5-9).
+
+> [!tip] Remember
+> Handler translates, service decides, repository persists; middleware wraps them all.
+
 ## 1. Why it exists
 
 Without an agreed pipeline, every endpoint reinvents where auth, validation and error formatting live. A team of five without this agreement ends up with five different places that check `X-Api-Key`, five different error JSON shapes, and a bug where one handler forgets rate limiting because nothing enforces that it runs for every route.
 
-Concretely: `POST /payments` on InvoiceOps has to authenticate the caller, validate the amount and currency, call a payment provider over the network (which can time out), write the result to Postgres, and return a consistent error body whether the failure was "bad input" (400) or "provider unreachable" (502). If that logic is scattered across the handler, a shared library, and ad hoc `if` statements, a new engineer cannot answer "where does a timeout turn into a 504?" without reading every file touched by the request.
+Concretely: `POST /payments` on InvoiceOps has to authenticate the caller, validate the amount and currency, call a payment provider over the network (which can time out), write the result to Postgres, and return a consistent error body whether the failure was "bad input" (400) or "provider unreachable" (502).
+
+If that logic is scattered across the handler, a shared library, and ad hoc `if` statements, a new engineer cannot answer "where does a timeout turn into a 504?" without reading every file touched by the request.
 
 The lifecycle gives that question one answer: transport and routing are fixed by `net/http`, middleware runs in a declared order for every route, the handler only translates HTTP ↔ Go types, the service owns the business decision and the transaction boundary, and the repository is the only thing that knows SQL exists.
 
 ## 2. Mental model
 
-Think of the request as a parcel going through airport security, not a function call. Each checkpoint (middleware) can stop the parcel and send a response back immediately — a `401` from auth, a `429` from rate limiting — without the parcel ever reaching the handler. The handler is a translator standing at a desk: it turns the parcel's contents (JSON bytes) into typed Go values, hands them to the one expert behind the desk (the service), and translates the expert's answer back into parcel form (JSON + status code). The service is the only one allowed an opinion about the business ("a void invoice cannot be paid"); the repository is a filing clerk who only knows how to put a form in a cabinet and take one out, with no opinion about whether the form made sense.
+Think of the request as a parcel going through airport security, not a function call. Each checkpoint (middleware) can stop the parcel and send a response back immediately — a `401` from auth, a `429` from rate limiting — without the parcel ever reaching the handler.
+
+The handler is a translator standing at a desk: it turns the parcel's contents (JSON bytes) into typed Go values, hands them to the one expert behind the desk (the service), and translates the expert's answer back into parcel form (JSON + status code).
+
+The service is the only one allowed an opinion about the business ("a void invoice cannot be paid"); the repository is a filing clerk who only knows how to put a form in a cabinet and take one out, with no opinion about whether the form made sense.
 
 ## 3. How it works
 
@@ -109,9 +163,13 @@ flowchart LR
    - The **repository** is an interface the service declares (see [[Service Project Layout and Wiring]] for why the consumer owns the interface) and a concrete type elsewhere implements against `database/sql` or `pgx`. It does queries and nothing else; see [[Database Access (database-sql, pgx, sqlc)]].
 5. **Response.** The handler is the only layer that writes HTTP status codes and body bytes. Logging middleware then records the status a lower layer already wrote (see the `statusWriter` gotcha in the code below).
 
-**Context propagation.** `ctx` flows in one direction only: the router passes it into middleware, middleware into the handler, the handler into the service, the service into the repository and provider client. Each stage reads the deadline or does `context.WithTimeout` to carve out a shorter one for one outbound call, and reads request-scoped values (like the request ID) that an earlier stage set with `context.WithValue`. No layer below the handler stores or reuses a `ctx` past the call that received it. The full rules for deadlines, cancellation and the `context.Context` API live in [[Context Package]]; this note only shows the shape of the propagation.
+**Context propagation.** `ctx` flows in one direction only: the router passes it into middleware, middleware into the handler, the handler into the service, the service into the repository and provider client. Each stage reads the deadline or does `context.WithTimeout` to carve out a shorter one for one outbound call, and reads request-scoped values (like the request ID) that an earlier stage set with `context.WithValue`.
 
-**Error mapping.** A domain error such as `ErrInvalidAmount` is created deep inside the service and wrapped with `%w` as it returns up the stack. Exactly one function, at the boundary between the handler and the service, turns that error into a status code with `errors.Is`. Nothing below the handler ever constructs an `http.StatusX` value. The richer version of this mapping — error response bodies, field-level validation errors — belongs to [[API Error Handling]]; this note only establishes that the mapping happens in one place.
+No layer below the handler stores or reuses a `ctx` past the call that received it. The full rules for deadlines, cancellation and the `context.Context` API live in [[Context Package]]; this note only shows the shape of the propagation.
+
+**Error mapping.** A domain error such as `ErrInvalidAmount` is created deep inside the service and wrapped with `%w` as it returns up the stack. Exactly one function, at the boundary between the handler and the service, turns that error into a status code with `errors.Is`.
+
+Nothing below the handler ever constructs an `http.StatusX` value. The richer version of this mapping — error response bodies, field-level validation errors — belongs to [[API Error Handling]]; this note only establishes that the mapping happens in one place.
 
 ## 4. Worked example
 
@@ -581,7 +639,9 @@ Hexagonal architecture is the same core idea as handler/service/repository with 
 > Because the service doesn't know who is calling it. The same `CreatePayment` method might be called from an HTTP handler, a background worker retrying a queued payment, or a test. Only the caller at the HTTP boundary knows "a timeout here means 504"; a worker might instead decide to retry silently.
 
 > [!question]- A middleware runs recover() but logging still shows no error. What's wrong?
-> Middleware order. If logging is registered to run *before* recover in the chain (i.e. recover wraps logging, not the other way around), a panic recovered inside recover never reaches the logging middleware's deferred log statement, because that statement already ran on the way in, not after a panic further in. Recover must be outermost so every later middleware's work — including logging's final line — runs inside its deferred recover.
+> Middleware order. If logging is registered to run *before* recover in the chain (i.e. recover wraps logging, not the other way around), a panic recovered inside recover never reaches the logging middleware's deferred log statement, because that statement already ran on the way in, not after a panic further in.
+>
+> Recover must be outermost so every later middleware's work — including logging's final line — runs inside its deferred recover.
 
 > [!question]- Where does `context.Context` fit into this pipeline, and what's one thing it should never carry?
 > It carries the request's deadline/cancellation and small request-scoped values (request ID, auth claims) from the router through every layer down to the repository and provider client. It should never carry a dependency like a database connection or a service struct — those are passed through constructors, not through `context.WithValue`.
@@ -605,3 +665,7 @@ Hexagonal architecture is the same core idea as handler/service/repository with 
 - **Before this:** [[Context Package]]
 - **Next:** [[Service Project Layout and Wiring]], [[HTTP Server Fundamentals (net-http)]], [[Middleware]]
 - **Compare with:** [[REST and HTTP API Design]] (the contract this pipeline serves), [[API Error Handling]] (the full error-response shape)
+
+### Watch on YouTube
+
+- [10. What are controllers, services, repositories, middlewares and request context?](https://www.youtube.com/watch?v=hyc-7w3pee8) · Sriniously · clear explainer of the handler/service/repository split and request context

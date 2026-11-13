@@ -8,13 +8,22 @@ related: ["[[JavaScript Objects, Arrays and Iteration]]", "[[DOM, Events and Tim
 sources:
   - "ECMA-262 (ECMAScript Language Specification), sections on Object and Array exotic objects"
   - "MDN Web Docs: Array.prototype methods, Object, Map, Set"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # JavaScript Objects, Arrays and Iteration - Go
 
 > [!summary] TL;DR
 > This code demonstrates JavaScript's `map`/`filter`/`reduce` in Go, using generics (Go 1.18+) to write each operation once for any element type. It's a companion to [[JavaScript Objects, Arrays and Iteration]] — read that note first for the concepts; this note shows the same three operations as a small, tested Go package.
+
+## Before the code
+
+- **Generics** (`func Map[T, U any]`): one function written once that works for any element type, like JS methods that accept any array.
+- **Function values / closures** (`func(n int) int { ... }`): functions passed as arguments, the Go version of a JS callback.
+- **Slices** (`[]T`): Go's growable list; `make([]U, len(in))` creates one with a fixed length, `append` grows it.
+- **Structs** (`CartItem`): a fixed set of named fields, the typed cousin of a JS object literal.
+- **Testing** (`testing`, `reflect.DeepEqual`): `TestXxx` functions run by `go test`; `DeepEqual` compares two slices element by element.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or `context` are needed here.
 
 ## What this code shows
 
@@ -48,7 +57,11 @@ Go has no built-in generic `Map`/`Filter`/`Reduce` in its standard library (the 
 
 ### Step 1: `Map` and `Filter`
 
-**Concept.** These two implement [[JavaScript Objects, Arrays and Iteration#map / filter / reduce|the theory note's map/filter section]]: both return a brand-new slice and leave the input untouched, exactly like JS's non-mutating array methods. Go has no generic numeric or interface shortcut for "any type," so both functions use two type parameters — one for the input element type, one for the output element type — which is what lets `Map` change the *type* of each element (e.g. `[]int` → `[]string`), not just its value. The alternative design, writing a separate `MapInts`, `MapStrings`, … for every type pair, is what Go code looked like before generics (1.18); it worked, but needed one copy of the same loop per type.
+**Concept.** These two implement [[JavaScript Objects, Arrays and Iteration#map / filter / reduce|the theory note's map/filter section]]: both return a brand-new slice and leave the input untouched, exactly like JS's non-mutating array methods.
+
+Go has no generic numeric or interface shortcut for "any type," so both functions use two type parameters — one for the input element type, one for the output element type — which is what lets `Map` change the *type* of each element (e.g. `[]int` → `[]string`), not just its value.
+
+The alternative design, writing a separate `MapInts`, `MapStrings`, … for every type pair, is what Go code looked like before generics (1.18); it worked, but needed one copy of the same loop per type.
 
 ```go
 // Package mapfilter mirrors JavaScript's Array.prototype.map/filter/reduce
@@ -87,7 +100,11 @@ func Filter[T any](in []T, pred func(T) bool) []T {
 
 ### Step 2: `Reduce` and the cart example
 
-**Concept.** `Reduce` implements [[JavaScript Objects, Arrays and Iteration#map / filter / reduce|the theory note's reduce]], including its most interview-relevant rule: an initial value is mandatory, not optional. In Go this isn't a runtime check — the function signature itself has no way to omit `initial`, so the "what if you forget it" bug class the theory note warns about for JS simply cannot compile in Go. `CartItem`/`CartTotal` then reuse `Reduce` for the theory note's shopping-cart worked example, with `Price` as an integer (paise) instead of a float, so summing many prices never accumulates floating-point rounding error.
+**Concept.** `Reduce` implements [[JavaScript Objects, Arrays and Iteration#map / filter / reduce|the theory note's reduce]], including its most interview-relevant rule: an initial value is mandatory, not optional.
+
+In Go this isn't a runtime check — the function signature itself has no way to omit `initial`, so the "what if you forget it" bug class the theory note warns about for JS simply cannot compile in Go.
+
+`CartItem`/`CartTotal` then reuse `Reduce` for the theory note's shopping-cart worked example, with `Price` as an integer (paise) instead of a float, so summing many prices never accumulates floating-point rounding error.
 
 ```go
 // Reduce folds in into a single value, like Array.reduce with an initial
@@ -209,7 +226,9 @@ func TestMapFilterChain(t *testing.T) {
 }
 ```
 
-If this test failed on the first assertion, `Map` or `Filter` would be computing the wrong values — a sign the pipeline's arithmetic or comparison is wrong. If it failed on the second assertion (`nums[0] != 1`), it would mean one of the "non-mutating" functions is secretly writing back into its input slice, breaking the exact guarantee the theory note draws from JavaScript's `map`/`filter`.
+If this test failed on the first assertion, `Map` or `Filter` would be computing the wrong values — a sign the pipeline's arithmetic or comparison is wrong.
+
+If it failed on the second assertion (`nums[0] != 1`), it would mean one of the "non-mutating" functions is secretly writing back into its input slice, breaking the exact guarantee the theory note draws from JavaScript's `map`/`filter`.
 
 ### `TestCartTotal`
 
@@ -268,7 +287,9 @@ PASS
 ok  	mapfilter	2.201s
 ```
 
-**Measured:** Go 1.24.4, darwin/arm64, 2026-11-09. `go vet ./...` reported no issues (no output on success). All three tests pass under the race detector, confirming no data race in the package even though none of these functions touch shared mutable state across goroutines — the race detector is run here as standard practice for every Go note in this vault, not because this package uses concurrency.
+**Measured:** Go 1.24.4, darwin/arm64, 2026-11-09. `go vet ./...` reported no issues (no output on success).
+
+All three tests pass under the race detector, confirming no data race in the package even though none of these functions touch shared mutable state across goroutines — the race detector is run here as standard practice for every Go note in this vault, not because this package uses concurrency.
 
 - Line 1 (`go vet`): no output means no suspicious constructs found — a vet warning would print before the test run.
 - `=== RUN`/`--- PASS` lines: each test function ran and its assertions held.

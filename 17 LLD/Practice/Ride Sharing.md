@@ -10,13 +10,15 @@ sources:
   - "Go 1.21 release notes: built-in min and max"
   - "Go 1.22 release notes: range over integers, per-iteration loop variables"
   - "PostgreSQL 17 docs: UPDATE, partial unique indexes, Read Committed re-check of UPDATE WHERE clauses (Concurrency Control)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Ride Sharing
 
 > [!summary] TL;DR
-> A ride-sharing LLD (Uber, Ola, Lyft) is three problems. First, a **trip state machine** from Requested to Completed with cancellations. Second, a **pluggable matcher** that finds nearby drivers through a **grid index** and ranks them. Third, an **atomic driver claim**, so two riders never get the same driver. The fare is a strategy with a **surge multiplier locked at request time**. Money is `int64` paise and the clock is injected.
+> A ride-sharing LLD (Uber, Ola, Lyft) is three problems. First, a **trip state machine** from Requested to Completed with cancellations. Second, a **pluggable matcher** that finds nearby drivers through a **grid index** and ranks them. Third, an **atomic driver claim**, so two riders never get the same driver.
+> 
+> The fare is a strategy with a **surge multiplier locked at request time**. Money is `int64` paise and the clock is injected.
 
 > [!abstract] Core idea
 > - Driver locations live in a grid of cells. "Nearby" means the pickup cell plus rings of neighbouring cells, not a scan of every driver.
@@ -24,6 +26,49 @@ updated: 2026-11-04
 > - The trip is a state machine with an explicit transition table, so "start a trip that was never assigned" is impossible.
 > - Surge is computed from demand and supply near the pickup, **stored on the trip** at request time, and applied at the end. The rider pays what they were quoted.
 > - Classic mistakes: search and claim as two separate steps without re-checking the status, or a ring search that stops at the first ring with a hit.
+
+## Start here: the basics
+
+**The problem in one story.** You open an app and ask for a cab.
+The app must find a free driver close to you, fast, and must never send the same driver to you and your neighbour.
+It also shows a price before the ride, and you should pay that price even if prices rise mid-ride.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| State machine | A fixed list of states and the allowed moves between them | Requested → Assigned → Started → Completed |
+| Grid index | The map cut into square cells, each listing the drivers inside | "Drivers in cell (12, 7)" |
+| Ring | The cells around a cell, one layer further out | The 8 cells around the pickup cell |
+| Strategy | A swappable piece of logic behind one interface | Nearest-driver matcher vs rating-weighted matcher |
+| Surge multiplier | A price boost when demand is higher than supply | 1.5x during rain |
+| Paise | 1/100 of a rupee, stored as an integer to avoid rounding errors | Rs 120.50 = 12050 paise |
+| Lock | Only one goroutine may run the protected code at a time | Claiming a driver |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R[Rider requests] --> F[Find drivers in nearby cells]
+    F --> K[Rank candidates]
+    K --> C{Claim first still Available?}
+    C -- yes --> A[Trip Assigned, driver OnTrip]
+    C -- no, taken --> K2[Try next candidate]
+    K2 --> C
+```
+
+**Analogy.** It is like a taxi dispatcher at a station: she looks at the nearby stands, picks the best taxi, and radios it; if another dispatcher grabbed it first, she radios the next one.
+It breaks down because a real dispatcher works one call at a time, while the code handles many riders at once and needs a lock for the claim.
+
+**How the rest of this note builds up**
+
+- First the problem statement and requirements (Steps 1-2): riders, drivers, trips, cancellation and fares.
+- Then entities, relationships and APIs (Steps 3-5): the trip state machine and the matcher interface.
+- Then storage and patterns (Steps 6-7): the grid index, strategies for matching and fares.
+- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): search without the lock and claim under it, ring search correctness, surge locked at request time, and scaling past one process.
+
+> [!tip] Remember
+> Find candidates without a lock, then claim one under a lock by re-checking it is still Available.
 
 ## Problem statement
 
@@ -330,7 +375,11 @@ cmd/demo/main.go  -> wiring: index, strategies, time.Now
 
 1. **Search without the service lock.** `GridIndex.Nearby` scans ring 0 (the pickup cell), ring 1, and so on, until it has `CandidateWant` candidates, then scans **one more ring**. It holds only the index read lock. One extra ring is a cheap heuristic, not an exact nearest search (see the trap question in the interview section).
 2. **Rank without any lock.** `MatchStrategy.Rank` filters by the radius and sorts by distance.
-3. **Claim under the service lock.** Re-check that the trip is still `Requested` (the rider may have cancelled during the search). Walk the ranked list; the first driver whose status is still `Available`, and who has not rejected this trip, is set to `OnTrip` and removed from the index. Check and set happen under one lock, so two riders cannot both win the same driver.
+3. **Claim under the service lock.** Re-check that the trip is still `Requested` (the rider may have cancelled during the search).
+
+   Walk the ranked list; the first driver whose status is still `Available`, and who has not rejected this trip, is set to `OnTrip` and removed from the index.
+
+   Check and set happen under one lock, so two riders cannot both win the same driver.
 4. Nobody left: the trip becomes `NoDriverFound`, the rider is no longer active, return `ErrNoDriver`.
 
 `EndTrip`: check the transition, compute `Fare(distance, ended - started, trip.SurgePct)`, release the driver at the drop point back into the index.
@@ -1257,10 +1306,20 @@ sequenceDiagram
 ## Interview questions
 
 > [!question]- How do you stop two riders from getting the same driver?
-> Search and rank without the service lock, then claim under it: re-read the driver's status and set `OnTrip` in the same critical section, and fall through to the next candidate if it is no longer `Available`. In a database the claim is `UPDATE drivers SET status = 'on_trip' WHERE id = $1 AND status = 'available'`, and 0 rows means you lost. The race test runs 50 riders against 3 drivers.
+> Search and rank without the service lock, then claim under it: re-read the driver's status and set `OnTrip` in the same critical section, and fall through to the next candidate if it is no longer `Available`.
+> 
+> In a database the claim is `UPDATE drivers SET status = 'on_trip' WHERE id = $1 AND status = 'available'`, and 0 rows means you lost.
+> 
+> The race test runs 50 riders against 3 drivers.
 
 > [!question]- Trap: the pickup cell has a driver, so you stop the search. What is wrong?
-> A driver just across the cell border can be much closer than one in the far corner of the pickup cell. After the first ring that gives enough candidates, scan one more ring and then sort by real distance. `TestNearbyScansOneExtraRing` has a 40 m driver in the next cell and a 1.2 km driver in the pickup cell. One extra ring is still a heuristic: a driver in the far corner of the pickup cell can be about 1.4 cells away, while a driver in ring 2 can be just over 1 cell away. For an exact answer, stop only when the closest edge of the next unscanned ring is farther than the `want`-th best distance so far. In practice the shortlist is re-ranked by ETA anyway.
+> A driver just across the cell border can be much closer than one in the far corner of the pickup cell. After the first ring that gives enough candidates, scan one more ring and then sort by real distance.
+> 
+> `TestNearbyScansOneExtraRing` has a 40 m driver in the next cell and a 1.2 km driver in the pickup cell.
+> 
+> One extra ring is still a heuristic: a driver in the far corner of the pickup cell can be about 1.4 cells away, while a driver in ring 2 can be just over 1 cell away.
+> 
+> For an exact answer, stop only when the closest edge of the next unscanned ring is farther than the `want`-th best distance so far. In practice the shortlist is re-ranked by ETA anyway.
 
 > [!question]- Why is the surge stored on the trip?
 > The rider agreed to a price at request time. If the fare read the current surge at the end, a trip requested at 1.0x could be charged at 2.0x. Storing `SurgePct` on the trip makes the fare a pure function of the trip's own data, which is also easier to audit and test.
@@ -1297,3 +1356,8 @@ I model a Trip as a state machine with an explicit transition table: Requested, 
 - **Before this:** [[Strategy and Template Method]], [[State Machines in Go]], [[Concurrency for LLD]], [[Delivery Partner Assignment]]
 - **Next:** [[Hotel Booking]]
 - **Compare with:** [[Case Study - Ride Sharing and Proximity]] (the system-level design), [[Geospatial Indexing]] (geohash, S2, H3, Redis GEO), [[Locking - Optimistic vs Pessimistic]] (the database side of the claim), [[Parking Lot]] (the same claim-a-scarce-unit race), [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [✅ System Design 11: Design Ride Sharing Application like UBER / OLA / Rapido / Lyft / HLD / LLD](https://www.youtube.com/watch?v=twUz_hWw2T8) · InterviewWithBunny · 65 min · 25,533 views
+- [Uber - System Design Interview Question (Ride Sharing Service)](https://www.youtube.com/watch?v=DGtalg5efCw) · TechPrep · 16 min · 109,856 views

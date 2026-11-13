@@ -21,13 +21,15 @@ sources:
   - "Lu et al., WiscKey: Separating Keys from Values in SSD-conscious Storage (FAST 2016)"
   - "Go source, internal/poll/fd_fsync_darwin.go (File.Sync uses F_FULLFSYNC on macOS)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 3"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Storage Engines - B-tree vs LSM and WAL
 
 > [!summary] TL;DR
-> A **storage engine** is the part of a database that lays rows out on disk and finds them again. **B-tree** engines (PostgreSQL, InnoDB) keep one sorted structure of fixed-size pages and edit pages in place. **LSM** engines (RocksDB, Cassandra) never edit a file: they write new sorted files and merge them in the background. Both survive crashes the same way: every change is first appended to a **write-ahead log (WAL)**, and a commit is acknowledged only after that log is flushed to disk with `fsync`.
+> A **storage engine** is the part of a database that lays rows out on disk and finds them again. **B-tree** engines (PostgreSQL, InnoDB) keep one sorted structure of fixed-size pages and edit pages in place. **LSM** engines (RocksDB, Cassandra) never edit a file: they write new sorted files and merge them in the background.
+>
+> Both survive crashes the same way: every change is first appended to a **write-ahead log (WAL)**, and a commit is acknowledged only after that log is flushed to disk with `fsync`.
 
 > [!abstract] Core idea
 > - Every change is appended to the write-ahead log (WAL) and flushed with `fsync` before the commit is acknowledged; data pages are written later.
@@ -36,6 +38,53 @@ updated: 2026-11-07
 > - LSM: buffer writes in memory, flush sorted immutable files, merge them in the background; cheap writes, reads check several files.
 > - Classic mistake: thinking COMMIT means the row is in the table file. It only means it is in the WAL.
 
+## Start here: the basics
+
+**The problem in one story.**
+You save a note in an app and the power cuts out one second later.
+When the machine restarts, you expect the note to still be there, whole, not half-written.
+A database has the same promise for millions of saves per second.
+This note is about how it keeps that promise and how it lays data out on disk so reads and writes stay fast.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Disk page | A fixed-size block the database reads and writes as one unit | 8 KB in PostgreSQL, 16 KB in InnoDB |
+| `fsync` | Asking the OS to really push data onto the disk, not just into memory | `COMMIT` waits for one `fsync` of the log |
+| Log (append-only) | A file you only ever add to the end of | A diary: new entries go at the bottom |
+| Index | A sorted lookup structure that finds rows without scanning everything | Finding invoice 42 without reading all invoices |
+| Buffer pool | Pages the database keeps cached in RAM | Hot pages stay in memory, cold ones go to disk |
+| Crash recovery | What the database does at restart to get back to a correct state | Replaying the log after a power cut |
+| Compaction | Background merging of files to drop old versions and deleted data | Merging 4 small sorted files into 1 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W["Write: UPDATE row"] --> L["Append to WAL<br/>+ fsync"]
+    L --> OK["COMMIT returns"]
+    L --> M["Change page in memory"]
+    M -- "later" --> BT["B-tree: rewrite page in place"]
+    M -- "or" --> LSM["LSM: flush new sorted file,<br/>merge files later"]
+    C["Crash"] --> R["Replay WAL at restart"]
+```
+
+**Analogy.** A shop clerk first writes every sale in a receipt book (the WAL), then updates the shelf inventory sheet (the data pages) when there is time.
+If the clerk faints, the next clerk replays the receipt book to fix the sheet.
+Where it breaks: a real receipt book never gets "compacted"; a database also has to manage files, caches and torn half-written pages.
+
+**How the rest of this note builds up**
+
+- First, why a log is needed at all (section 1) and the mental model of "log first, pages later" (section 2).
+- Then pages, the buffer pool, B+trees, WAL, group commit and checkpoints (section 3).
+- Then LSM trees: memtables, SSTables, tombstones and compaction, plus read, write and space amplification.
+- Then a traced crash and a measured compaction choice (section 4), trade-offs and production settings.
+- Finally the SDE-3 deep dive, interview questions and cheat sheet.
+
+> [!tip] Remember
+> COMMIT means "it is in the log on disk", not "it is in the table file"; B-trees edit in place, LSM trees append and merge later.
+
 ## 1. Why it exists
 
 InvoiceOps receives a payment webhook, marks invoice 42 as `paid` and answers `200 OK`. The power fails 5 ms later. Two things must still be true after the restart:
@@ -43,7 +92,9 @@ InvoiceOps receives a payment webhook, marks invoice 42 as `paid` and answers `2
 - **Durability:** the payment is there.
 - **No corruption:** a page that was half-written when the power failed does not break the table.
 
-Writing every changed 8 kB data page to disk at commit time would mean several random writes per commit. A power cut in the middle of one leaves a **torn page**: part old bytes, part new. So engines do something cheaper and safer: append a small record describing the change to a log, flush only the log, and write the data pages later. Many commits can share one flush.
+Writing every changed 8 kB data page to disk at commit time would mean several random writes per commit. A power cut in the middle of one leaves a **torn page**: part old bytes, part new.
+
+So engines do something cheaper and safer: append a small record describing the change to a log, flush only the log, and write the data pages later. Many commits can share one flush.
 
 **Measured on this laptop** (Apple M4, macOS 26.5, Go 1.24, the toy WAL from section 4; Go's `File.Sync` issues `F_FULLFSYNC` on macOS, a real flush to the SSD). `BenchmarkCommitFsyncEach` calls `Append(true, rec)` 100 times; `BenchmarkCommitGrouped` calls `Append(true, recs...)` once with the same 100 records:
 
@@ -68,7 +119,9 @@ Analogy: an accountant's **journal and ledger**. Every transaction is first writ
 
 ### Pages and the buffer pool
 
-A PostgreSQL page has a 24-byte header, an array of 4-byte line pointers growing forward, row versions (tuples) growing backward from the end, and free space in between. The header records the **LSN** (log sequence number, a byte position in the WAL) of the last WAL record that changed the page. Recovery uses it to skip changes the page already has.
+A PostgreSQL page has a 24-byte header, an array of 4-byte line pointers growing forward, row versions (tuples) growing backward from the end, and free space in between. The header records the **LSN** (log sequence number, a byte position in the WAL) of the last WAL record that changed the page.
+
+Recovery uses it to skip changes the page already has.
 
 ```mermaid
 flowchart LR
@@ -476,3 +529,7 @@ flowchart TD
 - **Runnable code:** [[Storage Engines - B-tree vs LSM and WAL - Go]] (toy WAL with checksums, toy LSM tree, tests and benchmarks)
 - **Next:** [[Isolation Levels and MVCC]], [[Replication]], [[Backup, PITR and Disaster Recovery]]
 - **Compare with:** [[Wide-Column Stores and Cassandra]] (an LSM engine in a distributed database), [[Time-Series and Columnar Storage]] (column layouts for analytics), [[Case Study - Key-Value Store]]
+
+### Watch on YouTube
+
+- [LSM Tree vs B-Tree / Database Internals Explained](https://www.youtube.com/watch?v=tLYgGaY1MYo) · AlgoSimplified · direct comparison of the two storage engine families the note covers

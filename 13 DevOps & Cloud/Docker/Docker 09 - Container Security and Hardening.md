@@ -10,7 +10,7 @@ sources:
   - "Sigstore / cosign documentation, docs.sigstore.dev"
   - "NIST SP 800-190, Application Container Security Guide"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 09 - Container Security and Hardening
@@ -24,13 +24,72 @@ updated: 2026-11-07
 > - Prove what you're running: sign images (cosign) and enforce that signature at admission, not just at build time.
 > - Classic mistake: believing a non-root `USER` alone makes a container safe. Mounting `/var/run/docker.sock` into *any* container — root or not — hands it root on the host, because the Docker socket itself is an unauthenticated root API.
 
+## Start here: the basics
+
+**The problem in one story**
+
+An attacker finds a bug in one library your Go API uses and gets code running inside its container.
+What happens next depends on what that container was allowed to do.
+If it runs as root with every permission and a writable disk, the attacker can dig in and maybe reach the host.
+If it runs as a limited user with nothing extra, the attacker is stuck in a small, locked room.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| root | The all-powerful admin user on Linux, UID 0 | `USER root` |
+| Linux capability | One slice of root's power that can be granted alone | `NET_BIND_SERVICE` to bind port 80 |
+| Syscall | A request a program makes to the kernel | `open`, `mount`, `ptrace` |
+| CVE | A public ID for a known security bug | `CVE-2024-xxxx` in a base-image package |
+| Image digest | A hash that names exact image content forever | `@sha256:3f1a...` |
+| Tag | A movable label pointing at some image | `golang:1.24`, `:latest` |
+| Secret | A password, token or key the app needs | `DB_PASSWORD` |
+| Docker socket | The file the Docker daemon's root API listens on | `/var/run/docker.sock` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Build["Build image<br/>minimal base, no secrets"] --> Scan["Scan for CVEs"]
+    Scan --> Sign["Sign digest"]
+    Sign --> Admit{"Admission check"}
+    Admit --> Run["Run locked down<br/>non-root, no caps, read-only"]
+```
+
+**Analogy**
+
+Hardening is like giving a contractor a keycard that opens only the one room they work in, instead of a master key.
+Where it breaks: a keycard cannot fix a weak wall; if the shared kernel has a bug, least privilege only reduces the damage, it does not remove the hole.
+
+**How the rest of this note builds up**
+
+- First, why Docker's defaults are permissive and the "assume it gets compromised" mental model.
+- Then the supply chain: minimal bases, digest pinning, scanning, SBOMs and signing.
+- Then runtime hardening: non-root, capabilities, `no-new-privileges`, read-only rootfs, seccomp, AppArmor and the Docker socket, with a Go Dockerfile checker.
+- Finally the SDE-3 deep dive: escape chains, rootless internals, keyless signing and admission policy.
+
+> [!tip] Remember
+> Assume the process will be compromised, and take away every permission it never needed.
+
 ## 1. Why it exists
 
-Because a container is a process restricted by namespaces and cgroups on a kernel it shares with the host (see [[Docker 08 - How Docker Works Under the Hood]]), the isolation is real but it is not a security perimeter by default. Docker's own defaults favor convenience: a container runs as root inside unless told otherwise, with a writable root filesystem, every Linux capability Docker grants by default (around 14, including `NET_RAW` and `SYS_CHROOT`), and no seccomp restriction beyond Docker's default profile. Each of those defaults is a door left open: root inside a container that also holds a kernel exploit or a mounted host path is root with a path outward; a writable filesystem means malware dropped at runtime persists across a restart of that same container; an unpinned `:latest` tag means the image you tested is not provably the image that shipped.
+Because a container is a process restricted by namespaces and cgroups on a kernel it shares with the host (see [[Docker 08 - How Docker Works Under the Hood]]), the isolation is real but it is not a security perimeter by default.
+
+Docker's own defaults favor convenience: a container runs as root inside unless told otherwise, with a writable root filesystem, every Linux capability Docker grants by default (around 14, including `NET_RAW` and `SYS_CHROOT`), and no seccomp restriction beyond Docker's default profile.
+
+Each of those defaults is a door left open:
+
+- root inside a container that also holds a kernel exploit or a mounted host path is root with a path outward;
+- a writable filesystem means malware dropped at runtime persists across a restart of that same container;
+- an unpinned `:latest` tag means the image you tested is not provably the image that shipped.
 
 ## 2. Mental model
 
-Treat a container like a process you don't fully trust, because its code came from a dependency tree you don't fully audit — then ask what that process should be *allowed* to do if it were compromised. A compromised process with no root, no capabilities, a read-only filesystem, and a seccomp filter blocking `mount`/`ptrace`/`kexec_load` can still run your application logic, but it can't install a rootkit, escalate privileges, or pivot to the host — because the permissions to do those things were never granted, not because an antivirus caught it afterward. Hardening is removing permissions the application never needed in the first place.
+Treat a container like a process you don't fully trust, because its code came from a dependency tree you don't fully audit — then ask what that process should be *allowed* to do if it were compromised.
+
+A compromised process with no root, no capabilities, a read-only filesystem, and a seccomp filter blocking `mount`/`ptrace`/`kexec_load` can still run your application logic. But it can't install a rootkit, escalate privileges, or pivot to the host — because the permissions to do those things were never granted, not because an antivirus caught it afterward.
+
+Hardening is removing permissions the application never needed in the first place.
 
 ## 3. How it works
 
@@ -50,7 +109,12 @@ flowchart LR
     ADMIT -->|yes| RUN["run: non-root USER, --cap-drop ALL,<br/>read-only rootfs, seccomp, pids/memory limits"]
 ```
 
-Each stage removes one way an attacker could win: scanning catches known CVEs before deploy; signing proves the image in the registry is the exact one the pipeline built, not something swapped in afterward; admission control makes the signature and scan mandatory rather than advisory; and the runtime flags shrink what a still-successful compromise can do next.
+Each stage removes one way an attacker could win:
+
+1. Scanning catches known CVEs before deploy.
+2. Signing proves the image in the registry is the exact one the pipeline built, not something swapped in afterward.
+3. Admission control makes the signature and scan mandatory rather than advisory.
+4. The runtime flags shrink what a still-successful compromise can do next.
 
 ### Hardening the image itself
 
@@ -83,9 +147,13 @@ flowchart TB
 - **`no-new-privileges`.** Blocks a process from gaining more privileges than it started with via `setuid`/`setgid` binaries or file capabilities — closing a class of escalation that capability-dropping alone doesn't.
 - **Read-only root filesystem (`--read-only`)**, with an explicit `tmpfs` mount for any directory the app genuinely needs to write to (like `/tmp`). This means a compromise can't persist a backdoor into the image's own filesystem.
 - **seccomp.** A BPF filter on which syscalls a process may make at all. Docker's default profile already blocks dangerous syscalls like `mount`, `ptrace`, `kexec_load`, and `reboot`; a custom, stricter profile (generated by tracing the application's actual syscalls) narrows this further for a specific workload.
-- **AppArmor (or SELinux).** A mandatory access control (MAC) layer, separate from seccomp: instead of filtering *which syscalls* a process may make, it restricts *what a given syscall may touch* — which paths a process may read, write or execute, and which capabilities it may use them with — via a named profile loaded into the kernel. Docker loads a default `docker-default` AppArmor profile on Debian/Ubuntu hosts automatically; `--security-opt apparmor=<profile>` swaps in a custom, tighter one (or `unconfined` to disable it, which should be rare and deliberate). RHEL/Fedora-family hosts use SELinux instead, enforced the same way via `--security-opt label=...`; Kubernetes exposes the equivalent through a Pod's `appArmorProfile`/`seLinuxOptions`.
+- **AppArmor (or SELinux).** A mandatory access control (MAC) layer, separate from seccomp: instead of filtering *which syscalls* a process may make, it restricts *what a given syscall may touch* — which paths a process may read, write or execute, and which capabilities it may use them with — via a named profile loaded into the kernel.
+  - Docker loads a default `docker-default` AppArmor profile on Debian/Ubuntu hosts automatically; `--security-opt apparmor=<profile>` swaps in a custom, tighter one (or `unconfined` to disable it, which should be rare and deliberate).
+  - RHEL/Fedora-family hosts use SELinux instead, enforced the same way via `--security-opt label=...`; Kubernetes exposes the equivalent through a Pod's `appArmorProfile`/`seLinuxOptions`.
 - **Rootless Docker** (see [[Docker 08 - How Docker Works Under the Hood]]) moves this hardening up a level: even the daemon itself doesn't run as host root, so a daemon compromise doesn't hand over the whole host.
-- **The Docker socket is the sharpest edge.** Mounting `/var/run/docker.sock` into a container — a common CI/CD pattern for "build images from inside a pipeline container" — hands that container the ability to start *new* containers with `--privileged` and arbitrary host mounts, through an API with no further authentication. A non-root `USER` inside that container changes nothing: the socket itself is root-equivalent. Use a rootless build tool (`buildx` with a rootless builder, `kaniko`, `buildah`) instead of socket-mounting when images must be built inside a pipeline container.
+- **The Docker socket is the sharpest edge.** Mounting `/var/run/docker.sock` into a container — a common CI/CD pattern for "build images from inside a pipeline container" — hands that container the ability to start *new* containers with `--privileged` and arbitrary host mounts, through an API with no further authentication.
+  - A non-root `USER` inside that container changes nothing: the socket itself is root-equivalent.
+  - Use a rootless build tool (`buildx` with a rootless builder, `kaniko`, `buildah`) instead of socket-mounting when images must be built inside a pipeline container.
 
 ## 4. Worked example
 
@@ -244,7 +312,9 @@ USER 65532
 ENTRYPOINT ["/app"]
 ```
 
-Built with `docker build --secret id=goproxy_token,src=./token.txt`. The secret is mounted only into the one `RUN` layer that needs it, at a path that BuildKit never commits to any image layer — unlike `ARG`/`ENV`, which both end up readable in the final image's history or environment.
+Built with `docker build --secret id=goproxy_token,src=./token.txt`. 
+
+The secret is mounted only into the one `RUN` layer that needs it, at a path that BuildKit never commits to any image layer — unlike `ARG`/`ENV`, which both end up readable in the final image's history or environment.
 
 **Run with the hardened flags** (the manual equivalent of a Kubernetes `securityContext`):
 
@@ -346,3 +416,8 @@ securityContext:
 - **Before this:** [[Docker 08 - How Docker Works Under the Hood]], [[Docker 04 - Writing a Production Dockerfile for Go]]
 - **Next:** [[Kubernetes Fundamentals]]
 - **Compare with:** [[Secrets Management]] (runtime secret storage and rotation beyond the build), [[Authentication vs Authorization]] (least privilege as a general principle, applied here to a process instead of a user)
+
+### Watch on YouTube
+
+- [Docker Container Security in 30 Minutes / Trivy Vulnerability Scanning & Hardening / Hands-On Projec](https://www.youtube.com/watch?v=wh9c9peM1sk) · The Cloud Threat Defender · 32 min · 304 views
+- [Container Security Explained](https://www.youtube.com/watch?v=b_euX_M82uI) · IBM Technology · 6 min · 86,273 views

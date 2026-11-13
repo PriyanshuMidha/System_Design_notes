@@ -12,7 +12,7 @@ sources:
   - "Lakshman and Malik, Cassandra: A Decentralized Structured Storage System (2010)"
   - "Chang et al., Bigtable: A Distributed Storage System for Structured Data (OSDI 2006)"
   - "Discord blog, How Discord Stores Billions of Messages (2017) and How Discord Stores Trillions of Messages (2023)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Wide-Column Stores and Cassandra
@@ -25,6 +25,51 @@ updated: 2026-11-02
 > - Design one table per query, and accept duplicated data, because there are no joins.
 > - Each request picks a consistency level; `R + W > RF` makes a read see the latest acknowledged write.
 > - Classic mistakes: unbounded partitions (bucket by day), and deleting heavily without understanding tombstones (delete markers that must reach every replica before `gc_grace_seconds` ends).
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app writes millions of audit events a day, from many regions, and must never stop accepting writes.
+One PostgreSQL server cannot take that write load, and you cannot afford downtime when a machine dies.
+Cassandra spreads data across many machines and copies each piece to several of them.
+The price: you must design tables around the exact questions you will ask.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Node | One server in the cluster | 6 nodes across 2 data centres |
+| Partition key | The field that decides which nodes store a row | `(tenant_id, day)` |
+| Clustering column | The field that sorts rows inside one partition | `event_time DESC` |
+| Replica / RF | A copy of the data; replication factor = number of copies | RF = 3 means 3 copies |
+| Consistency level | How many replicas must answer a read or write | `QUORUM` = 2 of 3 |
+| Tombstone | A "this was deleted" marker instead of an instant delete | Deleting a row writes a tombstone |
+| Denormalise | Store the same data in several tables to avoid joins | Events by tenant and events by user |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client write<br/>(tenant=7, day=Mar-1)"] --> CO["Coordinator node"]
+    CO -- "hash partition key" --> R1["Replica 1"]
+    CO --> R2["Replica 2"]
+    CO --> R3["Replica 3"]
+    R1 & R2 --> ACK["QUORUM: 2 acks = success"]
+```
+
+**Analogy.** A library with many branches: the first letter of the book title (partition key) decides which branches keep a copy, and on the shelf books sit in date order (clustering column).
+Where it breaks: a library lets you search by author too; Cassandra only finds rows fast by the partition key you designed for.
+
+**How the rest of this note builds up**
+
+- First, why wide-column stores exist (section 1) and the partition/clustering mental model (section 2).
+- Then placement with tokens, the write and read paths, tunable consistency, repair, tombstones and lightweight transactions (section 3).
+- Then a query-first design for InvoiceOps audit events and how deleted rows come back (section 4).
+- Then compaction strategies, other systems and when to choose Cassandra (sections 5-7).
+- Finally the SDE-3 deep dive and interview questions.
+
+> [!tip] Remember
+> One table per query, partition key picks the nodes, keep partitions bounded, and `R + W > RF` for read-your-writes.
 
 ## 1. Why it exists
 
@@ -90,7 +135,9 @@ Terms:
 
 ### 3.1 Placement: tokens and replicas
 
-The default partitioner hashes the partition key with Murmur3 into a 64-bit **token**. Each node owns several token ranges (virtual nodes: `num_tokens` is 16 by default since Cassandra 4.0, 256 before), and replicas go to the next nodes clockwise on the ring, as described in [[Consistent Hashing]]. `NetworkTopologyStrategy` places RF replicas in each data centre, on different racks where it can. Nodes learn about each other by gossip (see [[Failure Detection, Gossip and Membership]]).
+The default partitioner hashes the partition key with Murmur3 into a 64-bit **token**. Each node owns several token ranges (virtual nodes: `num_tokens` is 16 by default since Cassandra 4.0, 256 before), and replicas go to the next nodes clockwise on the ring, as described in [[Consistent Hashing]].
+
+`NetworkTopologyStrategy` places RF replicas in each data centre, on different racks where it can. Nodes learn about each other by gossip (see [[Failure Detection, Gossip and Membership]]).
 
 ```mermaid
 flowchart LR
@@ -177,7 +224,9 @@ sequenceDiagram
 | `ANY` (writes only) | 1, and a stored hint counts | Maximum write availability, weakest durability |
 | `SERIAL` / `LOCAL_SERIAL` | A Paxos quorum | The Paxos phase of lightweight transactions (§3.6) |
 
-If the write CL plus the read CL is greater than RF (for example `LOCAL_QUORUM` + `LOCAL_QUORUM` = 2 + 2 > 3), every read overlaps at least one replica that took the latest acknowledged write in that DC. That is overlap, not linearizability: concurrent writes, writes that failed half way, and last-write-wins with skewed clocks can still surprise you. See [[Quorums and Leaderless Replication]].
+If the write CL plus the read CL is greater than RF (for example `LOCAL_QUORUM` + `LOCAL_QUORUM` = 2 + 2 > 3), every read overlaps at least one replica that took the latest acknowledged write in that DC.
+
+That is overlap, not linearizability: concurrent writes, writes that failed half way, and last-write-wins with skewed clocks can still surprise you. See [[Quorums and Leaderless Replication]].
 
 ```mermaid
 flowchart LR
@@ -223,7 +272,9 @@ VALUES ('ws-7', 1042, 'inv-01JC9V')
 IF NOT EXISTS;
 ```
 
-`IF NOT EXISTS` and `UPDATE … IF col = value` run Paxos among the partition's replicas. The classic implementation (Paxos v1) needs 4 round trips for a write and 3 for a read. Cassandra 4.1 added Paxos v2 (`paxos_variant: v2`, opt-in), which needs 2 round trips for a write and 1 or 2 for a read. Use LWTs only for compare-and-set (unique claims, state transitions), keep them off hot partitions, and do not mix LWT and plain writes on the same cells: plain writes bypass Paxos and break its guarantees.
+`IF NOT EXISTS` and `UPDATE … IF col = value` run Paxos among the partition's replicas. The classic implementation (Paxos v1) needs 4 round trips for a write and 3 for a read. Cassandra 4.1 added Paxos v2 (`paxos_variant: v2`, opt-in), which needs 2 round trips for a write and 1 or 2 for a read.
+
+Use LWTs only for compare-and-set (unique claims, state transitions), keep them off hot partitions, and do not mix LWT and plain writes on the same cells: plain writes bypass Paxos and break its guarantees.
 
 ```mermaid
 sequenceDiagram
@@ -270,7 +321,9 @@ List the queries first, then build one table per query and accept duplicated dat
 | Q2: what did user U do on day D (security review) | `audit_events_by_actor_day` | `((actor_id, bucket_day), created_at, event_id)` |
 | Q3: full timeline of one invoice | `audit_events_by_invoice` | `((workspace_id, invoice_id), created_at, event_id)` |
 
-The full DDL (a keyspace with 3 replicas in each of two data centres, a day-bucketed table, time-window compaction and a 365-day TTL) is in [[Wide-Column Stores and Cassandra - Go]]. Q1 reads one partition that is already sorted newest first, `WHERE workspace_id = 'ws-7' AND bucket_day = '2026-11-02' LIMIT 50`. The anti-pattern is a query with no partition key, such as `WHERE actor_id = 'u-19' ALLOW FILTERING`, where every node scans every partition.
+The full DDL (a keyspace with 3 replicas in each of two data centres, a day-bucketed table, time-window compaction and a 365-day TTL) is in [[Wide-Column Stores and Cassandra - Go]]. Q1 reads one partition that is already sorted newest first, `WHERE workspace_id = 'ws-7' AND bucket_day = '2026-11-02' LIMIT 50`.
+
+The anti-pattern is a query with no partition key, such as `WHERE actor_id = 'u-19' ALLOW FILTERING`, where every node scans every partition.
 
 ```mermaid
 flowchart LR
@@ -324,9 +377,13 @@ sequenceDiagram
     Note over A,C: the deleted row is back. With a repair on day 5 C would hold the tombstone and the delete would survive
 ```
 
-Reading the trace with numbers: before day 10 the tombstone (2,000) beats the live cell (1,000) on every read. At day 10 the tombstone is eligible for purging (`gc_grace_seconds` = 864,000 s), and on day 11 compaction drops it on A and B. Only C remembers the row, so it is the only version left and it wins. If `nodetool repair` had run on day 5, C would have received the tombstone and all three would have purged it together.
+Reading the trace with numbers: before day 10 the tombstone (2,000) beats the live cell (1,000) on every read. At day 10 the tombstone is eligible for purging (`gc_grace_seconds` = 864,000 s), and on day 11 compaction drops it on A and B.
 
-The model also shows the clock-skew trap. If node A stamps a write 10,000 and node B writes 2 ms *later in real time* but its clock is behind and it stamps 8,000, B's write is silently discarded because 8,000 is lower. On an exact timestamp tie, a tombstone beats a live value. The model keeps one cell per key, as if compaction had already merged everything; real compaction may drop a tombstone only when no older SSTable outside the compaction could still hold the data it shadows.
+Only C remembers the row, so it is the only version left and it wins. If `nodetool repair` had run on day 5, C would have received the tombstone and all three would have purged it together.
+
+The model also shows the clock-skew trap. If node A stamps a write 10,000 and node B writes 2 ms *later in real time* but its clock is behind and it stamps 8,000, B's write is silently discarded because 8,000 is lower. On an exact timestamp tie, a tombstone beats a live value.
+
+The model keeps one cell per key, as if compaction had already merged everything; real compaction may drop a tombstone only when no older SSTable outside the compaction could still hold the data it shadows.
 
 The model (`Cell`, `Reconcile`, `Replica`, `Compact`, `Read`, `Repair`) and its three tests (`TestDeleteResurrectsWithoutRepair`, `TestRepairWithinGCGraceKeepsDelete`, `TestLastWriteWins`) are in Go. Runnable Go version: [[Wide-Column Stores and Cassandra - Go]]
 
@@ -434,7 +491,9 @@ flowchart LR
 > `QUORUM` needs 4 of all 6 replicas, so every request crosses regions. `LOCAL_QUORUM` needs 2 of the 3 local replicas. Writing and reading at `LOCAL_QUORUM` (2 + 2 > 3) means a read overlaps a replica that has the latest acknowledged write in that DC. It does not give linearizability: concurrent writes and skewed clocks still resolve by last-write-wins.
 
 > [!question]- You deleted rows, and a month later some of them came back. Why?
-> A replica missed the delete: it was down longer than the hint window, and no repair ran. After `gc_grace_seconds` (10 days by default) the other replicas purged their tombstones in compaction, so the stale replica's old value won the next read repair or anti-entropy repair. Fix: complete a repair of every table within `gc_grace_seconds`, and never bring a node back after it has been down longer than that without rebuilding it.
+> A replica missed the delete: it was down longer than the hint window, and no repair ran. After `gc_grace_seconds` (10 days by default) the other replicas purged their tombstones in compaction, so the stale replica's old value won the next read repair or anti-entropy repair.
+>
+> Fix: complete a repair of every table within `gc_grace_seconds`, and never bring a node back after it has been down longer than that without rebuilding it.
 
 > [!question]- Why are Cassandra writes cheap and reads more expensive?
 > A write is a sequential commit-log append plus an in-memory insert, with no read before it. A read may have to check the memtable and several SSTables (filtered by bloom filters), merge cells by timestamp, and compare replicas. Compaction strategy and partition design decide how many SSTables a read touches.
@@ -465,3 +524,9 @@ flowchart LR
 - **Before this:** [[NoSQL Data Modeling]], [[Storage Engines - B-tree vs LSM and WAL]], [[Consistent Hashing]]
 - **Next:** [[Quorums and Leaderless Replication]], [[Failure Detection, Gossip and Membership]], [[Hot Keys and Hot Partitions]]
 - **Compare with:** [[Partitioning and Sharding]] (sharding a relational database by hand), [[Time-Series and Columnar Storage]] (true column stores for analytics), [[Replication]] (single-leader replication)
+
+### Watch on YouTube
+
+- [Foundations of Cassandra Data Modeling - Session 1](https://www.youtube.com/watch?v=CivjlnV7lNc) · DataStax · deep dive on partition/clustering key data modeling from Cassandra's own vendor
+- [Cassandra in 100 Seconds](https://www.youtube.com/watch?v=ziq7FUKpCS8) · Fireship · super short visual intro to what Cassandra is
+- [Intro to NO SQL - Cassandra / Tutorial / Why the name Cassandra (Part 5) / Great Learning](https://www.youtube.com/watch?v=DtxXeCPcqNI) · Great Learning · broader NoSQL/wide-column-store context before diving into Cassandra specifics

@@ -12,7 +12,7 @@ sources:
   - "Brandur Leach, Implementing Stripe-like Idempotency Keys in Postgres (2017)"
   - "PostgreSQL 17 docs, INSERT ... ON CONFLICT"
   - "RFC 9562, Universally Unique IDentifiers (UUIDs)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Idempotency and Idempotency Keys
@@ -27,9 +27,58 @@ updated: 2026-11-02
 > - Claim the key atomically, and reject the same key with a different body (`422`).
 > - Classic mistake: check-then-insert without a lock or unique constraint, so two concurrent retries both run.
 
+## Start here: the basics
+
+**The problem in one story.**
+You tap "Pay" in a shopping app and the screen spins.
+The payment actually went through, but the reply got lost on a flaky network.
+The app does not know that, so it tries again, and you are charged twice.
+An idempotency key lets the server recognise "this is the same payment again" and answer without charging a second time.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Request / response | A message to the server and its answer | `POST /v1/payments` then `201 Created` |
+| Timeout | Giving up after waiting too long for an answer | The app waits 10 s, then stops |
+| Retry | Sending the same request again after a failure | The app resends the payment |
+| HTTP method | The verb of a request | `GET` reads, `POST` creates, `PUT` replaces |
+| Idempotent | Doing it twice has the same effect as once | Setting `balance = 100` |
+| Unique constraint | A database rule that rejects duplicate values | Only one row per `order_id` |
+| Race condition | Two things running at once give a wrong result | Two retries both see "not paid yet" |
+| Header | Extra key-value info sent with a request | `Idempotency-Key: 8e1f...` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client sends POST<br/>with Idempotency-Key"] --> S{"Server: key<br/>seen before?"}
+    S -- "no" --> W["Claim key, do the work,<br/>store the response"]
+    W --> R["Return response"]
+    S -- "yes, finished" --> RP["Replay stored response"]
+    S -- "yes, still running" --> X["409 Conflict:<br/>retry later"]
+```
+
+**Analogy.** A cloakroom ticket: you get one ticket number per coat, and showing the same ticket twice gets you the same coat, not a second one.
+Where it breaks: a cloakroom never has two people showing the same ticket at the same instant; a server does, so it must claim the key atomically.
+
+**How the rest of this note builds up**
+
+- First, why retries cause double charges (section 1) and what safe and idempotent mean (section 2).
+- Then which HTTP methods are idempotent, how to make operations naturally idempotent, and how the key store works (section 3).
+- Then a worked example, trade-offs, and production failure modes and monitoring.
+- Finally, the SDE-3 deep dive on same-transaction claims, recovery points, downstream keys and fingerprinting.
+
+> [!tip] Remember
+> Retries are only safe for idempotent operations, so give every retried `POST` one key per logical operation and claim it atomically.
+
 ## 1. Why it exists
 
-A user taps **Pay ₹499**. The app sends `POST /v1/payments`; the server charges the card at the payment service provider (PSP) and commits the payment. The response is on its way back when the phone switches from Wi-Fi to mobile data, and the app's 10-second timeout fires. The app cannot tell "the request never arrived" from "it worked but the answer got lost", so it retries, or the user taps again. Without protection, the user is charged twice.
+A user taps **Pay ₹499**. The app sends `POST /v1/payments`; the server charges the card at the payment service provider (PSP) and commits the payment.
+
+The response is on its way back when the phone switches from Wi-Fi to mobile data, and the app's 10-second timeout fires.
+
+The app cannot tell "the request never arrived" from "it worked but the answer got lost", so it retries, or the user taps again. Without protection, the user is charged twice.
 
 This is not rare at scale. If 0.1% of payment requests time out at the client after the server committed (an estimate; measure it as "client timeouts with a server-side 2xx"), then 1,000,000 payments a day produce 1,000 double charges a day.
 
@@ -56,7 +105,16 @@ The idempotency key is a **cloakroom ticket**. The client invents a ticket numbe
 | `POST` | No | **No** | "Create" or "process": each call may create something new |
 | `PATCH` | No | **No** by definition | `{"status":"paid"}` behaves idempotently; `{"op":"add", "path":"/items/-"}` does not |
 
-RFC 9110 lets a client retry an idempotent request automatically after a connection failure. For a non-idempotent method such as `POST` it says the client should not, unless it knows this particular request is idempotent anyway or can tell that the original was never applied. Go's `http.Transport` follows that rule: it silently retries a request that failed on a reused connection only when the body is absent or re-creatable (`GetBody` is set) **and** either the method is `GET`, `HEAD`, `OPTIONS` or `TRACE` or the request carries an `Idempotency-Key` or `X-Idempotency-Key` header (checked in the Go 1.24 source, `Request.isReplayable`). Sending the header therefore also tells Go's own client that a `POST` may be resent.
+RFC 9110 lets a client retry an idempotent request automatically after a connection failure.
+
+For a non-idempotent method such as `POST` it says the client should not, unless it knows this particular request is idempotent anyway or can tell that the original was never applied.
+
+Go's `http.Transport` follows that rule. It silently retries a request that failed on a reused connection only when:
+
+1. the body is absent or re-creatable (`GetBody` is set), **and**
+2. either the method is `GET`, `HEAD`, `OPTIONS` or `TRACE` or the request carries an `Idempotency-Key` or `X-Idempotency-Key` header (checked in the Go 1.24 source, `Request.isReplayable`).
+
+Sending the header therefore also tells Go's own client that a `POST` may be resent.
 
 ### Make it naturally idempotent first
 
@@ -628,7 +686,8 @@ If step 4 updates zero rows, another attempt took over the key; do not report su
 ## 7. In production
 
 - **Real systems:**
-	- Stripe accepts `Idempotency-Key` on every `POST`, keys up to 255 characters, prunes keys once they are at least 24 hours old, compares parameters with the original request, and replays the first result, including `500` errors. It saves a result only once the endpoint has started executing, so a request that failed validation, or conflicted with a concurrent one, can simply be retried.
+	- Stripe accepts `Idempotency-Key` on every `POST`, keys up to 255 characters, prunes keys once they are at least 24 hours old, compares parameters with the original request, and replays the first result, including `500` errors.
+		- It saves a result only once the endpoint has started executing, so a request that failed validation, or conflicted with a concurrent one, can simply be retried.
 	- Other PSPs follow the same model under other names: Adyen uses an `Idempotency-Key` header, PayPal a `PayPal-Request-Id` header. AWS EC2's `RunInstances` takes a `ClientToken`.
 	- The IETF `httpapi` working group's draft (still an Internet-Draft) standardizes the header and recommends the `400`/`409`/`422` responses. It requires servers to publish an idempotency specification, including the expiry policy when keys expire.
 - **Failure modes → fixes:**
@@ -661,15 +720,40 @@ COMMIT;
 
 At the default `READ COMMITTED` level, a concurrent duplicate's `INSERT` waits on the unique index until the first transaction commits, then sees the conflict and replays the committed response. If the first transaction rolls back, the duplicate's insert succeeds and it does the work. There is no `in_progress` state, no 409, and nothing can get stuck.
 
-**External effects need atomic phases.** A PSP call cannot sit inside your database transaction. Brandur Leach's 2017 write-up of Stripe-style keys splits the work into phases, each a local transaction that records a **recovery point**: claim and create a local `payment` row; call the PSP; record the PSP result and complete the key. A retry that takes over a stale claim resumes from the last recovery point. The PSP call is safe to repeat only because it carries its own idempotency key.
+**External effects need atomic phases.** A PSP call cannot sit inside your database transaction.
 
-**Propagate keys downstream.** Derive the downstream key deterministically from your own durable state, for example `Idempotency-Key: pay_981` where `981` is your `payments.id`. Then a crash after the PSP charged but before you recorded it is harmless: the retry sends the same downstream key, and the PSP returns the original charge. A random key generated per attempt would charge again.
+Brandur Leach's 2017 write-up of Stripe-style keys splits the work into phases, each a local transaction that records a **recovery point**:
 
-**What to replay.** Replay deterministic outcomes, including `4xx` errors such as `402 card_declined`: a retry should not suddenly succeed because the second attempt hit a different code path. For `5xx` there are two defensible policies. Stripe replays them: the first attempt may have had partial effects, so it refuses to guess. The middleware above releases the key on `5xx`, which is correct **only** if the handler's effects are atomic (rolled back on failure) or protected by downstream keys. Pick one per endpoint and document it.
+1. Claim the key and create a local `payment` row.
+2. Call the PSP.
+3. Record the PSP result and complete the key.
 
-**Fingerprinting.** Hash the method, the path and a canonical body. Hashing raw bytes treats `{"a":1,"b":2}` and `{"b":2,"a":1}` as different requests; a client library that re-serializes on retry would hit spurious 422s. Hash the parsed, validated request (or canonical JSON) instead, and leave out volatile fields such as client timestamps or trace IDs.
+A retry that takes over a stale claim resumes from the last recovery point. The PSP call is safe to repeat only because it carries its own idempotency key.
 
-**Idempotent APIs vs idempotent consumers.** An idempotent API protects the request path: the client holds the key. An idempotent **consumer** protects message handling: the producer's `event_id` is the key, and the consumer inserts it into `processed_events` in the same transaction as the effect. Brokers and webhook senders deliver at least once, so "exactly-once" processing is at-least-once delivery plus an idempotent consumer. See [[Delivery Semantics and Exactly-Once]], [[Receiving Webhooks Idempotently]] and [[Transactional Outbox and CDC]].
+**Propagate keys downstream.** Derive the downstream key deterministically from your own durable state, for example `Idempotency-Key: pay_981` where `981` is your `payments.id`.
+
+Then a crash after the PSP charged but before you recorded it is harmless: the retry sends the same downstream key, and the PSP returns the original charge. A random key generated per attempt would charge again.
+
+**What to replay.** Replay deterministic outcomes, including `4xx` errors such as `402 card_declined`: a retry should not suddenly succeed because the second attempt hit a different code path.
+
+For `5xx` there are two defensible policies:
+
+- Stripe replays them: the first attempt may have had partial effects, so it refuses to guess.
+- The middleware above releases the key on `5xx`, which is correct **only** if the handler's effects are atomic (rolled back on failure) or protected by downstream keys.
+
+Pick one per endpoint and document it.
+
+**Fingerprinting.** Hash the method, the path and a canonical body.
+
+Hashing raw bytes treats `{"a":1,"b":2}` and `{"b":2,"a":1}` as different requests; a client library that re-serializes on retry would hit spurious 422s.
+
+Hash the parsed, validated request (or canonical JSON) instead, and leave out volatile fields such as client timestamps or trace IDs.
+
+**Idempotent APIs vs idempotent consumers.** An idempotent API protects the request path: the client holds the key.
+
+An idempotent **consumer** protects message handling: the producer's `event_id` is the key, and the consumer inserts it into `processed_events` in the same transaction as the effect.
+
+Brokers and webhook senders deliver at least once, so "exactly-once" processing is at-least-once delivery plus an idempotent consumer. See [[Delivery Semantics and Exactly-Once]], [[Receiving Webhooks Idempotently]] and [[Transactional Outbox and CDC]].
 
 **Where to use it:** payments and refunds, order creation, money transfers, sending emails and SMS, inventory reservations, webhook handlers, and any `POST` a client or gateway may retry.
 
@@ -682,7 +766,11 @@ At the default `READ COMMITTED` level, a concurrent duplicate's `INSERT` waits o
 > `PUT` replaces a resource at a URI the client chose, so repeating it writes the same state. `POST` asks the server to create or process something new, and the server cannot tell a retry from a second intent. The key carries the client's intent ("this is the same operation") across attempts.
 
 > [!question]- What is wrong with "SELECT the key; if absent, process, then INSERT the key"?
-> Two concurrent retries both see "absent" and both process: the classic check-then-act race. Claim first with an atomic `INSERT … ON CONFLICT DO NOTHING` on a unique `(scope, key)`; only the request whose insert wins does the work. In my test, 50 concurrent retries charged between 17 and 50 times with check-then-insert (it varies run to run) and exactly once with the atomic claim.
+> Two concurrent retries both see "absent" and both process: the classic check-then-act race.
+>
+> Claim first with an atomic `INSERT … ON CONFLICT DO NOTHING` on a unique `(scope, key)`; only the request whose insert wins does the work.
+>
+> In my test, 50 concurrent retries charged between 17 and 50 times with check-then-insert (it varies run to run) and exactly once with the atomic claim.
 
 > [!question]- A retry arrives while the first attempt is still running. What do you return?
 > `409 Conflict` with `Retry-After` (Stripe and the IETF draft both use 409); the client retries shortly and then gets the replayed result. Alternatively, block until the first attempt finishes, which is what an in-transaction claim does for free.
@@ -711,3 +799,8 @@ At the default `READ COMMITTED` level, a concurrent duplicate's `INSERT` waits o
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Timeouts, Retries and Backoff]], [[Transactions and ACID]]
 - **Next:** [[Webhooks - Sending and Receiving]], [[Delivery Semantics and Exactly-Once]], [[Receiving Webhooks Idempotently]] (the Go service side), [[Case Study - Payment System]]
 - **Compare with:** [[Locking - Optimistic vs Pessimistic]] (conditional updates), [[Distributed Locks and Fencing Tokens]] (the `locked_at` fence), [[Transactional Outbox and CDC]] (making the effect and the message atomic)
+
+### Watch on YouTube
+
+- [What Is Idempotency? Idempotency Keys, Deduplication & Retries Explained](https://www.youtube.com/watch?v=jfHBrweuKRA) · The Right Trade-off · covers idempotency keys, dedup and retries together, matching the note's scope
+- [What is API Idempotency and Why Is It Important?](https://www.youtube.com/watch?v=I08syTslan8) · Be A Better Dev · basic intro on why idempotency matters for retried writes

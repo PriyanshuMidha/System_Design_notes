@@ -10,7 +10,7 @@ sources:
   - "RFC 6298, Computing TCP's Retransmission Timer"
   - "RFC 9293, Transmission Control Protocol (STD 7, obsoletes RFC 793)"
   - "Cardwell et al., BBR: Congestion-Based Congestion Control (ACM Queue, 2016)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # TCP - Handshake, Reliability, Flow and Congestion Control
@@ -24,17 +24,68 @@ updated: 2026-11-09
 > - Flow control (the receiver's window) stops a fast sender from overrunning a slow receiver; congestion control (the sender's `cwnd`) stops the sender from overrunning the network itself.
 > - Classic mistake: treating TCP as if it sends "messages". It sends a byte stream — one `write()` can arrive as several reads, or several writes can arrive as one read.
 
+## Start here: the basics
+
+**The problem in one story.**
+You send a friend a 50-page document, but the post office only takes postcards.
+You cut it into 500 postcards and mail them.
+Some get lost, some arrive twice, and they show up in random order.
+TCP is the system of numbering postcards, asking "which ones did you get?", and resending the missing ones, so your friend reads the pages in the right order.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Packet / segment | One small chunk of data sent over the network | ~1,460 bytes of a web page |
+| IP | The layer that moves packets between machines, with no promises | A packet may get dropped |
+| Port | A number naming one program on a machine | HTTPS server listens on 443 |
+| Socket | The OS object a program uses to send and receive on a connection | `net.Conn` in Go |
+| ACK | A message saying "I got data up to here" | "ACK 5001" = bytes 1-5000 arrived |
+| RTT | Round-trip time: send something and get the reply | 40ms Mumbai to Singapore |
+| Buffer | Memory where received bytes wait to be read | Kernel receive buffer of 128 KB |
+| Window | How many bytes may be sent before waiting for an ACK | 64 KB in flight |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App1["Sender app<br/>writes bytes"] --> T1["TCP: number bytes,<br/>cut into segments"]
+    T1 --> Net["Network (IP):<br/>may drop or reorder"]
+    Net --> T2["TCP: reorder,<br/>send ACKs"]
+    T2 --> App2["Receiver app<br/>reads bytes in order"]
+    T2 -. "ACK / missing data" .-> T1
+```
+
+**Analogy.** A phone call where the listener keeps saying "got it up to page 12" and "slow down, my notebook is full", and the speaker repeats anything not confirmed.
+Where it breaks: a real speaker repeats a sentence once you ask; TCP never hears "I missed it", it only notices the confirmation is late or repeated, and resends.
+
+**How the rest of this note builds up**
+
+- First, why TCP exists on top of IP (section 1) and the running-tally mental model (section 2).
+- Then how it works: the 3-way handshake, the close and `TIME_WAIT`, ACKs and retransmission, flow control, and congestion control (section 3).
+- Then a measured Go example and variants like CUBIC, BBR, Nagle and keepalives (sections 4-5).
+- Finally the SDE-3 material: trade-offs, production debugging with `ss`, and the deep dive on SACK, slow start, BBR and PMTU (sections 6-8).
+
+> [!tip] Remember
+> TCP numbers every byte, waits for ACKs, resends what is missing, and limits how much is in flight so neither the receiver nor the network gets flooded.
+
 ## 1. Why it exists
 
 IP alone promises nothing: a packet (an IP datagram) can be dropped, duplicated, or delivered out of order, and IP has no idea what "a connection" even is. An application that wants to send a file reliably over that would have to invent its own sequence numbers, timeouts, and retransmission from scratch.
 
-TCP (RFC 793, updated by RFC 9293) is the standard library for that problem. It sits between IP and the application and gives every byte stream three guarantees IP doesn't: **reliable delivery** (lost segments are retransmitted), **ordering** (bytes are delivered in the order they were sent, even if packets arrive out of order), and **flow control** (a fast sender can't flood a slow receiver's buffer). A fourth mechanism, **congestion control**, isn't a guarantee to the application at all — it protects the network from the senders using it.
+TCP (RFC 793, updated by RFC 9293) is the standard library for that problem.
+
+It sits between IP and the application and gives every byte stream three guarantees IP doesn't: **reliable delivery** (lost segments are retransmitted), **ordering** (bytes are delivered in the order they were sent, even if packets arrive out of order), and **flow control** (a fast sender can't flood a slow receiver's buffer).
+
+A fourth mechanism, **congestion control**, isn't a guarantee to the application at all — it protects the network from the senders using it.
 
 Concretely: a client opens a connection to port 443, the OS allocates a socket, and from then on `conn.Write([]byte("GET / HTTP/1.1..."))` either arrives at the other end byte-for-byte and in order, or the connection is torn down with an error. Everything below makes that promise hold over a network that reorders, drops, and duplicates packets.
 
 ## 2. Mental model
 
-Think of TCP as a conversation with a running tally, not a stack of labeled parcels. Each side keeps a mental counter: "the other side has told me they've sent and received up through byte N." A segment doesn't say "this is parcel 7"; it says "this segment starts at byte 1,460,001, and by the way, I've received everything up to byte 980,000 from you."
+Think of TCP as a conversation with a running tally, not a stack of labeled parcels.
+
+Each side keeps a mental counter: "the other side has told me they've sent and received up through byte N." A segment doesn't say "this is parcel 7"; it says "this segment starts at byte 1,460,001, and by the way, I've received everything up to byte 980,000 from you."
 
 Two windows ride alongside that tally:
 
@@ -89,7 +140,9 @@ sequenceDiagram
     Note over A: A closes after the TIME_WAIT timer expires
 ```
 
-The side that sends the **last ACK** (the active closer) parks in `TIME_WAIT` for twice the maximum segment lifetime (2×MSL, commonly 60s on Linux), not out of caution but for two concrete reasons: a duplicate, delayed FIN from the peer must still find a socket there to re-ACK, and a late-arriving duplicate segment from this connection must expire before the same 4-tuple (source IP, source port, dest IP, dest port) can be reused. A busy server making many outbound connections (or closing many client connections) can exhaust ephemeral ports or the OS's bookkeeping table if TIME_WAIT sockets pile up — the standard fix is `SO_REUSEADDR` plus not treating a closed load balancer connection as free to instantly reopen, or using connection pooling so sockets stay ESTABLISHED instead of churning.
+The side that sends the **last ACK** (the active closer) parks in `TIME_WAIT` for twice the maximum segment lifetime (2×MSL, commonly 60s on Linux), not out of caution but for two concrete reasons: a duplicate, delayed FIN from the peer must still find a socket there to re-ACK, and a late-arriving duplicate segment from this connection must expire before the same 4-tuple (source IP, source port, dest IP, dest port) can be reused.
+
+A busy server making many outbound connections (or closing many client connections) can exhaust ephemeral ports or the OS's bookkeeping table if TIME_WAIT sockets pile up — the standard fix is `SO_REUSEADDR` plus not treating a closed load balancer connection as free to instantly reopen, or using connection pooling so sockets stay ESTABLISHED instead of churning.
 
 ```mermaid
 stateDiagram-v2
@@ -112,13 +165,17 @@ stateDiagram-v2
 
 ### Reliability: sequence numbers, ACKs and retransmission
 
-Every byte sent has a sequence number; every ACK carries the next byte the receiver expects (a **cumulative** ACK — "I have everything up to here," not "I have this specific segment"). Modern stacks also use **SACK** (selective acknowledgment, RFC 2018) so a receiver can report non-contiguous ranges it has ("I have 1000–1999 and 3000–3999, still missing 2000–2999"), letting the sender retransmit only the actual gap instead of everything after it.
+Every byte sent has a sequence number; every ACK carries the next byte the receiver expects (a **cumulative** ACK — "I have everything up to here," not "I have this specific segment").
+
+Modern stacks also use **SACK** (selective acknowledgment, RFC 2018) so a receiver can report non-contiguous ranges it has ("I have 1000–1999 and 3000–3999, still missing 2000–2999"), letting the sender retransmit only the actual gap instead of everything after it.
 
 A segment is retransmitted when either:
 - The **retransmission timer (RTO)** fires before its ACK arrives. RTO is computed from the measured round-trip time and its variance (RFC 6298: `RTO = SRTT + 4×RTTVAR`, with a minimum floor), not a fixed number — a cross-region connection with 150ms RTT needs a much longer RTO than one on a LAN.
 - **Three duplicate ACKs** arrive for the same byte (the receiver is saying "I keep getting new data but still only have up to byte X") — this triggers **fast retransmit** without waiting for the slower RTO timer.
 
-**Example, with numbers:** say the measured `SRTT` (smoothed round-trip time) is 40ms and `RTTVAR` (its mean deviation) is 10ms. RFC 6298's formula gives `RTO = 40 + 4×10 = 80ms`. If an ACK for a sent segment hasn't arrived within 80ms, the sender assumes it was lost and retransmits — without ever seeing a negative acknowledgment, because TCP has none; absence of an ACK within the deadline *is* the loss signal.
+**Example, with numbers:** say the measured `SRTT` (smoothed round-trip time) is 40ms and `RTTVAR` (its mean deviation) is 10ms. RFC 6298's formula gives `RTO = 40 + 4×10 = 80ms`.
+
+If an ACK for a sent segment hasn't arrived within 80ms, the sender assumes it was lost and retransmits — without ever seeing a negative acknowledgment, because TCP has none; absence of an ACK within the deadline *is* the loss signal.
 
 > [!warning] Common mistake
 > Assuming TCP's ACK means "I received segment N specifically." A plain ACK is **cumulative** — "I have everything up through this byte" — so it says nothing about which specific segment just arrived. Only SACK (selective acknowledgment) reports specific non-contiguous ranges; without it, a sender re-learns the exact gap by watching duplicate ACKs pile up, not by being told directly.
@@ -128,7 +185,9 @@ A segment is retransmitted when either:
 
 ### Flow control: the sliding window
 
-The receiver advertises a **window size** in every ACK: how many more bytes past the ACKed point it can currently buffer. The sender may have at most that many unacknowledged bytes in flight. As the receiver's application reads data out of its buffer, the window grows back (a "window update"); if the receiver's buffer fills (a slow consumer), the window shrinks toward zero, and at zero the sender must stop and periodically probe with a 1-byte **zero-window probe** until room reopens.
+The receiver advertises a **window size** in every ACK: how many more bytes past the ACKed point it can currently buffer. The sender may have at most that many unacknowledged bytes in flight.
+
+As the receiver's application reads data out of its buffer, the window grows back (a "window update"); if the receiver's buffer fills (a slow consumer), the window shrinks toward zero, and at zero the sender must stop and periodically probe with a 1-byte **zero-window probe** until room reopens.
 
 ```mermaid
 flowchart LR
@@ -151,9 +210,15 @@ Flow control alone would let a sender on a fast LAN flood a congested link to a 
 
 **CUBIC** (Linux's default since 2.6.19) replaces the linear congestion-avoidance growth with a cubic function of time since the last loss: it grows fast right after a loss, flattens near the previous loss point (where congestion is expected), then grows faster again if no new loss happens — better suited to high-bandwidth, high-latency ("long fat") networks than plain Reno's slow linear climb.
 
-**BBR** (Google, used inside Linux and GCP/YouTube paths) rejects "wait for a packet loss" entirely. Loss-based control treats every dropped packet as a congestion signal, which is a poor fit for networks where buffers are large (**bufferbloat**: packets queue for hundreds of milliseconds before anything drops) or where loss is just noise (lossy Wi-Fi, satellite links). BBR instead continuously models two numbers — the bottleneck's delivery rate and the path's minimum RTT — and paces `cwnd` and sending rate from that model, probing periodically for more bandwidth and for a lower RTT, rather than only backing off after loss.
+**BBR** (Google, used inside Linux and GCP/YouTube paths) rejects "wait for a packet loss" entirely.
 
-**Example, with numbers:** a Reno-style sender starts at `cwnd = 1` segment with `ssthresh = 64`. Each RTT in slow start doubles `cwnd`: 1 → 2 → 4 → 8 → 16 → 32 → 64. At `cwnd = 64` it has reached `ssthresh`, so the next RTT switches to congestion avoidance and only adds 1: `cwnd = 65`, then 66, then 67 — one additional segment's worth of data per round trip from then on, until a loss resets the cycle.
+Loss-based control treats every dropped packet as a congestion signal, which is a poor fit for networks where buffers are large (**bufferbloat**: packets queue for hundreds of milliseconds before anything drops) or where loss is just noise (lossy Wi-Fi, satellite links).
+
+BBR instead continuously models two numbers — the bottleneck's delivery rate and the path's minimum RTT — and paces `cwnd` and sending rate from that model, probing periodically for more bandwidth and for a lower RTT, rather than only backing off after loss.
+
+**Example, with numbers:** a Reno-style sender starts at `cwnd = 1` segment with `ssthresh = 64`. Each RTT in slow start doubles `cwnd`: 1 → 2 → 4 → 8 → 16 → 32 → 64.
+
+At `cwnd = 64` it has reached `ssthresh`, so the next RTT switches to congestion avoidance and only adds 1: `cwnd = 65`, then 66, then 67 — one additional segment's worth of data per round trip from then on, until a loss resets the cycle.
 
 ```mermaid
 flowchart LR
@@ -171,15 +236,25 @@ flowchart LR
 
 ### Nagle's algorithm and `TCP_NODELAY`
 
-Nagle's algorithm (RFC 896) batches small writes: if there's unacknowledged data already in flight, a new small write is held and coalesced with the next one instead of sent as its own tiny segment, trading a little latency for fewer, bigger packets. Combined with **delayed ACKs** (an ACK is held up to ~40–500ms hoping to piggyback on a reply) the two can stack to add real latency to small request/response exchanges — a known anti-pattern for latency-sensitive protocols. `conn.SetNoDelay(true)` (Go) or `setsockopt(TCP_NODELAY)` disables Nagle so small writes go out immediately; interactive and RPC-style protocols (HTTP, Redis, gRPC) typically want this.
+Nagle's algorithm (RFC 896) batches small writes: if there's unacknowledged data already in flight, a new small write is held and coalesced with the next one instead of sent as its own tiny segment, trading a little latency for fewer, bigger packets.
+
+Combined with **delayed ACKs** (an ACK is held up to ~40–500ms hoping to piggyback on a reply) the two can stack to add real latency to small request/response exchanges — a known anti-pattern for latency-sensitive protocols.
+
+`conn.SetNoDelay(true)` (Go) or `setsockopt(TCP_NODELAY)` disables Nagle so small writes go out immediately; interactive and RPC-style protocols (HTTP, Redis, gRPC) typically want this.
 
 ### Keepalive
 
-Without a keepalive, a TCP connection sitting idle looks identical whether the peer is fine, crashed, or on a NAT'd network path that silently dropped the mapping — nobody sends anything, so nobody notices. `SO_KEEPALIVE` makes the OS send periodic empty probes after an idle period (the standard Go default effectively disables tuning this per-connection before 1.23's `net.Dialer.KeepAliveConfig`, which exposes idle time, interval and retry count directly); no reply after the configured retries closes the connection. This is a transport-level heartbeat — it says nothing about whether the application is still healthy, only whether the peer still ACKs.
+Without a keepalive, a TCP connection sitting idle looks identical whether the peer is fine, crashed, or on a NAT'd network path that silently dropped the mapping — nobody sends anything, so nobody notices.
+
+`SO_KEEPALIVE` makes the OS send periodic empty probes after an idle period (the standard Go default effectively disables tuning this per-connection before 1.23's `net.Dialer.KeepAliveConfig`, which exposes idle time, interval and retry count directly); no reply after the configured retries closes the connection.
+
+This is a transport-level heartbeat — it says nothing about whether the application is still healthy, only whether the peer still ACKs.
 
 ### Head-of-line blocking at the TCP layer
 
-TCP's ordering guarantee is also its cost: the receiving application cannot read byte 10,000 until byte 9,999 has arrived, even if 10,000 showed up first. One lost segment stalls *every* stream multiplexed on top of that one connection — this is exactly why HTTP/2, which multiplexes many requests over a single TCP connection, can have one slow request stall every other request behind a single lost packet (see [[UDP and QUIC]] for the fix QUIC applies by moving streams below TCP's single ordered byte stream).
+TCP's ordering guarantee is also its cost: the receiving application cannot read byte 10,000 until byte 9,999 has arrived, even if 10,000 showed up first.
+
+One lost segment stalls *every* stream multiplexed on top of that one connection — this is exactly why HTTP/2, which multiplexes many requests over a single TCP connection, can have one slow request stall every other request behind a single lost packet (see [[UDP and QUIC]] for the fix QUIC applies by moving streams below TCP's single ordered byte stream).
 
 ## 4. Worked example
 
@@ -219,7 +294,9 @@ sequenceDiagram
 
 Runnable Go version: [[TCP - Handshake, Reliability, Flow and Congestion Control - Go]].
 
-**Measured** on this machine (Go 1.24.4, darwin/arm64, loopback, `go test -race`, 2026-11-09): a full connect + write + echo + read round trip over `127.0.0.1` took **331µs**. That single number already contains one full 3-way handshake (hidden inside `net.Dial`) plus one data round trip — on a real cross-region link the handshake alone would cost one RTT (tens of milliseconds) before any data moves at all.
+**Measured** on this machine (Go 1.24.4, darwin/arm64, loopback, `go test -race`, 2026-11-09): a full connect + write + echo + read round trip over `127.0.0.1` took **331µs**.
+
+That single number already contains one full 3-way handshake (hidden inside `net.Dial`) plus one data round trip — on a real cross-region link the handshake alone would cost one RTT (tens of milliseconds) before any data moves at all.
 
 **Representative output (Linux, `ss` from iproute2)** — inspecting an established connection's congestion-control state (illustrative values, not from a live capture):
 
@@ -264,10 +341,18 @@ Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segmen
 
 ## 8. Deep dive
 
-- **Why `ack` is cumulative, not selective, by default.** A single number ("everything up to here") is cheap to generate and process, but it means one lost segment in the middle of a burst makes every later segment look "out of order" until the gap is filled, even if they all arrived fine. SACK (RFC 2018) is the patch: it rides alongside the cumulative ACK as extra TCP options and tells the sender exactly which non-contiguous ranges already arrived, so retransmission targets only the real gap.
-- **Why slow start is exponential, not linear, at the start.** An unused connection has zero information about the path's capacity; doubling `cwnd` every RTT finds the right order of magnitude in `O(log(capacity))` round trips instead of `O(capacity)` — a few RTTs instead of potentially thousands. The cost is that slow start can itself cause the first loss, which is exactly why `ssthresh` exists: it remembers roughly where the last loss happened, so a connection that disconnects and reconnects (or recovers from a single loss) doesn't have to re-discover capacity from scratch.
-- **Why BBR doesn't wait for loss.** Over a path with deep buffers, by the time a packet actually drops, the sender has already been overshooting the real bottleneck rate for a while — the buffer was simply absorbing the overshoot, adding queuing delay the whole time. BBR's bandwidth-delay-product model targets "as much data in flight as the pipe can hold," not "as much as the deepest buffer on the path can hold," which keeps queueing delay low even though it never needs a packet to actually drop.
-- **Nagle × delayed ACK interaction.** If both sides use their defaults, a small request can stall waiting for Nagle to release it (held because data is still "in flight"), while the reply's ACK is simultaneously held by delayed-ACK on the other side waiting to piggyback — the two timers can compound into tens to hundreds of milliseconds of pure protocol latency on an otherwise idle, fast link. This is specifically a request/response latency problem, not a throughput one; bulk transfers are barely affected since Nagle only holds data when there's already unacknowledged data in flight.
+- **Why `ack` is cumulative, not selective, by default.** A single number ("everything up to here") is cheap to generate and process, but it means one lost segment in the middle of a burst makes every later segment look "out of order" until the gap is filled, even if they all arrived fine.
+
+  SACK (RFC 2018) is the patch: it rides alongside the cumulative ACK as extra TCP options and tells the sender exactly which non-contiguous ranges already arrived, so retransmission targets only the real gap.
+- **Why slow start is exponential, not linear, at the start.** An unused connection has zero information about the path's capacity; doubling `cwnd` every RTT finds the right order of magnitude in `O(log(capacity))` round trips instead of `O(capacity)` — a few RTTs instead of potentially thousands.
+
+  The cost is that slow start can itself cause the first loss, which is exactly why `ssthresh` exists: it remembers roughly where the last loss happened, so a connection that disconnects and reconnects (or recovers from a single loss) doesn't have to re-discover capacity from scratch.
+- **Why BBR doesn't wait for loss.** Over a path with deep buffers, by the time a packet actually drops, the sender has already been overshooting the real bottleneck rate for a while — the buffer was simply absorbing the overshoot, adding queuing delay the whole time.
+
+  BBR's bandwidth-delay-product model targets "as much data in flight as the pipe can hold," not "as much as the deepest buffer on the path can hold," which keeps queueing delay low even though it never needs a packet to actually drop.
+- **Nagle × delayed ACK interaction.** If both sides use their defaults, a small request can stall waiting for Nagle to release it (held because data is still "in flight"), while the reply's ACK is simultaneously held by delayed-ACK on the other side waiting to piggyback — the two timers can compound into tens to hundreds of milliseconds of pure protocol latency on an otherwise idle, fast link.
+
+  This is specifically a request/response latency problem, not a throughput one; bulk transfers are barely affected since Nagle only holds data when there's already unacknowledged data in flight.
 - **MSS and PMTU.** The maximum segment size is negotiated at handshake time from each side's MTU, but a smaller MTU somewhere mid-path (a VPN, a tunnel) isn't visible at handshake time; Path MTU Discovery (sending with the "don't fragment" bit and backing off on an ICMP "too big" reply) exists to catch that after the fact, and its absence from a network path is a classic silent cause of connections that hang on anything but tiny payloads.
 
 ## 9. Interview questions
@@ -311,3 +396,9 @@ Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segmen
 - **Next:** [[UDP and QUIC]], [[TLS and HTTPS]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Compare with:** [[Forward and Reverse Proxies - L4 vs L7]] (an L4 proxy operates at exactly this layer), [[Network Debugging Toolkit - dig, curl, ss, tcpdump]] (reading `ss`/`tcpdump` output for a real connection)
 - **Code:** [[TCP - Handshake, Reliability, Flow and Congestion Control - Go]]
+
+### Watch on YouTube
+
+- [TCP 3-Way Handshake Explained / SYN, SYN-ACK, ACK + Practical Wireshark Lab](https://www.youtube.com/watch?v=V9wj1NiErUY) · Singh IT Concepts · visual + packet-capture walkthrough of the 3-way handshake and 4-way close
+- [TCP Flow Control & Connection Mgmt - Transport Layer / Computer Networks Ep. 3.5.5 / Kurose & Ross](https://www.youtube.com/watch?v=iPXaMBu_OLk) · Epic Networks Lab · explains the receiver-window flow control piece in depth
+- [TCP Congestion Control](https://www.youtube.com/watch?v=kRS4J-m5n04) · Anand Seetharam · dedicated deep dive on cwnd/congestion control distinct from flow control

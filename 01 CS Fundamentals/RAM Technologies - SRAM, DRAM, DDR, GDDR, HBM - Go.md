@@ -10,13 +10,21 @@ sources:
   - "JEDEC JESD250E (GDDR6 SGRAM standard); JEDEC HBM3 (JESD238) standard"
   - "Hennessy & Patterson, Computer Architecture: A Quantitative Approach, 6th ed., ch. 2, appendix B (memory technology)"
   - "Micron and Samsung DDR5/HBM3 technical datasheets and whitepapers"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM - Go
 
 > [!summary] TL;DR
 > Runnable code for [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]: a `GOMEMLIMIT` capacity-planning helper that turns a container's DRAM budget into a safe Go soft-memory-limit, with table-driven tests covering the normal cases and every invalid input.
+
+## Before the code
+
+- **Packages:** `memlimit` is a plain Go package; `fmt.Errorf` builds the error values it returns.
+- **Multiple return values:** `ForContainer` returns `(int64, error)`; callers check `err` before using the number.
+- **`int64` arithmetic:** byte counts use `int64`, and `512 << 20` is a shift meaning 512 × 2^20 bytes (512 MiB).
+- **Table-driven tests:** a slice of anonymous structs lists cases; `t.Run` runs each as a named subtest.
+- **What to run:** `go vet ./... && go test -race ./...` from the module root.
 
 ## What this code shows
 
@@ -43,7 +51,11 @@ flowchart LR
 
 ### Step 1: computing a safe GOMEMLIMIT
 
-**Concept.** The theory note's worked example argues that `GOGC` alone can't prevent an OOM kill in a memory-constrained container, because `GOGC` paces off live-heap growth with no absolute ceiling ([[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM#Tracing the capacity-planning decision, step by step]]). `ForContainer` is the smallest possible function that turns "this container has N bytes of DRAM" into "set `GOMEMLIMIT` to this many bytes, with headroom reserved for the Go runtime's own overhead and the OS." The alternative — hardcoding a fixed byte value per deployment — breaks the moment the container's memory request changes; computing it as a percentage of whatever limit the container actually has keeps the headroom proportional.
+**Concept.** The theory note's worked example argues that `GOGC` alone can't prevent an OOM kill in a memory-constrained container, because `GOGC` paces off live-heap growth with no absolute ceiling ([[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM#Tracing the capacity-planning decision, step by step]]).
+
+`ForContainer` is the smallest possible function that turns "this container has N bytes of DRAM" into "set `GOMEMLIMIT` to this many bytes, with headroom reserved for the Go runtime's own overhead and the OS."
+
+The alternative — hardcoding a fixed byte value per deployment — breaks the moment the container's memory request changes; computing it as a percentage of whatever limit the container actually has keeps the headroom proportional.
 
 ```go
 // Package memlimit picks a conservative GOMEMLIMIT for a container, leaving
@@ -93,7 +105,9 @@ func ForContainer(containerBytes int64, headroomPct int) (int64, error) {
 
 ### Test: ForContainer across normal and invalid inputs
 
-**Property.** Valid inputs must produce the exact expected byte count; every invalid input class (non-positive container size, headroom at or above 100%, negative headroom) must produce an error rather than a number, so that a caller can never accidentally pass a nonsensical `GOMEMLIMIT` downstream.
+**Property.** Valid inputs must produce the exact expected byte count; every invalid input class (non-positive container size, headroom at or above 100%, negative headroom) must produce an error rather than a number.
+
+That way a caller can never accidentally pass a nonsensical `GOMEMLIMIT` downstream.
 
 | Case | Input (bytes, headroom%) | Expected |
 | --- | --- | --- |
@@ -172,13 +186,17 @@ go vet ./... && go test -race ./...
 ok  	cs1scratch/memlimit	1.224s
 ```
 
-**Reading the output.** All five subtests (two valid cases, three invalid ones) pass under the race detector, which here mostly confirms there is nothing to race on: `ForContainer` is a pure function with no shared mutable state, so the race detector's clean pass is really a statement about the test harness rather than about the arithmetic itself.
+**Reading the output.** All five subtests (two valid cases, three invalid ones) pass under the race detector.
+
+That mostly confirms there is nothing to race on: `ForContainer` is a pure function with no shared mutable state, so the race detector's clean pass is really a statement about the test harness rather than about the arithmetic itself.
 
 ## Pitfalls in the code
 
 - **`headroomPct` is an `int`, not a `float64`.** Only whole-percent headroom values are supported; a caller wanting "12.5% headroom" would need to pre-convert that into an equivalent byte-based call instead, since this function has no fractional-percent path.
-- **No upper bound on how small `usable` can be and still be "valid."** A `headroomPct` of 99 on a tiny `containerBytes` could return a technically positive but practically useless `GOMEMLIMIT` of a few bytes; the function trusts the caller to pass a sensible headroom for their container size rather than second-guessing what counts as "too small to be useful."
-- **The function has no knowledge of `runtime.NumCPU()` or any other runtime fact.** It is a pure arithmetic helper; wiring its result into `debug.SetMemoryLimit` at process start-up is left to the caller, intentionally, so this function stays trivially testable without touching real runtime state.
+- **No upper bound on how small `usable` can be and still be "valid."** A `headroomPct` of 99 on a tiny `containerBytes` could return a technically positive but practically useless `GOMEMLIMIT` of a few bytes.
+  The function trusts the caller to pass a sensible headroom for their container size rather than second-guessing what counts as "too small to be useful."
+- **The function has no knowledge of `runtime.NumCPU()` or any other runtime fact.** It is a pure arithmetic helper.
+  Wiring its result into `debug.SetMemoryLimit` at process start-up is left to the caller, intentionally, so this function stays trivially testable without touching real runtime state.
 
 ## Exercises
 

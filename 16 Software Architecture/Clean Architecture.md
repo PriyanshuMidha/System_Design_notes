@@ -7,7 +7,7 @@ related: ["[[SOLID in Go]]", "[[Service Project Layout and Wiring]]", "[[Capston
 sources:
   - "Robert C. Martin, The Clean Architecture (blog post, 2012) and Clean Architecture: A Craftsman's Guide to Software Structure and Design (2017)"
   - "Jeffrey Palermo, The Onion Architecture (blog series, 2008)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Clean Architecture
@@ -36,15 +36,65 @@ flowchart LR
 
 The controller calls the use case; the use case calls the entity to enforce invariants, calls `Repo` to persist, and reports the outcome through a presenter port — never returning raw domain data to the controller directly.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your invoice rules live inside an HTTP handler.
+Now a nightly job must create invoices too.
+You either copy the rules or call the HTTP handler from a cron job.
+Clean Architecture puts the rules in the middle, where both can reach them.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Business rule | A rule the business cares about, no matter the tech | "Amount must be above zero" |
+| Entity | A core business object that enforces its own rules | `domain.Invoice` |
+| Use case | One thing the app does for a user | `CreateInvoice.Execute` |
+| Adapter | Code that translates between the outside world and your app | HTTP controller, Postgres repo |
+| Port | An interface the inner code declares for what it needs | `usecase.Repo` |
+| DTO | A plain data struct for crossing a boundary | `CreateInvoiceInput{Amount: 500}` |
+| Presenter | Code that turns a use case result into output | Writes JSON and a 201 status |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    FW["Frameworks & drivers<br/>(net/http, Postgres)"] --> AD["Interface adapters<br/>(controller, repo)"]
+    AD --> UC["Use cases<br/>(CreateInvoice)"]
+    UC --> EN["Entities<br/>(Invoice)"]
+```
+
+All arrows point inward: outer rings know inner rings, never the reverse.
+
+**Analogy.** An onion: you can peel and replace the outer skin (web framework, database) and the core stays the same.
+Where it breaks: onion layers do not talk; here outer rings call inward and inner rings reach outward only through interfaces they own.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the four rings plus the Dependency Rule (section 2).
+- Then ports, DTOs, presenters and error mapping (section 3), with a full Go worked example (section 4).
+- Then how it compares with hexagonal and onion architecture (section 5), and when it is overkill (section 6).
+- Finally the SDE-3 deep dive: production layouts, enforcing the rule, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Dependencies only point inward; the business rules never know about HTTP or SQL.
+
 ## 1. Why it exists
 
-A `CreateInvoice` handler that builds a `*sql.Invoice` struct straight from `r.Body`, inserts it, and serializes the same struct back as JSON works fine until three things happen at once, which they eventually do: the API needs a field the database doesn't have yet (a computed due-date label), a second entry point (an internal gRPC call from the reminders worker) needs to create invoices too, and the business rule "an invoice amount must be positive" needs to be enforced regardless of which entry point created it. Without a boundary, that rule either gets duplicated in both entry points or gets left in the database as a `CHECK` constraint that only produces a confusing SQL error instead of a clean validation message.
+A `CreateInvoice` handler that builds a `*sql.Invoice` struct straight from `r.Body`, inserts it, and serializes the same struct back as JSON works fine until three things happen at once, which they eventually do: the API needs a field the database doesn't have yet (a computed due-date label), a second entry point (an internal gRPC call from the reminders worker) needs to create invoices too, and the business rule "an invoice amount must be positive" needs to be enforced regardless of which entry point created it.
+
+Without a boundary, that rule either gets duplicated in both entry points or gets left in the database as a `CHECK` constraint that only produces a confusing SQL error instead of a clean validation message.
 
 Clean Architecture's answer is structural: put the rule inside an **entity** that cannot be constructed in an invalid state (`domain.NewInvoice` returns an error instead of letting a bad `Invoice` exist), put the operation inside a **use case** that any entry point can call the same way, and make every entry point (HTTP, gRPC, a test) talk to the use case through the same input and output boundary — never by reaching into the entity's internals or the database row's shape directly.
 
 ## 2. Mental model
 
-Four rings, drawn as circles, not a stack: **entities** in the center, **use cases** around them, **interface adapters** around that, **frameworks & drivers** on the outside. The rule is not "upper calls lower" (that's [[Layered Architecture]]'s mental model) — it's "nothing inside may know an outside ring exists." An entity has never heard of a use case. A use case has never heard of HTTP or SQL. An interface adapter (a controller, a presenter, a repository implementation) has heard of exactly one outer thing (its framework) and exactly one inner thing (the use case's ports) — it is the translation layer, by design, and nothing else gets to skip it.
+Four rings, drawn as circles, not a stack: **entities** in the center, **use cases** around them, **interface adapters** around that, **frameworks & drivers** on the outside. The rule is not "upper calls lower" (that's [[Layered Architecture]]'s mental model) — it's "nothing inside may know an outside ring exists."
+
+An entity has never heard of a use case. A use case has never heard of HTTP or SQL.
+
+An interface adapter (a controller, a presenter, a repository implementation) has heard of exactly one outer thing (its framework) and exactly one inner thing (the use case's ports) — it is the translation layer, by design, and nothing else gets to skip it.
 
 Where this differs from hexagonal's single core/port/adapter split: Clean Architecture subdivides "the inside" into two named rings (entities and use cases) specifically so that enterprise-wide rules (an invoice can't have a negative amount, true in any application that has invoices) are separated from application-specific rules (an invoice becomes payment_failed after a declined charge — specific to this app's workflow, not a universal fact about invoices).
 
@@ -85,11 +135,17 @@ The dashed "implements" arrows are the Dependency Rule made visible: `adapter/po
 
 ### Crossing a boundary: input ports, output ports, DTOs
 
-A use case is called through an **input port** — in Go, simply its exported `Execute` method, taking a plain input struct with no JSON tags and no framework type in sight. It reports its result through an **output port** — an interface the use case declares (`CreateInvoicePresenter` below), implemented by whichever adapter actually needs the result (a JSON presenter, a template renderer, a test's recording fake). The use case never returns a `domain.Invoice` directly to its caller, and never accepts an `http.Request`: both directions cross the boundary as a plain DTO the use case itself defines.
+A use case is called through an **input port** — in Go, simply its exported `Execute` method, taking a plain input struct with no JSON tags and no framework type in sight.
+
+It reports its result through an **output port** — an interface the use case declares (`CreateInvoicePresenter` below), implemented by whichever adapter actually needs the result (a JSON presenter, a template renderer, a test's recording fake).
+
+The use case never returns a `domain.Invoice` directly to its caller, and never accepts an `http.Request`: both directions cross the boundary as a plain DTO the use case itself defines.
 
 ### Error mapping across the boundary
 
-A `domain.ErrInvalidAmount` means nothing to an HTTP client; it needs to become a 400. A `postgres.ErrNotFound` needs to become a 404. That translation happens in exactly one place — the presenter, in `adapter/http` — using `errors.Is` against the domain and adapter packages' exported sentinel errors. The use case itself never imports `net/http`, so it cannot (and must not) decide what status code anything maps to; it only ever calls `PresentError(err)` and lets the ring outside it decide what that means in that ring's vocabulary.
+A `domain.ErrInvalidAmount` means nothing to an HTTP client; it needs to become a 400. A `postgres.ErrNotFound` needs to become a 404. That translation happens in exactly one place — the presenter, in `adapter/http` — using `errors.Is` against the domain and adapter packages' exported sentinel errors.
+
+The use case itself never imports `net/http`, so it cannot (and must not) decide what status code anything maps to; it only ever calls `PresentError(err)` and lets the ring outside it decide what that means in that ring's vocabulary.
 
 ### Go layout
 
@@ -103,7 +159,9 @@ clean/
   cmd/                 # frameworks & drivers: the composition root (Wire)
 ```
 
-Each folder is one ring. `domain` imports nothing in this module. `usecase` imports only `domain`. `adapter/*` imports `usecase` (and `domain`'s exported errors, for mapping) but never each other. `cmd` is the only package that imports every concrete type and wires them together — the same composition-root role [[Service Project Layout and Wiring]] gives `main.go` for an ordinary layered or hexagonal service.
+Each folder is one ring. `domain` imports nothing in this module. `usecase` imports only `domain`.
+
+`adapter/*` imports `usecase` (and `domain`'s exported errors, for mapping) but never each other. `cmd` is the only package that imports every concrete type and wires them together — the same composition-root role [[Service Project Layout and Wiring]] gives `main.go` for an ordinary layered or hexagonal service.
 
 ## 4. Worked example
 
@@ -688,3 +746,8 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
 - **Before this:** [[Hexagonal Architecture (Ports and Adapters)]]
 - **Next:** [[SOLID in Go]]
 - **Compare with:** [[Layered Architecture]] (the simpler default this pattern is an evolution of), [[Service Project Layout and Wiring]] (the composition-root pattern `cmd.Wire` follows), [[Capstone - InvoiceOps]] (the running example whose payment core uses this ring structure)
+
+### Watch on YouTube
+
+- [Understand Clean Architecture in 7 Minutes](https://www.youtube.com/watch?v=1OLSE6tX71Y) · Amichai Mantinband · 7 min · 227,606 views
+- [The Clean Architecture / Simply Explained / .NET Core](https://www.youtube.com/watch?v=_1cJ0JOLe8Y) · The Code Switch · 6 min · 55,726 views

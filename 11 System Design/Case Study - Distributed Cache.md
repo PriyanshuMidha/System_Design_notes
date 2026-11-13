@@ -11,7 +11,7 @@ sources:
   - "Memcached documentation: slab allocator, per-slab LRU, client-side sharding (the server nodes do not talk to each other)"
   - "Karger et al., Consistent Hashing and Random Trees (STOC 1997)"
   - "Twitter engineering, twemproxy (nutcracker) README: a proxy that shards across memcached and Redis servers"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Distributed Cache
@@ -26,9 +26,57 @@ updated: 2026-11-09
 > - Clients are either **smart** (they know the node map, like Redis Cluster clients) or go through a **proxy** (like twemproxy or mcrouter).
 > - The cache is not the source of truth. Design every failure mode (node down, hot key, stampede, stale data) around protecting the database behind it.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your app shows a product page.
+Each time, it asks the database for the price, name and photos.
+The database is slow and gets tired when a million people ask at once.
+So you keep recent answers in fast memory, spread over many machines, and ask the database only when memory does not know.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cache | A fast copy of data kept close by | Keeping `user:42` in RAM instead of re-querying SQL |
+| Key / value | A name and the data stored under it | `price:sku9` -> `499` |
+| Node | One server in the cluster | `cache-03` |
+| Hash | A function turning a key into a number | `hash("user:42") = 9183` |
+| Shard / partition | The slice of keys one node owns | Keys whose hash falls in slot 0-5460 |
+| Replica | A backup copy of a node's data on another node | `cache-03b` mirrors `cache-03` |
+| TTL | How long an entry lives before it expires | Keep the price for 300 s |
+| Eviction | Throwing out entries when memory is full | LRU drops the least recently used key |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App["App server"] --> C{"Key in cache?"}
+    C -- "hit" --> R["Return fast"]
+    C -- "miss" --> DB[("Database")]
+    DB --> F["Store in cache<br/>with TTL"]
+    F --> R
+    C -.-> N["Hash picks<br/>which node"]
+```
+
+**Analogy.** A cache cluster is like many small notebooks on your desk, each holding answers for names starting with certain letters, so you rarely walk to the library (database).
+Where it breaks: a notebook never loses pages on its own, while a cache node can crash or evict data at any time, so the library must always remain the truth.
+
+**How the rest of this note builds up**
+
+- First, why one cache box is not enough (section 1) and a mental model of keys landing on nodes (section 2).
+- Then the high-level design: consistent hashing, replication and clients (section 3), with sizing and API (section 4).
+- Then variants and trade-offs, Redis Cluster vs Memcached and friends (sections 5-6).
+- Finally the SDE-3 deep dive: production lessons, hot keys, stampedes, leases and failover (sections 7-8).
+
+> [!tip] Remember
+> A distributed cache is fast, forgetful memory spread over many nodes; the database stays the source of truth.
+
 ## 1. Why it exists - requirements
 
-A single Redis or Memcached server can hold maybe tens of gigabytes and serve on the order of 100,000 simple operations per second (an assumption, not a promise; it depends on value size and CPU). A big product needs terabytes and millions of operations per second. You cannot buy a bigger box forever, so you spread the cache over many machines and make them look like one.
+A single Redis or Memcached server can hold maybe tens of gigabytes and serve on the order of 100,000 simple operations per second (an assumption, not a promise; it depends on value size and CPU).
+
+A big product needs terabytes and millions of operations per second. You cannot buy a bigger box forever, so you spread the cache over many machines and make them look like one.
 
 **Everyday picture.** A library has one librarian with one desk. When 10,000 people arrive, you open 50 desks, each responsible for a range of the alphabet. A person must know which desk to walk to. That is partitioning. If a desk closes, only its alphabet range is disrupted. That is why you use consistent hashing and not "key mod number-of-desks".
 
@@ -53,7 +101,11 @@ A single Redis or Memcached server can hold maybe tens of gigabytes and serve on
 
 ## 2. Mental model
 
-Think of the cluster as a **hotel with numbered rooms and a front desk**. Each key has a room number computed from its name (the hash). The room number tells you which floor (node) to go to. Nobody has to ask the front desk each time if you carry the floor map, which is exactly a smart client with a cached node map.
+Think of the cluster as a **hotel with numbered rooms and a front desk**.
+
+- Each key has a room number computed from its name (the hash).
+- The room number tells you which floor (node) to go to.
+- Nobody has to ask the front desk each time if you carry the floor map, which is exactly a smart client with a cached node map.
 
 ```mermaid
 flowchart LR
@@ -373,7 +425,11 @@ See [[Hot Keys and Hot Partitions]].
 
 ### 8.3 Stampede protection with leases
 
-When a hot key expires, thousands of callers miss at once. Facebook's paper describes a **lease**: on a miss the cache hands one caller a token that allows it to fill the key. Other callers wait a few milliseconds or receive slightly stale data. If a delete arrives while the lease is open, the token is invalidated so the late writer cannot store a stale value.
+When a hot key expires, thousands of callers miss at once. Facebook's paper describes a **lease**:
+
+1. On a miss the cache hands one caller a token that allows it to fill the key.
+2. Other callers wait a few milliseconds or receive slightly stale data.
+3. If a delete arrives while the lease is open, the token is invalidated so the late writer cannot store a stale value.
 
 ```mermaid
 sequenceDiagram
@@ -497,3 +553,8 @@ A 45-minute script:
 - **Redis and caching:** [[Redis Replication, Sentinel and Cluster]], [[Cache Eviction Policies - LRU, LFU, TTL]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]], [[Cache Invalidation, TTL and Consistency]], [[Redis in Production - Memory, Latency, Security]]
 - **Related designs:** [[Case Study - Key-Value Store]], [[Case Study - URL Shortener]], [[Case Study - News Feed]]
 - **Distributed systems:** [[Failure Detection, Gossip and Membership]], [[Hot Keys and Hot Partitions]], [[Load Shedding and Graceful Degradation]], [[Bloom Filters and Probabilistic Data Structures]], [[Transactional Outbox and CDC]]
+
+### Watch on YouTube
+
+- [What are Distributed CACHES and how do they manage DATA CONSISTENCY?](https://www.youtube.com/watch?v=U3RkDLtS7uY) · Gaurav Sen · 13 min · 1,056,898 views
+- [System Design Interview - Distributed Cache](https://www.youtube.com/watch?v=iuqZvajTOyA) · System Design Interview · 34 min · 441,885 views

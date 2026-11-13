@@ -14,7 +14,7 @@ sources:
   - "Lieberherr & Holland, Assuring Good Style for Object-Oriented Programs (IEEE Software, 1989): Law of Demeter"
   - "Stevens, Myers & Constantine, Structured Design (IBM Systems Journal, 1974): coupling and cohesion"
   - "Go blog, Package names (go.dev/blog/package-names)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion
@@ -28,6 +28,49 @@ updated: 2026-11-04
 > - KISS and YAGNI: start concrete, add an interface or pattern when a second real variation or a test needs it.
 > - Coupling is how much one module must know about another; cohesion is how well one module's parts belong together. Aim for low and high.
 > - Tell, don't ask: ask an object to do the work (`wallet.Debit`) instead of reading its data and deciding for it.
+
+## Start here: the basics
+
+**The problem in one story.**
+A refund rule ("refund within 7 days") is copied into three files.
+The business changes it to 10 days, and someone updates only two of them.
+Now customers get different answers depending on which screen they use.
+Design principles are simple rules that stop this kind of mess before it starts.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Module | A unit of code with one job, in Go usually a package | `package wallet` |
+| Business rule | A fact about how the business works | "Delivery is free above Rs 500" |
+| Abstraction | A general shape that hides details | An interface instead of a concrete type |
+| Dependency | Something a piece of code needs to work | `OrderService` needs a `PaymentGateway` |
+| Coupling | How much one module must know about another | Code reading `order.Customer.Address.City` knows three types |
+| Cohesion | How well the parts of one module belong together | A `wallet` package that only handles balances |
+| Refactor | Change code structure without changing behaviour | Move a duplicated formula into one function |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["One business rule"] --> O["One owner<br/>(DRY)"]
+    O --> S["Simplest code that works today<br/>(KISS, YAGNI)"]
+    S --> M["Modules know little about each other<br/>(low coupling)"]
+    M --> J["Each module does one job<br/>(high cohesion)"]
+```
+
+**Analogy.** A well-run kitchen: one person owns each recipe, every station does one job, and nobody buys a pizza oven "in case we sell pizza one day".
+Where it breaks: kitchens can see the cost of a spare oven immediately; in code the cost of an unneeded abstraction shows up slowly, so these rules need judgement, not blind obedience.
+
+**How the rest of this note builds up**
+
+- First, why the principles exist (section 1) and a mental model of the pull between them (section 2).
+- Then each principle: DRY, KISS and YAGNI, coupling and cohesion, Law of Demeter, composition over inheritance (section 3).
+- Then a worked, tested Go example that applies them to one service (section 4).
+- Finally the SDE-3 deep dive: variants, trade-offs, production signals and interview questions (sections 5-9).
+
+> [!tip] Remember
+> One owner per rule, the simplest code that works today, and modules that know as little about each other as possible.
 
 ## 1. Why it exists
 
@@ -459,7 +502,9 @@ Trace of `all three in order` on a cart of 6 milk at 30.00 and 1 bread at 45.00:
 
 Rule order changes the result: applying the 10% first would give 10% of 21300 = 2130, a different total. That ordering is business knowledge, so it belongs in one place (the caller that builds the rule list), not spread across rules.
 
-`Rule` is a function type rather than an interface because each rule is one operation with no other methods; a function is the simplest thing that carries the variation. When rules need names, logging or persistence, an interface with `Discount` and `Name` methods would be the next step; see [[Strategy and Template Method]] and the full problem in [[Cart Checkout with Coupons]].
+`Rule` is a function type rather than an interface because each rule is one operation with no other methods; a function is the simplest thing that carries the variation.
+
+When rules need names, logging or persistence, an interface with `Discount` and `Name` methods would be the next step; see [[Strategy and Template Method]] and the full problem in [[Cart Checkout with Coupons]].
 
 ## 5. Variants and comparison
 
@@ -571,3 +616,8 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 - **Before this:** [[OOP in Go - Structs, Interfaces, Embedding]]
 - **Next:** [[SOLID in Go]], [[Design Patterns Overview and Chooser]], [[LLD Interview Method]]
 - **Compare with:** [[Strategy and Template Method]] (the pattern the pricing rules grow into), [[Cart Checkout with Coupons]], [[Backend Request Lifecycle and Layering]]
+
+### Watch on YouTube
+
+- [Design Principles / SOLID / DRY / KISS / YAGNI 🔥](https://www.youtube.com/watch?v=uxe_0RFgT7A) · codeWithAryan · 55 min · 72,302 views
+- [Software Design Principles Explained / DRY, KISS & YAGNI in Low Level Design](https://www.youtube.com/watch?v=eNnFThA60yw) · Yash Jain · 19 min · 1,135 views

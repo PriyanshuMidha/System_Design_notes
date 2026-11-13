@@ -9,7 +9,7 @@ sources:
   - "AMD Software Optimization Guide for the 'Zen 4' Microarchitecture"
   - "Hennessy & Patterson, Computer Architecture: A Quantitative Approach, 6th ed., ch. 2 (memory hierarchy, coherence)"
   - "Sun/Oracle MOESI/MESI protocol documentation; Culler, Singh & Gupta, Parallel Computer Architecture, ch. 5 (cache coherence)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Memory Hierarchy and CPU Caches
@@ -23,31 +23,94 @@ updated: 2026-11-09
 > - On a multi-core CPU, caches must stay consistent with each other. The **MESI** protocol makes every core agree on who owns a cache line before writing it — and two cores writing to *different* variables that happen to share one cache line pay for that agreement anyway. That's **false sharing**.
 > - This note is about CPU/hardware caches only. The OS page cache and file-system caches are a different mechanism, covered in [[Page Cache, File Systems and fsync]]; the TLB (a cache for address translation) is covered in [[Virtual Memory, Paging and the TLB]]; application-level caches (Redis, in-process caches) are covered in `08 Caching & Redis`.
 
+## Start here: the basics
+
+**The problem in one story.**
+You are cooking and the recipe needs salt.
+If the salt is on the counter, you grab it in a second.
+If it is in a shop across town, dinner waits an hour.
+A CPU has the same problem: it is very fast, but the data it needs is often far away in main memory.
+Caches are the "counter": small shelves of recently used data kept right next to the CPU.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| CPU core | One worker inside the processor that runs instructions | An 8-core laptop runs 8 instruction streams at once |
+| Clock cycle | One tick of the CPU's clock; the smallest step of work | At 3 GHz, one cycle is ~0.33 ns |
+| Nanosecond (ns) | One billionth of a second | A DRAM read takes ~100 ns |
+| Register | A tiny storage slot inside the core itself | The CPU adds two numbers held in registers |
+| DRAM / main memory | The big RAM chips, far slower than the core | 16 GB of RAM in a laptop |
+| Cache | A small, fast copy of recently used memory | L1 cache holding the array you are looping over |
+| Cache line | The fixed-size block a cache moves around (64 bytes) | Reading `a[0]` also brings in `a[1]..a[7]` for `int64`s |
+| Hit / miss | Hit: the data was in the cache. Miss: it had to be fetched from further away | Second read of a variable is usually a hit |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    CPU["CPU core"] --> L1["L1 cache<br/>tiny, ~1 ns"]
+    L1 -- "miss" --> L2["L2 cache<br/>~3-4 ns"]
+    L2 -- "miss" --> L3["L3 cache<br/>shared, ~10-20 ns"]
+    L3 -- "miss" --> RAM["DRAM<br/>~100 ns"]
+```
+
+**Analogy.** Kitchen counter (L1), cupboard (L2), pantry (L3), shop across town (DRAM). You keep what you just used close, and you buy a whole packet, not one grain (a cache line).
+Where it breaks: in a kitchen you choose what to keep close; the hardware decides automatically, and several cooks (cores) must agree on who changed the shared packet last (coherence).
+
+**How the rest of this note builds up**
+
+- First, why the hierarchy exists (section 1) and the desk-to-warehouse mental model (section 2).
+- Then how it works: the pyramid, locality, cache lines, hits and misses, write policies (section 3).
+- Then multi-core caches: MESI coherence and the false-sharing worked example with Go numbers (sections 3-4).
+- Finally the SDE-3 view: trade-offs, production failure modes, prefetching, NUMA and associativity (sections 5-8).
+
+> [!tip] Remember
+> Keep hot data small, close and contiguous: the CPU is only as fast as the memory level its data lives in.
+
 ## 1. Why it exists
 
-Imagine two co-workers: one sits at a desk with everything they need in arm's reach, the other has to walk to a warehouse across town for every single document. That is, roughly, the gap between a CPU register and main memory (**DRAM**). A 2025-era server core runs at 3–4 GHz, so one clock cycle is about 0.25–0.33 ns. A single DRAM access takes on the order of 100 ns. If every memory-touching instruction had to wait for DRAM, a core would spend over 99% of its time idle, no matter how fast its arithmetic units were.
+Imagine two co-workers: one sits at a desk with everything they need in arm's reach, the other has to walk to a warehouse across town for every single document. That is, roughly, the gap between a CPU register and main memory (**DRAM**).
+
+A 2025-era server core runs at 3–4 GHz, so one clock cycle is about 0.25–0.33 ns. A single DRAM access takes on the order of 100 ns.
+
+If every memory-touching instruction had to wait for DRAM, a core would spend over 99% of its time idle, no matter how fast its arithmetic units were.
 
 > [!warning] Common mistake
 > Assuming "the CPU is fast, so my program is fast." A CPU's raw instruction speed only matters if the data it operates on is already close by. A program that constantly waits on DRAM runs at DRAM's speed, not the CPU's clock speed — this is why data layout can matter as much as algorithm choice.
 
 ### Why it matters: a concrete number
 
-A function that walks a 10-million-element linked list, where each node is a separate heap allocation scattered across memory, pays close to a full DRAM-latency cache miss per node (~100 ns each), which totals about **1 second** just in memory stalls — before any actual computation. The same 10 million `int64` values packed into one contiguous slice stream through the cache hierarchy instead, at closer to a few nanoseconds per element, thanks to spatial locality and hardware prefetching (both explained below) — at least an order of magnitude faster for identical work. The exact ratio depends on the machine, so treat this as an illustration of the shape of the effect, not a benchmark result.
+A function that walks a 10-million-element linked list, where each node is a separate heap allocation scattered across memory, pays close to a full DRAM-latency cache miss per node (~100 ns each). That totals about **1 second** just in memory stalls — before any actual computation.
+
+The same 10 million `int64` values packed into one contiguous slice stream through the cache hierarchy instead, at closer to a few nanoseconds per element, thanks to spatial locality and hardware prefetching (both explained below) — at least an order of magnitude faster for identical work.
+
+The exact ratio depends on the machine, so treat this as an illustration of the shape of the effect, not a benchmark result.
 
 > [!tip] Remember
 > The memory hierarchy exists because DRAM is roughly 300× slower than a CPU cycle, and real programs touch the same data and nearby addresses repeatedly — that repetition is what a cache exploits.
 
 ## 2. Mental model
 
-Picture a programmer's desk (registers: a few items, instant access), a drawer at arm's reach (L1 cache: tens of kilobytes, barely slower than the desk), a filing cabinet across the room (L2 cache: roughly a megabyte, a short walk), a shared records room down the hall that the whole floor uses (L3 cache: tens of megabytes, shared across cores, a longer walk), and an archive warehouse across town (DRAM: gigabytes, a real trip).
+Picture a programmer's workspace:
 
-You never fetch "one byte" from the warehouse — you fetch a whole box (a 64-byte **cache line**) because if you need byte 100 of a file, you'll probably need byte 101 next. The analogy breaks down in one place: unlike a human archive, the hardware automatically decides what to keep nearby based on what you recently touched, without being asked.
+- A desk (registers: a few items, instant access).
+- A drawer at arm's reach (L1 cache: tens of kilobytes, barely slower than the desk).
+- A filing cabinet across the room (L2 cache: roughly a megabyte, a short walk).
+- A shared records room down the hall that the whole floor uses (L3 cache: tens of megabytes, shared across cores, a longer walk).
+- An archive warehouse across town (DRAM: gigabytes, a real trip).
+
+You never fetch "one byte" from the warehouse — you fetch a whole box (a 64-byte **cache line**) because if you need byte 100 of a file, you'll probably need byte 101 next.
+
+The analogy breaks down in one place: unlike a human archive, the hardware automatically decides what to keep nearby based on what you recently touched, without being asked.
 
 ## 3. How it works
 
 ### The pyramid
 
-In plain words: each level of memory is about an order of magnitude bigger and an order of magnitude slower than the level above it. That ratio is deliberate — a cache only has to be a small fraction of the size of the level below it to absorb most of the traffic, because of locality (next section).
+In plain words: each level of memory is about an order of magnitude bigger and an order of magnitude slower than the level above it.
+
+That ratio is deliberate — a cache only has to be a small fraction of the size of the level below it to absorb most of the traffic, because of locality (next section).
 
 ```mermaid
 flowchart TD
@@ -63,7 +126,10 @@ flowchart TD
 
 Sizes and latencies above are documented, approximate figures for a 2025-era server core (Intel/AMD x86-64 and Apple silicon all follow the same shape; exact numbers vary by SKU and are set by each vendor's optimization manual, listed in `sources`).
 
-**Example with numbers.** Summing 10 million `int64` values: at ~1 ns per element if the data streams through L1/L2 (contiguous slice), the loop costs about 10 ms. At ~100 ns per element if every access misses to DRAM (scattered linked list), the same loop costs about 1 second — a 100× difference from data layout alone, with the algorithm unchanged.
+**Example with numbers.** Summing 10 million `int64` values:
+
+- At ~1 ns per element if the data streams through L1/L2 (contiguous slice), the loop costs about 10 ms.
+- At ~100 ns per element if every access misses to DRAM (scattered linked list), the same loop costs about 1 second — a 100× difference from data layout alone, with the algorithm unchanged.
 
 > [!tip] Remember
 > Each hierarchy level is roughly 10× bigger and 10× slower than the one above — that ratio, combined with locality, is what makes a small cache able to absorb most of a program's memory traffic.
@@ -85,7 +151,9 @@ flowchart LR
     end
 ```
 
-**Example.** A `for` loop that re-reads the same loop-counter variable a million times is temporal locality in action: after the first read, every later read is an L1 hit. A loop that walks `array[0], array[1], array[2], ...` is spatial locality: fetching `array[0]`'s 64-byte cache line also pulls in `array[1]` through `array[7]` (for 8-byte elements) for free.
+**Example.** A `for` loop that re-reads the same loop-counter variable a million times is temporal locality in action: after the first read, every later read is an L1 hit.
+
+A loop that walks `array[0], array[1], array[2], ...` is spatial locality: fetching `array[0]`'s 64-byte cache line also pulls in `array[1]` through `array[7]` (for 8-byte elements) for free.
 
 > [!tip] Remember
 > Caches exploit both forms of locality: temporal locality by keeping recently used lines around instead of evicting them immediately, spatial locality by fetching a whole 64-byte line around the requested address instead of one byte.
@@ -106,7 +174,11 @@ flowchart LR
     H --> I["Fill L3, L2, L1, return data"]
 ```
 
-A cache is organized as a grid of **sets**, and each set holds a small fixed number of lines (its **associativity** — e.g. "8-way set-associative" means each set holds 8 lines). An address maps to exactly one set (by its middle bits) but can occupy any of that set's 8 ways. On a miss that needs room, the cache picks a victim line to evict using a policy approximating least-recently-used.
+A cache is organized as a grid of **sets**, and each set holds a small fixed number of lines (its **associativity** — e.g. "8-way set-associative" means each set holds 8 lines).
+
+An address maps to exactly one set (by its middle bits) but can occupy any of that set's 8 ways.
+
+On a miss that needs room, the cache picks a victim line to evict using a policy approximating least-recently-used.
 
 **Example.** An L1 miss that hits in L3 costs roughly 10–20 ns instead of 1 ns — a 10–20× slowdown for that one access, still 5–10× faster than going all the way to DRAM's 80–120 ns.
 
@@ -118,7 +190,11 @@ A cache is organized as a grid of **sets**, and each set holds a small fixed num
 
 ### Cache coherence: MESI
 
-In plain words: on a multi-core CPU, each core has its own private L1/L2, so the same 64-byte line of DRAM can be cached in several places at once. If core A and core B both cache the same line and one writes to it, the other must not keep reading its now-stale copy. **MESI** names four states a cache line can be in, per core, that make this safe.
+In plain words: on a multi-core CPU, each core has its own private L1/L2, so the same 64-byte line of DRAM can be cached in several places at once.
+
+If core A and core B both cache the same line and one writes to it, the other must not keep reading its now-stale copy.
+
+**MESI** names four states a cache line can be in, per core, that make this safe.
 
 ```mermaid
 stateDiagram-v2
@@ -137,7 +213,13 @@ stateDiagram-v2
 - **Shared**: multiple cores have read-only copies, all matching DRAM.
 - **Invalid**: this core's copy, if any, cannot be used.
 
-**Example.** Core A reads counter `x` (goes Exclusive on A). Core B then also reads `x` (both go Shared). Core A now writes `x` — this forces an invalidate broadcast to B before the write proceeds (Shared → Modified on A, Shared → Invalid on B). That broadcast is not free: it crosses the inter-core interconnect, and it happens on *every* such write, even if A and B were never logically sharing data — only a cache line.
+**Example.**
+
+1. Core A reads counter `x` (goes Exclusive on A).
+2. Core B then also reads `x` (both go Shared).
+3. Core A now writes `x` — this forces an invalidate broadcast to B before the write proceeds (Shared → Modified on A, Shared → Invalid on B).
+
+That broadcast is not free: it crosses the inter-core interconnect, and it happens on *every* such write, even if A and B were never logically sharing data — only a cache line.
 
 > [!warning] Common mistake
 > Assuming cache coherence is "the hardware's problem, it's always free." MESI keeps caches *correct*, but the invalidate broadcast on a Shared→Modified transition has a real, measurable cost. When that transition happens far more often than the program logically needs, it is called false sharing (next).
@@ -149,7 +231,13 @@ stateDiagram-v2
 
 ### Whiteboard version
 
-Two goroutines each increment their own private `int64` counter, millions of times, with no shared state in the source code. If both counters happen to sit in the same 64-byte cache line, every increment by goroutine A invalidates goroutine B's cached copy of that line (per the MESI diagram above) and vice versa — even though neither goroutine ever reads or writes the other's counter. This is **false sharing**: two independent variables contending only because of where they happen to sit in memory. Separating the counters onto different cache lines removes the invalidation traffic entirely.
+Two goroutines each increment their own private `int64` counter, millions of times, with no shared state in the source code.
+
+If both counters happen to sit in the same 64-byte cache line, every increment by goroutine A invalidates goroutine B's cached copy of that line (per the MESI diagram above) and vice versa — even though neither goroutine ever reads or writes the other's counter.
+
+This is **false sharing**: two independent variables contending only because of where they happen to sit in memory.
+
+Separating the counters onto different cache lines removes the invalidation traffic entirely.
 
 ```mermaid
 flowchart TD
@@ -178,7 +266,11 @@ A runnable version of this experiment, with tests and a measured benchmark, is k
 | Unpadded (false sharing) | ~448 us | 1.00x |
 | Padded (one cache line each) | ~411 us | **0.92x** (about 9% faster) |
 
-The effect is real but modest on this machine, and noisy at this sample size — repeated runs produced gaps ranging from roughly 5% to over 25% faster. Treat "padded was reproducibly faster, by a double-digit-percent amount that itself varies" as the honest takeaway, not "padded is exactly 9% faster." The same experiment on a multi-socket x86-64 server, where invalidations cross a slower inter-socket interconnect, documents a much larger and more consistent gap — always re-measure on the target machine with enough samples to see the variance.
+The effect is real but modest on this machine, and noisy at this sample size — repeated runs produced gaps ranging from roughly 5% to over 25% faster.
+
+Treat "padded was reproducibly faster, by a double-digit-percent amount that itself varies" as the honest takeaway, not "padded is exactly 9% faster."
+
+The same experiment on a multi-socket x86-64 server, where invalidations cross a slower inter-socket interconnect, documents a much larger and more consistent gap — always re-measure on the target machine with enough samples to see the variance.
 
 > [!tip] Remember
 > False sharing is a performance bug, not a correctness bug: both layouts compute the right answer, but the packed one pays invisible coherence traffic for data that was never logically shared.
@@ -256,3 +348,8 @@ The effect is real but modest on this machine, and noisy at this sample size —
 - **Next:** [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]], [[Virtual Memory, Paging and the TLB]]
 - **Compare with:** [[Page Cache, File Systems and fsync]] (OS-level file caching, a different mechanism), [[Concurrency Primitives - Mutex, Semaphore, Atomics]] (software coordination built on top of the hardware coherence this note describes)
 - **Go code:** [[Memory Hierarchy and CPU Caches - Go]]
+
+### Watch on YouTube
+
+- [L1, L2, L3 Cache: CPU Cache Hierarchy Finally Explained! (Bonus: TLBs, MMU, Page Tables)](https://www.youtube.com/watch?v=tSAcFKW9lM8) · Tech Fairy · covers the cache hierarchy end to end, plus related TLB/paging context
+- [Every CPU Cache Level Explained in Detail](https://www.youtube.com/watch?v=-YL9s9nBeN0) · Tech in a Teacup · deeper dive on why each cache level exists and how it's built

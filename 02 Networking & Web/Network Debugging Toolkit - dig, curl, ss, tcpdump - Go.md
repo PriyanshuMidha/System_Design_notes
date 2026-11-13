@@ -8,7 +8,7 @@ sources:
   - "dig(1), curl(1), openssl(1), ss(8), tcpdump(1), traceroute(8), nc(1) manual pages"
   - "RFC 1035, Domain Names - Implementation and Specification"
   - "RFC 793 / RFC 9293, Transmission Control Protocol"
-updated: 2026-11-09
+updated: 2026-11-13
 type: implementation
 ---
 
@@ -16,6 +16,15 @@ type: implementation
 
 > [!summary] TL;DR
 > This code is a tiny, programmatic version of `nc -zv host port`: it dials a TCP address, classifies the result into the same open/refused/timeout buckets a human reads off `ss` or `tcpdump`, and reports how long the attempt took. It backs [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]'s "Writing the same check as a Go health probe" section.
+
+## Before the code
+
+- **`net.Dialer.DialContext`**: opens a TCP connection and gives up when the context ends.
+- **`context.WithTimeout`**: a context that cancels itself after a set time; always pair it with `defer cancel()`.
+- **Custom `int` type with constants (`Outcome`)**: Go's simple enum, so callers switch on a type instead of a string.
+- **`errors.As` / `errors.Is` with `net.Error` and `syscall.ECONNREFUSED`**: dig inside a wrapped error to find a timeout or a refusal.
+- **Goroutine + `net.Listen` in tests**: a real local server on `127.0.0.1:0` (any free port) so the test needs no network.
+- **What to run**: `go vet ./...` then `go test -race -v ./...`.
 
 ## What this code shows
 
@@ -67,11 +76,21 @@ go test -race -v ./...
 
 ## Code
 
-The package is deliberately small: one file holding a closed set of outcomes, a single dialing function, a classifier, and a formatter. Each piece below maps to one playbook distinction from the theory note, so reading this section alongside [[Network Debugging Toolkit - dig, curl, ss, tcpdump#The debugging playbook]] should feel like watching that flowchart's decisions get written down as code instead of read off a terminal by eye.
+The package is deliberately small: one file holding a closed set of outcomes, a single dialing function, a classifier, and a formatter.
+
+Each piece below maps to one playbook distinction from the theory note, so reading this section alongside [[Network Debugging Toolkit - dig, curl, ss, tcpdump#The debugging playbook]] should feel like watching that flowchart's decisions get written down as code instead of read off a terminal by eye.
 
 ### The Outcome type
 
-**Concept.** The theory note's playbook distinguishes exactly three ways a TCP connect attempt can end, because each one points at a different thing to check next: a clean connection, a dropped packet with no reply (timeout — usually a firewall or dead route), or an explicit refusal (something answered, but nothing is listening). `Outcome` makes those three distinctions a type instead of a loose string, so a caller can switch on it exhaustively. The alternative — returning a plain `error` and having every caller re-parse it — was rejected because it would force each caller to repeat the same classification logic this package already centralizes.
+**Concept.** The theory note's playbook distinguishes exactly three ways a TCP connect attempt can end, because each one points at a different thing to check next:
+
+1. a clean connection;
+2. a dropped packet with no reply (timeout — usually a firewall or dead route);
+3. an explicit refusal (something answered, but nothing is listening).
+
+`Outcome` makes those three distinctions a type instead of a loose string, so a caller can switch on it exhaustively.
+
+The alternative — returning a plain `error` and having every caller re-parse it — was rejected because it would force each caller to repeat the same classification logic this package already centralizes.
 
 ```go
 // Package netdebug implements the same connectivity check `nc -zv host port`
@@ -131,7 +150,11 @@ func (o Outcome) String() string {
 
 ### Result and CheckTCP
 
-**Concept.** `Result` bundles everything one health check produced — target, outcome, how long it took, and the raw error if any — so a caller gets one value back instead of three separate return values to keep in sync. `CheckTCP` is the dial itself: it wraps `net.Dialer.DialContext` with a timeout and immediately classifies whatever comes back. A bare `net.Dial` (no context) was rejected because it offers no way to bound how long a hung connection attempt is allowed to block.
+**Concept.** `Result` bundles everything one health check produced — target, outcome, how long it took, and the raw error if any — so a caller gets one value back instead of three separate return values to keep in sync.
+
+`CheckTCP` is the dial itself: it wraps `net.Dialer.DialContext` with a timeout and immediately classifies whatever comes back.
+
+A bare `net.Dial` (no context) was rejected because it offers no way to bound how long a hung connection attempt is allowed to block.
 
 ```go
 // Result is one connectivity check.
@@ -171,7 +194,11 @@ func CheckTCP(ctx context.Context, addr string, timeout time.Duration) Result {
 
 ### classify and Report
 
-**Concept.** `classify` is the single place that turns a raw Go `error` into one of the three meaningful buckets — this is deliberately factored out of `CheckTCP` so it can be unit-tested directly, without needing a real socket or a real timeout to exercise each branch. `Report` is a thin formatting layer; keeping it separate from `Result` means a caller who wants to log or display results differently (structured JSON, a Prometheus metric) can skip `Report` entirely and read `Result`'s fields instead.
+**Concept.** `classify` is the single place that turns a raw Go `error` into one of the three meaningful buckets.
+
+This is deliberately factored out of `CheckTCP` so it can be unit-tested directly, without needing a real socket or a real timeout to exercise each branch.
+
+`Report` is a thin formatting layer; keeping it separate from `Result` means a caller who wants to log or display results differently (structured JSON, a Prometheus metric) can skip `Report` entirely and read `Result`'s fields instead.
 
 ```go
 // classify turns a dial error into the same open/refused/timeout buckets a
@@ -207,7 +234,13 @@ func Report(r Result) string {
 
 ## Tests
 
-Four test functions cover the package end to end: two exercise `CheckTCP` against a real socket (one success, one refusal), one exercises `classify` directly against synthetic errors so the timeout branch doesn't need a real network failure to trigger it, and one is a minimal smoke test on `Report`'s formatting. Together they touch every exported function and every branch of `classify`.
+Four test functions cover the package end to end:
+
+- two exercise `CheckTCP` against a real socket (one success, one refusal);
+- one exercises `classify` directly against synthetic errors so the timeout branch doesn't need a real network failure to trigger it;
+- one is a minimal smoke test on `Report`'s formatting.
+
+Together they touch every exported function and every branch of `classify`.
 
 ### TestCheckTCPOpen
 
@@ -371,7 +404,13 @@ PASS
 
 ## Why the tests avoid a real black-hole address
 
-A natural fourth test would dial an address that is known to silently drop packets, to exercise the real `Timeout` path end to end rather than only through `fakeTimeoutErr`. That test was deliberately left out: a real timeout depends on an external network condition (a firewall or route that drops packets without replying) that is not something this package, or any CI environment running it, can reliably guarantee exists — and worse, picking a real "unreachable" address risks it becoming reachable later (or already answering from inside a sandboxed network), which would make the test flaky for reasons entirely unrelated to a bug in this code. Driving `classify`'s timeout branch directly with a fake `net.Error` sidesteps that problem entirely: the test asserts the one thing this package actually controls — "does `classify` return `Timeout` when handed something whose `Timeout()` method returns true" — without needing a real network condition to reproduce it.
+A natural fourth test would dial an address that is known to silently drop packets, to exercise the real `Timeout` path end to end rather than only through `fakeTimeoutErr`.
+
+That test was deliberately left out: a real timeout depends on an external network condition (a firewall or route that drops packets without replying) that is not something this package, or any CI environment running it, can reliably guarantee exists.
+
+Worse, picking a real "unreachable" address risks it becoming reachable later (or already answering from inside a sandboxed network), which would make the test flaky for reasons entirely unrelated to a bug in this code.
+
+Driving `classify`'s timeout branch directly with a fake `net.Error` sidesteps that problem entirely: the test asserts the one thing this package actually controls — "does `classify` return `Timeout` when handed something whose `Timeout()` method returns true" — without needing a real network condition to reproduce it.
 
 ## Design decisions
 
@@ -385,7 +424,15 @@ A natural fourth test would dial an address that is known to silently drop packe
 
 ## A note on what "race-safe" means here
 
-Running these tests with `-race` matters specifically because `TestCheckTCPOpen` spins up a background goroutine (the `Accept` loop) that runs concurrently with the test's own goroutine. The race detector instruments every memory access made by both goroutines during the test and watches for two of them touching the same memory location without a happens-before relationship between the accesses — for example, one goroutine writing a value while another reads it with no lock, channel or other synchronization in between. In this package, the only values the background goroutine and the test goroutine could in principle both touch are the `net.Listener` itself (`ln`) and each `net.Conn` it produces. Both are safe here: `net.Listener.Accept` and `net.Conn`'s methods are themselves safe for concurrent use by multiple goroutines, which is a guarantee the standard library documents explicitly for these two types — unlike a plain Go map or slice, which are never safe for concurrent read/write without external synchronization. That is exactly why `-race` reports nothing to flag: there is genuine concurrency in this test, but no unsynchronized shared mutable state underneath it.
+Running these tests with `-race` matters specifically because `TestCheckTCPOpen` spins up a background goroutine (the `Accept` loop) that runs concurrently with the test's own goroutine.
+
+The race detector instruments every memory access made by both goroutines during the test and watches for two of them touching the same memory location without a happens-before relationship between the accesses — for example, one goroutine writing a value while another reads it with no lock, channel or other synchronization in between.
+
+In this package, the only values the background goroutine and the test goroutine could in principle both touch are the `net.Listener` itself (`ln`) and each `net.Conn` it produces.
+
+Both are safe here: `net.Listener.Accept` and `net.Conn`'s methods are themselves safe for concurrent use by multiple goroutines, which is a guarantee the standard library documents explicitly for these two types — unlike a plain Go map or slice, which are never safe for concurrent read/write without external synchronization.
+
+That is exactly why `-race` reports nothing to flag: there is genuine concurrency in this test, but no unsynchronized shared mutable state underneath it.
 
 ## Running it
 
@@ -402,11 +449,20 @@ PASS
 ok  	netdebug	1.2s
 ```
 
-Reading it: each top-level `--- PASS` line is one test function; `TestClassify`'s three indented sub-lines are its table-driven subtests (`t.Run`), run and reported individually. The overall `PASS` and `ok` line confirm every assertion across all four test functions held, and the race detector (`-race`) found nothing to report — expected, since `TestCheckTCPOpen` is the only test with any concurrency (its background `Accept` loop goroutine), and it only ever touches its own listener, never shared state with the test goroutine.
+Reading it: each top-level `--- PASS` line is one test function; `TestClassify`'s three indented sub-lines are its table-driven subtests (`t.Run`), run and reported individually.
+
+The overall `PASS` and `ok` line confirm every assertion across all four test functions held, and the race detector (`-race`) found nothing to report — expected, since `TestCheckTCPOpen` is the only test with any concurrency (its background `Accept` loop goroutine), and it only ever touches its own listener, never shared state with the test goroutine.
 
 ## Why this matters beyond a demo
 
-A health-check function that only returns "up" or "down" throws away exactly the information an on-call engineer needs first when a service looks unreachable. By returning a typed `Outcome` instead of a boolean, a monitoring system built on `CheckTCP` can already pre-sort incidents the way this note's own playbook does by hand: a spike in `Refused` results points at a crashed or misconfigured backend process, while a spike in `Timeout` results points at the network path itself — a firewall rule, a dead route, or a security-group change. That distinction is the single most useful thing a first responder can know before they ever open a terminal and start running `dig`, `curl` or `tcpdump` themselves.
+A health-check function that only returns "up" or "down" throws away exactly the information an on-call engineer needs first when a service looks unreachable.
+
+By returning a typed `Outcome` instead of a boolean, a monitoring system built on `CheckTCP` can already pre-sort incidents the way this note's own playbook does by hand:
+
+- a spike in `Refused` results points at a crashed or misconfigured backend process;
+- a spike in `Timeout` results points at the network path itself — a firewall rule, a dead route, or a security-group change.
+
+That distinction is the single most useful thing a first responder can know before they ever open a terminal and start running `dig`, `curl` or `tcpdump` themselves.
 
 This is also why `classify` is tested on its own, with a fake error, rather than only indirectly through `CheckTCP`: a classification bug would otherwise only surface under specific, hard-to-reproduce network conditions (a real firewall drop, a real refused port) instead of in a fast, deterministic unit test that runs the same way on every machine and in CI.
 
@@ -418,11 +474,21 @@ This is also why `classify` is tested on its own, with a fake error, rather than
 
 ## How this reads next to the manual playbook
 
-Each exported function in this package answers exactly one row of the theory note's symptom table. `CheckTCP` is the automated version of running `nc -zv` and watching whether it hangs or replies instantly. `classify` is the automated version of a human reading `ss -tan`'s state column, or noticing that `curl` failed before a single `>` line was printed. `Report` is the automated version of writing down what you saw in a postmortem or an incident channel — a consistent, greppable line instead of a free-form sentence. None of the three functions tries to replace `dig`, `openssl s_client` or `tcpdump`; DNS, TLS and raw-packet inspection all need their own tools, because a TCP-level `Open`/`Refused`/`Timeout` result genuinely cannot tell you whether the name resolved correctly or whether the certificate validated — only that a byte stream could, or could not, be opened to the target.
+Each exported function in this package answers exactly one row of the theory note's symptom table.
+
+- `CheckTCP` is the automated version of running `nc -zv` and watching whether it hangs or replies instantly.
+- `classify` is the automated version of a human reading `ss -tan`'s state column, or noticing that `curl` failed before a single `>` line was printed.
+- `Report` is the automated version of writing down what you saw in a postmortem or an incident channel — a consistent, greppable line instead of a free-form sentence.
+
+None of the three functions tries to replace `dig`, `openssl s_client` or `tcpdump`; DNS, TLS and raw-packet inspection all need their own tools, because a TCP-level `Open`/`Refused`/`Timeout` result genuinely cannot tell you whether the name resolved correctly or whether the certificate validated — only that a byte stream could, or could not, be opened to the target.
 
 ## Exercises
 
-Each exercise below asks you to change one small thing and predict the result before running it — the point is to build an accurate mental model of exactly where each piece of this package's behavior comes from (the dial itself, the error classification, or the formatting), not just to produce working code. Work through them in order; the first two only touch `netdebug.go`, and the third touches both the type and its tests.
+Each exercise below asks you to change one small thing and predict the result before running it.
+
+The point is to build an accurate mental model of exactly where each piece of this package's behavior comes from (the dial itself, the error classification, or the formatting), not just to produce working code.
+
+Work through them in order; the first two only touch `netdebug.go`, and the third touches both the type and its tests.
 
 1. Add a `DNSFailure` outcome and a `CheckHTTP` function that first resolves the host with `net.LookupHost` before dialing. Predict which existing `Outcome` value a plain DNS failure would currently fall into if you didn't add the new case.
 2. Change `CheckTCP`'s timeout to `1 * time.Nanosecond` and rerun `TestCheckTCPOpen`. Predict whether the test still passes, and why an unrealistically short timeout changes the *outcome* this test observes.

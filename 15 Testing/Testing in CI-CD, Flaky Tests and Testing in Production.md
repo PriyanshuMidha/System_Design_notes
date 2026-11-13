@@ -10,13 +10,17 @@ sources:
   - "Cindy Sridharan, 'Testing in Production' (medium.com/@copyconstruct, 2018)"
   - "Honeycomb docs, 'Synthetic Monitoring vs. Observability'"
 status: reviewed
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Testing in CI-CD, Flaky Tests and Testing in Production
 
 > [!summary] TL;DR
-> A CI pipeline runs the test pyramid in stages of increasing cost: a fast unit gate on every commit, a slower integration stage before merge, and a nightly end-to-end (E2E) sweep. A **flaky test** passes and fails on the same code with no change of input, usually because it secretly depends on shared state, wall-clock time, randomness, network timing, or test order; the fix is to remove that dependency, not to retry until green. **Testing in production** (canary releases, feature flags, synthetic monitoring) is not a replacement for pre-release tests — it is the stage that catches what no pre-release test environment can reproduce: real traffic, real data, real infrastructure.
+> A CI pipeline runs the test pyramid in stages of increasing cost: a fast unit gate on every commit, a slower integration stage before merge, and a nightly end-to-end (E2E) sweep.
+>
+> A **flaky test** passes and fails on the same code with no change of input, usually because it secretly depends on shared state, wall-clock time, randomness, network timing, or test order; the fix is to remove that dependency, not to retry until green.
+>
+> **Testing in production** (canary releases, feature flags, synthetic monitoring) is not a replacement for pre-release tests — it is the stage that catches what no pre-release test environment can reproduce: real traffic, real data, real infrastructure.
 
 > [!abstract] Core idea
 > - A CI pipeline is the test pyramid turned into stages: fast and narrow first, slow and broad later, so a bad commit fails in seconds, not hours.
@@ -25,9 +29,57 @@ updated: 2026-11-04
 > - Feature flags and canary releases let you ship code to production dark, then expose it to 1% of real traffic before 100%, catching failures that staging never sees.
 > - Synthetic monitoring runs test-shaped checks against production itself; it is a second, independent lookout, not a substitute for the pre-release test suite.
 
+## Start here: the basics
+
+**The problem in one story.**
+Every time someone opens a pull request, a robot runs all the tests.
+One test fails one time in ten for no clear reason, so people click "re-run" until it is green.
+Soon nobody trusts a red build, and a real bug slips into production.
+This note covers running tests in CI well, fixing flaky tests, and safely testing in production itself.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| CI (Continuous Integration) | A server that builds and tests every change automatically | GitHub Actions on each PR |
+| CD (Continuous Delivery/Deployment) | Automatically releasing changes that pass CI | Auto-deploy `main` to prod |
+| Pipeline / stage | The ordered steps CI runs | lint → unit → integration → deploy |
+| Shard | One slice of the tests, run on its own machine | Tests split across 4 runners |
+| Flaky test | A test that passes or fails with no code change | Depends on timing |
+| Quarantine | Moving a flaky test out of the blocking set until it is fixed | Tagged and skipped in the gate |
+| Feature flag | A switch that turns code on or off without a deploy | `new_checkout=false` |
+| Canary | Sending a small share of real traffic to a new version first | 1% of users |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    PR["Pull request"] --> F["Fast stage:<br/>lint + unit"]
+    F --> S["Slow stage:<br/>integration, sharded"]
+    S --> D["Deploy dark<br/>(flag off)"]
+    D --> C["Canary 1%"]
+    C --> A["100% rollout"]
+    M["Synthetic checks"] -.-> A
+```
+
+**Analogy.** CI is a factory line with quality checks: cheap checks first so most defects are caught early, and a canary is selling a few units in one shop before shipping to every store.
+Where it breaks: factory checks are deterministic, while flaky tests give random answers, which a factory would never tolerate.
+
+**How the rest of this note builds up**
+
+- First, why CI testing matters (section 1) and the pipeline-as-pyramid model (section 2).
+- Then stages, sharding, flaky-test causes and quarantine, flags, canaries and synthetics (section 3), with a worked pipeline (section 4).
+- Then variants, trade-offs and real-world practice (sections 5-7).
+- Finally the SDE-3 deep dive and interview questions (sections 8-9).
+
+> [!tip] Remember
+> Fail fast in CI, fix flaky tests instead of retrying them, and release to a small slice of production before everyone.
+
 ## 1. Why it exists
 
-A team merges to `main` 40 times a day. Suppose the full test suite — unit, integration, and E2E — takes 45 minutes to run end to end. If every commit waits for the full suite before merging, the team can land at most `(8 hours × 60) / 45 ≈ 10` commits per engineer-day **(an estimate, for illustration)**, and two commits queued back to back delay every commit behind them by 45 minutes.
+A team merges to `main` 40 times a day. Suppose the full test suite — unit, integration, and E2E — takes 45 minutes to run end to end.
+
+If every commit waits for the full suite before merging, the team can land at most `(8 hours × 60) / 45 ≈ 10` commits per engineer-day **(an estimate, for illustration)**, and two commits queued back to back delay every commit behind them by 45 minutes.
 
 Splitting the suite into fast and slow stages fixes the queue: a unit-test gate that takes 90 seconds blocks a bad commit almost immediately, while the 45-minute E2E suite runs once overnight against everything merged that day. The team gets fast feedback on the common case (a genuine bug) without paying the full cost on every commit.
 
@@ -127,7 +179,9 @@ stateDiagram-v2
 
 ### 3.5 Feature flags and canary releases as testing in production
 
-A **canary release** deploys the new version to a small slice of production traffic (a "canary," after the coal-mine sensor) and compares its error rate, latency, and business metrics against the rest of the fleet before rolling out further. A **feature flag** gates this at the request level instead of the deploy level: the new code is already deployed everywhere, dark, and a flag decides per-request whether to use it.
+A **canary release** deploys the new version to a small slice of production traffic (a "canary," after the coal-mine sensor) and compares its error rate, latency, and business metrics against the rest of the fleet before rolling out further.
+
+A **feature flag** gates this at the request level instead of the deploy level: the new code is already deployed everywhere, dark, and a flag decides per-request whether to use it.
 
 ```mermaid
 sequenceDiagram
@@ -345,7 +399,9 @@ func randomID(i int) string {
 
 ## 7. In production
 
-- **Real systems:** Google's test infrastructure auto-detects and reruns flaky tests while flagging them for investigation, rather than letting a single flaky run block a release train (Google Testing Blog, 2016). Automated canary analysis — rolling back a release automatically when it regresses on key metrics, without a human in the loop — is a widely used pattern at companies operating large-scale services, popularized in industry engineering blogs alongside Martin Fowler's canary-release write-up cited above.
+- **Real systems:** Google's test infrastructure auto-detects and reruns flaky tests while flagging them for investigation, rather than letting a single flaky run block a release train (Google Testing Blog, 2016).
+
+  Automated canary analysis — rolling back a release automatically when it regresses on key metrics, without a human in the loop — is a widely used pattern at companies operating large-scale services, popularized in industry engineering blogs alongside Martin Fowler's canary-release write-up cited above.
 - **Failure modes → fixes:**
   - *Flaky quarantine becomes permanent* → put an expiry/owner on every quarantined test; review the list in a weekly or sprint cadence.
   - *Canary bucket flips a user between old/new on every request* → use a deterministic hash of a stable identity (user ID, not session ID), as in section 4, never a fresh random draw per request.
@@ -359,38 +415,68 @@ func randomID(i int) string {
 
 ## 8. Deep dive
 
-**Why retries alone make things worse.** A retry-on-failure policy without quarantine optimizes the metric "is the build green" while silently degrading the metric that actually matters, "does a red build mean something is broken." Once engineers learn that red sometimes means nothing, the expected cost of investigating a red build drops, and so does the probability anyone investigates the one time it's a real regression. This is the core argument for quarantine-with-ownership over blind retries: it keeps the signal (a named, tracked flaky test) without destroying trust in the gate.
+**Why retries alone make things worse.** A retry-on-failure policy without quarantine optimizes the metric "is the build green" while silently degrading the metric that actually matters, "does a red build mean something is broken." Once engineers learn that red sometimes means nothing, the expected cost of investigating a red build drops, and so does the probability anyone investigates the one time it's a real regression.
 
-**Canary analysis as a statistical test, not a vibe check.** A naive canary compares one metric's absolute value between canary and control, but with a small canary slice (1% of traffic), noise alone can produce a difference that looks like a regression. Robust canary analysis treats this as a hypothesis test: it compares distributions (not single numbers) between canary and control cohorts that are matched on confounders (same time window, similar traffic mix), and only flags a regression when the difference exceeds a threshold accounting for the sample size — otherwise a canary at 1% traffic will "detect" false regressions constantly on pure sampling noise.
+This is the core argument for quarantine-with-ownership over blind retries: it keeps the signal (a named, tracked flaky test) without destroying trust in the gate.
 
-**Order-dependent flakiness and Go specifically.** Go's `go test` runs tests within a package sequentially by default in the order they appear in source, except for tests calling `t.Parallel()`: each such test pauses at that call, and only once every non-parallel test in the package has finished running do all the paused parallel tests resume and run concurrently with each other. A test suite that happens to pass because test A's side effect sets up test B's precondition will break the moment someone reorders the file, adds `t.Parallel()` to test A, or a future Go release changes default ordering — `go test -shuffle=on` (available since Go 1.17) exists specifically to surface this class of bug early, by randomizing test order on each run and printing the seed used so a failure can be reproduced.
+**Canary analysis as a statistical test, not a vibe check.** A naive canary compares one metric's absolute value between canary and control, but with a small canary slice (1% of traffic), noise alone can produce a difference that looks like a regression.
 
-**The feature-flag "debt" problem.** Every flag is a second code path that needs to keep compiling, keep passing tests, and keep being reasoned about — a codebase with hundreds of stale 100%-rolled-out flags has effectively hundreds of untested `if` branches, because nobody writes new tests for a flag they assume is permanent. Treating flag removal as a required follow-up task (not an optional cleanup) is what keeps canary/flag infrastructure from becoming its own source of bugs.
+Robust canary analysis treats this as a hypothesis test: it compares distributions (not single numbers) between canary and control cohorts that are matched on confounders (same time window, similar traffic mix), and only flags a regression when the difference exceeds a threshold accounting for the sample size — otherwise a canary at 1% traffic will "detect" false regressions constantly on pure sampling noise.
 
-**Synthetic monitoring's blind spot, precisely.** A synthetic check is a fixed script; it validates exactly the paths someone thought to write down, at the frequency it's scheduled, usually from a small number of vantage points. It will not notice a new feature silently failing for 2% of users in one region unless someone adds a check for that specific feature and region — which is why synthetic monitoring is paired with real-traffic observability (error rates and latency percentiles from production itself), not used alone.
+**Order-dependent flakiness and Go specifically.** Go's `go test` runs tests within a package sequentially by default in the order they appear in source, except for tests calling `t.Parallel()`: each such test pauses at that call, and only once every non-parallel test in the package has finished running do all the paused parallel tests resume and run concurrently with each other.
+
+A test suite that happens to pass because test A's side effect sets up test B's precondition will break the moment someone reorders the file, adds `t.Parallel()` to test A, or a future Go release changes default ordering — `go test -shuffle=on` (available since Go 1.17) exists specifically to surface this class of bug early, by randomizing test order on each run and printing the seed used so a failure can be reproduced.
+
+**The feature-flag "debt" problem.** Every flag is a second code path that needs to keep compiling, keep passing tests, and keep being reasoned about — a codebase with hundreds of stale 100%-rolled-out flags has effectively hundreds of untested `if` branches, because nobody writes new tests for a flag they assume is permanent.
+
+Treating flag removal as a required follow-up task (not an optional cleanup) is what keeps canary/flag infrastructure from becoming its own source of bugs.
+
+**Synthetic monitoring's blind spot, precisely.** A synthetic check is a fixed script; it validates exactly the paths someone thought to write down, at the frequency it's scheduled, usually from a small number of vantage points.
+
+It will not notice a new feature silently failing for 2% of users in one region unless someone adds a check for that specific feature and region — which is why synthetic monitoring is paired with real-traffic observability (error rates and latency percentiles from production itself), not used alone.
 
 ## 9. Interview questions
 
 > [!question]- What's the difference between a test being "flaky" and a test that fails because of a genuine intermittent bug (for example, a real race condition in the code under test)?
-> A flaky test fails and passes on the *same* code with no code change, because the test itself is non-deterministic (time, randomness, shared state, network). A genuine intermittent bug is the production code that's actually non-deterministic — for example a real data race — and the test correctly surfaces it inconsistently. The fix differs: a flaky test gets rewritten to remove its own non-determinism; a genuine race gets fixed in the code under test (and `go test -race` is specifically there to catch this second case, not the first).
+> A flaky test fails and passes on the *same* code with no code change, because the test itself is non-deterministic (time, randomness, shared state, network).
+>
+> A genuine intermittent bug is the production code that's actually non-deterministic — for example a real data race — and the test correctly surfaces it inconsistently.
+>
+> The fix differs: a flaky test gets rewritten to remove its own non-determinism; a genuine race gets fixed in the code under test (and `go test -race` is specifically there to catch this second case, not the first).
 
 > [!question]- Why shouldn't a team just add automatic retries to every CI job and call it done?
-> Because it hides regressions instead of fixing causes: once a build can go green after silently failing and retrying, "red means broken" stops being reliably true, and the one time a retry papers over a real regression, it ships to production unnoticed. Retries are acceptable as a stop-gap only when paired with tracking (which tests needed a retry) and a quarantine process with an owner and deadline for the root cause.
+> Because it hides regressions instead of fixing causes: once a build can go green after silently failing and retrying, "red means broken" stops being reliably true, and the one time a retry papers over a real regression, it ships to production unnoticed.
+>
+> Retries are acceptable as a stop-gap only when paired with tracking (which tests needed a retry) and a quarantine process with an owner and deadline for the root cause.
 
 > [!question]- A test passes locally every time but fails about 1 in 20 runs in CI. What's your first move?
-> Reproduce the failure mode before guessing at a fix: check whether CI runs tests in parallel/sharded in a way local runs don't, whether the test touches a shared resource (DB, filesystem, global variable), and whether it depends on timing (sleeps, timeouts) that's tighter under CI's load. `go test -race -count=100` locally, and `go test -shuffle=on`, often reproduce the exact class of bug (data race, order dependency) without needing CI access at all.
+> Reproduce the failure mode before guessing at a fix: check whether CI runs tests in parallel/sharded in a way local runs don't, whether the test touches a shared resource (DB, filesystem, global variable), and whether it depends on timing (sleeps, timeouts) that's tighter under CI's load.
+>
+> `go test -race -count=100` locally, and `go test -shuffle=on`, often reproduce the exact class of bug (data race, order dependency) without needing CI access at all.
 
 > [!question]- What is the actual difference between a canary release and a feature flag — aren't they both "test in production"?
-> A canary release splits traffic at the *deploy/infrastructure* level — two running versions of a service, traffic-split by the load balancer or mesh. A feature flag splits behavior at the *request* level inside one running binary — one deployed version, with an if-branch gated by a flag service. Canary needs new infrastructure support per deploy; feature flags need an in-process flag check but can toggle instantly without any redeploy, including an instant kill switch.
+> A canary release splits traffic at the *deploy/infrastructure* level — two running versions of a service, traffic-split by the load balancer or mesh.
+>
+> A feature flag splits behavior at the *request* level inside one running binary — one deployed version, with an if-branch gated by a flag service.
+>
+> Canary needs new infrastructure support per deploy; feature flags need an in-process flag check but can toggle instantly without any redeploy, including an instant kill switch.
 
 > [!question]- Trap: "If we have good E2E test coverage, we don't need testing in production." What's wrong with this?
-> E2E tests, however thorough, run against an approximation of production — synthetic data, a smaller or mocked set of dependencies, controlled traffic. They structurally cannot reproduce production's real traffic shape, real data skew, real third-party latency variance, or real infrastructure failures (an expired certificate, a misconfigured DNS record, a dependency's own outage). Testing in production (canary analysis, synthetic monitoring) exists precisely to catch the class of failure that only shows up with real traffic against real infrastructure — it's a different net, not a worse version of the same net.
+> E2E tests, however thorough, run against an approximation of production — synthetic data, a smaller or mocked set of dependencies, controlled traffic.
+>
+> They structurally cannot reproduce production's real traffic shape, real data skew, real third-party latency variance, or real infrastructure failures (an expired certificate, a misconfigured DNS record, a dependency's own outage).
+>
+> Testing in production (canary analysis, synthetic monitoring) exists precisely to catch the class of failure that only shows up with real traffic against real infrastructure — it's a different net, not a worse version of the same net.
 
 > [!question]- How would you decide what percentage of traffic a canary should start at, and how fast to ramp it?
-> Start small enough that a regression's blast radius is acceptable if it's wrong (commonly 1–5%), but large enough that your canary-analysis metrics aren't pure noise — a sample size too small can't statistically distinguish a real regression from random variance. Ramp in steps (for example 1% → 5% → 25% → 100%) with an automated health check gating each step, and keep each step live long enough to catch effects with a known delay (for example a metric that only regresses after cache warm-up, or after a batch job runs).
+> Start small enough that a regression's blast radius is acceptable if it's wrong (commonly 1–5%), but large enough that your canary-analysis metrics aren't pure noise — a sample size too small can't statistically distinguish a real regression from random variance.
+>
+> Ramp in steps (for example 1% → 5% → 25% → 100%) with an automated health check gating each step, and keep each step live long enough to catch effects with a known delay (for example a metric that only regresses after cache warm-up, or after a batch job runs).
 
 > [!question]- Why does it matter that canary bucketing is deterministic per user ID rather than randomized per request?
-> If bucketing were randomized per request, the same user could hit the new code once and the old code the next request, making bugs show up as random-seeming inconsistency instead of a clean "canary users see X" signal — this breaks both the user's experience (flickering between versions) and the team's ability to attribute a regression to the canary cohort specifically. Hashing a stable identity (user ID) deterministically, as in this note's worked example, keeps one user on one path for the rollout's duration.
+> If bucketing were randomized per request, the same user could hit the new code once and the old code the next request, making bugs show up as random-seeming inconsistency instead of a clean "canary users see X" signal — this breaks both the user's experience (flickering between versions) and the team's ability to attribute a regression to the canary cohort specifically.
+>
+> Hashing a stable identity (user ID) deterministically, as in this note's worked example, keeps one user on one path for the rollout's duration.
 
 > [!question]- What's the single biggest risk of letting quarantined tests accumulate?
 > They silently stop providing coverage while still appearing in test-count dashboards as "passing" or at least "present," so a team's confidence in its test suite diverges from the suite's actual ability to catch regressions — and because a quarantined test by definition isn't gating anything, a real regression in that exact area can ship with nobody noticing until a quarantine audit (if one ever happens).
@@ -409,3 +495,8 @@ func randomID(i int) string {
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Unit, Integration and E2E Tests]]
 - **Next:** [[Chaos Engineering]], [[Load and Performance Testing]]
 - **Compare with:** [[Testing in Go]] (the `testing` package mechanics this note's pipeline runs), [[Benchmarks, Profiling and Tracing]] (profiling a single run vs. this note's ongoing production monitoring), [[Testing LLD Code]] (LLD-round test structure — a different, interview-scoped scenario from this note's CI/production scope)
+
+### Watch on YouTube
+
+- [Series 2:How to Handle Flaky Tests in Production / Automation Framework Best Practices](https://www.youtube.com/watch?v=4ovVYJ44Pos) · Komal Tech Simplified · 18 min · 76 views
+- [Avoid flaky end-to-end tests due to poorly hydrated Frontends with Playwright's toPass()](https://www.youtube.com/watch?v=8g7FvoRToGo) · Checkly · 7 min · 23,332 views

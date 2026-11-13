@@ -8,13 +8,15 @@ sources:
   - "MCP Transports specification: stdio and Streamable HTTP (modelcontextprotocol.io/specification/2025-06-18/basic/transports)"
   - "Anthropic docs, Model Context Protocol (anthropic.com/docs, 2026)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Model Context Protocol (MCP)
 
 > [!summary] TL;DR
-> The Model Context Protocol (MCP) is an open, JSON-RPC 2.0 based protocol that standardizes how an LLM-powered application (a **host**) connects to the tools, data and prompts a separate process (an **MCP server**) exposes — the same way LSP standardized how an editor talks to a language's tooling. Instead of writing a bespoke integration per tool per AI app, you write one MCP server and any MCP-compatible host can use it.
+> The Model Context Protocol (MCP) is an open, JSON-RPC 2.0 based protocol that standardizes how an LLM-powered application (a **host**) connects to the tools, data and prompts a separate process (an **MCP server**) exposes — the same way LSP standardized how an editor talks to a language's tooling.
+>
+> Instead of writing a bespoke integration per tool per AI app, you write one MCP server and any MCP-compatible host can use it.
 
 > [!abstract] Core idea
 > - MCP has three roles: a **host** (the AI application, e.g. an IDE or a chat app), one **client** per server connection inside the host, and a **server** (a separate process exposing tools/resources/prompts).
@@ -23,15 +25,69 @@ updated: 2026-11-07
 > - Content a server returns (a resource's text, a tool's result) is data the model reads, never an instruction the host must obey — this is why MCP and prompt-injection defence are the same conversation (see [[Guardrails and LLM Security]]).
 > - MCP is the transport for tools; it does not replace the model's own tool-calling mechanics from [[Structured Outputs and Tool Calling]] — the host still turns the model's tool-call request into an MCP `tools/call`.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your AI assistant needs to read from a database, search a wiki, and open GitHub issues.
+Without a standard, each AI app writes its own adapter for each tool, again and again.
+MCP is one shared "plug shape": write a tool server once, and any MCP-aware app can use it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Protocol | Agreed rules for how two programs talk | HTTP for browsers and web servers |
+| JSON-RPC | Sending "call this method with these params" as JSON | `{"method":"tools/list","id":1}` |
+| Host | The AI app the user talks to | An IDE or chat app |
+| Server (MCP) | A separate program that offers tools or data | A Postgres MCP server |
+| Tool | An action the model can ask to run | `query_db(sql)` |
+| Resource | Read-only data the server can share | A file or a wiki page |
+| Transport | How the messages travel | stdin/stdout, or HTTP |
+| Prompt injection | Hidden text that tries to give the model orders | "Ignore your rules" inside a document |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User"] --> H["Host app<br/>(with the LLM)"]
+    H --> C1["Client 1"]
+    H --> C2["Client 2"]
+    C1 -- "JSON-RPC" --> S1["MCP server:<br/>database"]
+    C2 -- "JSON-RPC" --> S2["MCP server:<br/>GitHub"]
+```
+
+**Analogy.** MCP is like USB: any device with the right plug works in any laptop with the right port, without a custom cable per pair.
+Where it breaks: plugging in a USB device does not let it read your files by itself, but MCP tool output goes straight into the model's context, so the host must treat it as untrusted data.
+
+**How the rest of this note builds up**
+
+- First, why MCP exists (section 1) and the host / client / server model (section 2).
+- Then how it works: primitives, JSON-RPC messages, lifecycle, transports and discovery (section 3).
+- Then a Go worked example of the MCP tool-call message flow (section 4), and how MCP compares with other options (sections 5-6).
+- Finally the SDE-3 deep dive: production concerns, sampling and roots, and why discovery is not authorization (sections 7-9).
+
+> [!tip] Remember
+> MCP standardizes how an AI app finds and calls tools; it does not decide which tools are safe to use.
+
 ## 1. Why it exists
 
-Say your Go backend has an agent that needs to read from Postgres, search internal Confluence pages, and create Jira tickets. Without a shared protocol, you write three bespoke adapters: parse the model's tool-call JSON, map it to a Postgres query function, a Confluence search client, and a Jira API wrapper, each with its own auth, its own schema, its own error shape. Every new AI application that wants the same three capabilities (your CLI tool, your Slack bot, your IDE assistant) repeats that work.
+Say your Go backend has an agent that needs to read from Postgres, search internal Confluence pages, and create Jira tickets.
 
-MCP factors the "expose a capability to an LLM app" problem out of the model-calling code. You write one MCP server for Postgres (or use an existing one), one for Confluence, one for Jira. Any MCP host — Claude Code, Claude Desktop, your own Go backend, a teammate's IDE — can connect to the same servers and get the same tools, resources and prompts, with one connection handshake and one message format. It is the same move LSP made for editor-to-language-tooling integrations: `N` editors × `M` languages collapses from `N×M` integrations to `N+M`.
+Without a shared protocol, you write three bespoke adapters: parse the model's tool-call JSON, map it to a Postgres query function, a Confluence search client, and a Jira API wrapper, each with its own auth, its own schema, its own error shape.
+
+Every new AI application that wants the same three capabilities (your CLI tool, your Slack bot, your IDE assistant) repeats that work.
+
+MCP factors the "expose a capability to an LLM app" problem out of the model-calling code. You write one MCP server for Postgres (or use an existing one), one for Confluence, one for Jira.
+
+Any MCP host — Claude Code, Claude Desktop, your own Go backend, a teammate's IDE — can connect to the same servers and get the same tools, resources and prompts, with one connection handshake and one message format.
+
+It is the same move LSP made for editor-to-language-tooling integrations: `N` editors × `M` languages collapses from `N×M` integrations to `N+M`.
 
 ## 2. Mental model
 
-Think of an MCP server as a plugin that runs out-of-process from the AI application. The **host** (your chat app, IDE, or agent backend) opens one **client** connection per server it wants to use. Each client talks to exactly one server over one transport. The host aggregates what every connected server advertises — its tools, its readable resources, its reusable prompts — and decides what to actually offer the model (often less than everything a server exposes, scoped per user or per task).
+Think of an MCP server as a plugin that runs out-of-process from the AI application. The **host** (your chat app, IDE, or agent backend) opens one **client** connection per server it wants to use. Each client talks to exactly one server over one transport.
+
+The host aggregates what every connected server advertises — its tools, its readable resources, its reusable prompts — and decides what to actually offer the model (often less than everything a server exposes, scoped per user or per task).
 
 ```mermaid
 flowchart LR
@@ -89,13 +145,29 @@ sequenceDiagram
 
 MCP defines the message *content*; a transport carries the bytes.
 
-- **stdio**: the host spawns the server as a **subprocess** and talks over its stdin/stdout. Each JSON-RPC message is one line of UTF-8 JSON, newline-terminated, with no embedded newlines. Simple, zero network config, and the process lifetime *is* the connection lifetime — the host kills the process to disconnect. This is the default for local tools (a server that reads your filesystem, your local Postgres).
-- **Streamable HTTP**: the server is a long-running, possibly remote, process behind a single HTTP endpoint (conventionally `/mcp`). The client `POST`s a JSON-RPC message and gets back either a single JSON response or, when the server wants to stream multiple messages (progress notifications, a long tool call), an `Accept: text/event-stream` SSE body. The client can also issue a `GET` on the same endpoint to open a standing SSE stream for server-initiated messages. A session is tracked with an `Mcp-Session-Id` response header the client echoes on later requests. This replaced an older, two-endpoint "HTTP+SSE" transport (deprecated) because that design needed sticky sessions across two separate connections, which doesn't survive behind an ordinary load balancer.
-- **Authentication for remote servers**: stdio has no auth layer of its own (the OS process boundary is the trust boundary). Streamable HTTP servers that aren't purely local use OAuth 2.1 — the client is a registered OAuth client, the MCP server is a resource server, and tool calls carry a bearer token scoped (ideally) to exactly what that client should be allowed to do. Treat an MCP server's OAuth scope as another least-privilege boundary, on top of the host-side tool scoping in [[Guardrails and LLM Security]].
+- **stdio**: the host spawns the server as a **subprocess** and talks over its stdin/stdout. Each JSON-RPC message is one line of UTF-8 JSON, newline-terminated, with no embedded newlines.
+
+  Simple, zero network config, and the process lifetime *is* the connection lifetime — the host kills the process to disconnect. This is the default for local tools (a server that reads your filesystem, your local Postgres).
+- **Streamable HTTP**: the server is a long-running, possibly remote, process behind a single HTTP endpoint (conventionally `/mcp`).
+
+  The client `POST`s a JSON-RPC message and gets back either a single JSON response or, when the server wants to stream multiple messages (progress notifications, a long tool call), an `Accept: text/event-stream` SSE body.
+
+  The client can also issue a `GET` on the same endpoint to open a standing SSE stream for server-initiated messages. A session is tracked with an `Mcp-Session-Id` response header the client echoes on later requests.
+
+  This replaced an older, two-endpoint "HTTP+SSE" transport (deprecated) because that design needed sticky sessions across two separate connections, which doesn't survive behind an ordinary load balancer.
+- **Authentication for remote servers**: stdio has no auth layer of its own (the OS process boundary is the trust boundary).
+
+  Streamable HTTP servers that aren't purely local use OAuth 2.1 — the client is a registered OAuth client, the MCP server is a resource server, and tool calls carry a bearer token scoped (ideally) to exactly what that client should be allowed to do.
+
+  Treat an MCP server's OAuth scope as another least-privilege boundary, on top of the host-side tool scoping in [[Guardrails and LLM Security]].
 
 ### Discovery is the model's safety net, not a guarantee
 
-`tools/list` exists so the host — and by extension the model — only ever sees tools the server actually chose to expose right now. But "the server offered it" is not "the host should allow it": a well-behaved host still intersects a server's advertised tools with its own policy (which roles, which users, which task contexts get which tools) before showing anything to the model. A server is an external, sometimes third-party process; its tool list is input, not authorization.
+`tools/list` exists so the host — and by extension the model — only ever sees tools the server actually chose to expose right now.
+
+But "the server offered it" is not "the host should allow it": a well-behaved host still intersects a server's advertised tools with its own policy (which roles, which users, which task contexts get which tools) before showing anything to the model.
+
+A server is an external, sometimes third-party process; its tool list is input, not authorization.
 
 ## 4. Worked example
 
@@ -117,7 +189,9 @@ func Call(name string, args map[string]string) string {
 }
 ```
 
-That's the idea — a named function the model asks to run — but it skips the two things that make MCP a protocol rather than a convention: a schema the host can validate `args` against before the server even sees them, and a transport so the server can be a separate, sandboxed process instead of inline code. The full version below adds both, plus the `initialize`/`tools/list`/`tools/call` message flow over a real transport.
+That's the idea — a named function the model asks to run — but it skips the two things that make MCP a protocol rather than a convention: a schema the host can validate `args` against before the server even sees them, and a transport so the server can be a separate, sandboxed process instead of inline code.
+
+The full version below adds both, plus the `initialize`/`tools/list`/`tools/call` message flow over a real transport.
 
 A minimal, spec-shaped MCP server with one tool, a stdio transport (newline-delimited JSON) and a Streamable HTTP transport (one POST endpoint). It compiles and passes `go vet` and `go test -race` on Go 1.24; it is a teaching implementation, not the official SDK.
 
@@ -479,8 +553,12 @@ In production you would use the official SDK (`github.com/modelcontextprotocol/g
 ## 8. Deep dive
 
 - **Why JSON-RPC 2.0 and not gRPC or plain REST?** JSON-RPC's request/response/notification trio maps directly onto "call a tool and get a result" / "the server's tool list changed" without inventing new semantics, and it is trivially transportable over both a process pipe (stdio) and HTTP — a single message format, two transports, rather than a transport-specific wire format each.
-- **Sampling and roots.** Two less-common capabilities complete the picture: **sampling** lets a server ask the *host's* LLM to complete a prompt on the server's behalf (useful for a server that wants an LLM call without holding its own API key) — the host still mediates and can refuse; **roots** let a host tell a server which directories or URIs it is allowed to touch, a client-side scoping mechanism that complements server-side tool-permission scoping.
-- **Why discovery alone isn't authorization.** `tools/list` is the server's opinion of what it offers; nothing in the protocol stops a server from advertising (or a model from trying to call) a tool outside what a given user should be allowed to touch. The host's own authorization layer — which maps to a specific user/session/role, not to "whatever the server said" — is where real access control lives, exactly mirroring [[OWASP API Security Top 10]]'s broken-function-level-authorization lesson one layer up.
+- **Sampling and roots.** Two less-common capabilities complete the picture: **sampling** lets a server ask the *host's* LLM to complete a prompt on the server's behalf (useful for a server that wants an LLM call without holding its own API key) — the host still mediates and can refuse.
+
+  **Roots** let a host tell a server which directories or URIs it is allowed to touch, a client-side scoping mechanism that complements server-side tool-permission scoping.
+- **Why discovery alone isn't authorization.** `tools/list` is the server's opinion of what it offers; nothing in the protocol stops a server from advertising (or a model from trying to call) a tool outside what a given user should be allowed to touch.
+
+  The host's own authorization layer — which maps to a specific user/session/role, not to "whatever the server said" — is where real access control lives, exactly mirroring [[OWASP API Security Top 10]]'s broken-function-level-authorization lesson one layer up.
 - **Statelessness of the underlying model call.** MCP gives the *host* durable state (the open connections, the negotiated capabilities) but the model call itself is still the stateless request/response described in [[LLM Fundamentals]] — "memory" of earlier tool results is still just conversation history the host resends, same as any other turn.
 - **Versioning.** `protocolVersion` is negotiated at `initialize`; a host and server that don't share a supported version should fail the connection explicitly rather than guess at compatibility, the same defensive instinct as API versioning anywhere else.
 
@@ -523,3 +601,8 @@ In production you would use the official SDK (`github.com/modelcontextprotocol/g
 - **Before this:** [[Structured Outputs and Tool Calling]], [[Calling LLM APIs from Go]]
 - **Next:** [[Guardrails and LLM Security]], [[AI Agents and Agentic Workflows]]
 - **Compare with:** [[Calling External APIs]] (the general Go HTTP-client patterns an MCP Streamable HTTP client reuses)
+
+### Watch on YouTube
+
+- [Model Context Protocol (MCP) Explained for Beginners: AI Flight Booking Demo!](https://www.youtube.com/watch?v=E2DEHOEbzks) · KodeKloud · 24 min · 1,376,834 views
+- [Model Context Protocol Clearly Explained / MCP Beyond the Hype](https://www.youtube.com/watch?v=tzrwxLNHtRY) · codebasics · 15 min · 648,211 views

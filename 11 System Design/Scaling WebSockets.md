@@ -16,7 +16,7 @@ sources:
   - "Redis docs, Pub/Sub (at-most-once delivery) and Streams"
   - "NATS docs: Core NATS at-most-once, JetStream persistence"
   - "AWS Architecture Blog, Exponential Backoff and Jitter (Marc Brooker, 2015)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Scaling WebSockets
@@ -32,6 +32,51 @@ updated: 2026-11-04
 > - Classic mistake: scaling WebSocket servers like stateless HTTP servers. Adding a node does not move existing connections to it.
 
 This note is about running WebSockets at scale. The protocol itself (handshake, frames, ping/pong, SSE and long polling) is in [[Real-time APIs - WebSocket, SSE and Long Polling]], and the Go server code is in [[WebSockets and SSE in Go]].
+
+## Start here: the basics
+
+**The problem in one story.**
+A normal web page is like sending letters: ask, get one reply, done.
+A chat app is like a phone call that stays open, so the server can talk first.
+Now 10 million people are on calls at once, spread over 200 switchboards.
+Alice's switchboard must find which one holds Bob's call, and nobody's messages may get lost when a switchboard restarts.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Connection / socket | An open line between client and server | One browser tab's chat link |
+| WebSocket | A connection that stays open both ways | Server pushes "new message" any time |
+| Gateway | A server whose job is holding sockets | Gateway 17 holds 50,000 users |
+| Stateful | The server remembers something about you | Your socket lives only on gateway 17 |
+| Pub/sub | Send a message to a topic; subscribers receive it | Publish to `gw-142`, gateway 142 gets it |
+| Registry | A lookup table of who is where | `bob → gateway 142` |
+| Sequence number | A counter on each message | Message #57, so #56 came before |
+| Jitter | A small random delay | Reconnect after 1-5 s, not all at 0 s |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Alice"] --- G1["Gateway 17"]
+    B["Bob"] --- G2["Gateway 142"]
+    G1 -- "where is Bob?" --> R[("Registry")]
+    G1 -- "publish" --> P["Pub/sub bus"]
+    P --> G2
+```
+
+**Analogy.** A hotel with many floors: the front desk (registry) knows each guest's room, and a bellhop (bus) carries notes between floors.
+Where it breaks: hotel guests do not all check out and back in at the same second, but sockets do when a gateway restarts.
+
+**How the rest of this note builds up**
+
+- First, why WebSockets are hard to scale (section 1) and the mental model (section 2).
+- Then the architecture, routing between gateways and the connection lifecycle (section 3).
+- Then a capacity estimate for 10 million users and Go code for the hub, resume buffer and reconnects (section 4).
+- Finally the SDE-3 deep dive: load balancers, reconnect storms, slow clients and epoll-based servers (sections 5-8).
+
+> [!tip] Remember
+> Each socket lives on one server, so you need a registry to find it, a bus to reach it, and resume to survive drops.
 
 ## 1. Why it exists
 
@@ -147,14 +192,20 @@ stateDiagram-v2
 
 All figures below are **estimates** to show the method.
 
-- **Memory per connection** with a goroutine-per-connection design (for example gorilla/websocket with one reader and one writer goroutine): 2 goroutines × at least 2 KiB of stack (Go starts stacks at 2 KiB and grows them; real stacks are often 4 to 8 KiB) + 4 KiB read buffer + 4 KiB write buffer (gorilla's defaults) + TLS and kernel socket buffers. Call it **about 30 KiB** per connection.
+- **Memory per connection** with a goroutine-per-connection design (for example gorilla/websocket with one reader and one writer goroutine): 2 goroutines × at least 2 KiB of stack (Go starts stacks at 2 KiB and grows them; real stacks are often 4 to 8 KiB) + 4 KiB read buffer + 4 KiB write buffer (gorilla's defaults) + TLS and kernel socket buffers.
+
+  Call it **about 30 KiB** per connection.
 - **Per gateway:** 50,000 connections × 30 KiB ≈ 1.5 GB of RAM. That fits a modest machine; CPU for TLS and message volume is often the real limit.
 - **Fleet:** 10,000,000 ÷ 50,000 = **200 gateways**, plus spare capacity (say 25%, so about 250) to absorb a zone failure and deploys.
 - **Heartbeats:** ping every 30 s → 10,000,000 ÷ 30 ≈ **333,000 pings per second** across the fleet, handled locally by each gateway (1,667 per gateway per second).
-- **Registry writes:** if every gateway refreshes each user's TTL on every 30 s heartbeat, that is also about **333,000 writes per second** to Redis. Each gateway can pipeline its 1,667 `SET presence:{user} gw-17 EX 60` commands per second, but the total still needs a sharded Redis Cluster (for example 6 to 10 shards, estimate). A cheaper alternative is to write `user → gateway` only on connect and disconnect (about the connect rate, far lower), and treat "the gateway is alive" (one heartbeat key per gateway) as the presence signal.
+- **Registry writes:** if every gateway refreshes each user's TTL on every 30 s heartbeat, that is also about **333,000 writes per second** to Redis. Each gateway can pipeline its 1,667 `SET presence:{user} gw-17 EX 60` commands per second, but the total still needs a sharded Redis Cluster (for example 6 to 10 shards, estimate).
+
+  A cheaper alternative is to write `user → gateway` only on connect and disconnect (about the connect rate, far lower), and treat "the gateway is alive" (one heartbeat key per gateway) as the presence signal.
 - **Reconnect storm:** draining one gateway's 50,000 clients over a **30 s jittered window** gives about 50,000 ÷ 30 ≈ **1,700 new handshakes per second**, spread over 249 other gateways (about 7 each per second). Without jitter, 50,000 handshakes land within a second or two.
 - **File descriptors:** 50,000 sockets need `ulimit -n` (`nofile`) well above 50,000; the common default soft limit of 1,024 fails at connection 1,021 or so.
-- **Ephemeral ports:** a proxy that opens its own connection to a backend uses one local port per connection for each (source IP, backend IP, backend port). With Linux's default `ip_local_port_range` of 32768-60999, that is **28,232 connections** per backend address per proxy IP. An L7 proxy holding 50,000 WebSockets to one backend address runs out. Fixes: more backend IPs or ports, more proxy source IPs, or L4 pass-through.
+- **Ephemeral ports:** a proxy that opens its own connection to a backend uses one local port per connection for each (source IP, backend IP, backend port). With Linux's default `ip_local_port_range` of 32768-60999, that is **28,232 connections** per backend address per proxy IP.
+
+  An L7 proxy holding 50,000 WebSockets to one backend address runs out. Fixes: more backend IPs or ports, more proxy source IPs, or L4 pass-through.
 
 ### Go code: the gateway's hub, resume buffer, registry and reconnect delay
 
@@ -529,7 +580,9 @@ sequenceDiagram
 - **Do not use WebSockets for one-way updates.** If the server only pushes (notifications, progress bars, live scores), SSE is plain HTTP, reconnects with `Last-Event-ID` built in, and passes through proxies more easily.
 - **Do not use them for rare updates.** If a user gets one update per minute, long polling or a mobile push notification costs far less than a socket per user.
 - **Statefulness makes deploys slower.** You must drain connections gradually; a fleet of 250 gateways drained 10 at a time with a 30 s window takes about 13 minutes (25 batches × 30 s, estimate).
-- **L4 vs L7 load balancers:** L4 (TCP pass-through) has no per-connection HTTP parsing and no ephemeral-port problem on the backend side, but cannot route by path or header. L7 can route `/ws` to the gateway fleet and terminate TLS, but must support the `Upgrade` handshake and must have an idle timeout longer than your ping interval (ALB default 60 s, so ping every 30 s).
+- **L4 vs L7 load balancers:** L4 (TCP pass-through) has no per-connection HTTP parsing and no ephemeral-port problem on the backend side, but cannot route by path or header.
+
+  L7 can route `/ws` to the gateway fleet and terminate TLS, but must support the `Upgrade` handshake and must have an idle timeout longer than your ping interval (ALB default 60 s, so ping every 30 s).
 - **Imbalance after scale-out:** a new gateway starts with zero connections, and the old ones keep theirs until clients reconnect. Least-connections balancing helps only for *new* connections. To rebalance, ask a fraction of clients on overloaded nodes to reconnect.
 
 ## 7. In production
@@ -557,7 +610,11 @@ sequenceDiagram
 
 ## 8. Deep dive
 
-- **Why epoll-based servers hold more sockets.** In the goroutine-per-connection design each socket owns at least one blocked goroutine and its read buffer even when idle. The "A Million WebSockets and Go" design (gobwas/ws) registers sockets with epoll and only starts a goroutine and allocates a buffer when data actually arrives, so idle sockets cost little more than the kernel's socket structure. The price is more complex code and fewer ready-made libraries; most teams only need it above a few hundred thousand sockets per node.
+- **Why epoll-based servers hold more sockets.** In the goroutine-per-connection design each socket owns at least one blocked goroutine and its read buffer even when idle.
+
+  The "A Million WebSockets and Go" design (gobwas/ws) registers sockets with epoll and only starts a goroutine and allocates a buffer when data actually arrives, so idle sockets cost little more than the kernel's socket structure.
+
+  The price is more complex code and fewer ready-made libraries; most teams only need it above a few hundred thousand sockets per node.
 - **Ordering.** Per-conversation sequence numbers, assigned by the message service (a database sequence, a counter in the partition leader, or a Snowflake-style ID per channel), give clients a total order to apply and a cursor to resume from. Ordering across conversations is not needed.
 - **Exactly-once to the user.** The bus delivers at-most-once and resume can replay messages the client already has, so delivery to the client is at-least-once. The client drops any message with `seq <= last_seq`, which makes the result effectively once. See [[Delivery Semantics and Exactly-Once]].
 - **Send idempotency.** The client attaches a `client_msg_id` (a UUID) to each send. If the ack is lost and the client resends, the message service deduplicates on it. See [[Idempotency and Idempotency Keys]].
@@ -603,3 +660,8 @@ sequenceDiagram
 - **Before this:** [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Load Balancing]]
 - **Next:** [[Case Study - Chat System]], [[Case Study - Notification System]], [[WebSockets and SSE in Go]]
 - **Compare with:** [[Redis as a Queue - Lists, Streams and Pub-Sub]] (the bus options), [[Notification Service]] (class-level design of delivery channels)
+
+### Watch on YouTube
+
+- [Scaling Websockets with Redis, HAProxy and Node JS - High-availability Group Chat Application](https://www.youtube.com/watch?v=gzIcGhJC8hA) · Hussein Nasser · 20 min · 116,212 views
+- [Scaling Websockets Horizontally / SocketIo / Redis Pub\Sub / HandsOn](https://www.youtube.com/watch?v=dcroxRr8uJc) · Irshit · 14 min · 3,098 views

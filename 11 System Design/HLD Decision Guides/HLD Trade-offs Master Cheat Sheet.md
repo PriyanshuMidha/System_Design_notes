@@ -13,7 +13,7 @@ sources:
   - "Redis documentation, persistence and eviction"
   - "Twitter engineering talk 'Timelines at Scale' (Raffi Krikorian, QCon 2013) for fan-out on write with the celebrity exception"
   - "RFC 6455 (WebSocket), WHATWG HTML Living Standard (Server-Sent Events)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HLD Trade-offs Master Cheat Sheet
@@ -26,6 +26,52 @@ updated: 2026-11-09
 > - Almost every choice is decided by a small set of questions: how much data, how many requests, what read/write ratio, what happens if data is stale or lost, what latency the user feels.
 > - There is no best option, only the option whose weak spot your system does not touch.
 > - Use this note as a fast lookup during prep. When a row is not enough, open the linked guide.
+
+## Start here: the basics
+
+**The problem in one story.**
+In a design interview, you keep hitting forks in the road: SQL or NoSQL? Queue or stream? Cache or not?
+Picking one by name earns little.
+Saying "I pick X because my system needs Y, and I accept cost Z" earns a lot.
+This note is a one-page map of those forks.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Trade-off | Gaining one thing by giving up another | Faster reads, but data may be a bit stale |
+| Read/write ratio | How many reads happen per write | 100 reads per 1 write for a menu |
+| Latency | How long one request takes | p99 = 200 ms |
+| Throughput | How much work per second | 10,000 writes per second |
+| Consistency | Whether every reader sees the latest write | Bank balance must be exact |
+| Partitioning (sharding) | Splitting data across machines | Users A-M on node 1, N-Z on node 2 |
+| Async | The caller does not wait for the work to finish | Put "send email" on a queue |
+| Cache | A fast copy of data to avoid slow lookups | Redis in front of Postgres |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Requirement<br/>(numbers, ratio, staleness)"] --> Q["Five questions"]
+    Q --> C{"Choice"}
+    C --> A["Option A + its cost"]
+    C --> B["Option B + its cost"]
+    A --> J["Justified pick"]
+    B --> J
+```
+
+**Analogy.** Choosing a vehicle: a bike, a car or a truck. None is "best"; it depends on the distance, the load and the budget.
+Where it breaks: vehicles are chosen once, but system choices interact, so one pick (say, async) changes others (say, consistency).
+
+**How the rest of this note builds up**
+
+- First, why the sheet exists and a mental model for choosing (sections 1-2).
+- Then the five questions, then families of choices: data stores, messaging, sync vs async, caching, APIs, consistency, storage, compute, load balancers (section 3).
+- Then a worked example narrated with numbers, plus variants and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive: how choices interact, PACELC, the cost of asynchrony and back-pressure (sections 7-8).
+
+> [!tip] Remember
+> There is no best option, only the one whose weak spot your system does not touch; always say the requirement and the cost.
 
 ## 1. Why it exists
 
@@ -149,7 +195,11 @@ flowchart TD
 
 See [[Real-time APIs - WebSocket, SSE and Long Polling]] and [[Scaling WebSockets]].
 
-Fan-out example with numbers: a user with 300 followers posting fan-out on write means 300 timeline inserts, fine. An account with 30 million followers means 30 million inserts per post, so the common hybrid is fan-out on write for ordinary users and fan-out on read (merge at read time) for celebrities. This is the approach described in Twitter's public talks on timelines. See [[Case Study - News Feed]].
+Fan-out example with numbers: a user with 300 followers posting fan-out on write means 300 timeline inserts, fine.
+
+An account with 30 million followers means 30 million inserts per post, so the common hybrid is fan-out on write for ordinary users and fan-out on read (merge at read time) for celebrities.
+
+This is the approach described in Twitter's public talks on timelines. See [[Case Study - News Feed]].
 
 ```mermaid
 sequenceDiagram
@@ -316,7 +366,9 @@ flowchart LR
     Match --> WS["WebSocket push to rider"]
 ```
 
-Interview-style narration: "Rides are 120 per second at peak, so one PostgreSQL primary suffices and gives me transactions. The firehose is driver location at 100k writes per second, so that goes to Redis with a log behind it. I accept that a Redis failure loses a few seconds of positions because they are refreshed every 5 seconds anyway." See [[Case Study - Ride Sharing and Proximity]] for the full design.
+Interview-style narration: "Rides are 120 per second at peak, so one PostgreSQL primary suffices and gives me transactions. The firehose is driver location at 100k writes per second, so that goes to Redis with a log behind it.
+
+I accept that a Redis failure loses a few seconds of positions because they are refreshed every 5 seconds anyway." See [[Case Study - Ride Sharing and Proximity]] for the full design.
 
 ## 5. Variants and comparison
 
@@ -376,11 +428,17 @@ What to monitor for each choice family:
 
 ### 8.1 Why choices interact
 
-A partitioned log (Kafka) gives per-partition order. If you also need per-user order, the partition key must be the user id. That makes a hot user a hot partition. If your database is sharded by a different key (say order id), a consumer that updates the database now crosses shards. The master lesson: pick the partition key once and reuse it through the log, the cache and the database wherever you can. See [[Message Ordering and Partition Keys]] and [[Hot Keys and Hot Partitions]].
+A partitioned log (Kafka) gives per-partition order. If you also need per-user order, the partition key must be the user id. That makes a hot user a hot partition.
+
+If your database is sharded by a different key (say order id), a consumer that updates the database now crosses shards.
+
+The master lesson: pick the partition key once and reuse it through the log, the cache and the database wherever you can. See [[Message Ordering and Partition Keys]] and [[Hot Keys and Hot Partitions]].
 
 ### 8.2 PACELC in one paragraph
 
-CAP says that during a network partition you choose between consistency and availability. PACELC adds that even with no partition you choose between latency and consistency. That second trade-off is the one you feel daily: reading from a nearby replica is fast and maybe stale; reading from the leader is correct and maybe far. See [[CAP and PACELC]] and [[Consistency Models]].
+CAP says that during a network partition you choose between consistency and availability. PACELC adds that even with no partition you choose between latency and consistency.
+
+That second trade-off is the one you feel daily: reading from a nearby replica is fast and maybe stale; reading from the leader is correct and maybe far. See [[CAP and PACELC]] and [[Consistency Models]].
 
 ### 8.3 The cost of asynchrony
 
@@ -457,3 +515,10 @@ Foundations and next steps:
 - [[System Design Fundamentals]], [[System Design Interview Framework]], [[Back-of-the-Envelope Estimation]]
 - [[Queues vs Streams and Broker Comparison]], [[Choosing an API Style]], [[Caching Patterns]]
 - [[Case Study - News Feed]], [[Case Study - Chat System]], [[Case Study - Payment System]]
+
+## Links
+
+### Watch on YouTube
+
+- [System Design Was HARD - Until You Knew the Trade-Offs](https://www.youtube.com/watch?v=1nENigGr-a0) · ByteByteGo · 5 min · 209,309 views
+- [System Design Was HARD - Until You Knew the Trade-Offs, Part 2](https://www.youtube.com/watch?v=2g1G8Jr88xU) · ByteByteGo · 6 min · 64,310 views

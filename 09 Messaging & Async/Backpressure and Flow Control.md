@@ -13,13 +13,15 @@ sources:
   - "RabbitMQ documentation, Consumer Prefetch and Flow Control (memory and disk alarms)"
   - "AWS SQS Developer Guide, Quotas (in-flight messages)"
   - "KEDA documentation, Apache Kafka scaler"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Backpressure and Flow Control
 
 > [!summary] TL;DR
-> **Backpressure** is a slow consumer pushing back on a fast producer so that work does not pile up without limit. **Flow control** is the protocol-level version: the receiver tells the sender how much more it may send. Without it, a queue between a 1,000-per-second producer and a 800-per-second consumer grows by 200 items every second until memory or latency gives out.
+> **Backpressure** is a slow consumer pushing back on a fast producer so that work does not pile up without limit. **Flow control** is the protocol-level version: the receiver tells the sender how much more it may send.
+
+Without it, a queue between a 1,000-per-second producer and a 800-per-second consumer grows by 200 items every second until memory or latency gives out.
 
 > [!abstract] Core idea
 > - Every queue must be bounded. An unbounded queue does not remove overload; it turns it into rising latency and then an out-of-memory crash.
@@ -28,19 +30,69 @@ updated: 2026-11-04
 > - Pressure must travel all the way to the source. A hop that silently absorbs it just moves the pile-up.
 > - Choose per data type: metrics may be dropped; payments must block or be queued durably.
 
+## Start here: the basics
+
+**The problem in one story.**
+A kitchen gets 10 orders a minute but can cook only 8.
+If the waiters keep pinning tickets to the rail, the pile grows all evening.
+Soon every meal comes out an hour late, and the rail falls off the wall.
+Backpressure is the kitchen telling the waiters "slow down" or "we are full" before that happens.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Producer | The part that creates work | An API receiving requests |
+| Consumer | The part that does the work | A worker writing to a database |
+| Buffer / queue | Space where waiting work sits | A Go channel of size 100 |
+| Bounded | Has a fixed maximum size | `make(chan Job, 100)` |
+| Throughput | Work finished per second | 800 events/s |
+| Latency | How long one item takes end to end | 2 s from send to done |
+| Load shedding | Refusing some work on purpose to stay healthy | Reply 503 to extra requests |
+| Window / credit | How much more the receiver says it can take | TCP receive window |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Fast producer<br/>1,000/s"] --> B[("Bounded buffer")]
+    B --> C["Slow consumer<br/>800/s"]
+    B -- "full" --> X{"Choose"}
+    X --> BL["Block producer"]
+    X --> DR["Drop"]
+    X --> RJ["Reject 429/503"]
+```
+
+**Analogy.** A motorway on-ramp with a traffic light lets cars on only as fast as the road can take them.
+Where it breaks: cars waiting at the light are fine for a while, but a software request that waits too long is useless because the user has already given up.
+
+**How the rest of this note builds up**
+
+- First, why an unbounded queue fails (section 1) and the on-ramp mental model (section 2).
+- Then the four choices when full, and pull and credit-based protocols (section 3).
+- Then a Go pipeline with bounded channels and tests, plus sizing with Little's Law (section 4), and variants like TCP, HTTP/2 and Kafka (section 5).
+- Finally the SDE-3 deep dive: queues near 100% utilisation, adaptive concurrency limits and end-to-end propagation (sections 6-8).
+
+> [!tip] Remember
+> Every queue needs a limit, and when it is full someone must slow down, drop or say no.
+
 ## 1. Why it exists
 
 An ingest service accepts 1,000 events per second. Its workers can process 800 per second. The service puts incoming events in an in-memory Go slice-backed queue with no limit.
 
 - After 1 minute the queue holds 12,000 events. After 1 hour, 720,000.
-- A new event joins the back of the queue, so it waits for the whole backlog ahead of it to drain: 720,000 events at 800 per second is 900 seconds, about **15 minutes**, before a worker touches it. (Little's Law, `L = λ × W`, describes a queue in steady state; this one is not steady, it grows without limit, so the wait comes from simple drain arithmetic.)
+- A new event joins the back of the queue, so it waits for the whole backlog ahead of it to drain: 720,000 events at 800 per second is 900 seconds, about **15 minutes**, before a worker touches it.
+
+  (Little's Law, `L = λ × W`, describes a queue in steady state; this one is not steady, it grows without limit, so the wait comes from simple drain arithmetic.)
 - At 2 KB per event, 720,000 events is about 1.4 GB of heap (an estimate). The pod hits its memory limit, is OOM-killed, and every queued event is lost at once.
 
 The queue did not fix the overload. It hid it for an hour, made every request slow, and then lost the data. A **bounded** queue would have made the problem visible in the first second, and a deliberate policy would have decided who waits and what is dropped.
 
 ## 2. Mental model
 
-A motorway on-ramp with a traffic light (ramp metering). When the motorway is full, the light turns red and cars wait on the ramp, a short and bounded queue. If the ramp itself fills, the queue spills back onto the city streets, and drivers there decide to take another route. Nobody is allowed to park cars on the motorway's hard shoulder "for later".
+A motorway on-ramp with a traffic light (ramp metering). When the motorway is full, the light turns red and cars wait on the ramp, a short and bounded queue.
+
+If the ramp itself fills, the queue spills back onto the city streets, and drivers there decide to take another route. Nobody is allowed to park cars on the motorway's hard shoulder "for later".
 
 Terms:
 
@@ -346,10 +398,16 @@ Other Go tools for the same job:
 
 ## 8. Deep dive
 
-- **Why queues explode near 100% utilisation.** For a simple single-server queue with random arrivals (M/M/1), average time in the system is `1 / (μ − λ)`. With service rate `μ = 1,000` per second, going from 80% load (λ = 800) to 95% (λ = 950) moves average time from 5 ms to 20 ms, and at 99% it is 100 ms. Latency rises sharply long before the queue is "full", which is why systems shed load at about 80 to 90% of capacity rather than at 100% (this is a model, not a measurement; real systems differ).
+- **Why queues explode near 100% utilisation.** For a simple single-server queue with random arrivals (M/M/1), average time in the system is `1 / (μ − λ)`.
+
+  With service rate `μ = 1,000` per second, going from 80% load (λ = 800) to 95% (λ = 950) moves average time from 5 ms to 20 ms, and at 99% it is 100 ms.
+
+  Latency rises sharply long before the queue is "full", which is why systems shed load at about 80 to 90% of capacity rather than at 100% (this is a model, not a measurement; real systems differ).
 - **Bufferbloat.** Large buffers keep throughput high but make every item wait behind the backlog. The same thing happens in network routers and in application queues. Small buffers plus early rejection give lower latency for the work you accept.
 - **Adaptive concurrency limits.** Instead of a fixed worker count, adjust the limit by observed latency, like TCP congestion control: increase while latency is flat, cut it when latency rises (AIMD or gradient algorithms, as in Netflix's concurrency-limits library). Rejected requests become the pressure signal. See [[Bulkheads and Concurrency Limits]].
-- **End-to-end propagation.** In a chain `client → API → queue → worker → DB`, the DB being slow should eventually reach the client as a 429/503 or as slower responses. Each hop must either pass the signal back (bounded buffer, rejection, flow-control window) or shed explicitly. A hop with an unbounded buffer cuts the signal, and the overload appears later and larger somewhere else.
+- **End-to-end propagation.** In a chain `client → API → queue → worker → DB`, the DB being slow should eventually reach the client as a 429/503 or as slower responses.
+
+  Each hop must either pass the signal back (bounded buffer, rejection, flow-control window) or shed explicitly. A hop with an unbounded buffer cuts the signal, and the overload appears later and larger somewhere else.
 - **Choosing per data type.**
 	- Payments and orders: block with a deadline or write to a durable queue; never drop.
 	- User-facing reads: reject fast with 503 so clients can retry elsewhere.
@@ -360,7 +418,9 @@ Other Go tools for the same job:
 ## 9. Interview questions
 
 > [!question]- Why is an unbounded queue dangerous if memory is plentiful?
-> Because latency, not memory, fails first. A new item waits for the backlog ahead of it to drain, so its wait is queue length divided by drain rate: 720,000 queued items at 800 per second is a 15-minute delay. Callers time out while the work is still queued, and eventually memory runs out and the whole backlog is lost.
+> Because latency, not memory, fails first. A new item waits for the backlog ahead of it to drain, so its wait is queue length divided by drain rate: 720,000 queued items at 800 per second is a 15-minute delay.
+>
+> Callers time out while the work is still queued, and eventually memory runs out and the whole backlog is lost.
 
 > [!question]- Name the options when a bounded queue is full, and when you would pick each.
 > Block the producer with a deadline (must-not-lose work), drop newest or oldest (telemetry, latest-value data), spill to a durable log (bursts that average below capacity), reject upstream with 429/503 and `Retry-After` (request/response APIs), or throttle the source (known stable capacity).
@@ -392,3 +452,8 @@ Other Go tools for the same job:
 - **Before this:** [[Goroutines and Channels]], [[select and Concurrency Patterns]], [[Background Jobs and Worker Pools]]
 - **Next:** [[Load Shedding and Graceful Degradation]], [[Bulkheads and Concurrency Limits]], [[Kafka and Event Streaming]]
 - **Compare with:** [[Rate Limiting - Algorithms and Distributed Design]] (limits set by policy rather than by consumer capacity), [[TCP - Handshake, Reliability, Flow and Congestion Control]] (flow control at the transport layer), [[Autoscaling]] (adding capacity instead of pushing back)
+
+### Watch on YouTube
+
+- [Backpressure Handling: Flow Control in Distributed Streaming Systems Explained](https://www.youtube.com/watch?v=Vwb_rliN_2k) · CodeLucky · 4 min · 313 views
+- [NSDI '22 - Backpressure Flow Control](https://www.youtube.com/watch?v=3q2IyEGKyNo) · USENIX · 16 min · 1,637 views

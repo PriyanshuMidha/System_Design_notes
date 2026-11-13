@@ -9,13 +9,22 @@ sources:
   - "Cormen, Leiserson, Rivest, Stein, Introduction to Algorithms (3rd ed.), ch. 6"
   - "Go standard library docs, container/heap"
   - "Go runtime source, src/runtime/time.go (timer heap)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Heaps and Priority Queues - Go
 
 > [!summary] TL;DR
 > Four small, runnable heaps: a hand-rolled `MinHeap`, a `container/heap`-based `TaskQueue` with in-place reprioritizing, a size-k `TopKLargest`, and a two-heap `MedianFinder`. Together they demonstrate every mechanism in [[Heaps and Priority Queues]]: sift-up, sift-down, O(n) heapify, `heap.Fix`, and the size-k and two-heap patterns.
+
+## Before the code
+
+- **Slices** (`[]int`): Go's growable arrays; the heap lives in one slice and uses index math for parent/child.
+- **Methods on types**: `func (h *MinHeap) Push(...)` attaches behavior to a struct; the pointer receiver lets it change the slice.
+- **Interfaces**: `container/heap` works with any type that has `Len`, `Less`, `Swap`, `Push`, `Pop`.
+- **`any` and type assertions**: `heap.Pop` returns `any`, so the code converts it back with `x.(*Task)` or `x.(int)`.
+- **Multiple return values**: `Pop() (int, bool)` returns the value plus an "ok" flag for the empty case.
+- **What to run**: put the code and tests in one package, then `go vet ./...` and `go test -race ./...`.
 
 ## What this code shows
 
@@ -69,7 +78,15 @@ Four independent, self-contained pieces of code in one package: `MinHeap` is the
 
 ### Step 1: a hand-rolled MinHeap
 
-**Concept.** This is §3.2–§3.4 of [[Heaps and Priority Queues]] made literal: `data` is the flat array from the array-layout section, `siftUp` is the push mechanism, `siftDown` is the pop mechanism, and `NewMinHeap` is the O(n) heapify. Writing it by hand first, before using `container/heap`, makes the index arithmetic (`2i+1`, `2i+2`, `(i-1)/2`) concrete instead of hidden behind an interface. The alternative — only ever using `container/heap` — would work, but would hide exactly the mechanism this note exists to teach.
+**Concept.** This is §3.2–§3.4 of [[Heaps and Priority Queues]] made literal:
+
+- `data` is the flat array from the array-layout section.
+- `siftUp` is the push mechanism, and `siftDown` is the pop mechanism.
+- `NewMinHeap` is the O(n) heapify.
+
+Writing it by hand first, before using `container/heap`, makes the index arithmetic (`2i+1`, `2i+2`, `(i-1)/2`) concrete instead of hidden behind an interface.
+
+The alternative — only ever using `container/heap` — would work, but would hide exactly the mechanism this note exists to teach.
 
 ```go
 package pq
@@ -179,12 +196,19 @@ flowchart LR
 
 ### Step 2: the standard `container/heap` interface
 
-**Concept.** Go's standard library doesn't ship a heap type directly — it ships `container/heap`, which turns *any* type satisfying a 5-method interface (`sort.Interface`'s `Len`/`Less`/`Swap`, plus `Push`/`Pop`) into a heap ([[Heaps and Priority Queues#Go's container/heap the standard interface]]). This is the idiomatic way to build a priority queue in Go, and it's what `TopKLargest` and `MedianFinder` below both build on. `Task.index` exists only so `Reprioritize` can call `heap.Fix` in `O(log n)` instead of needing an `O(n)` search to find the element first — the decrease-key problem from the deep dive.
+**Concept.** Go's standard library doesn't ship a heap type directly — it ships `container/heap`, which turns *any* type satisfying a 5-method interface (`sort.Interface`'s `Len`/`Less`/`Swap`, plus `Push`/`Pop`) into a heap ([[Heaps and Priority Queues#Go's container/heap the standard interface]]).
+
+This is the idiomatic way to build a priority queue in Go, and it's what `TopKLargest` and `MedianFinder` below both build on.
+
+`Task.index` exists only so `Reprioritize` can call `heap.Fix` in `O(log n)` instead of needing an `O(n)` search to find the element first — the decrease-key problem from the deep dive.
 
 ```go
 package pq
 
-import "container/heap"
+import (
+	"container/heap"
+	"sort" // TopKLargest sorts its result
+)
 
 // Task is one item in a priority queue of scheduled work: lower Priority
 // runs first — the same shape a job scheduler or timer heap uses.
@@ -258,7 +282,10 @@ sequenceDiagram
 
 ### Step 3: top-K and the running median
 
-**Concept.** Both of these build on a second, minimal `heap.Interface` implementation (`intMinHeap`/`maxIntHeap`) rather than reusing `TaskQueue`, because they operate on plain `int`s, not `*Task`s — a good example of why `container/heap` asks you to implement the interface per concrete type instead of offering one generic heap. `TopKLargest` is the size-k pattern from [[Heaps and Priority Queues#Tracing a size-K top-K scan]]: keep a min-heap capped at size `k`, and only replace-and-sift when a new value beats the current weakest kept value. `MedianFinder` is the two-heap pattern: a max-heap for the lower half, a min-heap for the upper half, rebalanced after every `Add` so their sizes never differ by more than one.
+**Concept.** Both of these build on a second, minimal `heap.Interface` implementation (`intMinHeap`/`maxIntHeap`) rather than reusing `TaskQueue`, because they operate on plain `int`s, not `*Task`s — a good example of why `container/heap` asks you to implement the interface per concrete type instead of offering one generic heap.
+
+- `TopKLargest` is the size-k pattern from [[Heaps and Priority Queues#Tracing a size-K top-K scan]]: keep a min-heap capped at size `k`, and only replace-and-sift when a new value beats the current weakest kept value.
+- `MedianFinder` is the two-heap pattern: a max-heap for the lower half, a min-heap for the upper half, rebalanced after every `Add` so their sizes never differ by more than one.
 
 ```go
 // intMinHeap is the smallest container/heap.Interface implementation that

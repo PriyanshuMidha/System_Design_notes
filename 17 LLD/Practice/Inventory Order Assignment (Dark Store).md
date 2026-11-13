@@ -9,13 +9,17 @@ sources:
   - "Go 1.20 release notes: errors.Join"
   - "Go 1.21 release notes: context.WithoutCancel"
   - "PostgreSQL 17 docs: UPDATE, CHECK constraints, transaction isolation"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Inventory Order Assignment (Dark Store)
 
 > [!summary] TL;DR
-> A quick-commerce order must come from one dark store near the customer that has every item. The service claims the client's idempotency key, asks a store-selection strategy for full-stock stores nearest first, reserves every item at one store all-or-nothing (falling back to the next store if it loses a race), and saves the order as `reserved` with a 10-minute payment hold. Every undo runs even if the client hung up, and every status change is a compare-and-set.
+> A quick-commerce order must come from one dark store near the customer that has every item.
+>
+> The service claims the client's idempotency key, asks a store-selection strategy for full-stock stores nearest first, reserves every item at one store all-or-nothing (falling back to the next store if it loses a race), and saves the order as `reserved` with a 10-minute payment hold.
+>
+> Every undo runs even if the client hung up, and every status change is a compare-and-set.
 
 > [!abstract] Core idea
 > - Stock per (store, product) is the contended resource; reserve it with a conditional decrement (`qty = qty - n WHERE qty >= n`).
@@ -23,6 +27,53 @@ updated: 2026-11-03
 > - An idempotency key (a client-chosen ID for one order attempt) makes a retry return the same order.
 > - Every status change is a compare-and-set (CAS: change only if the current value is still what you read), so payment and expiry cannot both win.
 > - Classic mistake: running the undo on the request context, so a client hang-up skips the release and leaks stock.
+
+## Start here: the basics
+
+**The problem in one story.**
+You order milk, bread and eggs on a 10-minute delivery app.
+The app must pick one small warehouse near you that has all three right now.
+Ten other people may be grabbing the last packet of milk at the same second.
+If the app double-sells that packet, or "holds" it for you and then forgets, someone gets a cancelled order.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Dark store | A small warehouse that only serves online orders | One store per few km of a city |
+| Reservation | Stock set aside for an order before payment | 2 milk moved from "available" to "reserved" |
+| Conditional decrement | Subtract only if enough is left | `qty = qty - 2 WHERE qty >= 2` |
+| All-or-nothing | Either every item is reserved, or none are | Eggs missing, so milk is released too |
+| Idempotency key | A client-chosen ID so a retry does not order twice | Same key on retry returns the same order |
+| Compare-and-set (CAS) | Change a value only if it is still what you read | `reserved → confirmed` only if still `reserved` |
+| Compensation | The undo step run when a later step fails | Release stock if saving the order fails |
+| Strategy | A swappable rule behind an interface | "Nearest store first" selector |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    O["Order: milk, bread, eggs"] --> K["Claim idempotency key"]
+    K --> S["Pick stores in range<br/>with every item, nearest first"]
+    S --> R{"Reserve all items<br/>at this store?"}
+    R -- "lost a race" --> U["Undo, try next store"]
+    U --> R
+    R -- "yes" --> V["Order reserved<br/>(10-min payment hold)"]
+    V --> P["Paid: confirmed, then packed"]
+```
+
+**Analogy.** It is like calling nearby shops one by one and asking "put aside all three items for me": if a shop has only two, you ask it to put them back and call the next one.
+Where it breaks: real shops forget slowly; here the hold must expire automatically, and the "put them back" call must succeed even if you hang up.
+
+**How the rest of this note builds up**
+
+- First, the problem statement, requirements and scale estimate (Step 1).
+- Then actors, entities, the order state machine and the API (Steps 2-5).
+- Then storage in PostgreSQL: conditional decrements, the idempotency key with a lease, and fencing (Step 6), and the patterns (Step 7).
+- Finally the code, tests, edge cases and the SDE-3 topics: leak-free compensations, crash recovery, split orders and interview traps (Step 8 onwards).
+
+> [!tip] Remember
+> Reserve every item at one store or none, make every status change a compare-and-set, and run every undo even if the client hung up.
 
 ## Problem statement
 
@@ -55,7 +106,14 @@ What it tests: an **atomic multi-item reservation** (all items or none, no overs
 - **Payment?** *Owned by the payment service. It calls `ConfirmPayment`; a cancel after payment emits `refund.requested` for it.*
 - **Scale?** *An estimate for the interview: a few hundred orders per minute per city. A large city can have dozens of stores or more (also an estimate), but only the few inside the radius are candidates for one order.*
 
-**Functional:** place a multi-item order; pick active stores in range that have every item, nearest first; reserve all items or none; fall back to the next store on a lost race; lifecycle `reserved → confirmed → packed`, `cancelled` from reserved or confirmed (stock released, refund requested if paid); unpaid holds expire after 10 minutes; a retry with the same key returns the same order.
+**Functional:**
+
+- place a multi-item order;
+- pick active stores in range that have every item, nearest first;
+- reserve all items or none; fall back to the next store on a lost race;
+- lifecycle `reserved → confirmed → packed`, `cancelled` from reserved or confirmed (stock released, refund requested if paid);
+- unpaid holds expire after 10 minutes;
+- a retry with the same key returns the same order.
 
 **Non-functional:** never oversell; never leak a reservation or a key (partial reserves roll back, compensations survive client disconnects, unpaid holds expire); `PlaceOrder` under about 200 ms (target, an estimate); the selection rule is swappable; money in `int64` paise.
 
@@ -220,7 +278,9 @@ CREATE TABLE idempotency_keys (
 );
 ```
 
-The reservation is one transaction per candidate store, items in `product_id` order (one lock order everywhere, so no deadlock). The lease and fencing statements below (the claim, the fenced bind and the fenced release) follow the PostgreSQL 17 `INSERT ... ON CONFLICT DO UPDATE ... WHERE` and `RETURNING` syntax but have **not been executed against PostgreSQL**; only the Go version was compiled and tested.
+The reservation is one transaction per candidate store, items in `product_id` order (one lock order everywhere, so no deadlock).
+
+The lease and fencing statements below (the claim, the fenced bind and the fenced release) follow the PostgreSQL 17 `INSERT ... ON CONFLICT DO UPDATE ... WHERE` and `RETURNING` syntax but have **not been executed against PostgreSQL**; only the Go version was compiled and tested.
 
 ```sql
 -- Claim the key first, in its own statement. $3 = now and $4 = now + lease, both
@@ -256,7 +316,13 @@ UPDATE idempotency_keys SET lease_until = '-infinity'
 WHERE user_id = $1 AND key = $2 AND attempt = $3 AND order_id IS NULL;
 ```
 
-Each statement numbers its own placeholders from `$1`. In SQL the order insert and the key binding commit together, so neither can fail alone, and the `attempt = $4` condition makes the bind the fence: a late attempt whose lease was taken over binds 0 rows and rolls its whole reservation back. The in-memory repositories below make them separate calls, which is exactly why the code needs the compensation for a failed `BindKey`. A status change is also a compare-and-set: `UPDATE orders SET status = $1 WHERE id = $2 AND status = $3` ([[Locking - Optimistic vs Pessimistic]]).
+Each statement numbers its own placeholders from `$1`.
+
+In SQL the order insert and the key binding commit together, so neither can fail alone, and the `attempt = $4` condition makes the bind the fence: a late attempt whose lease was taken over binds 0 rows and rolls its whole reservation back.
+
+The in-memory repositories below make them separate calls, which is exactly why the code needs the compensation for a failed `BindKey`.
+
+A status change is also a compare-and-set: `UPDATE orders SET status = $1 WHERE id = $2 AND status = $3` ([[Locking - Optimistic vs Pessimistic]]).
 
 ## Step 7: Patterns
 
@@ -296,14 +362,29 @@ cmd/demo/main.go   -> wires the Mem* repositories, NearestWithFullStock{MaxDista
 `PlaceOrder(ctx, req)`:
 
 1. `normalize` merges duplicate lines, rejects empty carts and bad quantities, and sorts by product ID: the same lock order for every request.
-2. `ClaimKey(user, key, now, lease)`: a retry with a bound key returns that order; an unbound key inside its lease means the first request is in flight (`ErrInProgress`). **Another leak to avoid:** if the process crashes after the claim and before `BindKey`, a claim with no lease stays "in progress" forever and every retry gets 409. Here the claim stores `leaseUntil = now + 1 min` from the injected clock (`DefaultKeyLease`, well above the 200 ms target), and a retry that finds an unbound claim past its lease takes it over with `attempt + 1`. The crashed attempt's orphan order, if it saved one, is cancelled by the expiry job like any unpaid hold.
+2. `ClaimKey(user, key, now, lease)`: a retry with a bound key returns that order; an unbound key inside its lease means the first request is in flight (`ErrInProgress`).
+   - **Another leak to avoid:** if the process crashes after the claim and before `BindKey`, a claim with no lease stays "in progress" forever and every retry gets 409.
+   - Here the claim stores `leaseUntil = now + 1 min` from the injected clock (`DefaultKeyLease`, well above the 200 ms target), and a retry that finds an unbound claim past its lease takes it over with `attempt + 1`.
+   - The crashed attempt's orphan order, if it saved one, is cancelled by the expiry job like any unpaid hold.
 3. `selector.Select` returns active stores within 3 km that have every item, nearest first. It reads without locks, so it can be stale.
 4. For each candidate, `reserveAll` does one conditional decrement per item; on the first failure it releases what it took and the loop tries the next store.
-5. Save the order as `reserved` with `CreatedAt` from the injected clock. **Leak to avoid:** if `Save` fails, a naive version releases the stock with the request's `ctx`. After a client disconnect that `ctx` is cancelled, so a real database release fails too, the error is dropped, and the units stay held forever. Here every compensation runs with `context.WithoutCancel(ctx)` (Go 1.21+), and `releaseAll` returns its failures (`errors.Join`, Go 1.20+) instead of hiding them.
-6. `BindKey`. **Second leak to avoid:** if it fails after a successful save, a naive version returns the error and leaves the key "in progress" forever (every retry gets `ErrInProgress`) while the stock stays held until expiry. Here the order is moved `reserved → cancelled` by compare-and-set, the stock is released and the key is freed, so the same key works on the next try. If even that compare-and-set fails, its error is reported with the rest and the expiry job cancels the hold later. `BindKey` and `ReleaseKey` carry the attempt number, so they are **fenced**: an attempt that was only slow and lost its key to a takeover gets `ErrLeaseLost` from `BindKey`, goes down this same path (its order cancelled, its stock released), and its `ReleaseKey` leaves the new attempt's claim alone. `ReleaseKey` frees a key by ending its lease instead of deleting the row, so the attempt counter never goes back to 1 and a late attempt can never match a newer claim.
+5. Save the order as `reserved` with `CreatedAt` from the injected clock.
+   - **Leak to avoid:** if `Save` fails, a naive version releases the stock with the request's `ctx`.
+   - After a client disconnect that `ctx` is cancelled, so a real database release fails too, the error is dropped, and the units stay held forever.
+   - Here every compensation runs with `context.WithoutCancel(ctx)` (Go 1.21+), and `releaseAll` returns its failures (`errors.Join`, Go 1.20+) instead of hiding them.
+6. `BindKey`.
+   - **Second leak to avoid:** if it fails after a successful save, a naive version returns the error and leaves the key "in progress" forever (every retry gets `ErrInProgress`) while the stock stays held until expiry.
+   - Here the order is moved `reserved → cancelled` by compare-and-set, the stock is released and the key is freed, so the same key works on the next try.
+   - If even that compare-and-set fails, its error is reported with the rest and the expiry job cancels the hold later.
+   - `BindKey` and `ReleaseKey` carry the attempt number, so they are **fenced**: an attempt that was only slow and lost its key to a takeover gets `ErrLeaseLost` from `BindKey`, goes down this same path (its order cancelled, its stock released), and its `ReleaseKey` leaves the new attempt's claim alone.
+   - `ReleaseKey` frees a key by ending its lease instead of deleting the row, so the attempt counter never goes back to 1 and a late attempt can never match a newer claim.
 7. Publish `order.created`.
 
-Lifecycle methods go through `transition`: check `CanMoveTo`, then `CompareAndSetStatus(from, to)`, so racing callers (cancel versus payment, payment versus expiry) cannot both win. `Cancel` releases stock only when it won, and when it moved a **confirmed** (paid) order it also publishes `refund.requested` with the amount. This service does not own payment; the payment service refunds idempotently by order ID. Publish it through an outbox so it cannot be lost ([[Transactional Outbox and CDC]]).
+Lifecycle methods go through `transition`: check `CanMoveTo`, then `CompareAndSetStatus(from, to)`, so racing callers (cancel versus payment, payment versus expiry) cannot both win.
+
+`Cancel` releases stock only when it won, and when it moved a **confirmed** (paid) order it also publishes `refund.requested` with the amount.
+
+This service does not own payment; the payment service refunds idempotently by order ID. Publish it through an outbox so it cannot be lost ([[Transactional Outbox and CDC]]).
 
 ```mermaid
 sequenceDiagram
@@ -1428,7 +1509,16 @@ func TestLateOriginalIsFencedOut(t *testing.T) {
 | Store goes offline after `Select` | `ListActive` filters; in SQL the reserve transaction also checks `stores.active` |
 | A release itself fails (DB blip) | `releaseAll` returns `ErrReleaseFailed` with the store, product and quantity; a reconciliation job compares `available + reserved` with the physical count |
 
-Common mistakes: an in-progress key with no lease, so one crash blocks the key forever; a takeover with no attempt number, so the late original binds over the new order; read stock then update it in a separate step; reserve item by item with no rollback; run compensations on the request context; ignore release errors; no state machine; no idempotency key; "nearest store" hard-coded in the service; logic in the HTTP handler.
+Common mistakes:
+
+- an in-progress key with no lease, so one crash blocks the key forever;
+- a takeover with no attempt number, so the late original binds over the new order;
+- read stock then update it in a separate step;
+- reserve item by item with no rollback;
+- run compensations on the request context;
+- ignore release errors;
+- no state machine; no idempotency key;
+- "nearest store" hard-coded in the service; logic in the HTTP handler.
 
 ## Step 10: Tradeoffs and extensions
 
@@ -1439,7 +1529,11 @@ Common mistakes: an in-progress key with no lease, so one crash blocks the key f
 - **One in-memory mutex for all stock:** it stands in for the database. In a real process it would serialise every store; per-store locks or the database row locks remove that bottleneck.
 - **Release on `Save` failure assumes the save did not happen.** If a database can time out after committing, re-read the order by ID before releasing, or (better) keep the order insert, the reservation and the key binding in one transaction as the SQL above does.
 
-**Split-order fulfilment (extension).** When no single store in range has everything: pick the nearest store covering the most items, then cover the rest from the next store. Each part becomes a `Shipment` with its own reservation; the parent order is placed only if every shipment reserves (a saga with per-shipment release as the undo). Costs: two riders and two delivery fees, two ETAs to show, and partial cancellation rules. Start by offering "remove item X" instead.
+**Split-order fulfilment (extension).** When no single store in range has everything: pick the nearest store covering the most items, then cover the rest from the next store.
+
+Each part becomes a `Shipment` with its own reservation; the parent order is placed only if every shipment reserves (a saga with per-shipment release as the undo).
+
+Costs: two riders and two delivery fees, two ETAs to show, and partial cancellation rules. Start by offering "remove item X" instead.
 
 | Follow-up | Change |
 |---|---|
@@ -1457,7 +1551,9 @@ Common mistakes: an in-progress key with no lease, so one crash blocks the key f
 
 ![[Inventory Order Assignment LLD Drawing.excalidraw]]
 
-The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder` chain with red failure branches (existing key, partial rollback, no store), the order state machine and the tables with their key constraints. It predates the two leak fixes in Step 8: when you redraw it, add the "Save fails" and "BindKey fails" branches with their undo, the `refund.requested` event on cancel-after-payment, and the key lease with takeover and the attempt-number fence.
+The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder` chain with red failure branches (existing key, partial rollback, no store), the order state machine and the tables with their key constraints.
+
+It predates the two leak fixes in Step 8: when you redraw it, add the "Save fails" and "BindKey fails" branches with their undo, the `refund.requested` event on cancel-after-payment, and the key lease with takeover and the attempt-number fence.
 
 ## Interview questions
 
@@ -1471,7 +1567,11 @@ The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder
 > No retry can find the order, and an unbound key looks "in progress" until its lease ends (forever, without a lease). Cancel the order with a compare-and-set, release its stock, and free the key, so the client's retry creates a fresh order. In SQL, bind the key in the same transaction as the order insert so this cannot happen.
 
 > [!question]- The server crashed between claiming the key and binding it. What do retries see?
-> Without a lease, `ErrInProgress` (409) forever. So the claim stores `lease_until` from the injected clock, and a retry that finds an unbound claim past its lease takes it over in the same `INSERT ... ON CONFLICT DO UPDATE ... WHERE lease_until <= now` statement, bumping `attempt`. The bind is `UPDATE ... WHERE attempt = $n AND order_id IS NULL`, so if the first attempt was only slow it binds 0 rows and rolls back instead of overwriting. Keep the lease well above a healthy request's duration.
+> Without a lease, `ErrInProgress` (409) forever.
+>
+> So the claim stores `lease_until` from the injected clock, and a retry that finds an unbound claim past its lease takes it over in the same `INSERT ... ON CONFLICT DO UPDATE ... WHERE lease_until <= now` statement, bumping `attempt`.
+>
+> The bind is `UPDATE ... WHERE attempt = $n AND order_id IS NULL`, so if the first attempt was only slow it binds 0 rows and rolls back instead of overwriting. Keep the lease well above a healthy request's duration.
 
 > [!question]- Payment confirmation and hold expiry fire at the same moment. Who wins?
 > Whoever's compare-and-set lands first: both run `UPDATE orders SET status = $1 WHERE id = $2 AND status = 'reserved'`. If expiry wins, the late `ConfirmPayment` gets `ErrBadTransition` and the payment service refunds. A paid order is never cancelled by expiry.
@@ -1502,3 +1602,8 @@ I treat stock per store and product as the contended resource. PlaceOrder first 
 - **Before this:** [[Cart Checkout with Coupons]], [[State Machines in Go]], [[Repository and Unit of Work]], [[Concurrency for LLD]]
 - **Next:** [[Delivery Partner Assignment]], [[Food Ordering System]]
 - **Compare with:** [[Case Study - Ticket Booking]] (holding limited inventory at system scale), [[Locking - Optimistic vs Pessimistic]], [[Saga Pattern]]
+
+### Watch on YouTube
+
+- [Low Level Design of an Order and Inventory System in a Multi-Threaded environment + Machine  Coding](https://www.youtube.com/watch?v=VtBL_NNa7hs) · System Design and Gossip · 18 min · 1,878 views
+- [Blinkit (Zepto) Low-Level Design with Code & UML / Order Management System & Inventory / #lld #easy](https://www.youtube.com/watch?v=_7b5qL_deio) · Mrunmai Dahare · 57 min · 7,726 views

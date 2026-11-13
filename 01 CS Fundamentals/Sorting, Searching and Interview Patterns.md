@@ -8,13 +8,17 @@ sources:
   - "Go standard library docs, package sort and package slices"
   - "Go source, cmd/compile and src/sort: pdqsort (pattern-defeating quicksort), introduced in Go 1.19"
   - "Orson Peters, pdqsort: Pattern-defeating Quicksort (2021)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Sorting, Searching and Interview Patterns
 
 > [!summary] TL;DR
-> Sorting puts data in order so that searching, deduplication and range queries all get cheaper; Go's `slices.Sort` uses **pdqsort**, a hybrid algorithm that is fast in the average case but is not stable (equal elements can be reordered). Binary search finds a target in sorted data in `O(log n)`, and Go's `sort.Search` generalizes it to any monotonic yes/no predicate. On top of both sit the recurring interview patterns — two pointers, sliding window, prefix sums, BFS/DFS, backtracking, and dynamic programming — that turn brute-force `O(n²)` or `O(2ⁿ)` solutions into linear or polynomial ones.
+> Sorting puts data in order so that searching, deduplication and range queries all get cheaper; Go's `slices.Sort` uses **pdqsort**, a hybrid algorithm that is fast in the average case but is not stable (equal elements can be reordered).
+>
+> Binary search finds a target in sorted data in `O(log n)`, and Go's `sort.Search` generalizes it to any monotonic yes/no predicate.
+>
+> On top of both sit the recurring interview patterns — two pointers, sliding window, prefix sums, BFS/DFS, backtracking, and dynamic programming — that turn brute-force `O(n²)` or `O(2ⁿ)` solutions into linear or polynomial ones.
 
 > [!abstract] Core idea
 > - Comparison sorts have a hard floor of `O(n log n)` comparisons; **stability** (equal elements keep their input order) is a property some algorithms give up for speed.
@@ -23,9 +27,54 @@ updated: 2026-11-09
 > - Most interview problems are one of a handful of patterns in disguise — recognizing the pattern is most of the work.
 > - Classic mistake: reaching for a sort (`O(n log n)`) when a hash set or two pointers would solve the same problem in `O(n)`.
 
+## Start here: the basics
+
+**The problem in one story.**
+You have a pile of 1,000 exam papers and need to find the one for "Priya".
+Flipping through them one by one could take all 1,000 looks.
+If the pile is sorted by name, you can open the middle, see which half she is in, and repeat: about 10 looks.
+Sorting costs work up front; searching then gets cheap.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Big-O | How work grows as input grows | `O(n)` = double the input, double the work |
+| `O(n log n)` | Slightly more than linear; the best general sorting speed | Sorting 1M items ≈ 20M steps |
+| Comparison sort | Sorts only by asking "is a < b?" | Merge sort, quicksort |
+| Stable sort | Equal items keep their original order | Two "Amit"s stay in input order |
+| Binary search | Halve a sorted range each step | Guessing a number 1-100 in 7 tries |
+| Monotonic | Once a condition becomes true, it stays true | `x >= 5` over sorted numbers |
+| Pattern | A reusable trick that solves a family of problems | Two pointers, sliding window |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Unsorted data"] --> S["Sort once<br/>O(n log n)"]
+    S --> D["Sorted data"]
+    D --> B["Binary search<br/>O(log n) per query"]
+    U --> H["Or: hash set / two pointers<br/>O(n), no sort needed"]
+```
+
+**Analogy.** A sorted list is a dictionary: you open near the middle and jump, instead of reading every page.
+Where it breaks: a real dictionary never changes, while program data keeps changing, so keeping it sorted costs work on every insert.
+
+**How the rest of this note builds up**
+
+- First, why sorting and searching exist (section 1) and the mental model of the `O(n log n)` floor and stability (section 2).
+- Then how the main sorts, Go's pdqsort and binary search work (section 3), plus a worked example (section 4).
+- Then the interview patterns and their variants (section 5) and when not to sort at all (section 6).
+- Finally the SDE-3 view: sorting in production and the deep dive (sections 7-8).
+
+> [!tip] Remember
+> Sort once so you can halve the search space forever; but if a hash set or two pointers solves it in `O(n)`, skip the sort.
+
 ## 1. Why it exists
 
-Say you're given 10 million unsorted log-timestamp records and asked "how many requests happened between 14:00 and 14:05?" Scanning linearly costs `O(n)` **per query**. Sort the records once — `O(n log n)`, done one time — and every later range query becomes two binary searches, `O(log n)` each. The one-time sorting cost pays for itself the moment you run more than a handful of queries.
+Say you're given 10 million unsorted log-timestamp records and asked "how many requests happened between 14:00 and 14:05?" Scanning linearly costs `O(n)` **per query**.
+
+Sort the records once — `O(n log n)`, done one time — and every later range query becomes two binary searches, `O(log n)` each. The one-time sorting cost pays for itself the moment you run more than a handful of queries.
 
 Searching has the same shape: checking "is `x` present?" against an unsorted list of a million elements costs up to a million comparisons. Sorted, binary search needs at most `log₂(1,000,000) ≈ 20` comparisons — a difference that matters the instant the list is queried more than once.
 
@@ -36,7 +85,9 @@ Most coding-interview problems are really asking "do you recognize which of thes
 
 ## 2. Mental model
 
-Think of sorting as the one-time cost of **organizing a library** so that later, finding any book by title is a quick jump to a shelf instead of scanning every book. Binary search is "open the book at the middle; is what you want earlier or later? Repeat on the half that matters" — exactly how a reader finds a word in a paper dictionary, and why it needs the dictionary to already be alphabetized.
+Think of sorting as the one-time cost of **organizing a library** so that later, finding any book by title is a quick jump to a shelf instead of scanning every book.
+
+Binary search is "open the book at the middle; is what you want earlier or later? Repeat on the half that matters" — exactly how a reader finds a word in a paper dictionary, and why it needs the dictionary to already be alphabetized.
 
 The interview patterns are mental shortcuts for recognizing shape: "two sorted things, converging from both ends" is two pointers; "a fixed- or variable-size window sliding across an array" is the sliding-window pattern; "I need many range sums fast" is prefix sums; "explore everything reachable, level by level" is BFS; "explore as deep as possible, then back out" is DFS or backtracking; "the answer to a big problem is built from the answers to smaller, overlapping versions of itself" is dynamic programming.
 
@@ -82,7 +133,11 @@ flowchart LR
 > [!warning] Common mistake
 > Assuming any sort that "looks right" on a quick test is stable. Both outputs above are correctly sorted by the second field — the only difference is tie order, which a small test is unlikely to catch unless it's specifically checking for it.
 
-Go's `slices.Sort` and the older `sort.Sort`/`sort.Slice` all use **pdqsort** (pattern-defeating quicksort) — a hybrid of quicksort, heapsort and insertion sort that picks good pivots, falls back to heapsort to avoid quicksort's `O(n²)` worst case, and detects already-sorted or few-distinct-value patterns to go faster on them. `sort.Sort`/`sort.Slice` switched to pdqsort in Go 1.19; the `slices` package (and `slices.Sort` with it) was added later, in Go 1.21, using the same algorithm from its first release. It is fast but **not stable**. `slices.SortStableFunc` and `sort.SliceStable` (an `O(n log n)` stable merge-based sort) exist specifically for when stability matters.
+Go's `slices.Sort` and the older `sort.Sort`/`sort.Slice` all use **pdqsort** (pattern-defeating quicksort) — a hybrid of quicksort, heapsort and insertion sort that picks good pivots, falls back to heapsort to avoid quicksort's `O(n²)` worst case, and detects already-sorted or few-distinct-value patterns to go faster on them.
+
+`sort.Sort`/`sort.Slice` switched to pdqsort in Go 1.19; the `slices` package (and `slices.Sort` with it) was added later, in Go 1.21, using the same algorithm from its first release. It is fast but **not stable**.
+
+`slices.SortStableFunc` and `sort.SliceStable` (an `O(n log n)` stable merge-based sort) exist specifically for when stability matters.
 
 > [!tip] Remember
 > Fast and stable are in tension: pdqsort trades away stability for speed. If you ever depend on tie order, reach for `SortStableFunc`/`SliceStable` explicitly — never assume.
@@ -103,7 +158,9 @@ flowchart TD
 
 **Example with numbers:** searching `nums = [1, 3, 5, 7, 9, 11]` for the first value `>= 6`. `lo=0, hi=6` → `mid=3`, `nums[3]=7 >= 6` so `hi=3`. `lo=0, hi=3` → `mid=1`, `nums[1]=3 < 6` so `lo=2`. `lo=2, hi=3` → `mid=2`, `nums[2]=5 < 6` so `lo=3`. Now `lo==hi==3`: answer is index 3 (value 7), found in 3 steps instead of scanning up to 6 elements.
 
-Go's `sort.Search(n, f)` is exactly this loop, generalized: it takes a length `n` and a predicate `f(i) bool` that must be false for some prefix and true for the rest, and returns the first index where `f` is true (or `n` if `f` is never true). This generalization is what lets the same function solve "find the first element `>= target`" **and** "binary search on the answer" problems — for example, "what's the smallest capacity that lets a ship carry all packages within `D` days?" — where the predicate is "does capacity `c` work?" instead of a simple comparison.
+Go's `sort.Search(n, f)` is exactly this loop, generalized: it takes a length `n` and a predicate `f(i) bool` that must be false for some prefix and true for the rest, and returns the first index where `f` is true (or `n` if `f` is never true).
+
+This generalization is what lets the same function solve "find the first element `>= target`" **and** "binary search on the answer" problems — for example, "what's the smallest capacity that lets a ship carry all packages within `D` days?" — where the predicate is "does capacity `c` work?" instead of a simple comparison.
 
 ### Picture it: two pointers converging
 
@@ -117,7 +174,9 @@ flowchart LR
     HI(["hi"]) -.-> A4
 ```
 
-Walking it through: `1 + 8 = 9` on the first check — done in one step, because both pointers started at the ends and the sum happened to match immediately. If the sum is too small, `lo` moves right (toward larger values); if too large, `hi` moves left (toward smaller values) — each move discards one element permanently from consideration, which is why the whole pass is `O(n)`, not `O(n²)`.
+Walking it through: `1 + 8 = 9` on the first check — done in one step, because both pointers started at the ends and the sum happened to match immediately.
+
+If the sum is too small, `lo` moves right (toward larger values); if too large, `hi` moves left (toward smaller values) — each move discards one element permanently from consideration, which is why the whole pass is `O(n)`, not `O(n²)`.
 
 ### Picture it: a sliding window
 
@@ -248,7 +307,9 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 > No — `slices.Sort` is pdqsort (the `sort` package switched to pdqsort in Go 1.19; `slices.Sort` has used it since the `slices` package arrived in Go 1.21), which does not preserve the relative order of equal elements. Use `slices.SortStableFunc` or the older `sort.SliceStable` when tie order matters, at the same `O(n log n)` cost.
 
 > [!question]- Implement binary search, then generalize it to `sort.Search`.
-> A loop with `lo, hi := 0, len(nums)`, moving `hi = mid` when the condition at `mid` is true and `lo = mid+1` otherwise, terminating when `lo == hi`. `sort.Search(n, f)` is this same loop with `f(i) bool` in place of a direct comparison, which is why it also solves "binary search on the answer" problems where the predicate is "does this candidate answer work?"
+> A loop with `lo, hi := 0, len(nums)`, moving `hi = mid` when the condition at `mid` is true and `lo = mid+1` otherwise, terminating when `lo == hi`.
+>
+> `sort.Search(n, f)` is this same loop with `f(i) bool` in place of a direct comparison, which is why it also solves "binary search on the answer" problems where the predicate is "does this candidate answer work?"
 
 > [!question]- Two sorted arrays; find if any pair (one from each) sums to a target. What pattern, and what's the cost?
 > Two pointers: one pointer at the start of the first array, one at the end of the second; move the one whose sum is too small forward, or the one too large backward. `O(n + m)` time, `O(1)` extra space — far better than a nested loop's `O(n·m)`.
@@ -257,10 +318,14 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 > When there are many range-sum queries on a fixed (non-mutating) array. Precomputing prefix sums costs `O(n)` once, then each query is `O(1)`; without it, each query costs `O(range length)`, which adds up badly across many queries.
 
 > [!question]- What's the difference between BFS and DFS for finding a path, and when does the choice matter?
-> BFS explores level by level and is guaranteed to find the shortest path (fewest edges) in an unweighted graph first, because it visits nodes in increasing distance order. DFS explores as deep as possible before backtracking and does not give a shortest-path guarantee, but uses less memory in graphs that are wide but not deep, and is the natural fit for problems like cycle detection or topological sort where "shortest" isn't the question.
+> BFS explores level by level and is guaranteed to find the shortest path (fewest edges) in an unweighted graph first, because it visits nodes in increasing distance order.
+>
+> DFS explores as deep as possible before backtracking and does not give a shortest-path guarantee, but uses less memory in graphs that are wide but not deep, and is the natural fit for problems like cycle detection or topological sort where "shortest" isn't the question.
 
 > [!question]- Trap: you need the k-th smallest element in an unsorted array. Is sorting the whole array the best approach?
-> It works (`O(n log n)`), but it's not optimal: a selection algorithm (Quickselect) finds the k-th smallest in `O(n)` average time by partitioning like quicksort but recursing into only the side that contains the target rank, discarding the other side entirely instead of sorting it. Mention Quickselect as the faster answer, while noting `sort.Search`-style approaches don't apply here since the array isn't sorted yet.
+> It works (`O(n log n)`), but it's not optimal: a selection algorithm (Quickselect) finds the k-th smallest in `O(n)` average time by partitioning like quicksort but recursing into only the side that contains the target rank, discarding the other side entirely instead of sorting it.
+>
+> Mention Quickselect as the faster answer, while noting `sort.Search`-style approaches don't apply here since the array isn't sorted yet.
 
 > [!question]- Given a recursive solution that's correct but too slow, how do you tell if memoization will help?
 > Check whether the same subproblem (the same arguments) is computed more than once across the recursion tree — if so, it's exhibiting overlapping subproblems, and memoization (caching results keyed by the arguments) turns the exponential blowup into one computation per distinct subproblem. If subproblems never repeat, memoization won't help and the exponential cost is likely inherent (e.g., enumerating all subsets).
@@ -282,3 +347,9 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 - **Next:** [[Tries, Suffix Trees and Suffix Arrays]], [[Union-Find and Skip Lists]]
 - **Compare with:** [[Graphs and Graph Algorithms]] (BFS/DFS in full graph context), [[Heaps and Priority Queues]] (top-K and k-way merge patterns built on a heap instead of a sort)
 - **Runnable code:** [[Sorting, Searching and Interview Patterns - Go]]
+
+### Watch on YouTube
+
+- [Sorting Algorithms, Visualized (O(n log n) vs O(n²))](https://www.youtube.com/watch?v=7RlWhw8D-9A) · Generalist Programmer · visual comparison of why n log n sorts beat n² ones
+- [Quick Sort Algorithm Explained Visually – Step-by-Step Animation!](https://www.youtube.com/watch?v=sULZKjc_XRg) · Visual Algorithm · step-by-step pivot/partition animation, relevant to Go's pdqsort basis
+- [Binary Search Patterns Explained 🔥 / Complete Roadmap for Interviews](https://www.youtube.com/watch?v=RdIolKon3FM) · RisingBrain · interview walkthrough of binary-search-on-the-answer patterns

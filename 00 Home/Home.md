@@ -26,6 +26,8 @@ updated: 2026-11-04
 
 Open [[Study Index]]. It lists every topic in order with a checkbox, so you can work through the vault line by line.
 
+For videos, open [[Video Library]]. It has 1–3 verified YouTube videos for every topic, and each note also lists its videos under **Watch on YouTube** in its Links.
+
 ## Learning map
 
 ```mermaid

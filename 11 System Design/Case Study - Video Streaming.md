@@ -13,7 +13,7 @@ sources:
   - "Netflix Open Connect overview (openconnect.netflix.com)"
   - "AWS S3 docs, Multipart upload limits (5 MiB to 5 GiB parts, 10,000 parts)"
   - "Huang et al., A Buffer-Based Approach to Rate Adaptation (SIGCOMM 2014)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Video Streaming
@@ -28,9 +28,58 @@ updated: 2026-11-04
 > - The player, not the server, chooses the quality for every next segment from measured throughput and buffer level (adaptive bitrate, ABR).
 > - Classic mistake: designing a streaming server that pushes video over a custom socket. Segments over HTTP are what make CDN caching possible.
 
+## Start here: the basics
+
+**The problem in one story**
+
+You upload a holiday video from your phone. A friend in another country presses play on a slow train connection.
+Another friend watches on a big TV over fibre.
+Both expect it to start in a second and never freeze.
+One big file sent from one computer cannot do that for millions of people.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Bitrate | How many bits per second the video needs | 1080p at about 5 Mbps |
+| Transcoding | Re-encoding a video into another size or quality | 4K upload turned into 360p, 720p, 1080p |
+| Segment | A short slice of video stored as its own file | `seg_0042.ts`, 4 seconds long |
+| Playlist (manifest) | A text file listing the segments and qualities | HLS `.m3u8` file |
+| CDN | Many cache servers near users that keep copies of files | An edge server in Mumbai serves Mumbai viewers |
+| Object storage | Cheap storage for big files, read by URL | Amazon S3 bucket |
+| ABR | Adaptive bitrate: the player picks quality per segment | Drops to 480p when the network slows |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  U[Uploader] --> S[Object storage]
+  S --> T[Transcode into many qualities]
+  T --> P[Segments + playlists]
+  P --> C[CDN edge]
+  C --> V[Viewer player picks quality]
+```
+
+**Analogy**
+
+A publisher prints one book in pocket, standard and large-print editions, and ships copies to local bookshops so readers never travel to the printing press.
+Where it breaks: a reader cannot switch edition halfway through a page, but a video player switches quality every few seconds.
+
+**How the rest of this note builds up**
+
+- First the requirements and the mental model (sections 1-2).
+- Then the high-level design: upload, transcoding pipeline, CDN delivery (section 3).
+- Then the numbers, API and data model (section 4).
+- Finally variants, trade-offs, production practice and the SDE-3 deep dive on ABR and pipeline details (sections 5-8).
+
+> [!tip] Remember
+> Cut the video into small files at many qualities, put them on a CDN, and let the player choose.
+
 ## 1. Why it exists - requirements
 
-A video file is huge and viewers are everywhere. A 10-minute 1080p source upload at 10 Mbps is about 750 MB. If 1 million people press play in the same hour and every byte comes from one data centre, that data centre needs terabits per second of egress, and a viewer on a 2 Mbps mobile link cannot play a 5 Mbps file at all.
+A video file is huge and viewers are everywhere. A 10-minute 1080p source upload at 10 Mbps is about 750 MB.
+
+If 1 million people press play in the same hour and every byte comes from one data centre, that data centre needs terabits per second of egress, and a viewer on a 2 Mbps mobile link cannot play a 5 Mbps file at all.
 
 **Terms used below:**
 - **Transcoding:** decoding the uploaded video and re-encoding it at other resolutions, bitrates or codecs.
@@ -56,7 +105,9 @@ A video file is huge and viewers are everywhere. A 10-minute 1080p source upload
 
 ## 2. Mental model
 
-Think of a publisher of printed books. The author hands in one manuscript (the upload). The printing plant (transcoding) produces a large-print edition, a paperback and a pocket edition (renditions), each cut into numbered chapters (segments). Copies are shipped to local bookshops (CDN edges) before readers ask. A reader walks into the nearest shop and takes chapter after chapter, choosing the pocket edition while on the bus and the large-print edition at home (ABR).
+Think of a publisher of printed books. The author hands in one manuscript (the upload). The printing plant (transcoding) produces a large-print edition, a paperback and a pocket edition (renditions), each cut into numbered chapters (segments).
+
+Copies are shipped to local bookshops (CDN edges) before readers ask. A reader walks into the nearest shop and takes chapter after chapter, choosing the pocket edition while on the bus and the large-print edition at home (ABR).
 
 Two paths, very different in shape:
 - **Write path** (upload and transcode): rare, heavy on CPU, can take minutes, must never lose data.
@@ -527,7 +578,9 @@ Starting at a low rendition is deliberate: the first segment is small, so playba
 
 ### Counting views
 
-Heartbeats flow into Kafka; a stream job deduplicates by `session_id`, applies a rule such as "a view counts after 30 s of playback" (an example rule), aggregates per video per minute and writes batched increments to `video_stats`. A real-time counter can be approximate, while billing-grade numbers (for creator payouts or ads) are reconciled by a batch job. This is the same pattern as [[Case Study - Ad Click Aggregation]].
+Heartbeats flow into Kafka; a stream job deduplicates by `session_id`, applies a rule such as "a view counts after 30 s of playback" (an example rule), aggregates per video per minute and writes batched increments to `video_stats`.
+
+A real-time counter can be approximate, while billing-grade numbers (for creator payouts or ads) are reconciled by a batch job. This is the same pattern as [[Case Study - Ad Click Aggregation]].
 
 ## 9. Interview questions
 
@@ -567,3 +620,8 @@ Heartbeats flow into Kafka; a stream job deduplicates by `session_id`, applies a
 - **Before this:** [[System Design Interview Framework]], [[Back-of-the-Envelope Estimation]], [[CDN and Edge]], [[File Upload Architecture]], [[File Uploads and Object Storage]]
 - **Next:** [[Case Study - Distributed Message Queue]], [[Case Study - Ad Click Aggregation]]
 - **Compare with:** [[Case Study - File Storage and Sync]] (also chunked uploads to object storage, but sync instead of streaming), [[Case Study - Distributed Job Scheduler]] (the engine under the transcode DAG), [[Scaling WebSockets]] (stateful connections, the opposite of stateless segment GETs)
+
+### Watch on YouTube
+
+- [How Video Streaming Works on Scale - System Design ](https://www.youtube.com/watch?v=-JtjQ-OA7XE) · Piyush Garg · 30 min · 102,215 views
+- [How Video Streaming works / System Design](https://www.youtube.com/watch?v=kCAXpAikMVc) · ByteMonk · 5 min · 140,692 views

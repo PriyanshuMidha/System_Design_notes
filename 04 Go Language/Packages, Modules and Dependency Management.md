@@ -11,7 +11,7 @@ sources:
   - "go.dev/ref/mod#private-module-privacy, GOPRIVATE and module privacy"
   - "go.dev/doc/tutorial/workspaces, multi-module workspaces"
   - "go.dev/blog/vuln, govulncheck"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Packages, Modules and Dependency Management
@@ -26,11 +26,59 @@ updated: 2026-11-07
 > - `internal/` is enforced by the `go` command's package loader, not a convention: only code inside the directory tree rooted at `internal`'s parent may import it, and the build refuses anything else before the compiler ever runs.
 > - `go work` lets you build and test several modules together from local source, without editing any `go.mod` to point at a local path.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your service uses two libraries, and both use a third library, but they ask for different versions of it.
+Your teammate builds the project a month later and gets different code than you did.
+Something must decide which version wins and record it so every build is identical.
+In Go, packages organize code and modules (`go.mod`, `go.sum`) handle versions.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Package | A folder of `.go` files compiled together | `package checkout` |
+| Import | Use another package's code | `import "net/http"` |
+| Exported | Visible outside its package (starts with a capital letter) | `Reserve` yes, `reserve` no |
+| Module | A versioned bundle of packages with one `go.mod` | `module example.com/shop` |
+| Dependency | Code your code needs from someone else | `github.com/google/uuid` |
+| Version (semver) | `vMAJOR.MINOR.PATCH`; MAJOR changes break callers | `v1.5.0` → `v2.0.0` |
+| Checksum | A fingerprint proving downloaded bytes did not change | lines in `go.sum` |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    S["your service"] --> A["lib A"]
+    S --> B["lib B"]
+    A -- "needs libX v1.2.0" --> X["libX"]
+    B -- "needs libX v1.5.0" --> X
+    X --> P["Go picks v1.5.0:<br/>highest version anyone asked for"]
+```
+
+**Analogy.** Packages are rooms in a house; a module is the whole house with an address and a version number, and `go.sum` is the sealed inspection report.
+Where it breaks: a house has one owner, but one module can be imported by thousands of others, each asking for a different minimum version.
+
+**How the rest of this note builds up**
+
+- First, why modules replaced `GOPATH` and the diamond dependency (section 1), then packages vs. modules (section 2).
+- Then `go.mod` directives, `go.sum` and the checksum database, Minimal Version Selection, `/v2` import paths and `internal/` (section 3).
+- Then a worked multi-module example and workspaces (section 4).
+- Finally the SDE-3 deep dive: MVS vs. SAT solvers, workspaces vs. `replace`, and production practice (sections 6-8).
+
+> [!tip] Remember
+> `go.mod` says what you need, `go.sum` proves what you got, and Go picks the lowest version that satisfies everyone.
+
 ## 1. Why it exists
 
-Before modules (pre-Go 1.11, `GOPATH` mode), every import had to live under a single global `$GOPATH/src` tree, with no per-project version: two projects needing different versions of the same library could not both build from the same machine. Modules fix this by making the dependency set, and its exact versions, a property of the project itself — recorded in `go.mod`, checked into version control, and reproducible on any machine or CI runner with the same Go toolchain.
+Before modules (pre-Go 1.11, `GOPATH` mode), every import had to live under a single global `$GOPATH/src` tree, with no per-project version: two projects needing different versions of the same library could not both build from the same machine.
 
-The deeper problem modules solve is the **diamond dependency**: your service imports package `A` and package `B`; `A` requires `libX@v1.2.0`; `B` requires `libX@v1.5.0`. Some ecosystems resolve this by installing both versions side by side (larger binaries, subtle bugs if the two copies' types leak into each other) or by picking "the newest requested" and hoping it is backward compatible. Go's answer, Minimal Version Selection, is covered in section 3: it deterministically picks `v1.5.0` — the minimum version that satisfies every requirement in the graph — and the same inputs always produce the same answer, with no solver, no newest-compatible heuristic, and no lockfile needed.
+Modules fix this by making the dependency set, and its exact versions, a property of the project itself — recorded in `go.mod`, checked into version control, and reproducible on any machine or CI runner with the same Go toolchain.
+
+The deeper problem modules solve is the **diamond dependency**: your service imports package `A` and package `B`; `A` requires `libX@v1.2.0`; `B` requires `libX@v1.5.0`. Some ecosystems resolve this by installing both versions side by side (larger binaries, subtle bugs if the two copies' types leak into each other) or by picking "the newest requested" and hoping it is backward compatible.
+
+Go's answer, Minimal Version Selection, is covered in section 3: it deterministically picks `v1.5.0` — the minimum version that satisfies every requirement in the graph — and the same inputs always produce the same answer, with no solver, no newest-compatible heuristic, and no lockfile needed.
 
 ## 2. Mental model
 
@@ -46,7 +94,9 @@ A repository is normally one module at its root. A monorepo *can* hold multiple 
 ### Package naming and init order
 
 - A package name is short, lowercase, and singular (`http`, not `httpUtils`); the import path's last segment should match it.
-- Within one package, every file's top-level `var` initializers run first (in dependency order among themselves, then file order), then every `func init()` runs (in the order its file was presented to the compiler), then `main` (if this is the `main` package). Across packages, Go initializes each imported package fully before initializing the package that imports it — so `init` order follows the import graph, not source order.
+- Within one package, every file's top-level `var` initializers run first (in dependency order among themselves, then file order), then every `func init()` runs (in the order its file was presented to the compiler), then `main` (if this is the `main` package).
+
+  Across packages, Go initializes each imported package fully before initializing the package that imports it — so `init` order follows the import graph, not source order.
 
 ### go.mod directives
 
@@ -82,13 +132,19 @@ tool golang.org/x/tools/cmd/stringer
 
 ### go.sum and the checksum database
 
-`go.sum` records a cryptographic hash of every module version your build has ever downloaded — both its source tree and its `go.mod` file — so a later build with the same `go.mod` reproduces bit-for-bit identical dependencies, and a tampered or corrupted download is detected and rejected. The hashes are cross-checked against the public **checksum database** (`sum.golang.org`, via `GOSUMDB`) the first time any machine sees a given version, so an attacker who compromises one proxy cannot silently serve a different artifact for a version everyone else already verified.
+`go.sum` records a cryptographic hash of every module version your build has ever downloaded — both its source tree and its `go.mod` file — so a later build with the same `go.mod` reproduces bit-for-bit identical dependencies, and a tampered or corrupted download is detected and rejected.
 
-Both the download and the checksum check go through a **module proxy**, controlled by `GOPROXY` (default `https://proxy.golang.org,direct`): `go` asks the proxy for a module version's zip and `go.mod` file instead of talking to the VCS host directly, falling through the comma-separated list — `direct` means "clone the repository yourself" — until one source answers. `GOPROXY=off` forbids any network fetch, forcing the build to use only what is already in the local module cache or a `vendor/` directory.
+The hashes are cross-checked against the public **checksum database** (`sum.golang.org`, via `GOSUMDB`) the first time any machine sees a given version, so an attacker who compromises one proxy cannot silently serve a different artifact for a version everyone else already verified.
+
+Both the download and the checksum check go through a **module proxy**, controlled by `GOPROXY` (default `https://proxy.golang.org,direct`): `go` asks the proxy for a module version's zip and `go.mod` file instead of talking to the VCS host directly, falling through the comma-separated list — `direct` means "clone the repository yourself" — until one source answers.
+
+`GOPROXY=off` forbids any network fetch, forcing the build to use only what is already in the local module cache or a `vendor/` directory.
 
 ### Minimal Version Selection (MVS)
 
-Given a module and its full dependency graph, Go computes, for every module that appears anywhere in the graph, the **highest version requested by any requirement** — not the newest version published. That is the version used. The algorithm is a graph walk, not a constraint solver: there is one deterministic answer, computed without backtracking, which is why Go needs no separate lockfile the way `package-lock.json` or `Pipfile.lock` exist to pin down an otherwise nondeterministic solver's choice.
+Given a module and its full dependency graph, Go computes, for every module that appears anywhere in the graph, the **highest version requested by any requirement** — not the newest version published. That is the version used.
+
+The algorithm is a graph walk, not a constraint solver: there is one deterministic answer, computed without backtracking, which is why Go needs no separate lockfile the way `package-lock.json` or `Pipfile.lock` exist to pin down an otherwise nondeterministic solver's choice.
 
 ```mermaid
 flowchart TD
@@ -102,15 +158,25 @@ flowchart TD
 
 `go mod tidy` then prunes the `require` list down to the modules your code actually imports (direct or indirect) at the versions MVS selected, and adds any missing entries; `go mod graph` prints the raw requirement edges MVS walks.
 
-`go get` takes the same version syntax everywhere: `go get example.com/foo@v1.2.0` pins an exact version, `go get example.com/foo@latest` takes the newest tagged release (ignoring what MVS would otherwise pick), and `go get example.com/foo@none` removes the requirement entirely, dropping it and anything it alone pulled in. Run `go get -u` to move every direct and indirect dependency forward to its latest minor/patch release in one step.
+`go get` takes the same version syntax everywhere: `go get example.com/foo@v1.2.0` pins an exact version, `go get example.com/foo@latest` takes the newest tagged release (ignoring what MVS would otherwise pick), and `go get example.com/foo@none` removes the requirement entirely, dropping it and anything it alone pulled in.
+
+Run `go get -u` to move every direct and indirect dependency forward to its latest minor/patch release in one step.
 
 ### Semantic import versioning
 
-Go encodes a module's major version **in its import path** from v2 onward: `example.com/mylib` is implicitly v0 or v1, but a v2 release becomes `example.com/mylib/v2`. This means v1 and v2 of the same library have different import paths and so can be imported side by side in the same build — a diamond where one dependency needs the old API and another needs the new one is not a conflict, because they are, as far as the compiler and MVS are concerned, different modules. A dependency not yet tagged with a release version resolves to a **pseudo-version** such as `v0.0.0-20261001120000-abc123def456`, encoding a timestamp and commit hash so an untagged commit is still addressable and reproducible.
+Go encodes a module's major version **in its import path** from v2 onward: `example.com/mylib` is implicitly v0 or v1, but a v2 release becomes `example.com/mylib/v2`.
+
+This means v1 and v2 of the same library have different import paths and so can be imported side by side in the same build — a diamond where one dependency needs the old API and another needs the new one is not a conflict, because they are, as far as the compiler and MVS are concerned, different modules.
+
+A dependency not yet tagged with a release version resolves to a **pseudo-version** such as `v0.0.0-20261001120000-abc123def456`, encoding a timestamp and commit hash so an untagged commit is still addressable and reproducible.
 
 ### The internal/ rule, precisely
 
-A package under a path containing a directory literally named `internal` may be imported only by packages rooted at the directory **one level above** that `internal` directory (and anything further down inside it). `demo.example/invoiceops/internal/billing` can be imported by `demo.example/invoiceops/cmd/api` or any other package under `demo.example/invoiceops/...`, but not by a different module entirely, nor even by a sibling module in the same repository that does not share that parent path. This is enforced by the `go` command itself at build time, not by convention or code review.
+A package under a path containing a directory literally named `internal` may be imported only by packages rooted at the directory **one level above** that `internal` directory (and anything further down inside it).
+
+`demo.example/invoiceops/internal/billing` can be imported by `demo.example/invoiceops/cmd/api` or any other package under `demo.example/invoiceops/...`, but not by a different module entirely, nor even by a sibling module in the same repository that does not share that parent path.
+
+This is enforced by the `go` command itself at build time, not by convention or code review.
 
 ```mermaid
 flowchart LR
@@ -301,7 +367,9 @@ $ go build ./...
 - MVS intentionally never picks a version newer than every requirement demands, even if a newer, better version exists — you must `go get -u` deliberately to move forward. This avoids silent breakage from an unreviewed transitive upgrade, at the cost of needing to run upgrades yourself.
 - A `replace` directive pointing at a local path is invisible to MVS entirely — it bypasses version selection, which is exactly the point for local development, but it also means CI and other developers must have that local path too, or the build fails. Never let a local `replace` reach a release.
 - Vendoring trades disk space and repo size for build reproducibility without any network or proxy dependency — rarely worth it unless your environment genuinely cannot reach a proxy (an air-gapped build server, strict supply-chain policy).
-- Splitting a repository into many small modules (rather than many packages inside one module) adds real overhead: each module needs its own `go.mod`, its own versioning discipline, and cross-module changes need either a workspace or a round trip through a published version. Default to one module per repository unless you specifically need independent versioning or release cadence for a piece of it.
+- Splitting a repository into many small modules (rather than many packages inside one module) adds real overhead: each module needs its own `go.mod`, its own versioning discipline, and cross-module changes need either a workspace or a round trip through a published version.
+
+  Default to one module per repository unless you specifically need independent versioning or release cadence for a piece of it.
 
 ## 7. In production
 
@@ -315,11 +383,15 @@ $ go build ./...
 
 ## 8. Deep dive
 
-- **MVS versus a SAT-style solver.** Package managers that resolve to "the newest version satisfying every constraint" (npm, pip's newer resolvers) run a constraint solver that can, in principle, backtrack and may produce different results depending on resolution order or solver version. MVS instead computes a single highest-requested-version per module directly from the requirement graph — no backtracking, no solver, and the same `go.mod` files always produce the same build list, which is also why Go needs no separate lockfile.
+- **MVS versus a SAT-style solver.** Package managers that resolve to "the newest version satisfying every constraint" (npm, pip's newer resolvers) run a constraint solver that can, in principle, backtrack and may produce different results depending on resolution order or solver version.
+
+  MVS instead computes a single highest-requested-version per module directly from the requirement graph — no backtracking, no solver, and the same `go.mod` files always produce the same build list, which is also why Go needs no separate lockfile.
 - **Why `go.sum` still matters with MVS being deterministic.** Determinism of *which version* is picked does not guarantee the *bytes* of that version have not changed upstream (a tag force-pushed, a proxy compromised). `go.sum`'s hashes, backed by the append-only public checksum database, catch that independently of version selection.
 - **Pseudo-versions in detail.** `vX.0.0-yyyymmddhhmmss-abcdef123456` is how Go addresses a commit with no semver tag: the timestamp orders it relative to tagged releases for MVS purposes, and the 12-character prefix of the commit hash pins the exact source. `go get module@commit-or-branch` generates one automatically.
 - **`retract` is self-service, not enforcement.** A module author adds a `retract` directive and republishes; `go get` and `go list -m -u` then warn anyone who depends on the retracted version, but nothing stops an already-pinned `go.sum` from continuing to build against it — retraction is advisory, not a takedown.
-- **Workspaces versus `replace`, mechanically.** A `go.work` file is read only by the `go` command invoked from within (or below) the directory that contains it; it never travels with either module and never affects a `go build` run from outside the workspace or by a downstream consumer. A `replace` directive, by contrast, lives inside a `go.mod` and does affect anyone who depends on that module unless it is a `replace` of something already required only as a test-only or main-module-only dependency — which is why workspaces are the preferred way to develop two local modules against each other.
+- **Workspaces versus `replace`, mechanically.** A `go.work` file is read only by the `go` command invoked from within (or below) the directory that contains it; it never travels with either module and never affects a `go build` run from outside the workspace or by a downstream consumer.
+
+  A `replace` directive, by contrast, lives inside a `go.mod` and does affect anyone who depends on that module unless it is a `replace` of something already required only as a test-only or main-module-only dependency — which is why workspaces are the preferred way to develop two local modules against each other.
 
 ## 9. Interview questions
 
@@ -339,7 +411,9 @@ $ go build ./...
 > When developing two or more local modules together and you want changes in one picked up by the other immediately, without editing either module's own `go.mod` — a workspace is local-only and never affects anyone who later depends on either module, whereas a `replace` left in a published `go.mod` redirects every consumer's build.
 
 > [!question]- Trap: your CI build is slower every month even though `go.mod` hasn't changed. What's a likely module-related cause?
-> `go.mod`'s `require` list can silently drift from what the code actually imports — unused indirect dependencies pile up, or `go mod tidy` was never run after a refactor — each one still resolved and downloaded. Running `go mod tidy` in CI and failing on any diff catches this; it is unrelated to MVS itself being slow, since MVS's graph walk is cheap.
+> `go.mod`'s `require` list can silently drift from what the code actually imports — unused indirect dependencies pile up, or `go mod tidy` was never run after a refactor — each one still resolved and downloaded.
+>
+> Running `go mod tidy` in CI and failing on any diff catches this; it is unrelated to MVS itself being slow, since MVS's graph walk is cheap.
 
 ## 10. Cheat sheet
 
@@ -356,3 +430,8 @@ $ go build ./...
 - **Before this:** [[Go Toolchain, Tooling and Debugging]], [[Syntax, Types and Control Flow]]
 - **Next:** [[Service Project Layout and Wiring]], [[Standard Library Essentials (time, io, files, encoding)]]
 - **Compare with:** [[Error Handling]] (the `errgroup` dependency used above), [[Containerizing Go Services]] (building a reproducible image from a pinned `go.sum`)
+
+### Watch on YouTube
+
+- [Go (Golang) Modules Tutorial](https://www.youtube.com/watch?v=AJxKKmzRTUY) · Golang Cafe · practical go.mod/go.sum and dependency management walkthrough
+- [Go Modules Explained / Mastering Dependency Management in Go](https://www.youtube.com/watch?v=-qh4qi4_Vpg) · Code & Learn · explainer on module versioning and dependency resolution

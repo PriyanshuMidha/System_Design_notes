@@ -12,7 +12,7 @@ sources:
   - "Tom Wilkie, 'The RED Method: How to Instrument Your Services' (Weaveworks, 2016)"
   - "Gil Tene, 'How NOT to Measure Latency' (talk, 2015) — coordinated omission"
   - "J.D.C. Little, 'A Proof for the Queuing Formula: L = λW' (Operations Research, 1961)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Latency, Percentiles and Bottleneck Analysis
@@ -27,11 +27,62 @@ updated: 2026-11-07
 > - **Measure time, don't guess it.** The USE method (saturation of a resource) and the RED method (request-level symptoms) are the two lenses; traces show you which stage actually owns the time.
 > - **How you measure latency can be wrong.** A naive load generator suffers "coordinated omission" and silently hides the exact stalls you are trying to find.
 
+## Start here: the basics
+
+**The problem in one story.**
+A shop's checkout page loads in 0.2 seconds for most people.
+But one customer in a hundred waits 4 seconds and gives up.
+The "average load time" chart looks great, so nobody notices.
+This note is about measuring that slow 1% and finding the one stage that causes it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Latency | How long one request takes, start to finish | A page load took 180 ms |
+| Throughput | How many requests finish per second | 2,000 requests/second |
+| Percentile (p50, p99) | The value that X% of requests are faster than | p99 = 900 ms: 99 in 100 requests took ≤ 900 ms |
+| Tail | The slowest slice of requests (p95 and above) | The 1 in 100 that took 4 s |
+| Bottleneck | The one stage that limits the whole system | The database, while app servers sit idle |
+| Queue | Requests waiting their turn for a busy resource | 50 requests waiting for a DB connection |
+| Fan-out | One request calling many other services | A search page calling 100 shards |
+| Saturation | How much extra work is waiting beyond capacity | CPU run queue of 8 on a 4-core box |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request"] --> Q["Wait in queue"]
+    Q --> A["App work"]
+    A --> D["Database call"]
+    D --> N["Network back"]
+    N --> M["Measure: p50, p99"]
+    M --> B{"Which stage<br/>owns the time?"}
+    B --> F["Fix that one<br/>(the bottleneck)"]
+```
+
+**Analogy.** A supermarket with several tills: the average wait is fine, but one till with a price-check problem makes a few shoppers wait ten minutes. You fix that till, not the whole store.
+Where it breaks: shoppers pick a different till, but in a fan-out request you must wait for *every* "till" you called, so one slow one slows the whole request.
+
+**How the rest of this note builds up**
+
+- First, why averages mislead (section 1) and a mental model of where time goes (section 2).
+- Then how it works: USE and RED methods, percentiles, and tail amplification under fan-out (section 3).
+- Then a worked example with real numbers and Little's Law (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production practice, coordinated omission, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Look at p99, not the average, and measure which stage owns the time before fixing anything.
+
 ## 1. Why it exists
 
-A checkout API has an average latency of 45ms — looks healthy on any dashboard that only plots the mean. But 1 request in 100 takes 2.1 seconds, because it happens to land on a connection pool that is momentarily full. That's 1% of users sitting on a loading spinner for two seconds, every minute, all day. The average told you nothing was wrong.
+A checkout API has an average latency of 45ms — looks healthy on any dashboard that only plots the mean. But 1 request in 100 takes 2.1 seconds, because it happens to land on a connection pool that is momentarily full.
 
-Worse: if that checkout page calls 20 downstream services to render (pricing, inventory, promotions, recommendations, ...), and each one independently has that same 1%-slow tail, the checkout page itself is slow for far more than 1% of its users — because it only needs *one* of 20 calls to be slow. That's **tail amplification**, and it's why "p99 is only slow for 1% of requests" is the wrong way to reason about a fan-out system.
+That's 1% of users sitting on a loading spinner for two seconds, every minute, all day. The average told you nothing was wrong.
+
+Worse: if that checkout page calls 20 downstream services to render (pricing, inventory, promotions, recommendations, ...), and each one independently has that same 1%-slow tail, the checkout page itself is slow for far more than 1% of its users — because it only needs *one* of 20 calls to be slow.
+
+That's **tail amplification**, and it's why "p99 is only slow for 1% of requests" is the wrong way to reason about a fan-out system.
 
 Bottleneck analysis answers the next question correctly: of DNS, TLS, the load balancer, app CPU, GC, the database, a cache, an external API and a queue, which one actually owns the time in the slow 1%? Guessing wastes an afternoon optimizing a cache that was never the problem.
 
@@ -42,7 +93,9 @@ Every request's total latency is a sum of two very different things:
 - **Service time**: the work itself — a CPU instruction, a disk read, a network round trip.
 - **Queueing time**: time spent waiting for a resource (a connection, a goroutine, a CPU core, a lock) that is busy serving someone else.
 
-As a system's utilization climbs toward 100%, queueing time does not grow linearly — it grows **asymptotically**, because an almost-full resource occasionally has a long queue build up behind it. This is the **latency knee**: the point past which small increases in load cause disproportionate latency increases. A server at 60% CPU utilization and the same server at 95% CPU utilization can have wildly different p99s for the same average service time, because the 95%-loaded one is far more likely to have a queue.
+As a system's utilization climbs toward 100%, queueing time does not grow linearly — it grows **asymptotically**, because an almost-full resource occasionally has a long queue build up behind it. This is the **latency knee**: the point past which small increases in load cause disproportionate latency increases.
+
+A server at 60% CPU utilization and the same server at 95% CPU utilization can have wildly different p99s for the same average service time, because the 95%-loaded one is far more likely to have a queue.
 
 Think of a single supermarket checkout lane. At 60% of capacity, a new customer almost never waits. At 95% of capacity, a slightly slow customer ahead of you (a wait that a 60%-loaded lane would absorb instantly) now creates a visible line. The register didn't get slower; it got closer to its limit.
 
@@ -68,7 +121,9 @@ flowchart LR
     Q --> RESP
 ```
 
-A trace span exists for most of these hops. **The dangerous gap is the time that belongs to none of them** — the unaccounted time between the end of one span and the start of the next, which is almost always queueing: a goroutine waiting for a free OS thread, a request waiting in an HTTP server's accept queue, or a task waiting for a worker pool slot. If spans account for 30ms but the client measured 90ms, 60ms went somewhere your tracing isn't looking — usually a queue.
+A trace span exists for most of these hops. **The dangerous gap is the time that belongs to none of them** — the unaccounted time between the end of one span and the start of the next, which is almost always queueing: a goroutine waiting for a free OS thread, a request waiting in an HTTP server's accept queue, or a task waiting for a worker pool slot.
+
+If spans account for 30ms but the client measured 90ms, 60ms went somewhere your tracing isn't looking — usually a queue.
 
 ### The USE method and the RED method
 
@@ -89,7 +144,9 @@ flowchart TD
 
 ### Percentiles, and why averages lie
 
-Given a sorted set of latencies, the p99 is the value below which 99% of requests fall (the "nearest-rank" method: for `n` samples, `rank = round(p/100 × (n-1))`, 0-indexed). The mean is dragged only a little by a rare huge value; the p99 is defined entirely by the tail. A system where 99% of requests take 10ms and 1% take 2000ms has a mean of about 29.9ms (`0.99×10 + 0.01×2000`) — looking almost fine — while its p99 is 2000ms: about 67× the mean, and 200× the typical (p50) request.
+Given a sorted set of latencies, the p99 is the value below which 99% of requests fall (the "nearest-rank" method: for `n` samples, `rank = round(p/100 × (n-1))`, 0-indexed). The mean is dragged only a little by a rare huge value; the p99 is defined entirely by the tail.
+
+A system where 99% of requests take 10ms and 1% take 2000ms has a mean of about 29.9ms (`0.99×10 + 0.01×2000`) — looking almost fine — while its p99 is 2000ms: about 67× the mean, and 200× the typical (p50) request.
 
 **Percentiles do not average.** `p99(A) ≈ 500ms` and `p99(B) ≈ 10ms` does **not** make the combined fleet's p99 `(500+10)/2 = 255ms`. The only correct way to combine percentiles from multiple instances is to merge the underlying samples (or histograms) and recompute the percentile on the merged distribution — see the worked example below for a case where naive averaging is off by 50×.
 
@@ -175,7 +232,9 @@ func AverageOfPerInstanceP99s(perInstance [][]float64) float64 {
 }
 ```
 
-**Measured** (this scratch module, Go 1.24, 2026-11-07): 9 instances each serve 10,000 requests at a flat 10ms; a 10th instance just started during a rollout and has served only 10 requests, one of which took 5000ms. `AverageOfPerInstanceP99s` = **509.0ms** (the low-traffic instance's p99 *is* its one slow sample, and it counts equally with 9 instances that served 1,000× more traffic). `MergedP99` on the pooled 90,010 requests = **10.0ms** (that one slow request is 1 of 90,010, nowhere near the true 99th percentile). The naive average overstates the real p99 by about 50×.
+**Measured** (this scratch module, Go 1.24, 2026-11-07): 9 instances each serve 10,000 requests at a flat 10ms; a 10th instance just started during a rollout and has served only 10 requests, one of which took 5000ms.
+
+`AverageOfPerInstanceP99s` = **509.0ms** (the low-traffic instance's p99 *is* its one slow sample, and it counts equally with 9 instances that served 1,000× more traffic). `MergedP99` on the pooled 90,010 requests = **10.0ms** (that one slow request is 1 of 90,010, nowhere near the true 99th percentile). The naive average overstates the real p99 by about 50×.
 
 Coordinated omission, demonstrated the same way: an **open-loop** generator sends a request every fixed interval regardless of server load (what real traffic does); a **closed-loop** generator sends the next request only after the previous one completes (what a naive single-threaded benchmark does).
 
@@ -227,7 +286,11 @@ func TestCoordinatedOmissionHidesTheStall(t *testing.T) {
 }
 ```
 
-**Measured** (same module): closed-loop p99 = **10ms** — the generator was blocked waiting during the stall, so it never sent the requests that would have queued behind it, and the stall is invisible. Open-loop p99 = **2000ms** — and not just for the one stalled request: because this example's normal service time (10ms) exactly equals the fixed arrival interval (10ms), the server is running at 100% utilization even before the stall, so the 2000ms backlog never drains. The stalled request and every one of the 499 requests that arrive right after it (500 of the 1000 requests, half the sample) all end up at the full 2000ms, not a fraction of it (in a system with real slack — interval comfortably longer than service time — the backlog would instead shrink request by request back to baseline). This is why load-testing tools built for this (k6, wrk2, Gatling) use **constant-arrival-rate** execution, never "wait for the response before sending the next one."
+**Measured** (same module): closed-loop p99 = **10ms** — the generator was blocked waiting during the stall, so it never sent the requests that would have queued behind it, and the stall is invisible. Open-loop p99 = **2000ms** — and not just for the one stalled request: because this example's normal service time (10ms) exactly equals the fixed arrival interval (10ms), the server is running at 100% utilization even before the stall, so the 2000ms backlog never drains.
+
+The stalled request and every one of the 499 requests that arrive right after it (500 of the 1000 requests, half the sample) all end up at the full 2000ms, not a fraction of it (in a system with real slack — interval comfortably longer than service time — the backlog would instead shrink request by request back to baseline).
+
+This is why load-testing tools built for this (k6, wrk2, Gatling) use **constant-arrival-rate** execution, never "wait for the response before sending the next one."
 
 Finally, Little's Law for pool sizing:
 
@@ -322,3 +385,8 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 - **Before this:** [[Latency Numbers Every Engineer Should Know]]
 - **Next:** [[Debugging Database Performance]], [[Performance Engineering and Capacity Planning]]
 - **Compare with:** [[Benchmarks, Profiling and Tracing]] (Go-specific profiling once you've localized the bottleneck), [[Back-of-the-Envelope Estimation]] (capacity math before the system exists), [[Observability in Go Services]] (how to emit the histograms this note assumes)
+
+### Watch on YouTube
+
+- [What is Bottleneck Analysis in Lean manufacturing ? / Bottleneck Analysis in explained with ✅𝐄𝐗𝐀𝐌𝐏𝐋𝐄](https://www.youtube.com/watch?v=ZjlQeBpVk70) · Digital E-Learning · 8 min · 80,400 views
+- [GPU Performance Engineering Explained: Latency, Throughput, and Bottlenecks Explained](https://www.youtube.com/watch?v=MSIhAMHbmn0) · ZeroEntropy · 8 min · 391 views

@@ -1,0 +1,344 @@
+1
+00:00:02,399 --> 00:00:17,442
+Narrator: Showtown, eleven fifty. In ten minutes, tickets for the biggest concert of the year go on sale. And then the alarm rings. On phones, the checkout page crawls. Spinners everywhere. Every second of waiting, a customer leaves. Ten minutes to find out why.
+
+2
+00:00:17,871 --> 00:00:28,833
+Zara: I am Zara, the performance engineer. Ravi, my rookie, you are with me. The page needs thirty files, and it is slow, even though the server is fast.
+
+3
+00:00:29,263 --> 00:00:36,289
+Ravi: Why would a fast server give a slow page, Zara? Is it the files, the road, or the server?
+
+4
+00:00:36,820 --> 00:00:51,405
+Zara: The server answers in fifty milliseconds. The problem is how we ask. There are three versions of H T T P, three ways to ask for many things at once. Let us meet them, one by one.
+
+5
+00:00:51,835 --> 00:01:30,542
+Narrator: Words first. A request is a question the browser sends, and a response is the answer. A connection is an open line between them. T C P is the transport that delivers bytes reliably and in order. U D P sends packets with no promise of order or retry. Packet loss is the network silently dropping data, like a Wi Fi glitch. A round trip, or R T T, is the time to go to the server and back, forty milliseconds from Mumbai to Singapore. Multiplexing is mixing many conversations on one line, each one tagged. And head of line blocking is when one stuck item at the front makes everything behind it wait, like one slow customer at the only checkout counter.
+
+6
+00:01:30,971 --> 00:01:50,141
+Zara: Picture a news page. The H T M L, a stylesheet, scripts, twenty images and a font. If you can only ask for one thing at a time, the page crawls in piece by piece. Our question is simple. How do we ask for many things at once, even when the network drops data?
+
+7
+00:01:50,572 --> 00:02:11,901
+Narrator: Here is the whole story on a whiteboard. Six requests, each taking fifty milliseconds. Over one H T T P one point one connection, about three hundred ten milliseconds. Over one H T T P two connection, about sixty two. That gap is the entire reason H T T P two exists. And each version fixes the bottleneck of the one before.
+
+8
+00:02:14,852 --> 00:02:24,662
+Narrator: Suspect one. Hal, at the single window counter. H T T P one point one sends one request at a time, on each connection. Zara and Ravi walk over.
+
+9
+00:02:25,092 --> 00:02:49,973
+Hal: I am Hal. One customer at a time. Ask me for the style sheet. Done? Next. My requests are plain text, ending with a blank line. G E T, slash style dot C S S, Host, Accept Encoding. Keep alive lets you reuse my window for the next customer, but still, only one at a time.
+
+10
+00:02:50,403 --> 00:02:53,542
+Ravi: Can you not take a queue of requests, Hal?
+
+11
+00:02:54,072 --> 00:03:10,674
+Hal: Pipelining. The spec allows it. But the answers must come back in the same order, so one slow answer blocks everyone behind it, and some middlemen mangled it. No major browser ever turned it on. Pipelining is a failed feature.
+
+12
+00:03:11,104 --> 00:03:32,457
+Narrator: So browsers shipped a workaround. Open six T C P connections per host, and spread the requests. Parallelism, at a price. Six times the T C P handshakes. Six times the T L S handshakes over H T T P S. Six congestion control states, each starting from scratch. And six connections fighting over the same link.
+
+13
+00:03:32,888 --> 00:03:45,770
+Zara: Thirty files over six connections is still five round trips per connection. Each connection serializes its own share. Parallelism tops out at however many sockets the browser is willing to open.
+
+14
+00:03:46,199 --> 00:03:59,538
+Narrator: The classic mistake is thinking more connections are a free lunch. Each one repeats the T C P handshake, one round trip, and over H T T P S, one to two more for T L S, before a single byte of the file arrives.
+
+15
+00:03:59,967 --> 00:04:10,066
+Narrator: Think of a doctor's office. In one point one, one patient is called in and finishes completely, then the next. To see two at once, you need a second office.
+
+16
+00:04:13,015 --> 00:04:21,577
+Narrator: Suspect two. Maya, the receptionist of the shared lobby. H T T P two, from twenty fifteen, built on Google's SPDY.
+
+17
+00:04:22,007 --> 00:04:39,665
+Maya: I am Maya. I wrap every request and response in small binary frames. Headers, data, settings, window update, reset stream. Each frame carries a stream I D. Frames from many streams interleave on one connection, and the receiver puts each stream back together.
+
+18
+00:04:40,096 --> 00:04:42,538
+Ravi: So nobody waits for anybody?
+
+19
+00:04:43,067 --> 00:05:02,670
+Maya: Right. Headers for stream one. Headers for stream three. A bit of data for stream one, then stream three. Headers for stream five. Then the rest of stream one. No response waits for another to finish. One connection, with the parallelism of six.
+
+20
+00:05:03,100 --> 00:05:24,958
+Narrator: Maya also compresses headers, with H pack, instead of sending repetitive text on every request. A static table of sixty one common pairs, like method get, referenced by a one byte index. A dynamic table per connection, so a long cookie or user agent is sent once, then referenced by number. And Huffman coding for literal values that are in neither table.
+
+21
+00:05:25,387 --> 00:05:42,709
+Maya: Priority was meant to let a browser say, render blocking C S S jumps ahead of a background image, using a dependency tree and weights. In practice, servers implemented it unevenly, or ignored it. A simpler scheme, R F C ninety two eighteen, later replaced it.
+
+22
+00:05:43,139 --> 00:06:01,254
+Narrator: Then server push. A push promise frame lets a server send the app script before it is asked. Chrome removed it in twenty twenty two. Browsers already had the file cached most of the time, so push wasted bandwidth, and it made cache rules harder to reason about. Use link rel preload, or one oh three Early Hints, instead.
+
+23
+00:06:01,684 --> 00:06:10,870
+Narrator: In the doctor's office, Maya is one receptionist swapping charts between patients, all progressing in the same room. But the building has a single entrance.
+
+24
+00:06:13,819 --> 00:06:23,005
+Narrator: Noon. The sale opens, and a commuter train enters a tunnel. Packets start vanishing. Ravi watches every stream freeze at the same instant.
+
+25
+00:06:23,435 --> 00:06:28,757
+Ravi: Maya, you said no stream blocks another. Why did everything stop?
+
+26
+00:06:29,288 --> 00:06:52,081
+Tom: I am Tom, the T C P road. I promise in order delivery. Segment forty two was lost. Segments forty three, forty four and more arrived, but I hold them back from the application until forty two is sent again. I do not know, or care, that they belong to different streams.
+
+27
+00:06:52,512 --> 00:07:07,434
+Zara: One lost packet stalls every stream on the connection. Maya fixed head of line blocking at the H T T P layer only. Underneath, T C P still blocks everything. That is the classic mistake.
+
+28
+00:07:07,863 --> 00:07:22,497
+Narrator: Look at the buffer. Frames from stream one, three and five all pour into one T C P receive buffer, in strict byte order. The segment for stream one is lost, so the kernel withholds every later byte, including ready frames for streams three and five.
+
+29
+00:07:25,447 --> 00:07:36,649
+Narrator: Suspect three, and the fix. Quinn, at the hub with a separate door for every stream. H T T P three, standardized in R F C ninety one fourteen, in twenty twenty two.
+
+30
+00:07:37,079 --> 00:07:54,017
+Quinn: I am Quinn. I keep Maya's request and frame model, but I replace T C P with QUIC, which runs over U D P. Every H T T P stream gets its own QUIC stream, with its own loss detection and retransmission.
+
+31
+00:07:54,447 --> 00:08:05,505
+Narrator: Watch. Stream one gets its first packet. The second packet is lost. Stream three delivers app dot J S in full, unaffected. Only stream one waits for the retransmission.
+
+32
+00:08:05,935 --> 00:08:20,906
+Quinn: And handshakes. T C P and T L S used to be two handshakes stacked. First agree on a byte stream, then agree on keys. I fold T L S one point three into my own handshake.
+
+33
+00:08:21,336 --> 00:08:41,898
+Narrator: On a fifty millisecond round trip, a fresh H T T P two connection pays about a hundred milliseconds, two round trips, before the first request byte leaves. A fresh H T T P three connection pays about fifty. A resumed one, zero R T T, sends the request in the very first packet. On a slow mobile link, the handshake can cost more than the data.
+
+34
+00:08:42,327 --> 00:08:59,145
+Quinn: I also use Q pack, not H pack. Table updates travel on their own one way stream, so a lost update never blocks headers on other streams. H pack's ordered, inline updates would have brought head of line blocking back at the compression layer.
+
+35
+00:08:59,576 --> 00:09:11,258
+Quinn: And I identify a connection by a connection I D, not by the I P and port. When a phone switches from Wi Fi to cellular in the middle of a request, I keep going.
+
+36
+00:09:11,687 --> 00:09:25,097
+Narrator: In the doctor's office, every patient now has their own entrance. Same building, shared encryption and congestion control. Where the picture breaks, real lanes do not share one budget, but QUIC streams do, at the connection level.
+
+37
+00:09:25,528 --> 00:09:38,001
+Zara: And Ravi, QUIC is not raw U D P with no reliability. It adds its own reliable delivery, congestion control and encryption. U D P is only the carrier.
+
+38
+00:09:40,951 --> 00:10:10,706
+Narrator: Now, prove it. One handler that sleeps fifty milliseconds, called six times at once. The baseline. Serial is six times fifty, three hundred. Parallel is about fifty, plus a little overhead. On the H T T P two path, a test server speaks H T T P two over T L S, A L P N picks h two, and all six requests share one connection. On the H T T P one point one path, a plain server, and a client capped to one connection per host. Measure both.
+
+39
+00:10:11,135 --> 00:10:29,466
+Narrator: The result. H T T P one point one lands near the three hundred serial ideal. H T T P two lands near the fifty parallel ideal. Multiplexing, proven as a passing test. And notice, the handler code is identical. The upgrade is a transport decision, not an application one.
+
+40
+00:10:29,895 --> 00:10:49,066
+Zara: On the wire, curl dash v with the http two flag prints, server accepted h two, then H T T P slash two two hundred. Against a C D N with the http three flag, it prints, using H T T P slash three. Exact lines vary by curl build.
+
+41
+00:10:49,495 --> 00:11:25,730
+Narrator: The comparison. One point one runs on T C P, with no multiplexing and no header compression, blocking per connection. It suits simple services, legacy clients and some internal A P Is. H T T P two runs on T C P plus T L S, multiplexed, with H pack. Fixed at the H T T P layer, but still blocked at T C P. The default for most web traffic and g R P C. H T T P three runs on QUIC over U D P, with independent loss recovery and Q pack. Fixed at both layers, and used by browsers and C D Ns on lossy or mobile networks.
+
+42
+00:11:26,159 --> 00:11:52,697
+Narrator: How do you spot T C P blocking in production? The H T T P layer only sees slow requests, never why. The symptom, several H T T P two streams spike in latency at the same instant. Run S S dash T I on that very connection. Retransmits at the same moment mean one lost segment stalled every stream. No retransmits means the handlers were simply slow. Inside Go, the socket's T C P info is reachable through syscall conn.
+
+43
+00:11:53,128 --> 00:12:07,402
+Zara: The trap is watching only request latency, and concluding that multiplexing is broken. The fix is not a code change at the H T T P layer at all. Accept the trade off, or move to H T T P three.
+
+44
+00:12:10,351 --> 00:12:19,754
+Narrator: Now the Go code. One test, called test H one single conn versus H two multiplexing. Standard library only, no external dependencies.
+
+45
+00:12:20,183 --> 00:12:31,865
+Narrator: Step one, a helper called measure concurrency. It fires N concurrent gets with a wait group, and returns the wall clock time of the whole batch. The same helper serves both protocols, so the comparison is fair.
+
+46
+00:12:32,296 --> 00:12:44,001
+Narrator: Inside, add one to the wait group, start a goroutine, defer done, get the url, and close the body. Closing matters. An unclosed body keeps the connection out of the pool and quietly distorts the timing.
+
+47
+00:12:44,432 --> 00:13:06,769
+Narrator: Step two. One handler that sleeps fifty milliseconds, and two servers. The H T T P two server is an unstarted test server with enable H T T P two switched on, then start T L S. Its client already trusts the generated certificate. The H T T P one point one server is a plain test server, with a client whose transport sets max conns per host to one.
+
+48
+00:13:07,200 --> 00:13:21,210
+Narrator: Step three. Measure both, and assert. H T T P two must finish under half the serial ideal. H T T P one point one must take at least seventy percent of it. Thresholds, not exact numbers, so the test never flakes.
+
+49
+00:13:21,639 --> 00:13:45,009
+Narrator: Measured on this machine, three hundred thirteen milliseconds against sixty eight. Pitfalls. Forgetting to close the body leaks connections. Calling t fatal f from inside a goroutine. And leaving out max conns per host, so Go quietly opens extra connections. H T T P three is not in the standard library as of Go one point twenty four. Add x net http three, or quic go.
+
+50
+00:13:47,960 --> 00:14:13,346
+Narrator: The trade offs. H T T P two and three add real complexity. Frame parsing, flow control windows per stream and per connection, and for three, a full QUIC stack. A tiny internal service gains little. QUIC does loss recovery in user space, costing more C P U per byte than kernel T C P. Pick one point one when you control both ends, need no multiplexing, or are debugging, because it is easy to read on the wire.
+
+51
+00:14:13,775 --> 00:14:33,929
+Gus: I am Gus, the corporate firewall. I only recognize T C P. I block U D P on port four forty three. Fine by me. But your client must fall back. The Alt Svc header advertises H T T P three, so the fallback is explicit, not silent.
+
+52
+00:14:34,360 --> 00:14:48,874
+Narrator: Failure one. Under packet loss, a single slow stream degrades the whole H T T P two connection. The fix, prefer H T T P three on lossy networks, or open a second H T T P two connection for latency sensitive traffic.
+
+53
+00:14:49,303 --> 00:15:05,162
+Narrator: Failure two, the Rapid Reset attack. A flood of cheap reset stream frames drives a server's C P U to exhaustion, creating and tearing down streams. The fix, rate limit resets per connection, and cap concurrent streams with settings max concurrent streams.
+
+54
+00:15:05,591 --> 00:15:17,322
+Narrator: Failure three. U D P blocked by a middlebox silently falls back to T C P. Rely on the client's automatic fallback through Alt Svc, and never assume H T T P three reached the server.
+
+55
+00:15:17,751 --> 00:15:45,778
+Narrator: In production, Go's net http negotiates H T T P two automatically over T L S. g R P C requires H T T P two for streaming. Cloudflare, Fastly, Google and Akamai serve H T T P three at the edge. What to monitor. The negotiated protocol on every response, resp dot Proto in Go. Concurrent streams per connection. Stream reset rate. And QUIC packet loss and retransmission rate at the edge.
+
+56
+00:15:48,727 --> 00:16:05,809
+Narrator: Why pipelining really failed. Responses must return in request order, so one response that never returns, or an intermediary that reorders wrongly, wedges the whole connection. H T T P two solves the same goal without that hazard, because each stream is framed and identified on its own.
+
+57
+00:16:06,240 --> 00:16:20,274
+Narrator: Flow control is per stream and per connection. Window update frames give every stream its own window, on top of a connection wide window, so one greedy stream cannot starve the others. This sits above T C P's own byte level flow control.
+
+58
+00:16:20,703 --> 00:16:38,649
+Narrator: QUIC's zero R T T has a replay caveat. An attacker who captures the first packet can send it again. T L S one point three has the same caveat. Servers must accept zero R T T only for requests that are safe to run twice, idempotent gets, never anything that changes state.
+
+59
+00:16:39,080 --> 00:16:59,714
+Narrator: Compression side channels. H pack and Q pack, like any compression over attacker influenced text, can leak through compressed size. That is the family of attacks including CRIME and BREACH. The mitigation, never compress sensitive headers together with attacker controlled ones across a trust boundary. Mostly a concern for proxies that mix trust levels.
+
+60
+00:17:00,144 --> 00:17:20,034
+Narrator: And the uncertain future of priority. The old dependency tree is obsolete. R F C ninety two eighteen's extensible priority is one urgency from zero to seven, plus an incremental flag, used for both H T T P two and three. A server that ignores it is still conformant. It just offers no scheduling benefit.
+
+61
+00:17:22,983 --> 00:17:27,321
+Narrator: Interview round. Ravi asks, Zara answers. Seven questions.
+
+62
+00:17:27,751 --> 00:17:31,538
+Ravi: Did H T T P two solve head of line blocking?
+
+63
+00:17:32,067 --> 00:17:44,854
+Zara: Only at the H T T P layer. Streams still share one T C P byte stream, so one lost segment stalls them all. H T T P three fixes it with loss recovery per stream.
+
+64
+00:17:45,284 --> 00:17:48,086
+Ravi: Why did browsers never use pipelining?
+
+65
+00:17:48,615 --> 00:18:00,442
+Zara: Responses must return in order, so one slow one blocks the rest, and some middlemen mishandled it. Parallel connections were safer, and that is the waste H T T P two removed.
+
+66
+00:18:00,872 --> 00:18:05,210
+Ravi: What does H pack compress, and why not just gzip the headers?
+
+67
+00:18:05,740 --> 00:18:19,198
+Zara: Table indexes plus Huffman coding. Gzip over headers that mix secrets and attacker text leaked through size, the CRIME and BREACH attacks. H pack and Q pack were designed with that history in mind.
+
+68
+00:18:19,627 --> 00:18:26,917
+Ravi: The trap. Is H T T P three just H T T P over U D P with no reliability?
+
+69
+00:18:27,448 --> 00:18:39,178
+Zara: No. QUIC adds reliable delivery, congestion control and encryption per stream. U D P is used to escape T C P's connection wide ordering.
+
+70
+00:18:39,607 --> 00:18:43,586
+Ravi: Why is server push deprecated, if it sounds so useful?
+
+71
+00:18:44,115 --> 00:18:55,582
+Zara: Pushed files were usually already cached, so it wasted bandwidth and confused invalidation. Chrome removed it in twenty twenty two. Use preload and Early Hints.
+
+72
+00:18:56,011 --> 00:19:00,902
+Ravi: What changes in a Go server for H T T P two, versus three?
+
+73
+00:19:01,432 --> 00:19:13,185
+Zara: Nothing for two. Net http negotiates h two over T L S with A L P N. Three needs a QUIC module, because it is a different transport.
+
+74
+00:19:13,615 --> 00:19:19,778
+Ravi: A client on flaky Wi Fi keeps stalling mid download. Which change helps most?
+
+75
+00:19:20,307 --> 00:19:29,038
+Zara: Move to H T T P three. Loss is isolated per stream, and the connection I D survives the switch from Wi Fi to cellular.
+
+76
+00:19:31,988 --> 00:19:46,213
+Narrator: Eleven fifty nine. Zara turns on H T T P three at the edge, with H T T P two as the fallback. Noon. The sale opens, the train rolls through the tunnel, and the page still loads. Let us put it all together.
+
+77
+00:19:46,644 --> 00:19:53,526
+Narrator: One. H T T P one point one asks for one thing at a time per connection, so browsers opened six, and pipelining failed.
+
+78
+00:19:53,955 --> 00:20:01,173
+Narrator: Two. H T T P two multiplexes many streams over one T C P connection, with binary frames and H pack.
+
+79
+00:20:01,604 --> 00:20:08,821
+Narrator: Three. That fixes blocking only at the H T T P layer. One lost T C P segment still stalls every stream.
+
+80
+00:20:09,251 --> 00:20:17,213
+Narrator: Four. H T T P three runs the same model over QUIC on U D P, so loss recovery is per stream, with Q pack for headers.
+
+81
+00:20:17,644 --> 00:20:25,917
+Narrator: Five. QUIC needs one round trip for a new connection, zero on resume with a replay caveat, and migrates by connection I D.
+
+82
+00:20:26,347 --> 00:20:33,038
+Narrator: Six. Server push is dead. Use preload or Early Hints, and always keep a fallback through Alt Svc.
+
+83
+00:20:33,468 --> 00:20:43,253
+Narrator: And the one line to keep. Each version fixes the previous one's bottleneck. Two shares one connection, three stops one lost packet from stalling every stream.
+
+84
+00:20:46,203 --> 00:21:08,685
+Narrator: To go deeper, open the note, H T T P one point one versus two versus three, and its Go note, in your vault. Before it, read T C P, H T T P Fundamentals, and U D P and QUIC. After it, T L S and H T T P S, and H T T P Caching. And compare it with g R P C, and the Network Debugging Toolkit.
+
+85
+00:21:09,115 --> 00:21:12,301
+Ravi: Zara, that was ten minutes I will never forget.
+
+86
+00:21:12,731 --> 00:21:16,925
+Zara: Next case, Ravi. Bring a coffee.
+

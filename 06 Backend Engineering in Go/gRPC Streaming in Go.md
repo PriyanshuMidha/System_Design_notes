@@ -8,7 +8,7 @@ sources:
   - "grpc-go v1.68.1 source: stream.go, internal/transport (HTTP/2 flow control)"
   - "RFC 9113, HTTP/2 (flow control, SETTINGS, trailers)"
   - "protoc-gen-go-grpc v1.5.1: generic stream types (grpc.ServerStreamingServer[T] etc.)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # gRPC Streaming in Go
@@ -22,11 +22,60 @@ updated: 2026-11-07
 > - Exactly one goroutine may call `Send` on a given stream at a time; concurrent `Send`s on the same stream are a data race gRPC itself doesn't protect you from.
 > - Classic mistake: never draining a client-streaming RPC to `io.EOF`, or never cancelling a server-streaming RPC's context — both leak the underlying HTTP/2 stream and the goroutine serving it.
 
+## Start here: the basics
+
+**The problem in one story.**
+A client wants every invoice created today, which might be a million rows.
+One giant response would use huge memory on both sides.
+With a gRPC stream, the server sends invoices one by one over one call.
+The client handles each as it arrives, and the server slows down if the client falls behind.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Unary RPC | One request in, one response out | `GetInvoice` |
+| Stream | Many messages over one RPC call | `ListInvoices` sending rows one by one |
+| `Send` / `Recv` | Write one message / read one message on a stream | `stream.Send(inv)` |
+| `io.EOF` | The "no more messages" signal | Loop ends when `Recv` returns it |
+| Backpressure | Slowing the sender when the receiver is behind | `Send` blocks until there is room |
+| Goroutine | A cheap Go function running concurrently | One reading, one writing |
+| Context cancel | Telling the other side "stop, I'm done" | `cancel()` ends the stream |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] -->|"one request"| S["Server"]
+    S -->|"msg 1"| C
+    S -->|"msg 2"| C
+    S -->|"... then io.EOF"| C
+```
+
+**Analogy.** A conveyor belt instead of a delivery truck: items arrive one at a time, and the belt pauses when the worker at the end is full.
+Where it breaks: a belt has no "error halfway through"; a stream can fail mid-way, so the client must handle partial results.
+
+**How the rest of this note builds up**
+
+- First, why one big response fails (section 1) and the Send/Recv mental model (section 2).
+- Then server-streaming, client-streaming and bidirectional streams, plus draining and closing (section 3).
+- Then flow control, ordering, mid-stream errors, load balancing and interceptors (section 3), plus the worked example (section 4).
+- Finally the SDE-3 deep dive: choosing streaming vs pagination vs WebSocket and leak traps (sections 5-8).
+
+> [!tip] Remember
+> A stream is a loop of Send/Recv ending in `io.EOF`; a blocking `Send` is your backpressure, and one goroutine sends at a time.
+
 ## 1. Why it exists
 
-InvoiceOps' dashboard wants to show an invoice's status live — draft → sent → paid — without the browser's tab polling `GetInvoice` every second. A unary RPC can't do this: each call is one request, one response, done. Polling every second from every open tab also means the server re-runs the same lookup for clients who are, most of the time, waiting for nothing to have changed.
+InvoiceOps' dashboard wants to show an invoice's status live — draft → sent → paid — without the browser's tab polling `GetInvoice` every second. A unary RPC can't do this: each call is one request, one response, done.
 
-A **server-streaming** RPC flips the model: the client asks once ("tell me about invoice X"), and the server pushes an event every time something is worth saying, for as long as the client stays connected. The same shape, run in reverse, is **client-streaming**: an accountant uploading a CSV of a thousand invoices sends them as a stream of small messages instead of one request built from the whole file in memory, and gets one summary back when done. **Bidirectional** streaming combines both, used here for a live support-chat widget where either side can speak first.
+Polling every second from every open tab also means the server re-runs the same lookup for clients who are, most of the time, waiting for nothing to have changed.
+
+A **server-streaming** RPC flips the model: the client asks once ("tell me about invoice X"), and the server pushes an event every time something is worth saying, for as long as the client stays connected.
+
+The same shape, run in reverse, is **client-streaming**: an accountant uploading a CSV of a thousand invoices sends them as a stream of small messages instead of one request built from the whole file in memory, and gets one summary back when done.
+
+**Bidirectional** streaming combines both, used here for a live support-chat widget where either side can speak first.
 
 All three reuse the same HTTP/2 connection and the same deadline/metadata/interceptor machinery from [[gRPC Services in Go]] — streaming is a different method shape, not a different protocol.
 
@@ -125,7 +174,9 @@ func (s *InvoiceServer) Chat(stream invoicev1.InvoiceService_ChatServer) error {
 }
 ```
 
-This server happens to reply once per received message, on the same goroutine — a valid pattern when replies are always a direct response to an inbound message. The moment a stream needs to **push** data unprompted (a server-initiated notification mid-chat, say), `Recv` and `Send` need separate goroutines, because `Recv` blocks waiting for the next inbound message and would otherwise starve any unprompted `Send`:
+This server happens to reply once per received message, on the same goroutine — a valid pattern when replies are always a direct response to an inbound message.
+
+The moment a stream needs to **push** data unprompted (a server-initiated notification mid-chat, say), `Recv` and `Send` need separate goroutines, because `Recv` blocks waiting for the next inbound message and would otherwise starve any unprompted `Send`:
 
 ```mermaid
 sequenceDiagram
@@ -141,7 +192,9 @@ sequenceDiagram
     S->>RG: Recv() returns msg 2
 ```
 
-The one rule that matters for correctness, not just style: **a given stream's `Send` must only ever be called from one goroutine at a time.** `Recv` has the same rule on the read side. gRPC does not serialize concurrent `Send` calls for you — it's a data race, the same class of bug as two goroutines writing one `map` without a mutex.
+The one rule that matters for correctness, not just style: **a given stream's `Send` must only ever be called from one goroutine at a time.**
+
+`Recv` has the same rule on the read side. gRPC does not serialize concurrent `Send` calls for you — it's a data race, the same class of bug as two goroutines writing one `map` without a mutex.
 
 ### Client side: draining and closing
 
@@ -167,7 +220,13 @@ Chat(grpc.BidiStreamingServer[ChatRequest, ChatResponse]) error
 
 ### Flow control and backpressure
 
-HTTP/2 gives every stream a **flow-control window**: a budget of bytes the sender is allowed to have in flight before the receiver acknowledges them (a `WINDOW_UPDATE` frame). When `WatchInvoice` calls `stream.Send` faster than the client reads, the window fills up and `Send` **blocks** until the client catches up — this is backpressure, and it costs no extra code: a slow consumer simply makes the producer wait, the same way an unbuffered channel does between two goroutines. The default window and the connection's bandwidth-delay product (BDP) together bound how much data can sit "in the pipe" before this kicks in; grpc-go's BDP estimator grows the window over a connection's lifetime if the link can sustain more throughput. See [[Backpressure and Flow Control]] for the general pattern this is one instance of.
+HTTP/2 gives every stream a **flow-control window**: a budget of bytes the sender is allowed to have in flight before the receiver acknowledges them (a `WINDOW_UPDATE` frame).
+
+When `WatchInvoice` calls `stream.Send` faster than the client reads, the window fills up and `Send` **blocks** until the client catches up — this is backpressure, and it costs no extra code: a slow consumer simply makes the producer wait, the same way an unbuffered channel does between two goroutines.
+
+The default window and the connection's bandwidth-delay product (BDP) together bound how much data can sit "in the pipe" before this kicks in; grpc-go's BDP estimator grows the window over a connection's lifetime if the link can sustain more throughput.
+
+See [[Backpressure and Flow Control]] for the general pattern this is one instance of.
 
 ### Ordering
 
@@ -175,11 +234,17 @@ gRPC guarantees messages on **one stream** arrive in the order they were sent. I
 
 ### Errors mid-stream
 
-A streaming RPC's final outcome is still one `codes.Code`, delivered as a trailer after the last message — a stream that sent 500 events successfully and then hit a DB error ends with `codes.Internal` in the trailer, not a special "partial success" code. Design around this by making events **idempotent to reprocess** and, for consumer-resumable streams, including a position or version the client can hand back on reconnect (a resume token) so a dropped connection doesn't mean starting over from the beginning.
+A streaming RPC's final outcome is still one `codes.Code`, delivered as a trailer after the last message — a stream that sent 500 events successfully and then hit a DB error ends with `codes.Internal` in the trailer, not a special "partial success" code.
+
+Design around this by making events **idempotent to reprocess** and, for consumer-resumable streams, including a position or version the client can hand back on reconnect (a resume token) so a dropped connection doesn't mean starting over from the beginning.
 
 ### Streams, load balancing and keepalive
 
-A streaming RPC can run for minutes, which makes the long-lived-connection load-balancing problem from [[gRPC Services in Go]] sharper: a client that opened a `WatchInvoice` stream an hour ago is still pinned to whatever backend it originally reached. `MaxConnectionAge`/`MaxConnectionAgeGrace` server options force the *connection* to recycle periodically — existing streams on it get `GOAWAY`'d gracefully, and a well-behaved client reconnects (with backoff) and re-opens the stream against a freshly load-balanced backend. Keepalive pings matter even more here: an idle period in a chat stream, or a `WatchInvoice` stream between infrequent status changes, is exactly when an idle-connection-killing NAT or proxy would otherwise silently drop the stream without either side noticing until the next write fails.
+A streaming RPC can run for minutes, which makes the long-lived-connection load-balancing problem from [[gRPC Services in Go]] sharper: a client that opened a `WatchInvoice` stream an hour ago is still pinned to whatever backend it originally reached.
+
+`MaxConnectionAge`/`MaxConnectionAgeGrace` server options force the *connection* to recycle periodically — existing streams on it get `GOAWAY`'d gracefully, and a well-behaved client reconnects (with backoff) and re-opens the stream against a freshly load-balanced backend.
+
+Keepalive pings matter even more here: an idle period in a chat stream, or a `WatchInvoice` stream between infrequent status changes, is exactly when an idle-connection-killing NAT or proxy would otherwise silently drop the stream without either side noticing until the next write fails.
 
 ### Stream interceptors
 
@@ -581,8 +646,10 @@ All four streaming tests pass alongside the six unary tests from [[gRPC Services
 
 ## 8. Deep dive
 
-- **HTTP/2 flow control in more depth.** Flow control operates at two levels: a per-stream window and a per-connection window, both negotiated via `SETTINGS` and updated via `WINDOW_UPDATE` frames. A single slow stream can only stall itself once its stream-level window fills — but if the *connection*-level window fills (several streams all backed up), every stream on that connection stalls together, which is one reason a server under load should watch for a few consumers monopolizing shared connections.
-- **Resume tokens.** For a stream a client may need to reconnect to mid-sequence (a long `WatchInvoice` after a network blip), include a monotonically increasing position or version in each message; on reconnect the client sends that value back and the server resumes from there instead of replaying everything or silently skipping gaps. This is the same idea a Kafka consumer offset or a Kubernetes `resourceVersion` implements for the same problem.
+- **HTTP/2 flow control in more depth.** Flow control operates at two levels: a per-stream window and a per-connection window, both negotiated via `SETTINGS` and updated via `WINDOW_UPDATE` frames.
+  - A single slow stream can only stall itself once its stream-level window fills — but if the *connection*-level window fills (several streams all backed up), every stream on that connection stalls together, which is one reason a server under load should watch for a few consumers monopolizing shared connections.
+- **Resume tokens.** For a stream a client may need to reconnect to mid-sequence (a long `WatchInvoice` after a network blip), include a monotonically increasing position or version in each message; on reconnect the client sends that value back and the server resumes from there instead of replaying everything or silently skipping gaps.
+  - This is the same idea a Kafka consumer offset or a Kubernetes `resourceVersion` implements for the same problem.
 - **Why generics changed the generated stream types.** Before Go generics (and before protoc-gen-go-grpc adopted them), each streaming RPC got its own hand-generated interface and struct wrapping the embedded `grpc.ServerStream`/`grpc.ClientStream`. The generic `grpc.ServerStreamingServer[T]` family lets grpc-go define `Send`/`Recv` once, generically, and the generated per-RPC names collapse to type aliases — less generated code, same compile-time type safety.
 - **Hedging does not apply to streams.** Service-config hedging (re-sending a slow unary call to try to win a race) only makes sense for a single request/response; a stream that has already sent several messages cannot be safely hedged without the server seeing duplicates, so retry/hedge policies in service config apply to unary (and client-streaming-before-any-Send) calls only.
 
@@ -622,3 +689,8 @@ All four streaming tests pass alongside the six unary tests from [[gRPC Services
 - **Before this:** [[gRPC Services in Go]], [[select and Concurrency Patterns]]
 - **Next:** [[Serving REST and gRPC Together]]
 - **Compare with:** [[Backpressure and Flow Control]] (the general pattern HTTP/2 flow control implements here), [[Real-time APIs - WebSocket, SSE and Long Polling]] (the browser-facing equivalent), [[Pagination, Filtering and Sorting]] (the simpler alternative when a client just wants a bounded read)
+
+### Watch on YouTube
+
+- [Building a gRPC Service in Golang: Server Streaming RPC (Tutorial)](https://www.youtube.com/watch?v=l_74x_qQZB8) · Mario Carrion · server-streaming RPC implementation walkthrough
+- [(gRPC #13.1) Implement bidirectional-streaming gRPC - Golang](https://www.youtube.com/watch?v=hjTI35iKMyQ) · TECH SCHOOL · bidirectional streaming implementation, the hardest of the three shapes

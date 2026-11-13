@@ -10,7 +10,7 @@ sources:
   - "Fastly docs, Request collapsing and shielding"
   - "AWS docs, Amazon CloudFront key concepts"
   - "RFC 9111, HTTP Caching"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # CDN and Edge
@@ -24,9 +24,56 @@ updated: 2026-11-09
 > - `Cache-Control` headers and the **cache key** decide what gets cached, for how long, and whether two requests share a cache entry.
 > - Classic mistake: thinking a CDN only serves static files. TLS termination near the user, keep-alive pools to the origin, and HTTP/3 all speed up **dynamic**, uncacheable requests too.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your shop's server sits in Virginia, USA.
+A shopper in Mumbai opens your product page.
+Every image travels halfway around the planet, so the page feels slow.
+A CDN keeps copies of those images on servers inside India, so the shopper gets them from nearby.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Origin | Your own server, the real source of the content | `api.myshop.com` in us-east-1 |
+| Latency / RTT | Time for a message to go there and back | Mumbai to Virginia, about 200 ms |
+| Cache | A stored copy kept so you need not fetch again | The CDN's saved `product.jpg` |
+| Hit / miss | Copy was found / was not found in the cache | `x-cache: HIT` |
+| TTL | How long a cached copy counts as fresh | `max-age=3600` = 1 hour |
+| DNS | The internet's phone book: name to IP address | `myshop.com` to `104.16.1.1` |
+| PoP | One CDN data center in a city | The CDN's Mumbai PoP |
+| Header | Extra key-value info sent with an HTTP message | `Cache-Control: public` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User in Mumbai"] --> P["Nearby CDN PoP"]
+    P -- "hit: has a copy" --> U
+    P -- "miss" --> S["Shield (regional cache)"]
+    S -- "miss" --> O["Origin server<br/>(Virginia)"]
+    O --> S --> P
+```
+
+**Analogy.** A CDN is a chain of local warehouses for a factory. Most orders ship from the warehouse in your city; only when every warehouse is out does the factory ship.
+Where it breaks: a warehouse cannot know the factory changed a product; a CDN keeps serving an old copy until its TTL runs out or you purge it.
+
+**How the rest of this note builds up**
+
+- First, why a CDN exists (section 1) and the warehouse mental model (section 2).
+- Then how users reach a PoP (anycast vs GeoDNS), hits, misses and revalidation (section 3).
+- Then cache keys, request collapsing and the origin shield.
+- Finally, the SDE-3 deep dive on edge compute: what belongs at the edge vs the origin, and failure modes.
+
+> [!tip] Remember
+> A CDN moves copies close to users and shields the origin from repeated work; headers decide what it may keep.
+
 ## 1. Why it exists
 
-A user in Mumbai requests `product.jpg` from an origin server in Virginia. Round-trip time alone is typically 180–250 ms each way on the open internet for an India-to-US-East route (a representative range for that geography, not a specific measurement); add TCP and TLS handshakes and the first byte of a cold connection can take 400–600 ms before the image even starts downloading. Serve 50,000 users a day and the Virginia server also now has to open and hold 50,000 TLS connections and push every byte itself.
+A user in Mumbai requests `product.jpg` from an origin server in Virginia. Round-trip time alone is typically 180–250 ms each way on the open internet for an India-to-US-East route (a representative range for that geography, not a specific measurement); add TCP and TLS handshakes and the first byte of a cold connection can take 400–600 ms before the image even starts downloading.
+
+Serve 50,000 users a day and the Virginia server also now has to open and hold 50,000 TLS connections and push every byte itself.
 
 A CDN puts a copy of `product.jpg` on a server inside Mumbai's own network. The same request now completes in single-digit milliseconds of network time, and the origin in Virginia serves it exactly once — to the CDN, the first time anyone in that region asks for it.
 
@@ -44,7 +91,9 @@ x-cache: MISS, HIT, MISS
 x-served-by: cache-sin-wsat1880030-SIN, cache-sin-wsat1880030-SIN, cache-sin-wsat1880086-SIN, cache-ccu830028-CCU
 ```
 
-`age: 2205` means this exact response has been sitting in a cache for 2205 seconds — the origin did not see this request. `x-cache` shows three tiers: the page missed at one shield node, hit at a nearby one, and missed again going toward a further tier — this is the shield/regional/origin tier structure in a single header, not a single flat cache.
+`age: 2205` means this exact response has been sitting in a cache for 2205 seconds — the origin did not see this request.
+
+`x-cache` shows three tiers: the page missed at one shield node, hit at a nearby one, and missed again going toward a further tier — this is the shield/regional/origin tier structure in a single header, not a single flat cache.
 
 ## 2. Mental model
 
@@ -90,7 +139,9 @@ flowchart LR
     MISS --> STORE
 ```
 
-A **304** is cheap: the origin confirms the cached copy is still correct without resending the body. This needs the origin to send a validator (`ETag`, or `Last-Modified`) in the first place — see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] for how the validator itself is computed and compared; this note only covers what the CDN tier does with it.
+A **304** is cheap: the origin confirms the cached copy is still correct without resending the body.
+
+This needs the origin to send a validator (`ETag`, or `Last-Modified`) in the first place — see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] for how the validator itself is computed and compared; this note only covers what the CDN tier does with it.
 
 ### Cache-Control: who may cache, and for how long
 
@@ -122,7 +173,9 @@ The **cache key** is the set of request attributes the CDN uses to decide whethe
 
 ### Request collapsing and the origin shield
 
-When a popular object's TTL expires, hundreds of edge requests can arrive within milliseconds of each other, all seeing a miss at the same instant. Without protection, every one of them hits the origin — a self-inflicted stampede (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]] for the general pattern; this is the CDN-specific instance of it).
+When a popular object's TTL expires, hundreds of edge requests can arrive within milliseconds of each other, all seeing a miss at the same instant.
+
+Without protection, every one of them hits the origin — a self-inflicted stampede (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]] for the general pattern; this is the CDN-specific instance of it).
 
 Two mechanisms fix it:
 
@@ -209,9 +262,13 @@ flowchart LR
 | AWS CloudFront Functions | Tiny JS subset, runs at every PoP | Sub-millisecond budget; no network calls — header/URL rewrites and redirects only |
 | Fastly Compute | WebAssembly, runs at every PoP | Millisecond-scale CPU budget, no local disk |
 
-What belongs at the edge: a JWT **signature and expiry** pre-check (so a clearly invalid or expired token gets a fast 401 without a trip to origin) — but the **authoritative** authorization decision (does this specific user own this specific resource) stays at the origin, where the source of truth for permissions lives. Also at the edge: A/B bucket assignment, geo-based redirects, header normalization, and lightweight WAF rules.
+What belongs at the edge: a JWT **signature and expiry** pre-check (so a clearly invalid or expired token gets a fast 401 without a trip to origin) — but the **authoritative** authorization decision (does this specific user own this specific resource) stays at the origin, where the source of truth for permissions lives.
 
-What stays at origin: anything that needs strongly consistent reads, writes with business logic, or a decision that must never be wrong because the edge's view of the world (its JWT public keys, its feature-flag snapshot) is only **eventually consistent** — edge KV stores typically replicate globally in seconds, not instantly. An edge function's own deploy should be versioned and roll out gradually with the ability to roll back, exactly like an origin deploy, because a bad edge rule affects every PoP at once.
+Also at the edge: A/B bucket assignment, geo-based redirects, header normalization, and lightweight WAF rules.
+
+What stays at origin: anything that needs strongly consistent reads, writes with business logic, or a decision that must never be wrong because the edge's view of the world (its JWT public keys, its feature-flag snapshot) is only **eventually consistent** — edge KV stores typically replicate globally in seconds, not instantly.
+
+An edge function's own deploy should be versioned and roll out gradually with the ability to roll back, exactly like an origin deploy, because a bad edge rule affects every PoP at once.
 
 **Observability**: correlate an edge-side request ID (most providers inject one, e.g. Cloudflare's `cf-ray`) with the origin's own request ID/trace ID so a slow or failed request can be followed edge → shield → origin in one trace.
 
@@ -239,7 +296,9 @@ This is the mechanism a CDN's shield tier implements, shown in miniature: concur
 > [!warning] Common mistake
 > Holding a single lock for the *entire* fetch (not just the bookkeeping step) looks safer but is slower: it would force every other **key**, not just the same key, to wait its turn, removing the concurrency a shield exists to preserve. The lock should protect only "check and register," never the fetch itself.
 
-**What happens if** step 4's cleanup ran *after* handing out the result instead of before? A request arriving in that narrow window would join a call that's already finished and about to be deleted — harmless here since it gets the same already-computed result, but it's the kind of ordering detail that turns into a real bug if the cleanup and the handoff are ever reordered carelessly.
+**What happens if** step 4's cleanup ran *after* handing out the result instead of before?
+
+A request arriving in that narrow window would join a call that's already finished and about to be deleted — harmless here since it gets the same already-computed result, but it's the kind of ordering detail that turns into a real bug if the cleanup and the handoff are ever reordered carelessly.
 
 **Measured** (Go 1.24, `go test -race`, scratch module, 2026-11-09): a test asserting exactly 1 origin call for 100 concurrent requesters, and a second test confirming a *new* fetch happens once the in-flight call has finished (so collapsing doesn't last forever), both pass under the race detector.
 
@@ -333,3 +392,8 @@ x-served-by: marketing-site
 - **Next:** [[Forward and Reverse Proxies - L4 vs L7]], [[What Happens When You Type a URL]]
 - **Compare with:** [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] (the browser/origin side of the same headers), [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]] (the general pattern this note's shield section is one instance of), [[Load Balancing]] (balancing within one origin fleet, not across the globe)
 - **Code:** [[CDN and Edge - Go]]
+
+### Watch on YouTube
+
+- [What is a CDN (Content Delivery Network)?](https://www.youtube.com/watch?v=b4_6thkYZXs) · Gaurav Sen · system-design-style explainer on PoPs, origin and caching at the edge
+- [Is Your Website Slow? Here's What a CDN Actually Does](https://www.youtube.com/watch?v=kzbVb3PQt0k) · WebFX · accessible explainer tying CDN hit/miss and latency together

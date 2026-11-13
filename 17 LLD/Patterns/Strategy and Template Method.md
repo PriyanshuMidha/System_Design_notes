@@ -9,7 +9,7 @@ sources:
   - "Go standard library docs: sort (Sort, Interface), slices (SortFunc, since Go 1.21), bufio (Scanner.Split), net/http (Client.CheckRedirect, RoundTripper)"
   - "Go 1.19 release notes: sort uses pattern-defeating quicksort"
   - "The Go Programming Language Specification: Struct types (promoted methods), Comparison operators"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Strategy and Template Method
@@ -23,9 +23,57 @@ updated: 2026-11-02
 > - The rule that matters: separate what stays fixed from what changes, and pass the changing part in as a value.
 > - Classic mistake: a growing `switch city { ... }` inside the service, or (in Go) trying to fake inheritance with struct embedding, where the embedded type's method never calls your override.
 
+## Start here: the basics
+
+**The problem in one story.**
+A parking app charges by the hour in one city and a flat fee in another.
+The first version has an `if city == ...` for each city, and it grows every month.
+Strategy pulls each pricing rule out into its own small piece you can pass in.
+Template Method does the reverse: it fixes the order of the steps and lets you swap only the steps.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Algorithm | A recipe for computing something | "₹20 per hour" |
+| Interface | A list of methods; any type that has them fits | `type Pricer interface { Price(h int) int }` |
+| Function type | A function used as a value | `type PriceFn func(h int) int` |
+| Inheritance | A class reusing a parent class's code (Java, not Go) | `class Car extends Vehicle` |
+| Struct embedding | Go putting one struct inside another to reuse its methods | `type B struct { A }` |
+| Workflow | A fixed sequence of steps | validate, price, save, notify |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    subgraph Strategy
+        S["Service"] --> P{"Pricer<br/>(passed in)"}
+        P --> H["Hourly"]
+        P --> F["Flat fee"]
+    end
+    subgraph Template
+        W["Run(): fixed steps"] --> S1["step 1"] --> S2["step 2"] --> S3["step 3"]
+    end
+```
+
+**Analogy.** Strategy is a drill with swappable bits: same drill, different bit for wood or metal. Template Method is a recipe card with blanks: the order is printed, you only choose the filling.
+Where it breaks: a drill bit cannot see the drill's state, while a Go strategy can be given whatever data it needs; and Go has no inheritance, so the "recipe" is a function taking an interface, not a parent class.
+
+**How the rest of this note builds up**
+
+- First, why separating fixed from changing code matters (section 1) and the mental model (section 2).
+- Then how both patterns look in Go with interfaces and function types (section 3), and a worked example with tests (section 4).
+- Then variants, the comparison table and when not to use them (sections 5-6).
+- Finally the SDE-3 view: production use and the deep dive on embedding pitfalls (sections 7-8).
+
+> [!tip] Remember
+> Find what changes, make it a value (interface or func), and pass it in.
+
 ## 1. Why it exists
 
-A quick-commerce backend assigns each order to a dark store. Mumbai wants the **nearest store with stock**. Bengaluru, during the evening peak, wants the **least loaded store**. Product wants to try a third rule next month. Pricing for the parking feature has the same shape: an hourly base price, plus a weekend surcharge in some cities, plus a coupon in others.
+A quick-commerce backend assigns each order to a dark store. Mumbai wants the **nearest store with stock**. Bengaluru, during the evening peak, wants the **least loaded store**. Product wants to try a third rule next month.
+
+Pricing for the parking feature has the same shape: an hourly base price, plus a weekend surcharge in some cities, plus a coupon in others.
 
 Without Strategy, all of this becomes one function:
 
@@ -680,3 +728,8 @@ The business must decide which one is right, and the wiring code must make the o
 - **Before this:** [[Interfaces]], [[Structs, Methods and Embedding]], [[Design Patterns Overview and Chooser]], [[SOLID in Go]]
 - **Next:** [[Factory and Abstract Factory]]
 - **Compare with:** [[State Machines in Go]], [[Decorator and Middleware]], [[Rare GoF Patterns in Go]], [[Rate Limiting - Algorithms and Distributed Design]]
+
+### Watch on YouTube
+
+- [The Strategy and Template Method Patterns and Section Summary](https://www.youtube.com/watch?v=AmcA8wWCHQQ) · Douglas Schmidt · 33 min · 6,415 views
+- [The Template Method Pattern Explained Implemented in Java / Behavioral Design Patterns / Geekific](https://www.youtube.com/watch?v=cGoVDzHvD4A) · Geekific · 6 min · 59,011 views

@@ -11,7 +11,7 @@ sources:
   - "Go 1.21 release notes: sync.OnceFunc/OnceValue/OnceValues; package initialization order specified precisely"
   - "The Go Memory Model: Once"
   - "PostgreSQL 17 docs: max_connections (default 100)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Singleton and sync.Once
@@ -25,6 +25,50 @@ updated: 2026-11-02
 > - When creation must be lazy, `sync.Once` / `sync.OnceValues` runs it exactly once, even under many goroutines.
 > - Classic mistake: `if cfg == nil { cfg = load() }`, which is a data race; a second mistake is a hidden global that tests cannot replace.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your server reads a config file and opens a database pool.
+Doing that once is fine; doing it on every request is slow and wasteful.
+So you want exactly one shared copy that everybody uses.
+The hard part is when many requests arrive at the same instant and all try to create it first.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Instance | One built copy of a type | `cfg := LoadConfig()` |
+| Global variable | A package-level variable any code can read | `var cfg *Config` |
+| Goroutine | A lightweight thread run by Go | `go handle(req)` |
+| Data race | Two goroutines touch the same memory, one writes, no lock | Two goroutines set `cfg` at once |
+| Lazy initialisation | Build the thing only when first needed | Load config on first request |
+| Dependency injection | Pass what a function needs as a parameter | `NewServer(cfg, db)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    G1["Goroutine 1"] --> O{"sync.Once:<br/>already done?"}
+    G2["Goroutine 2"] --> O
+    G3["Goroutine 3"] --> O
+    O -- "no (first caller)" --> L["Run load()<br/>exactly once"]
+    O -- "yes / waits" --> V["Use the same value"]
+    L --> V
+```
+
+**Analogy.** An office has one coffee machine. The first person in the morning turns it on; everyone after just pours a cup.
+Where it breaks: in an office two people might both flip the switch, which is harmless; in Go two goroutines both "turning it on" is a data race unless `sync.Once` guards it.
+
+**How the rest of this note builds up**
+
+- First, why one shared instance is wanted (section 1) and the mental model (section 2).
+- Then how `sync.Once`, `OnceValue` and `OnceValues` work (section 3) and a worked example with tests (section 4).
+- Then variants and when a singleton hurts more than it helps (sections 5-6).
+- Finally the SDE-3 view: production usage and the memory-model deep dive (sections 7-8).
+
+> [!tip] Remember
+> Prefer building one instance in `main` and passing it in; when it must be lazy, let `sync.Once` do the "only once".
+
 ## 1. Why it exists
 
 A checkout service reads its config (database URL, worker count) and opens one connection pool. Two problems appear without a plan for "exactly one":
@@ -32,11 +76,15 @@ A checkout service reads its config (database URL, worker count) and opens one c
 - **Duplicate expensive work.** If every handler calls `loadConfig()` and `sql.Open()`, 200 concurrent requests on a cold start create 200 pools. Each pool can open up to `MaxOpenConns` connections, so a limit of 10 per pool becomes up to 2,000 connections against a PostgreSQL server whose default `max_connections` is typically 100.
 - **Races on lazy creation.** The naive lazy singleton, `if cfg == nil { cfg = load() }`, is a data race: two goroutines both see `nil`, both load, and one overwrites the other. `go test -race` reports it.
 
-The GoF Singleton answers both with a class that controls its own single instance. In Go that answer brings the usual cost of globals: hidden dependencies and tests that cannot reset state. So the Go answer has two parts: **create once** with `sync.Once` when laziness is really needed, and **share by passing the instance** rather than by reaching for a global.
+The GoF Singleton answers both with a class that controls its own single instance. In Go that answer brings the usual cost of globals: hidden dependencies and tests that cannot reset state.
+
+So the Go answer has two parts: **create once** with `sync.Once` when laziness is really needed, and **share by passing the instance** rather than by reaching for a global.
 
 ## 2. Mental model
 
-A building has one main water tank. You could let every flat install a pipe to "the tank" hidden in the walls (a global): it works until someone needs to test a flat with a different tank, or replace the tank, and has to find every hidden pipe. Or the plumber connects each flat to the tank at construction time with a visible, labelled pipe (dependency injection from `main`). There is still exactly one tank; the difference is whether you can see who uses it.
+A building has one main water tank. You could let every flat install a pipe to "the tank" hidden in the walls (a global): it works until someone needs to test a flat with a different tank, or replace the tank, and has to find every hidden pipe.
+
+Or the plumber connects each flat to the tank at construction time with a visible, labelled pipe (dependency injection from `main`). There is still exactly one tank; the difference is whether you can see who uses it.
 
 `sync.Once` is the rule "the first person to arrive fills the tank; everyone else waits at the door until it is full, then uses the same water". Nobody fills it twice, and nobody drinks from a half-filled tank.
 
@@ -555,3 +603,7 @@ Do **not** use a singleton for:
 - **Before this:** [[sync Primitives and Atomics]], [[Goroutines and Channels]], [[Factory and Abstract Factory]]
 - **Next:** [[Adapter]]
 - **Compare with:** [[Service Project Layout and Wiring]], [[Memory Model and Data Races]], [[Builder and Functional Options]]
+
+### Watch on YouTube
+
+- [sync.Once in Go](https://www.youtube.com/watch?v=61kvPbwzXi4) · The Coding Gopher · 5 min · 3,056 views

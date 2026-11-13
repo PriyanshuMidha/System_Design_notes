@@ -9,7 +9,7 @@ sources:
   - "Prometheus client_golang docs: CounterVec, HistogramVec"
   - "Google SRE Workbook, ch. 2: Implementing SLOs (percentiles, why averages mislead)"
   - "Thanos and Grafana Mimir docs: long-term storage for Prometheus"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Metrics and Prometheus
@@ -35,15 +35,65 @@ requests.WithLabelValues("/invoices/{id}", "GET", "2xx").Inc()
 
 One counter, three bounded labels. The full version below adds a histogram, an HTTP middleware wrapper, and tests.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your service is slow, and you want to know since when and how often.
+Reading every log line would take hours.
+Instead you keep a few running numbers, like "requests so far" and "how many took over 1 second".
+A tool called Prometheus collects those numbers every few seconds so you can graph and alert on them.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Metric | A named number tracked over time | `http_requests_total` |
+| Label | A tag that splits one metric into groups | `route="/invoices"`, `status="2xx"` |
+| Time series | One metric + one exact set of labels, with its values over time | Requests for `GET /invoices` returning 2xx |
+| Scrape | Prometheus fetching the current numbers from a service | `GET /metrics` every 15 s |
+| Counter | A number that only goes up | Total requests served |
+| Gauge | A number that goes up or down | Requests in flight right now |
+| Histogram | Counts of values falling into ranges ("buckets") | How many requests took ≤ 100 ms, ≤ 500 ms... |
+| Cardinality | How many distinct time series exist | 5 routes × 3 statuses = 15 series |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S1["Service A<br/>/metrics"] --> P["Prometheus<br/>(scrapes every 15 s)"]
+    S2["Service B<br/>/metrics"] --> P
+    P --> DB["Time-series<br/>storage"]
+    DB --> Q["PromQL query"]
+    Q --> G["Dashboard"]
+    Q --> AL["Alert"]
+```
+
+**Analogy.** A car dashboard: the odometer is a counter (only grows), the speedometer is a gauge (goes up and down), and someone writes them all down every 15 seconds.
+Where it breaks: a car has a fixed handful of dials, but every new label value creates a new "dial" in Prometheus, and memory grows with each one.
+
+**How the rest of this note builds up**
+
+- First, why metrics exist (section 1) and a mental model of pull-based scraping (section 2).
+- Then how it works: the four metric types, histogram buckets, and cardinality math (section 3).
+- Then a worked Go example with middleware, tests and essential PromQL (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: running Prometheus in production, its internals, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Use counters and histograms with a small, fixed set of label values; let Prometheus scrape them.
+
 ## 1. Why it exists
 
-A log line can tell you one request was slow. It cannot efficiently answer "what fraction of all requests in the last 5 minutes were slower than 500ms" — that requires scanning and aggregating every log line in the window, which is exactly what metrics are built to avoid. A Prometheus histogram pre-aggregates observations into buckets as they happen, so `histogram_quantile(0.99, ...)` over 5 minutes of traffic is a cheap query against pre-computed counters, not a scan over millions of log lines.
+A log line can tell you one request was slow. It cannot efficiently answer "what fraction of all requests in the last 5 minutes were slower than 500ms" — that requires scanning and aggregating every log line in the window, which is exactly what metrics are built to avoid.
+
+A Prometheus histogram pre-aggregates observations into buckets as they happen, so `histogram_quantile(0.99, ...)` over 5 minutes of traffic is a cheap query against pre-computed counters, not a scan over millions of log lines.
 
 The trade is specificity for cheapness: a metric knows "47 requests took between 100ms and 250ms" but not which 47 requests, or anything else about them. That's why metrics and logs are both needed — see [[Observability Fundamentals]].
 
 ## 2. Mental model
 
-A Prometheus metric is a tally board bolted to a wall: every unique label combination gets its own running tally (a time series), and Prometheus walks around every 15 seconds (by default) copying down every board's current numbers with a timestamp. Querying is asking "show me how board X's number changed over the last hour" or "add up boards X, Y and Z."
+A Prometheus metric is a tally board bolted to a wall: every unique label combination gets its own running tally (a time series), and Prometheus walks around every 15 seconds (by default) copying down every board's current numbers with a timestamp.
+
+Querying is asking "show me how board X's number changed over the last hour" or "add up boards X, Y and Z."
 
 The crucial constraint: **you only get as many boards as the label combinations you declared**. If a label can take a million different values, you get a million boards, and the wall runs out of room.
 
@@ -79,7 +129,9 @@ Prometheus **pulls**: it holds the list of targets (via static config, Kubernete
 | **Histogram** | Observations sorted into buckets, exposed as `_bucket{le="..."}`, `_sum`, `_count` | `http_request_duration_seconds` |
 | **Summary** | Client-side quantiles computed in-process, exposed as `_sum`, `_count`, and per-quantile values | Rarely the right choice — see below |
 
-A histogram exposes its raw bucket counts, so Prometheus can compute a quantile **across every instance of a service at query time** with `histogram_quantile()`. A summary computes its quantiles inside the client process, over only that one instance's observations, and those per-instance quantiles **cannot be averaged or combined across instances** — a p99 of five summaries from five pods is not the fleet's p99. Prefer histograms; reach for a summary only when you need an exact quantile from one process and don't need to aggregate across instances.
+A histogram exposes its raw bucket counts, so Prometheus can compute a quantile **across every instance of a service at query time** with `histogram_quantile()`. A summary computes its quantiles inside the client process, over only that one instance's observations, and those per-instance quantiles **cannot be averaged or combined across instances** — a p99 of five summaries from five pods is not the fleet's p99.
+
+Prefer histograms; reach for a summary only when you need an exact quantile from one process and don't need to aggregate across instances.
 
 > [!tip] Native histograms
 > Newer Prometheus versions (verify the native-histogram feature's stability in your deployed version) add sparse, high-resolution histograms that avoid hand-picking bucket boundaries and cut storage cost. They are a drop-in improvement once your Prometheus and client library versions support them; the classic bucketed histogram above remains the portable default.
@@ -106,11 +158,15 @@ A 0.6s observation lands in the `le="1"` and `le="+Inf"` buckets (and every buck
 
 ### Cardinality: series count is a product
 
-Series count for one metric = (number of values of label 1) × (number of values of label 2) × … For `http_requests_total{route, method, status}` with 20 routes, 4 methods and 5 status classes, that's `20 × 4 × 5 = 100` series — fine. Swap `route` for the raw request path with unique IDs in it, and that number is unbounded. **Bounded labels** (route template, method, a 5-value status class) are the rule; **unbounded labels** (user ID, order ID, raw path, email) never belong in a metric.
+Series count for one metric = (number of values of label 1) × (number of values of label 2) × … For `http_requests_total{route, method, status}` with 20 routes, 4 methods and 5 status classes, that's `20 × 4 × 5 = 100` series — fine.
+
+Swap `route` for the raw request path with unique IDs in it, and that number is unbounded. **Bounded labels** (route template, method, a 5-value status class) are the rule; **unbounded labels** (user ID, order ID, raw path, email) never belong in a metric.
 
 ## 4. Worked example
 
-The Go code below instruments an HTTP handler with a request counter and a latency histogram, both labeled by a **route template** supplied by the caller — never the raw path — so the series count stays bounded regardless of how many distinct resources exist. It compiles and passes `go vet` and `go test -race` on Go 1.24, using `github.com/prometheus/client_golang` v1.20.5.
+The Go code below instruments an HTTP handler with a request counter and a latency histogram, both labeled by a **route template** supplied by the caller — never the raw path — so the series count stays bounded regardless of how many distinct resources exist.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24, using `github.com/prometheus/client_golang` v1.20.5.
 
 ```go
 // Package metrics instruments an HTTP server with the three labels that make
@@ -311,3 +367,8 @@ func TestWrapRecordsBoundedLabels(t *testing.T) {
 - **Before this:** [[Observability Fundamentals]], [[Structured Logging]]
 - **Next:** [[Distributed Tracing with OpenTelemetry]], [[SLIs, SLOs, SLAs and Error Budgets]], [[Alerting and On-Call]]
 - **Compare with:** [[Observability in Go Services]] (metrics alongside logs and traces in one Go service)
+
+### Watch on YouTube
+
+- [Metrics SIMPLIFIED with OpenTelemetry & Prometheus](https://www.youtube.com/watch?v=tLSS2t7Md3w) · That DevOps Guy · 16 min · 9,397 views
+- [How Prometheus Works - How to Collect Metrics](https://www.youtube.com/watch?v=q4fr0p-6JO0) · That DevOps Guy · 30 min · 19,344 views

@@ -11,7 +11,7 @@ sources:
   - "Kreps, Questioning the Lambda Architecture (O'Reilly Radar, 2014): the Kappa architecture"
   - "Marz and Warren, Big Data (Manning, 2015): the Lambda architecture"
   - "PostgreSQL 17 docs, INSERT ... ON CONFLICT"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Ad Click Aggregation
@@ -26,9 +26,62 @@ updated: 2026-11-04
 > - A batch job recomputes the same counts from the raw log later and is the source of truth for billing; the stream is the fast, approximate-but-close view.
 > - Classic mistake: `UPDATE counts SET clicks = clicks + 1` for every click. It cannot survive retries, replays or 50,000 clicks per second on one popular ad.
 
+## Start here: the basics
+
+**The problem in one story.**
+A shoe company pays an ad network 10 cents every time someone clicks its ad.
+The company wants a live chart of clicks per minute, and an invoice at month end.
+If a click is counted twice, the company overpays; if it is lost, the network loses money.
+Counting a billion clicks a day, fast and exactly once, is the whole problem.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Event | A record that something happened | `{ad: 42, user: 7, time: 9:01:13}` |
+| Stream | Events arriving one after another, forever | Clicks flowing in all day |
+| Kafka | A durable log that stores events in order for readers | Topic `clicks` with 64 partitions |
+| Window | A fixed time bucket you count inside | Clicks for ad 42 from 9:01 to 9:02 |
+| Event time vs arrival time | When it happened vs when the server got it | Clicked 9:01, arrived 9:04 |
+| Watermark | "I believe everything up to time T has arrived" | Watermark 9:02 closes the 9:01 window |
+| Idempotent | Doing it twice gives the same result as once | `SET count = 5`, not `count + 1` |
+| Batch job | A job that re-processes stored data in bulk later | Nightly recount from raw files |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Ad clicks"] --> K["Kafka log"]
+    K --> S["Stream job:<br/>count per ad per minute"]
+    S --> DB["Results store"]
+    DB --> D["Live dashboard"]
+    K --> RAW["Raw archive"]
+    RAW --> B["Nightly batch recount"]
+    B --> BILL["Billing"]
+```
+
+**Analogy.** Counting votes by the hour they were cast, with a fast unofficial tally on election night and an official recount later (section 2 expands this).
+Where it breaks: ballots do not get retried by a flaky network; clicks do, so duplicates are normal, not fraud.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the high-level design (section 3) and the estimates, API and data model with Go code (section 4).
+- Then variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: watermarks, exactly-once, hot ads and stream-vs-batch reconciliation (sections 7-8).
+
+> [!tip] Remember
+> Count by event time, dedupe by click ID, write results by overwrite, and let the batch recount be the billing truth.
+
 ## 1. Why it exists - requirements
 
-An ad network charges advertisers per click. A user clicks an ad on a phone in a tunnel; the app retries the click event when the connection returns 3 minutes later; a load balancer retry sends it twice. If the system counts by arrival time, that click lands in the wrong minute. If it counts every delivery, the advertiser pays twice. Over 1 billion clicks a day, small error rates are real money, and advertisers audit invoices.
+An ad network charges advertisers per click.
+
+A user clicks an ad on a phone in a tunnel; the app retries the click event when the connection returns 3 minutes later; a load balancer retry sends it twice.
+
+If the system counts by arrival time, that click lands in the wrong minute. If it counts every delivery, the advertiser pays twice.
+
+Over 1 billion clicks a day, small error rates are real money, and advertisers audit invoices.
 
 **Terms used below:**
 - **Event time:** when the click happened, stamped by the device or the click server.
@@ -52,7 +105,13 @@ An ad network charges advertisers per click. A user clicks an ad on a phone in a
 
 ## 2. Mental model
 
-Think of a polling station counting votes by the hour each ballot was cast. Ballots arrive by post, some days late. The counters keep one tally sheet per hour. They publish the 9 am sheet once they are fairly sure all 9 am ballots have arrived (the watermark). A ballot stamped 9:15 that turns up after the 9 am sheet is published goes into a separate "late" tray. Every ballot has a serial number, so a photocopy is spotted and ignored. At the end of the week an auditor recounts every ballot from the archive (the batch job), and the official result is the auditor's count.
+Think of a polling station counting votes by the hour each ballot was cast. Ballots arrive by post, some days late.
+
+The counters keep one tally sheet per hour. They publish the 9 am sheet once they are fairly sure all 9 am ballots have arrived (the watermark).
+
+A ballot stamped 9:15 that turns up after the 9 am sheet is published goes into a separate "late" tray. Every ballot has a serial number, so a photocopy is spotted and ignored.
+
+At the end of the week an auditor recounts every ballot from the archive (the batch job), and the official result is the auditor's count.
 
 ## 3. How it works - high-level design
 
@@ -491,7 +550,9 @@ After windows close, a second operator keeps a min-heap of size N over the per-a
 
 ### Reconciliation
 
-The nightly batch job reads the raw Parquet files and the late-click topic, deduplicates by `click_id` across the whole day, applies the full fraud rules, and writes hourly and daily totals with `source = 'batch'`. Billing reads only batch totals. A difference above the alert threshold between stream and batch is a bug signal (a broken watermark, a lost partition), not something to average away.
+The nightly batch job reads the raw Parquet files and the late-click topic, deduplicates by `click_id` across the whole day, applies the full fraud rules, and writes hourly and daily totals with `source = 'batch'`.
+
+Billing reads only batch totals. A difference above the alert threshold between stream and batch is a bug signal (a broken watermark, a lost partition), not something to average away.
 
 ## 9. Interview questions
 
@@ -532,3 +593,8 @@ The nightly batch job reads the raw Parquet files and the late-click topic, dedu
 - **Before this:** [[Kafka and Event Streaming]], [[Stream Processing Basics]], [[Delivery Semantics and Exactly-Once]], [[Case Study - Distributed Message Queue]]
 - **Next:** [[Case Study - Leaderboard and Top-K]], [[Case Study - Metrics and Logging Platform]]
 - **Compare with:** [[Case Study - Video Streaming]] (its view counting is the same pipeline), [[Rate Limiting - Algorithms and Distributed Design]] (also windowed counting, but per request and online), [[Transactional Outbox and CDC]] (another route for getting events into Kafka exactly once)
+
+### Watch on YouTube
+
+- [Designing a Scalable Ad Click Aggregation System / Using Kafka & Redis](https://www.youtube.com/watch?v=q-2eqgB9M8I) · Sanket Singh · 138 min · 4,059 views
+- [Design Ad Click Event Aggregation: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=P82HuMr8kso) · TechPrep · 22 min · 4,859 views

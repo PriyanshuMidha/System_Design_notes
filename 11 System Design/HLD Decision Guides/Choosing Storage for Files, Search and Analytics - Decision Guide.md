@@ -18,7 +18,7 @@ sources:
   - "Uber engineering blog, Fast and Reliable Schema-Agnostic Log Analytics Platform (2021): ClickHouse for logs"
   - "Apache Iceberg docs (project created at Netflix), Apache Hudi docs (project created at Uber)"
   - "Kleppmann, Designing Data-Intensive Applications (O'Reilly, 2017), chapter 3, OLTP versus OLAP"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Choosing Storage for Files, Search and Analytics - Decision Guide
@@ -32,6 +32,53 @@ updated: 2026-11-09
 > - Analytics: never run heavy scans on the OLTP primary. Copy data to a columnar warehouse via CDC or batch loads.
 > - The primary database stays the source of truth. Search indexes and warehouses are derived copies you can rebuild.
 > - Keep the derived stores honest by feeding them from a log (change data capture), not by dual writes.
+
+## Start here: the basics
+
+**The problem in one story**
+
+An online shop has a product table, millions of product photos, a search box and a sales report.
+If you put all of it in one database, photos bloat it, search is slow and fuzzy, and the nightly report slows down checkout.
+So each job goes to a store built for it, and the main database stays the truth.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Object storage | A huge, cheap store for files, addressed by key | S3 key `products/42/main.jpg` |
+| Metadata | Small facts about a file, kept in your database | size, owner, S3 key, upload time |
+| CDN | Servers near users that keep copies of files | Photo served from a Mumbai edge |
+| Full-text search | Finding documents by words, not exact match | "red shoe" finds "Red Running Shoes" |
+| Inverted index | A map from each word to the documents that contain it | `shoe` → docs 3, 9, 42 |
+| OLTP | Many small, fast reads and writes (the app's daily work) | Place one order |
+| OLAP / warehouse | Big scans and sums over lots of history | Revenue by city for last year |
+| CDC | Change data capture: stream every database change out | New row in `orders` → event to the warehouse |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App[App] --> DB[(Primary DB: source of truth)]
+    App --> OBJ[(Object storage)]
+    OBJ --> CDN[CDN]
+    DB -- CDC --> SE[(Search index)]
+    DB -- CDC --> WH[(Warehouse)]
+```
+
+**Analogy**
+
+A library: books sit on shelves (object storage), the catalog cards say where each book is (metadata in the DB), the subject index finds books by topic (search), and the yearly report is made from a copy of the loan records (warehouse).
+Where it breaks: a real library has one copy of each record, while derived stores here can lag behind the source and must be rebuildable.
+
+**How the rest of this note builds up**
+
+- First, why one database cannot do everything and the mental model (sections 1-2).
+- Then how files, search and analytics stores each work (section 3), and a full e-commerce worked example (section 4).
+- Next, variants, trade-offs and production lessons (sections 5-7).
+- Finally, the SDE-3 deep dive on object storage durability, columnar scans, derived search indexes, deletes and cost, then drills and interview questions (sections 8-12).
+
+> [!tip] Remember
+> Files to object storage, words to a search index, big sums to a warehouse; the primary DB stays the truth.
 
 ## 1. Why it exists
 
@@ -441,3 +488,7 @@ Object storage tiers (infrequent access, archive) cut cost for old data. CDN off
 - Cloud: [[AWS 07 - S3]], [[AWS 08 - RDS and Aurora]], [[AWS 10 - CloudWatch]]
 - System design: [[Case Study - File Storage and Sync]], [[Case Study - Video Streaming]], [[Case Study - Metrics and Logging Platform]], [[Case Study - Search Autocomplete]], [[Case Study - Ad Click Aggregation]], [[Back-of-the-Envelope Estimation]], [[System Design Interview Framework]]
 - Sibling guide: [[Choosing Consistency, Replication and Partitioning - Decision Guide]]
+
+### Watch on YouTube
+
+- [Designing Data-Intensive Applications Ep06: Analytics Storage and Search](https://www.youtube.com/watch?v=kPMwr9E6Zd0) · The Simplified Architect · 17 min · 17 views

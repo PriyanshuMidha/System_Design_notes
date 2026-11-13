@@ -10,7 +10,7 @@ sources:
   - "Nishtala et al., Scaling Memcache at Facebook (NSDI 2013)"
   - "golang.org/x/sync/singleflight package docs"
   - "github.com/redis/go-redis/v9 docs"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Caching Patterns
@@ -24,6 +24,50 @@ updated: 2026-11-04
 > - **Write-behind:** writes land in the cache and reach the database later. Fast, but the cache now holds data you can lose.
 > - **Refresh-ahead:** hot keys are reloaded before they expire, so users rarely see a miss.
 > - Whatever the pattern, a cache outage must degrade to "slower", not "down".
+
+## Start here: the basics
+
+**The problem in one story.**
+You decided to put a cache in front of your database.
+Now someone must decide: who fills the cache, and when?
+When a user edits data, do you change the cache first, the database first, or both?
+Each answer is a "caching pattern", and each one fails in a different way.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cache | Fast copy of data kept near the app | Redis holding `user:7` |
+| Database (DB) | The permanent source of truth | PostgreSQL `users` table |
+| Miss | The cache did not have the key | First request after a deploy |
+| Loader | A function that fetches the value from the DB on a miss | `func(id) (User, error)` |
+| Invalidate | Remove a cached value because the data changed | `DEL user:7` after an update |
+| TTL | Time after which a cached value expires by itself | `EX 300` = 5 minutes |
+| Write path / read path | Code that runs on updates / on reads | `UpdateUser` vs `GetUser` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App["App"] -- "1 read" --> Cache["Cache"]
+    Cache -- "2 miss" --> App
+    App -- "3 query" --> DB["Database"]
+    App -- "4 fill" --> Cache
+    App -- "write: update DB, then delete key" --> DB
+```
+
+**Analogy.** A restaurant's specials board copies what the kitchen has. Cache-aside: the waiter checks the kitchen when the board is blank and writes it up. Write-through: the chef updates the board every time the menu changes.
+Where it breaks: a board can be read by everyone at once without crashing; a cache rebuild under heavy load can flood the DB.
+
+**How the rest of this note builds up**
+
+- First, why patterns matter (section 1) and the "who owns the cache" mental model (section 2).
+- Then each pattern in turn: cache-aside, read-through, write-through, write-behind, refresh-ahead (section 3).
+- Then Go code with tests (section 4) and a side-by-side comparison and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production rollout, two-level caching with pub/sub invalidation, serialisation formats (sections 7-8).
+
+> [!tip] Remember
+> Default to cache-aside: read cache, on miss load DB and fill; on write update DB, then delete the key.
 
 ## 1. Why it exists
 
@@ -74,7 +118,9 @@ sequenceDiagram
 
 ### Read-through
 
-The application calls `cache.Get(key)` and the cache layer runs a **loader** on a miss. The logic is the same as cache-aside, but it lives in a library or a caching proxy, so every caller gets the same miss handling, coalescing and TTLs. Examples: a Go wrapper with a loader function, Caffeine's `LoadingCache` in Java, or a caching proxy in front of a service. Redis itself does not load from your database.
+The application calls `cache.Get(key)` and the cache layer runs a **loader** on a miss. The logic is the same as cache-aside, but it lives in a library or a caching proxy, so every caller gets the same miss handling, coalescing and TTLs.
+
+Examples: a Go wrapper with a loader function, Caffeine's `LoadingCache` in Java, or a caching proxy in front of a service. Redis itself does not load from your database.
 
 ### Write-through
 
@@ -119,7 +165,9 @@ sequenceDiagram
 
 ### Refresh-ahead
 
-A background job (or the read path, once a key passes, say, 80% of its TTL) reloads hot keys before they expire. Users of hot keys almost never see a miss, at the cost of reloading keys that might not be read again. It works best for a small, known set of hot keys, such as the home page's top lists. Probabilistic early refresh and serving stale data during a rebuild belong to [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+A background job (or the read path, once a key passes, say, 80% of its TTL) reloads hot keys before they expire. Users of hot keys almost never see a miss, at the cost of reloading keys that might not be read again.
+
+It works best for a small, known set of hot keys, such as the home page's top lists. Probabilistic early refresh and serving stale data during a rebuild belong to [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 
 ## 4. Worked example
 
@@ -514,7 +562,9 @@ sequenceDiagram
     Note over A,B: Pub/Sub is fire-and-forget: a disconnected instance misses the message, so L1 also keeps a short TTL (for example 5 s)
 ```
 
-Redis Pub/Sub does not store messages. An instance that is reconnecting misses the invalidation, so the **L1 TTL is the bound on staleness**, and the broadcast only makes the common case faster. Redis 6+ also offers client-side caching with server-assisted invalidation (`CLIENT TRACKING`), where Redis remembers which keys a connection read and pushes invalidation messages for them; see [[Redis in Production - Memory, Latency, Security]].
+Redis Pub/Sub does not store messages. An instance that is reconnecting misses the invalidation, so the **L1 TTL is the bound on staleness**, and the broadcast only makes the common case faster.
+
+Redis 6+ also offers client-side caching with server-assisted invalidation (`CLIENT TRACKING`), where Redis remembers which keys a connection read and pushes invalidation messages for them; see [[Redis in Production - Memory, Latency, Security]].
 
 ### Choosing a serialisation format
 
@@ -590,3 +640,8 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 - **Before this:** [[Caching Fundamentals]], [[Redis Fundamentals]]
 - **Next:** [[Cache Invalidation, TTL and Consistency]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]], [[Redis in Go]]
 - **Compare with:** [[Cache Eviction Policies - LRU, LFU, TTL]], [[Transactional Outbox and CDC]], [[Materialized Views and Denormalization]]
+
+### Watch on YouTube
+
+- [Distributed Caching Strategies: Cache-Aside, Write-Through, Write-Behind](https://www.youtube.com/watch?v=V1oGVbxD8mk) · CodeLucky · directly covers cache-aside, write-through and write-behind patterns from the note
+- [Caching For System Design: Redis, CDN, Cache Patterns Explained](https://www.youtube.com/watch?v=ETvLl-8bPbo) · System Design Lab · broader pass over caching patterns with Redis-specific framing

@@ -15,13 +15,15 @@ sources:
   - "Apache Cassandra documentation: per-cell write timestamps, last write wins"
   - "Yjs documentation (YATA algorithm); Automerge documentation"
   - "Nicolaescu et al., Near Real-Time Peer-to-Peer Shared Editing on Extensible Data Types (GROUP 2016): YATA"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # CRDTs and Conflict Resolution
 
 > [!summary] TL;DR
-> When two replicas accept writes to the same data without talking to each other, their copies **conflict**. Conflict resolution is the rule that decides the final value. A **CRDT** (Conflict-free Replicated Data Type) is a data structure whose merge rule is designed so that all replicas that have seen the same updates end up with the same value automatically, in any order, without coordination.
+> When two replicas accept writes to the same data without talking to each other, their copies **conflict**. Conflict resolution is the rule that decides the final value.
+>
+> A **CRDT** (Conflict-free Replicated Data Type) is a data structure whose merge rule is designed so that all replicas that have seen the same updates end up with the same value automatically, in any order, without coordination.
 
 > [!abstract] Core idea
 > - Conflicts appear whenever more than one replica accepts writes: multi-leader, leaderless, offline clients, multi-region active-active.
@@ -29,6 +31,45 @@ updated: 2026-11-04
 > - CRDTs merge with a function that is commutative, associative and idempotent, so order, duplication and delay of sync do not matter.
 > - Counters, sets, registers, maps and even text sequences have CRDT versions; each has a built-in policy (for example, add wins over remove).
 > - Classic mistake: thinking CRDTs remove the need to think about semantics. They guarantee convergence, not that the merged value is what the business wanted.
+
+## Start here: the basics
+
+**The problem in one story.** Two friends edit the same shopping list on their phones while on a flight with no internet. One adds "milk", the other removes "eggs" and adds "bread". When they land, both phones sync. What should the final list be, and will both phones show the same thing?
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Replica | One copy of the data that can accept changes | The list on each phone |
+| Conflict | Two copies changed the same data differently | Both phones edited the list offline |
+| Merge | Combining two copies into one | Union of both phones' items |
+| Converge | All copies end up the same | Both phones show {milk, bread} |
+| Last writer wins (LWW) | Keep the change with the latest timestamp | The other edit is silently lost |
+| Commutative / idempotent | Order does not matter / applying twice is same as once | max(3,5) = max(5,3); max(5,5)=5 |
+| Tombstone | A marker that says "this was deleted" | `eggs: removed` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  S[Same start state] --> A[Replica A edits offline]
+  S --> B[Replica B edits offline]
+  A --> M{Merge function}
+  B --> M
+  M --> R[Same final state on both]
+```
+
+**Analogy.** Two people counting visitors at two doors with their own tally sheets. At the end you add the sheets, and order never matters. Where it breaks: counting is easy to merge, but "remove" or text edits need careful rules, and the merged result may still not be what the business wanted.
+
+**How the rest of this note builds up**
+
+- First, *Why it exists* shows where conflicts come from (multi-leader, offline, multi-region).
+- Then *Mental model* and *How it works* compare LWW, siblings and CRDT merge rules.
+- The *Worked example* builds counters and sets in Go and merges them.
+- Finally, *Variants*, *In production* and the *Deep dive* cover sequence CRDTs, metadata cost and SDE-3 trade-offs.
+
+> [!tip] Remember
+> A CRDT guarantees every replica ends up the same; you still decide whether that result is right.
 
 ## 1. Why it exists
 
@@ -45,7 +86,9 @@ When both reconnect, what is on the list? Three common answers:
 | Keep both versions, ask the app | `{[], ["milk"]}` returned as siblings | Every reader must write merge code |
 | OR-Set CRDT | "milk" is on the list: the add was not seen by the remove | None for this case; the policy (add wins) is built in |
 
-The same problem appears at much larger scale: a like counter written in Mumbai and Frankfurt regions at once (see [[Multi-Region Architecture]]), a Cassandra row updated by two clients, a Google-Docs-style editor with 20 people typing. Wherever writes are accepted on more than one replica to stay available during a network partition (the "A" choice in [[CAP and PACELC]]), something has to merge them.
+The same problem appears at much larger scale: a like counter written in Mumbai and Frankfurt regions at once (see [[Multi-Region Architecture]]), a Cassandra row updated by two clients, a Google-Docs-style editor with 20 people typing.
+
+Wherever writes are accepted on more than one replica to stay available during a network partition (the "A" choice in [[CAP and PACELC]]), something has to merge them.
 
 ## 2. Mental model
 
@@ -54,7 +97,9 @@ Think of each replica's state as a point that can only move **up** in a partial 
 - Mumbai's view `{mumbai: 120, frankfurt: 70}`, Frankfurt's view `{mumbai: 100, frankfurt: 80}`.
 - Merge → `{mumbai: 120, frankfurt: 80}`, total 200. Merging again changes nothing. Merging in the other order gives the same answer.
 
-The analogy is **two people ticking boxes on copies of the same attendance sheet**. Combining the sheets means "a box is ticked if it is ticked on either copy". You can combine them in any order, combine one twice, and the result is the same. A plain "count = 5" number cannot be combined that way; a sheet of ticks can.
+The analogy is **two people ticking boxes on copies of the same attendance sheet**. Combining the sheets means "a box is ticked if it is ticked on either copy".
+
+You can combine them in any order, combine one twice, and the result is the same. A plain "count = 5" number cannot be combined that way; a sheet of ticks can.
 
 Terms used below:
 
@@ -485,15 +530,21 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 
 ### Why the three laws matter
 
-Anti-entropy (background sync, often via gossip, see [[Failure Detection, Gossip and Membership]]) delivers states late, repeatedly and in any order. Commutativity handles reordering, associativity handles batching (merging A into B then into C equals merging in any grouping), and idempotence handles duplicates. Together they mean the network layer can be as sloppy as it likes; this is why state-based CRDTs need no exactly-once delivery.
+Anti-entropy (background sync, often via gossip, see [[Failure Detection, Gossip and Membership]]) delivers states late, repeatedly and in any order. Commutativity handles reordering, associativity handles batching (merging A into B then into C equals merging in any grouping), and idempotence handles duplicates.
+
+Together they mean the network layer can be as sloppy as it likes; this is why state-based CRDTs need no exactly-once delivery.
 
 ### OR-Set internals and garbage collection
 
-The tag set grows forever in the naive design shown here. Production implementations (the "optimized OR-Set" and dot-based designs) replace explicit tombstones with a **causal context**: a version vector summarizing which tags each replica has seen. A tag that the context covers but the add-set does not contain must have been removed. That makes removes cost no extra space, at the price of more intricate merge code.
+The tag set grows forever in the naive design shown here. Production implementations (the "optimized OR-Set" and dot-based designs) replace explicit tombstones with a **causal context**: a version vector summarizing which tags each replica has seen.
+
+A tag that the context covers but the add-set does not contain must have been removed. That makes removes cost no extra space, at the price of more intricate merge code.
 
 ### Sequence CRDTs for text
 
-Each inserted character gets a unique id `(replica, counter)` and a reference to the character it was inserted after. Concurrent inserts after the same character are ordered by a deterministic rule on their ids, so every replica produces the same text. Deletes mark characters as tombstones so later inserts can still refer to them. Libraries compress runs of characters typed in a row into one entry, which keeps memory practical for long documents.
+Each inserted character gets a unique id `(replica, counter)` and a reference to the character it was inserted after. Concurrent inserts after the same character are ordered by a deterministic rule on their ids, so every replica produces the same text.
+
+Deletes mark characters as tombstones so later inserts can still refer to them. Libraries compress runs of characters typed in a row into one entry, which keeps memory practical for long documents.
 
 ### LWW and time
 
@@ -542,3 +593,8 @@ To sell 100 seats from two regions without coordination per sale, split the quot
 - **Before this:** [[Replication]], [[Clocks and Ordering]], [[Consistency Models]], [[Quorums and Leaderless Replication]]
 - **Next:** [[Multi-Region Architecture]], [[Failure Detection, Gossip and Membership]]
 - **Compare with:** [[Consensus - Raft and Paxos]] (coordinate every write instead of merging later), [[Quorums and Leaderless Replication]] (read repair and LWW in Dynamo-style stores)
+
+### Watch on YouTube
+
+- [CRDTs - Stop Worrying About Write Conflicts / Systems Design 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=FG5Varj1Ows) · Jordan has no life · 16 min · 46,021 views
+- [An introduction to Conflict-Free Replicated Data Types (CRDTs)](https://www.youtube.com/watch?v=gZP2VUmH05A) · Mycelial · 9 min · 14,583 views

@@ -8,13 +8,22 @@ related: ["[[Graphs and Graph Algorithms]]", "[[Union-Find and Skip Lists]]", "[
 sources:
   - "Cormen, Leiserson, Rivest, Stein, Introduction to Algorithms (3rd ed.), ch. 22–24"
   - "Go standard library docs, container/heap"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Graphs and Graph Algorithms - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Graphs and Graph Algorithms]]: an adjacency-list `Graph`, BFS, recursive DFS, three-color cycle detection, Kahn's topological sort, a heap-backed Dijkstra, and union-find-backed Kruskal's MST — tested against one shared sample graph.
+
+## Before the code
+
+- **Maps (`map[int][]Edge`)**: Go's built-in hash table; here it maps each vertex to its list of outgoing edges.
+- **Slices as queues**: `queue = queue[1:]` drops the front item; `append` adds to the back.
+- **Recursive closures**: `var visit func(int)` then `visit = func...` lets a function literal call itself (used by DFS and cycle detection).
+- **Interfaces (`container/heap`)**: implement `Len`, `Less`, `Swap`, `Push`, `Pop` and the standard library gives you a min-heap.
+- **`iota` constants**: auto-numbered `white=0, gray=1, black=2`, so a fresh map entry starts as white.
+- **What to run**: `go vet ./... && go test -race -v ./...` in a scratch module (no goroutines here, so `-race` just confirms none are needed).
 
 ## What this code shows
 
@@ -48,7 +57,9 @@ flowchart LR
 
 ### Step 1: the graph type and adjacency list
 
-**Concept.** This is [[Graphs and Graph Algorithms#Representations]]'s default choice made concrete: `map[int][]Edge` gives `O(degree(u))` neighbor iteration at `O(V+E)` total space, which every algorithm below builds on. The rejected alternative, `[][]int` (adjacency matrix), was not used because this note's sample graphs are sparse — the matrix's `O(V²)` space would be mostly wasted zero entries.
+**Concept.** This is [[Graphs and Graph Algorithms#Representations]]'s default choice made concrete: `map[int][]Edge` gives `O(degree(u))` neighbor iteration at `O(V+E)` total space, which every algorithm below builds on.
+
+The rejected alternative, `[][]int` (adjacency matrix), was not used because this note's sample graphs are sparse — the matrix's `O(V²)` space would be mostly wasted zero entries.
 
 ```go
 package graph
@@ -79,7 +90,9 @@ func (g *Graph) AddEdge(u, v, weight int) {
 
 ### Step 2: BFS and recursive DFS
 
-**Concept.** These implement the two traversal orders from [[Graphs and Graph Algorithms#BFS: breadth-first search]] and [[Graphs and Graph Algorithms#DFS: depth-first search]]. `BFS` uses an explicit queue (a plain slice); `DFSRecursive` uses Go's own call stack via a recursive closure. The alternative for DFS — an explicit stack — is mentioned in the theory note for very deep or adversarial graphs, but isn't shown here because the recursive form is clearer for a graph of any reasonable size.
+**Concept.** These implement the two traversal orders from [[Graphs and Graph Algorithms#BFS: breadth-first search]] and [[Graphs and Graph Algorithms#DFS: depth-first search]]. `BFS` uses an explicit queue (a plain slice); `DFSRecursive` uses Go's own call stack via a recursive closure.
+
+The alternative for DFS — an explicit stack — is mentioned in the theory note for very deep or adversarial graphs, but isn't shown here because the recursive form is clearer for a graph of any reasonable size.
 
 ```go
 package graph
@@ -130,7 +143,9 @@ func DFSRecursive(g *Graph, start int) []int {
 
 ### Step 3: three-color cycle detection
 
-**Concept.** This implements [[Graphs and Graph Algorithms#Cycle detection (directed graphs): three-color DFS]] exactly: a `colorOf` map standing in for the white/gray/black states, with a gray-to-gray edge as the cycle signal. The alternative — tracking only a single `visited` boolean — can't distinguish "on the current path" from "visited on an earlier, now-finished branch," which is precisely the bug this three-color scheme avoids.
+**Concept.** This implements [[Graphs and Graph Algorithms#Cycle detection (directed graphs): three-color DFS]] exactly: a `colorOf` map standing in for the white/gray/black states, with a gray-to-gray edge as the cycle signal.
+
+The alternative — tracking only a single `visited` boolean — can't distinguish "on the current path" from "visited on an earlier, now-finished branch," which is precisely the bug this three-color scheme avoids.
 
 ```go
 package graph
@@ -147,7 +162,7 @@ The three constants give the three DFS states names; the zero value (`white`, si
 ```go
 // HasCycle: three-color DFS. A gray -> gray edge is a back edge: a cycle.
 func HasCycle(g *Graph) bool {
-	colorOf := newColorOf()
+	colorOf := make(map[int]int) // missing key reads as 0 = white
 	var visit func(u int) bool
 	visit = func(u int) bool {
 		colorOf[u] = gray
@@ -182,7 +197,9 @@ func HasCycle(g *Graph) bool {
 
 ### Step 4: topological sort (Kahn's algorithm)
 
-**Concept.** This is [[Graphs and Graph Algorithms#Topological sort: Kahn's algorithm]] directly: repeatedly remove in-degree-0 vertices. The alternative — DFS-based topological sort (post-order, then reverse) — is equally valid and is what many textbooks show first, but Kahn's version was chosen here because its `len(order) == len(g.adj)` check gives cycle detection for free, without a separate pass.
+**Concept.** This is [[Graphs and Graph Algorithms#Topological sort: Kahn's algorithm]] directly: repeatedly remove in-degree-0 vertices.
+
+The alternative — DFS-based topological sort (post-order, then reverse) — is equally valid and is what many textbooks show first, but Kahn's version was chosen here because its `len(order) == len(g.adj)` check gives cycle detection for free, without a separate pass.
 
 ```go
 package graph
@@ -206,7 +223,9 @@ func TopoSort(g *Graph) (order []int, ok bool) {
 	}
 ```
 
-The first loop initializes every vertex's in-degree to 0 before the second loop increments it — without this, a vertex with in-degree 0 that's never a map key would be invisible to the seeding step below. `queue` then seeds with every vertex that starts at in-degree 0 — in a DAG with multiple independent starting points, all of them go in at once, not just one.
+The first loop initializes every vertex's in-degree to 0 before the second loop increments it — without this, a vertex with in-degree 0 that's never a map key would be invisible to the seeding step below.
+
+`queue` then seeds with every vertex that starts at in-degree 0 — in a DAG with multiple independent starting points, all of them go in at once, not just one.
 
 ```go
 	for len(queue) > 0 {
@@ -231,7 +250,9 @@ The first loop initializes every vertex's in-degree to 0 before the second loop 
 
 ### Step 5: Dijkstra with a min-heap frontier
 
-**Concept.** `distHeap` implements Go's `container/heap` interface to give [[Graphs and Graph Algorithms#Dijkstra's algorithm: shortest paths with non-negative weights]] its min-heap frontier. The alternative — scanning the whole `dist` map for the minimum each iteration — would be `O(V)` per pop instead of `O(log V)`, turning the overall algorithm from `O((V+E) log V)` into `O(V² )`-ish for dense graphs; the heap is what makes Dijkstra scale.
+**Concept.** `distHeap` implements Go's `container/heap` interface to give [[Graphs and Graph Algorithms#Dijkstra's algorithm: shortest paths with non-negative weights]] its min-heap frontier.
+
+The alternative — scanning the whole `dist` map for the minimum each iteration — would be `O(V)` per pop instead of `O(log V)`, turning the overall algorithm from `O((V+E) log V)` into `O(V² )`-ish for dense graphs; the heap is what makes Dijkstra scale.
 
 ```go
 package graph
@@ -291,7 +312,9 @@ func Dijkstra(g *Graph, start int) map[int]int {
 
 ### Step 6: union-find and Kruskal's MST
 
-**Concept.** `UnionFind` implements [[Graphs and Graph Algorithms#Union-find and Kruskal's MST]]'s path-compression-plus-union-by-rank design, and `KruskalMST` uses it to answer "would this edge close a cycle?" in near-constant time. The alternative to union-find here — re-running BFS/DFS after every edge to check connectivity — is explicitly rejected in the theory note's interview questions section, because it would turn an `O(E log E)` algorithm into something far more expensive.
+**Concept.** `UnionFind` implements [[Graphs and Graph Algorithms#Union-find and Kruskal's MST]]'s path-compression-plus-union-by-rank design, and `KruskalMST` uses it to answer "would this edge close a cycle?" in near-constant time.
+
+The alternative to union-find here — re-running BFS/DFS after every edge to check connectivity — is explicitly rejected in the theory note's interview questions section, because it would turn an `O(E log E)` algorithm into something far more expensive.
 
 ```go
 package graph
@@ -342,7 +365,11 @@ func (uf *UnionFind) Union(x, y int) bool {
 }
 ```
 
-**How it works.** `Union`'s return value doubles as the "would this close a cycle?" answer Kruskal needs — `false` means `x` and `y` were already in the same component (adding this edge would close a cycle), `true` means the merge happened. The `rank` comparison in the `switch` is union by rank: always attach the shorter tree under the taller one's root, which is what keeps future `Find` calls' paths short even before path compression kicks in.
+**How it works.**
+
+`Union`'s return value doubles as the "would this close a cycle?" answer Kruskal needs — `false` means `x` and `y` were already in the same component (adding this edge would close a cycle), `true` means the merge happened.
+
+The `rank` comparison in the `switch` is union by rank: always attach the shorter tree under the taller one's root, which is what keeps future `Find` calls' paths short even before path compression kicks in.
 
 ```go
 // WEdge is a weighted, undirected edge between vertices U and V, the shape
@@ -370,7 +397,11 @@ func KruskalMST(n int, edges []WEdge) []WEdge {
 }
 ```
 
-**How it works.** `KruskalMST` copies `edges` into `sorted` before sorting (`append([]WEdge(nil), edges...)`) specifically so it never mutates the caller's slice in place — `sort.Slice` sorts whatever slice you hand it, and silently reordering the caller's own data would be a surprising side effect. The loop then greedily keeps any edge whose `Union` call returns `true`, which is exactly "connects two different components."
+**How it works.**
+
+`KruskalMST` copies `edges` into `sorted` before sorting (`append([]WEdge(nil), edges...)`) specifically so it never mutates the caller's slice in place — `sort.Slice` sorts whatever slice you hand it, and silently reordering the caller's own data would be a surprising side effect.
+
+The loop then greedily keeps any edge whose `Union` call returns `true`, which is exactly "connects two different components."
 
 > [!example]- Full file (graph package, all five source files concatenated)
 > ```go

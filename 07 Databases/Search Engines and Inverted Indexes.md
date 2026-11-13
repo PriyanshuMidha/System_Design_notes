@@ -11,13 +11,17 @@ sources:
   - "OpenSearch docs: Intro to OpenSearch (inverted index), segment replication"
   - "PostgreSQL 17 docs: Full Text Search (tsvector, tsquery, websearch_to_tsquery, ts_rank, GIN indexes), pg_trgm"
   - "Cormack, Clarke & Buettcher, Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods (SIGIR 2009)"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Search Engines and Inverted Indexes
 
 > [!summary] TL;DR
-> A search engine answers "which documents contain these words, and which are most relevant?" It does this with an **inverted index**: for every word (term), a sorted list of the documents that contain it. Text is broken into terms by an **analyzer**, matches are ranked with a formula such as **BM25**, and engines like Elasticsearch and OpenSearch spread the index over shards of immutable Lucene segments. Your database stays the source of truth; the search index is a copy kept in sync.
+> A search engine answers "which documents contain these words, and which are most relevant?" It does this with an **inverted index**: for every word (term), a sorted list of the documents that contain it.
+>
+> Text is broken into terms by an **analyzer**, matches are ranked with a formula such as **BM25**, and engines like Elasticsearch and OpenSearch spread the index over shards of immutable Lucene segments.
+>
+> Your database stays the source of truth; the search index is a copy kept in sync.
 
 > [!abstract] Core idea
 > - An inverted index maps term → postings list (document ids, often with positions), so a query reads a few lists instead of scanning every document.
@@ -26,6 +30,54 @@ updated: 2026-11-03
 > - Elasticsearch/OpenSearch: index → primary and replica shards → Lucene segments; new documents become searchable after a refresh (1 s by default), not on write.
 > - Start with Postgres full-text search; add a search engine when relevance, fuzziness, facets or load demand it, and feed it through an outbox or CDC.
 
+
+## Start here: the basics
+
+**The problem in one story.**
+You want to find every email that mentions "refund" among a million emails.
+Reading every email each time would take far too long.
+Instead you keep a list: for each word, which emails contain it.
+Now "refund" is one lookup, and that list is an inverted index.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Document | One thing you can search for | One invoice, one product |
+| Term | A word after cleaning it up | "Refunds" becomes `refund` |
+| Analyzer | The steps that turn text into terms | Split, lowercase, stem |
+| Inverted index | A map from each term to the documents that contain it | `refund → [3, 7, 19]` |
+| Postings list | The list of document ids for one term | `[3, 7, 19]` |
+| Relevance score | A number that ranks how well a document matches | BM25 score 2.4 |
+| Shard | One slice of a big index stored on one node | Index split into 5 shards |
+| Refresh | Making newly written documents visible to search | Every 1 s by default in Elasticsearch |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  D[Documents] --> A[Analyzer]
+  A --> I[Inverted index: term to doc ids]
+  Q[Query text] --> A2[Same analyzer]
+  A2 --> L[Look up terms]
+  I --> L
+  L --> R[Rank with BM25]
+  R --> O[Top results]
+```
+
+**Analogy.**
+An inverted index is the index at the back of a textbook: look up a word, get the page numbers.
+Where it breaks: a book index is written once, while a search engine must keep updating and must also rank pages by how well they match.
+
+**How the rest of this note builds up**
+
+- First, why search engines exist and the mental model of term → document list.
+- Then analysis, the index structure, AND/OR/phrase queries, BM25 ranking, and Elasticsearch shards and segments.
+- Then a worked example with real scores, Postgres full-text search, keeping the index in sync, and zero-downtime reindexing.
+- Finally, trade-offs, production practice and the SDE-3 deep dive.
+
+> [!tip] Remember
+> Run the same analyzer at index time and query time, and treat the search index as a copy fed from your source of truth.
 
 ## 1. Why it exists
 
@@ -288,7 +340,11 @@ sequenceDiagram
 
 #### Example: the life of one write
 
-Consider document `inv_812`. At `t = 0` it is indexed: it sits in the buffer and the translog, and a search for it finds nothing. At `t <= 1 s` the next refresh writes it into a small new segment and the same search finds it. Later a flush commits the segments to disk and trims the translog, and a background merge may fold its segment into a bigger one. If `inv_812` is updated at `t = 60 s`, the old copy is only marked deleted in its segment's live docs, and the new version goes into another segment; the old bytes disappear at the next merge that rewrites that segment.
+Consider document `inv_812`. At `t = 0` it is indexed: it sits in the buffer and the translog, and a search for it finds nothing.
+
+At `t <= 1 s` the next refresh writes it into a small new segment and the same search finds it. Later a flush commits the segments to disk and trims the translog, and a background merge may fold its segment into a bigger one.
+
+If `inv_812` is updated at `t = 60 s`, the old copy is only marked deleted in its segment's live docs, and the new version goes into another segment; the old bytes disappear at the next merge that rewrites that segment.
 
 ## 4. Worked example
 
@@ -515,7 +571,9 @@ Common mistakes:
 
 **Facets.** Aggregations count matches per `keyword` value ("status: overdue 12, paid 40") over the query's result set, using column-oriented doc values rather than the inverted index.
 
-**Deep pagination.** `from` + `size` makes every shard return `from + size` hits to the coordinator, so cost grows with depth; `index.max_result_window` caps `from + size` at 10,000 by default. For deep or exported result sets use `search_after` (the sort values of the last hit) together with a **point in time** (PIT) so the pages come from one consistent view ([[Pagination, Filtering and Sorting]] covers cursor pagination in APIs).
+**Deep pagination.** `from` + `size` makes every shard return `from + size` hits to the coordinator, so cost grows with depth; `index.max_result_window` caps `from + size` at 10,000 by default.
+
+For deep or exported result sets use `search_after` (the sort values of the last hit) together with a **point in time** (PIT) so the pages come from one consistent view ([[Pagination, Filtering and Sorting]] covers cursor pagination in APIs).
 
 **Failure modes and fixes.**
 - *Too many small shards* (one index per tenant per month) → heap and cluster-state overhead; consolidate with routing and fewer indices.
@@ -544,7 +602,11 @@ fmt.Println(index["invoice"]) // [1 2]
 
 ## 8. Deep dive
 
-**Postings compression and skipping.** Lucene stores postings in blocks of 128 document ids as deltas from the previous id, bit-packed. Skip data lets an AND query jump over blocks that cannot contain the next candidate, so intersecting a rare term with a common one costs about the length of the rare list. Top-k scoring additionally uses per-block maximum scores (block-max WAND) to skip blocks that cannot reach the current top-k.
+**Postings compression and skipping.** Lucene stores postings in blocks of 128 document ids as deltas from the previous id, bit-packed.
+
+Skip data lets an AND query jump over blocks that cannot contain the next candidate, so intersecting a rare term with a common one costs about the length of the rare list.
+
+Top-k scoring additionally uses per-block maximum scores (block-max WAND) to skip blocks that cannot reach the current top-k.
 
 **Why `refresh` and not `commit`.** Making a segment searchable (refresh) only needs it to be written to the file system cache; making it durable (Lucene commit, called flush in Elasticsearch) needs an fsync, which is expensive. The translog covers durability between commits, so refreshes can be cheap and frequent.
 
@@ -610,3 +672,8 @@ flowchart LR
 - **Next:** [[Keyword, Semantic and Hybrid Search]], [[Vector Databases and ANN Indexes]], [[Transactional Outbox and CDC]]
 - **Implementation:** [[Search Engines and Inverted Indexes - Go]]
 - **Compare with:** [[Materialized Views and Denormalization]], [[Partitioning and Sharding]], [[Replication]]
+
+### Watch on YouTube
+
+- [How Inverted Index Works in Elasticsearch ⚙️ / Explained in 60 Seconds](https://www.youtube.com/watch?v=b3Elk4bp-0M) · Himanshu Singal · super short visual intro to the term-to-postings-list mapping
+- [A no nonsense intro to BM25](https://www.youtube.com/watch?v=TW9vHU1GpU4) · Abhishek Thakur · concise explanation of the BM25 ranking formula used in the note

@@ -7,13 +7,22 @@ prereqs: ["[[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]"]
 related: ["[[DNS - Resolution, Records and Caching]]", "[[CDN and Edge]]"]
 sources:
   - "Go standard library docs, package net (Resolver)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # DNS - Resolution, Records and Caching - Go
 
 > [!summary] TL;DR
 > This code is a `CachingResolver` that wraps Go's `net.Resolver` with the TTL-aware caching the standard library deliberately leaves out, plus a helper showing how to force the pure-Go resolver and point it at a specific DNS server. See the theory in [[DNS - Resolution, Records and Caching]].
+
+## Before the code
+
+- **Interfaces:** `Resolver` is a one-method interface, so a real `*net.Resolver` or a test fake can be plugged in.
+- **`context.Context`:** every lookup takes a context, so a caller can cancel or time out a slow DNS query.
+- **`sync.Mutex`:** guards the shared `cache` map, because many goroutines may call `Lookup` at once.
+- **Injectable clock (`Now func() time.Time`):** tests move time forward by hand instead of sleeping.
+- **`net.Resolver{PreferGo, Dial}`:** forces the pure-Go resolver and points it at a chosen DNS server.
+- **Run:** `go vet ./...` then `go test -race ./...` in a module containing `dnscache.go` and `dnscache_test.go`.
 
 ## What this code shows
 
@@ -157,7 +166,11 @@ func realResolverExample() *net.Resolver {
 }
 ```
 
-**Concept.** `net.DefaultResolver.LookupHost` makes a fresh query every call — the standard library intentionally does no caching, leaving TTL handling to the caller (the `CachingResolver` above) or to the OS resolver it delegates to. Go has **two resolver implementations**: a pure-Go one (parses `/etc/resolv.conf` and speaks DNS itself) and a cgo one (calls the OS's native resolver via libc). Go picks automatically based on `/etc/resolv.conf` and `GODEBUG=netdns=`, but setting `Resolver.PreferGo = true` forces the pure-Go path — useful in minimal containers without a working libc resolver, or when a specific DNS server needs to be targeted directly.
+**Concept.** `net.DefaultResolver.LookupHost` makes a fresh query every call — the standard library intentionally does no caching, leaving TTL handling to the caller (the `CachingResolver` above) or to the OS resolver it delegates to.
+
+Go has **two resolver implementations**: a pure-Go one (parses `/etc/resolv.conf` and speaks DNS itself) and a cgo one (calls the OS's native resolver via libc).
+
+Go picks automatically based on `/etc/resolv.conf` and `GODEBUG=netdns=`, but setting `Resolver.PreferGo = true` forces the pure-Go path — useful in minimal containers without a working libc resolver, or when a specific DNS server needs to be targeted directly.
 
 **How it works.**
 1. `PreferGo: true` forces Go's own DNS client instead of delegating to libc — the alternative (leaving it unset) means behavior silently depends on the host's `/etc/resolv.conf`, which is harder to reason about in a container.
@@ -291,6 +304,21 @@ flowchart TD
 
 A failure where the `t=30s` lookup shows a miss would mean the expiry check is comparing the wrong clock or the wrong boundary (`Before` vs `After`). A failure where the `t=61s` lookup still shows a hit would mean expired entries are never actually treated as stale — silently serving data that could be arbitrarily out of date.
 
+The tests use a tiny fake upstream that counts how many times it was asked, so a cache hit is provable without real DNS:
+
+```go
+// fakeResolver satisfies Resolver and counts upstream calls.
+type fakeResolver struct {
+	addrs []string
+	calls int // tests call Lookup sequentially, so no lock needed
+}
+
+func (f *fakeResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	f.calls++
+	return f.addrs, nil
+}
+```
+
 ```go
 func TestCacheHitSuppressesUpstreamQuery(t *testing.T) {
 	fake := &fakeResolver{addrs: []string{"93.184.216.34"}}
@@ -390,7 +418,9 @@ Reading it: `go vet` found nothing to flag, and both tests pass under the race d
 ## Exercises
 
 1. Change `TTL` from a single `time.Duration` field to a `map[string]time.Duration` keyed by host, so different hosts can have different TTLs (closer to how real DNS answers carry their own TTL). Predict which existing test would need to change, then update it.
-2. Remove the early return on `err != nil` in `Lookup` so a failed lookup still gets cached (with a very short TTL, say 1 second) as a "negative cache" entry, mirroring [[DNS - Resolution, Records and Caching#Caching layers, TTL, and negative caching]]'s negative caching. Predict what a repeated lookup for a permanently broken host now does differently, then write a test for it.
+2. Remove the early return on `err != nil` in `Lookup` so a failed lookup still gets cached (with a very short TTL, say 1 second) as a "negative cache" entry, mirroring [[DNS - Resolution, Records and Caching#Caching layers, TTL, and negative caching]]'s negative caching.
+
+   Predict what a repeated lookup for a permanently broken host now does differently, then write a test for it.
 3. Add a `Close` method that clears the cache map, and a test proving a lookup immediately after `Close` is a cache miss even though the TTL hasn't expired. Predict whether the existing mutex is sufficient for this without any other change.
 
 ## Links

@@ -11,7 +11,7 @@ sources:
   - "pgx v5.8 source: QueryTracer, CollectRows, SendBatch, statement_cache_capacity default 512"
   - "GORM docs, Preloading (Preload vs Joins)"
   - "graphql/dataloader README (batching within one event-loop tick)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # N+1 Query Problem
@@ -24,6 +24,51 @@ updated: 2026-11-07
 > - Each query is fast; the cost is the network round trip, paid N times in a row.
 > - The rule: fetch related rows for the whole list at once (JOIN, or one `WHERE id = ANY($1)` query).
 > - Classic mistake: "fixing" it with goroutines. That still sends N queries and can exhaust the connection pool.
+
+## Start here: the basics
+
+**The problem in one story.**
+A page lists 50 invoices with each client's name.
+The code loads the 50 invoices, then asks the database for one client name per invoice.
+That is 51 trips to the database. Each trip is quick, but 51 of them in a row are slow.
+The fix is to ask for all 50 client names in one trip.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Query | One question sent to the database | `SELECT * FROM clients WHERE id = 7` |
+| Round trip | Send a query and wait for the answer over the network | About 0.5 ms inside a data centre |
+| Related row | A row in another table linked by an ID | An invoice's client |
+| ORM | A library that turns rows into objects and hides SQL | GORM, Hibernate |
+| JOIN | One query that combines rows from two tables | `invoices JOIN clients` |
+| Batch query | One query for many IDs at once | `WHERE id = ANY($1)` |
+| Connection pool | A fixed set of open database connections shared by requests | 20 connections |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    subgraph bad["N+1: 51 trips"]
+        A1["1 query: 50 invoices"] --> A2["50 queries:<br/>1 client each"]
+    end
+    subgraph good["Batched: 2 trips"]
+        B1["1 query: 50 invoices"] --> B2["1 query:<br/>all client IDs"]
+    end
+```
+
+**Analogy.** Going to the shop once per item on your shopping list instead of once with the whole list.
+Where it breaks: one huge list can also be a problem, so very large ID lists are split into chunks.
+
+**How the rest of this note builds up**
+
+- First, why N+1 appears, usually hidden by an ORM (section 1), and the mental model (section 2).
+- Then what changes on the wire and the batching steps (section 3).
+- Then a traced page of 50 invoices (section 4) and the fixes compared: JOIN, batch query, DataLoader (sections 5-6).
+- Finally the SDE-3 view: detecting it in production and how a DataLoader works in Go (sections 7-8).
+
+> [!tip] Remember
+> Never query inside a loop: collect the IDs, fetch them in one query, join in memory.
 
 ## 1. Why it exists
 
@@ -174,7 +219,9 @@ flowchart TD
     C -- no --> R["50 rows for the page"]
 ```
 
-Two details matter. The batch query silently omits IDs that do not exist, so the stitching step must check for a missing client instead of printing a blank name. And with 50 distinct clients and a chunk size of 20, the batched version runs 1 + 3 queries: the count depends on the number of chunks, not on the page size.
+Two details matter. The batch query silently omits IDs that do not exist, so the stitching step must check for a missing client instead of printing a blank name.
+
+And with 50 distinct clients and a chunk size of 20, the batched version runs 1 + 3 queries: the count depends on the number of chunks, not on the page size.
 
 The pgx side sends the whole ID slice as one `bigint[]` parameter, and the `workspace_id` filter keeps a bad ID from reading another tenant's client. With sqlc, the same query is declared once and sqlc generates a method that takes `[]int64`. sqlc does not allow mixing `$n` and named parameters in one query, so both are named here:
 
@@ -315,7 +362,9 @@ flowchart LR
 
 ### How a DataLoader works without an event loop
 
-JavaScript's DataLoader batches every `load()` made in one event-loop tick. Go has no tick, so Go loaders collect keys for a short **wait window**, or until **maxBatch** keys arrive, then run one fetch. Every caller blocks on the result of the batch its key landed in. A per-request cache maps each key to its batch, so a key is never fetched twice.
+JavaScript's DataLoader batches every `load()` made in one event-loop tick. Go has no tick, so Go loaders collect keys for a short **wait window**, or until **maxBatch** keys arrive, then run one fetch.
+
+Every caller blocks on the result of the batch its key landed in. A per-request cache maps each key to its batch, so a key is never fetched twice.
 
 The `Loader[K, V]` type holds the open batch, a per-request cache from key to batch, a wait window and a `maxBatch` limit. `Load` joins or starts a batch and blocks until it finishes; `dispatch` runs the fetch exactly once, whether the timer or a full batch triggered it.
 
@@ -328,7 +377,11 @@ stateDiagram-v2
     Done --> [*]: every waiting Load gets its value
 ```
 
-Its test runs 300 concurrent resolver-style calls for 100 distinct clients. `maxBatch` is set to 100, so the batch fires as soon as the last key arrives and the test is deterministic: the expected result is 1 fetch for 100 keys. One caveat of this design: the batch runs with the context of the caller that opened it, so if that caller's context is cancelled, every caller in that batch gets the error. Inside one request all callers share the request context, which is another reason to keep one loader per request. The code and the test are in [[N+1 Query Problem - Go]].
+Its test runs 300 concurrent resolver-style calls for 100 distinct clients. `maxBatch` is set to 100, so the batch fires as soon as the last key arrives and the test is deterministic: the expected result is 1 fetch for 100 keys.
+
+One caveat of this design: the batch runs with the context of the caller that opened it, so if that caller's context is cancelled, every caller in that batch gets the error.
+
+Inside one request all callers share the request context, which is another reason to keep one loader per request. The code and the test are in [[N+1 Query Problem - Go]].
 
 ### The GraphQL flow it enables
 
@@ -396,3 +449,7 @@ sequenceDiagram
 - **Runnable code:** [[N+1 Query Problem - Go]] (naive and batched list handlers, the pgx batch query, a query counter, a generic DataLoader, tests)
 - **Next:** [[Query Plans and EXPLAIN]], [[Connection Pooling]], [[Materialized Views and Denormalization]]
 - **Compare with:** [[GraphQL]] (wiring dataloaders into gqlgen), [[Database Access (database-sql, pgx, sqlc)]] (pgx and sqlc usage), [[Caching Patterns]] (when a cache is the better fix)
+
+### Watch on YouTube
+
+- [Understanding the N+1 Select Problem in Database-Driven Applications](https://www.youtube.com/watch?v=kIUhMd2JeCY) · Asdf asdf1234 · explains the N+1 loop bug and batching fix

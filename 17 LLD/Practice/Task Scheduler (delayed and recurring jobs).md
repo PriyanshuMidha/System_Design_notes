@@ -9,13 +9,15 @@ sources:
   - "Go 1.24 standard library docs, container/heap (Fix, Remove and the index field pattern)"
   - "Go 1.24 standard library docs, time.Timer (Stop) and context (WithCancel)"
   - "PostgreSQL 17 docs, SELECT: The Locking Clause (FOR UPDATE, SKIP LOCKED)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Task Scheduler (delayed and recurring jobs)
 
 > [!summary] TL;DR
-> A task scheduler runs a function at a given time, once or on a fixed interval. One dispatcher goroutine keeps the jobs in a min-heap ordered by next run time and sleeps on one timer until the earliest job is due. It then hands the job to a bounded worker pool. The clock is injected, so tests move time by hand instead of sleeping.
+> A task scheduler runs a function at a given time, once or on a fixed interval. One dispatcher goroutine keeps the jobs in a min-heap ordered by next run time and sleeps on one timer until the earliest job is due.
+> 
+> It then hands the job to a bounded worker pool. The clock is injected, so tests move time by hand instead of sleeping.
 
 > [!abstract] Core idea
 > - A **min-heap by next run time** gives the earliest job in O(1) and inserts or removes in O(log n). One timer for the heap head replaces one goroutine per job.
@@ -24,6 +26,50 @@ updated: 2026-11-04
 > - **Missed-run policy** decides what a recurring job does after the scheduler wakes up late: run every missed slot (`CatchUp`) or run once and jump to the next future slot (`Coalesce`).
 > - **Graceful shutdown**: stop dispatching, let running jobs finish, and cancel their contexts only when the shutdown deadline expires.
 > - Classic mistakes: one `time.AfterFunc` goroutine per job with no way to list or cancel them, a scan of all jobs every second, and `time.Sleep` in tests.
+
+## Start here: the basics
+
+**The problem in one story.** An app must send a reminder email in 10 minutes, clean old files every hour, and retry a failed payment at 3 pm.
+Thousands of such jobs wait, each with its own time.
+Something must wake up at the right moment, run the job, and allow a job to be cancelled before it runs.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Delayed job | Runs once, at a future time | "Send email at 10:05" |
+| Recurring job | Runs again and again on a fixed interval | "Clean up every hour" |
+| Min-heap | A tree that always keeps the smallest item on top | The job due soonest is at the top |
+| Goroutine | A lightweight Go thread | The dispatcher runs in one goroutine |
+| Timer | Something that wakes you at a deadline | Wake at 10:05:00 |
+| Worker pool | A fixed number of goroutines that run jobs | 4 workers share all jobs |
+| Context | A Go value that carries cancellation to running code | Cancel stops an in-flight run |
+| Injected clock | Time comes from an interface, so tests can fake it | Test calls `Advance(10*time.Second)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S[Schedule job] --> H[Min-heap by next run time]
+    H --> D[Dispatcher sleeps until top job is due]
+    D --> Q[Bounded channel]
+    Q --> W1[Worker]
+    Q --> W2[Worker]
+    D -. recurring: next time .-> H
+```
+
+**Analogy.** It is like one alarm clock on a desk with a sorted pile of to-do cards: you set the alarm for the top card, and when it rings you hand that card to a helper and set the alarm for the next card.
+It breaks down because helpers here can be cancelled mid-task through a context, and the "alarm" can be faked in tests.
+
+**How the rest of this note builds up**
+
+- First the problem statement and requirements (Steps 1-2): one-off and recurring jobs, cancel, shutdown.
+- Then entities, relationships and APIs (Steps 3-5): job, heap, dispatcher, workers and the clock.
+- Then storage and patterns (Steps 6-7): persisting jobs and the patterns used.
+- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): `TimerAt` with a fake clock, O(log n) cancel, missed-run policies, backpressure and graceful shutdown.
+
+> [!tip] Remember
+> One heap, one timer for the earliest job, one dispatcher deciding when, and a bounded pool of workers doing what.
 
 ## Problem statement
 
@@ -310,7 +356,13 @@ cmd/demo/main.go    -> New(RealClock{}, 4, logResult), signal.NotifyContext, Shu
 `Shutdown(ctx)`: mark closed, close `stop`, wait for the dispatcher to exit, close `work` so the workers drain it, then wait for the workers or for `ctx`. On expiry, cancel every job context.
 
 > [!tip] Why `TimerAt(deadline)` and not `NewTimer(duration)`
-> With a relative `NewTimer(next.Sub(now))`, a fake clock turns into a race. If the test advances the clock between the dispatcher's `Now()` and its `NewTimer` call, the fake clock adds the duration to the *new* time, so the deadline moves into the future and a test that expects the timer to fire can hang. Such a hang shows up only now and then, for example in a `go test -race -count=20` run. An absolute deadline cannot drift that way. The same race exists with real time when the process is paused between the two calls, but there it only delays the run slightly.
+> With a relative `NewTimer(next.Sub(now))`, a fake clock turns into a race.
+> 
+> If the test advances the clock between the dispatcher's `Now()` and its `NewTimer` call, the fake clock adds the duration to the *new* time, so the deadline moves into the future and a test that expects the timer to fire can hang.
+> 
+> Such a hang shows up only now and then, for example in a `go test -race -count=20` run.
+> 
+> An absolute deadline cannot drift that way. The same race exists with real time when the process is paused between the two calls, but there it only delays the run slightly.
 
 ```go
 package scheduler
@@ -1156,7 +1208,11 @@ Redraw it from memory:
 > When every worker is busy the send blocks. If the lock were held, `Schedule`, `Cancel` and `Shutdown` would all block behind a slow job. Outside the lock only the dispatcher waits, which is the backpressure you want; the cost is that a job cancelled during that window is already in the channel, so the worker re-checks the context.
 
 > [!question]- How do you test a scheduler without `time.Sleep`?
-> Inject a clock with `Now` and `TimerAt`. The fake clock moves only on `Advance` and fires timers whose deadline has passed. A helper waits until the dispatcher has armed the timer you expect, so the test never advances time before the dispatcher is ready. `testing/synctest` (experimental in Go 1.24 behind `GOEXPERIMENT=synctest`, generally available in Go 1.25) offers a fake-time bubble as an alternative.
+> Inject a clock with `Now` and `TimerAt`. The fake clock moves only on `Advance` and fires timers whose deadline has passed.
+> 
+> A helper waits until the dispatcher has armed the timer you expect, so the test never advances time before the dispatcher is ready.
+> 
+> `testing/synctest` (experimental in Go 1.24 behind `GOEXPERIMENT=synctest`, generally available in Go 1.25) offers a fake-time bubble as an alternative.
 
 > [!question]- What does graceful shutdown mean here, exactly?
 > Stop the dispatcher so nothing new is handed out, close the work channel so the workers drain what is queued, and wait for them. If the caller's deadline expires first, cancel every job context and return `ctx.Err()`. In `main` this sits behind `signal.NotifyContext` for SIGTERM, with a deadline shorter than the orchestrator's kill timeout.
@@ -1180,3 +1236,8 @@ Redraw it from memory:
 - **Before this:** [[LLD Interview Method]], [[Concurrency for LLD]], [[Command, Undo and Memento]]
 - **Next:** [[17 LLD/Practice/Circuit Breaker|Circuit Breaker]]
 - **Compare with:** [[Scheduled Jobs - Cron to Durable Schedulers]] (cron and durable schedulers at system level), [[Background Jobs and Worker Pools]], [[Case Study - Distributed Job Scheduler]], [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [How to build a Distributed Task Scheduler with Go, Postgres, and gRPC](https://www.youtube.com/watch?v=bBp5AOTkJcg) · Jyotinder Singh · 34 min · 13,462 views
+- [Machine Coding: Design Concurrent Task Scheduler (Amazon, D. E. Shaw, Oracle)](https://www.youtube.com/watch?v=ohv-XUKBnB0) · Code design by Naman · 59 min · 3,314 views

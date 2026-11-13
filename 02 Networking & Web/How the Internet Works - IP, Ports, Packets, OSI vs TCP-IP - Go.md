@@ -9,7 +9,7 @@ sources:
   - "RFC 1122, Requirements for Internet Hosts - Communication Layers"
   - "ISO/IEC 7498-1, OSI Basic Reference Model"
   - "Cisco, BGP Case Studies and RFC 4271 overview"
-updated: 2026-11-09
+updated: 2026-11-13
 type: implementation
 ---
 
@@ -17,6 +17,15 @@ type: implementation
 
 > [!summary] TL;DR
 > This code opens a real TCP listener and a real TCP client on the loopback interface, and prints the 5-tuple each side sees, proving the claim in [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] that a connection's identity is `(protocol, source IP:port, destination IP:port)`, not just a port number.
+
+## Before the code
+
+- **`net.Listen` / `net.Dial`**: the standard library's way to open a listening socket and an outgoing TCP connection.
+- **`net.Conn` (an interface)**: one live connection; `LocalAddr()` and `RemoteAddr()` give this end and the other end as `ip:port`.
+- **Goroutine (`go EchoServer(...)`)**: runs the server concurrently so the test can act as the client at the same time.
+- **Channel (`chan string`)**: a typed pipe the server goroutine uses to hand its 5-tuple back to the test safely.
+- **`defer`**: schedules `Close()` to run when the function returns, so sockets are never leaked.
+- **What to run:** `go vet ./...` then `go test -race -v ./...` in a module containing `socket.go` and `socket_test.go`.
 
 ## What this code shows
 
@@ -43,7 +52,11 @@ go test -race -v ./...
 
 ### Formatting the 5-tuple
 
-**Concept.** The theory note's "Ports and sockets" section says a connection's real identity on the wire is the 5-tuple, not the port alone. `FiveTuple` makes that concrete: given a `net.Conn`, it prints exactly the four address fields (protocol is fixed to the network name passed in) that the kernel uses as its socket lookup key. An alternative design would print the fields separately as a struct, but a single formatted string is simplest for a demo that only needs to be logged and eyeballed.
+**Concept.** The theory note's "Ports and sockets" section says a connection's real identity on the wire is the 5-tuple, not the port alone.
+
+`FiveTuple` makes that concrete: given a `net.Conn`, it prints exactly the four address fields (protocol is fixed to the network name passed in) that the kernel uses as its socket lookup key.
+
+An alternative design would print the fields separately as a struct, but a single formatted string is simplest for a demo that only needs to be logged and eyeballed.
 
 ```go
 // Package socket demonstrates the TCP 5-tuple (protocol, source IP, source
@@ -66,7 +79,7 @@ func FiveTuple(network string, conn net.Conn) string {
 
 **How it works:**
 
-1. `conn.LocalAddr()` returns this end's own address — for the server, its listening address plus the ephemeral port the OS picked for *this* accepted connection; for the client, the ephemeral source port the OS picked when dialing.
+1. `conn.LocalAddr()` returns this end's own address — for the server, its listening address and port (an accepted connection shares the listener's port; the client's port is what makes it unique); for the client, the ephemeral source port the OS picked when dialing.
 2. `conn.RemoteAddr()` returns the other end's address as seen from here.
 3. Both are `net.Addr` values whose `String()` method already renders as `ip:port`, which is why formatting is a one-line `Sprintf`.
 
@@ -102,7 +115,9 @@ func EchoServer(ln net.Listener, tuples chan<- string) {
 
 ### TestFiveTupleDiffersPerConnection
 
-**What it proves:** each connection — even to the same listening port — gets its own distinct ephemeral source port, which is exactly the reason one listening port can serve many simultaneous clients. This matters because it is the mechanism question an interviewer is actually probing when they ask "how does a server handle multiple clients on one port."
+**What it proves:** each connection — even to the same listening port — gets its own distinct ephemeral source port, which is exactly the reason one listening port can serve many simultaneous clients.
+
+This matters because it is the mechanism question an interviewer is actually probing when they ask "how does a server handle multiple clients on one port."
 
 | Input | Expected output |
 | --- | --- |
@@ -172,7 +187,9 @@ PASS
 ok  	net01	1.671s
 ```
 
-Reading it line by line: `server saw: tcp 127.0.0.1:54664 -> 127.0.0.1:54665` means the server's local port is `54664` (the ephemeral port the OS gave the *accepted* connection, not the listening socket) and its peer is at `54665`. The client's line is the exact mirror: local `54665`, peer `54664` — the same socket pair, described from each side, with the OS having picked `54665` as a free ephemeral port for the client without being asked.
+Reading it line by line: `server saw: tcp 127.0.0.1:54664 -> 127.0.0.1:54665` means the server's local port is `54664` (the listening port, which every accepted connection shares) and its peer is at `54665`.
+
+The client's line is the exact mirror: local `54665`, peer `54664` — the same socket pair, described from each side, with the OS having picked `54665` as a free ephemeral port for the client without being asked.
 
 ## Design decisions
 
@@ -195,7 +212,9 @@ PASS
 ok  	net01	1.671s
 ```
 
-Reading the output: `RUN` announces the test name, the two `t.Logf` lines are each side's own view of the same socket pair (notice the local/remote ports are swapped between them), `PASS` confirms every assertion held, and the race detector (`-race`) finding nothing to report means no goroutine touched shared memory without synchronization — important here because the server and client run concurrently in separate goroutines.
+Reading the output: `RUN` announces the test name; the two `t.Logf` lines are each side's own view of the same socket pair (notice the local/remote ports are swapped between them), and `PASS` confirms every assertion held.
+
+The race detector (`-race`) finding nothing to report means no goroutine touched shared memory without synchronization — important here because the server and client run concurrently in separate goroutines.
 
 ## Pitfalls in the code
 

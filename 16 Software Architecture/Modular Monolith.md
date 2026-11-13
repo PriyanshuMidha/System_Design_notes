@@ -10,7 +10,7 @@ sources:
   - "Shopify Engineering, Enforcing Modularity in Rails Apps with Packwerk (2020)"
   - "Shopify, packwerk (github.com/Shopify/packwerk) — a Ruby gem that enforces module boundaries in a Rails monolith"
   - "Go command documentation: internal packages (go.dev/doc/go1.4, 'go command')"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Modular Monolith
@@ -23,6 +23,51 @@ updated: 2026-11-07
 > - In Go, "hidden" is not a convention: a module's own `internal/` subtree is invisible to every other package by the compiler's own rule, not a lint warning someone can ignore.
 > - Modules talk to each other in two ways only: a narrow public Go API (direct function calls, same process) or published events on an in-process bus — never by reaching into another module's storage.
 > - This buys you the option to extract a module into its own service later, because the module already has no secret backdoor another module's code depends on.
+
+## Start here: the basics
+
+**The problem in one story.**
+A team builds one app that handles invoices and sends emails.
+At first everything lives in one folder, and any code can call any other code.
+A year later, changing the invoice code breaks emails, and nobody knows why.
+A modular monolith keeps one app but puts walls between its parts, so that can't happen silently.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Monolith | One program deployed as one unit | One Go binary serving the whole API |
+| Microservice | A small program deployed on its own, talking over the network | A separate billing service called over HTTP |
+| Module | A self-contained part of the code with one job | `billing`, `notifications` |
+| Boundary | A rule about what one module may see in another | `notifications` can't read billing's database code |
+| Go package | A folder of Go files compiled together | `internal/billing` |
+| `internal/` folder | Go rule: only nearby code may import what's inside | `billing/internal/store` is private to `billing` |
+| Event / event bus | A "this happened" message, and the thing that delivers it to listeners | `InvoiceCreated` sent to whoever subscribed |
+| Deploy | Shipping a new version to production | One `go build` + one rollout |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    subgraph App["One binary, one deploy"]
+        B["billing module<br/>(private store inside)"] -- "publishes InvoiceCreated" --> E["shared events bus"]
+        E -- "delivers" --> N["notifications module"]
+    end
+    App --> DB[("one database")]
+```
+
+**Analogy.** An apartment building: one building and one front gate, but each flat has its own locked door. Neighbours talk through a notice board in the lobby, not by walking into each other's flats.
+Where it breaks: flats can't share a kitchen by accident, but modules sharing one database can still read each other's tables unless you add schema rules too.
+
+**How the rest of this note builds up**
+
+- First, a tiny whiteboard version and why the pattern exists (section 1), then the apartment mental model (section 2).
+- Then how Go's `internal/` rule, architecture tests and the in-process event bus enforce the walls (section 3).
+- Then a full runnable two-module example with tests (section 4), and variants compared (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production failure modes, `depguard` vs architecture tests, Conway's law (sections 6-8).
+
+> [!tip] Remember
+> One deploy, many walled-off modules: they talk only through a public API or events, never through each other's private code.
 
 ### Whiteboard version
 
@@ -54,19 +99,31 @@ The full version below replaces `billing.Event`/`notifications` importing `billi
 
 ## 1. Why it exists
 
-A single Go service with one flat `internal/` tree (`internal/invoice.go`, `internal/notify.go`, `internal/client.go`, all one package) has no compiler-enforced boundary between "billing logic" and "notification logic" at all — any function can call any other function and read any other package-level variable, so after a few quarters nobody can say with confidence which code a change to the invoice schema might break. The usual fix people reach for is "split it into microservices", which does enforce a boundary (a network call cannot accidentally become a shared-memory read), but it also means every module now needs its own deploy pipeline, its own on-call rotation, a service mesh or at least retries and circuit breakers for calls that used to be a function call, and a plan for what happens when two services' writes need to stay consistent.
+A single Go service with one flat `internal/` tree (`internal/invoice.go`, `internal/notify.go`, `internal/client.go`, all one package) has no compiler-enforced boundary between "billing logic" and "notification logic" at all — any function can call any other function and read any other package-level variable, so after a few quarters nobody can say with confidence which code a change to the invoice schema might break.
 
-A modular monolith takes the boundary microservices give you — "module A's data and code are off-limits to module B" — and gets it from the compiler and a package layout instead of from a network hop, while keeping one deploy, one transaction-capable database, and one process to operate. [[Monolith vs Microservices]] covers the deployment-unit decision in general; this note is about how to get real internal boundaries once you've decided to stay on one deployment unit.
+The usual fix people reach for is "split it into microservices", which does enforce a boundary (a network call cannot accidentally become a shared-memory read), but it also means every module now needs its own deploy pipeline, its own on-call rotation, a service mesh or at least retries and circuit breakers for calls that used to be a function call, and a plan for what happens when two services' writes need to stay consistent.
+
+A modular monolith takes the boundary microservices give you — "module A's data and code are off-limits to module B" — and gets it from the compiler and a package layout instead of from a network hop, while keeping one deploy, one transaction-capable database, and one process to operate.
+
+[[Monolith vs Microservices]] covers the deployment-unit decision in general; this note is about how to get real internal boundaries once you've decided to stay on one deployment unit.
 
 ## 2. Mental model
 
-Picture the monolith as an apartment building, not a single open-plan office. Each module is its own apartment with its own locked door (`internal/<module>/internal/...`); nobody else in the building can walk into your apartment and rearrange your furniture, even though everyone shares the same building (binary), the same front gate (one deploy), and the same utilities (one database, one process). When one tenant wants to tell the building something happened, they post a notice on the shared lobby board (the event bus) that any apartment can read — nobody needs to know who's listening, and nobody can read a notice before it's been posted.
+Picture the monolith as an apartment building, not a single open-plan office.
+
+Each module is its own apartment with its own locked door (`internal/<module>/internal/...`); nobody else in the building can walk into your apartment and rearrange your furniture, even though everyone shares the same building (binary), the same front gate (one deploy), and the same utilities (one database, one process).
+
+When one tenant wants to tell the building something happened, they post a notice on the shared lobby board (the event bus) that any apartment can read — nobody needs to know who's listening, and nobody can read a notice before it's been posted.
 
 ## 3. How it works
 
 ### 3.1 Module boundaries enforced in Go
 
-A module is a subtree under `internal/<module-name>/`. Its public surface is whatever that top-level package exports (typically one `Service` type); everything it wants to keep private goes one level deeper, under `internal/<module-name>/internal/...`. Go's own rule (in effect since Go 1.4) is: a package whose import path contains an `internal` segment can be imported only by code rooted at the directory that is the parent of that `internal` segment. For `modmono/internal/billing/internal/store`, that parent is `modmono/internal/billing` — so only code under `modmono/internal/billing/...` can import `store`, and nothing else in the module, not even `cmd/monolith`'s own `main.go`, can.
+A module is a subtree under `internal/<module-name>/`. Its public surface is whatever that top-level package exports (typically one `Service` type); everything it wants to keep private goes one level deeper, under `internal/<module-name>/internal/...`.
+
+Go's own rule (in effect since Go 1.4) is: a package whose import path contains an `internal` segment can be imported only by code rooted at the directory that is the parent of that `internal` segment.
+
+For `modmono/internal/billing/internal/store`, that parent is `modmono/internal/billing` — so only code under `modmono/internal/billing/...` can import `store`, and nothing else in the module, not even `cmd/monolith`'s own `main.go`, can.
 
 ```mermaid
 flowchart TB
@@ -93,15 +150,25 @@ flowchart TB
     NotifSvc -.->|subscribes to| EventType
 ```
 
-The dashed arrow from `main.go` to `Store` is the one every other arrow in this diagram is drawn to make true: even the file that wires every module together cannot see into one module's private internals, because the import simply does not compile. "How it works" in [[Service Project Layout and Wiring]] covers the single-module version of this `internal/` rule; a modular monolith applies it once per module instead of once per service.
+The dashed arrow from `main.go` to `Store` is the one every other arrow in this diagram is drawn to make true: even the file that wires every module together cannot see into one module's private internals, because the import simply does not compile.
+
+"How it works" in [[Service Project Layout and Wiring]] covers the single-module version of this `internal/` rule; a modular monolith applies it once per module instead of once per service.
 
 ### 3.2 Import rules beyond what `internal/` catches
 
-`internal/` stops a module from being imported from outside its own tree, but it does not stop `billing` from importing `notifications`' *public* `Service` directly, which would be just as real a boundary violation (now billing's build depends on notifications, and a notifications bug or slow test blocks a billing deploy). That rule — "module X's package may depend on module Y's public package" or not — is a policy decision no `internal/` folder expresses, which is exactly what `depguard` (a golangci-lint linter) or a hand-written **architecture test** exists to check. "Worked example" below writes one as a plain `go test` using `go list -json`, so the rule runs in CI with no extra tool.
+`internal/` stops a module from being imported from outside its own tree, but it does not stop `billing` from importing `notifications`' *public* `Service` directly, which would be just as real a boundary violation (now billing's build depends on notifications, and a notifications bug or slow test blocks a billing deploy).
+
+That rule — "module X's package may depend on module Y's public package" or not — is a policy decision no `internal/` folder expresses, which is exactly what `depguard` (a golangci-lint linter) or a hand-written **architecture test** exists to check.
+
+"Worked example" below writes one as a plain `go test` using `go list -json`, so the rule runs in CI with no extra tool.
 
 ### 3.3 In-process domain events
 
-Direct calls between modules are fine when one module simply needs an answer right now (`notifications.Service` could, in principle, call `billing.Service.GetInvoice` synchronously). But the common case — "billing wants other modules to react to something that happened, without knowing who they are" — is better served by an event: `billing` publishes `events.InvoiceCreated` to an in-process bus; `notifications` subscribes, with no reference to `billing` in its own imports at all, only to the shared `events` package. This is exactly the publish/subscribe shape [[Domain-Driven Design - Tactical Patterns in Go]] describes for domain events, except the "broker" here is a synchronous Go function-call fan-out — a real message queue (covered in 09 Messaging & Async) is a cost this note's "Trade-offs" section weighs against it.
+Direct calls between modules are fine when one module simply needs an answer right now (`notifications.Service` could, in principle, call `billing.Service.GetInvoice` synchronously).
+
+But the common case — "billing wants other modules to react to something that happened, without knowing who they are" — is better served by an event: `billing` publishes `events.InvoiceCreated` to an in-process bus; `notifications` subscribes, with no reference to `billing` in its own imports at all, only to the shared `events` package.
+
+This is exactly the publish/subscribe shape [[Domain-Driven Design - Tactical Patterns in Go]] describes for domain events, except the "broker" here is a synchronous Go function-call fan-out — a real message queue (covered in 09 Messaging & Async) is a cost this note's "Trade-offs" section weighs against it.
 
 ```mermaid
 sequenceDiagram
@@ -125,11 +192,17 @@ sequenceDiagram
 
 ### 3.4 Path to extraction
 
-Because `notifications` never imported `billing` directly — only the shared, plain-data `events` package — splitting `notifications` into its own deployed service later is mostly a wiring change, not a rewrite: `events.Bus.Publish` becomes "publish to Kafka/SNS instead of calling an in-process handler list", and `notifications.Register` becomes "a consumer process subscribing to that topic instead of a function call at startup". The event payload (`InvoiceCreated`) was already plain, serializable data with no pointer into billing's aggregate — exactly what a real message needs to be — so the one thing that would otherwise force a rewrite (reshaping the payload) was done up front. [[Strangler Fig Pattern and Legacy Migration]] covers the rest of an actual extraction (routing, data migration, verification); this is only the "did we leave ourselves an exit" half of the story.
+Because `notifications` never imported `billing` directly — only the shared, plain-data `events` package — splitting `notifications` into its own deployed service later is mostly a wiring change, not a rewrite: `events.Bus.Publish` becomes "publish to Kafka/SNS instead of calling an in-process handler list", and `notifications.Register` becomes "a consumer process subscribing to that topic instead of a function call at startup".
+
+The event payload (`InvoiceCreated`) was already plain, serializable data with no pointer into billing's aggregate — exactly what a real message needs to be — so the one thing that would otherwise force a rewrite (reshaping the payload) was done up front.
+
+[[Strangler Fig Pattern and Legacy Migration]] covers the rest of an actual extraction (routing, data migration, verification); this is only the "did we leave ourselves an exit" half of the story.
 
 ## 4. Worked example
 
-The code below is a two-module monolith: `billing` (owns an invoice store, publishes one event) and `notifications` (reacts to that event, owns nothing billing can see). A third, shared `platform/events` package holds the in-process bus and the event payload type; neither module owns it, and it depends on neither module. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
+The code below is a two-module monolith: `billing` (owns an invoice store, publishes one event) and `notifications` (reacts to that event, owns nothing billing can see).
+
+A third, shared `platform/events` package holds the in-process bus and the event payload type; neither module owns it, and it depends on neither module. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
 **`internal/platform/events/bus.go`** — the one package every module may depend on, and that depends on no module back:
 
@@ -595,7 +668,9 @@ func TestServiceHandlesConcurrentPublishes(t *testing.T) {
 }
 ```
 
-**Measured** (Go 1.24.4, scratch module `modmono`, 2026-11-07): `go vet ./...` is clean, `gofmt -l .` reports no files, and `go test -race -v ./...` passes 8 tests across `archtest` (4 architecture-fitness tests), `internal/billing` (2), and `internal/notifications` (2, including the 100-goroutine concurrent-publish stress test). A manual check confirms the boundary is real, not just test-asserted: temporarily adding `import "modmono/internal/billing/internal/store"` to `notifications.go` and running `go build ./...` produces `use of internal package modmono/internal/billing/internal/store not allowed` — the compiler itself refuses the build.
+**Measured** (Go 1.24.4, scratch module `modmono`, 2026-11-07): `go vet ./...` is clean, `gofmt -l .` reports no files, and `go test -race -v ./...` passes 8 tests across `archtest` (4 architecture-fitness tests), `internal/billing` (2), and `internal/notifications` (2, including the 100-goroutine concurrent-publish stress test).
+
+A manual check confirms the boundary is real, not just test-asserted: temporarily adding `import "modmono/internal/billing/internal/store"` to `notifications.go` and running `go build ./...` produces `use of internal package modmono/internal/billing/internal/store not allowed` — the compiler itself refuses the build.
 
 ## 5. Variants and comparison
 
@@ -609,14 +684,24 @@ func TestServiceHandlesConcurrentPublishes(t *testing.T) {
 
 ## 6. Trade-offs and when not to use
 
-- **A one-person or two-person team gets little from this.** The entire value of a module boundary is stopping *someone else's* change from reaching into your module by accident; with one or two people who both know the whole codebase, the ceremony (nested `internal/`, a shared events package, an architecture test) outweighs the benefit. Start with a flat `internal/` tree and add module boundaries once a second team, or a second concern big enough to need its own mental model, shows up.
-- **The in-process bus is synchronous and in-memory.** `Bus.Publish` calls every handler on the publisher's own goroutine before returning — a slow or panicking `notifications` handler directly slows down or crashes the request that created the invoice. There is also no delivery guarantee across a process restart: an event published between the last successful handler call and a crash is simply lost, because nothing persisted it. A module that needs guaranteed, durable delivery writes to the outbox table in its own transaction instead (see [[Transactional Outbox and CDC]]) and treats the in-process bus as a local fan-out convenience on top of that, not a replacement for it.
-- **Module boundaries do not replace schema boundaries.** If `billing` and `notifications` share one Postgres schema with no convention keeping `notifications`' queries off `billing`'s tables, a raw SQL query can bypass the Go-level wall entirely. A stricter version of this pattern gives each module its own Postgres schema (or even its own database) so a cross-module read is also a build-time-visible cross-schema query, not just a Go import.
+- **A one-person or two-person team gets little from this.** The entire value of a module boundary is stopping *someone else's* change from reaching into your module by accident; with one or two people who both know the whole codebase, the ceremony (nested `internal/`, a shared events package, an architecture test) outweighs the benefit.
+
+  Start with a flat `internal/` tree and add module boundaries once a second team, or a second concern big enough to need its own mental model, shows up.
+- **The in-process bus is synchronous and in-memory.** `Bus.Publish` calls every handler on the publisher's own goroutine before returning — a slow or panicking `notifications` handler directly slows down or crashes the request that created the invoice.
+
+  There is also no delivery guarantee across a process restart: an event published between the last successful handler call and a crash is simply lost, because nothing persisted it.
+
+  A module that needs guaranteed, durable delivery writes to the outbox table in its own transaction instead (see [[Transactional Outbox and CDC]]) and treats the in-process bus as a local fan-out convenience on top of that, not a replacement for it.
+- **Module boundaries do not replace schema boundaries.** If `billing` and `notifications` share one Postgres schema with no convention keeping `notifications`' queries off `billing`'s tables, a raw SQL query can bypass the Go-level wall entirely.
+
+  A stricter version of this pattern gives each module its own Postgres schema (or even its own database) so a cross-module read is also a build-time-visible cross-schema query, not just a Go import.
 - **Extraction is still work, not a flag flip.** "Path to extraction" above describes why it's *cheaper* than extracting from a flat monolith, not free: the module still needs its own deploy pipeline, its own database (or at least its own schema with its own migrations), and a real broker in place of the in-process bus.
 
 ## 7. In production
 
-- **Real systems:** Shopify's core Ruby monolith adopted this shape at scale in two steps — Kirsten Westeinde's 2019 Shopify Engineering post, "Deconstructing the Monolith," describes splitting the codebase into bounded "components" with enforced public interfaces; Shopify then open-sourced `packwerk` in 2020 (a static analysis gem) to fail CI on a cross-component privacy violation, the same role this note's `archtest` package plays for a Go codebase. Martin Fowler's **MonolithFirst** (2015) argues for starting monolithic and splitting only once real service boundaries have proven themselves in production — a modular monolith is the structure that makes that later split cheaper, because the boundaries already exist in the code before they exist in the deployment.
+- **Real systems:** Shopify's core Ruby monolith adopted this shape at scale in two steps — Kirsten Westeinde's 2019 Shopify Engineering post, "Deconstructing the Monolith," describes splitting the codebase into bounded "components" with enforced public interfaces; Shopify then open-sourced `packwerk` in 2020 (a static analysis gem) to fail CI on a cross-component privacy violation, the same role this note's `archtest` package plays for a Go codebase.
+
+  Martin Fowler's **MonolithFirst** (2015) argues for starting monolithic and splitting only once real service boundaries have proven themselves in production — a modular monolith is the structure that makes that later split cheaper, because the boundaries already exist in the code before they exist in the deployment.
 - **Failure modes → fixes:**
   - A new hire adds `import "modmono/internal/notifications"` to `billing` to call one convenience function → the architecture test (or, with `depguard` configured, the linter) fails CI before review, not after a production incident traces a deploy coupling back to it.
   - A module's private package grows a second, unrelated responsibility because "it's already `internal`, nobody else can see it, so who cares" → `internal/` enforces *who can import it*, not *how big or well-organized it is*; a module's own `internal/` tree can still rot without a sibling module ever noticing, so code review has to apply ordinary cohesion judgment inside a module too, not just at its border.
@@ -627,39 +712,59 @@ func TestServiceHandlesConcurrentPublishes(t *testing.T) {
 
 ### Why a nested `internal/` per module, not one `internal/` at the repo root
 
-A single `internal/` at the repository root only stops *other repositories* from importing anything inside it — it says nothing about `billing` and `notifications` importing each other, because both already live under that one root `internal/` tree and the rule is satisfied either way. Nesting a second `internal/` one level inside each module (`internal/billing/internal/...`) moves the enforced boundary from "outside this repo" to "outside this module", which is the boundary a modular monolith actually needs.
+A single `internal/` at the repository root only stops *other repositories* from importing anything inside it — it says nothing about `billing` and `notifications` importing each other, because both already live under that one root `internal/` tree and the rule is satisfied either way.
+
+Nesting a second `internal/` one level inside each module (`internal/billing/internal/...`) moves the enforced boundary from "outside this repo" to "outside this module", which is the boundary a modular monolith actually needs.
 
 ### Why the event payload lives in a third, neutral package
 
-If `notifications` imported `billing.InvoiceCreated` directly, the import graph would still show `notifications -> billing`, and `TestNotificationsNeverImportsBillingInternals`-style checks would have to special-case "except for this one event type", which is exactly the kind of exception that quietly grows over time. Defining the payload in `platform/events` — a package both modules depend on and that depends on neither — keeps the dependency graph a clean two-level tree (`modules -> platform`, never `platform -> modules`, never `module -> module`), which is also the shape that survives a future extraction cleanly: whichever side gets pulled out keeps importing `events`, now as a tiny shared contracts package or a generated protobuf, instead of as another service's internal type.
+If `notifications` imported `billing.InvoiceCreated` directly, the import graph would still show `notifications -> billing`, and `TestNotificationsNeverImportsBillingInternals`-style checks would have to special-case "except for this one event type", which is exactly the kind of exception that quietly grows over time.
+
+Defining the payload in `platform/events` — a package both modules depend on and that depends on neither — keeps the dependency graph a clean two-level tree (`modules -> platform`, never `platform -> modules`, never `module -> module`), which is also the shape that survives a future extraction cleanly: whichever side gets pulled out keeps importing `events`, now as a tiny shared contracts package or a generated protobuf, instead of as another service's internal type.
 
 ### What `depguard` adds that a hand-rolled architecture test doesn't
 
-`depguard` (a `golangci-lint` linter) runs as part of normal linting, on every file, incrementally, and its deny-list is declarative YAML a reviewer can scan without reading Go. The architecture test in this note's worked example is arguably more precise for this exact shape (it reasons about whole dependency closures via `go list`, not per-file import statements) but it is Go code a team has to write and maintain itself, and it only runs where `go test` runs. Many real codebases use both: `depguard` for fast, per-file feedback in the editor and in lint CI, and a small number of whole-graph architecture tests for the handful of global invariants (like "platform never depends on a module") that are awkward to express as a per-file rule.
+`depguard` (a `golangci-lint` linter) runs as part of normal linting, on every file, incrementally, and its deny-list is declarative YAML a reviewer can scan without reading Go.
+
+The architecture test in this note's worked example is arguably more precise for this exact shape (it reasons about whole dependency closures via `go list`, not per-file import statements) but it is Go code a team has to write and maintain itself, and it only runs where `go test` runs.
+
+Many real codebases use both: `depguard` for fast, per-file feedback in the editor and in lint CI, and a small number of whole-graph architecture tests for the handful of global invariants (like "platform never depends on a module") that are awkward to express as a per-file rule.
 
 ### Component ownership and Conway's law
 
-A module boundary works best when it also matches who is allowed to change it: one team "owns" `billing` the way they would own a `billing` microservice's repository, even though the code sits in the same repository and binary as everything else. [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]] covers Conway's law in general; a modular monolith is one way to get the organizational clarity Conway's law describes (one team per module) without yet paying for the operational cost of one deploy per team.
+A module boundary works best when it also matches who is allowed to change it: one team "owns" `billing` the way they would own a `billing` microservice's repository, even though the code sits in the same repository and binary as everything else.
+
+[[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]] covers Conway's law in general; a modular monolith is one way to get the organizational clarity Conway's law describes (one team per module) without yet paying for the operational cost of one deploy per team.
 
 ## 9. Interview questions
 
 > [!question]- What exactly stops one module from reaching into another module's database table in a modular monolith?
-> In Go, nothing stops a raw SQL query from reaching another module's table if both modules share one schema and one connection — the `internal/` rule only blocks a Go *import*, not a query string. The stronger version of this pattern gives each module its own Postgres schema (or its own database), so a cross-module read becomes a cross-schema query that's visible in a migration review, not a wall the compiler enforces on its own.
+> In Go, nothing stops a raw SQL query from reaching another module's table if both modules share one schema and one connection — the `internal/` rule only blocks a Go *import*, not a query string.
+>
+> The stronger version of this pattern gives each module its own Postgres schema (or its own database), so a cross-module read becomes a cross-schema query that's visible in a migration review, not a wall the compiler enforces on its own.
 
 > [!question]- Trap: if two modules communicate only through events, haven't you basically already built microservices, just without the network?
-> No — the events are in-process function calls with no serialization, no network hop, no partial-failure mode where the publisher succeeds but the subscriber never finds out, and (critically) no separate deploy or database per module. The event *shape* (plain, serializable payloads) is deliberately chosen to resemble what a real message would look like, specifically so that splitting a module out later is cheaper — but until that split happens, this is still one process with one transaction-capable database, which is the entire point.
+> No — the events are in-process function calls with no serialization, no network hop, no partial-failure mode where the publisher succeeds but the subscriber never finds out, and (critically) no separate deploy or database per module.
+>
+> The event *shape* (plain, serializable payloads) is deliberately chosen to resemble what a real message would look like, specifically so that splitting a module out later is cheaper — but until that split happens, this is still one process with one transaction-capable database, which is the entire point.
 
 > [!question]- How would you enforce "module A may not import module B" without buying a static-analysis tool?
 > Two compiler-level mechanisms, plus one test: nest a second `internal/` inside each module so its own private packages are unreachable from outside it (enforced by `go build` itself); keep each module's own package as the only public surface another module may import; and write a small `go test` that runs `go list -json` on each module and fails if its dependency closure contains another module's import path, as this note's `archtest` package does.
 
 > [!question]- Why does `billing.NewService` build its own `store.Store` internally instead of taking one as a constructor argument, the way the DDD tactical-patterns note's repository is injected?
-> Because `*store.Store`'s type lives under `billing/internal/`, which only code rooted at `billing/...` may import — `cmd/monolith`, one directory outside that tree, cannot construct a `*store.Store` to pass in even if the constructor wanted one. The signature is a direct consequence of the `internal/` boundary, not a style choice; a repository interface injected from outside (as in the DDD tactical-patterns note) is still the right shape across a module's own internal layers, just not across the module boundary itself.
+> Because `*store.Store`'s type lives under `billing/internal/`, which only code rooted at `billing/...` may import — `cmd/monolith`, one directory outside that tree, cannot construct a `*store.Store` to pass in even if the constructor wanted one.
+>
+> The signature is a direct consequence of the `internal/` boundary, not a style choice; a repository interface injected from outside (as in the DDD tactical-patterns note) is still the right shape across a module's own internal layers, just not across the module boundary itself.
 
 > [!question]- What's the single biggest risk of adopting this pattern with a small team?
-> Paying real ongoing cost (the nested `internal/` layout, a shared events package, an architecture test to maintain) for a boundary that never gets violated anyway, because the team is small enough that everyone already holds the whole system in their head. The pattern earns its keep once a second team, or a module complex enough to need its own mental model, actually shows up — introducing it earlier is optimizing for a coordination problem that doesn't exist yet.
+> Paying real ongoing cost (the nested `internal/` layout, a shared events package, an architecture test to maintain) for a boundary that never gets violated anyway, because the team is small enough that everyone already holds the whole system in their head.
+>
+> The pattern earns its keep once a second team, or a module complex enough to need its own mental model, actually shows up — introducing it earlier is optimizing for a coordination problem that doesn't exist yet.
 
 > [!question]- If `notifications` needs an answer from `billing` right now — not an event — how should it ask?
-> A direct call to `billing`'s public `Service` type (or a narrow interface `notifications` declares for just the method it needs), the same consumer-owns-the-interface shape [[Service Project Layout and Wiring]] uses within one module. This is still a cross-module Go import, which is fine — the rule a modular monolith enforces is "never import another module's *private* internals", not "modules may never call each other synchronously".
+> A direct call to `billing`'s public `Service` type (or a narrow interface `notifications` declares for just the method it needs), the same consumer-owns-the-interface shape [[Service Project Layout and Wiring]] uses within one module.
+>
+> This is still a cross-module Go import, which is fine — the rule a modular monolith enforces is "never import another module's *private* internals", not "modules may never call each other synchronously".
 
 ## 10. Cheat sheet
 
@@ -677,3 +782,8 @@ A module boundary works best when it also matches who is allowed to change it: o
 - **Before this:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]], [[Monolith vs Microservices]]
 - **Next:** [[Strangler Fig Pattern and Legacy Migration]], [[Documenting Architecture - C4 Diagrams and Fitness Functions]]
 - **Compare with:** [[Service Project Layout and Wiring]] (the single-module version of the `internal/` and consumer-owns-the-interface rules this note applies per module), [[Domain-Driven Design - Tactical Patterns in Go]] (domain events inside one aggregate/module, the pattern this note's event bus generalizes across modules), [[Transactional Outbox and CDC]] (durable delivery, for when the in-process bus's guarantees aren't enough)
+
+### Watch on YouTube
+
+- [Modular Monoliths • Simon Brown • GOTO 2018](https://www.youtube.com/watch?v=5OjqD-ow8GE) · GOTO Conferences · 46 min · 111,731 views
+- [Introduction to Spring Modulith - Modular Monoliths in Spring Boot](https://www.youtube.com/watch?v=xHlDyKVyvig) · Dan Vega · 37 min · 25,634 views

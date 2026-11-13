@@ -9,7 +9,7 @@ sources:
   - "GitHub Actions docs, aws-actions/configure-aws-credentials, amazon-ecs-deploy-task-definition"
   - "DORA, 2024 State of DevOps Report (the four keys)"
   - "SLSA.dev, Supply-chain Levels for Software Artifacts v1.0"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # CI-CD Pipelines (GitHub Actions for Go)
@@ -24,6 +24,51 @@ updated: 2026-11-07
 > - Authenticate to the cloud with short-lived OIDC tokens, never long-lived access keys checked into pipeline secrets.
 > - A pipeline without an automatic rollback trigger is not finished, it is a deploy script with extra steps.
 
+## Start here: the basics
+
+**The problem in one story.**
+A developer finishes a change and copies it to the server by hand on Friday evening.
+They forgot to run the tests, and the build on their laptop differs from the one on the server.
+The site breaks, and nobody knows exactly which version is live.
+A CI/CD pipeline makes every change go through the same automatic build, test and deploy steps.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Commit / push | Saving a change in Git and sending it to GitHub | `git push origin main` |
+| Build | Turning source code into something runnable | `go build` makes a binary |
+| Artifact / image | The packaged output of a build | A Docker image tagged with the commit SHA |
+| Environment | A separate place the app runs | staging vs production |
+| Workflow / job | A set of automated steps GitHub Actions runs | "test" job, then "deploy" job |
+| Secret / credential | A password or key that grants access | AWS keys (avoid long-lived ones) |
+| Rollback | Going back to the previous working version | Redeploy yesterday's image |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Push["git push"] --> CI["CI: build + test + scan"]
+    CI --> Img["One image<br/>(tagged by SHA)"]
+    Img --> Stg["Deploy to staging"]
+    Stg --> Ok{"Approve?"}
+    Ok -->|"yes"| Prod["Deploy same image<br/>to production"]
+    Prod --> Watch["Watch health;<br/>auto-rollback if bad"]
+```
+
+**Analogy.** A pipeline is a car factory assembly line: every car passes the same stations and inspections, and the exact car that passed inspection is the one shipped.
+Where it breaks: a factory rarely recalls a car within minutes; a good pipeline can roll a bad deploy back automatically almost right away.
+
+**How the rest of this note builds up**
+
+- First, why pipelines exist (section 1) and the mental model (section 2).
+- Then how the stages connect: build once, promote, OIDC auth (section 3).
+- Then a full GitHub Actions pipeline deploying a Go service to ECS, and a smoke-test gate in Go (section 4), plus comparisons (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production practice, and pipeline internals (sections 6-8).
+
+> [!tip] Remember
+> Build once, test it, then promote that exact same artifact to every environment, with rollback wired in.
+
 ## 1. Why it exists
 
 Before CI/CD, a typical release looked like this: an engineer runs the test suite on their laptop (if they remember to), SSHes into a production box, `git pull`s, restarts the process, and watches the logs for a minute. Three things go wrong with this in practice:
@@ -32,11 +77,17 @@ Before CI/CD, a typical release looked like this: an engineer runs the test suit
 - **It is not repeatable.** "Works on my machine" becomes "works on the machine I happened to SSH into," because the build step ran somewhere different from where the tests ran.
 - **It has no gate.** Nothing stops an engineer from deploying code that fails `go vet` or a unit test; the only test environment is production.
 
-**Documented numbers (DORA 2024 State of DevOps Report):** elite-performing teams deploy to production multiple times a day with change failure rates around 5%, while low performers deploy between once a month and once every six months with change failure rates over 40%. A pipeline is what turns "deploy" from a risky, manual ritual into a boring, frequent, low-risk event — which is exactly what lets a team ship fixes fast instead of batching up large, risky releases.
+**Documented numbers (DORA 2024 State of DevOps Report):** elite-performing teams deploy to production multiple times a day with change failure rates around 5%, while low performers deploy between once a month and once every six months with change failure rates over 40%.
+
+A pipeline is what turns "deploy" from a risky, manual ritual into a boring, frequent, low-risk event — which is exactly what lets a team ship fixes fast instead of batching up large, risky releases.
 
 ## 2. Mental model
 
-A CI/CD pipeline is an assembly line for one commit. Each station either rejects the commit (test station finds a bug, scan station finds a CVE) or stamps it and passes it to the next station. The stamp carries forward: once an artifact is built and tagged with the commit SHA, every later station — staging, production — runs *that exact artifact*, never a fresh rebuild. That single rule, "build once, promote the same artifact," is what makes "it passed staging" mean something: if production used a different build, staging would have tested nothing.
+A CI/CD pipeline is an assembly line for one commit. Each station either rejects the commit (test station finds a bug, scan station finds a CVE) or stamps it and passes it to the next station.
+
+The stamp carries forward: once an artifact is built and tagged with the commit SHA, every later station — staging, production — runs *that exact artifact*, never a fresh rebuild.
+
+That single rule, "build once, promote the same artifact," is what makes "it passed staging" mean something: if production used a different build, staging would have tested nothing.
 
 ## 3. How it works
 
@@ -445,3 +496,8 @@ func TestWaitForHealthy_TimesOutWhenAlwaysUnhealthy(t *testing.T) {
 - **Before this:** [[Testing in Go]], [[Containerizing Go Services]]
 - **Next:** [[Deployment Strategies - Rolling, Blue-Green, Canary]], [[Feature Flags]]
 - **Compare with:** [[Rollback and Safe Migrations]], [[Testing in CI-CD, Flaky Tests and Testing in Production]], [[Kubernetes Fundamentals]] (GitOps alternative to a push-based pipeline)
+
+### Watch on YouTube
+
+- [GitHub Actions Tutorial - Basic Concepts and CI/CD Pipeline with Docker](https://www.youtube.com/watch?v=R8_veQiYBjI) · TechWorld with Nana · 32 min · 2,378,185 views
+- [CI/CD Tutorial using GitHub Actions - Automated Testing & Automated Deployments](https://www.youtube.com/watch?v=YLtlz88zrLg) · Tom Shaw · 6 min · 486,435 views

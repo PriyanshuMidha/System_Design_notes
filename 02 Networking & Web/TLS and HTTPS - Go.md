@@ -13,7 +13,7 @@ sources:
   - "RFC 6960, OCSP"
   - "RFC 6962, Certificate Transparency"
   - "Go crypto/tls package documentation (Go 1.24)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # TLS and HTTPS - Go
@@ -21,11 +21,26 @@ updated: 2026-11-09
 > [!summary] TL;DR
 > This code proves three real handshakes with Go's `crypto/tls`: a server negotiating TLS 1.3, a TLS-1.2-only client being rejected by a TLS-1.3-only server, and mutual TLS (mTLS) using a throwaway test certificate authority. See the theory in [[TLS and HTTPS]].
 
+## Before the code
+
+- **`crypto/tls`**: Go's built-in TLS; a `tls.Config` sets versions (`MinVersion`, `MaxVersion`), certificates and client-cert rules.
+- **`crypto/x509` + `crypto/ecdsa`**: build and sign certificates in memory, so the tests need no certificate files.
+- **`net/http/httptest`**: starts a real HTTPS server on a random local port for one test, then `Close()` shuts it down.
+- **`*testing.T` and `t.Helper()`**: test functions; `t.Helper()` makes failures point at the caller's line.
+- **Handler goroutines**: the server runs each request on its own goroutine, which is why the tests run with `-race`.
+- **Run it**: `go vet ./...` then `go test -race -v ./...` inside a module named `tlsdemo` (see Setup).
+
 ## What this code shows
 
-All three tests below exercise a real TLS handshake over a real `net.Listener` (via `httptest`), never a mocked connection — the point of this note is to make the theory note's handshake diagrams literally observable in test output, not just plausible on paper. Each test is scoped to prove exactly one claim from the theory note, so a failure always points at one specific mechanism rather than "something about TLS broke."
+All three tests below exercise a real TLS handshake over a real `net.Listener` (via `httptest`), never a mocked connection — the point of this note is to make the theory note's handshake diagrams literally observable in test output, not just plausible on paper.
 
-This matters because TLS bugs are notoriously easy to hide behind a green checkmark: a test that happens to connect successfully proves almost nothing on its own, since a misconfigured client or server can still "work" while silently skipping the one check that was supposed to matter (a missing hostname check, a disabled certificate validation, a downgraded cipher). Every test here is instead built to fail loudly in exactly the scenario it exists to catch, which is why `TestTLS12ClientRejectedByTLS13Server` and the no-client-certificate half of `TestMutualTLS` both assert on an *error*, not a success — the interesting behavior in both cases is the handshake refusing to proceed.
+Each test is scoped to prove exactly one claim from the theory note, so a failure always points at one specific mechanism rather than "something about TLS broke."
+
+This matters because TLS bugs are notoriously easy to hide behind a green checkmark.
+
+A test that happens to connect successfully proves almost nothing on its own, since a misconfigured client or server can still "work" while silently skipping the one check that was supposed to matter (a missing hostname check, a disabled certificate validation, a downgraded cipher).
+
+Every test here is instead built to fail loudly in exactly the scenario it exists to catch, which is why `TestTLS12ClientRejectedByTLS13Server` and the no-client-certificate half of `TestMutualTLS` both assert on an *error*, not a success — the interesting behavior in both cases is the handshake refusing to proceed.
 
 | Code | Theory concept | Theory section |
 | --- | --- | --- |
@@ -47,14 +62,20 @@ flowchart TB
     end
 ```
 
-One throwaway certificate authority (`testCA`) feeds every test that needs a real certificate chain: `newTLS13Server` builds the plain TLS-1.3 server the first two tests share, while `TestMutualTLS` additionally issues a client certificate from the same CA and configures the server to require it. Keeping one CA type shared across all three tests, rather than three separate ad-hoc certificate setups, is what lets `TestMutualTLS` reuse `testCA.issue` unchanged.
+One throwaway certificate authority (`testCA`) feeds every test that needs a real certificate chain: `newTLS13Server` builds the plain TLS-1.3 server the first two tests share, while `TestMutualTLS` additionally issues a client certificate from the same CA and configures the server to require it.
+
+Keeping one CA type shared across all three tests, rather than three separate ad-hoc certificate setups, is what lets `TestMutualTLS` reuse `testCA.issue` unchanged.
 
 ## Setup
 
 - **Module layout:** a single package, `tlsdemo`, with the test-CA helper in its own file and the three handshake tests in another.
 - **Go version:** 1.24.
 - **Dependencies:** standard library only (`crypto/tls`, `crypto/x509`, `net/http/httptest`).
-- **Why standard library only.** Nothing here needs a third-party TLS library: `crypto/tls` and `crypto/x509` already expose every knob this note demonstrates (minimum/maximum version, client-certificate requirement, custom root pools), and `httptest` already wraps the socket plumbing a hand-rolled `net.Listen` + `tls.NewListener` setup would otherwise require. Reaching for a third-party library here would add a dependency without removing any code this note actually needs to show.
+- **Why standard library only.** Nothing here needs a third-party TLS library: `crypto/tls` and `crypto/x509` already expose every knob this note demonstrates (minimum/maximum version, client-certificate requirement, custom root pools).
+
+  `httptest` already wraps the socket plumbing a hand-rolled `net.Listen` + `tls.NewListener` setup would otherwise require.
+
+  Reaching for a third-party library here would add a dependency without removing any code this note actually needs to show.
 - **Run it:**
 
 ```text
@@ -87,7 +108,9 @@ func newTLS13Server(handler http.Handler) *httptest.Server {
 }
 ```
 
-**Concept.** This is the Go-side knob for the theory note's "TLS 1.3: one round trip" section: `MinVersion` is what a real server sets to refuse to negotiate anything weaker. `httptest.NewUnstartedServer` plus a manually assigned `srv.TLS` (instead of the simpler `httptest.NewTLSServer`) was chosen specifically so this config could be set *before* starting the listener — `httptest`'s default helper generates its own cert and starts immediately, leaving no window to override `MinVersion` first.
+**Concept.** This is the Go-side knob for the theory note's "TLS 1.3: one round trip" section: `MinVersion` is what a real server sets to refuse to negotiate anything weaker.
+
+`httptest.NewUnstartedServer` plus a manually assigned `srv.TLS` (instead of the simpler `httptest.NewTLSServer`) was chosen specifically so this config could be set *before* starting the listener — `httptest`'s default helper generates its own cert and starts immediately, leaving no window to override `MinVersion` first.
 
 **How it works.**
 1. `NewUnstartedServer` creates the listener and generates a self-signed certificate, but does not yet start accepting connections.
@@ -152,7 +175,9 @@ func TestTLS12ClientRejectedByTLS13Server(t *testing.T) {
 }
 ```
 
-**Concept.** This is the direct, working proof behind the theory note's interview question about protocol-version mismatches: a client whose `MaxVersion` excludes a server's `MinVersion` must fail the handshake, not silently downgrade. Cloning the transport (`.Clone()`) rather than mutating the client's shared default transport was chosen so this test can't leak a changed `MaxVersion` into any other test that happens to reuse the same `http.DefaultTransport`.
+**Concept.** This is the direct, working proof behind the theory note's interview question about protocol-version mismatches: a client whose `MaxVersion` excludes a server's `MinVersion` must fail the handshake, not silently downgrade.
+
+Cloning the transport (`.Clone()`) rather than mutating the client's shared default transport was chosen so this test can't leak a changed `MaxVersion` into any other test that happens to reuse the same `http.DefaultTransport`.
 
 **How it works.**
 1. `client.Transport.(*http.Transport).Clone()` makes an independent copy of the transport so this test's TLS constraint is fully isolated.
@@ -186,7 +211,9 @@ type testCA struct {
 }
 ```
 
-**Concept.** This is the theory note's chain-of-trust diagram (root → intermediate → leaf) collapsed to two levels for a test: `testCA` plays the root, and `issue` signs leaf certificates directly under it. The alternative — calling `tls.Config{InsecureSkipVerify: true}` and skipping certificate verification entirely — was rejected because it would prove nothing about the actual mechanism this note exists to demonstrate: a client or server that only trusts a certificate because a real signature chains back to a root it holds.
+**Concept.** This is the theory note's chain-of-trust diagram (root → intermediate → leaf) collapsed to two levels for a test: `testCA` plays the root, and `issue` signs leaf certificates directly under it.
+
+The alternative — calling `tls.Config{InsecureSkipVerify: true}` and skipping certificate verification entirely — was rejected because it would prove nothing about the actual mechanism this note exists to demonstrate: a client or server that only trusts a certificate because a real signature chains back to a root it holds.
 
 ```go
 func newTestCA(t *testing.T) *testCA {
@@ -252,7 +279,9 @@ func (ca *testCA) issue(t *testing.T, name string, client bool) tls.Certificate 
 }
 ```
 
-**Concept.** One function issues both the server certificate and the client certificate the theory note's mTLS section needs, distinguished only by the `client bool` flag and the resulting `ExtKeyUsage`. The alternative of two separate functions was rejected as unnecessary duplication — the only real difference between a server cert and a client cert here is which `ExtKeyUsage` and which identity fields (IP/DNS SANs vs. none) get set.
+**Concept.** One function issues both the server certificate and the client certificate the theory note's mTLS section needs, distinguished only by the `client bool` flag and the resulting `ExtKeyUsage`.
+
+The alternative of two separate functions was rejected as unnecessary duplication — the only real difference between a server cert and a client cert here is which `ExtKeyUsage` and which identity fields (IP/DNS SANs vs. none) get set.
 
 **How it works.**
 1. `x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)` signs with `ca.key` (the CA's private key) while the certificate's own public key is the leaf's — this asymmetry (signed by one key, identifying another) is the entire mechanism of a certificate chain.
@@ -334,7 +363,11 @@ Every choice in this section is one a reader could reasonably make differently; 
 
 The two tests after `TestServerNegotiatesTLS13` each isolate exactly one failure mode — a version mismatch, and a missing client certificate — rather than combining them into one large scenario, because a single test that failed for either reason would leave a reader unsure which guarantee actually broke.
 
-Three design pressures shaped this file as a whole. First, every handshake had to be **real**: no step anywhere calls `InsecureSkipVerify` or hand-constructs a fake `tls.ConnectionState`, because a test that skips verification can pass even when the actual mechanism being taught (chain-of-trust validation) is completely broken. Second, each test had to fail for exactly one reason, which is why the CA and certificate-issuing code is shared infrastructure (`testCA`) rather than duplicated per test — a bug in certificate issuance would then show up as every test failing, which is itself a useful signal, not noise. Third, the file stays in a single package deliberately: splitting the CA helper into its own package would mirror production code structure more closely, but it would also hide, behind an import, exactly the two-level signing relationship (`newTestCA` signs itself, `issue` signs a leaf under it) that this note exists to make visible in one place.
+Three design pressures shaped this file as a whole.
+
+1. First, every handshake had to be **real**: no step anywhere calls `InsecureSkipVerify` or hand-constructs a fake `tls.ConnectionState`, because a test that skips verification can pass even when the actual mechanism being taught (chain-of-trust validation) is completely broken.
+2. Second, each test had to fail for exactly one reason, which is why the CA and certificate-issuing code is shared infrastructure (`testCA`) rather than duplicated per test — a bug in certificate issuance would then show up as every test failing, which is itself a useful signal, not noise.
+3. Third, the file stays in a single package deliberately: splitting the CA helper into its own package would mirror production code structure more closely, but it would also hide, behind an import, exactly the two-level signing relationship (`newTestCA` signs itself, `issue` signs a leaf under it) that this note exists to make visible in one place.
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -380,7 +413,9 @@ A failure in the first case would mean the server isn't actually enforcing `Requ
 
 ## Running it
 
-The commands below are the same two steps every Go module in this vault's implementation notes runs: `go vet` first, because a vet failure usually points at a mistake worth fixing before even running the tests, then `go test -race` second, so a pass also rules out a whole class of concurrency bugs that a plain `go test` run would miss.
+The commands below are the same two steps every Go module in this vault's implementation notes runs.
+
+`go vet` first, because a vet failure usually points at a mistake worth fixing before even running the tests. `go test -race` runs second, so a pass also rules out a whole class of concurrency bugs that a plain `go test` run would miss.
 
 ```text
 $ go vet ./...
@@ -398,9 +433,15 @@ PASS
 ok  	tlsdemo	1.923s
 ```
 
-Reading it: `go vet` printed nothing (no suspicious constructs found). `version=304` is TLS 1.3's wire-format version number in hex, and `cipher=1301` is `TLS_AES_128_GCM_SHA256`'s suite ID — both confirm the negotiation claimed in the test assertions actually happened at the protocol level, not just that Go's high-level API returned success. All three tests ran under `-race`; a pass here specifically rules out any data race in the `httptest` server's concurrent handling of the handshake and the handler goroutine.
+Reading it: `go vet` printed nothing (no suspicious constructs found).
 
-The second log line, `handshake failed as expected: remote error: tls: protocol version not supported`, is the server's own alert message traveling back to the client — the exact wire-level signal the theory note's "protocol-version mismatch" interview question describes, captured here instead of only described in prose. Seeing the real alert text, rather than a generic "connection refused," is the detail that makes a production TLS error log readable the first time it shows up for real: the alert name usually names the mismatched parameter directly.
+`version=304` is TLS 1.3's wire-format version number in hex, and `cipher=1301` is `TLS_AES_128_GCM_SHA256`'s suite ID — both confirm the negotiation claimed in the test assertions actually happened at the protocol level, not just that Go's high-level API returned success.
+
+All three tests ran under `-race`; a pass here specifically rules out any data race in the `httptest` server's concurrent handling of the handshake and the handler goroutine.
+
+The second log line, `handshake failed as expected: remote error: tls: protocol version not supported`, is the server's own alert message traveling back to the client — the exact wire-level signal the theory note's "protocol-version mismatch" interview question describes, captured here instead of only described in prose.
+
+Seeing the real alert text, rather than a generic "connection refused," is the detail that makes a production TLS error log readable the first time it shows up for real: the alert name usually names the mismatched parameter directly.
 
 ## Pitfalls in the code
 

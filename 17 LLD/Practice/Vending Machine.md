@@ -8,13 +8,15 @@ related: ["[[Adapter]]", "[[Strategy and Template Method]]", "[[Concurrency for 
 sources:
   - "Go 1.21 release notes, context.WithoutCancel"
   - "PostgreSQL 17 docs, UPDATE (conditional update returning row count)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Vending Machine
 
 > [!summary] TL;DR
-> The vending machine is the textbook State-pattern round: insert, select and cancel behave differently in idle, has-money, dispensing, out-of-stock and out-of-service. The money rules matter as much as the pattern: coins wait in escrow until the item drops, change is found with a bounded search over the real coin counts (greedy fails with a finite coin box), and a jam refunds everything.
+> The vending machine is the textbook State-pattern round: insert, select and cancel behave differently in idle, has-money, dispensing, out-of-stock and out-of-service.
+> 
+> The money rules matter as much as the pattern: coins wait in escrow until the item drops, change is found with a bounded search over the real coin counts (greedy fails with a finite coin box), and a jam refunds everything.
 
 > [!abstract] Core idea
 > - The machine is in exactly one state (idle, has money, dispensing, out of stock, out of service), and each state decides what insert, select and cancel do.
@@ -22,6 +24,50 @@ updated: 2026-11-02
 > - The one rule: a failed sale never keeps the user's money; a jam or cancel refunds the whole escrow.
 > - Change comes from the real, finite coin counts, so it needs a bounded search, not greedy.
 > - Classic mistake: greedy change-making with a finite coin box, which refuses sales that are possible.
+
+## Start here: the basics
+
+**The problem in one story.** You put Rs 100 into a vending machine and pick a Rs 40 drink.
+The machine must give the drink and Rs 60 change, or, if it cannot, give all your money back.
+If the drink gets stuck, you must also get a full refund.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| State | The mode the machine is in right now | Idle, has money, dispensing |
+| State pattern | Each state is its own type that decides what actions do | `idleState.Select` refuses; `hasMoneyState.Select` sells |
+| Escrow | Money held aside until the sale finishes | Your Rs 100 waits, not yet in the box |
+| Coin box | The machine's own coins, used for change | {Rs 50 x1, Rs 20 x3} |
+| Greedy change | Always take the biggest coin first | Fails with a finite box |
+| Mutex | A lock so one action changes the machine at a time | Two buyers cannot both get the last can |
+| Jam | The motor fails and the item does not drop | Refund and go out of service |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> HasMoney: insert coin
+    HasMoney --> HasMoney: insert more
+    HasMoney --> Idle: cancel (refund)
+    HasMoney --> Dispensing: select (valid, change possible)
+    Dispensing --> Idle: item dropped
+    Dispensing --> OutOfService: jam (refund)
+```
+
+**Analogy.** It is like a shop counter clerk who holds your cash in hand until the item is on the counter, then puts it in the till.
+It breaks down because the clerk can improvise change, while the machine must compute it from the exact coins it holds.
+
+**How the rest of this note builds up**
+
+- First the problem statement and requirements (Steps 1-2): insert, select, cancel, change and restock.
+- Then entities, relationships and APIs (Steps 3-5): states, slots, coins and escrow.
+- Then storage and patterns (Steps 6-7): the State pattern and what a fleet backend stores.
+- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): bounded change-making, a real dispensing state with the lock released, and idempotent remote sales.
+
+> [!tip] Remember
+> Money stays in escrow until the item drops; any failure refunds it all.
 
 ## Problem statement
 
@@ -270,8 +316,20 @@ cmd/demo/main.go  -> builds slots and coin box, injects the real dispenser
 
 Two design points are worth saying out loud in the interview:
 
-1. **Change-making is a bounded search, not greedy.** Greedy (largest coin first) is optimal for INR only when every coin is unlimited. A real box is finite: price Rs 40, paid Rs 100, box {Rs 50 x1, Rs 20 x3}. Greedy takes the 50, needs 10 more, has no 10, and refuses the sale, although 3 x Rs 20 works. `makeChange` is a DP over coin counts: `best[v]` is the fewest coins for value `v` using the denominations seen so far, each used at most `box + escrow` times, and `take[i][v]` lets it rebuild the coins. Values are counted in units of the denominations' GCD (Rs 1 = 100 paise for INR), so change of Rs 60 needs a table of only 61 cells (0 to 60).
-2. **`dispensingState` is real.** `hasMoneyState.Select` only validates and reserves a `sale`, then switches to dispensing. `vend` releases the mutex while the motor turns and re-locks to commit or refund, so the display shows "dispensing" and other calls get `ErrBusy` instead of blocking for seconds. Every invariant holds at the unlock point: the money is still in escrow and stock is untouched. `context.WithoutCancel` (Go 1.21+) keeps a caller who hangs up from aborting a motor that is already turning.
+1. **Change-making is a bounded search, not greedy.** Greedy (largest coin first) is optimal for INR only when every coin is unlimited.
+
+   A real box is finite: price Rs 40, paid Rs 100, box {Rs 50 x1, Rs 20 x3}. Greedy takes the 50, needs 10 more, has no 10, and refuses the sale, although 3 x Rs 20 works.
+
+   `makeChange` is a DP over coin counts: `best[v]` is the fewest coins for value `v` using the denominations seen so far, each used at most `box + escrow` times, and `take[i][v]` lets it rebuild the coins.
+
+   Values are counted in units of the denominations' GCD (Rs 1 = 100 paise for INR), so change of Rs 60 needs a table of only 61 cells (0 to 60).
+2. **`dispensingState` is real.** `hasMoneyState.Select` only validates and reserves a `sale`, then switches to dispensing.
+
+   `vend` releases the mutex while the motor turns and re-locks to commit or refund, so the display shows "dispensing" and other calls get `ErrBusy` instead of blocking for seconds.
+
+   Every invariant holds at the unlock point: the money is still in escrow and stock is untouched.
+
+   `context.WithoutCancel` (Go 1.21+) keeps a caller who hangs up from aborting a motor that is already turning.
 
 ### Walkthrough
 
@@ -870,7 +928,9 @@ func TestConcurrentBuyExactWinners(t *testing.T) {
 
 ### Tradeoffs I chose
 
-- **Unlock during the dispense.** It keeps the display and the app responsive, at the cost of a lock that is released in the middle of `vend`; that is safe only because the dispensing state blocks every other money action. Holding the lock through the dispense is simpler and also correct (one physical customer at a time), but nobody can ever observe the dispensing state.
+- **Unlock during the dispense.** It keeps the display and the app responsive, at the cost of a lock that is released in the middle of `vend`; that is safe only because the dispensing state blocks every other money action.
+
+  Holding the lock through the dispense is simpler and also correct (one physical customer at a time), but nobody can ever observe the dispensing state.
 - **Escrow plus coin box instead of one balance number.** A little more code, but exact change and refunds become correct.
 - **DP instead of greedy.** O(denominations x value x count) with values in GCD units; for change up to Rs 500 that is tiny, and it never refuses change that exists.
 - **`Buy` reuses the State methods instead of a separate code path.** One set of rules serves the keypad and the app.
@@ -953,3 +1013,8 @@ I model the machine with the State pattern: a State interface with Insert, Selec
 - **Before this:** [[State Machines in Go]], [[Parking Lot]]
 - **Next:** [[Library Management]]
 - **Compare with:** [[Case Study - Payment System]] (idempotent payments at system scale), [[Concurrency for LLD]], [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [Design a Vending Machine / LLD  / State Design Patterns / OOPS  / Java](https://www.youtube.com/watch?v=8CcB3xAt9p4) · Riddhi Dutta · 26 min · 31,484 views
+- [Vending Machine - Low Level Design Interview Question / System Design Class 12](https://www.youtube.com/watch?v=qJOYokhfhCM) · Genie Ashwani · 18 min · 4,274 views

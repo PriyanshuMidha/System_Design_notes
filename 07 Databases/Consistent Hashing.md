@@ -11,7 +11,7 @@ sources:
   - "Mirrokni, Thorup & Zadimoghaddam, Consistent Hashing with Bounded Loads (Google, 2016)"
   - "Eisenbud et al., Maglev: A Fast and Reliable Software Network Load Balancer (NSDI 2016)"
   - "Redis Cluster specification (hash slots)"
-updated: 2026-11-01
+updated: 2026-11-13
 ---
 
 # Consistent Hashing
@@ -25,11 +25,55 @@ updated: 2026-11-01
 > - Virtual nodes (many points per server) even out the load and spread a failed server's keys across all the others.
 > - Classic mistake: thinking it fixes hot keys. One very popular key still lands on one server.
 
+## Start here: the basics
+
+**The problem in one story.**
+You have 4 cache servers and put each key on server `hash(key) % 4`.
+Traffic grows, so you add a fifth server and the rule becomes `% 5`.
+Suddenly about 80% of keys map to a different server, the caches are all empty, and the database gets hammered.
+Consistent hashing adds a server while moving only about one fifth of the keys.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Hash function | Turns any text into a big number that looks random | `hash("user:42")` = 2,914,003,117 |
+| Modulo (`%`) | The remainder after division | `17 % 4 = 1` |
+| Node | One server that stores part of the data | `cache-3` |
+| Key | The name you look data up by | `"user:42"` |
+| Ring | The range of hash numbers bent into a circle | 0 up to 2^32, then back to 0 |
+| Virtual node (vnode) | One of many points a single server owns on the ring | `cache-3#17` |
+| Hot key | One key that gets far more traffic than the rest | A celebrity's profile |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    K["key 'user:42'"] -->|"hash"| POS["point on the ring"]
+    POS -->|"walk clockwise"| N2["first server after it:<br/>cache-2"]
+    NEW["add cache-5<br/>between cache-1 and cache-2"] -.->|"takes only that arc"| N2
+```
+
+**Analogy.** Picture houses around a round lake, each served by the next post office clockwise. Opening a new post office only takes houses from its one neighbour; everyone else keeps their office.
+Where it breaks: one house that gets a million letters (a hot key) still overloads its single post office; moving offices does not help.
+
+**How the rest of this note builds up**
+
+- First, the modulo trap with real numbers (section 1) and the ring mental model (section 2).
+- Then how it works: the sorted array, binary-search lookup, adding and removing nodes, virtual nodes and replication (section 3).
+- Then a traced and measured growth from 4 to 5 nodes (section 4).
+- Finally the SDE-3 view: rendezvous and jump hash, bounded loads, Redis Cluster slots and membership changes in production (sections 5-8).
+
+> [!tip] Remember
+> Put servers and keys on one circle; each key goes to the next server clockwise, so a change moves only one arc.
+
 ## 1. Why it exists
 
 You have 4 cache servers and pick one per key with `server = hash(key) % 4`. Traffic grows, you add a 5th server, and the formula becomes `hash(key) % 5`.
 
-A key stays on its server only if `hash % 4 == hash % 5`, which holds for about 1 key in 5. **Measured on 100,000 keys: 80.0% of keys changed server.** For a cache, that means 80% misses at once and a stampede on the database. For a database, it means moving 80% of your data to add one machine.
+A key stays on its server only if `hash % 4 == hash % 5`, which holds for about 1 key in 5. **Measured on 100,000 keys: 80.0% of keys changed server.** For a cache, that means 80% misses at once and a stampede on the database.
+
+For a database, it means moving 80% of your data to add one machine.
 
 Consistent hashing makes the same change move only the new server's fair share: about 20%.
 
@@ -394,3 +438,7 @@ stateDiagram-v2
 - **Next:** [[Replication]], [[Quorums and Leaderless Replication]], [[Hot Keys and Hot Partitions]]
 - **Compare with:** [[Load Balancing]] (consistent hashing as a sticky load-balancing policy), [[Redis Replication, Sentinel and Cluster]] (hash slots instead of a ring)
 - **Code to read:** `github.com/golang/groupcache/consistenthash` (about 80 lines), `github.com/buraksezer/consistent` (bounded loads)
+
+### Watch on YouTube
+
+- [Consistent Hashing: Easy Explanation for System Design Interviews](https://www.youtube.com/watch?v=vccwdhfqIrI) · Hello Interview · clear visual intro aimed at interviews, matches TL;DR exactly

@@ -9,7 +9,7 @@ sources:
   - "redis.io docs, EVAL and Scripting (atomicity of Lua scripts)"
   - "redis.io docs, EXPIRE (the NX/XX/GT/LT flags, since Redis 7.0)"
   - "Measured: go test -race against miniredis v2.40.0 (go-redis v9.7.0), Go 1.24.4, 2026-11-07"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Redis in Go
@@ -23,9 +23,65 @@ updated: 2026-11-07
 > - A read-then-write against Redis (`INCR` then `EXPIRE`, or "check the lock token then delete it") is not atomic unless it runs as one Lua script. Two round trips leave a window where a crash, a retry, or another goroutine changes the answer.
 > - Classic mistake: letting a cache or a rate limiter make Redis a single point of failure for a request that would have worked fine without it.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your dashboard runs the same heavy database query hundreds of times a second.
+Most of those users want data that has not changed in the last second.
+Redis is a fast in-memory store you keep next to the database, so you can save that answer, count login attempts, or hold a lock.
+This note is about using it safely from Go.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Redis | An in-memory key-value server, very fast | `SET user:1 "Asha"` |
+| Key / value | A name and the data stored under it | `dash:ws42` → JSON summary |
+| TTL | Time-to-live: how long until a key deletes itself | `EXPIRE key 60` |
+| Cache | A quick copy of slow data | Dashboard summary saved for 30 s |
+| Connection pool | A set of reusable open connections | go-redis keeps 10 ready |
+| Atomic | Happens as one step, nothing can sneak in between | A Lua script running `INCR` + `EXPIRE` |
+| Lua script | A small program Redis runs as one atomic command | `EVAL "..." 1 key` |
+| `redis.Nil` | go-redis's signal that a key does not exist | Cache miss on `GET` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    H["Go handler"] --> C["Shared *redis.Client<br/>(pool)"]
+    C --> R{"Key in Redis?"}
+    R -- "yes" --> F["Return fast"]
+    R -- "redis.Nil" --> DB["Query Postgres"]
+    DB --> W["Save to Redis with TTL"]
+    W --> F
+```
+
+**Analogy.** A sticky note on your monitor with a phone number you look up often, instead of opening the phone book every time.
+Where it breaks: a sticky note never vanishes mid-sentence, but Redis can be slow or down, and your service must decide what to do then.
+
+**How the rest of this note builds up**
+
+- First, why a Go service needs Redis and the broken two-command rate limiter (section 1), then the mental model of atomicity (section 2).
+- Then how it works: one client, `redis.Nil`, Lua scripts, timeouts (section 3).
+- Then a worked example with cache-aside, an atomic counter and tests (section 4).
+- Finally the SDE-3 deep dive: variants, trade-offs, Redis as a single point of failure, and production failures (sections 5-8).
+
+> [!tip] Remember
+> One shared client, treat `redis.Nil` as a miss, and do read-then-write in one Lua script.
+
 ## 1. Why it exists
 
-InvoiceOps's dashboard handler does one `SELECT` across workspaces, clients and invoices to build a summary. Illustrative numbers for a workspace with 50,000 invoices: **p50 around 40 ms, p99 around 180 ms** (assumed for the story, not measured; measure your own). At 200 requests/second from a handful of busy workspaces refreshing their dashboard every few seconds, that is 200 of those queries per second landing on the primary, most of them asking for data that changed a second ago. The question this note answers is not "should InvoiceOps cache this" — [[Caching Patterns]] already covers cache-aside — but **how a Go service wires a Redis dependency so that caching, rate limiting and locking survive contact with concurrency and failure**: who owns the client, what happens when two goroutines race the same key, and what happens to the request when Redis itself is slow or down.
+InvoiceOps's dashboard handler does one `SELECT` across workspaces, clients and invoices to build a summary.
+
+Illustrative numbers for a workspace with 50,000 invoices: **p50 around 40 ms, p99 around 180 ms** (assumed for the story, not measured; measure your own).
+
+At 200 requests/second from a handful of busy workspaces refreshing their dashboard every few seconds, that is 200 of those queries per second landing on the primary, most of them asking for data that changed a second ago.
+
+The question this note answers is not "should InvoiceOps cache this" — [[Caching Patterns]] already covers cache-aside — but **how a Go service wires a Redis dependency so that caching, rate limiting and locking survive contact with concurrency and failure**:
+
+- who owns the client,
+- what happens when two goroutines race the same key,
+- and what happens to the request when Redis itself is slow or down.
 
 A second, sharper problem: InvoiceOps's login endpoint needs a rate limit. The obvious first draft is:
 
@@ -35,11 +91,21 @@ if n == 1: EXPIRE(rate:login:{ip}, 60)
 if n > 5: reject
 ```
 
-The first request from an IP runs `INCR` and gets `n == 1`. Now picture a crash, a timeout or a dropped connection *between* that `INCR` and the `EXPIRE`. The key now has a count but no TTL: it never expires, and once the count passes 5 that IP is rate-limited forever. This is not a hypothetical; it is the default behavior of two separate commands against a service that has no idea they were meant to be one unit.
+The first request from an IP runs `INCR` and gets `n == 1`. Now picture a crash, a timeout or a dropped connection *between* that `INCR` and the `EXPIRE`.
+
+The key now has a count but no TTL: it never expires, and once the count passes 5 that IP is rate-limited forever. This is not a hypothetical; it is the default behavior of two separate commands against a service that has no idea they were meant to be one unit.
 
 ## 2. Mental model
 
-Treat Redis exactly like Postgres: a remote dependency with a connection pool, a context on every call, and a failure mode the service must have an opinion about. The difference that matters for Go code is **atomicity across two commands**. Postgres gives you `BEGIN; ...; COMMIT`. Redis gives you three ways to get the same guarantee for a handful of commands: `MULTI`/`EXEC` (queues commands, but can't branch on a value it just read), `WATCH` (optimistic, retries under contention), or a **Lua script** (the one Redis command that runs several steps with no other client's command in between). For anything that reads a value and then decides what to write based on it — a rate limiter, a lock release — the script is the standard answer.
+Treat Redis exactly like Postgres: a remote dependency with a connection pool, a context on every call, and a failure mode the service must have an opinion about.
+
+The difference that matters for Go code is **atomicity across two commands**. Postgres gives you `BEGIN; ...; COMMIT`. Redis gives you three ways to get the same guarantee for a handful of commands:
+
+- `MULTI`/`EXEC` (queues commands, but can't branch on a value it just read),
+- `WATCH` (optimistic, retries under contention),
+- or a **Lua script** (the one Redis command that runs several steps with no other client's command in between).
+
+For anything that reads a value and then decides what to write based on it — a rate limiter, a lock release — the script is the standard answer.
 
 ```mermaid
 flowchart LR
@@ -110,7 +176,9 @@ sequenceDiagram
     R-->>A: count (INCR + conditional EXPIRE already done)
 ```
 
-The algorithms themselves — fixed window vs sliding window vs token bucket/GCRA, and the distributed design questions (which key, which failure mode) — are [[Rate Limiting - Algorithms and Distributed Design]]'s canonical home, including a token-bucket Lua script and an HTTP middleware. This note's script is the simpler fixed-window form, shown for the atomicity lesson above; wire whichever algorithm the limiter needs the same way.
+The algorithms themselves — fixed window vs sliding window vs token bucket/GCRA, and the distributed design questions (which key, which failure mode) — are [[Rate Limiting - Algorithms and Distributed Design]]'s canonical home, including a token-bucket Lua script and an HTTP middleware.
+
+This note's script is the simpler fixed-window form, shown for the atomicity lesson above; wire whichever algorithm the limiter needs the same way.
 
 ### Lock caveats
 
@@ -134,7 +202,13 @@ Each of these has a full treatment in the linked note. Here is the Go-specific o
 
 ### What this note does not re-derive
 
-The full queue, pipelining and Cluster treatments already have a canonical home: queue semantics in [[Redis as a Queue - Lists, Streams and Pub-Sub]] (patterns) and [[Background Workers and Job Queues]] (the Go worker side); the full distributed-lock code and the Redlock debate in [[Redis Use Cases]]; cache stampede protection in [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]. Link to them instead of re-explaining them.
+The full queue, pipelining and Cluster treatments already have a canonical home:
+
+- queue semantics in [[Redis as a Queue - Lists, Streams and Pub-Sub]] (patterns) and [[Background Workers and Job Queues]] (the Go worker side);
+- the full distributed-lock code and the Redlock debate in [[Redis Use Cases]];
+- cache stampede protection in [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+
+Link to them instead of re-explaining them.
 
 ## 4. Worked example
 
@@ -621,3 +695,8 @@ func TestFixedWindowLimiter_CountersExpireWithTheWindow(t *testing.T) {
 - **Before this:** [[Redis Hands-on Setup with Go]], [[Caching Patterns]]
 - **Next:** [[Background Workers and Job Queues]], [[Rate Limiting - Algorithms and Distributed Design]]
 - **Compare with:** [[Redis Use Cases]] (the patterns this note's code wires into a service), [[Distributed Locks and Fencing Tokens]] (the full lock story), [[Database Access (database-sql, pgx, sqlc)]] (the same client-as-shared-dependency shape for Postgres)
+
+### Watch on YouTube
+
+- [Beginner's Guide to Redis with Go!](https://www.youtube.com/watch?v=1C3Ym_JjkMw) · TutorialEdge · intro to connecting and using go-redis client
+- [Building a REST API in Go – Part 7: Redis for Caching](https://www.youtube.com/watch?v=CnamhxiYtGo) · DrSimple · wiring a shared redis client into a real Go service for caching

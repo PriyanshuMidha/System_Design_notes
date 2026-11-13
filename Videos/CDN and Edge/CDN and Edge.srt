@@ -1,0 +1,479 @@
+1
+00:00:00,350 --> 00:00:02,222
+Quick question.
+
+2
+00:00:02,382 --> 00:00:06,409
+Your server is in Virginia. Your shopper is in Mumbai. How long
+
+3
+00:00:06,409 --> 00:00:09,030
+does one product photo take to reach her?
+
+4
+00:00:09,190 --> 00:00:11,062
+Longer than you think.
+
+5
+00:00:11,222 --> 00:00:13,646
+So let's fix that, with a CDN.
+
+6
+00:00:15,556 --> 00:00:17,428
+Here is the problem.
+
+7
+00:00:17,588 --> 00:00:22,063
+A message between Mumbai and Virginia takes somewhere between a hundred eighty
+
+8
+00:00:22,063 --> 00:00:24,644
+and two hundred fifty milliseconds, each way.
+
+9
+00:00:24,804 --> 00:00:28,183
+Add the TCP and TLS handshakes, and the first byte of a
+
+10
+00:00:28,183 --> 00:00:30,948
+cold connection can take four to six hundred.
+
+11
+00:00:31,108 --> 00:00:34,726
+And your one server has to hold every connection, and send every
+
+12
+00:00:34,726 --> 00:00:35,404
+byte itself.
+
+13
+00:00:36,014 --> 00:00:39,326
+That is too slow, and too much work for one machine!
+
+14
+00:00:40,436 --> 00:00:44,060
+So here is the idea. Think of a chain of warehouses.
+
+15
+00:00:44,220 --> 00:00:48,420
+The factory is your origin server. Do not ship everything from there.
+
+16
+00:00:48,580 --> 00:00:52,708
+Put a regional warehouse in the middle. That is the origin shield.
+
+17
+00:00:52,868 --> 00:00:56,045
+And a local one right in Mumbai. That is a pop, a
+
+18
+00:00:56,045 --> 00:00:57,212
+point of presence.
+
+19
+00:00:57,372 --> 00:01:00,036
+Now the shopper orders from the local shelf.
+
+20
+00:01:00,196 --> 00:01:03,652
+The factory only ships when every warehouse is empty.
+
+21
+00:01:04,762 --> 00:01:07,402
+Four words, and you can follow everything else.
+
+22
+00:01:07,562 --> 00:01:11,570
+A hit: the pop has a fresh copy, and answers instantly.
+
+23
+00:01:11,730 --> 00:01:15,522
+A miss: no copy, so it asks the next warehouse up.
+
+24
+00:01:15,682 --> 00:01:20,193
+TTL: how long a copy counts as fresh. Max age equals thirty
+
+25
+00:01:20,193 --> 00:01:22,258
+six hundred means one hour.
+
+26
+00:01:22,418 --> 00:01:26,426
+And a pop is simply one CDN data center, in one city.
+
+27
+00:01:27,536 --> 00:01:30,872
+How does she reach the nearest pop? There are two ways.
+
+28
+00:01:31,032 --> 00:01:35,943
+Anycast. Every pop announces the same IP address, and internet routing simply
+
+29
+00:01:35,943 --> 00:01:40,152
+sends her to the closest one. Cloudflare and Fastly work this way.
+
+30
+00:01:40,312 --> 00:01:44,871
+GeoDNS. The CDN's name servers hand out a different IP address for
+
+31
+00:01:44,871 --> 00:01:49,983
+each region, based on where the resolver is. CloudFront and classic Akamai
+
+32
+00:01:49,983 --> 00:01:51,088
+setups use this.
+
+33
+00:01:52,198 --> 00:01:54,454
+Now she asks for the product photo.
+
+34
+00:01:54,614 --> 00:01:58,622
+If the copy is fresh, that is a hit. Served in milliseconds.
+
+35
+00:01:58,782 --> 00:02:01,825
+If it is stale but has an ETag, the pop asks the
+
+36
+00:02:01,825 --> 00:02:04,614
+origin one cheap question: has this changed?
+
+37
+00:02:04,774 --> 00:02:08,278
+A three oh four reply means no. Reuse what you have.
+
+38
+00:02:08,438 --> 00:02:11,525
+And if there is no copy at all? That is a miss.
+
+39
+00:02:11,525 --> 00:02:13,430
+Fetch it, store it, serve it.
+
+40
+00:02:14,540 --> 00:02:18,092
+Let us look at real headers from MDN, served by Fastly.
+
+41
+00:02:18,252 --> 00:02:21,372
+Cache control says: keep this for an hour.
+
+42
+00:02:21,532 --> 00:02:25,060
+Now look at age. Two thousand two hundred five.
+
+43
+00:02:25,220 --> 00:02:28,855
+That response had been sitting in a cache for over half an
+
+44
+00:02:28,855 --> 00:02:31,676
+hour. The origin never even saw this request!
+
+45
+00:02:31,836 --> 00:02:35,659
+And x cache lists one result per tier it passed through: miss,
+
+46
+00:02:35,659 --> 00:02:36,276
+hit, miss.
+
+47
+00:02:37,386 --> 00:02:39,834
+Headers decide what a CDN may keep.
+
+48
+00:02:39,994 --> 00:02:43,930
+Max age: fresh for this many seconds, in every cache.
+
+49
+00:02:44,090 --> 00:02:48,284
+S max age: the same, but for shared caches only, like the
+
+50
+00:02:48,284 --> 00:02:48,578
+CDN.
+
+51
+00:02:48,738 --> 00:02:52,453
+No cache. It sounds like don't cache, but it is not! It
+
+52
+00:02:52,453 --> 00:02:56,370
+means: cache it, but check with the origin before serving.
+
+53
+00:02:56,530 --> 00:02:58,666
+No store is the real never store.
+
+54
+00:02:58,826 --> 00:03:02,258
+And private means only the user's own browser may keep it.
+
+55
+00:03:03,368 --> 00:03:05,240
+Next, the cache key.
+
+56
+00:03:05,400 --> 00:03:09,439
+By default it is the scheme, host, path and query string. Same
+
+57
+00:03:09,439 --> 00:03:10,416
+key, same copy.
+
+58
+00:03:10,576 --> 00:03:14,917
+Varying on Accept Encoding is fine. Gzip and brotli just get their
+
+59
+00:03:14,917 --> 00:03:15,640
+own copies.
+
+60
+00:03:15,800 --> 00:03:19,948
+But vary on Cookie? Almost every request has a different cookie, so
+
+61
+00:03:19,948 --> 00:03:24,344
+almost every request becomes its own key, and your hit ratio collapses.
+
+62
+00:03:24,504 --> 00:03:28,442
+And strip tracking parameters like u t m source, or one page
+
+63
+00:03:28,442 --> 00:03:29,952
+turns into many misses.
+
+64
+00:03:31,062 --> 00:03:34,470
+Picture a popular photo whose copy has just expired.
+
+65
+00:03:34,630 --> 00:03:39,211
+A hundred requests arrive within five milliseconds, from pops all over. Every
+
+66
+00:03:39,211 --> 00:03:41,590
+one of them misses, at the same instant.
+
+67
+00:03:42,200 --> 00:03:46,599
+Without protection, all hundred go to your origin. That is a stampede,
+
+68
+00:03:46,599 --> 00:03:48,296
+and you caused it yourself.
+
+69
+00:03:48,456 --> 00:03:53,594
+Request collapsing fixes it. The first request goes. The others wait for
+
+70
+00:03:53,594 --> 00:03:53,808
+it.
+
+71
+00:03:53,968 --> 00:03:56,632
+The origin shield does the same, one tier up.
+
+72
+00:03:56,792 --> 00:04:00,800
+A hundred requests. Exactly one origin request.
+
+73
+00:04:01,910 --> 00:04:04,022
+How do you get rid of an old copy?
+
+74
+00:04:04,182 --> 00:04:08,928
+The best answer is: do not purge at all. Use versioned URLs.
+
+75
+00:04:08,928 --> 00:04:12,725
+A new deploy means a new URL, and the old one is
+
+76
+00:04:12,725 --> 00:04:14,070
+simply abandoned.
+
+77
+00:04:14,230 --> 00:04:17,806
+Tag purge removes only the pages tagged with one object.
+
+78
+00:04:17,966 --> 00:04:21,888
+Soft purge marks copies stale, but keeps serving them while a fresh
+
+79
+00:04:21,888 --> 00:04:22,766
+one is fetched.
+
+80
+00:04:22,926 --> 00:04:27,478
+And purge everything? Instant, but every pop hits your origin at once.
+
+81
+00:04:27,478 --> 00:04:30,534
+That is how a routine deploy becomes an outage.
+
+82
+00:04:31,644 --> 00:04:33,804
+Now, what must never be cached?
+
+83
+00:04:33,964 --> 00:04:38,884
+Anything with Set Cookie. Mark authenticated responses private or no store.
+
+84
+00:04:39,044 --> 00:04:43,388
+For paid downloads or video, use signed URLs, checked at the edge.
+
+85
+00:04:43,548 --> 00:04:48,182
+Then two attacks to know. Cache poisoning: an unkeyed header lets one
+
+86
+00:04:48,182 --> 00:04:50,532
+attacker response reach every user.
+
+87
+00:04:50,692 --> 00:04:55,660
+Cache deception: add slash nonexistent dot CSS to a private page, and
+
+88
+00:04:55,660 --> 00:04:57,172
+the CDN may cache it.
+
+89
+00:04:57,332 --> 00:05:01,642
+The fix for both: the cache key must include everything the response
+
+90
+00:05:01,642 --> 00:05:02,276
+varies on.
+
+91
+00:05:03,386 --> 00:05:07,901
+Not everything can be cached. Checkout, or a logged in dashboard, must
+
+92
+00:05:07,901 --> 00:05:10,610
+reach the origin. But the CDN still helps.
+
+93
+00:05:10,770 --> 00:05:14,790
+TLS and TCP end at the nearby pop, so the slow handshakes
+
+94
+00:05:14,790 --> 00:05:16,482
+happen over a short hop.
+
+95
+00:05:16,642 --> 00:05:20,986
+The pop keeps warm connections open to your origin, and reuses them.
+
+96
+00:05:21,146 --> 00:05:25,551
+HTTP 3 avoids head of line blocking, and survives a switch from
+
+97
+00:05:25,551 --> 00:05:26,810
+Wi-Fi to cellular.
+
+98
+00:05:26,970 --> 00:05:31,050
+Some providers even carry the long leg over their own private backbone.
+
+99
+00:05:32,160 --> 00:05:35,544
+Then there is edge compute: your own code, running at the pop.
+
+100
+00:05:35,704 --> 00:05:39,088
+A request first passes the WAF and bot checks.
+
+101
+00:05:39,248 --> 00:05:41,120
+Then the cache.
+
+102
+00:05:41,280 --> 00:05:43,416
+And if needed, your edge function.
+
+103
+00:05:43,576 --> 00:05:48,306
+Good jobs for the edge: a JWT signature and expiry check, A
+
+104
+00:05:48,306 --> 00:05:51,352
+B buckets, redirects, header rewrites.
+
+105
+00:05:51,512 --> 00:05:55,563
+But the real authorization decision stays at the origin, because the edge
+
+106
+00:05:55,563 --> 00:05:58,448
+only has an eventually consistent view of the world.
+
+107
+00:05:59,558 --> 00:06:02,630
+So, is a CDN always the answer? No.
+
+108
+00:06:02,790 --> 00:06:05,929
+It adds a layer that can fail, or serve stale data. And
+
+109
+00:06:05,929 --> 00:06:09,126
+a bug in Brazil means checking a pop you do not control.
+
+110
+00:06:09,286 --> 00:06:12,286
+It fixes aggregate traffic, not one hot key.
+
+111
+00:06:12,446 --> 00:06:15,806
+Highly personalized responses get little from caching.
+
+112
+00:06:15,966 --> 00:06:19,575
+And for an internal service with no spread out users, a plain
+
+113
+00:06:19,575 --> 00:06:21,054
+load balancer is simpler.
+
+114
+00:06:22,164 --> 00:06:24,036
+Let us recap.
+
+115
+00:06:24,196 --> 00:06:27,628
+A CDN keeps copies in pops close to your users.
+
+116
+00:06:27,788 --> 00:06:29,660
+Headers say what it may keep.
+
+117
+00:06:29,820 --> 00:06:31,908
+The cache key says what is shared.
+
+118
+00:06:32,068 --> 00:06:34,852
+Collapsing turns a hundred misses into one.
+
+119
+00:06:35,012 --> 00:06:39,428
+Prefer versioned URLs over purges, and never cache private data.
+
+120
+00:06:39,588 --> 00:06:43,476
+Cheap checks at the edge. Real decisions at the origin.

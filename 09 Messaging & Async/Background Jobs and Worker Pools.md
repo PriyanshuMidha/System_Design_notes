@@ -11,13 +11,15 @@ sources:
   - "hibiken/asynq README: retries, scheduled tasks, unique tasks"
   - "KEDA docs: scalers for AWS SQS, Redis Streams, PostgreSQL, Kafka"
   - "RFC 9110, 15.3.3 202 Accepted"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Background Jobs and Worker Pools
 
 > [!summary] TL;DR
-> A **background job** is work the user should not wait for (an email, a PDF, a webhook) that the API records in a durable queue and returns at once. A **worker pool** is a fixed set of processes or goroutines that take jobs from that queue, run them, and mark them done, retrying or giving up when they fail.
+> A **background job** is work the user should not wait for (an email, a PDF, a webhook) that the API records in a durable queue and returns at once.
+>
+> A **worker pool** is a fixed set of processes or goroutines that take jobs from that queue, run them, and mark them done, retrying or giving up when they fail.
 
 > [!abstract] Core idea
 > - The request path only *enqueues* and returns `202 Accepted` with a job id; workers do the slow part.
@@ -25,6 +27,53 @@ updated: 2026-11-04
 > - Delivery is at least once: a job can run twice, so handlers must be idempotent.
 > - Retries use backoff and a maximum; permanent failures go to a dead-letter state for a human.
 > - Size the pool by what the job waits on, cap concurrency per downstream, and drain gracefully on shutdown.
+
+## Start here: the basics
+
+**The problem in one story.**
+You click "Download invoice" and the server must build a PDF, which takes a few seconds.
+If the server does it while you wait, your page hangs, and many clicks at once can overload it.
+Instead the server writes a note "make PDF for invoice 7" and answers "working on it" straight away.
+A separate helper program picks up the note, builds the PDF, and marks it done.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Job | One piece of work to do later | "Send welcome email to user 9" |
+| Queue | A stored list of jobs waiting to run | A `jobs` table in Postgres |
+| Worker | A program (or goroutine) that runs jobs | 8 goroutines reading the queue |
+| Worker pool | A fixed number of workers sharing the queue | Pool of size 8 |
+| Lease | A time-limited claim on a job, not a delete | Hidden for 30 s while running |
+| Retry with backoff | Try again later, waiting longer each time | 1 s, 2 s, 4 s, ... |
+| Idempotent | Running it twice has the same effect as once | Upsert, not insert |
+| 202 Accepted | HTTP reply meaning "got it, will do later" | Returned with a job id |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User request"] --> API["API: save job,<br/>reply 202"]
+    API --> Q[("Durable queue")]
+    Q --> W1["Worker 1"]
+    Q --> W2["Worker 2"]
+    W1 --> D{"Success?"}
+    D -- "yes" --> Done["Mark done"]
+    D -- "no" --> R["Retry later<br/>or dead-letter"]
+```
+
+**Analogy.** A restaurant: the waiter writes the order on a ticket and goes back to tables; cooks take tickets from the rail and cook.
+Where it breaks: a real cook never cooks the same ticket twice, but a worker that dies mid-job can make another worker run it again.
+
+**How the rest of this note builds up**
+
+- First, why jobs move off the request path (section 1) and the kitchen mental model (section 2).
+- Then the job life cycle: enqueue, claim with `SKIP LOCKED` or a lease, retry, dead-letter (section 3).
+- Then a full Go worker pool with tests (section 4), and queue backends compared (section 5).
+- Finally the SDE-3 deep dive: lease length, leases vs locks, Postgres queues at scale, sizing and shutdown (sections 6-8).
+
+> [!tip] Remember
+> Save the job, reply fast, let a bounded pool of idempotent workers do the slow part and retry safely.
 
 ## 1. Why it exists
 
@@ -40,7 +89,11 @@ Typical work that leaves the request path: transactional emails and SMS, PDF and
 
 ## 2. Mental model
 
-A restaurant kitchen. The waiter (API) writes the order on a ticket, spikes it on the rail (queue), and goes back to the floor. Cooks (workers) take tickets. A cook who takes a ticket holds it (lease). If the cook walks out, the ticket goes back on the rail after a while (lease expiry). A dish that keeps failing is put aside for the chef to look at (dead letter), not retried forever. The number of cooks is set by the number of stoves (downstream capacity), not by the number of tickets.
+A restaurant kitchen. The waiter (API) writes the order on a ticket, spikes it on the rail (queue), and goes back to the floor. Cooks (workers) take tickets. A cook who takes a ticket holds it (lease).
+
+If the cook walks out, the ticket goes back on the rail after a while (lease expiry). A dish that keeps failing is put aside for the chef to look at (dead letter), not retried forever.
+
+The number of cooks is set by the number of stoves (downstream capacity), not by the number of tickets.
 
 ## 3. How it works
 
@@ -145,7 +198,9 @@ Representative output (PostgreSQL 17), one worker's claim:
 UPDATE 1
 ```
 
-A second worker running the same statement at the same moment skips row 90412 and gets the next one. The claim commits immediately; the job runs **outside** that transaction, so no row lock is held for the job's duration. Completion is a separate `UPDATE ... WHERE id = $1 AND attempts = $2`, and the `attempts` check stops a worker whose lease expired from overwriting the new owner's result. Go code that wires this up with pgx, River and graceful shutdown lives in [[Background Workers and Job Queues]].
+A second worker running the same statement at the same moment skips row 90412 and gets the next one. The claim commits immediately; the job runs **outside** that transaction, so no row lock is held for the job's duration. Completion is a separate `UPDATE ...
+
+WHERE id = $1 AND attempts = $2`, and the `attempts` check stops a worker whose lease expired from overwriting the new owner's result. Go code that wires this up with pgx, River and graceful shutdown lives in [[Background Workers and Job Queues]].
 
 ## 4. Worked example
 
@@ -645,7 +700,9 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 ## 9. Interview questions
 
 > [!question]- Walk through what happens when a worker crashes halfway through a job.
-> The job is in `running` with a lease (or SQS visibility timeout). Nobody acks it. When the lease expires, another worker's claim picks it up as the next attempt. If the first worker had already sent the email, it is sent again unless the handler is idempotent. If it reappears too often, max attempts moves it to dead.
+> The job is in `running` with a lease (or SQS visibility timeout). Nobody acks it. When the lease expires, another worker's claim picks it up as the next attempt.
+>
+> If the first worker had already sent the email, it is sent again unless the handler is idempotent. If it reappears too often, max attempts moves it to dead.
 
 > [!question]- How do you make sure a job is enqueued if and only if the order is saved?
 > Put the job in the same transaction: a jobs table in the same Postgres database (River does this), or an outbox row that a relay publishes to SQS or Kafka. "Commit, then enqueue" loses the job if the process dies between the two; "enqueue, then commit" runs jobs for orders that rolled back.
@@ -681,3 +738,8 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 - **Before this:** [[Queues vs Streams and Broker Comparison]], [[Event-Driven Architecture Basics]]
 - **Next:** [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Dead Letter Queues and Poison Messages]], [[Scheduled Jobs - Cron to Durable Schedulers]]
 - **Compare with:** [[Background Workers and Job Queues]] (Go implementation), [[Workflow Engines and Durable Execution]], [[AWS SQS, SNS and EventBridge]]
+
+### Watch on YouTube
+
+- [14. Task queues and background jobs](https://www.youtube.com/watch?v=r-nQsyguU1Y) · Sriniously · 55 min · 46,306 views
+- [System Design: Background Job-Processing Workers!](https://www.youtube.com/watch?v=Hvm2hOFb6gM) · KodeKloud · 3 min · 5,728 views

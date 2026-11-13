@@ -14,7 +14,7 @@ sources:
   - "Go Protobuf: The new Opaque API (go.dev/blog/protobuf-opaque, December 2024)"
   - "google.golang.org/protobuf v1.36.10 source: encoding/protowire, proto/encode.go"
   - "Google AIP-134, Standard methods: Update (FieldMask update_mask)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Protocol Buffers and Schema Evolution
@@ -28,6 +28,50 @@ updated: 2026-11-02
 > - Rule: add fields with new numbers, never reuse a number, and `reserved` the numbers and names you delete.
 > - Classic mistake: changing a field's type or reusing a deleted number, so old readers silently decode garbage.
 
+## Start here: the basics
+
+**The problem in one story.**
+A billing service sends an "invoice paid" message to six other services.
+Billing adds a new field on Monday, but one reader will not update its code until Friday.
+For those four days the old reader must still understand the new message, without crashing or misreading it.
+Protocol Buffers is a message format designed so that changes like this are safe, small and fast.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Serialization | Turning an in-memory object into bytes to send or store | A Go struct becomes 10 bytes |
+| Binary vs text format | Compact bytes for machines vs readable text for humans | Protobuf vs JSON |
+| Schema | A file that declares the shape of a message | `message Invoice { string id = 1; }` |
+| Field number | The permanent number that identifies a field on the wire | `id = 1`, `total_cents = 2` |
+| Producer / consumer | The service that writes a message / the one that reads it | Billing writes, ledger reads |
+| Backward / forward compatible | New code reads old data / old code reads new data | The ledger reads Monday's new field safely |
+| Code generation | A tool turns the schema into typed code | `protoc` writes `invoice.pb.go` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P[".proto schema"] --> G["Code generator<br/>(protoc / buf)"]
+    G --> W["Writer code<br/>(billing)"]
+    G --> R["Reader code<br/>(ledger)"]
+    W -- "bytes: field number + value" --> R
+    R --> U["Unknown numbers:<br/>skipped and kept"]
+```
+
+**Analogy.** A paper form with numbered boxes: the reader looks up box 1 and box 2 and ignores boxes it has never heard of.
+Where it breaks: on paper you can see the label next to each box; on the wire only the number travels, so reusing a number for a different meaning silently corrupts data.
+
+**How the rest of this note builds up**
+
+- First, why protobuf exists (section 1) and the numbered-boxes mental model (section 2).
+- Then the wire format, field presence and the safe and unsafe schema changes (section 3).
+- Then a measured Go example, trade-offs against JSON, and production practice such as `buf breaking` in CI.
+- Finally, the SDE-3 deep dive on `oneof` moves, enums, Editions and compatibility edge cases.
+
+> [!tip] Remember
+> Field numbers are forever: add new numbers, never reuse old ones, and `reserved` what you delete.
+
 ## 1. Why it exists
 
 An `InvoicePaid` event is written by the billing service and read by six consumers (email, ledger, analytics and others) that deploy on their own schedules. Billing adds a `currency` field on Monday; the ledger consumer will not redeploy until Friday.
@@ -35,7 +79,9 @@ An `InvoicePaid` event is written by the billing service and read by six consume
 - With **JSON**, every message repeats every field name, and compatibility depends on each consumer's parser being lenient. Nothing checks a change before it ships.
 - With **protobuf**, the ledger's old code reads the new message, skips the field number it does not know, and keeps its bytes. The change was safe by construction, and `buf breaking` in CI checks it before merge.
 
-Size matters too. **Measured** in section 4: `Invoice{id: "inv_1", total_cents: 1500}` is **10 bytes** in protobuf and **34 bytes** as protobuf's own JSON mapping. In the section 4 benchmark (Go, one small message), binary parsing was about 8 times faster than protojson parsing.
+Size matters too. **Measured** in section 4: `Invoice{id: "inv_1", total_cents: 1500}` is **10 bytes** in protobuf and **34 bytes** as protobuf's own JSON mapping.
+
+In the section 4 benchmark (Go, one small message), binary parsing was about 8 times faster than protojson parsing.
 
 ## 2. Mental model
 
@@ -451,7 +497,11 @@ The rules, each with its reason:
 
 **`oneof` and `optional`:**
 
-- Moving **one** existing field with explicit presence (an `optional` field or a message field) into a **new** `oneof` is wire-safe. A plain proto3 scalar changes meaning when moved, because inside a `oneof` its zero value is sent and detectable. Moving several fields is safe only if no writer ever sets more than one of them. Moving a field into an **existing** `oneof` is not safe. In Go, any of these moves changes the generated API.
+- Moving **one** existing field with explicit presence (an `optional` field or a message field) into a **new** `oneof` is wire-safe.
+	- A plain proto3 scalar changes meaning when moved, because inside a `oneof` its zero value is sent and detectable.
+	- Moving several fields is safe only if no writer ever sets more than one of them.
+	- Moving a field into an **existing** `oneof` is not safe.
+	- In Go, any of these moves changes the generated API.
 - Adding a field to a `oneof` is wire-safe, but old readers see the new member as an unknown field, so the oneof looks unset to them.
 - Adding or removing `optional` keeps the wire format but changes generated code, which makes it a source-breaking change.
 
@@ -483,7 +533,21 @@ Use `FILE` or `PACKAGE` for code shared through generated libraries. Use `WIRE_J
 
 ### Editions
 
-Protobuf **Editions** replace `syntax = "proto2"` and `syntax = "proto3"` with `edition = "2023";` (and later `"2024"`). Instead of two syntaxes, each behaviour is a **feature** with a default per edition, which you can override per file, message or field. In Edition 2023, `field_presence` defaults to `EXPLICIT` (like proto2), `enum_type` to `OPEN`, and `repeated_field_encoding` to `PACKED`. To keep proto3 behaviour for a field, set `features.field_presence = IMPLICIT`. Moving a file to an edition keeps its encoding unchanged only if features restore the old behaviour: a proto3 file needs `option features.field_presence = IMPLICIT;` at file level, or zero values that were never sent start being sent and presence semantics change. Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new edition.
+Protobuf **Editions** replace `syntax = "proto2"` and `syntax = "proto3"` with `edition = "2023";` (and later `"2024"`).
+
+Instead of two syntaxes, each behaviour is a **feature** with a default per edition, which you can override per file, message or field.
+
+In Edition 2023:
+
+- `field_presence` defaults to `EXPLICIT` (like proto2).
+- `enum_type` defaults to `OPEN`.
+- `repeated_field_encoding` defaults to `PACKED`.
+
+To keep proto3 behaviour for a field, set `features.field_presence = IMPLICIT`.
+
+Moving a file to an edition keeps its encoding unchanged only if features restore the old behaviour: a proto3 file needs `option features.field_presence = IMPLICIT;` at file level, or zero values that were never sent start being sent and presence semantics change.
+
+Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new edition.
 
 ### What to monitor
 
@@ -543,3 +607,8 @@ Protobuf **Editions** replace `syntax = "proto2"` and `syntax = "proto3"` with `
 - **Before this:** [[gRPC]], [[Number Representation and Text Encoding]]
 - **Next:** [[gRPC Services in Go]], [[Event Schemas and Schema Registry]], [[API Versioning and Backward Compatibility]]
 - **Compare with:** [[API Contract Design and OpenAPI]] (JSON contracts), [[Event Schemas and Schema Registry]] (Avro and registries)
+
+### Watch on YouTube
+
+- [Protocol Buffers Crash Course](https://www.youtube.com/watch?v=46O73On0gyI) · Hussein Nasser · reputable deep-dive crash course on protobuf internals and wire format
+- [The Need for Protocol Buffers](https://www.youtube.com/watch?v=BywIOD_Y3CE) · Stephane Maarek · short intro on why protobuf exists versus JSON/XML

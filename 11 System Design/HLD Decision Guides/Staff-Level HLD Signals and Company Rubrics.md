@@ -11,19 +11,64 @@ sources:
   - "Google SRE Book, ch. 3 Embracing Risk and ch. 6 Monitoring Distributed Systems"
   - "Meta, Google, Amazon and Uber public careers pages and recruiter-shared preparation guides: used only for the general shape of rounds. Formats change; confirm with your recruiter."
   - "Candidate-reported experiences on public forums: treated as anecdotal and used only for broad patterns, never for specific internal rubrics"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Staff-Level HLD Signals and Company Rubrics
 
 > [!summary] TL;DR
-> The same design question is scored differently at different levels. An **SDE-2** is judged on producing a sound, working design. An **SDE-3** is judged on choosing well between options, quantifying, and finding failures. A **Staff** candidate is also judged on **driving the conversation**, resolving ambiguity, planning how v1 evolves to v2, migration without downtime, and thinking about people, cost and risk. Company formats differ in flavor, but the public advice agrees on the core signals. Company rubrics are not published, so this note describes only what is publicly known, conservatively.
+> The same design question is scored differently at different levels. An **SDE-2** is judged on producing a sound, working design. An **SDE-3** is judged on choosing well between options, quantifying, and finding failures.
+>
+> A **Staff** candidate is also judged on **driving the conversation**, resolving ambiguity, planning how v1 evolves to v2, migration without downtime, and thinking about people, cost and risk.
+>
+> Company formats differ in flavor, but the public advice agrees on the core signals. Company rubrics are not published, so this note describes only what is publicly known, conservatively.
 
 > [!abstract] Core idea
 > - Levels differ by **scope of ambiguity you can handle** and **depth of trade-off reasoning**, not by number of boxes drawn.
 > - Staff signals: you lead, you frame the problem, you cut scope on purpose, you plan the migration, you name org and cost impact.
 > - Company formats differ (product-flavored, infra-flavored, behavioral overlay), but each wants requirements, numbers, trade-offs and failure thinking.
 > - Treat company-specific claims as hints, not facts. Ask your recruiter what the round looks like.
+
+## Start here: the basics
+
+**The problem in one story.**
+Three engineers get the same question: "design a food delivery app".
+All three draw similar boxes, yet one is hired as SDE-2, one as SDE-3 and one as Staff.
+The difference is not the drawing; it is how each one reasons, leads the talk, and plans for change, risk and cost.
+This note lists what interviewers look for at each level.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HLD round | A design interview about the big boxes of a system | "Design a URL shortener" in 45 minutes |
+| Signal | Evidence the interviewer writes down about you | "Quantified load before picking a DB" |
+| Rubric | The scoring guide interviewers use | Requirements, design, trade-offs, communication |
+| Ambiguity | A question with missing or unclear details | "Design chat" without saying how many users |
+| Trade-off | Gaining one thing by giving up another | Lower latency, higher cost |
+| Migration | Moving a live system to a new design without downtime | Moving orders from MySQL to Postgres |
+| Scope | What you include in v1 and what you leave out | "v1: OTP login only, no social login" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S2["SDE-2:<br/>a working design"] --> S3["SDE-3:<br/>+ trade-offs, numbers, failures"]
+    S3 --> ST["Staff:<br/>+ drives the talk, scope,<br/>v1→v2, migration, cost, people"]
+```
+
+**Analogy.** A building project: a builder builds the wall well, a site engineer picks materials and checks loads, and the architect decides what to build first and how to extend it later.
+Where it breaks: in an interview you must show all three hats yourself, in under an hour.
+
+**How the rest of this note builds up**
+
+- First, why levels are scored differently and the building-project mental model (sections 1-2).
+- Then the signals by level, driving ambiguity, evolving v1 to v2, migration plans, company formats and Staff extras (section 3).
+- Then a worked example and red flags with recoveries (sections 4-5).
+- Finally the SDE-3/Staff deep dive: reading interviewer hints, reversible trade-offs and a 45-minute plan (sections 6-8).
+
+> [!tip] Remember
+> Higher levels are scored on handling ambiguity and reasoning about trade-offs, not on drawing more boxes.
 
 ## 1. Why it exists
 
@@ -41,7 +86,9 @@ Candidates preparing for SDE-3 often do not know what the interviewer is writing
 
 ## 2. Mental model
 
-Think of a **building project**. The SDE-2 is a skilled builder: give a blueprint and they build it well. The SDE-3 is the site engineer: they check the blueprint for load, choose materials, and spot what will crack. The Staff engineer is the architect plus the project lead: they ask what the building is for, decide what to build first, plan how people keep living in the old building while the new one goes up, and think about who maintains it in ten years.
+Think of a **building project**. The SDE-2 is a skilled builder: give a blueprint and they build it well. The SDE-3 is the site engineer: they check the blueprint for load, choose materials, and spot what will crack.
+
+The Staff engineer is the architect plus the project lead: they ask what the building is for, decide what to build first, plan how people keep living in the old building while the new one goes up, and think about who maintains it in ten years.
 
 The analogy breaks because in an interview the interviewer is also the client who can change requirements mid-way; your job is to adapt, not to defend the first drawing.
 
@@ -253,7 +300,11 @@ How the same answer reads at each level:
 
 1. **SDE-2 answer:** API, one queue, workers per channel, provider calls with retry, a table of statuses.
 2. **SDE-3 answer:** adds idempotency keys so retries do not double-send, priority queues so OTPs jump ahead of marketing, per-user rate limits, provider failover, and a DLQ for poison messages. Estimates 50M messages per day, about 600 per second average, 5 to 10 times at peak (estimates).
-3. **Staff answer:** adds scope and sequence. "v1 covers OTP and order updates on email and SMS for two teams. Marketing waits for v2 because its volume and risk differ." Adds a migration plan: "the three existing teams each send directly. We ship a client library, run in shadow mode that logs what we would send, compare with what they sent, then move one team per sprint, rolling back by a flag." Adds ownership and cost: "we own routing and templates; teams own content; we publish a cost-per-channel report."
+3. **Staff answer:** adds scope and sequence. "v1 covers OTP and order updates on email and SMS for two teams. Marketing waits for v2 because its volume and risk differ." Adds a migration plan: "the three existing teams each send directly.
+
+   We ship a client library, run in shadow mode that logs what we would send, compare with what they sent, then move one team per sprint, rolling back by a flag." Adds ownership and cost:
+
+   "we own routing and templates; teams own content; we publish a cost-per-channel report."
 
 ```mermaid
 sequenceDiagram
@@ -392,3 +443,7 @@ Staff candidates classify decisions as **one-way doors** (hard to undo: primary 
 - Supporting: [[Back-of-the-Envelope Estimation]], [[Zero-Downtime Schema Migrations]], [[Multi-Region Architecture]], [[SLIs, SLOs, SLAs and Error Budgets]], [[Production Readiness Review]], [[Architecture Decision Records]].
 - Case studies: [[Case Study - Notification System]], [[Case Study - Ride Sharing and Proximity]], [[Geospatial Indexing]].
 - Career: [[SDE-3 Readiness Checklist]].
+
+### Watch on YouTube
+
+- [Concurrency in Low-level Design Interviews w/ Staff Engineer](https://www.youtube.com/watch?v=d8rmosXttTE) · Hello Interview · 22 min · 205,429 views

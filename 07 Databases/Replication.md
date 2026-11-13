@@ -13,19 +13,67 @@ sources:
   - "Verbitski et al., Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases (SIGMOD 2017)"
   - "Elhemali et al., Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022)"
   - "Kleppmann, Designing Data-Intensive Applications (2017), chapter 5: Replication"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Replication
 
 > [!summary] TL;DR
-> Replication keeps copies of the same database on several servers. In the usual setup one **primary** takes all writes and streams its change log (the WAL) to **replicas**, which serve reads and can take over if the primary dies. The price is **replication lag**: a replica can be a little behind, so a read sent there may not see a write that just succeeded.
+> Replication keeps copies of the same database on several servers. In the usual setup one **primary** takes all writes and streams its change log (the WAL) to **replicas**, which serve reads and can take over if the primary dies.
+>
+> The price is **replication lag**: a replica can be a little behind, so a read sent there may not see a write that just succeeded.
 
 > [!abstract] Core idea
 > - The primary writes a change log (the WAL); replicas replay it in order to keep their own copy.
 > - Replicas are usually a little behind (replication lag), so a read right after a write can return old data.
 > - The rule: a read that must see the user's own write goes to a replica that has replayed past that write, or to the primary.
 > - Classic mistakes: treating a replica as a backup (it replays deletes too), and adding replicas to scale writes (every replica still applies every write).
+
+## Start here: the basics
+
+**The problem in one story.**
+A teacher writes notes on the main whiteboard, and two students copy them onto side boards so more people can read.
+The copies are always a few seconds behind the main board.
+If you write something on the main board and immediately look at a side board, your words may not be there yet.
+Database replication works the same way, and that delay is the core thing to design around.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Primary | The one server that accepts writes | `db-primary` |
+| Replica (standby) | A server holding a copy that follows the primary | `db-replica-1` serves reads |
+| WAL (write-ahead log) | The ordered list of every change the primary makes | "insert invoice 42" |
+| Replication lag | How far a replica is behind the primary | 200 ms behind |
+| Synchronous | The primary waits for a replica before confirming a commit | No data loss, slower writes |
+| Asynchronous | The primary confirms without waiting | Fast writes, may lose the last few on crash |
+| Failover | Promoting a replica to primary when the primary dies | Replica 1 becomes the new primary |
+| LSN | A position in the WAL, like a page number | `16/B374D848` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  App[App] -- writes --> P[(Primary)]
+  P -- WAL stream --> R1[(Replica 1)]
+  P -- WAL stream --> R2[(Replica 2)]
+  App -- reads --> R1
+  App -- reads --> R2
+```
+
+**Analogy.**
+Replication is like a newspaper printing copies at several presses from one master layout.
+Where it breaks: a replica copies mistakes too, so a `DELETE` on the primary also deletes on every replica, which is why a replica is not a backup.
+
+**How the rest of this note builds up**
+
+- First, why replication exists and the mental model of "replay the log".
+- Then how PostgreSQL streaming replication works, sync versus async, measuring lag, and replication slots.
+- Then a worked example of a stale read and a router that fixes it with WAL positions.
+- Finally, topologies, logical replication, production practice and the SDE-3 deep dive.
+
+> [!tip] Remember
+> Replicas lag: a read that must see the user's own write goes to the primary or to a replica that has caught up.
 
 ## 1. Why it exists
 
@@ -285,7 +333,9 @@ flowchart TD
     NX -- no --> PR
 ```
 
-Worked trace with the numbers from the diagram above: token `16/B374D848`; `replica_1` has replayed `16/B3000000` (behind), `replica_2` has replayed `16/B374D848` (equal, so caught up). Ten reads with that token all go to `replica_2`. A later write with token `16/B374D900` goes to the primary because no replica has reached it. A session that has never written passes token 0 and spreads over both replicas.
+Worked trace with the numbers from the diagram above: token `16/B374D848`; `replica_1` has replayed `16/B3000000` (behind), `replica_2` has replayed `16/B374D848` (equal, so caught up). Ten reads with that token all go to `replica_2`.
+
+A later write with token `16/B374D900` goes to the primary because no replica has reached it. A session that has never written passes token 0 and spreads over both replicas.
 
 ### Other fixes, and the two related anomalies
 
@@ -377,7 +427,11 @@ CREATE SUBSCRIPTION invoiceops_sub
     PUBLICATION invoiceops_pub;
 ```
 
-Its main uses are major-version upgrades with a short cut-over, copying a subset of tables, and **CDC**: Debezium reads the same logical decoding stream through a slot and publishes row changes to Kafka (see [[Transactional Outbox and CDC]]). PostgreSQL 16 allows logical decoding on a standby. PostgreSQL 17 adds **failover slots** (create the slot with `failover = true` and set `sync_replication_slots = on` on the standby), so a CDC connector can continue after a failover, and `pg_createsubscriber`, which turns a physical standby into a logical replica.
+Its main uses are major-version upgrades with a short cut-over, copying a subset of tables, and **CDC**: Debezium reads the same logical decoding stream through a slot and publishes row changes to Kafka (see [[Transactional Outbox and CDC]]).
+
+PostgreSQL 16 allows logical decoding on a standby.
+
+PostgreSQL 17 adds **failover slots** (create the slot with `failover = true` and set `sync_replication_slots = on` on the standby), so a CDC connector can continue after a failover, and `pg_createsubscriber`, which turns a physical standby into a logical replica.
 
 ## 6. Trade-offs and when not to use
 
@@ -486,10 +540,14 @@ flowchart LR
 > No. Replication copies mistakes as faithfully as data: a bad `DELETE`, a broken migration or application-level corruption reaches every replica within milliseconds. Backups mean a base backup plus archived WAL for point-in-time recovery, stored somewhere else. A delayed replica is a useful extra layer, not a backup.
 
 > [!question]- A user records a payment and the next page still shows the old balance. Why, and how do you fix it?
-> The read went to an asynchronous replica that had not replayed the write yet: a read-your-writes violation. Fixes: after the commit, store the primary's WAL position in the session and read only from replicas that have replayed past it; or read from the primary for a few seconds after the user's writes; or use `synchronous_commit = remote_apply` for that one transaction.
+> The read went to an asynchronous replica that had not replayed the write yet: a read-your-writes violation.
+>
+> Fixes: after the commit, store the primary's WAL position in the session and read only from replicas that have replayed past it; or read from the primary for a few seconds after the user's writes; or use `synchronous_commit = remote_apply` for that one transaction.
 
 > [!question]- What do synchronous and asynchronous replication each cost you?
-> Async adds no write latency, but an acknowledged commit can be lost on failover: the RPO equals the lag. Sync waits for a standby on every commit (one round trip plus a flush), and the primary blocks if no synchronous standby is reachable. Quorum sync (`ANY 1` of two or three) keeps zero loss while tolerating one slow or dead standby.
+> Async adds no write latency, but an acknowledged commit can be lost on failover: the RPO equals the lag. Sync waits for a standby on every commit (one round trip plus a flush), and the primary blocks if no synchronous standby is reachable.
+>
+> Quorum sync (`ANY 1` of two or three) keeps zero loss while tolerating one slow or dead standby.
 
 > [!question]- Why don't more replicas increase write throughput?
 > Every replica must apply every write, so the write capacity of the group is the capacity of one node, and in PostgreSQL replay is single-process, which is often slower. To scale writes, split the data across primaries (sharding) or use a database that partitions and replicates each range, such as [[Distributed SQL]].
@@ -522,3 +580,8 @@ flowchart LR
 - **Before this:** [[Transactions and ACID]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Next:** [[High Availability and Failover]], [[Partitioning and Sharding]], [[Quorums and Leaderless Replication]]
 - **Compare with:** [[Backup, PITR and Disaster Recovery]] (copies that survive mistakes), [[Distributed SQL]] (consensus replication per range), [[Transactional Outbox and CDC]] (logical decoding as an event source)
+
+### Watch on YouTube
+
+- [Database Replication Explained: Synchronous vs Asynchronous vs Semi-Synchronous](https://www.youtube.com/watch?v=gFch8qdL8GE) · ThatNotesGuy · covers sync/async replication trade-offs and lag
+- [Database Replication in System Design Explained / Primary-Replica, Replication Lag & Failover](https://www.youtube.com/watch?v=Ii01aFJY9ns) · Errors overflow · primary-replica setup, replication lag and failover, matches note directly

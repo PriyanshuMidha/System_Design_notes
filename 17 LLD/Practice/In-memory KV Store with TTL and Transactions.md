@@ -10,13 +10,17 @@ sources:
   - "Redis docs, SET command (a successful SET discards any previous TTL)"
   - "Redis docs, Transactions (MULTI/EXEC, no rollback of failed commands)"
   - "Go 1.24 language spec, For statements with range clause (map iteration order is not specified)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # In-memory KV Store with TTL and Transactions
 
 > [!summary] TL;DR
-> Build a tiny Redis: `GET`, `SET` with an optional TTL, `DELETE`, plus nested `BEGIN`, `ROLLBACK` and `COMMIT`. Expired keys are removed in two ways, lazily when someone reads them and actively by a background sweeper that samples keys with a TTL. Transactions are a stack of small maps that hold only the keys written since each `BEGIN`; a read walks the stack from the top down, a rollback pops one map, and the outermost commit applies everything to the store under one lock.
+> Build a tiny Redis: `GET`, `SET` with an optional TTL, `DELETE`, plus nested `BEGIN`, `ROLLBACK` and `COMMIT`.
+>
+> Expired keys are removed in two ways, lazily when someone reads them and actively by a background sweeper that samples keys with a TTL.
+>
+> Transactions are a stack of small maps that hold only the keys written since each `BEGIN`; a read walks the stack from the top down, a rollback pops one map, and the outermost commit applies everything to the store under one lock.
 
 > [!abstract] Core idea
 > - Every entry is `{value, expireAt}`; a zero `expireAt` means no TTL. TTL is turned into an absolute time at `SET` using an injected clock.
@@ -24,6 +28,52 @@ updated: 2026-11-04
 > - Transactions are layered maps, not copies of the store: `BEGIN` pushes an empty map, writes go to the top map, a delete is a tombstone, reads check top to bottom then the store.
 > - `ROLLBACK` pops one layer; an inner `COMMIT` merges into its parent; the outermost `COMMIT` applies all writes in one critical section, so other sessions see all or nothing.
 > - Concurrency: one mutex on the store, one per session, and a fixed lock order (session before store) so there is no deadlock.
+
+## Start here: the basics
+
+**The problem in one story.**
+A web app stores login sessions so users stay signed in.
+Each session should vanish 30 minutes after it is written.
+Sometimes the app changes several keys and wants "all of these, or none" if something fails half-way.
+This note builds a small in-memory store that does both: keys that expire, and undoable groups of writes.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Key-value store | A dictionary you can `SET` and `GET` by name | `SET user:1 "Asha"` |
+| TTL (time to live) | How long a key lives before it disappears | `SET otp 1234 TTL 60s` |
+| Lazy expiry | Delete an old key only when someone reads it | `GET otp` after 61 s returns missing |
+| Active expiry | A background job that deletes old keys | Sweeper runs every 100 ms |
+| Transaction | A group of writes kept aside until commit | `BEGIN; SET a 1; ROLLBACK` leaves `a` unchanged |
+| Nested transaction | A transaction opened inside another | `BEGIN; BEGIN; ...` |
+| Tombstone | A marker saying "deleted in this transaction" | `DELETE a` inside `BEGIN` |
+| Mutex | Lets only one goroutine touch shared data at a time | `mu.Lock()` around the map |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    C["Client"] --> T{"Inside a<br/>transaction?"}
+    T -- "no" --> ST["Store map<br/>{value, expireAt}"]
+    T -- "yes" --> L["Top layer map<br/>(writes since BEGIN)"]
+    L -- "COMMIT" --> ST
+    L -- "ROLLBACK" --> D["Layer thrown away"]
+    J["Janitor<br/>(sweeps expired keys)"] --> ST
+```
+
+**Analogy.** Transaction layers are like sticky notes on a printed page: you write changes on a note on top, read through the notes first, and either peel the note off (rollback) or copy it onto the page (commit).
+Where it breaks: paper never expires, while every key here may carry a deadline that applies even inside a transaction.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and the clarifying questions (Step 1).
+- Then entities, relationships and the API (Steps 2-5): entries, sessions and layered maps.
+- Then the core code: lazy and active expiry, the janitor, and nested transactions (Step 8).
+- Finally tests, edge cases, trade-offs and the SDE-3 questions on lock order, isolation and memory (Steps 9-10 and the interview section).
+
+> [!tip] Remember
+> Store absolute expiry times, delete expired keys on read and in the background, and keep transactions as a stack of small maps.
 
 ## Problem statement
 
@@ -35,7 +85,8 @@ ROLLBACK undoes only the innermost open transaction. Keys with a TTL disappear o
 it passes, even if nobody reads them again. Many clients use the store at once.
 ```
 
-- It tests data-structure choice (maps and a TTL index), two expiry strategies and their memory and latency costs, the layered-map trick for nested transactions, testability with an injected clock, and lock design. It is also the LLD half of [[Case Study - Key-Value Store]]. Time box: 10 minutes for Steps 1-4, 5 for Steps 5-7, 30 for the code, 10 for edge cases.
+- It tests data-structure choice (maps and a TTL index), two expiry strategies and their memory and latency costs, the layered-map trick for nested transactions, testability with an injected clock, and lock design.
+- It is also the LLD half of [[Case Study - Key-Value Store]]. Time box: 10 minutes for Steps 1-4, 5 for Steps 5-7, 30 for the code, 10 for edge cases.
 
 ### Solving path
 
@@ -226,7 +277,9 @@ Expiry:
 1. `Set` converts the TTL to an absolute `exp = now() + ttl`. Absolute times are what make "a transaction that commits late does not revive a key" true.
 2. `live(key)` is the only read path: if the entry exists and `now >= exp`, it deletes the key and reports "missing". That is lazy expiry.
 3. `put` adds the key to `withTTL` when it has a TTL and removes it otherwise. `SweepExpired(sample)` walks at most `sample` keys of `withTTL` and deletes the expired ones.
-4. `RunJanitor` ticks every interval. If more than a quarter of a sample was expired, it sweeps again at once, up to 16 rounds, then waits for the next tick. The Redis `EXPIRE` documentation describes the same shape: sample 20 keys that have a TTL, delete the expired ones, and repeat if more than 25% were expired. The 25% threshold follows that description; the 16-round cap is this design's own choice (Redis bounds the loop by time instead).
+4. `RunJanitor` ticks every interval. If more than a quarter of a sample was expired, it sweeps again at once, up to 16 rounds, then waits for the next tick.
+   - The Redis `EXPIRE` documentation describes the same shape: sample 20 keys that have a TTL, delete the expired ones, and repeat if more than 25% were expired.
+   - The 25% threshold follows that description; the 16-round cap is this design's own choice (Redis bounds the loop by time instead).
 
 Transactions:
 
@@ -875,3 +928,8 @@ Redraw it from memory:
 - **Before this:** [[Concurrency for LLD]], [[Command, Undo and Memento]], [[ATM]]
 - **Next:** [[Task Scheduler (delayed and recurring jobs)]]
 - **Compare with:** [[LRU Cache with TTL]] (eviction by size), [[Case Study - Key-Value Store]] (the distributed system), [[Redis Fundamentals]], [[Isolation Levels and MVCC]], [[Locking - Optimistic vs Pessimistic]]
+
+### Watch on YouTube
+
+- [Low Level System design of Redis-Like In-Memory Key-Value Store / Full code / Easy & Detailed](https://www.youtube.com/watch?v=izakW9x89Sc) · Lavakumar Techie · 52 min · 3,217 views
+- [KV Store Nested Transactions](https://www.youtube.com/watch?v=QgG5y31BqHw) · Algoforgeeks · 10 min · 8 views

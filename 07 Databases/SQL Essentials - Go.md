@@ -16,13 +16,24 @@ sources:
   - "PostgreSQL wiki, Don't Do This (NOT IN)"
   - "MySQL 8.0 docs, Type Conversion in Expression Evaluation (string column compared with a number)"
   - "Codd, A Relational Model of Data for Large Shared Data Banks (CACM, 1970)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # SQL Essentials - Go
 
 > [!summary] TL;DR
-> The runnable side of [[SQL Essentials]]: the InvoiceOps schema and the long reference queries (grouping, recursive CTE, the traced collections report) as PostgreSQL 17 SQL, plus a small Go package that builds a list query with `$n` placeholders and a fixed sort whitelist, so user input can never become SQL. Every block is short and comes with a concept paragraph, a numbered walkthrough, and a diagram where one helps.
+> The runnable side of [[SQL Essentials]]: the InvoiceOps schema and the long reference queries (grouping, recursive CTE, the traced collections report) as PostgreSQL 17 SQL, plus a small Go package that builds a list query with `$n` placeholders and a fixed sort whitelist, so user input can never become SQL.
+>
+> Every block is short and comes with a concept paragraph, a numbered walkthrough, and a diagram where one helps.
+
+## Before the code
+
+- **Structs as input**: a `Filter` struct holds the user's choices (workspace, status, sort, limit).
+- **Maps as whitelists**: `orderBy` maps a sort key to a fixed SQL fragment, so unknown keys are rejected.
+- **`strings.Builder` and `fmt`**: build the SQL text with `$1`, `$2`, ... placeholders.
+- **`[]any` arguments**: values travel separately from the SQL, so the driver sends them as parameters.
+- **Multiple return values**: `Build` returns SQL, args and an `error`.
+- **Run**: `go vet ./... && go test -race ./...` inside the `listquery` module; no database needed.
 
 ## What this code shows
 
@@ -45,7 +56,9 @@ flowchart LR
     A --> D
 ```
 
-The diagram is the whole Go story in one picture: the HTTP request becomes a `Filter` struct, `Build` either rejects it or splits it into SQL text and an argument list, and the driver sends those two halves to the server separately. The SQL parts of this note have no Go in them; they are the queries the theory note traces by hand.
+The diagram is the whole Go story in one picture: the HTTP request becomes a `Filter` struct, `Build` either rejects it or splits it into SQL text and an argument list, and the driver sends those two halves to the server separately.
+
+The SQL parts of this note have no Go in them; they are the queries the theory note traces by hand.
 
 ## Setup
 
@@ -58,7 +71,11 @@ The diagram is the whole Go story in one picture: the HTTP request becomes a `Fi
 
 ### Step 1: the running schema
 
-**Concept.** Every example in [[SQL Essentials#The running schema]] runs against four tables: clients, invoices, invoice items and payments. This is a trimmed version, only as wide as the queries need. Columns ending in `_minor` hold money as integer minor units (paise), so Rs 1,500.00 is `150000`; the reasoning is in [[Relational Schema Design#Step 6: types]]. The constraints (`CHECK`, `UNIQUE`, `REFERENCES`) are written in the table so the database, not the application, rejects bad rows. The full production DDL, with tenant-safe composite keys, is in [[Relational Schema Design - Go]]; this version keeps simple single-column foreign keys so the queries stay readable.
+**Concept.** Every example in [[SQL Essentials#The running schema]] runs against four tables: clients, invoices, invoice items and payments. This is a trimmed version, only as wide as the queries need.
+
+Columns ending in `_minor` hold money as integer minor units (paise), so Rs 1,500.00 is `150000`; the reasoning is in [[Relational Schema Design#Step 6: types]]. The constraints (`CHECK`, `UNIQUE`, `REFERENCES`) are written in the table so the database, not the application, rejects bad rows.
+
+The full production DDL, with tenant-safe composite keys, is in [[Relational Schema Design - Go]]; this version keeps simple single-column foreign keys so the queries stay readable.
 
 ```mermaid
 erDiagram
@@ -125,7 +142,11 @@ CREATE TABLE payments (
 
 ### Step 2: grouping and aggregates
 
-**Concept.** This implements [[SQL Essentials#Grouping and aggregates]]. After `GROUP BY`, each output row stands for a whole group and aggregate functions summarise it. The query is built to expose two classic surprises: `count(*)` counts joined rows while `count(i.id)` counts only non-NULL values, and `sum` over no rows is NULL, not 0. `FILTER` is used instead of several subqueries or `CASE` expressions because it computes several conditional aggregates in one pass over the grouped rows. The alternative, a separate query per metric, reads the table several times and gives results that can disagree under concurrent writes.
+**Concept.** This implements [[SQL Essentials#Grouping and aggregates]]. After `GROUP BY`, each output row stands for a whole group and aggregate functions summarise it.
+
+The query is built to expose two classic surprises: `count(*)` counts joined rows while `count(i.id)` counts only non-NULL values, and `sum` over no rows is NULL, not 0.
+
+`FILTER` is used instead of several subqueries or `CASE` expressions because it computes several conditional aggregates in one pass over the grouped rows. The alternative, a separate query per metric, reads the table several times and gives results that can disagree under concurrent writes.
 
 ```sql
 SELECT c.name,
@@ -170,7 +191,11 @@ Read the last row first: `joined_rows = 1` against `invoices = 0` is the `count(
 
 ### Step 3: a recursive CTE
 
-**Concept.** This is the recursive form of [[SQL Essentials#Subqueries and CTEs]]. A client can be the parent of other clients, so "Acme's balance including subsidiaries" needs a walk down a tree of unknown depth, which a fixed number of self-joins cannot do. A recursive CTE has an anchor (the starting rows) and a step (rows reached from rows already found); the database repeats the step until it finds nothing new. The alternatives are a loop in Go issuing one query per level, which costs a round trip per level, or storing a materialised path, which is faster to read but harder to keep correct.
+**Concept.** This is the recursive form of [[SQL Essentials#Subqueries and CTEs]]. A client can be the parent of other clients, so "Acme's balance including subsidiaries" needs a walk down a tree of unknown depth, which a fixed number of self-joins cannot do.
+
+A recursive CTE has an anchor (the starting rows) and a step (rows reached from rows already found); the database repeats the step until it finds nothing new.
+
+The alternatives are a loop in Go issuing one query per level, which costs a round trip per level, or storing a materialised path, which is faster to read but harder to keep correct.
 
 ```sql
 WITH RECURSIVE family AS (
@@ -205,7 +230,11 @@ Representative output (PostgreSQL 17): `group_open_minor = 230000` (150000 from 
 
 ### Step 4: the collections query
 
-**Concept.** This is the whiteboard query from [[SQL Essentials#The collections query, traced]], with every feature of the topic in one statement: a tenant filter, a CTE, lateness arithmetic, a share of the total and a rank. It exists to show the logical processing order (FROM, WHERE, GROUP BY, HAVING, window functions, SELECT, ORDER BY) working together. Splitting the work into a CTE keeps the filter and the date arithmetic separate from the report, which makes each half easy to test; the alternative is one flat query with a subquery in `FROM`, which does the same thing.
+**Concept.** This is the whiteboard query from [[SQL Essentials#The collections query, traced]], with every feature of the topic in one statement: a tenant filter, a CTE, lateness arithmetic, a share of the total and a rank.
+
+It exists to show the logical processing order (FROM, WHERE, GROUP BY, HAVING, window functions, SELECT, ORDER BY) working together.
+
+Splitting the work into a CTE keeps the filter and the date arithmetic separate from the report, which makes each half easy to test; the alternative is one flat query with a subquery in `FROM`, which does the same thing.
 
 The CTE, the part that selects invoices still owing money:
 
@@ -272,7 +301,11 @@ Reading it line by line:
 
 ### Step 5: building SQL safely from Go, the types
 
-**Concept.** This is [[SQL Essentials#Building SQL safely from Go]]. Values must travel as parameters (`$1`, `$2`): drivers such as pgx send the SQL text and the values in separate protocol messages by default, so a value can never become SQL. Column names and `ASC`/`DESC` cannot be parameters, so the builder maps each public sort key to a fixed fragment. The alternatives are an ORM or a query builder library, which solve the same problem with more machinery, and quoting user input into the string, which is the injection bug itself. A map whitelist is the smallest design that is safe.
+**Concept.** This is [[SQL Essentials#Building SQL safely from Go]]. Values must travel as parameters (`$1`, `$2`): drivers such as pgx send the SQL text and the values in separate protocol messages by default, so a value can never become SQL.
+
+Column names and `ASC`/`DESC` cannot be parameters, so the builder maps each public sort key to a fixed fragment.
+
+The alternatives are an ORM or a query builder library, which solve the same problem with more machinery, and quoting user input into the string, which is the injection bug itself. A map whitelist is the smallest design that is safe.
 
 ```go
 package listquery
@@ -318,7 +351,9 @@ flowchart LR
 
 ### Step 6: building SQL safely from Go, `Build`
 
-**Concept.** `Build` turns a `Filter` into SQL text with `$n` placeholders plus the argument slice. It validates first and builds second, so an invalid request never produces SQL at all. The placeholder number is `len(args)` after appending, so numbers stay correct whether or not the optional status filter is present. A `strings.Builder` avoids repeated string concatenation. The alternative of hard-coding one query per filter combination does not scale past two optional filters.
+**Concept.** `Build` turns a `Filter` into SQL text with `$n` placeholders plus the argument slice. It validates first and builds second, so an invalid request never produces SQL at all.
+
+The placeholder number is `len(args)` after appending, so numbers stay correct whether or not the optional status filter is present. A `strings.Builder` avoids repeated string concatenation. The alternative of hard-coding one query per filter combination does not scale past two optional filters.
 
 ```go
 // Build returns SQL with $n placeholders plus the matching arguments.

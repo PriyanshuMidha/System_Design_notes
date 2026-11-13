@@ -14,7 +14,7 @@ sources:
   - "AWS News Blog, Amazon S3 Update - Strong Read-After-Write Consistency (December 2020)"
   - "Amazon DynamoDB docs, Read consistency; MongoDB docs, Causal Consistency and Read and Write Concerns"
   - "PostgreSQL 17 docs, synchronous_commit and System Administration Functions (pg_last_wal_replay_lsn)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Consistency Models
@@ -28,6 +28,52 @@ updated: 2026-11-04
 > - Session guarantees (read-your-writes, monotonic reads, monotonic writes, writes-follow-reads) fix what users notice, cheaply.
 > - Stronger models cost latency and availability (see [[CAP and PACELC]]), so choose per feature.
 > - Classic mistake: confusing linearizable (one object, real-time) with serializable (multi-object transactions, any order).
+
+## Start here: the basics
+
+**The problem in one story.**
+You change your profile photo and press save.
+The page reloads and shows your old photo.
+You save again, and a friend on another phone still sees the old one.
+A consistency model is the written promise about which version each reader is allowed to see.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Replica | Another copy of the same data on another machine | A read replica of the main database |
+| Primary | The copy that accepts writes first | The Postgres primary |
+| Replication lag | How far a replica is behind the primary | Replica is 400 ms behind |
+| Stale read | Reading an older value after a newer one was written | Old bio after saving a new one |
+| Anomaly | A result a weaker model allows but users find wrong | Seeing a reply before the question |
+| Session | One user's sequence of requests | All requests from one logged-in browser |
+| Linearizable | Behaves like one single copy in real time | Once a write returns, every read sees it |
+| Eventual | Copies agree once writes stop | DNS changes spreading over minutes |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User writes<br/>new bio"] --> P["Primary"]
+    P -- "copies after lag" --> R["Replica"]
+    U -- "reads soon after" --> R
+    R --> Q{"Caught up yet?"}
+    Q -- "no" --> OLD["Old bio:<br/>stale read"]
+    Q -- "yes" --> NEW["New bio"]
+```
+
+**Analogy.** A shared notice board with copies in several buildings, updated by a courier. A strong model says "every copy changes the instant the main board does"; an eventual model says "the courier will get there".
+Where it breaks: a courier visits buildings in order, but replicas can apply writes in different orders unless the model forbids it.
+
+**How the rest of this note builds up**
+
+- First, why a system must state what reads may return (section 1), and the mental model of allowed and forbidden anomalies (section 2).
+- Then the hierarchy of models, single-object models, session guarantees and how replication lag causes each anomaly (section 3).
+- Then a Go example with LSN tokens over lagging replicas (section 4), and linearizable vs serializable plus defaults in real systems (section 5).
+- Finally the SDE-3 deep dive: choosing per feature, production cases and the costs behind each guarantee (sections 6-8).
+
+> [!tip] Remember
+> A consistency model is a contract about stale reads; pick the weakest one each feature can tolerate.
 
 ## 1. Why it exists
 
@@ -394,3 +440,8 @@ The table carried over from the old note, with the model named:
 - **Before this:** [[CAP and PACELC]], [[Replication]]
 - **Next:** [[Quorums and Leaderless Replication]], [[Clocks and Ordering]], [[Consensus - Raft and Paxos]]
 - **Compare with:** [[Isolation Levels and MVCC]] (single-node transaction isolation), [[Distributed SQL]] (serializable transactions across nodes; strict serializability only in some systems, such as Spanner), [[CRDTs and Conflict Resolution]] (making eventual consistency safe)
+
+### Watch on YouTube
+
+- [L17: Consistency Models in Distributed Systems](https://www.youtube.com/watch?v=Fm8iUFM2iWU) · Distributed Systems Course · 18 min · 43,952 views
+- [Consistency Models / System Design / Distributed Systems](https://www.youtube.com/watch?v=uAqIa-mtjJ4) · Knowledge Center · 10 min · 35,135 views

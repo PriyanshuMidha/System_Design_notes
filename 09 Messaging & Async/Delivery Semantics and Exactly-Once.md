@@ -12,13 +12,15 @@ sources:
   - "AWS SQS Developer Guide, Visibility timeout"
   - "Apache Flink documentation, Fault Tolerance Guarantees of Data Sources and Sinks"
   - "Akkoyunlu, Ekanadham & Huber, Some Constraints and Tradeoffs in the Design of Network Communications (1975), the Two Generals problem"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Delivery Semantics and Exactly-Once
 
 > [!summary] TL;DR
-> A **delivery guarantee** says how many times a message's effect can happen when things crash: at most once (maybe lost), at least once (maybe duplicated), or exactly once. Over a real network, exactly-once *delivery* is impossible; what systems actually build is **effectively-once processing**: deliver at least once, and make the effect idempotent so a duplicate changes nothing.
+> A **delivery guarantee** says how many times a message's effect can happen when things crash: at most once (maybe lost), at least once (maybe duplicated), or exactly once.
+>
+> Over a real network, exactly-once *delivery* is impossible; what systems actually build is **effectively-once processing**: deliver at least once, and make the effect idempotent so a duplicate changes nothing.
 
 > [!abstract] Core idea
 > - The guarantee is decided by **when the consumer acknowledges**: before the work (at most once) or after it (at least once).
@@ -26,6 +28,52 @@ updated: 2026-11-04
 > - Effectively-once = at-least-once delivery + a dedupe record written in the **same transaction** as the effect.
 > - Kafka's exactly-once covers Kafka-to-Kafka pipelines only. An email or a card charge still needs an idempotency key.
 > - In an interview, say exactly which hops are covered and what happens to duplicates at each one.
+
+## Start here: the basics
+
+**The problem in one story.**
+You tap "Pay" and the screen freezes, so you do not know if it worked.
+If you tap again, you might pay twice; if you do not, you might not have paid at all.
+Message systems face the same doubt every time a reply gets lost.
+Delivery semantics names which risk you accept: losing a message, or seeing it twice.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Broker | The server that stores and passes messages | Kafka, SQS |
+| Ack | The consumer saying "I handled it" | Commit offset, delete message |
+| At most once | Never twice, but can be lost | Ack before doing the work |
+| At least once | Never lost, but can repeat | Ack after doing the work |
+| Duplicate | The same message handled again | Two "charge card" calls |
+| Idempotency key | A unique id used to ignore repeats | `msg_id` = `a1b2` |
+| Transaction | Several writes that succeed or fail together | Insert row + record msg id |
+| Offset | A message's position in a Kafka partition | Offset 1052 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Broker"] --> C["Consumer"]
+    C --> T["DB transaction:<br/>do effect + save msg id"]
+    T --> A["Ack to broker"]
+    A -. "ack lost" .-> B
+    B -- "redeliver" --> C
+    C -- "msg id seen" --> S["Skip duplicate"]
+```
+
+**Analogy.** Sending a parcel with tracking: if the "delivered" text never arrives, you either resend (maybe two parcels) or give up (maybe none).
+Where it breaks: the receiver of a parcel can see two boxes are the same order; software can only do that if you give it an id to check.
+
+**How the rest of this note builds up**
+
+- First, why duplicates are normal (section 1) and the ack-timing mental model (section 2).
+- Then the Two Generals problem, effectively-once with a dedupe table, and Kafka's guarantees (section 3).
+- Then a Go consumer that dedupes in the same transaction, with tests (section 4), and the variants compared (section 5).
+- Finally the SDE-3 deep dive: external side effects, offsets stored with results and zombie fencing (sections 6-8).
+
+> [!tip] Remember
+> Exactly-once delivery is impossible; at-least-once plus an idempotent, transactional consumer gives effectively-once.
 
 ## 1. Why it exists
 
@@ -90,7 +138,9 @@ Only the last column survives every crash point.
 
 ### Why exactly-once *delivery* is impossible
 
-This is the **Two Generals problem**. Two generals must agree on an attack time by sending messengers through enemy territory, where any messenger can be captured. General A sends "attack at dawn". To know it arrived, A needs an acknowledgement. But B cannot know whether the acknowledgement arrived, so B needs an acknowledgement of the acknowledgement, and so on forever. No finite number of messages makes both sides certain.
+This is the **Two Generals problem**. Two generals must agree on an attack time by sending messengers through enemy territory, where any messenger can be captured. General A sends "attack at dawn". To know it arrived, A needs an acknowledgement.
+
+But B cannot know whether the acknowledgement arrived, so B needs an acknowledgement of the acknowledgement, and so on forever. No finite number of messages makes both sides certain.
 
 For a broker it means: when a consumer's ack is lost, the broker cannot tell "the consumer never processed it" from "it processed it and the ack vanished". It must pick one: resend (risking duplicates) or not (risking loss). No protocol removes this choice; you can only make duplicates harmless.
 
@@ -367,7 +417,9 @@ In PostgreSQL the same guarantee comes from the `PRIMARY KEY (consumer, message_
 
 ### Kafka exactly-once semantics (EOS), precisely
 
-- **Idempotent producer** (`enable.idempotence=true`, default since Kafka 3.0): the broker gives the producer a **producer ID**, and the producer numbers each batch per partition with a **sequence number**. If a network retry resends a batch, the broker sees the repeated sequence number and drops it. This removes duplicates caused by producer retries, per partition, for the life of that producer session.
+- **Idempotent producer** (`enable.idempotence=true`, default since Kafka 3.0): the broker gives the producer a **producer ID**, and the producer numbers each batch per partition with a **sequence number**. If a network retry resends a batch, the broker sees the repeated sequence number and drops it.
+
+  This removes duplicates caused by producer retries, per partition, for the life of that producer session.
 - **Transactions** (`transactional.id`, since Kafka 0.11, KIP-98): a producer can write to several partitions **and** commit the consumer's input offsets (`sendOffsetsToTransaction`) atomically. Consumers with `isolation.level=read_committed` see only committed transactions. The stable `transactional.id` lets a restarted producer **fence** its old "zombie" instance (bumped epoch), so the zombie's writes are rejected.
 - **Scope:** read from Kafka, process, write to Kafka. The moment your processing calls an HTTP API, sends an email or writes to PostgreSQL, those effects are outside the transaction and can repeat when the transaction aborts and the input is reprocessed.
 
@@ -401,7 +453,9 @@ In PostgreSQL the same guarantee comes from the `PRIMARY KEY (consumer, message_
 ## 8. Deep dive
 
 - **Exactly-once is a property of a pipeline, not a broker.** Draw each hop (producer → broker, broker → consumer, consumer → side effect) and state the guarantee and the dedupe mechanism for each. A chain is only as strong as its weakest hop.
-- **External side effects need a "prepare, then confirm" shape.** For a card charge: insert the intent row and idempotency key, commit, call the PSP with that key, then record the result. If the call times out, the outcome is **unknown**, not failed. Retry with the same key, or reconcile by querying the PSP. An email provider without idempotency keys cannot be made exactly-once; the best you can do is record "sent" right after the call and accept a rare duplicate.
+- **External side effects need a "prepare, then confirm" shape.** For a card charge: insert the intent row and idempotency key, commit, call the PSP with that key, then record the result. If the call times out, the outcome is **unknown**, not failed.
+
+  Retry with the same key, or reconcile by querying the PSP. An email provider without idempotency keys cannot be made exactly-once; the best you can do is record "sent" right after the call and accept a rare duplicate.
 - **Dedupe store design choices:**
 	- Same database as the effect: the strongest option, described above.
 	- Redis `SET msg:{id} 1 NX EX 86400` as a fast pre-check: cheap, but it is a separate store, so a crash between the Redis write and the DB commit can make a message look processed when it was not. Use it only to reduce load in front of a DB-level check, never as the only check.
@@ -416,7 +470,9 @@ In PostgreSQL the same guarantee comes from the `PRIMARY KEY (consumer, message_
 > At most once: ack before processing, so a crash loses the message but never repeats it. At least once: ack after processing, so a crash repeats it but never loses it. Exactly once: the effect happens once despite crashes, which in practice means at-least-once delivery plus an idempotent or deduplicated effect.
 
 > [!question]- Trap: "We use Kafka with exactly-once enabled, so our consumer that charges cards is safe." Is it?
-> No. Kafka EOS makes the Kafka writes and offset commits atomic. The HTTP call to the payment provider is outside that transaction; if the transaction aborts after the call, the input is reprocessed and the card is charged again. The charge needs an idempotency key sent to the provider and an intent row stored before the call.
+> No. Kafka EOS makes the Kafka writes and offset commits atomic. The HTTP call to the payment provider is outside that transaction; if the transaction aborts after the call, the input is reprocessed and the card is charged again.
+>
+> The charge needs an idempotency key sent to the provider and an intent row stored before the call.
 
 > [!question]- Why must the dedupe insert and the effect be in the same transaction?
 > Otherwise a crash between them leaves one without the other. Dedupe row first then crash: the message is marked processed but the effect never happened (lost). Effect first then crash: the effect happened but no row exists, so the redelivery applies it again.
@@ -449,3 +505,8 @@ In PostgreSQL the same guarantee comes from the `PRIMARY KEY (consumer, message_
 - **Before this:** [[Queues vs Streams and Broker Comparison]], [[Transactions and ACID]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[Dead Letter Queues and Poison Messages]], [[Transactional Outbox and CDC]], [[Message Ordering and Partition Keys]]
 - **Compare with:** [[Kafka and Event Streaming]] (how EOS is implemented in the broker), [[Timeouts, Retries and Backoff]] (where duplicates come from on the sending side), [[Saga Pattern]] (compensating instead of preventing duplicates)
+
+### Watch on YouTube
+
+- [Apache Kafka® Transactions: Message Delivery and Exactly-Once Semantics](https://www.youtube.com/watch?v=Ki2D2o9aVl8) · Confluent, an IBM Company · 14 min · 40,096 views
+- [How Kafka Actually Achieves Exactly-Once Semantics](https://www.youtube.com/watch?v=iRhDCIzhm4A) · Arpit Bhayani · 18 min · 64,555 views

@@ -10,7 +10,7 @@ sources:
   - "protovalidate-go v0.7.3 docs"
   - "Go 1.24 release notes: the go.mod `tool` directive"
   - "gRPC status codes (grpc/grpc repository, doc/statuscodes.md)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # gRPC Services in Go
@@ -24,9 +24,55 @@ updated: 2026-11-07
 > - Cross-cutting concerns (auth, logging, recovery, validation) live in a chain of interceptors that wrap every handler, not inside each handler.
 > - Classic mistake: calling `grpc.Dial` per request, or trusting the request body without running `protovalidate` first — one connection is reused for thousands of calls, and shape validation belongs in the interceptor chain, before any handler code runs.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your `payments` service needs to tell your `invoices` service "mark invoice 42 paid".
+With REST you hand-write JSON structs on both sides, and they can quietly drift apart.
+gRPC lets you write the contract once in a `.proto` file.
+Go code for both sides is generated from it, so a mismatch fails to compile.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| RPC | Calling a function that runs on another machine | `client.GetInvoice(ctx, req)` |
+| Protocol Buffers (`.proto`) | A file describing messages and methods | `message Invoice { string id = 1; }` |
+| Code generation | A tool writes Go code from the `.proto` | `buf generate` |
+| HTTP/2 | Newer HTTP that carries many calls over one connection | One TCP link, many RPCs |
+| Context deadline | A time limit that travels with the call | `context.WithTimeout(ctx, 2*time.Second)` |
+| Status code | gRPC's version of HTTP 404/500 | `codes.NotFound` |
+| Interceptor | Middleware that wraps every RPC | Logging, auth, panic recovery |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P[".proto file"] --> G["buf generate"]
+    G --> C["Go client stub"]
+    G --> S["Go server interface"]
+    C -->|"HTTP/2 + protobuf"| I["Interceptors"]
+    I --> H["Your handler"]
+```
+
+**Analogy.** Calling a restaurant with a fixed printed menu: both you and the kitchen use the same item numbers, so orders can't be misread.
+Where it breaks: a phone order still crosses a network; it can time out or fail, unlike a real local function call.
+
+**How the rest of this note builds up**
+
+- First, why REST+JSON hurts for internal calls (section 1) and the mental model (section 2).
+- Then code generation, server/client setup, status codes, deadlines and metadata (section 3).
+- Then interceptors, TLS, health, load balancing, retries and testing (section 3), plus the full worked example (section 4).
+- Finally the SDE-3 deep dive: trade-offs, production issues and wire details (sections 5-8).
+
+> [!tip] Remember
+> The `.proto` is the contract; every gRPC call is a network call with a deadline and a status code.
+
 ## 1. Why it exists
 
-InvoiceOps has a `payments` service that calls the `invoices` service internally on every webhook: "mark this invoice paid." Over REST+JSON, each call pays three costs: hand-written request/response structs that can drift from the real shape, a client that must retry its own `Content-Type` and status-code conventions, and a wire format that is larger than it needs to be for traffic that never leaves the cluster.
+InvoiceOps has a `payments` service that calls the `invoices` service internally on every webhook: "mark this invoice paid."
+
+Over REST+JSON, each call pays three costs: hand-written request/response structs that can drift from the real shape, a client that must retry its own `Content-Type` and status-code conventions, and a wire format that is larger than it needs to be for traffic that never leaves the cluster.
 
 **Measured:** marshaling `Invoice{id: "inv_1", workspace_id: "ws_1", total_cents: 4999, currency: "USD", status: STATUS_DRAFT}` with `proto.Marshal` versus `encoding/json.Marshal` (snake_case fields, enum as its string name), Go 1.24.4, 2026-11-07:
 
@@ -35,11 +81,17 @@ InvoiceOps has a `payments` service that calls the `invoices` service internally
 | Protobuf | 23    |
 | JSON     | 96    |
 
-Protobuf came out about 4× smaller here, because field names never go on the wire (just small integer tags) and `total_cents` is a varint instead of ASCII digits. The exact ratio depends on field lengths — longer ids narrow the gap, since both encodings pay for the string bytes — and it disappears if the JSON is itself compressed, but it is one real reason internal RPC traffic prefers a binary wire format.
+Protobuf came out about 4× smaller here, because field names never go on the wire (just small integer tags) and `total_cents` is a varint instead of ASCII digits.
 
-The second cost is structural, not just size: REST+JSON gives you no compiler-checked contract between `payments` and `invoices` — a renamed field is a runtime surprise. gRPC's generated client and server share the same Go types, built from the same `.proto`, so a breaking change is a compile error in both services, or a `buf breaking` failure in CI before it ever reaches a compiler.
+The exact ratio depends on field lengths — longer ids narrow the gap, since both encodings pay for the string bytes — and it disappears if the JSON is itself compressed, but it is one real reason internal RPC traffic prefers a binary wire format.
 
-This is why the common InvoiceOps shape is **public REST, internal gRPC**: external clients and browsers get a stable, cacheable, human-readable REST API (see [[REST and HTTP API Design]]), and service-to-service calls inside the cluster use gRPC for the typed contract, binary size, and native HTTP/2 multiplexing. [[Choosing an API Style]] covers that decision in general; this note is the Go implementation once gRPC has been chosen.
+The second cost is structural, not just size: REST+JSON gives you no compiler-checked contract between `payments` and `invoices` — a renamed field is a runtime surprise.
+
+gRPC's generated client and server share the same Go types, built from the same `.proto`, so a breaking change is a compile error in both services, or a `buf breaking` failure in CI before it ever reaches a compiler.
+
+This is why the common InvoiceOps shape is **public REST, internal gRPC**: external clients and browsers get a stable, cacheable, human-readable REST API (see [[REST and HTTP API Design]]), and service-to-service calls inside the cluster use gRPC for the typed contract, binary size, and native HTTP/2 multiplexing.
+
+[[Choosing an API Style]] covers that decision in general; this note is the Go implementation once gRPC has been chosen.
 
 ## 2. Mental model
 
@@ -48,7 +100,9 @@ Think of a `.proto` file as a function signature shared by two processes that wi
 - A Go **interface** (`InvoiceServiceServer`) your server must implement.
 - A Go **client** (`InvoiceServiceClient`) whose methods look exactly like calling that interface locally.
 
-Calling `client.GetInvoice(ctx, req)` *feels* like a local function call, but every call is really: serialize `req` to protobuf bytes → send an HTTP/2 request with the method name as the path → the server deserializes, runs your handler, serializes the response → the client deserializes it back into a Go struct. The `ctx` you pass in doesn't just cancel a goroutine, the way it does for an in-process call — its deadline is marshaled into a `grpc-timeout` header and re-materialized as a context on the server, and its cancellation is what actually stops the TCP stream.
+Calling `client.GetInvoice(ctx, req)` *feels* like a local function call, but every call is really: serialize `req` to protobuf bytes → send an HTTP/2 request with the method name as the path → the server deserializes, runs your handler, serializes the response → the client deserializes it back into a Go struct.
+
+The `ctx` you pass in doesn't just cancel a goroutine, the way it does for an in-process call — its deadline is marshaled into a `grpc-timeout` header and re-materialized as a context on the server, and its cancellation is what actually stops the TCP stream.
 
 ## 3. How it works
 
@@ -96,7 +150,9 @@ flowchart LR
     GR --> C
 ```
 
-`go_package = "invoiceops/gen/invoice/v1;invoicev1"` has two halves: the import path (`invoiceops/gen/invoice/v1`) and the package name used inside Go (`invoicev1`) — needed because proto packages (`invoice.v1`) aren't valid Go identifiers. Plugin versions are pinned explicitly (`protoc-gen-go@v1.34.2`, `protoc-gen-go-grpc@v1.5.1`) rather than `@latest`, the same way any other dependency is pinned; Go 1.24 added a `tool` directive in `go.mod` (`go get -tool google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2`) so these generator binaries are tracked and reproducible the same way module dependencies are, without a separate `tools.go` file.
+`go_package = "invoiceops/gen/invoice/v1;invoicev1"` has two halves: the import path (`invoiceops/gen/invoice/v1`) and the package name used inside Go (`invoicev1`) — needed because proto packages (`invoice.v1`) aren't valid Go identifiers.
+
+Plugin versions are pinned explicitly (`protoc-gen-go@v1.34.2`, `protoc-gen-go-grpc@v1.5.1`) rather than `@latest`, the same way any other dependency is pinned; Go 1.24 added a `tool` directive in `go.mod` (`go get -tool google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2`) so these generator binaries are tracked and reproducible the same way module dependencies are, without a separate `tools.go` file.
 
 Generated code is never hand-edited. CI should run `buf generate && git diff --exit-code gen/` so a `.proto` change without a regenerated commit fails the build, not a confusing runtime mismatch.
 
@@ -160,7 +216,11 @@ A gRPC handler returns `(response, error)`, and that `error` should almost alway
 | `Unavailable` | Transient, safe to retry | Server restarting |
 | `Internal` | A bug, not the caller's fault | Panic, unexpected nil |
 
-Map domain errors to codes in exactly one place (an interceptor or a small translation function), the same discipline [[API Error Handling]] describes for HTTP — never let a raw driver error leak into a `codes.Internal` message a client might log or show. For field-level detail, attach `google.rpc.BadRequest` via the `errdetails` package rather than encoding it into the message string. On the client side, `status.FromError(err)` recovers the `*status.Status` (code, message, details) from any error a call returns; `status.Code(err)` is the shortcut when only the code is needed, and both return `codes.Unknown` for a plain Go error that never went through `status.Error`.
+Map domain errors to codes in exactly one place (an interceptor or a small translation function), the same discipline [[API Error Handling]] describes for HTTP — never let a raw driver error leak into a `codes.Internal` message a client might log or show.
+
+For field-level detail, attach `google.rpc.BadRequest` via the `errdetails` package rather than encoding it into the message string.
+
+On the client side, `status.FromError(err)` recovers the `*status.Status` (code, message, details) from any error a call returns; `status.Code(err)` is the shortcut when only the code is needed, and both return `codes.Unknown` for a plain Go error that never went through `status.Error`.
 
 ### Deadlines
 
@@ -177,7 +237,11 @@ sequenceDiagram
     I-->>C: response + status + trailers
 ```
 
-The client's `context.WithTimeout` is what actually becomes the `grpc-timeout` header; the server reconstructs a context with that same deadline. A handler that calls a downstream RPC or a DB query must pass that *same* `ctx` down — resetting a fresh `context.Background()` (or a fresh 5-second timeout) at each hop breaks the budget: a client that gave up after 2 seconds no longer has a listener, but downstream calls happily keep running past it. See [[Context Package]] for the general propagation rules this builds on.
+The client's `context.WithTimeout` is what actually becomes the `grpc-timeout` header; the server reconstructs a context with that same deadline.
+
+A handler that calls a downstream RPC or a DB query must pass that *same* `ctx` down — resetting a fresh `context.Background()` (or a fresh 5-second timeout) at each hop breaks the budget: a client that gave up after 2 seconds no longer has a listener, but downstream calls happily keep running past it.
+
+See [[Context Package]] for the general propagation rules this builds on.
 
 ### Metadata
 
@@ -220,15 +284,25 @@ creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
 grpcServer := grpc.NewServer(grpc.Creds(creds))
 ```
 
-For service-to-service calls inside a cluster, mutual TLS (both sides present a certificate) is the common choice — see [[Service-to-Service Auth - API Keys, HMAC, mTLS]] for the certificate and rotation side, and [[TLS and HTTPS]] for the protocol itself. `grpc.WithTransportCredentials(insecure.NewCredentials())`, used throughout this note's tests, is for bufconn and local development only — it does not belong on a line that could ever cross a real network. A `PerRPCCredentials` implementation (not shown here) can additionally attach a short-lived token to every call over an already-TLS-protected channel.
+For service-to-service calls inside a cluster, mutual TLS (both sides present a certificate) is the common choice — see [[Service-to-Service Auth - API Keys, HMAC, mTLS]] for the certificate and rotation side, and [[TLS and HTTPS]] for the protocol itself.
+
+`grpc.WithTransportCredentials(insecure.NewCredentials())`, used throughout this note's tests, is for bufconn and local development only — it does not belong on a line that could ever cross a real network.
+
+A `PerRPCCredentials` implementation (not shown here) can additionally attach a short-lived token to every call over an already-TLS-protected channel.
 
 ### Health and reflection
 
-The standard `grpc_health_v1` service lets a load balancer or Kubernetes probe ask "are you serving `invoice.v1.InvoiceService`?" without knowing the service's own RPCs. Server **reflection** (`reflection.Register(grpcServer)`) is what let `grpcurl` discover and call this service below without a local copy of the `.proto` — register it in dev and staging; in production either leave it off or protect it, since it hands out your full API surface to anyone who can reach the port.
+The standard `grpc_health_v1` service lets a load balancer or Kubernetes probe ask "are you serving `invoice.v1.InvoiceService`?" without knowing the service's own RPCs.
+
+Server **reflection** (`reflection.Register(grpcServer)`) is what let `grpcurl` discover and call this service below without a local copy of the `.proto` — register it in dev and staging; in production either leave it off or protect it, since it hands out your full API surface to anyone who can reach the port.
 
 ### Load balancing
 
-A plain TCP (L4) load balancer picks one backend per **connection**, and gRPC connections are long-lived HTTP/2 streams carrying thousands of calls — so an L4 balancer in front of gRPC tends to pin all traffic from one client to one backend, defeating the balancer entirely. Two real fixes: client-side load balancing (`grpc.WithDefaultServiceConfig` with the `round_robin` policy, resolving a headless Kubernetes `Service` to every pod IP so the client itself round-robins per call), or an L7 proxy that understands HTTP/2 framing (Envoy, or a service mesh sidecar). `MaxConnectionAge`/`MaxConnectionAgeGrace` server options force periodic reconnects so new connections keep landing on a balanced set of backends even without either fix.
+A plain TCP (L4) load balancer picks one backend per **connection**, and gRPC connections are long-lived HTTP/2 streams carrying thousands of calls — so an L4 balancer in front of gRPC tends to pin all traffic from one client to one backend, defeating the balancer entirely.
+
+Two real fixes: client-side load balancing (`grpc.WithDefaultServiceConfig` with the `round_robin` policy, resolving a headless Kubernetes `Service` to every pod IP so the client itself round-robins per call), or an L7 proxy that understands HTTP/2 framing (Envoy, or a service mesh sidecar).
+
+`MaxConnectionAge`/`MaxConnectionAgeGrace` server options force periodic reconnects so new connections keep landing on a balanced set of backends even without either fix.
 
 Keepalive pings keep idle connections (and anything in between, like NAT devices) from silently dropping them — but a client that pings too aggressively trips the server's `EnforcementPolicy.MinTime` and gets disconnected with a `too_many_pings` error; keep client `keepalive.ClientParameters.Time` comfortably above the server's configured minimum (grpc-go's server default is 5 minutes).
 
@@ -238,7 +312,9 @@ grpc-go's default receive limit is **4 MiB** per message. A large `CreateInvoice
 
 ### Retries
 
-Automatic retries are configured declaratively via **service config**, and only make sense for RPCs that are safe to run twice — the same idempotency rule [[Idempotency and Idempotency Keys]] covers for HTTP. grpc-go also supports **hedging** (firing a second copy of a slow call before the first one returns, keeping whichever answers first), which trades extra load for tail latency and is only safe for idempotent reads.
+Automatic retries are configured declaratively via **service config**, and only make sense for RPCs that are safe to run twice — the same idempotency rule [[Idempotency and Idempotency Keys]] covers for HTTP.
+
+grpc-go also supports **hedging** (firing a second copy of a slow call before the first one returns, keeping whichever answers first), which trades extra load for tail latency and is only safe for idempotent reads.
 
 ### Observability
 
@@ -685,7 +761,9 @@ ERROR:
     	}
 ```
 
-That second call never reached `CreateInvoice`'s own handler code at all — `ValidateUnaryInterceptor` rejected it in the chain, which is exactly the point of running protovalidate as an interceptor instead of as the first lines of every handler. The structured `errdetails.BadRequest` — not just the status message — is what lets a client render "total_cents must be greater than 0" next to the right form field instead of parsing an error string.
+That second call never reached `CreateInvoice`'s own handler code at all — `ValidateUnaryInterceptor` rejected it in the chain, which is exactly the point of running protovalidate as an interceptor instead of as the first lines of every handler.
+
+The structured `errdetails.BadRequest` — not just the status message — is what lets a client render "total_cents must be greater than 0" next to the right form field instead of parsing an error string.
 
 ## 5. Variants and comparison
 
@@ -716,8 +794,10 @@ That second call never reached `CreateInvoice`'s own handler code at all — `Va
 ## 8. Deep dive
 
 - **Wire format.** Each gRPC message on an HTTP/2 DATA frame is prefixed with a 1-byte compression flag and a 4-byte big-endian length, followed by the protobuf-encoded bytes — this 5-byte header is why a gRPC message can't simply be read with a generic HTTP/1.1 client even if it could parse protobuf.
-- **Trailers-only vs headers+trailers.** A call that fails before any response message is sent (e.g. an auth rejection) returns a **trailers-only** response: `grpc-status` and `grpc-message` arrive as the one and only HTTP/2 header block. A call that sends a response first carries `grpc-status` in a trailing header block after the DATA frame — which is exactly why gRPC needs HTTP/2's trailer support and doesn't work over plain HTTP/1.1.
-- **Why embed `UnimplementedXServer` by value, not a pointer.** The generated unimplemented struct's methods already return `codes.Unimplemented` for every RPC. Embedding it by value means a new method added to the service interface later is satisfied automatically (through promotion) and the code still compiles; embedding a pointer would need it initialized, and omitting the embed entirely means every future proto addition is a compile break across every implementation in the codebase — the mechanism Buf's `require_unimplemented_servers=true` option enforces.
+- **Trailers-only vs headers+trailers.** A call that fails before any response message is sent (e.g. an auth rejection) returns a **trailers-only** response: `grpc-status` and `grpc-message` arrive as the one and only HTTP/2 header block.
+  - A call that sends a response first carries `grpc-status` in a trailing header block after the DATA frame — which is exactly why gRPC needs HTTP/2's trailer support and doesn't work over plain HTTP/1.1.
+- **Why embed `UnimplementedXServer` by value, not a pointer.** The generated unimplemented struct's methods already return `codes.Unimplemented` for every RPC.
+  - Embedding it by value means a new method added to the service interface later is satisfied automatically (through promotion) and the code still compiles; embedding a pointer would need it initialized, and omitting the embed entirely means every future proto addition is a compile break across every implementation in the codebase — the mechanism Buf's `require_unimplemented_servers=true` option enforces.
 - **protovalidate vs protoc-gen-validate.** `protoc-gen-validate` (PGV) is in maintenance mode; `protovalidate` is its replacement, evaluating rules as CEL expressions read from the message's own descriptor at runtime rather than generating per-field Go validation code — slightly slower per call, much less generated code, and rules are inspectable from the compiled `FileDescriptorProto` without needing the original `.proto`.
 - **Service config retry policy** (JSON, set via `grpc.WithDefaultServiceConfig` or a resolver): declares max attempts, backoff, and which status codes are retryable, scoped per method — so only idempotent RPCs opt in, and a `CreateInvoice` without an idempotency key never does.
 
@@ -739,7 +819,9 @@ That second call never reached `CreateInvoice`'s own handler code at all — `Va
 > gRPC connections are long-lived HTTP/2 streams; an L4 balancer picks a backend once per connection, not per call, so one client pins to one backend for its whole session. Fix with client-side load balancing (`round_robin` against a headless Service) or an L7/HTTP-2-aware proxy, and bound connection lifetime with `MaxConnectionAge` so new connections keep rebalancing.
 
 > [!question]- Where should request validation live in a gRPC service, and why not just check fields at the top of each handler?
-> In a `protovalidate` unary interceptor, driven by `(buf.validate.field)` annotations in the `.proto`. Putting it in the chain means every RPC gets the same shape checks for free, the rules live next to the field they constrain (self-documenting), and a handler is guaranteed never to run on malformed input — versus hand-written `if` checks that are easy to forget on a new RPC.
+> In a `protovalidate` unary interceptor, driven by `(buf.validate.field)` annotations in the `.proto`.
+>
+> Putting it in the chain means every RPC gets the same shape checks for free, the rules live next to the field they constrain (self-documenting), and a handler is guaranteed never to run on malformed input — versus hand-written `if` checks that are easy to forget on a new RPC.
 
 > [!question]- Trap: is it safe to retry every gRPC call automatically on `Unavailable`?
 > No — only if the RPC is idempotent. `GetInvoice` is safe to retry; `CreateInvoice` without an idempotency key is not, since a retry after a successful-but-unacknowledged first attempt creates a duplicate invoice. Service-config retry policies should be scoped per method, same as HTTP retries in [[Timeouts, Retries and Backoff]].
@@ -760,3 +842,8 @@ That second call never reached `CreateInvoice`'s own handler code at all — `Va
 - **Before this:** [[Service Project Layout and Wiring]], [[gRPC]], [[Context Package]]
 - **Next:** [[gRPC Streaming in Go]], [[Serving REST and gRPC Together]]
 - **Compare with:** [[Protocol Buffers and Schema Evolution]] (the schema rules this note's proto follows), [[Testing Go Services]] (where `bufconn` fits alongside HTTP handler tests), [[API Error Handling]] (the HTTP-side equivalent of the status-code table above)
+
+### Watch on YouTube
+
+- [Build a gRPC server with Go - Step by step tutorial](https://www.youtube.com/watch?v=gbrPMv_GuQY) · Maximilien Andile · step-by-step: proto, codegen, server wiring
+- [gRPC: The Tutorial I Wish I Had (Golang)](https://www.youtube.com/watch?v=6Ol6zeocR28) · HuseyinCodes · clear conceptual + practical overview of gRPC in Go

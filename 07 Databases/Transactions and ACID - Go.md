@@ -15,13 +15,24 @@ sources:
   - "Go standard library docs, database/sql: DB.BeginTx, Tx.Commit, Tx.Rollback, TxOptions"
   - "Härder and Reuter, Principles of Transaction-Oriented Database Recovery (ACM Computing Surveys, 1983)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 7"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Transactions and ACID - Go
 
 > [!summary] TL;DR
-> Runnable Go for the ideas in [[Transactions and ACID]]: a conditional `UPDATE` that sells the last unit of stock exactly once, a generic `InTx` helper that commits, rolls back on error or panic, and retries the whole transaction on serialization failures and deadlocks, and a `BuyOne` function that wires them to `database/sql`. The retry and rollback logic is tested against a fake transaction, so no database is needed.
+> Runnable Go for the ideas in [[Transactions and ACID]]: a conditional `UPDATE` that sells the last unit of stock exactly once, a generic `InTx` helper that commits, rolls back on error or panic, and retries the whole transaction on serialization failures and deadlocks, and a `BuyOne` function that wires them to `database/sql`.
+>
+> The retry and rollback logic is tested against a fake transaction, so no database is needed.
+
+## Before the code
+
+- **`database/sql`** (`*sql.DB`, `BeginTx`, `Commit`, `Rollback`): Go's standard database API; a driver such as pgx is plugged in at run time.
+- **`context.Context`**: carries a deadline or cancellation into every query, so a slow transaction can be stopped.
+- **`defer` and `recover()`**: `defer` runs the rollback on every exit path; `recover` catches a panic so the transaction still rolls back before the panic continues.
+- **Interfaces and generics** (`Tx` interface, `runOnce[T Tx]`): the helper works with a real `*sql.Tx` or a fake one in tests.
+- **Error wrapping** (`errors.Is`, `errors.As`): look inside a wrapped error for the SQLSTATE code (40001, 40P01) that says "retry the whole transaction".
+- **What to run**: `go vet ./... && go test -race ./...`; no database is needed for the tests.
 
 ## What this code shows
 
@@ -75,7 +86,9 @@ INSERT INTO products VALUES (1, 'Cheque book (50 leaves)', 25000, 1);
 
 ### Step 1: reserve one unit with a conditional UPDATE
 
-**Concept.** The naive way to sell stock is "read the stock, check it is positive, write stock minus one", which lets two buyers both read `1` and both succeed ([[Transactions and ACID#Why the naive version oversells]]). The fix is to push the check into the `UPDATE` itself: `WHERE stock > 0` is evaluated by the database on the latest committed version of the row, after any concurrent writer has finished with it ([[Transactions and ACID#Why the conditional UPDATE is safe]]). The function therefore needs no explicit lock and no isolation level above READ COMMITTED. Alternatives are `SELECT ... FOR UPDATE` followed by an update (two statements, a held lock) or a version column ([[Locking - Optimistic vs Pessimistic - Go]]). The conditional update was chosen because it is one statement, and the row count tells the caller whether it won.
+**Concept.** The naive way to sell stock is "read the stock, check it is positive, write stock minus one", which lets two buyers both read `1` and both succeed ([[Transactions and ACID#Why the naive version oversells]]). The fix is to push the check into the `UPDATE` itself: `WHERE stock > 0` is evaluated by the database on the latest committed version of the row, after any concurrent writer has finished with it ([[Transactions and ACID#Why the conditional UPDATE is safe]]).
+
+The function therefore needs no explicit lock and no isolation level above READ COMMITTED. Alternatives are `SELECT ... FOR UPDATE` followed by an update (two statements, a held lock) or a version column ([[Locking - Optimistic vs Pessimistic - Go]]). The conditional update was chosen because it is one statement, and the row count tells the caller whether it won.
 
 ```go
 package txn
@@ -130,7 +143,11 @@ sequenceDiagram
 
 ### Step 2: a reusable transaction helper
 
-**Concept.** Every write path needs the same envelope: `BEGIN`, run the work, `COMMIT`, and `ROLLBACK` on every other exit, including panics ([[Transactions and ACID#The lifecycle of one transaction]]). Serialization failures and deadlocks add a second rule: the database has already rolled the transaction back, and the correct reaction is to run the whole function again ([[Transactions and ACID#Retrying: what to do on 40001 and 40P01]]). Copy-pasting this into each repository method invites a missing rollback on one early `return`. The helper is generic over a two-method `Tx` interface so it works with `*sql.Tx`, with an adapted `pgx.Tx`, and with the fake used in the tests. The plain alternative is `defer tx.Rollback()` in each function, which handles rollback but not retry.
+**Concept.** Every write path needs the same envelope: `BEGIN`, run the work, `COMMIT`, and `ROLLBACK` on every other exit, including panics ([[Transactions and ACID#The lifecycle of one transaction]]). Serialization failures and deadlocks add a second rule: the database has already rolled the transaction back, and the correct reaction is to run the whole function again ([[Transactions and ACID#Retrying: what to do on 40001 and 40P01]]).
+
+Copy-pasting this into each repository method invites a missing rollback on one early `return`. The helper is generic over a two-method `Tx` interface so it works with `*sql.Tx`, with an adapted `pgx.Tx`, and with the fake used in the tests.
+
+The plain alternative is `defer tx.Rollback()` in each function, which handles rollback but not retry.
 
 The helper is built from four small pieces. First, a `Tx` interface with only the two methods the helper needs, and a one-method interface for reading the SQLSTATE from a driver error:
 
@@ -263,7 +280,9 @@ stateDiagram-v2
 
 ### Step 3: call it with database/sql
 
-**Concept.** The helper is useful only when the repository code sits on top of it. `BuyOne` is the smallest realistic use: two statements that must both happen or neither ([[Transactions and ACID#Autocommit]] explains why each statement alone would commit separately). `db.BeginTx` takes one connection from the pool and holds it until commit or rollback, so every statement must go through the returned `*sql.Tx`. The isolation level is named explicitly so the code documents what it depends on. READ COMMITTED is enough here because the conditional update carries its own safety.
+**Concept.** The helper is useful only when the repository code sits on top of it. `BuyOne` is the smallest realistic use: two statements that must both happen or neither ([[Transactions and ACID#Autocommit]] explains why each statement alone would commit separately). `db.BeginTx` takes one connection from the pool and holds it until commit or rollback, so every statement must go through the returned `*sql.Tx`.
+
+The isolation level is named explicitly so the code documents what it depends on. READ COMMITTED is enough here because the conditional update carries its own safety.
 
 ```go
 package txn
@@ -300,7 +319,9 @@ func BuyOne(ctx context.Context, db *sql.DB, orderID, productID, priceMinor int6
 
 ### Step 4: the payment-webhook transaction in SQL
 
-**Concept.** The boundary rule is one transaction per business fact that must be all-or-nothing, and nothing slow inside it ([[Transactions and ACID#Choosing the boundary: the payment webhook]]). A payment webhook touches four tables: a dedupe row, the payment, the invoice and an audit row. Here it is as plain SQL, because the Go version is simply `InTx` around four `ExecContext` calls on one `tx`. The email is not sent here; an outbox row would be inserted in this transaction instead ([[Transactional Outbox and CDC]]), so that a slow mail server never holds the locks.
+**Concept.** The boundary rule is one transaction per business fact that must be all-or-nothing, and nothing slow inside it ([[Transactions and ACID#Choosing the boundary: the payment webhook]]). A payment webhook touches four tables: a dedupe row, the payment, the invoice and an audit row. Here it is as plain SQL, because the Go version is simply `InTx` around four `ExecContext` calls on one `tx`.
+
+The email is not sent here; an outbox row would be inserted in this transaction instead ([[Transactional Outbox and CDC]]), so that a slow mail server never holds the locks.
 
 ```sql
 BEGIN;

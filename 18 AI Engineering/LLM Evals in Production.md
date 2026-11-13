@@ -8,13 +8,15 @@ sources:
   - "OpenAI Cookbook, Evaluation best practices (2026)"
   - "Zheng et al., Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena (NeurIPS 2023)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # LLM Evals in Production
 
 > [!summary] TL;DR
-> An **eval** is an automated, repeatable check of whether an LLM-powered feature's output is good, run the same way a unit test suite runs: against a fixed dataset of cases, on every change, with a pass/fail (or scored) verdict you can gate a deploy on. Evals exist because "I read ten outputs and they looked fine" does not scale, does not repeat, and does not catch a regression three model-version upgrades from now.
+> An **eval** is an automated, repeatable check of whether an LLM-powered feature's output is good, run the same way a unit test suite runs: against a fixed dataset of cases, on every change, with a pass/fail (or scored) verdict you can gate a deploy on.
+>
+> Evals exist because "I read ten outputs and they looked fine" does not scale, does not repeat, and does not catch a regression three model-version upgrades from now.
 
 > [!abstract] Core idea
 > - Evals are tests for non-deterministic, open-ended output: they trade the unit test's exact-match assertion for assertions suited to natural language (keyword/regex checks, reference comparison, or another model as judge).
@@ -23,15 +25,67 @@ updated: 2026-11-07
 > - **Offline evals gate a deploy** (CI, before anything ships); **online evals watch a deploy** (A/B tests, shadow traffic, canaries, after it ships) — they answer different questions and you need both.
 > - An eval suite is only as trustworthy as its correlation with human judgment: calibrate your judge against human labels before trusting its score.
 
+## Start here: the basics
+
+**The problem in one story.**
+You tweak the prompt of your support bot so it sounds friendlier.
+You try five questions by hand and they look fine, so you ship.
+A week later you learn it stopped mentioning the refund policy on a whole class of questions.
+An eval suite is a set of saved test questions you rerun on every change, so this is caught before users see it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Eval | A test that scores model output instead of checking an exact value | "Does the answer mention the 30-day policy?" |
+| Non-deterministic | Same input can give different output | Two runs, two wordings |
+| Dataset | The saved list of test inputs (and maybe expected answers) | 200 real support questions |
+| Golden set | Hand-picked cases with known-good answers | "How do I reset my password?" + correct reply |
+| Rubric | Written scoring rules | "1 point if it cites a source" |
+| LLM-as-judge | Using another model to grade an answer | A model scoring answers 1-5 for faithfulness |
+| Regression | Something that used to work and now does not | Refund answers broke after a prompt edit |
+| CI | Automatic checks that run on every code change | Tests run on every pull request |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    CH["Prompt or model change"] --> OFF["Offline evals in CI<br/>(fixed dataset)"]
+    OFF -- "pass" --> SHIP["Ship"]
+    OFF -- "fail" --> FIX["Fix before merge"]
+    SHIP --> ON["Online evals<br/>(A/B, shadow, canary)"]
+    ON --> BAD["Bad cases found"]
+    BAD --> DS["Added to dataset"]
+    DS --> OFF
+```
+
+**Analogy.**
+Like grading essays: some checks are mechanical (word count, required facts), some need a teacher's judgment, and you keep old exam questions to test every new class.
+Where it breaks: a teacher grades consistently with experience, while an LLM judge must itself be checked against human grades before you trust its scores.
+
+**How the rest of this note builds up**
+
+- First "Why it exists" and the "Mental model": why manual spot checks miss regressions.
+- Then "How it works": the eval loop, the four eval kinds (cheapest first), dataset composition, offline vs online gates, and the error-analysis loop.
+- Then a worked Go example of an eval runner that gates a change.
+- Finally the SDE-3 deep dive: judge calibration, trade-offs and interview questions.
+
+> [!tip] Remember
+> Evals are unit tests for fuzzy output: run cheap checks first, gate merges offline, watch real traffic online, and feed every failure back into the dataset.
+
 ## 1. Why it exists
 
 Say you ship a support-bot feature backed by an LLM, and you manually try ten questions before every deploy: they look fine, you ship. Three weeks later a prompt tweak meant to fix formatting quietly breaks the bot's refund-policy answer for a class of question your ten manual tries never covered — a customer gets told the wrong refund window, and nobody notices until support tickets spike.
 
-An eval suite is the fix: a fixed set of representative and adversarial questions, with the refund-policy answer in particular, run automatically on every prompt or model change. "Does my new prompt still get the 30-day refund window right" becomes a single assertion that runs in CI, the same way a regression test catches a broken function before it reaches production — except the assertion has to work on free-form text, not `want == got`.
+An eval suite is the fix: a fixed set of representative and adversarial questions, with the refund-policy answer in particular, run automatically on every prompt or model change.
+
+"Does my new prompt still get the 30-day refund window right" becomes a single assertion that runs in CI, the same way a regression test catches a broken function before it reaches production — except the assertion has to work on free-form text, not `want == got`.
 
 ## 2. Mental model
 
-Treat an LLM feature's correctness the way you'd treat any other software behavior under test, but swap the assertion style: instead of `assert output == "30 days"`, you assert "output contains 30 days" (code assertion), or "output's meaning matches this reference answer" (reference-based / LLM-as-judge), because the model will phrase a correct answer differently every time. The dataset of cases plays the same role a table-driven test's cases play; the eval *harness* plays the role of `go test`; a CI gate plays the role of "don't merge red."
+Treat an LLM feature's correctness the way you'd treat any other software behavior under test, but swap the assertion style: instead of `assert output == "30 days"`, you assert "output contains 30 days" (code assertion), or "output's meaning matches this reference answer" (reference-based / LLM-as-judge), because the model will phrase a correct answer differently every time.
+
+The dataset of cases plays the same role a table-driven test's cases play; the eval *harness* plays the role of `go test`; a CI gate plays the role of "don't merge red."
 
 The twist unit tests don't have: your "assertion function" is sometimes itself a model call (an LLM judge), which means the test can be wrong in its own right — so part of running evals seriously is testing the judge against human labels, the way you'd validate any measurement instrument before trusting its readings.
 
@@ -65,7 +119,9 @@ flowchart TB
 
 - **Code assertions** check something mechanically verifiable: "is this valid JSON", "does the output contain the word 'refund'", "is the cited URL one of the retrieved sources". Cheap, deterministic, zero false positives from model variance — use these for everything that can be checked this way before reaching for a judge.
 - **Reference-based** scoring compares the model's output to a known-good reference answer, either with a simple similarity measure or by having a judge compare the two. This needs a labeled dataset (a human or a strong model wrote the reference once), but then scoring is repeatable.
-- **LLM-as-judge** has a (often more capable, or differently-prompted) model score an output against a rubric, with no single reference answer required — good for open-ended quality ("is this response helpful and on-topic") where there's no one right phrasing. The judge itself needs a clear rubric, ideally a few-shot example per rubric score, and — critically — periodic comparison against human labels (**judge calibration**) so you know it isn't systematically too lenient or too harsh, or biased toward longer answers (a documented failure mode of naive LLM judges).
+- **LLM-as-judge** has a (often more capable, or differently-prompted) model score an output against a rubric, with no single reference answer required — good for open-ended quality ("is this response helpful and on-topic") where there's no one right phrasing.
+
+  The judge itself needs a clear rubric, ideally a few-shot example per rubric score, and — critically — periodic comparison against human labels (**judge calibration**) so you know it isn't systematically too lenient or too harsh, or biased toward longer answers (a documented failure mode of naive LLM judges).
 - **Human review** is ground truth. It doesn't scale to run on every CI build, but a small, regularly-refreshed sample of human-labeled cases is what calibrates the other three and catches what no automated check anticipated.
 - **Pairwise comparison** (judge picks "A is better than B" between two outputs for the same input) is often more reliable than asking a judge to produce an absolute score, because relative judgments are easier for a model (and a human) to make consistently than calibrated absolute numbers.
 
@@ -94,11 +150,15 @@ sequenceDiagram
     Dev->>Prod: ramp to 100% or roll back
 ```
 
-**Offline** evals run before anything reaches a user: they're deterministic enough to gate a merge, fast enough to run on every PR, and they answer "did this change break something we already knew to check." **Online** evaluation — A/B tests, shadow traffic (the new version runs on real traffic but its output is never shown to the user, just logged and compared), and canary releases (a small percentage of real users see the new version) — answers "does this change actually help, on traffic we didn't anticipate in our dataset," and it's the only way to catch a regression your dataset genuinely has no case for.
+**Offline** evals run before anything reaches a user: they're deterministic enough to gate a merge, fast enough to run on every PR, and they answer "did this change break something we already knew to check."
+
+**Online** evaluation — A/B tests, shadow traffic (the new version runs on real traffic but its output is never shown to the user, just logged and compared), and canary releases (a small percentage of real users see the new version) — answers "does this change actually help, on traffic we didn't anticipate in our dataset," and it's the only way to catch a regression your dataset genuinely has no case for.
 
 ### The error-analysis loop
 
-Every eval failure is a lead, not just a number. Reading failing cases, grouping them by root cause ("it's always the ambiguous-pronoun questions", "it's always when the retrieved context has more than 3 chunks") and turning the pattern into either a prompt fix or a new dataset case is what keeps an eval suite from becoming a stale, un-trusted ritual. Treat a dropping pass rate the way you'd treat a dropping test-coverage number: as the start of an investigation, not the end of one.
+Every eval failure is a lead, not just a number. Reading failing cases, grouping them by root cause ("it's always the ambiguous-pronoun questions", "it's always when the retrieved context has more than 3 chunks") and turning the pattern into either a prompt fix or a new dataset case is what keeps an eval suite from becoming a stale, un-trusted ritual.
+
+Treat a dropping pass rate the way you'd treat a dropping test-coverage number: as the start of an investigation, not the end of one.
 
 ## 4. Worked example
 
@@ -440,7 +500,9 @@ ok  	evals	1.534s
 > False. The judge is itself a model with its own biases (e.g. favoring longer answers) and sampling variance. It's only trustworthy once calibrated against human labels, and even then it's a proxy for human judgment, not a replacement for it.
 
 > [!question]- What's the difference between offline and online evaluation, and why do you need both?
-> Offline evals run against a fixed dataset before a change ships and gate the merge; they catch known failure modes fast but can't catch what the dataset didn't anticipate. Online evaluation (A/B, shadow, canary) runs against real production traffic after a controlled partial release and catches regressions the dataset missed — at the cost of exposing some real users to the new version first (shadow traffic avoids even that, at the cost of not measuring real user reactions).
+> Offline evals run against a fixed dataset before a change ships and gate the merge; they catch known failure modes fast but can't catch what the dataset didn't anticipate.
+>
+> Online evaluation (A/B, shadow, canary) runs against real production traffic after a controlled partial release and catches regressions the dataset missed — at the cost of exposing some real users to the new version first (shadow traffic avoids even that, at the cost of not measuring real user reactions).
 
 > [!question]- Your eval pass rate has been 99% for six months with zero failures. Is that good news?
 > Not necessarily — it's more likely the dataset has gone stale and no longer reflects what's actually breaking in production. Check whether production-sampled failures are still being added to the dataset; a suite that never fails is a suite that isn't testing anything new.
@@ -467,3 +529,8 @@ ok  	evals	1.534s
 - **Before this:** [[Prompt Engineering]], [[RAG Evaluation]]
 - **Next:** [[Guardrails and LLM Security]], [[LLM Observability]]
 - **Compare with:** [[Testing Strategy and the Test Pyramid]] (the same CI-gate discipline applied to deterministic code)
+
+### Watch on YouTube
+
+- [How to Systematically Setup LLM Evals (Metrics, Unit Tests, LLM-as-a-Judge)](https://www.youtube.com/watch?v=a3SMraZWNNs) · Dave Ebbelaar · 55 min · 133,758 views
+- [What are LLM Evals ?](https://www.youtube.com/watch?v=FdqrP7jvZEo) · New Machina · 4 min · 13,032 views

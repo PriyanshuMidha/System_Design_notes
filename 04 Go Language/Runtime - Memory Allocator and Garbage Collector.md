@@ -10,7 +10,7 @@ sources:
   - "golang.org/doc/gc-guide (A Guide to the Go Garbage Collector)"
   - "golang.org/doc/go1.19, GOMEMLIMIT"
   - "golang.org/doc/go1.24, weak pointers and runtime.AddCleanup"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Runtime - Memory Allocator and Garbage Collector
@@ -25,15 +25,67 @@ updated: 2026-11-07
 > - `GOGC` says "run again once live memory has grown by this percent"; `GOMEMLIMIT` says "never let the heap exceed this absolute size" — most services should set both.
 > - GC cost tracks **live, pointer-containing data**, not total garbage: pointer-free bytes (most byte slices, strings) are nearly free to scan.
 
+## Start here: the basics
+
+**The problem in one story.**
+In an office, people keep taking new sheets of paper and leaving old ones on their desks.
+Someone must hand out paper quickly and, now and then, collect sheets nobody needs anymore.
+If collection stops the whole office, everyone waits; if it never happens, the office fills up.
+Go's allocator hands out memory; its garbage collector cleans up while the program keeps working.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Allocation | Asking for a piece of memory | `make([]byte, 1024)` |
+| Heap | Memory that lives beyond one function call | A `*User` returned from a function |
+| Garbage | Memory no variable can reach anymore | A slice nobody points to |
+| Garbage collector (GC) | Runtime part that finds and frees garbage | Runs automatically in the background |
+| Mark and sweep | Mark everything reachable, then free the rest | Start from globals and stacks |
+| Stop-the-world (STW) | A short pause of all goroutines | Usually well under 1ms in Go |
+| `GOGC` | How much the heap may grow before the next GC | `GOGC=100` = grow 100% |
+| `GOMEMLIMIT` | A soft cap on total Go memory | `GOMEMLIMIT=1GiB` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["new object"] --> MC["mcache<br/>(per P, no lock)"]
+    MC -- "empty" --> CE["mcentral<br/>(per size class)"]
+    CE -- "empty" --> MH["mheap"] --> OS["OS memory"]
+    GC["GC: mark reachable,<br/>sweep the rest"] -. "frees back" .-> MH
+```
+
+**Analogy.** The allocator is a stationery cupboard with a small tray on each desk; the GC is a cleaner who tags papers still in use and bins the rest during the workday.
+Where it breaks: a real cleaner can't watch you move papers mid-cleanup; Go needs a write barrier to notice pointer changes during marking.
+
+**How the rest of this note builds up**
+
+- First, why Go manages memory for you and the mental model (sections 1-2).
+- Then the allocator path (mcache, mcentral, mheap), tri-color marking, write barrier and the pacer (section 3).
+- Then a worked example measuring allocations and GC, plus comparisons and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive: tuning `GOGC`/`GOMEMLIMIT` in production, why pointers cost more than bytes, interview questions (sections 7-9).
+
+> [!tip] Remember
+> Go allocates fast from per-P caches and collects concurrently; fewer allocations and fewer pointers mean less GC work.
+
 ## 1. Why it exists
 
-Manual memory management (C's `malloc`/`free`) requires knowing exactly when nobody needs an object any more. A function that returns a pointer to a struct it allocated, stored by its caller in three different data structures, cannot know — in general — whether it is safe to free, without tracking every reference. Get it wrong by freeing too early and you get a use-after-free; get it wrong by never freeing and you leak.
+Manual memory management (C's `malloc`/`free`) requires knowing exactly when nobody needs an object any more. A function that returns a pointer to a struct it allocated, stored by its caller in three different data structures, cannot know — in general — whether it is safe to free, without tracking every reference.
 
-Go's answer is twofold: the compiler's **escape analysis** decides, per variable, whether it can live safely on the stack — freed automatically when its function returns, no GC involved — or whether it must go on the heap because a reference to it outlives the function (see [[Pointers, Values and Escape Analysis]]). For whatever does end up on the heap, the **garbage collector** tracks reachability from a set of roots (goroutine stacks, globals) and frees anything unreachable, so application code never calls `free`.
+Get it wrong by freeing too early and you get a use-after-free; get it wrong by never freeing and you leak.
+
+Go's answer is twofold: the compiler's **escape analysis** decides, per variable, whether it can live safely on the stack — freed automatically when its function returns, no GC involved — or whether it must go on the heap because a reference to it outlives the function (see [[Pointers, Values and Escape Analysis]]).
+
+For whatever does end up on the heap, the **garbage collector** tracks reachability from a set of roots (goroutine stacks, globals) and frees anything unreachable, so application code never calls `free`.
 
 ## 2. Mental model
 
-Think of the allocator as a warehouse with bins of fixed-size boxes (size classes): asking for an 18-byte box gets you a 24-byte bin, because the warehouse only stocks a fixed set of sizes — simpler shelving, and a next-door bin of the same size is immediately reusable for the next same-sized request. The garbage collector is a (mostly) separate crew that, every so often, walks the warehouse starting from the loading docks (goroutine stacks and globals) and the boxes they directly hold, following every box's own outgoing labels transitively, marking every box it reaches as "in use", and then recycling anything unmarked. Crucially, that crew does its walk **while the warehouse keeps operating**, not during a shutdown — it just has to coordinate carefully with whoever is actively relabeling boxes mid-walk (the write barrier).
+Think of the allocator as a warehouse with bins of fixed-size boxes (size classes): asking for an 18-byte box gets you a 24-byte bin, because the warehouse only stocks a fixed set of sizes — simpler shelving, and a next-door bin of the same size is immediately reusable for the next same-sized request.
+
+The garbage collector is a (mostly) separate crew that, every so often, walks the warehouse starting from the loading docks (goroutine stacks and globals) and the boxes they directly hold, following every box's own outgoing labels transitively, marking every box it reaches as "in use", and then recycling anything unmarked.
+
+Crucially, that crew does its walk **while the warehouse keeps operating**, not during a shutdown — it just has to coordinate carefully with whoever is actively relabeling boxes mid-walk (the write barrier).
 
 ## 3. How it works
 
@@ -61,11 +113,17 @@ flowchart TB
     os -. "scavenger returns unused pages" .-> mh
 ```
 
-A small object (≤32 KB) is allocated by rounding its size up to the nearest of **~68 size classes** (8, 16, 24, 32, 48, 64, … bytes) and taking a free slot from the current P's `mcache` for that class — no lock, because each P owns its `mcache` alone. When a class's local free list empties, the P refills a batch from the shared `mcentral` for that class (one lock per class, so contention is spread across classes, not global), and `mcentral` in turn asks `mheap` for another **span** (a multiple of 8 KB of same-class memory) when it runs out. A **large object** (>32 KB) skips size classes and goes straight to `mheap`, which finds or creates a span sized to fit it exactly.
+A small object (≤32 KB) is allocated by rounding its size up to the nearest of **~68 size classes** (8, 16, 24, 32, 48, 64, … bytes) and taking a free slot from the current P's `mcache` for that class — no lock, because each P owns its `mcache` alone.
+
+When a class's local free list empties, the P refills a batch from the shared `mcentral` for that class (one lock per class, so contention is spread across classes, not global), and `mcentral` in turn asks `mheap` for another **span** (a multiple of 8 KB of same-class memory) when it runs out.
+
+A **large object** (>32 KB) skips size classes and goes straight to `mheap`, which finds or creates a span sized to fit it exactly.
 
 A special **tiny allocator** packs multiple sub-16-byte, pointer-free objects (e.g. small strings, individual `int8`/`bool` values that escape) into one 16-byte block, because a separate size-class slot per tiny object would waste more on bookkeeping than the object itself.
 
-Whether an allocation happens at all, and where, is decided at compile time by **escape analysis** (`go build -gcflags=-m` prints its decisions): a value that provably never outlives its function and is never captured by reference stays on the stack, costing nothing once the function returns. That recap belongs to [[Pointers, Values and Escape Analysis]]; this note starts from "it escaped to the heap."
+Whether an allocation happens at all, and where, is decided at compile time by **escape analysis** (`go build -gcflags=-m` prints its decisions): a value that provably never outlives its function and is never captured by reference stays on the stack, costing nothing once the function returns.
+
+That recap belongs to [[Pointers, Values and Escape Analysis]]; this note starts from "it escaped to the heap."
 
 ### Returning memory to the OS
 
@@ -97,7 +155,11 @@ Only the two **stop-the-world** pauses (sweep termination, mark termination) act
 
 ### The write barrier
 
-Marking concurrently with a running program creates a real hazard: a goroutine could move the only reference to a white object from an already-scanned (black) object into an unscanned (grey) one, then the mark phase could finish believing the white object is garbage, and sweep would free a reachable object. Go's **write barrier** — a few extra instructions the compiler inserts around every pointer write during the concurrent mark phase — prevents this, by shading the object being pointed to grey whenever a pointer to it is written, which guarantees the invariant "no black object points to a white object" holds throughout marking (Dijkstra's insertion barrier, specifically). The write barrier is compiled in only while a GC cycle's mark phase is active; it costs nothing between cycles.
+Marking concurrently with a running program creates a real hazard: a goroutine could move the only reference to a white object from an already-scanned (black) object into an unscanned (grey) one, then the mark phase could finish believing the white object is garbage, and sweep would free a reachable object.
+
+Go's **write barrier** — a few extra instructions the compiler inserts around every pointer write during the concurrent mark phase — prevents this, by shading the object being pointed to grey whenever a pointer to it is written, which guarantees the invariant "no black object points to a white object" holds throughout marking (Dijkstra's insertion barrier, specifically).
+
+The write barrier is compiled in only while a GC cycle's mark phase is active; it costs nothing between cycles.
 
 ### The pacer: GOGC and GOMEMLIMIT
 
@@ -107,9 +169,13 @@ The **pacer** decides when the next cycle starts, aiming for a heap goal:
 heap goal = live heap size × (1 + GOGC / 100)
 ```
 
-`GOGC=100` (the default) means "let the heap roughly double from its last live size before collecting again" — trading memory for less CPU spent collecting. `GOGC=400` collects a quarter as often, using roughly 4x the live heap in peak memory, for services with memory to spare and a CPU-bound hot path. `GOGC=off` disables the goal-based trigger entirely (used only alongside `GOMEMLIMIT`, see below).
+`GOGC=100` (the default) means "let the heap roughly double from its last live size before collecting again" — trading memory for less CPU spent collecting. `GOGC=400` collects a quarter as often, using roughly 4x the live heap in peak memory, for services with memory to spare and a CPU-bound hot path.
 
-Since **Go 1.19**, `GOMEMLIMIT` sets a **soft, absolute** ceiling (e.g. `GOMEMLIMIT=900MiB`) on total runtime-managed memory. The pacer runs extra GC cycles, beyond what `GOGC` alone would trigger, if the heap is approaching that limit — a safety net against OOM-killing, especially in a container with a hard memory limit, where "double the live heap" can simply exceed the container's quota regardless of `GOGC`. The common container pattern is `GOGC=off` with `GOMEMLIMIT` set to ~90% of the container's memory limit: let the heap grow freely up to near the ceiling (minimizing GC CPU) and let `GOMEMLIMIT` alone decide when to collect. Pure `GOMEMLIMIT` with no margin risks GC thrashing (collecting almost continuously once near the limit, since every small allocation re-triggers the check) or an OOM kill if a short spike outpaces collection — the ~10% margin, plus leaving `GOGC` at its default alongside `GOMEMLIMIT` for services less confident in the limit, exists for exactly that reason.
+`GOGC=off` disables the goal-based trigger entirely (used only alongside `GOMEMLIMIT`, see below).
+
+Since **Go 1.19**, `GOMEMLIMIT` sets a **soft, absolute** ceiling (e.g. `GOMEMLIMIT=900MiB`) on total runtime-managed memory. The pacer runs extra GC cycles, beyond what `GOGC` alone would trigger, if the heap is approaching that limit — a safety net against OOM-killing, especially in a container with a hard memory limit, where "double the live heap" can simply exceed the container's quota regardless of `GOGC`.
+
+The common container pattern is `GOGC=off` with `GOMEMLIMIT` set to ~90% of the container's memory limit: let the heap grow freely up to near the ceiling (minimizing GC CPU) and let `GOMEMLIMIT` alone decide when to collect. Pure `GOMEMLIMIT` with no margin risks GC thrashing (collecting almost continuously once near the limit, since every small allocation re-triggers the check) or an OOM kill if a short spike outpaces collection — the ~10% margin, plus leaving `GOGC` at its default alongside `GOMEMLIMIT` for services less confident in the limit, exists for exactly that reason.
 
 ```mermaid
 flowchart LR
@@ -125,11 +191,17 @@ flowchart LR
 
 ### Cost model: why pointers matter more than bytes
 
-GC work is proportional to the number of **pointers in live objects**, not to the number of bytes or the amount of garbage. A `[]byte` holding 10 MB of pointer-free data costs the scanner nothing beyond noting "this span has no pointers, skip it" (the runtime tracks per-span pointer bitmaps precisely so it can skip pointer-free spans entirely). A `map[string]*Record` holding 10 MB of boxed pointers makes the collector walk every single pointer, every cycle. This is the single biggest lever for GC-bound services: prefer value types and pointer-free data (byte slices, numeric slices, flat structs) over pointer-heavy structures (maps of pointers, linked lists, interface-boxed values) wherever the access pattern allows it.
+GC work is proportional to the number of **pointers in live objects**, not to the number of bytes or the amount of garbage. A `[]byte` holding 10 MB of pointer-free data costs the scanner nothing beyond noting "this span has no pointers, skip it" (the runtime tracks per-span pointer bitmaps precisely so it can skip pointer-free spans entirely).
+
+A `map[string]*Record` holding 10 MB of boxed pointers makes the collector walk every single pointer, every cycle. This is the single biggest lever for GC-bound services: prefer value types and pointer-free data (byte slices, numeric slices, flat structs) over pointer-heavy structures (maps of pointers, linked lists, interface-boxed values) wherever the access pattern allows it.
 
 ### Finalizers, cleanups, and weak pointers (Go 1.24)
 
-`runtime.SetFinalizer` lets an object run cleanup code just before it's collected, but it has sharp edges: it delays collection by at least one extra GC cycle, never runs at all if the object is part of a reference cycle the finalizer itself would need to break, and runs on an arbitrary goroutine. **Since Go 1.24**, `runtime.AddCleanup` replaces most finalizer use cases with a safer primitive: a cleanup function attached to an object (not the object's whole type), which doesn't keep the object reachable and may run concurrently with the object's own last use, and multiple cleanups can be attached without interfering with each other. Go 1.24 also added `weak.Pointer[T]`: a pointer that doesn't itself keep its target alive, useful for caches that should let unreferenced entries be collected rather than pin them forever.
+`runtime.SetFinalizer` lets an object run cleanup code just before it's collected, but it has sharp edges: it delays collection by at least one extra GC cycle, never runs at all if the object is part of a reference cycle the finalizer itself would need to break, and runs on an arbitrary goroutine.
+
+**Since Go 1.24**, `runtime.AddCleanup` replaces most finalizer use cases with a safer primitive: a cleanup function attached to an object (not the object's whole type), which doesn't keep the object reachable and may run concurrently with the object's own last use, and multiple cleanups can be attached without interfering with each other.
+
+Go 1.24 also added `weak.Pointer[T]`: a pointer that doesn't itself keep its target alive, useful for caches that should let unreferenced entries be collected rather than pin them forever.
 
 ### Observing the GC
 
@@ -140,13 +212,17 @@ gc 1 @0.000s 5%: 0.017+0.090+0.002 ms clock, 0.17+0.065/0.088/0+0.023 ms cpu, 1-
 gc 2 @0.000s 5%: 0.010+0.10+0.027 ms clock, 0.10+0.022/0.058/0.003+0.27 ms cpu, 1->2->0 MB, 2 MB goal, 0 MB stacks, 0 MB globals, 10 P
 ```
 
-**Measured output** (go1.24.4 darwin/arm64, Apple M4, `GOGC=50 GODEBUG=gctrace=1`) from a program allocating 2,000 short-lived 64 KiB byte slices and retaining every 50th one. Reading the fields: `gc 1` is the cycle number; `@0.000s` is time since program start; `5%` is the cumulative fraction of CPU time spent in GC so far; `0.017+0.090+0.002 ms clock` is wall-clock time for sweep termination + concurrent mark/scan + mark termination; the `cpu` group breaks the concurrent-mark time down further (assist/background/idle); `1->1->0 MB` is heap size at mark start → mark end → after sweep; `2 MB goal` is the pacer's target for this cycle; and `10 P` is `GOMAXPROCS`. The 64 KiB allocations are pointer-free `[]byte`, so each cycle's actual mark work here is near-zero — the trace is dominated by small, fixed per-cycle overhead, not by the amount of data allocated, which is itself a demonstration of the pointer-free cost model above.
+**Measured output** (go1.24.4 darwin/arm64, Apple M4, `GOGC=50 GODEBUG=gctrace=1`) from a program allocating 2,000 short-lived 64 KiB byte slices and retaining every 50th one. Reading the fields: `gc 1` is the cycle number; `@0.000s` is time since program start; `5%` is the cumulative fraction of CPU time spent in GC so far; `0.017+0.090+0.002 ms clock` is wall-clock time for sweep termination + concurrent mark/scan + mark termination; the `cpu` group breaks the concurrent-mark time down further (assist/background/idle); `1->1->0 MB` is heap size at mark start → mark end → after sweep; `2 MB goal` is the pacer's target for this cycle; and `10 P` is `GOMAXPROCS`.
+
+The 64 KiB allocations are pointer-free `[]byte`, so each cycle's actual mark work here is near-zero — the trace is dominated by small, fixed per-cycle overhead, not by the amount of data allocated, which is itself a demonstration of the pointer-free cost model above.
 
 `runtime/metrics` exposes the same and more as typed, stable counters (`/gc/heap/goal:bytes`, `/gc/cycles/total:gc-cycles`, `/memory/classes/...`) for production dashboards, and is preferred over parsing `GODEBUG` text in code. A heap profile (`go tool pprof` on `/debug/pprof/heap`, see [[Benchmarks, Profiling and Tracing]]) shows *where* allocations come from, which `gctrace` cannot.
 
 ### Green Tea GC (experimental, Go 1.25)
 
-Go 1.25 ships an experimental GC implementation, nicknamed "Green Tea," that groups small objects by memory span rather than scanning them individually, aiming to cut mark-phase overhead for allocation-heavy workloads; enable it with `GOEXPERIMENT=greenteagc`. As of Go 1.25 it is opt-in, not the default, and whether or when it becomes default in a later release is not yet documented (verify before relying on it in production).
+Go 1.25 ships an experimental GC implementation, nicknamed "Green Tea," that groups small objects by memory span rather than scanning them individually, aiming to cut mark-phase overhead for allocation-heavy workloads; enable it with `GOEXPERIMENT=greenteagc`.
+
+As of Go 1.25 it is opt-in, not the default, and whether or when it becomes default in a later release is not yet documented (verify before relying on it in production).
 
 ## 4. Worked example
 
@@ -222,7 +298,9 @@ BenchmarkBuildGrow-10        594721       1958 ns/op     25208 B/op     12 alloc
 BenchmarkBuildPrealloc-10   1638664      741.7 ns/op      8192 B/op      1 allocs/op
 ```
 
-Growing without a hint costs **12 allocations** (each growth threshold crossed reallocates and copies everything so far) and **3x the bytes** actually needed (over-allocation from doubling growth), versus **1 allocation** of exactly `1000 * 8 = 8192` bytes when the size is known up front. This is the allocator's size-class and growth behaviour showing up directly in `allocs/op`; fewer, larger allocations is almost always the right GC-pressure fix, not a smaller `GOGC`.
+Growing without a hint costs **12 allocations** (each growth threshold crossed reallocates and copies everything so far) and **3x the bytes** actually needed (over-allocation from doubling growth), versus **1 allocation** of exactly `1000 * 8 = 8192` bytes when the size is known up front.
+
+This is the allocator's size-class and growth behaviour showing up directly in `allocs/op`; fewer, larger allocations is almost always the right GC-pressure fix, not a smaller `GOGC`.
 
 ### A sync.Pool buffer pool (logic code, tested)
 
@@ -380,3 +458,8 @@ Ran with `go vet ./...` (clean) and `go test -race ./...` (go1.24.4 darwin/arm64
 - **Before this:** [[Pointers, Values and Escape Analysis]], [[Process Memory Layout - Stack vs Heap]], [[Runtime - Goroutine Scheduler (GMP)]]
 - **Next:** [[Benchmarks, Profiling and Tracing]]
 - **Compare with:** [[Arrays, Slices and Maps (with internals)]] (how slice growth drives the allocation patterns this note measures)
+
+### Watch on YouTube
+
+- [GopherCon 2015: Go GC: Solving the Latency Problem - Rick Hudson](https://www.youtube.com/watch?v=aiv1JOfMjm0) · Gopher Academy · foundational talk on the design of Go's concurrent GC
+- [GopherCon 2022: Control Theory and Concurrent Garbage Collection Deep Dive - Madhav Jivrajani](https://www.youtube.com/watch?v=We-8RSk4eZA) · Gopher Academy · deep dive on GC pacing and GOGC/GOMEMLIMIT tuning

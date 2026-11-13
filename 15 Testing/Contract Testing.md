@@ -8,7 +8,7 @@ sources:
   - "Confluent Schema Registry docs, Compatibility Types"
   - "pact-go v2 README (pact-foundation/pact-go)"
 status: reviewed
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Contract Testing
@@ -21,6 +21,53 @@ updated: 2026-11-04
 > - The consumer tests that recording against a mock; the provider later replays the same recording against its real code ("provider verification").
 > - A broker stores every contract version and tells a provider, before it deploys, whether every consumer it has a contract with is still satisfied (`can-i-deploy`).
 > - It is not schema testing: a schema check says the shapes match; a contract says this specific consumer's real usage still works, so additive, backward-compatible changes pass even though the schema changed.
+
+## Start here: the basics
+
+**The problem in one story.**
+Two teams own two services: `orders` asks `billing` for an invoice over HTTP.
+The billing team renames a field from `amount` to `total` and ships it.
+Both teams' own tests pass, because each tested only its own code.
+In production, `orders` reads an empty `amount` and charges customers zero.
+A contract test is a shared, written promise that catches this before billing ships.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Consumer | The service that makes the call | `orders` calling billing |
+| Provider | The service that answers the call | `billing` returning an invoice |
+| API | The agreed way two programs talk | `GET /invoices/42` returns JSON |
+| Schema | A description of the allowed data shape | OpenAPI or `.proto` file |
+| Mock | A fake stand-in for a real service in a test | A fake billing server returning fixed JSON |
+| Breaking change | A change that makes old callers fail | Removing or renaming a field |
+| CI | Automatic checks run on every code change | Tests run on each pull request |
+| Broker | A shared store that keeps contracts | Pact Broker |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Consumer test<br/>(against a mock)"] --> P["Contract file<br/>(what I call, what I read)"]
+    P --> B["Broker"]
+    B --> V["Provider CI replays it<br/>against real code"]
+    V --> D{"All consumers OK?"}
+    D -- "yes" --> S["Provider may deploy"]
+    D -- "no" --> X["Deploy blocked"]
+```
+
+**Analogy.** A restaurant order slip: the customer writes exactly what they want, and the kitchen checks it can still make every slip before changing the menu.
+Where it breaks: a slip only lists what was ordered, so the kitchen can change unordered dishes freely; real contracts also cannot prove the whole system works together end to end.
+
+**How the rest of this note builds up**
+
+- First, why it exists versus E2E tests and hand-written mocks (section 1), plus the tolerant-reader rule.
+- Then the record-and-replay mental model and how the broker and `can-i-deploy` work (sections 2-3).
+- Then a Go worked example of a contract and provider verification (section 4) and variants like bi-directional testing (section 5).
+- Finally the SDE-3 deep dive: provider states, schema-only limits and async message contracts (sections 6-8).
+
+> [!tip] Remember
+> The consumer writes down exactly what it uses; the provider must prove it still serves that before it deploys.
 
 ## 1. Why it exists
 
@@ -71,7 +118,11 @@ The consumer never talks to the real provider during its own test; the provider 
 
 ### Tolerant reader: the rule that makes "additive changes are safe" true
 
-A contract only asserts the fields the consumer actually reads (`WantFields` below), not the full response shape. This is the **tolerant reader** pattern: the consumer's parsing code should ignore fields it doesn't know about, so the provider is free to add new fields without breaking anyone. Combined with a **deprecate-before-removal** policy — mark a field deprecated, wait until the broker shows no active contract still depends on it, then remove — provider and consumer can each ship independently.
+A contract only asserts the fields the consumer actually reads (`WantFields` below), not the full response shape.
+
+This is the **tolerant reader** pattern: the consumer's parsing code should ignore fields it doesn't know about, so the provider is free to add new fields without breaking anyone.
+
+Combined with a **deprecate-before-removal** policy — mark a field deprecated, wait until the broker shows no active contract still depends on it, then remove — provider and consumer can each ship independently.
 
 ### Contract testing vs schema testing
 
@@ -331,30 +382,45 @@ flowchart LR
 
 ## 8. Deep dive
 
-- **Why tolerant reader matters for schema evolution:** if a consumer's deserializer rejects unknown fields (strict mode), tolerant-reader contract testing doesn't help — the consumer breaks on any addition regardless of what the contract says. Contract testing assumes (and should also test) that consumer parsing is lenient by default; strict parsers need an explicit allow-list of consumer-known fields kept in sync separately.
-- **Provider states are the hard part in practice.** A provider state like "order ord_1 exists and is refunded" needs the provider's CI to have a way to seed exactly that database state before each interaction — this is where [[Test Data Strategy]]'s builders and isolation techniques plug directly into contract verification: each provider state becomes a call to a test-data builder, not a hand-maintained SQL fixture.
-- **Limits of schema-only approaches**: `buf breaking` can tell you a field's wire number didn't change and a new field was appended (both compatible by protobuf rules) but cannot tell you a consumer's `switch` statement over an enum doesn't have a `default` case and will silently drop a new enum value — that failure mode is exactly what a consumer-driven contract (which encodes the consumer's actual assertions) is positioned to catch, if the consumer's test exercises that switch.
+- **Why tolerant reader matters for schema evolution:** if a consumer's deserializer rejects unknown fields (strict mode), tolerant-reader contract testing doesn't help — the consumer breaks on any addition regardless of what the contract says.
+  Contract testing assumes (and should also test) that consumer parsing is lenient by default; strict parsers need an explicit allow-list of consumer-known fields kept in sync separately.
+- **Provider states are the hard part in practice.** A provider state like "order ord_1 exists and is refunded" needs the provider's CI to have a way to seed exactly that database state before each interaction.
+  This is where [[Test Data Strategy]]'s builders and isolation techniques plug directly into contract verification: each provider state becomes a call to a test-data builder, not a hand-maintained SQL fixture.
+- **Limits of schema-only approaches**: `buf breaking` can tell you a field's wire number didn't change and a new field was appended (both compatible by protobuf rules) but cannot tell you a consumer's `switch` statement over an enum doesn't have a `default` case and will silently drop a new enum value.
+  That failure mode is exactly what a consumer-driven contract (which encodes the consumer's actual assertions) is positioned to catch, if the consumer's test exercises that switch.
 - **Async contracts**: for a message consumer, the "interaction" is "given this message on the topic, my consumer's handler does X" rather than a request/response pair; Pact supports message pacts for this, verified by feeding the recorded message into the provider's message-producing code and checking the same tolerant-reader field list.
 
 ## 9. Interview questions
 
 > [!question]- A provider team wants to add a new required field to their API. Does contract testing catch the risk here?
-> A newly **required** field on an existing endpoint is a breaking change for any consumer that doesn't send it (if it's a request field) or isn't ready to always receive it (if it's a response field consumers assume may be absent). Tolerant-reader contracts only guard additions that are optional from the consumer's perspective; a required-field addition needs a deprecation-style rollout (add optional, migrate consumers, then make required) and should itself be caught by the schema-diff half of a bi-directional check, since a schema diff explicitly flags newly required fields as breaking.
+> A newly **required** field on an existing endpoint is a breaking change for any consumer that doesn't send it (if it's a request field) or isn't ready to always receive it (if it's a response field consumers assume may be absent).
+>
+> Tolerant-reader contracts only guard additions that are optional from the consumer's perspective; a required-field addition needs a deprecation-style rollout (add optional, migrate consumers, then make required) and should itself be caught by the schema-diff half of a bi-directional check, since a schema diff explicitly flags newly required fields as breaking.
 
 > [!question]- How is this different from testing against a shared staging environment?
-> Staging couples both services' deploy schedules and shares one mutable environment across every team's tests, which is a common source of flakiness. Contract testing verifies the provider against the consumer's **recorded expectations** without the consumer running at all, so each side tests independently and faster, at the cost of not proving the full system works together — which is what staging and a smaller set of E2E tests are still for.
+> Staging couples both services' deploy schedules and shares one mutable environment across every team's tests, which is a common source of flakiness.
+>
+> Contract testing verifies the provider against the consumer's **recorded expectations** without the consumer running at all, so each side tests independently and faster, at the cost of not proving the full system works together — which is what staging and a smaller set of E2E tests are still for.
 
 > [!question]- Trap: "if the OpenAPI schemas match, the contract is satisfied." True or false?
-> False. Schema compatibility is necessary but not sufficient. A provider can keep an endpoint schema-compatible while still changing the *values* it returns for a given state (changing an error code's meaning, reordering an array a consumer indexes into) in a way that breaks a specific consumer's logic, which a consumer-driven contract — built from that consumer's actual assertions — would catch and a schema diff would not.
+> False. Schema compatibility is necessary but not sufficient.
+>
+> A provider can keep an endpoint schema-compatible while still changing the *values* it returns for a given state (changing an error code's meaning, reordering an array a consumer indexes into) in a way that breaks a specific consumer's logic, which a consumer-driven contract — built from that consumer's actual assertions — would catch and a schema diff would not.
 
 > [!question]- What is a provider state, and why does provider verification need it?
-> A provider state is the data setup an interaction assumes (e.g. "order ord_1 exists and is refunded"). Provider verification replays a captured request against the real provider code, so the provider must actually be in that state first — otherwise the response won't match what the consumer recorded, for reasons that have nothing to do with a real compatibility break.
+> A provider state is the data setup an interaction assumes (e.g. "order ord_1 exists and is refunded").
+>
+> Provider verification replays a captured request against the real provider code, so the provider must actually be in that state first — otherwise the response won't match what the consumer recorded, for reasons that have nothing to do with a real compatibility break.
 
 > [!question]- When would you add bi-directional contract testing instead of plain Pact-style CDC?
-> When you want both guarantees at low effort: Pact-style verification is cheap for the consumer (it already wrote the recording as part of its own tests) but only covers fields consumers currently use; a schema diff is cheap for the provider and covers the whole shape. Combining them catches consumer-specific logic breaks and general shape breaks, without needing every consumer to write a pact for every field.
+> When you want both guarantees at low effort: Pact-style verification is cheap for the consumer (it already wrote the recording as part of its own tests) but only covers fields consumers currently use; a schema diff is cheap for the provider and covers the whole shape.
+>
+> Combining them catches consumer-specific logic breaks and general shape breaks, without needing every consumer to write a pact for every field.
 
 > [!question]- Stop a provider deploy from breaking 5 consumers: what do you build?
-> A Pact Broker (or PactFlow) all 5 consumer teams publish pacts to, a provider verification step in the provider's CI that pulls every pact tagged for the target environment and replays it with correct provider states, and a `can-i-deploy` gate in the deploy pipeline that blocks release unless every one of those 5 contracts currently passes. Add a broker webhook so each consumer team's new pact triggers provider verification immediately, not at the provider's next unrelated deploy.
+> A Pact Broker (or PactFlow) all 5 consumer teams publish pacts to, a provider verification step in the provider's CI that pulls every pact tagged for the target environment and replays it with correct provider states, and a `can-i-deploy` gate in the deploy pipeline that blocks release unless every one of those 5 contracts currently passes.
+>
+> Add a broker webhook so each consumer team's new pact triggers provider verification immediately, not at the provider's next unrelated deploy.
 
 ## 10. Cheat sheet
 
@@ -371,3 +437,8 @@ flowchart LR
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Unit, Integration and E2E Tests]]
 - **Next:** [[Testing Async and Event-Driven Systems]]
 - **Compare with:** [[Test Data Strategy]] (provider states are a test-data problem), [[Fuzz and Property-Based Testing]] (checks an invariant across many inputs, not agreement between two services)
+
+### Watch on YouTube
+
+- [What is Contract Testing](https://www.youtube.com/watch?v=rHgOA_D_DRs) · Automation Step by Step · 3 min · 32,511 views
+- [What is Contract Testing in API automation + Demo (EA Weekly)](https://www.youtube.com/watch?v=KPu5VK8AP4E) · Execute Automation · 27 min · 42,786 views

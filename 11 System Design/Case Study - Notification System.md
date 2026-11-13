@@ -10,13 +10,15 @@ sources:
   - "Amazon SES Developer Guide, Managing your sending quotas; Receiving Amazon SES notifications (bounce, complaint, delivery)"
   - "RFC 8058, Signaling One-Click Functionality for List Email Headers"
   - "Twilio documentation, Message status values and status callbacks"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Notification System
 
 > [!summary] TL;DR
-> A notification system takes "tell this user (or these 5 million users) something" from other services and delivers it by push, email, SMS or in-app message. The hard parts are not sending: they are keeping a one-time password (OTP) fast while a marketing blast is running, never sending the same message twice, respecting user preferences, and surviving slow or failing third-party providers.
+> A notification system takes "tell this user (or these 5 million users) something" from other services and delivers it by push, email, SMS or in-app message.
+>
+> The hard parts are not sending: they are keeping a one-time password (OTP) fast while a marketing blast is running, never sending the same message twice, respecting user preferences, and surviving slow or failing third-party providers.
 
 > [!abstract] Core idea
 > - One ingestion API; behind it, separate queues per channel and per priority, so an OTP never waits behind a promotion.
@@ -24,6 +26,55 @@ updated: 2026-11-04
 > - Channel workers call providers (APNs, FCM, SES, Twilio) with timeouts, retries with backoff, a dead letter queue and a fallback provider.
 > - Delivery status comes back later by callbacks and is recorded per message.
 > - Broadcasts expand a segment into per-user messages in batches and are throttled to provider quotas.
+
+## Start here: the basics
+
+**The problem in one story.**
+You log in to your bank and wait for the one-time password (OTP) SMS.
+At the same moment, marketing is sending a sale message to 5 million people.
+If both go through the same line, your OTP arrives after it already expired.
+A notification system keeps urgent messages fast, never sends twice, and respects "do not disturb".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Channel | The way a message reaches a user | Push, email, SMS, in-app |
+| Provider | An outside company that actually delivers it | APNs, FCM, Twilio, SES |
+| Queue | A waiting line of jobs that workers take from | Kafka topic of SMS jobs |
+| Priority | How urgent a message is | OTP = high, promo = low |
+| Idempotency key | A unique ID so a repeat request is ignored | `order-42-shipped` |
+| Retry with backoff | Try again, waiting longer each time | 1 s, 2 s, 4 s |
+| Dead letter queue | A parking spot for messages that kept failing | Inspect later by hand |
+| Device token | An address for one app on one phone | FCM token string |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Other services"] --> API["Notify API"]
+    API --> G["Gate: dedupe,<br/>preferences, caps"]
+    G --> HQ["High-priority queue"]
+    G --> LQ["Low-priority queue"]
+    HQ --> W["Channel workers"]
+    LQ --> W
+    W --> P["Providers<br/>(APNs, FCM, SMS)"]
+    P --> U["User's phone"]
+```
+
+**Analogy.** A post office with a separate express counter, a list of people who said "no flyers", and a rule never to deliver the same letter twice.
+Where it breaks: a post office owns its vans; here the "vans" are third-party providers that can be slow, down, or rate-limited.
+
+**How the rest of this note builds up**
+
+- First, requirements and the mental model (sections 1-2).
+- Then the high-level design with queues per channel and priority (section 3).
+- Then the worked example: estimates, API, data model and Go code for the admission gate (section 4).
+- Then variants, trade-offs and production lessons (sections 5-7).
+- Finally the SDE-3 deep dive: broadcasting to 20 million users, deduplication at three levels, and device token hygiene (section 8).
+
+> [!tip] Remember
+> Separate queues by urgency, dedupe at the gate, and treat providers as unreliable.
 
 ## 1. Why it exists - requirements
 
@@ -47,7 +98,9 @@ Without a shared service, every team calls Twilio and SES directly. Each one re-
 
 ## 2. Mental model
 
-Think of a **post office sorting room**. Letters (requests) arrive at one counter. A clerk checks the address book (preferences) and throws away exact copies (dedupe). Letters are dropped into separate bins: express and bulk, per carrier (channel and priority queues). Each carrier (provider) has its own couriers (workers) who know that carrier's rules and limits. Undeliverable letters go to a dead-letter shelf, and delivery receipts come back later through a separate door (callbacks).
+Think of a **post office sorting room**. Letters (requests) arrive at one counter. A clerk checks the address book (preferences) and throws away exact copies (dedupe). Letters are dropped into separate bins: express and bulk, per carrier (channel and priority queues).
+
+Each carrier (provider) has its own couriers (workers) who know that carrier's rules and limits. Undeliverable letters go to a dead-letter shelf, and delivery receipts come back later through a separate door (callbacks).
 
 Two principles:
 1. **Isolation by priority and channel.** Separate queues and separate worker pools; a slow SMS provider cannot block push, and a campaign cannot block an OTP.
@@ -138,7 +191,9 @@ sequenceDiagram
     CB->>L: status=delivered
 ```
 
-A timeout does not prove the first provider failed to send. Retrying the same provider without a provider-side idempotency feature, or failing over to another provider, can therefore produce a duplicate SMS. For OTPs that is acceptable (two identical codes); for a "you were charged" message the worker must first query the provider for the earlier attempt. See [[Timeouts, Retries and Backoff]] and [[Circuit Breaker]].
+A timeout does not prove the first provider failed to send. Retrying the same provider without a provider-side idempotency feature, or failing over to another provider, can therefore produce a duplicate SMS.
+
+For OTPs that is acceptable (two identical codes); for a "you were charged" message the worker must first query the provider for the earlier attempt. See [[Timeouts, Retries and Backoff]] and [[Circuit Breaker]].
 
 **Message lifecycle.**
 
@@ -192,7 +247,11 @@ POST /v1/notifications {recipient|segment, template_id, params,
 | SMS cost driver | 1M SMS/day × provider price per SMS | SMS is the expensive channel; cap marketing SMS hard |
 | Device tokens | 50M users × 1.5 devices × 200 B | ≈ 15 GB |
 
-**What the numbers decide.** 185/s is trivial for any queue. The design is driven by the **11k/s broadcast peak** and by **provider quotas**: an SES account has a per-second sending rate set by AWS for that account, so a 5M-email campaign must be spread over time anyway. The queue's job is to smooth the burst, and the worker pool's rate limiter must match the provider quota.
+**What the numbers decide.** 185/s is trivial for any queue.
+
+The design is driven by the **11k/s broadcast peak** and by **provider quotas**: an SES account has a per-second sending rate set by AWS for that account, so a 5M-email campaign must be spread over time anyway.
+
+The queue's job is to smooth the burst, and the worker pool's rate limiter must match the provider quota.
 
 ### API
 
@@ -512,7 +571,11 @@ A campaign is a job, not a request. The campaign service stores `campaign(id, se
 
 ### 8.3 Device token hygiene
 
-Tokens change when users reinstall apps or restore phones. The app re-registers its token on each start (`PUT /v1/devices`), updating `last_seen_at`. Workers disable tokens on APNs `410 Unregistered` or FCM `UNREGISTERED`, and a weekly job disables tokens not seen for a long period (for example 270 days, a product choice). Without this, a broadcast spends a large share of its throughput on tokens that can never receive a message.
+Tokens change when users reinstall apps or restore phones. The app re-registers its token on each start (`PUT /v1/devices`), updating `last_seen_at`.
+
+Workers disable tokens on APNs `410 Unregistered` or FCM `UNREGISTERED`, and a weekly job disables tokens not seen for a long period (for example 270 days, a product choice).
+
+Without this, a broadcast spends a large share of its throughput on tokens that can never receive a message.
 
 ## 9. Interview questions
 
@@ -552,3 +615,8 @@ A 45-minute interview script:
 - **Before this:** [[System Design Interview Framework]], [[Queues vs Streams and Broker Comparison]], [[Idempotency and Idempotency Keys]], [[Case Study - URL Shortener]]
 - **Next:** [[Case Study - Key-Value Store]], [[Case Study - Chat System]], [[Case Study - News Feed]]
 - **Compare with:** [[Notification Service]] (the class-level LLD twin), [[Rate Limiter]], [[Rate Limiting - Algorithms and Distributed Design]], [[Kafka and Event Streaming]], [[Timeouts, Retries and Backoff]], [[Transactional Outbox and CDC]]
+
+### Watch on YouTube
+
+- [19: Notification Service / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=J-5JozlYIqI) · Jordan has no life · 21 min · 65,691 views
+- [How Razorpay Designed and Scaled their Notification System](https://www.youtube.com/watch?v=DQwlmTvs6xA) · Arpit Bhayani · 17 min · 36,682 views

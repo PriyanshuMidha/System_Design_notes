@@ -11,7 +11,7 @@ sources:
   - "AWS DynamoDB Developer Guide: partition limits (3,000 RCU and 1,000 WCU per partition), 400 KB item size, Query 1 MB page and LastEvaluatedKey, Limit applied before FilterExpression, GSIs eventually consistent, LSI 10 GB item collection limit and LSIs only at table creation, TransactWriteItems (up to 100 actions, 4 MB, two underlying writes per item), read/write capacity unit sizes (4 KB / 1 KB)"
   - "Rick Houlihan, Advanced Design Patterns for DynamoDB (AWS re:Invent 2018, DAT401)"
   - "Alex DeBrie, The DynamoDB Book (2020)"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # NoSQL Data Modeling
@@ -26,9 +26,59 @@ updated: 2026-11-03
 > - Single-table design stores several entity types in one table and overloads generic index attributes (`GSI1PK`, `GSI1SK`) to serve many patterns.
 > - Both stores support multi-item transactions, but they cost more and are capped, so the model should make most writes touch one item or document.
 
+## Start here: the basics
+
+**The problem in one story.**
+In SQL you store data neatly and can ask almost any question later.
+A NoSQL store like DynamoDB is very fast and scales far, but only for questions you planned for.
+So you first write down every question the app will ask.
+Then you shape the data so each question is one cheap lookup.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Document store | A database that stores JSON-like documents | MongoDB |
+| Key-value store | A database that finds items by a key | DynamoDB |
+| Access pattern | One exact read or write the app makes, with its rate | "List a workspace's invoices by month, 200/s" |
+| Embed | Put related data inside the same document | Line items inside the invoice |
+| Reference | Store only the ID of related data | `clientId: 42` |
+| Partition key | Decides where an item is stored | `WS#acme` |
+| Sort key | Decides the order of items under one partition key | `INV#2026-11#0042` |
+| Index (GSI) | A second copy of the data keyed differently, for another pattern | Invoices by client |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    AP["List access patterns<br/>+ QPS"] --> K["Design keys<br/>and documents"]
+    K --> Q1["Pattern 1 → one Query<br/>on PK + SK prefix"]
+    K --> Q2["Pattern 2 → one Query<br/>on a GSI"]
+```
+
+**Analogy.** A library that only lets you find books by shelf and position, so you decide shelf order based on how people will search.
+Where it breaks: a real librarian can still walk every shelf; a full table scan in DynamoDB is slow and costly at scale.
+
+**How the rest of this note builds up**
+
+- First, why query-first design exists (section 1) and the mental model (section 2).
+- Then listing access patterns, MongoDB embed vs reference and its design patterns (sections 3.1-3.3).
+- Then DynamoDB keys and indexes, single-table design and transactions (sections 3.4-3.6).
+- Then the same invoice modelled in both stores with capacity arithmetic (section 4).
+- Finally the SDE-3 view: comparisons, hot partitions in production and the deep dive (sections 5-8).
+
+> [!tip] Remember
+> In NoSQL, the access patterns come first; every pattern must be one key lookup or one range query.
+
 ## 1. Why it exists
 
-InvoiceOps runs on PostgreSQL. Suppose a team moves its invoice reads to DynamoDB and copies the relational schema one-to-one: tables `workspaces`, `clients`, `invoices`, `invoice_items`, `payments`. The invoice detail page now needs one request for the invoice, one `Query` for its items and one for its payments, then a request for the client. DynamoDB has no joins, so that is 4 network round trips at about 5–10 ms each (an estimate) instead of one SQL query. The list page "invoices of client c_1" needs a filter on a non-key attribute, so it becomes a `Scan` of the whole table: at 20 million invoices of about 1 KB, that is roughly 20 GB read per request.
+InvoiceOps runs on PostgreSQL. Suppose a team moves its invoice reads to DynamoDB and copies the relational schema one-to-one: tables `workspaces`, `clients`, `invoices`, `invoice_items`, `payments`.
+
+The invoice detail page now needs one request for the invoice, one `Query` for its items and one for its payments, then a request for the client.
+
+DynamoDB has no joins, so that is 4 network round trips at about 5–10 ms each (an estimate) instead of one SQL query.
+
+The list page "invoices of client c_1" needs a filter on a non-key attribute, so it becomes a `Scan` of the whole table: at 20 million invoices of about 1 KB, that is roughly 20 GB read per request.
 
 ```mermaid
 sequenceDiagram
@@ -67,7 +117,9 @@ flowchart LR
     end
 ```
 
-**Analogy:** a library catalogue versus a meal-prep kitchen. The library (SQL) shelves books by a neutral system and lets you ask anything at the desk. The meal-prep kitchen (NoSQL) packs each customer's lunch box in the morning, because it knows exactly who will ask for what at noon. Handing over a box is instant; answering an unexpected question ("which boxes contain cumin?") means opening every box.
+**Analogy:** a library catalogue versus a meal-prep kitchen. The library (SQL) shelves books by a neutral system and lets you ask anything at the desk.
+
+The meal-prep kitchen (NoSQL) packs each customer's lunch box in the morning, because it knows exactly who will ask for what at noon. Handing over a box is instant; answering an unexpected question ("which boxes contain cumin?") means opening every box.
 
 Key terms used below:
 - **Access pattern:** one concrete operation, such as "get invoice by id with its lines and payments".
@@ -300,7 +352,9 @@ sequenceDiagram
     M-->>API: matched 0, modified 0 (filter fails, no double payment)
 ```
 
-The `$ne` condition makes a retried webhook a no-op instead of a double payment. The `$ne` must name the same `provider_ref` that is being pushed (`pay_Q1z7`). The status change (`paid` once `paid_minor >= total_minor`) can be made in the same single-document write by rewriting the update as an aggregation pipeline (`$set` with `$concatArrays` and `$cond`), because `$push` is not available inside a pipeline update.
+The `$ne` condition makes a retried webhook a no-op instead of a double payment. The `$ne` must name the same `provider_ref` that is being pushed (`pay_Q1z7`).
+
+The status change (`paid` once `paid_minor >= total_minor`) can be made in the same single-document write by rewriting the update as an aggregation pipeline (`$set` with `$concatArrays` and `$cond`), because `$push` is not available inside a pipeline update.
 
 What the SQL version had and this one must rebuild: the uniqueness of `(provider, provider_ref)` across all invoices (needs a separate unique index or collection), the client-rename fan-out (the copied `client.name`), and reports across clients (aggregation pipelines).
 
@@ -428,9 +482,15 @@ flowchart LR
 
 **Item collections and LSIs.** With an LSI, one partition key's item collection is limited to 10 GB, because the index lives on the same partitions. Without an LSI, an item collection can grow beyond one partition: DynamoDB splits it by sort key range. Avoid LSIs unless you need strongly consistent alternative sort orders.
 
-**Multi-document transactions in MongoDB under the hood.** A transaction runs on a snapshot (WiredTiger MVCC); a concurrent write to the same document causes a write conflict, and the driver retries with `TransientTransactionError`. On sharded clusters, a transaction across shards uses a two-phase commit run by a coordinator on one of the participating shards (`mongos` only routes) ([[Two-Phase Commit]]), with higher latency. Embedding what changes together avoids all of it.
+**Multi-document transactions in MongoDB under the hood.** A transaction runs on a snapshot (WiredTiger MVCC); a concurrent write to the same document causes a write conflict, and the driver retries with `TransientTransactionError`.
 
-**Lazy migration with schema versioning.** v1 invoices stored `amount` as a float; v2 stores `total_minor` as an integer of paise. Readers convert v1 on the fly (`round(amount * 100)`), writers always write v2, and a background job rewrites the remaining v1 documents with a conditional update (`{schema_version: 1}`) so it never overwrites a newer write. Once the count of v1 documents is zero, delete the v1 code path.
+On sharded clusters, a transaction across shards uses a two-phase commit run by a coordinator on one of the participating shards (`mongos` only routes) ([[Two-Phase Commit]]), with higher latency. Embedding what changes together avoids all of it.
+
+**Lazy migration with schema versioning.** v1 invoices stored `amount` as a float; v2 stores `total_minor` as an integer of paise.
+
+Readers convert v1 on the fly (`round(amount * 100)`), writers always write v2, and a background job rewrites the remaining v1 documents with a conditional update (`{schema_version: 1}`) so it never overwrites a newer write.
+
+Once the count of v1 documents is zero, delete the v1 code path.
 
 ```mermaid
 stateDiagram-v2
@@ -481,3 +541,8 @@ stateDiagram-v2
 - **Before this:** [[SQL vs NoSQL]], [[Relational Schema Design]], [[Partitioning and Sharding]]
 - **Next:** [[Wide-Column Stores and Cassandra]], [[Hot Keys and Hot Partitions]], [[Search Engines and Inverted Indexes]]
 - **Compare with:** [[Materialized Views and Denormalization]], [[Consistent Hashing]], [[Transactions and ACID]]
+
+### Watch on YouTube
+
+- [Designing a DynamoDB Table in 4 Steps: From Entities to Access Patterns](https://www.youtube.com/watch?v=JLZOI8patlw) · FooBar Serverless · walks through access-pattern-first modeling exactly as the note describes
+- [DynamoDB Single Table Design: Simplify Your Code and Boost Performance with Table Design Strategies](https://www.youtube.com/watch?v=lWCch8GEK4E) · FooBar Serverless · single-table design with GSI1PK/SK overloading, matches note's core idea

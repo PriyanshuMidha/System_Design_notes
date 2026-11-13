@@ -11,7 +11,7 @@ sources:
   - "Charikar, Similarity Estimation Techniques from Rounding Algorithms (STOC 2002)"
   - "Manku, Jain and Das Sarma, Detecting Near-Duplicates for Web Crawling (WWW 2007)"
   - "Google Search Central docs, robots.txt (Googlebot ignores crawl-delay)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Web Crawler
@@ -25,6 +25,53 @@ updated: 2026-11-04
 > - Deduplicate URLs after normalizing them, with a Bloom filter or a hash set at scale; deduplicate content with exact hashes and SimHash for near-duplicates.
 > - Respect robots.txt (RFC 9309), cache it per host, and cap pages and depth per host to escape traps.
 > - Store raw pages in object storage and hand them to parsing and indexing through a queue, so fetching never waits on processing.
+
+## Start here: the basics
+
+**The problem in one story**
+
+A search engine must know what is on billions of web pages.
+Nobody sends it the pages; it has to visit each one, read it, and find links to more pages.
+It must do this fast, but without hammering any single website.
+It must also avoid reading the same page twice or getting lost in endless pages.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Crawler | A program that downloads pages and follows their links | Googlebot |
+| URL frontier | The to-do list of URLs still to fetch | A queue holding `https://a.com/page2` |
+| Host | The website part of a URL | `example.com` |
+| Politeness | Waiting between requests to the same host | At most 1 request per second to `example.com` |
+| robots.txt | A file where a site says what crawlers may fetch | `Disallow: /admin` |
+| Bloom filter | A small structure that says "maybe seen" or "surely not seen" | Check a URL before adding it again |
+| Normalization | Rewriting a URL into one standard form | `HTTP://A.com/x/` and `http://a.com/x` become the same |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  F[URL frontier] --> D[Fetcher]
+  D --> S[Store raw page]
+  S --> P[Parser extracts links]
+  P --> U[Dedup seen URLs]
+  U --> F
+```
+
+**Analogy**
+
+A team of librarians photocopies every book in a city: each librarian owns certain libraries, keeps a list of books still to copy, and never rushes one library.
+Where it breaks: libraries do not invent new books while you walk around, but websites generate infinite pages (calendars, session IDs).
+
+**How the rest of this note builds up**
+
+- First the requirements and mental model (sections 1-2).
+- Then the high-level design around the URL frontier (section 3).
+- Then estimates, API and data model, with the frontier and dedup worked through (section 4).
+- Finally variants, trade-offs, production practice and the SDE-3 deep dive on politeness, traps and near-duplicate detection (sections 5-8).
+
+> [!tip] Remember
+> A crawler is a loop: take a URL, fetch it politely, save it, extract new links, skip what you have seen.
 
 ## 1. Why it exists - requirements
 
@@ -49,7 +96,11 @@ The naive crawler is a breadth-first search: a queue of URLs, a loop that pops o
 
 ## 2. Mental model
 
-Imagine a team of librarians photocopying every book in a city. A dispatcher holds one small tray per library branch and hands out at most one request per branch at a time, waiting a few seconds before sending anyone back to the same branch. A big ledger records every book title already requested, so nobody fetches the same book twice. Each librarian copies a book, notes the other books it cites, and passes those titles back to the dispatcher. The dispatcher refuses requests to branches that have posted "no visitors in this wing", and stops sending people to a branch that seems to have infinitely many "next volume" books.
+Imagine a team of librarians photocopying every book in a city. A dispatcher holds one small tray per library branch and hands out at most one request per branch at a time, waiting a few seconds before sending anyone back to the same branch.
+
+A big ledger records every book title already requested, so nobody fetches the same book twice. Each librarian copies a book, notes the other books it cites, and passes those titles back to the dispatcher.
+
+The dispatcher refuses requests to branches that have posted "no visitors in this wing", and stops sending people to a branch that seems to have infinitely many "next volume" books.
 
 Mapped to the system:
 - **Trays per branch** = per-host queues in the frontier.
@@ -206,7 +257,9 @@ At 10 billion URLs, the `urls` table belongs in a wide-column store partitioned 
 
 ### Go: a polite frontier with an injected clock
 
-The frontier keeps one FIFO queue per host and a min-heap of hosts ordered by `readyAt`, the earliest time the host may be fetched again. `Next` pops a URL only from a host whose time has come; otherwise it tells the caller how long to wait. The clock is injected, so the tests control time exactly. A plain map plays the seen set; at web scale it becomes a Bloom filter ([[Bloom Filters and Probabilistic Data Structures]]).
+The frontier keeps one FIFO queue per host and a min-heap of hosts ordered by `readyAt`, the earliest time the host may be fetched again. `Next` pops a URL only from a host whose time has come; otherwise it tells the caller how long to wait.
+
+The clock is injected, so the tests control time exactly. A plain map plays the seen set; at web scale it becomes a Bloom filter ([[Bloom Filters and Probabilistic Data Structures]]).
 
 ```go
 // Package frontier is a polite URL frontier: one FIFO queue per host and a
@@ -508,7 +561,9 @@ Two URLs that fetch the same resource should become one string before the seen-c
 
 Only normalize what is safe: path case and query-parameter order can matter to a server.
 
-Then hash the result (for example 64 bits) and test it against the seen set. With a Bloom filter sized at about 9.6 bits per element for 1% false positives, 10^10 URLs need about 12 GB, split by host hash across nodes so each node checks only its own hosts. Remember the direction of the error: a false positive says "seen" for a new URL, so that page is skipped, never fetched twice.
+Then hash the result (for example 64 bits) and test it against the seen set. With a Bloom filter sized at about 9.6 bits per element for 1% false positives, 10^10 URLs need about 12 GB, split by host hash across nodes so each node checks only its own hosts.
+
+Remember the direction of the error: a false positive says "seen" for a new URL, so that page is skipped, never fetched twice.
 
 ### Content dedupe with SimHash
 
@@ -573,3 +628,8 @@ Conditional requests (`If-Modified-Since`, `If-None-Match`) turn unchanged pages
 - **Before this:** [[Bloom Filters and Probabilistic Data Structures]], [[Consistent Hashing]], [[Back-of-the-Envelope Estimation]], [[Case Study - File Storage and Sync]]
 - **Next:** [[Search Engines and Inverted Indexes]], [[Case Study - Search Autocomplete]], [[Case Study - Distributed Job Scheduler]]
 - **Compare with:** [[Rate Limiting - Algorithms and Distributed Design]] (per-host politeness is a rate limit), [[Pub-Sub Message Queue]] (class-level queue design), [[Kafka and Event Streaming]]
+
+### Watch on YouTube
+
+- [Design a Web Crawler: FAANG Interview Question](https://www.youtube.com/watch?v=6u25GckPhLU) · ByteByteGo · 5 min · 53,099 views
+- [Design a Web Crawler System Design Interview w/ a Ex-Meta Staff Engineer](https://www.youtube.com/watch?v=krsuaUp__pM) · Hello Interview · 65 min · 237,171 views

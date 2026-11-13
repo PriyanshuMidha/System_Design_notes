@@ -11,13 +11,15 @@ sources:
   - "Muralidhar et al., f4: Facebook's Warm BLOB Storage System (USENIX OSDI 2014): warm photos and videos stored with erasure coding"
   - "Amazon S3 User Guide: multipart upload, presigned URLs, storage classes (Standard, Infrequent Access, Glacier)"
   - "Raffi Krikorian, Timelines at Scale (QCon 2012): fan-out on write with a high-follower exception"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Photo Sharing (Instagram)
 
 > [!summary] TL;DR
-> A photo sharing app lets people upload pictures, follow others and scroll a feed of their photos. Three problems dominate: **storing and serving enormous amounts of binary data cheaply** (object storage plus CDN, several resized copies), **making upload reliable on bad mobile networks** (presigned, resumable, direct-to-storage), and **building a fast feed** (fan-out on write with a celebrity exception, as in [[Case Study - News Feed]]).
+> A photo sharing app lets people upload pictures, follow others and scroll a feed of their photos. Three problems dominate:
+>
+> **storing and serving enormous amounts of binary data cheaply** (object storage plus CDN, several resized copies), **making upload reliable on bad mobile networks** (presigned, resumable, direct-to-storage), and **building a fast feed** (fan-out on write with a celebrity exception, as in [[Case Study - News Feed]]).
 
 > [!abstract] Core idea
 > - Separate **metadata** (small, in a database) from **bytes** (huge, in object storage). Never push image bytes through your app servers or your database.
@@ -25,6 +27,52 @@ updated: 2026-11-09
 > - An **asynchronous pipeline** makes thumbnails and other sizes, strips location data, and scans for unsafe content, after the upload is acknowledged.
 > - Serve images through a **CDN** with a long cache time. Because images are immutable, each variant has a content-based URL that never changes.
 > - Feed generation reuses the hybrid push and pull design: push post IDs to ordinary followers, pull for celebrities.
+
+## Start here: the basics
+
+**The problem in one story.**
+You take a photo on a shaky train network and post it.
+Your friends scroll past it a minute later, sharp and instant, on small phones and big screens.
+Behind that, the app stored billions of photos cheaply, survived a half-finished upload, and built everyone's feed.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Metadata | Small facts about a photo | Owner, caption, time, size |
+| Object storage | Cheap, huge file storage reached over HTTP | Amazon S3 bucket |
+| Presigned URL | A temporary link that lets a client upload directly | Valid for 15 minutes |
+| CDN | Servers near users that cache files | Cloudflare edge in Mumbai |
+| Thumbnail / variant | A smaller copy of the same image | 150 px and 1080 px versions |
+| Async pipeline | Work done in the background after replying | Resize after "upload done" |
+| Fan-out | Copying one item to many followers' feeds | One post to 300 feeds |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Phone"] -->|"1. ask"| API["App server"]
+    API -->|"2. presigned URL"| P
+    P -->|"3. upload bytes"| OS["Object storage"]
+    OS --> PL["Resize pipeline"]
+    PL --> OS
+    OS --> CDN["CDN"]
+    CDN --> V["Viewers"]
+```
+
+**Analogy.** A photo lab with a drop-box: the front desk only gives you a ticket, you drop the film in the box yourself, and the lab prints sizes later; copies sit in shops near every customer.
+Where it breaks: a lab does not need to show your prints to 300 friends within seconds, which is what the feed adds.
+
+**How the rest of this note builds up**
+
+- First, requirements and the mental model (sections 1-2).
+- Then the big picture with step-by-step upload and feed viewing (section 3).
+- Then the worked example: estimates, API, data model and content-addressed keys (section 4).
+- Then variants, trade-offs and production lessons (sections 5-7).
+- Finally the SDE-3 deep dive: resumable uploads, the image pipeline, CDN caching, counters, storage tiers and privacy (section 8).
+
+> [!tip] Remember
+> Metadata in the database, bytes in object storage, served by CDN, uploaded directly by the client.
 
 ## 1. Why it exists - requirements
 
@@ -53,7 +101,9 @@ People want to share photos with friends and see what friends shared. The techni
 
 ## 2. Mental model
 
-Picture a **photo lab with a shop front**. You (the client) walk to the back door of a huge warehouse (object storage) with a stamped pass (the presigned URL) and drop your photo yourself, so the shop clerk (the app server) never carries heavy boxes. Back-room staff then make small prints in different sizes (the resize pipeline). A catalogue card file (the metadata database) says which shelf each print is on. Customers pick up prints from neighbourhood kiosks (the CDN), not from the warehouse.
+Picture a **photo lab with a shop front**. You (the client) walk to the back door of a huge warehouse (object storage) with a stamped pass (the presigned URL) and drop your photo yourself, so the shop clerk (the app server) never carries heavy boxes.
+
+Back-room staff then make small prints in different sizes (the resize pipeline). A catalogue card file (the metadata database) says which shelf each print is on. Customers pick up prints from neighbourhood kiosks (the CDN), not from the warehouse.
 
 ```mermaid
 flowchart LR
@@ -376,8 +426,12 @@ Serve the best format the client advertises in its `Accept` header, and cache ea
 
 ## 7. In production
 
-- **Instagram (public engineering posts):** the 2012 sharding post describes PostgreSQL with many logical shards mapped to fewer physical servers, and 64-bit IDs that embed a timestamp, a shard ID and a sequence number so IDs are generated inside the database without a central service. A 2011 post describes using Redis hashes to map hundreds of millions of media IDs to user IDs in far less memory than one key per entry.
-- **Facebook Haystack and f4 (public papers):** Facebook found that one file per photo caused extra disk operations for file-system metadata, so Haystack packs many photos into large files with an in-memory index, so a read needs about one disk operation. f4 later moved older, rarely read blobs to erasure-coded storage to cut the replication cost. The lesson is the same as our tiering in section 8.5.
+- **Instagram (public engineering posts):** the 2012 sharding post describes PostgreSQL with many logical shards mapped to fewer physical servers, and 64-bit IDs that embed a timestamp, a shard ID and a sequence number so IDs are generated inside the database without a central service.
+
+  A 2011 post describes using Redis hashes to map hundreds of millions of media IDs to user IDs in far less memory than one key per entry.
+- **Facebook Haystack and f4 (public papers):** Facebook found that one file per photo caused extra disk operations for file-system metadata, so Haystack packs many photos into large files with an in-memory index, so a read needs about one disk operation. f4 later moved older, rarely read blobs to erasure-coded storage to cut the replication cost.
+
+  The lesson is the same as our tiering in section 8.5.
 - **Object storage (documented):** managed object stores offer multipart upload, presigned URLs, lifecycle rules and storage classes for infrequently accessed data.
 - **Failure modes and fixes:**
 	- *Upload abandoned halfway:* a lifecycle rule aborts incomplete multipart uploads after 1-7 days; a reaper job deletes `pending` media older than 24 hours.
@@ -507,7 +561,9 @@ flowchart LR
 > A database is tuned for small rows and transactional access. Multi-megabyte blobs inflate backups, replication and cache memory, and make the database the bandwidth bottleneck. Object storage is cheaper per byte, built for durability, and serves through a CDN. Keep only the object key and metadata in the database.
 
 > [!question]- How does a presigned URL upload work, and why use it?
-> The server signs a time-limited URL that authorises one `PUT` to a specific object key. The client sends the bytes directly to storage, so the app servers do not carry the traffic. The server then confirms the upload and records it. Risks to handle: validate the file afterward, restrict size and type (a presigned PUT cannot enforce a size limit; a presigned POST policy with `content-length-range` can, or check size after upload), and expire the URL quickly.
+> The server signs a time-limited URL that authorises one `PUT` to a specific object key. The client sends the bytes directly to storage, so the app servers do not carry the traffic. The server then confirms the upload and records it.
+>
+> Risks to handle: validate the file afterward, restrict size and type (a presigned PUT cannot enforce a size limit; a presigned POST policy with `content-length-range` can, or check size after upload), and expire the URL quickly.
 
 > [!question]- Trap: a user uploads a 1 MB file that decodes to a 50,000 by 50,000 pixel bitmap. What happens?
 > It is a decompression bomb that can exhaust worker memory. Read the header first, reject images over a pixel limit (for example 100 megapixels), cap decode time and memory per job, and run image decoding in an isolated worker so a crash does not hurt other jobs.
@@ -519,7 +575,9 @@ flowchart LR
 > Show the poster's local copy immediately. For followers, either wait to fan out until the media is `ready` (adds a few seconds) or fan out at once and have the client show a placeholder with the original as a fallback. Pick by whether a few seconds of delay or a blurry first frame is worse for the product.
 
 > [!question]- How would you reduce storage cost by half?
-> Move originals older than 30 days to infrequent access and older than a year to archive; serve WebP or AVIF to shrink variants; drop rarely requested sizes and generate them lazily; deduplicate identical uploads by content hash; use erasure coding rather than triple replication for warm data. State the trade-off: slower restore for cold originals and more CPU for newer formats.
+> Move originals older than 30 days to infrequent access and older than a year to archive; serve WebP or AVIF to shrink variants; drop rarely requested sizes and generate them lazily; deduplicate identical uploads by content hash; use erasure coding rather than triple replication for warm data.
+>
+> State the trade-off: slower restore for cold originals and more CPU for newer formats.
 
 > [!question]- How do you delete a photo everywhere, including the CDN?
 > Mark deleted in metadata so no feed or profile returns it, delete the objects asynchronously, and issue a CDN invalidation for those URLs. Because the URL is content-hashed and no longer referenced, stale CDN copies are reachable only by someone who has the link. For sensitive cases use short-lived signed URLs so access ends quickly.
@@ -554,3 +612,8 @@ A 45-minute script:
 - **Decision guides:** [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Choosing a Database - Decision Guide]]
 - **Related designs:** [[Case Study - Video Streaming]], [[Case Study - Notification System]], [[Case Study - URL Shortener]]
 - **Supporting:** [[Background Jobs and Worker Pools]], [[Rate Limiting - Algorithms and Distributed Design]], [[Idempotency and Idempotency Keys]], [[Pagination, Filtering and Sorting]]
+
+### Watch on YouTube
+
+- [Instagram System Design / Design Photo-Sharing Application / System Design Interview](https://www.youtube.com/watch?v=da7mdMz0g0g) · Tech Takshila · 20 min · 27,713 views
+- [Design Photo Sharing Service / Instagram](https://www.youtube.com/watch?v=qP12SpInZOI) · Scribble Lab · 7 min · 29 views

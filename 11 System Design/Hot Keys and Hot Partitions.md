@@ -13,13 +13,15 @@ sources:
   - "AWS DynamoDB Developer Guide, Using write sharding to distribute workloads evenly"
   - "Apache Kafka documentation, Consumers: each partition is consumed by exactly one consumer in a group"
   - "Google Cloud Bigtable docs, Schema design: avoid row keys that start with a timestamp (hotspotting)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Hot Keys and Hot Partitions
 
 > [!summary] TL;DR
-> A **hot key** is one key (a cache entry, a database row, a message key) that gets far more traffic than the rest. A **hot partition** is the shard, node or queue partition that owns it. Because each key lives on exactly one partition, adding more machines does not help: the fix is to change how that one key is read or written.
+> A **hot key** is one key (a cache entry, a database row, a message key) that gets far more traffic than the rest. A **hot partition** is the shard, node or queue partition that owns it.
+>
+> Because each key lives on exactly one partition, adding more machines does not help: the fix is to change how that one key is read or written.
 
 > [!abstract] Core idea
 > - Partitioning spreads **keys** evenly, not **traffic**. One popular key still lands on one shard.
@@ -28,13 +30,60 @@ updated: 2026-11-04
 > - Write-hot keys are fixed by splitting them: sharded counters, batching, or one writer per key with a queue.
 > - Classic mistake: answering "add more shards" or "use consistent hashing". Neither moves a single key.
 
+## Start here: the basics
+
+**The problem in one story.**
+A ticket site stores data across ten machines, each holding a slice of the keys.
+A superstar announces a concert, and a million fans open the same event page at once.
+That one event lives on one machine, so that machine melts while the other nine sit idle.
+Buying more machines does not help, because the event still lives on just one of them.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Key | The name you use to store and fetch one piece of data | `event:9001` |
+| Partition / shard | One slice of the data, owned by one machine or queue | Shard 3 holds keys whose hash ends in 3 |
+| Partitioner | The rule that decides which shard owns a key | `hash(key) % 10` |
+| Cache | A fast copy of data kept close to the reader | Redis holding the event page |
+| Replica | An extra copy of the same data on another machine | A read replica of the database |
+| Throughput limit | The most work one machine or partition can do per second | 1,000 writes per second per DynamoDB partition |
+| Skew | Traffic piling up unevenly on a few keys | 1 key gets 40% of all reads |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Million fans"] --> K["key: event:9001"]
+    K --> P["hash picks shard 3"]
+    P --> S3["Shard 3: overloaded"]
+    O["Other keys"] --> S1["Shards 1, 2, 4...: idle"]
+```
+
+**Analogy.** A supermarket with ten checkout lanes, but the only lane that sells concert tickets is lane 3. Opening lane 11 does not shorten lane 3's queue.
+Where it breaks: a supermarket can just let every lane sell tickets; with data, copying or splitting a key brings real costs like staleness or extra reads.
+
+**How the rest of this note builds up**
+
+- First, why hot keys happen and a mental model (sections 1-2).
+- Then where skew comes from, why the partitioner cannot spread one key, and the fix menu for read-hot vs write-hot keys (section 3).
+- Then the arithmetic and Go code for an L1 cache, request coalescing and a sharded counter (section 4).
+- Finally the SDE-3 material: variants, trade-offs, production detection and the deep dive on Zipf skew, choosing N, monotonic keys and Kafka hot partitions (sections 5-8).
+
+> [!tip] Remember
+> Sharding spreads keys, not traffic: a hot key must be copied (if read-hot) or split (if write-hot), not just given more machines.
+
 ## 1. Why it exists
 
 A ticketing site opens sales for a stadium concert at 10:00. One million fans are waiting. At 10:00:00 each of them refreshes the event page, which reads the cache key `event:8812:availability`.
 
 - Requests on that key: about 1,000,000 users × 1 refresh every 5 s = **200,000 reads per second** (estimate).
 - The cache is a 12-shard Redis Cluster. The key hashes to **one slot on one shard**, so that shard gets all 200,000 reads per second while the other 11 shards are idle.
-- A single Redis shard runs commands on one main thread. A plain `GET` workload on one shard tops out somewhere around 100,000 to a few hundred thousand operations per second, depending on hardware and pipelining (estimate; measure with `redis-benchmark` on your own instance). The hot shard's CPU hits 100%, latency climbs from under 1 ms to hundreds of milliseconds, and every *other* key on that shard becomes slow too.
+- A single Redis shard runs commands on one main thread.
+
+  A plain `GET` workload on one shard tops out somewhere around 100,000 to a few hundred thousand operations per second, depending on hardware and pipelining (estimate; measure with `redis-benchmark` on your own instance).
+
+  The hot shard's CPU hits 100%, latency climbs from under 1 ms to hundreds of milliseconds, and every *other* key on that shard becomes slow too.
 
 Adding a 13th shard does nothing: the key still maps to one slot. The same shape shows up everywhere:
 
@@ -75,7 +124,11 @@ Key terms used below:
 
 ### 3.2 Why one key cannot be spread by the partitioner
 
-Every partitioner, whether `hash % N`, a [[Consistent Hashing]] ring, Redis Cluster's `CRC16(key) mod 16384` slots or a range map, is a **function of the key**. The same key always gives the same partition. That is the whole point: it is how readers find the data. So the only way to spread a hot key is to make it *several keys* (split it), or to stop sending its traffic to the partition at all (copy it closer to the caller).
+Every partitioner, whether `hash % N`, a [[Consistent Hashing]] ring, Redis Cluster's `CRC16(key) mod 16384` slots or a range map, is a **function of the key**. The same key always gives the same partition.
+
+That is the whole point: it is how readers find the data.
+
+So the only way to spread a hot key is to make it *several keys* (split it), or to stop sending its traffic to the partition at all (copy it closer to the caller).
 
 ```mermaid
 flowchart LR
@@ -156,7 +209,9 @@ WRITE (50k/s)                         READ (300k/s)
 ### The arithmetic
 
 - **Without sharding:** one item `likes:9` receives 50,000 writes/s. One partition allows 1,000 WCU/s, and a 1 KB-or-smaller `UpdateItem` costs 1 WCU. 50,000 WCU/s ÷ 1,000 WCU/s = **50 times over the limit**. Requests are throttled.
-- **Sub-key count:** need N ≥ 50,000 ÷ 1,000 = 50. Pick **N = 64** for head-room: 50,000 ÷ 64 ≈ **781 WCU/s per sub-item**, which is under the limit only if the sub-items land on different partitions. DynamoDB hashes the partition key, so 64 distinct keys spread over the table's partitions (the table must have enough partitions; adaptive capacity and split-for-heat help here).
+- **Sub-key count:** need N ≥ 50,000 ÷ 1,000 = 50. Pick **N = 64** for head-room: 50,000 ÷ 64 ≈ **781 WCU/s per sub-item**, which is under the limit only if the sub-items land on different partitions.
+
+  DynamoDB hashes the partition key, so 64 distinct keys spread over the table's partitions (the table must have enough partitions; adaptive capacity and split-for-heat help here).
 - **Read cost:** one exact read is a `BatchGetItem` of 64 items. 64 items × 0.5 RCU (eventually consistent, ≤ 4 KB) = **32 RCU per read**. At 300,000 reads/s that would be 9.6 million RCU/s, which is absurd.
 - **So reads go through L1:** 200 app pods × 1 refresh per second per pod = **200 sharded reads per second** × 32 RCU = **6,400 RCU/s**, spread over 64 items. Users see a count that is up to 1 s old, which a like counter tolerates.
 
@@ -286,7 +341,9 @@ func (d *Detector) rollLocked() {
 }
 ```
 
-Two simplifications to know about. The L1 cache holds one mutex while loading, which serialises loads of *different* keys too; production code uses a per-key `singleflight.Group` instead. The detector keeps an exact count per key, which is fine for sampled traffic; at full traffic a Count-Min Sketch with a small top-K heap gives the same answer in fixed memory (see [[Bloom Filters and Probabilistic Data Structures]]).
+Two simplifications to know about. The L1 cache holds one mutex while loading, which serialises loads of *different* keys too; production code uses a per-key `singleflight.Group` instead.
+
+The detector keeps an exact count per key, which is fine for sampled traffic; at full traffic a Count-Min Sketch with a small top-K heap gives the same answer in fixed memory (see [[Bloom Filters and Probabilistic Data Structures]]).
 
 The tests use a map-backed store and a fake clock:
 
@@ -510,13 +567,27 @@ sequenceDiagram
 
 ## 8. Deep dive
 
-- **Why skew gets worse with scale.** With a Zipf-like distribution, the top key's share of traffic stays roughly constant as total traffic grows. If the top key is 2% of 1 million requests per second, it is 20,000 requests per second on one shard no matter how many shards you add. Total capacity grows with shards; the ceiling for one key does not.
-- **Choosing N for a sharded counter.** N must be at least `peak write rate ÷ per-partition write limit`, with head-room for uneven random picks. With N sub-keys and uniform random choice, each gets about `rate / N` with small variance at high rates. Larger N makes reads more expensive, so some systems make N **adaptive**: start at 1, and raise N when a detector flags the key. Readers must then know N, so store it in the key's metadata.
+- **Why skew gets worse with scale.** With a Zipf-like distribution, the top key's share of traffic stays roughly constant as total traffic grows.
+
+  If the top key is 2% of 1 million requests per second, it is 20,000 requests per second on one shard no matter how many shards you add. Total capacity grows with shards; the ceiling for one key does not.
+- **Choosing N for a sharded counter.** N must be at least `peak write rate ÷ per-partition write limit`, with head-room for uneven random picks.
+
+  With N sub-keys and uniform random choice, each gets about `rate / N` with small variance at high rates.
+
+  Larger N makes reads more expensive, so some systems make N **adaptive**: start at 1, and raise N when a detector flags the key. Readers must then know N, so store it in the key's metadata.
 - **Hot keys in Redis Cluster specifically.** Hash tags (`{user:42}:cart`) deliberately put keys in one slot for multi-key commands. That is the opposite of what you want for a hot key: the replicated copies must use *different* tags (`{event:8812#3}`), or they all land on the same shard.
-- **Monotonic keys in range-partitioned stores.** A timestamp-first row key in Bigtable or HBase, or an auto-increment primary key in a range-sharded distributed SQL database, sends every insert to the last range. Fixes: put a high-cardinality field first (`device_id#timestamp`), prefix a small hash bucket (`hash(id) % 16 # timestamp`, which costs 16 scans for a time-range query), or use random or hashed IDs. See [[Unique ID Generation]].
+- **Monotonic keys in range-partitioned stores.** A timestamp-first row key in Bigtable or HBase, or an auto-increment primary key in a range-sharded distributed SQL database, sends every insert to the last range.
+
+  Fixes: put a high-cardinality field first (`device_id#timestamp`), prefix a small hash bucket (`hash(id) % 16 # timestamp`, which costs 16 scans for a time-range query), or use random or hashed IDs. See [[Unique ID Generation]].
 - **Write contention in SQL.** `UPDATE counters SET n = n + 1 WHERE id = 9` at high rates serialises on the row lock: each transaction waits for the previous one to commit. The same sharded-counter idea applies: 16 rows `(id, slot, n)` and `SELECT sum(n)` to read.
-- **Single writer vs locks.** For inventory you cannot salt (100 seats cannot be split into independent counters without risking overselling). The usual design is to partition by *seat* or *section* so the hot unit is smaller, and to serialise updates per unit through a queue or row lock. Pre-split inventory (10 buckets of 10 seats each, with rebalancing when a bucket runs out) is the counter trick applied to stock.
-- **Kafka hot partitions.** The default partitioner hashes the key, so a skewed key gives a skewed partition, and one consumer in the group owns it. Options in order of preference: choose a finer key that still gives the ordering you need (`match_id + innings` instead of `match_id`); pre-aggregate before producing; salt the key when order does not matter; inside the consumer, dispatch the hot partition's records to worker goroutines by a finer sub-key while committing offsets only after all earlier records finish.
+- **Single writer vs locks.** For inventory you cannot salt (100 seats cannot be split into independent counters without risking overselling).
+
+  The usual design is to partition by *seat* or *section* so the hot unit is smaller, and to serialise updates per unit through a queue or row lock.
+
+  Pre-split inventory (10 buckets of 10 seats each, with rebalancing when a bucket runs out) is the counter trick applied to stock.
+- **Kafka hot partitions.** The default partitioner hashes the key, so a skewed key gives a skewed partition, and one consumer in the group owns it.
+
+  Options in order of preference: choose a finer key that still gives the ordering you need (`match_id + innings` instead of `match_id`); pre-aggregate before producing; salt the key when order does not matter; inside the consumer, dispatch the hot partition's records to worker goroutines by a finer sub-key while committing offsets only after all earlier records finish.
 
 ## 9. Interview questions
 
@@ -556,3 +627,8 @@ sequenceDiagram
 - **Before this:** [[Partitioning and Sharding]], [[Consistent Hashing]], [[Caching Patterns]]
 - **Next:** [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]], [[Case Study - Ticket Booking]], [[Case Study - Leaderboard and Top-K]]
 - **Compare with:** [[Message Ordering and Partition Keys]] (choosing Kafka keys), [[Rate Limiting - Algorithms and Distributed Design]] (a global limit is itself a hot key)
+
+### Watch on YouTube
+
+- [Video 4: Dynamo DB: Partition key, Sort Keys and Hot partitions](https://www.youtube.com/watch?v=v_kDZO1wE6Y) · NextGen Machines · 37 min · 2,053 views
+- [How Kafka Scales: Partitions, Keys & the Hot Partition Problem Explained](https://www.youtube.com/watch?v=OFBQKouRglM) · Under The Hood Engineering · 8 min · 579 views

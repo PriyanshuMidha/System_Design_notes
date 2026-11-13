@@ -1,0 +1,100 @@
+# HTTP caching story v2: "The Price That Would Not Change". id | SPEAKER | tone | text. Source: [[HTTP Caching - Cache-Control, ETag, Conditional Requests]]
+# Cast: OLGA = the origin server, who owns the true price (hero detective). BEN = a customer and her rookie. FRAN = Ben's fridge, the browser cache. CARL = the shared warehouse, a CDN. VERA = the sorter who splits copies (Vary).
+== s1 The same answer, paid for twice
+l1 | N | hook | Nine in the morning. Olga, who runs the price office, changes the price of a loaf from one forty nine to one ninety nine. By ten, customers are still seeing the old price, and the shop is losing money on every sale. The price changed at the source. So why does nobody see it? Detective Olga, and her rookie Ben, are on the case.
+l1b | OLGA | normal | Ben, a copy of my answer is hiding somewhere between my office and the customer. We find every hiding place, and learn the rules that put it there.
+l1c | N | normal | Ben opens the shopping site every morning. The logo, the fonts, the layout, and the price are the same as yesterday. If his browser downloaded all of it again every time, pages would be slow, and the servers would do the same work millions of times.
+l2 | N | normal | H T T P caching lets a browser, and servers in between, keep a copy of an answer and reuse it safely. Think of milk in a fridge, with a best before date. Before the date, you just drink it. After the date, you sniff it. If it is fine, you keep it. If not, you buy a new carton.
+l3 | N | normal | Meet the cast. Fran is Ben's fridge, the browser cache. Carl runs a warehouse near the street, a shared cache, like a C D N. And Olga runs the price office. She is the origin server, the only one who owns the truth.
+l4 | N | normal | The words you need. A request is the question, a response is the answer. A header is a labelled line of extra information. The body is the content. A status code says how it went, two hundred is okay, three oh four is not modified. And a fingerprint is a short string that changes whenever the content changes.
+== s2 Why caching exists: two gates
+l5 | N | normal | Picture a price page that rarely changes, but a thousand people load it every minute. Without caching, each of those loads fetches the same styles, images, fonts, and price data from Olga's office, even when nothing changed. Wasted bandwidth, wasted processing, and delay that Ben feels on every click.
+l6 | N | normal | The rules, mostly in R F C ninety one eleven, solve this with two different tools, working at different moments. Freshness avoids the trip entirely, for a window of time Olga names up front. Validation avoids resending the body, once that window has passed, by letting the server answer, still the same, cheaply.
+l7 | N | normal | A concrete case. A price file is only fourteen bytes. Served fresh from a cache with max age sixty, a full minute of traffic costs Olga zero requests. After that, a conditional request costs her one cheap comparison, and a three oh four with no body.
+l8 | FRAN | question | Every time Ben asks, I ask myself two questions, in order. Do I already have a recent enough copy? And if not, has it actually changed since I last checked?
+l9 | N | punch | Remember. A cache always asks, can I skip the trip, before it asks, can I skip the resend. Freshness and validation are two separate gates, not one setting.
+== s3 Gate one: freshness and Cache-Control
+sus1 | N | normal | Suspect one. Fran, Ben's fridge, the browser cache. A copy of the old price could be sitting in her fridge, still within its best before date.
+l10 | N | normal | Gate one. Olga sends a header called Cache control. It tells every cache on the way, the browser, a company proxy, a C D N edge, how long this exact response counts as current, and who may keep a copy.
+l11 | OLGA | normal | Cache control, public, max age sixty.
+l12 | N | normal | Fran stores it at time zero. For every request up to second sixty, she answers from memory, with no contact with Olga at all. At second sixty one, the copy is stale, and she must at least ask.
+l13 | N | normal | Now the directives, one by one. Max age, N, means fresh for N seconds, for any cache, browser or shared. Like a best before date on a food label.
+l14 | N | normal | S max age overrides max age, but only for shared caches, like Carl's warehouse. A separate shelf life for the warehouse, not your home fridge.
+l15 | N | normal | No cache. Many people think it forbids caching. It does the opposite. The cache may store the response, but must check with Olga before every reuse. Like a librarian who keeps a copy on the desk, but phones ahead before lending it.
+l16 | N | normal | No store means do not keep any part of it, anywhere. A message that destroys itself. Nothing is ever written down.
+l17 | N | normal | Private means only one user's own browser may store it. Shared caches must not. A locker that opens only with your own key. Public explicitly allows shared caches to store it, even when the request carried a login. A notice board anyone may read.
+l18 | N | normal | Immutable says this exact address will never change, so skip even the check, even when the user presses reload. It is for file names containing a content hash, like app dot three f eight a two one dot j s. Never for an address that gets reused with new content.
+l19 | N | normal | Stale while revalidate, N. Serve the stale copy at once, and refresh in the background for up to N seconds. Like handing over yesterday's newspaper while someone runs for today's. And stale if error, N, serve the stale copy if the origin errors or cannot be reached. Yesterday's weather forecast, in case today's station is down.
+l20 | N | warn | The mix up to avoid. No cache and no store answer different questions. No cache says, keep it, but always check first. No store says, keep nothing, so there is nothing to check. Max age answers, how long. No cache and no store answer, under what conditions. And public and private answer, who.
+== s4 Gate two: validation with ETag
+sus2 | N | normal | Suspect two. What happens after the best before date? Does Fran throw the old copy away, or check it? The check is the next gate.
+l21 | N | normal | Gate two. The copy has gone stale. Fran does not have to download everything blind. She sends back a short fingerprint of what she holds, and asks, is this still current?
+l22 | N | normal | That fingerprint is an E tag. An opaque string the server chooses. A hash of the content, a version number, or a database row's updated time. Last modified is the same idea, using a timestamp instead of a fingerprint.
+l23 | BEN | normal | What is the price today?
+l24 | FRAN | normal | My copy is stale. Olga, I hold the tag zero f two six d zero f one. If none match. Is it still current?
+l25 | OLGA | punch | Same tag. Nothing changed. Three oh four, not modified. And I did not even read the body, I only compared two short strings.
+l26 | N | normal | That is validation working. A three oh four has no body. The fourteen bytes are never sent a second time, and Fran's copy is fresh again.
+l27 | N | normal | If Ben sends both validators, if none match and if modified since, the E tag wins. E tags are exact, byte for byte. Last modified has only one second resolution, and cannot detect a change that goes back to identical content within the same second. The rule is in R F C ninety one ten.
+l28 | N | warn | A classic mistake. Putting something that changes on every response, a timestamp, or a per process random number, inside the bytes the E tag hashes. Then every request gets a new tag, even when nothing meaningful changed, and the server never answers three oh four again. Caching silently stops working.
+== s5 Vary: one address, many versions
+sus3 | N | normal | Suspect three. The sorter, Vera. Could one address hold several versions, so that a customer gets the wrong one?
+l29 | N | normal | Some responses are not one thing. The same address may return compressed bytes to one client, and plain bytes to another. Meet Vera, the sorter at Carl's warehouse. The Vary header tells her which request header splits the shelf into separate copies.
+l30 | VERA | normal | Vary, accept encoding. So I keep one copy for clients that accept gzip, and one for those that do not. They are not interchangeable, even at the same address.
+l31 | N | warn | And the famous anti pattern. Vary cookie. Cookies are usually unique per visitor, so Vera must keep one copy per person. A near infinite number of shelves. Technically correct, and a shared cache that almost never hits.
+l32 | N | normal | If a response really differs per user, mark it private, and do not count on a shared cache at all. Or split the cacheable, cookie free parts from the personal parts. Vary is a correctness tool, not a speed tool. It only pays off when the named header has few distinct values.
+== s5b Suspect four: the warehouse
+car1 | N | normal | Suspect four. Carl's shared warehouse, a C D N, sits between every customer and Olga. The old price may be on his shelf.
+car2 | CARL | normal | I am Carl. Olga's label says S max age three hundred. So I keep the price for five minutes, and I never ask her. But Ben's browser has max age zero.
+car3 | N | normal | That explains it. S max age governs only shared caches, like Carl's. It does not set the browser's own freshness. With max age missing or zero, the browser revalidates on every load, while the C D N serves its own fresh copy for three hundred seconds without reaching the origin. Two audiences, two directives, and they must be set deliberately.
+== s6 A request, traced end to end
+l33 | N | normal | Now trace one resource, price dot json, across two requests. Cold request first. No if none match header arrives, because Ben has nothing stored. Olga computes the E tag, sets cache control, E tag, last modified, and vary, and writes a two hundred with the full fourteen byte body.
+l34 | N | normal | Fran stores the body, and the tag. Sixty seconds pass, and the max age window closes. The next time Ben asks, the copy is stale, so Fran sends a conditional request, with if none match, and the tag she holds.
+l35 | N | normal | Olga recomputes the current tag, and compares. They match. So she writes three oh four, not modified, and returns. The body is never written again. That is not caching failing. That is caching working.
+== s7 In Go: an ETag handler
+g1 | N | normal | Now the code, in Go. A small handler that serves a resource with cache control, an E tag, and conditional requests.
+g2 | N | normal | A resource holds its body and a last modified time. Its E tag is a hash of the body. Sha two fifty six, the first eight bytes, in hex, wrapped in quotes. A real fingerprint of the content, not of a timestamp.
+g3 | N | normal | The handler gets the resource, computes the tag, and sets the headers once, up front. Cache control, public, max age, must revalidate. The E tag. Last modified. And vary, accept encoding. Setting headers before branching keeps the two hundred path and the three oh four path from drifting apart.
+g4 | N | normal | Then it checks the validators. If the request has if none match, and it equals the tag, write three oh four and return. Only when if none match is absent does it fall back to if modified since, and compare times. Otherwise, write two hundred and the body.
+g5 | N | normal | The tests prove it. A repeat request carrying the current tag gets a three oh four. And the last modified fallback also works, when no tag is sent. Both pass with the race detector on.
+== s8 Deep dive: the details that bite
+d1 | N | normal | A few deeper points. First, strong versus weak validators. An E tag with no W slash prefix is strong, byte identical guaranteed. W slash marks a weak one, equivalent in meaning, not necessarily in bytes, for example the same data with keys in a different order. Range requests, resuming a partial download, require a strong validator, because stitching ranges from a weakly equivalent copy would be silently wrong.
+d2 | N | normal | Second, must revalidate. Without it, the rules allow a cache to serve a stale copy anyway in some situations, for example when the origin is unreachable. Must revalidate forbids serving stale without a successful check. Use it whenever stale data would be a real problem.
+d3 | N | normal | Third, why a three oh four still carries headers. It must repeat the headers the cache needs to update its stored copy, a fresh cache control, or a changed E tag. The body is what is left out, not the metadata.
+d4 | N | normal | And last, request collapsing. When many requests for the same stale address reach a cache at once, a well built cache sends only one revalidation upstream, and lets the others wait for it. Otherwise Olga is hit by a thundering herd of identical checks. That is a C D N and proxy detail, not an H T T P header.
+== s9 Trade-offs, failures and what to watch
+t1 | N | warn | Caching trades freshness for speed and origin load. Anything that must show the absolute latest state on every read, a live auction bid, a real time stock ticker, needs no store, or a very short max age. Never rely on revalidation alone for that.
+t2 | N | warn | And never use stale while revalidate or stale if error where a stale read is a correctness bug, not just a nuisance. An inventory count near zero. A payment status. Also, E tags cost a hash per response. For very large bodies, last modified is cheaper, but coarser.
+t3 | N | normal | Four failures, and fixes. Stale data served silently, because max age was far too long. Shorten it, or use no cache with strong E tags, so every request still revalidates cheaply. A per user page cached at a shared cache, so Ben sees someone else's account. Mark it private, and never mark anything with a login or cookie as public.
+t4 | N | normal | Vary cookie silently disabling shared caching. Split the cacheable parts from the personal ones. And an E tag that changes every request. Hash only the stable, meaningful fields.
+t5 | N | normal | What to watch. The cache hit ratio, requests served without reaching the origin. And the three oh four ratio, requests that reached the origin but needed no body. A persistently low three oh four ratio on stable content usually means an unstable E tag. The usual production recipe for static files is a content hashed file name, with cache control public, max age thirty one million five hundred thirty six thousand, immutable. A changed file gets a new address, instead of ever being invalidated.
+== s10 Interview round
+q0 | BEN | hook | Olga, test me. Six questions you will really get.
+q1 | BEN | question | No cache versus no store?
+q1a | OLGA | normal | No cache allows storing, but requires revalidation before every reuse, so a three oh four still saves the download. No store forbids keeping any copy, for genuinely sensitive one time responses.
+q2 | BEN | question | Why does if none match win over if modified since?
+q2a | OLGA | normal | E tags are exact, and can detect any change, including one that returns to identical content within the same second. Last modified has only one second resolution.
+q3 | BEN | question | Every request to an endpoint returns two hundred. Is caching broken?
+q3a | OLGA | normal | Not necessarily. On a first visit, or after eviction, two hundred is correct. The real bug is when a repeat request with a correct if none match still gets two hundred. That points to an unstable E tag.
+q4 | BEN | question | Stale while revalidate, instead of shortening max age?
+q4a | OLGA | normal | Use it when the user must never wait on the origin, but the data can be a little stale. It serves instantly, and refreshes in the background, so the next request is fresh. A shorter max age alone would make some requests pay the full round trip.
+q5 | BEN | question | Why is vary cookie almost always a mistake?
+q5a | OLGA | normal | Cookies are unique per user, so it creates one cache entry per visitor, and the shared cache almost never hits. If the response truly differs per user, mark it private.
+q6 | BEN | question | The C D N has S max age three hundred, but the browser still refetches on every load. Why might that be right?
+q6a | OLGA | normal | S max age governs only shared caches. If max age is absent or zero, the browser must revalidate every time, even though the C D N serves its own fresh copy. Set both, deliberately, for the two audiences.
+== s10b The fix
+fix1 | OLGA | punch | Found it. Three hiding places. Carl's three hundred second label, Fran's best before date, and no validator to tell them the price changed.
+fix2 | N | normal | The fix. A shorter max age and a longer S max age only where staleness is safe. A strong E tag, built from the content, so a check can say, changed. And for a price, no cache with an E tag, so every reuse is checked, yet a three oh four still saves the download.
+fix3 | N | normal | At ten fifteen, the new price, one ninety nine, appears everywhere. Case closed.
+== s11 Summary
+s0 | N | calm | Let us put it all together.
+s1a | N | normal | One. Caching avoids paying for the same answer twice. Freshness skips the network trip. Validation skips the resend, once the copy is stale.
+s1b | N | normal | Two. Cache control says how long, under what conditions, and who. Max age and S max age for how long. No cache means always check first. No store means keep nothing. Private for one user, public for shared caches. Immutable for content hashed files.
+s1c | N | normal | Three. Stale while revalidate and stale if error trade a little staleness for speed and resilience. Never for data where stale is a bug.
+s1d | N | normal | Four. An E tag is an exact fingerprint, last modified is a one second timestamp, and if none match wins. A match gets a three oh four, with no body. That is caching working.
+s1e | N | warn | Five. Vary splits the cache by a request header. Accept encoding is fine. Cookie kills sharing. Never hash a changing timestamp into an E tag.
+s1f | N | normal | Six. Strong tags are byte exact, and needed for range requests. Must revalidate forbids serving stale unchecked. A three oh four still carries headers. And good caches collapse concurrent revalidations into one.
+s1g | N | calm | And the one line to keep. A cache always asks, can I skip the trip, before it asks, can I skip the resend.
+== s12 Where to go next
+rn1 | N | calm | To go deeper, open the H T T P caching note, and its Go note, in your vault. Before it, read H T T P one versus two versus three, and H T T P fundamentals. After it, C D N and edge, and caching fundamentals. Compare it with cache invalidation, T T L and consistency, which covers application level caches like Redis.
+e1 | BEN | hook | Thank you, Olga. The right price, everywhere.
+e2 | OLGA | punch | Next case.

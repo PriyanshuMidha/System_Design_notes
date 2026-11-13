@@ -10,7 +10,7 @@ sources:
   - "PostgreSQL 17 docs: Explicit Locking, INSERT ... ON CONFLICT, pg_stat_replication"
   - "Redis documentation: SET with NX and EX, INFO replication"
   - "Stripe API docs, Idempotent requests"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Data Inconsistency and Duplicate Processing
@@ -23,6 +23,58 @@ updated: 2026-11-09
 > - **At-least-once delivery plus a non-idempotent handler equals duplicates.** Almost every duplicate incident is this.
 > - **Inconsistency has a finite list of causes:** retries, redelivery, race conditions, replica lag, dual writes, partial failures, bad migrations, clock problems.
 > - **Repair is a data change in production.** Snapshot first, dry-run, run in small batches, reconcile afterward.
+
+## Start here: the basics
+
+**The problem in one story**
+
+A customer pays once for an order.
+The payment message is delivered twice because the first reply got lost.
+The system charges them twice and sends two emails.
+Another customer's order shows paid in one screen and unpaid in another.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Duplicate processing | The same message or request is handled more than once | Two charges for one click |
+| Idempotent | Doing it twice has the same effect as doing it once | `SET status=paid` is idempotent; `balance += 10` is not |
+| Idempotency key | A unique ID sent with a request so repeats can be detected | `Idempotency-Key: ord-123` |
+| At-least-once delivery | The queue promises every message arrives, maybe more than once | Kafka redelivers after a consumer crash |
+| Retry | Sending a request again after a failure or timeout | Client retries after 2 s timeout |
+| Source of truth | The one system whose data is considered correct | The payments ledger, not the cache |
+| Reconciliation | Comparing two data sets and fixing mismatches | Nightly job compares orders with payments |
+| Dual write | Writing the same change to two systems separately | Write DB, then publish event; one may fail |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Producer"] -->|"message"| Q["Queue"]
+    Q --> C["Consumer"]
+    C --> DB["Database"]
+    C -. "ack lost" .-> Q
+    Q -->|"redeliver same message"| C
+    C --> K{"Seen this key?"}
+    K -->|"yes"| S["Skip"]
+```
+
+**Analogy**
+
+A postal clerk stamps every letter that arrives. If the post office sometimes delivers the same letter twice, the clerk must check a ledger of letter numbers before stamping, or the same bill gets paid twice.
+
+Where it breaks: letters are physical and rarely duplicate; in software, retries and redeliveries are normal and expected every day.
+
+**How the rest of this note builds up**
+
+- First, **Why it exists** and **Mental model** explain why duplicates are normal in distributed systems.
+- Then **How it works** shows where duplicates and mismatches come from.
+- Next, **First 5 minutes**, **Diagnosis flowchart** and **Investigation steps by cause** form the playbook.
+- Then **Fixes** and the InvoiceOps **Worked example** show idempotency keys, outbox and repair.
+- Finally, the SDE-3 **Deep dive** and **Interview questions** cover exactly-once myths and reconciliation.
+
+> [!tip] Remember
+> Assume every message can arrive twice; make handlers idempotent and keep one source of truth.
 
 ## 1. Why it exists
 
@@ -518,3 +570,8 @@ A job scheduled on N replicas runs N times unless one acquires a lock. Use the s
 - [[Saga Pattern]]
 - [[Webhooks - Sending and Receiving]]
 - [[Postmortems and Root Cause Analysis]]
+
+### Watch on YouTube
+
+- [Lessons Learned From Etcd the Data Inconsistency Issues - Marek Siarkowicz & Benjamin Wang](https://www.youtube.com/watch?v=_nSJ_vozyqk) · CNCF (Cloud Native Computing Foundation) · 35 min · 493 views
+- [Data Redundancy & Data Inconsistency // DBMS // Lecture In Urdu/Hindi](https://www.youtube.com/watch?v=r0z9_pmS0qM) · THE FACT SCHOOL · 3 min · 53,013 views

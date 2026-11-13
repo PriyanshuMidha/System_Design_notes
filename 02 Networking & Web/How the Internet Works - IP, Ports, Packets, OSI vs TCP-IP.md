@@ -9,7 +9,7 @@ sources:
   - "RFC 1122, Requirements for Internet Hosts - Communication Layers"
   - "ISO/IEC 7498-1, OSI Basic Reference Model"
   - "Cisco, BGP Case Studies and RFC 4271 overview"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP
@@ -25,9 +25,56 @@ updated: 2026-11-09
 > - A connection's identity on the wire is a **5-tuple**: protocol, source IP:port, destination IP:port.
 > - This note goes deeper than a first pass at networking: it also covers BGP route propagation between organizations and MTU/fragmentation, which is why it is tagged intermediate rather than basic.
 
+## Start here: the basics
+
+**The problem in one story.**
+You type a web address and a page appears in under a second.
+The server could be in another country, owned by a company you never heard of.
+Your laptop has no wire going straight to it.
+Somehow your bytes hop through a dozen machines and still reach the right program on the right computer.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Host | Any machine on a network | Your laptop, a cloud server |
+| Packet | A small chunk of data with an address label | ~1500 bytes of a web page |
+| IP address | A number that names a host on the network | `93.184.216.34` |
+| Port | A number that names a program on a host | 443 for HTTPS |
+| Router | A machine that passes packets toward their destination | Your home Wi-Fi box |
+| Header | Label bytes stuck in front of data | "from X, to Y, port 443" |
+| Protocol | Agreed rules for how two machines talk | TCP, UDP, HTTP |
+| ISP | Company that connects you to the internet | Your broadband provider |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    L["Your laptop"] --> H["Home router"]
+    H --> I1["Your ISP"]
+    I1 --> I2["Other networks"]
+    I2 --> S["Server's network"]
+    S --> P["Server program<br/>on port 443"]
+```
+
+**Analogy.** Sending data is like posting a letter: the address on the envelope (IP) gets it to the right building, and the apartment number (port) gets it to the right person. Each post office only decides the next office to send it to.
+Where it breaks: real mail is not chopped into pieces that may take different roads, arrive out of order, or get lost and resent.
+
+**How the rest of this note builds up**
+
+- First, why the internet uses packets instead of reserved wires (section 1) and the nested-envelopes model (section 2).
+- Then encapsulation, OSI vs TCP/IP layers, and routing with BGP (section 3).
+- Then MTU, ports and the 5-tuple, plus a small Go socket example (sections 3-4).
+- Finally the SDE-3 view: trade-offs, production failures like MTU black holes and port exhaustion, TTL, anycast (sections 6-8).
+
+> [!tip] Remember
+> IP address finds the machine, port finds the program, and routers pass each packet one hop at a time.
+
 ## 1. Why it exists
 
-Imagine your laptop (`192.168.1.42`) wants to fetch a page from a server (`93.184.216.34`). There is no dedicated wire running between the two machines. Your laptop talks to a home router, which talks to your ISP, which talks to other ISPs, which eventually reach the network the server lives on. That path crosses machines owned by different companies, upgraded independently, some of them down for maintenance on any given day.
+Imagine your laptop (`192.168.1.42`) wants to fetch a page from a server (`93.184.216.34`). There is no dedicated wire running between the two machines. Your laptop talks to a home router, which talks to your ISP, which talks to other ISPs, which eventually reach the network the server lives on.
+
+That path crosses machines owned by different companies, upgraded independently, some of them down for maintenance on any given day.
 
 A phone call used to solve this by reserving a dedicated **circuit** for the whole call — a fixed slice of wire that only that call could use, sitting idle during every silent pause. The internet's designers rejected that idea. Instead:
 
@@ -93,7 +140,9 @@ flowchart TB
 
 **Example:** an HTTP GET request leaves your browser as plain bytes. TCP wraps it with a header naming port 443 and a sequence number. IP wraps that with a header naming your address and the server's address. Ethernet wraps that again with the MAC address of the very next device — your home router, not the server.
 
-**Why it matters:** each header carries a field that names what comes next — the Ethernet frame's EtherType (IPv4 vs IPv6 vs ARP), the IP header's protocol field (TCP=6, UDP=17, ICMP=1), and the destination port. Without those fields, decapsulation would have no way to know which header to strip next, and the receiving machine could not hand the data to the right program.
+**Why it matters:** each header carries a field that names what comes next — the Ethernet frame's EtherType (IPv4 vs IPv6 vs ARP), the IP header's protocol field (TCP=6, UDP=17, ICMP=1), and the destination port.
+
+Without those fields, decapsulation would have no way to know which header to strip next, and the receiving machine could not hand the data to the right program.
 
 > [!warning] Common mistake
 > Thinking a router "reads the request" or "sees the URL." A router at the IP layer never opens the TCP header, so it never sees a port number, and it absolutely never sees the HTTP request text inside. Only the two endpoints (and anything terminating TLS) ever see that.
@@ -119,7 +168,9 @@ flowchart TB
 
 **Example:** OSI's layers 5, 6 and 7 (session, presentation, application) all collapse into one "Application" layer on the wire for almost anything you will build. There is no separate "session layer protocol" running between your browser and a web server — that idea exists only in the teaching diagram.
 
-**Why it matters:** when someone says "L4 load balancer" or "L7 firewall" (see [[Forward and Reverse Proxies - L4 vs L7]]), they are borrowing OSI's numbers as shorthand for "does it only see IP and port, or does it actually parse HTTP." Knowing which model is real and which is a teaching aid keeps you from drawing a fictitious "session layer" into a real system diagram.
+**Why it matters:** when someone says "L4 load balancer" or "L7 firewall" (see [[Forward and Reverse Proxies - L4 vs L7]]), they are borrowing OSI's numbers as shorthand for "does it only see IP and port, or does it actually parse HTTP."
+
+Knowing which model is real and which is a teaching aid keeps you from drawing a fictitious "session layer" into a real system diagram.
 
 > [!warning] Common mistake
 > Describing a production system's layers using all 7 OSI numbers as if each were a distinct wire protocol. Use the 4-layer TCP/IP model for how things actually work, and OSI's numbers only as shorthand vocabulary.
@@ -154,7 +205,9 @@ sequenceDiagram
     Transit->>Server-ISP: forwards it (one hop closer)
 ```
 
-**Why it matters:** this word-of-mouth design is exactly why losing one undersea cable or one ISP peering point reroutes traffic instead of cutting the internet in half — neighbors simply stop hearing a route and switch to the next-best one they know. It is also why a *bad* BGP announcement (a misconfigured AS claiming a prefix it has no business serving) can hijack and misdirect traffic: there is no central authority checking who is allowed to announce what.
+**Why it matters:** this word-of-mouth design is exactly why losing one undersea cable or one ISP peering point reroutes traffic instead of cutting the internet in half — neighbors simply stop hearing a route and switch to the next-best one they know.
+
+It is also why a *bad* BGP announcement (a misconfigured AS claiming a prefix it has no business serving) can hijack and misdirect traffic: there is no central authority checking who is allowed to announce what.
 
 > [!warning] Common mistake
 > Assuming BGP verifies who is "allowed" to announce a prefix. It does not, by default — route-origin validation (RPKI) is a bolt-on fix layered on top of BGP, not something built into the original protocol.
@@ -178,16 +231,22 @@ flowchart LR
     G --> H["lose ANY one piece<br/>-> resend the WHOLE original packet"]
 ```
 
-**Example:** TCP negotiates a Maximum Segment Size (MSS) at connection setup, sized so each segment plus its IP/TCP headers fits inside one 1500-byte Ethernet frame — avoiding fragmentation entirely for TCP traffic. UDP and ICMP traffic has no such negotiation, so it can still get fragmented; if any single fragment of that split packet is lost, the *entire* original packet must be resent, not just the missing piece.
+**Example:** TCP negotiates a Maximum Segment Size (MSS) at connection setup, sized so each segment plus its IP/TCP headers fits inside one 1500-byte Ethernet frame — avoiding fragmentation entirely for TCP traffic.
 
-**Why it matters:** **Path MTU Discovery** sends packets with the "don't fragment" bit set and shrinks its guess of the usable MTU whenever a router replies "too big." This is why MTU-related outages — commonly a VPN or tunnel header pushing an otherwise-fine packet over 1500 bytes — show up as "everything works except big responses," a confusing symptom that traces straight back to this one header field.
+UDP and ICMP traffic has no such negotiation, so it can still get fragmented; if any single fragment of that split packet is lost, the *entire* original packet must be resent, not just the missing piece.
+
+**Why it matters:** **Path MTU Discovery** sends packets with the "don't fragment" bit set and shrinks its guess of the usable MTU whenever a router replies "too big."
+
+This is why MTU-related outages — commonly a VPN or tunnel header pushing an otherwise-fine packet over 1500 bytes — show up as "everything works except big responses," a confusing symptom that traces straight back to this one header field.
 
 > [!tip] Remember
 > TCP avoids fragmentation by negotiating segment size up front; UDP/ICMP can still be fragmented, and losing one fragment means resending the whole packet.
 
 ### Ports and sockets: the 5-tuple
 
-**In plain words:** an IP address identifies a *host* (one machine). A **port** — a number from 0 to 65535 — identifies a *program* running on that host. It lives in the TCP or UDP header, not the IP header, which is exactly why a router forwarding on the IP header alone never sees it. Ports below 1024 are "well-known" by convention (80 = HTTP, 443 = HTTPS, 53 = DNS) and on Linux require root privileges to bind.
+**In plain words:** an IP address identifies a *host* (one machine). A **port** — a number from 0 to 65535 — identifies a *program* running on that host. It lives in the TCP or UDP header, not the IP header, which is exactly why a router forwarding on the IP header alone never sees it.
+
+Ports below 1024 are "well-known" by convention (80 = HTTP, 443 = HTTPS, 53 = DNS) and on Linux require root privileges to bind.
 
 A **socket** is the operating system's handle for one end of a connection. The OS and the network together identify a single TCP connection by its **5-tuple**:
 
@@ -195,7 +254,9 @@ A **socket** is the operating system's handle for one end of a connection. The O
 (protocol, source IP, source port, destination IP, destination port)
 ```
 
-**Example — why two browser tabs don't collide.** Open two tabs to `https://example.com`. Both get the *same* destination IP and the *same* destination port (443). What differs is the **source port**: the OS picks a different, free **ephemeral source port** (typically 32768–60999 on Linux) for each outgoing connection, so every 5-tuple is unique even though 4 of its 5 fields are identical between the two tabs.
+**Example — why two browser tabs don't collide.** Open two tabs to `https://example.com`. Both get the *same* destination IP and the *same* destination port (443).
+
+What differs is the **source port**: the OS picks a different, free **ephemeral source port** (typically 32768–60999 on Linux) for each outgoing connection, so every 5-tuple is unique even though 4 of its 5 fields are identical between the two tabs.
 
 **Picture it:**
 
@@ -281,11 +342,19 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 
 ## 8. Deep dive
 
-- **Why packet switching over circuit switching:** a phone network reserves a fixed-capacity circuit for a call's whole duration, wasting it during silence. Packet switching statistically multiplexes many flows over the same link, trading guaranteed bandwidth for better average utilization — the core bet the early ARPANET made and the internet inherited.
-- **TTL as a loop-breaker, not a timer:** the IP header's **TTL** (Time To Live) field is a hop count, decremented by one at every router; when it hits zero the packet is dropped and an ICMP "Time Exceeded" is sent back. This is what `traceroute` abuses: it sends packets with TTL=1, 2, 3, … and records which router replies "exceeded" at each hop, reconstructing the path one router at a time.
+- **Why packet switching over circuit switching:** a phone network reserves a fixed-capacity circuit for a call's whole duration, wasting it during silence.
+
+  Packet switching statistically multiplexes many flows over the same link, trading guaranteed bandwidth for better average utilization — the core bet the early ARPANET made and the internet inherited.
+- **TTL as a loop-breaker, not a timer:** the IP header's **TTL** (Time To Live) field is a hop count, decremented by one at every router; when it hits zero the packet is dropped and an ICMP "Time Exceeded" is sent back.
+
+  This is what `traceroute` abuses: it sends packets with TTL=1, 2, 3, … and records which router replies "exceeded" at each hop, reconstructing the path one router at a time.
 - **Why the 5-tuple, not just the port:** a server listening on port 443 can be reached by millions of distinct clients simultaneously. The OS demultiplexes incoming segments to the right in-memory socket using the full 5-tuple as the lookup key, not just the destination port — otherwise it couldn't tell two clients' traffic apart.
-- **EtherType and the IP protocol field** are what make decapsulation deterministic: EtherType `0x0800` says "the next header is IPv4," and the IP header's protocol field (6=TCP, 17=UDP, 1=ICMP) says what follows it. Get either field wrong (common in hand-rolled raw-socket code) and the receiving stack silently drops the packet.
-- **Anycast as an application of IP routing, not a special protocol**: the same IP address is announced via BGP from many physical locations, and normal shortest-AS-path routing sends each client to its topologically nearest instance. This is how DNS root servers and CDNs serve a single IP from dozens of data centers (see [[DNS - Resolution, Records and Caching]] and [[CDN and Edge]]).
+- **EtherType and the IP protocol field** are what make decapsulation deterministic: EtherType `0x0800` says "the next header is IPv4," and the IP header's protocol field (6=TCP, 17=UDP, 1=ICMP) says what follows it.
+
+  Get either field wrong (common in hand-rolled raw-socket code) and the receiving stack silently drops the packet.
+- **Anycast as an application of IP routing, not a special protocol**: the same IP address is announced via BGP from many physical locations, and normal shortest-AS-path routing sends each client to its topologically nearest instance.
+
+  This is how DNS root servers and CDNs serve a single IP from dozens of data centers (see [[DNS - Resolution, Records and Caching]] and [[CDN and Edge]]).
 
 ## 9. Interview questions
 
@@ -323,3 +392,8 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 - **Next:** [[IP Addressing, Subnets, NAT and VPC Basics]], [[TCP - Handshake, Reliability, Flow and Congestion Control]], [[DNS - Resolution, Records and Caching]]
 - **Compare with:** [[Forward and Reverse Proxies - L4 vs L7]] (where L4 vs L7 actually matters), [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]] (how a program reads from a socket)
 - **Runnable code:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP - Go]]
+
+### Watch on YouTube
+
+- [TCP/IP vs. OSI: How the Internet *Actually* Works](https://www.youtube.com/watch?v=VmTT2USqAZA) · Beaird IT · direct compare of the 7-layer OSI teaching model vs the 4-layer TCP/IP model actually used
+- [TCP/IP Model Explained (4 Layers, OSI vs TCP/IP & Real-World Data Flow) (CCNA)](https://www.youtube.com/watch?v=IjIZGyMwUdI) · StudyPalz · walks through real-world packet/data flow across the layers

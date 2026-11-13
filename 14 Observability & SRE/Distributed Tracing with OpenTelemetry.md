@@ -8,7 +8,7 @@ sources:
   - "W3C Trace Context (traceparent/tracestate), W3C Baggage"
   - "go.opentelemetry.io/otel v1.31.0 godoc"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Distributed Tracing with OpenTelemetry
@@ -36,6 +36,52 @@ flowchart LR
 ```
 
 Three spans (`db.query`, `queue.publish`, and the worker's consume span) all carry the same trace ID, `abc...`. One trace ID, one `GET /trace/abc...` query in the backend, one waterfall with every hop.
+
+## Start here: the basics
+
+**The problem in one story.**
+A user clicks "Pay" and waits 3 seconds.
+That one click touched an API, a database, a queue and a worker.
+Each service has its own logs, so nobody can see the whole journey.
+Tracing stamps the request with one ID and records every step, so you can see where the 3 seconds went.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Request | One call from a client to a service | `POST /pay` |
+| Trace | The full story of one request across all services | One ID like `abc123` |
+| Span | One timed step inside a trace, with a parent | "db.query took 40 ms" |
+| Propagation | Passing the trace ID along to the next service | Sending a `traceparent` HTTP header |
+| OpenTelemetry (OTel) | A vendor-neutral standard and SDK for traces | `otel.Tracer("api")` in Go |
+| Collector | A middle service that receives, filters and forwards spans | Drops 90% of healthy traces |
+| Sampling | Keeping only some traces to save cost | Keep 1 in 100 |
+| Cardinality | How many distinct values a label has | User IDs = millions |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] -->|"trace ID"| A["API span"]
+    A --> D["DB span"]
+    A --> K["Kafka publish span"]
+    K --> W["Worker span"]
+    A -. "spans" .-> COL["OTel Collector"]
+    COL --> B["Backend: waterfall view"]
+```
+
+**Analogy.** A parcel with a tracking number: every depot scans it, so you can see where it sat and for how long.
+Where it breaks: a parcel is scanned at every depot, but traces are usually sampled, so many requests are never recorded at all.
+
+**How the rest of this note builds up**
+
+- First, why logs and metrics alone can't follow one request (section 1) and the tree-of-spans model (section 2).
+- Then span anatomy, the `traceparent` header, the SDK-Collector-backend pipeline and reading a waterfall (section 3).
+- Then a Go worked example with HTTP and Kafka propagation (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: Collector monitoring, span metrics, Go context pitfalls, exemplars, baggage and 128-bit trace IDs (sections 7-8).
+
+> [!tip] Remember
+> One trace ID travels with the request; every hop adds a span, and the waterfall shows where time went.
 
 ## 1. Why it exists
 
@@ -83,7 +129,9 @@ traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
              version
 ```
 
-Every outbound call (HTTP header, gRPC metadata, or a Kafka message header) carries this string. The receiving service's instrumentation reads it, and any span it starts becomes a child of that span ID instead of the start of a new trace. **Baggage** (the `baggage` header) carries arbitrary key/value context the same way — for example a `tenant.id` to tag every downstream span — but baggage is not telemetry; it must be kept small since it travels on every request.
+Every outbound call (HTTP header, gRPC metadata, or a Kafka message header) carries this string. The receiving service's instrumentation reads it, and any span it starts becomes a child of that span ID instead of the start of a new trace.
+
+**Baggage** (the `baggage` header) carries arbitrary key/value context the same way — for example a `tenant.id` to tag every downstream span — but baggage is not telemetry; it must be kept small since it travels on every request.
 
 For asynchronous work (a Kafka consumer, a cron-triggered job), the consumer does not share a timeline with the producer, so OTel uses a **span link** instead of a parent/child edge: the consumer's span links back to the producer's span ID, and tracing UIs draw it as a cross-reference rather than claiming the consumer "contains" the producer's wait time.
 
@@ -103,8 +151,12 @@ flowchart LR
 
 - **API vs SDK:** the OTel **API** (`otel.Tracer(...)`, `trace.SpanFromContext`) is what instrumented libraries and your own code call. The **SDK** (`sdktrace.NewTracerProvider`) is what you wire up once at startup — it decides sampling, batching and export. Code that only imports the API has zero behavior until an SDK is registered with `otel.SetTracerProvider`.
 - **Instrumentation libraries** wrap a transport so you don't hand-write spans for routine calls: `otelhttp` (HTTP client and server middleware), `otelgrpc` (gRPC interceptors), `otelsql` / `otelpgx` (SQL driver wrapper that emits `db.query` spans).
-- **Sampling.** Head sampling (`ParentBased(TraceIDRatioBased(0.1))`) decides whether to even record a trace, at the root, before any work happens — cheap, but a 3.4 s outlier has only a 10% chance of being kept. Tail sampling, run in the Collector, buffers whole traces briefly and keeps every trace with an error or a latency over a threshold, dropping the boring 99%. Production systems almost always want tail sampling for anything that isn't 100%-sampled.
-- **The Collector** sits between services and backends so services only ever talk OTLP to one place. Its pipeline is receivers (OTLP gRPC/HTTP) → processors (`batch`, `memory_limiter`, `tail_sampling`, attribute redaction for PII) → exporters (per backend). Running it as a per-node **agent** keeps the hop local and cheap; running it as a central **gateway** centralizes sampling decisions and redaction policy. Most fleets run both: agent for collection, gateway for tail sampling.
+- **Sampling.** Head sampling (`ParentBased(TraceIDRatioBased(0.1))`) decides whether to even record a trace, at the root, before any work happens — cheap, but a 3.4 s outlier has only a 10% chance of being kept. Tail sampling, run in the Collector, buffers whole traces briefly and keeps every trace with an error or a latency over a threshold, dropping the boring 99%.
+
+  Production systems almost always want tail sampling for anything that isn't 100%-sampled.
+- **The Collector** sits between services and backends so services only ever talk OTLP to one place. Its pipeline is receivers (OTLP gRPC/HTTP) → processors (`batch`, `memory_limiter`, `tail_sampling`, attribute redaction for PII) → exporters (per backend).
+
+  Running it as a per-node **agent** keeps the hop local and cheap; running it as a central **gateway** centralizes sampling decisions and redaction policy. Most fleets run both: agent for collection, gateway for tail sampling.
 
 ### Reading a waterfall
 
@@ -122,11 +174,15 @@ gantt
     queue.publish_invoice_status :a5, 390, 30
 ```
 
-The root span (420 ms) is explained almost entirely by `db.update_invoice` (320 ms): that is the critical path. A gap between the end of one span and the start of the next (not shown here) that isn't covered by any child span means time the parent spent on something unsampled — often a GC pause, a lock wait, or a connection-pool queue. Repeated, near-identical child spans (`db.query` ×40) is the N+1 pattern: look for a loop calling the database once per item instead of batching.
+The root span (420 ms) is explained almost entirely by `db.update_invoice` (320 ms): that is the critical path. A gap between the end of one span and the start of the next (not shown here) that isn't covered by any child span means time the parent spent on something unsampled — often a GC pause, a lock wait, or a connection-pool queue.
+
+Repeated, near-identical child spans (`db.query` ×40) is the N+1 pattern: look for a loop calling the database once per item instead of batching.
 
 ## 4. Worked example
 
-The full version below builds InvoiceOps's real webhook span tree (`verify_signature → db.check_webhook_event → db.update_invoice → queue.publish_invoice_status`, kept from the old Go OpenTelemetry Metrics Tracing note) with a real `TracerProvider`, context threading, error recording, and a span exported in-memory for the test to assert on. It compiles and passes `go vet` and `go test -race` on Go 1.24.4 with `go.opentelemetry.io/otel` v1.31.0.
+The full version below builds InvoiceOps's real webhook span tree (`verify_signature → db.check_webhook_event → db.update_invoice → queue.publish_invoice_status`, kept from the old Go OpenTelemetry Metrics Tracing note) with a real `TracerProvider`, context threading, error recording, and a span exported in-memory for the test to assert on.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24.4 with `go.opentelemetry.io/otel` v1.31.0.
 
 ```go
 // Package tracing shows the shape of an OpenTelemetry-instrumented request
@@ -360,3 +416,8 @@ Full logging and metrics instrumentation for a Go service — `log/slog` setup, 
 - **Before this:** [[Observability Fundamentals]], [[Structured Logging]]
 - **Next:** [[SLIs, SLOs, SLAs and Error Budgets]], [[Production Debugging Playbook]]
 - **Compare with:** [[Metrics and Prometheus]] (aggregate health vs one request's path), [[Observability in Go Services]] (the full Go SDK/logging/metrics wiring), [[Benchmarks, Profiling and Tracing]] (in-process CPU/goroutine profiling vs cross-service tracing)
+
+### Watch on YouTube
+
+- [Distributed tracing with OpenTelemetry and Cloud Trace](https://www.youtube.com/watch?v=NQeK8Kbu6UM) · Google Cloud Tech · 4 min · 16,941 views
+- [Distributed Tracing Integration with OpenTelemetry and Knative - Daniel Oh & James Falkner, Red Hat](https://www.youtube.com/watch?v=48uWe9Y3CwQ) · CNCF (Cloud Native Computing Foundation) · 33 min · 568 views

@@ -1,0 +1,38 @@
+{
+  "N": {
+    "voice": "en-US-EmmaMultilingualNeural",
+    "rate": 4,
+    "pitch": 0,
+    "volume": 0
+  },
+  "ZOE": {
+    "voice": "en-US-AriaNeural",
+    "rate": 4,
+    "pitch": 2,
+    "volume": 0
+  },
+  "MAX": {
+    "voice": "en-US-GuyNeural",
+    "rate": -4,
+    "pitch": -4,
+    "volume": 0
+  },
+  "GIA": {
+    "voice": "en-AU-NatashaNeural",
+    "rate": 2,
+    "pitch": 2,
+    "volume": 0
+  },
+  "PAT": {
+    "voice": "en-GB-RyanNeural",
+    "rate": 0,
+    "pitch": -2,
+    "volume": 0
+  },
+  "MAL": {
+    "voice": "en-US-EricNeural",
+    "rate": 0,
+    "pitch": -2,
+    "volume": 0
+  }
+}

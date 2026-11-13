@@ -9,13 +9,22 @@ sources:
   - "System V Application Binary Interface, AMD64 Architecture Processor Supplement (stack layout, calling convention)"
   - "Go runtime source, runtime/stack.go and runtime/proc.go, `go build -gcflags=-m` output captured on Go 1.24.4, darwin/arm64, 2026-11-06"
   - "Love, Linux Kernel Development, 3rd ed., ch. 2 (process address space layout)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Process Memory Layout - Stack vs Heap - Go
 
 > [!summary] TL;DR
 > Runnable code for [[Process Memory Layout - Stack vs Heap]]: two functions whose `-gcflags=-m` output proves the escape-analysis rule directly, a hand-built LIFO call stack that makes "push/pop is just a pointer move" concrete and testable, and a stack-growth harness that measures a real goroutine's stack doubling as recursion gets deeper.
+
+## Before the code
+
+- **Packages**: three small packages (`escape`, `memlayout`, `cmd/stackdemo`) in one module; each folder is one package.
+- **Pointers and `&`**: `&Counter{...}` takes the address of a value; returning it is what makes a value escape to the heap.
+- **Methods on a pointer receiver**: `func (s *CallStack) Push(...)` lets the method change the stack it is called on.
+- **Goroutines and channels**: `go func(){...}()` starts a goroutine; closing `done` and receiving `<-done` waits for it to finish.
+- **`runtime.ReadMemStats`**: reads the runtime's memory counters, including `StackInuse` (bytes used by all goroutine stacks).
+- **What to run**: `go vet ./... && go test -race ./...`, then `go build -gcflags=-m ./escape/` and `go run ./cmd/stackdemo`.
 
 ## What this code shows
 
@@ -47,7 +56,11 @@ flowchart LR
 
 ### Step 1: two functions the compiler treats differently
 
-**Concept.** The theory note's whole claim is that a value's *provable lifetime*, not its type or syntax, decides stack vs heap ([[Process Memory Layout - Stack vs Heap#3. How it works]]). The clearest way to prove that isn't to assert it — it's to write the smallest possible pair of functions where one value obviously can't escape and one obviously must, and then ask the compiler itself what it decided. The alternative — reading the Go spec's escape-analysis prose alone — tells you the rule but not whether your mental model of it matches what the real compiler does on real code.
+**Concept.** The theory note's whole claim is that a value's *provable lifetime*, not its type or syntax, decides stack vs heap ([[Process Memory Layout - Stack vs Heap#3. How it works]]).
+
+The clearest way to prove that isn't to assert it — it's to write the smallest possible pair of functions where one value obviously can't escape and one obviously must, and then ask the compiler itself what it decided.
+
+The alternative — reading the Go spec's escape-analysis prose alone — tells you the rule but not whether your mental model of it matches what the real compiler does on real code.
 
 ```go
 // Package escape holds two functions used only to demonstrate the compiler's
@@ -86,7 +99,9 @@ func NewCounterOnHeap(start int) *Counter {
 
 ### Step 2: confirming it with the compiler's own output
 
-**Concept.** `go build -gcflags=-m` asks the compiler to print its escape-analysis reasoning alongside the normal build. Running it is the fastest way to find an unexpected heap allocation in a hot path, and it's how you check the theory note's rule against reality for any function, not just this demo pair.
+**Concept.** `go build -gcflags=-m` asks the compiler to print its escape-analysis reasoning alongside the normal build.
+
+Running it is the fastest way to find an unexpected heap allocation in a hot path, and it's how you check the theory note's rule against reality for any function, not just this demo pair.
 
 ```text
 $ go build -gcflags=-m ./escape/
@@ -105,7 +120,9 @@ escape/demo.go:23:7: &Counter{...} escapes to heap
 
 ### Step 3: a call stack you can push and pop
 
-**Concept.** The LIFO mechanism itself, modelled directly and tested — not a demonstration of escape analysis, but of what "the stack" actually *is* underneath it ([[Process Memory Layout - Stack vs Heap#Stack frames and the call stack]]). The alternative to a fixed backing array would be a `[]Frame` that grows with `append`, which is how Go's own growable goroutine stacks behave conceptually — but a fixed-capacity array is the better teaching tool here because it makes "stack overflow" an explicit, testable error instead of something `append` silently absorbs.
+**Concept.** The LIFO mechanism itself, modelled directly and tested — not a demonstration of escape analysis, but of what "the stack" actually *is* underneath it ([[Process Memory Layout - Stack vs Heap#Stack frames and the call stack]]).
+
+The alternative to a fixed backing array would be a `[]Frame` that grows with `append`, which is how Go's own growable goroutine stacks behave conceptually — but a fixed-capacity array is the better teaching tool here because it makes "stack overflow" an explicit, testable error instead of something `append` silently absorbs.
 
 ```go
 // Package memlayout models a call stack explicitly, as a backing array plus
@@ -218,7 +235,11 @@ sequenceDiagram
 
 ### Step 4: measuring a goroutine's stack actually grow
 
-**Concept.** The theory note claims goroutine stacks grow by doubling as recursion goes deeper ([[Process Memory Layout - Stack vs Heap#Worked numeric example: a goroutine's stack growing by doubling]]). `recurseAndMeasure` and `GoroutineStackGrowth` turn that claim into a number you can read off a real run: each call recurses to a chosen depth, forcing the runtime's `morestack` mechanism to fire repeatedly, then reports the process-wide stack memory in use. The alternative — trusting the Go runtime's documentation alone — tells you the policy exists; running this shows the actual jumps on your own machine and Go version.
+**Concept.** The theory note claims goroutine stacks grow by doubling as recursion goes deeper ([[Process Memory Layout - Stack vs Heap#Worked numeric example: a goroutine's stack growing by doubling]]).
+
+`recurseAndMeasure` and `GoroutineStackGrowth` turn that claim into a number you can read off a real run: each call recurses to a chosen depth, forcing the runtime's `morestack` mechanism to fire repeatedly, then reports the process-wide stack memory in use.
+
+The alternative — trusting the Go runtime's documentation alone — tells you the policy exists; running this shows the actual jumps on your own machine and Go version.
 
 ```go
 package memlayout

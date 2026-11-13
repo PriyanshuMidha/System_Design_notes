@@ -8,13 +8,22 @@ related: ["[[Virtual Memory, Paging and the TLB]]"]
 sources:
   - "Linux kernel documentation, Documentation/admin-guide/mm/ (transparent hugepages, concepts)"
   - "Bovet & Cesati, Understanding the Linux Kernel, 3rd ed., ch. 2 (memory addressing) and ch. 17 (page frame reclaiming)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Virtual Memory, Paging and the TLB - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Virtual Memory, Paging and the TLB]]: a small, deterministic `MMU` that simulates a page table, a fixed-capacity LRU TLB, and demand paging with a bounded number of physical frames — so a TLB hit, a TLB miss, a minor fault and a major fault are all things a test can actually observe and assert on.
+
+## Before the code
+
+- **Maps** (`map[uint64]*pte`): Go's built-in hash table. Here it plays the page table and the TLB's storage.
+- **Pointers to structs** (`*pte`, `*MMU`): changing `entry.swapped` through a pointer changes the one shared entry, not a copy.
+- **Defined types** (`type Event string`): a new named type built on `string`, so only the four named constants are meant to be used.
+- **Slices** (`order []uint64`): a growable list. The TLB uses one to remember which page was used least recently.
+- **Methods** (`func (m *MMU) Translate`): functions attached to a type, called as `m.Translate(addr)`.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or generics are needed here.
 
 ## What this code shows
 
@@ -37,13 +46,20 @@ flowchart LR
 - Go 1.24. No external dependencies — everything here is standard-library-free, pure in-memory simulation.
 - Layout: a module `vm` with `mmu.go` (the `MMU`, page table and fault logic), `tlb.go` (the LRU TLB), and `mmu_test.go` (all four tests, pinning down the exact event sequence the theory note describes).
 - Run it with `go vet ./... && go test -race -v ./...`.
-- This is a teaching model, not a real MMU: real hardware walks a radix-tree page table in silicon and the OS handles faults in kernel code written in C/assembly. Here both are modelled directly in plain Go so the sequence of events (TLB hit, TLB miss, minor fault, major fault) is visible and testable in a few milliseconds, with no root privileges, kernel module or virtual machine required.
+- This is a teaching model, not a real MMU. Real hardware walks a radix-tree page table in silicon, and the OS handles faults in kernel code written in C/assembly.
+- Here both are modelled directly in plain Go. The sequence of events (TLB hit, TLB miss, minor fault, major fault) is visible and testable in a few milliseconds, with no root privileges, kernel module or virtual machine required.
 
 ## Code
 
+**Reading order.** Steps 1-5 build `mmu.go`: the outcome names, the MMU's state, the two cheap translation paths, the two fault paths, and frame allocation with eviction.
+
+Steps 6-8 build `tlb.go`, the small LRU cache that sits in front of the page table. The tests at the end pin each of the four outcomes to one concrete access sequence, so read a step and then find the test that exercises it.
+
 ### Step 1: naming the four outcomes
 
-**Concept.** The theory note's translation-path diagram ends in one of four named outcomes ([[Virtual Memory, Paging and the TLB#The translation path]]). Giving each one an explicit `Event` string, rather than returning a bare `bool` or an `int` code, makes every test assertion below read as "this access was a TLB hit" instead of "this access returned `2`" — worth the small verbosity for code whose entire purpose is to make an invisible hardware mechanism legible.
+**Concept.** The theory note's translation-path diagram ends in one of four named outcomes ([[Virtual Memory, Paging and the TLB#The translation path]]).
+
+Giving each one an explicit `Event` string, rather than returning a bare `bool` or an `int` code, makes every test assertion below read as "this access was a TLB hit" instead of "this access returned `2`" — worth the small verbosity for code whose entire purpose is to make an invisible hardware mechanism legible.
 
 ```go
 // Package vm is a small, deterministic simulation of the paging mechanism:
@@ -78,7 +94,9 @@ type pte struct {
 
 ### Step 2: the MMU's state and constructor
 
-**Concept.** `MMU` holds exactly the state the theory note's mental model needs: a page table (the big, slow map), a TLB (the small, fast cache in front of it), and a bounded pool of physical frames, because demand paging only becomes observable once frames can run out ([[Virtual Memory, Paging and the TLB#Multi-level page tables]]).
+**Concept.** `MMU` holds exactly the state the theory note's mental model needs: a page table (the big, slow map), a TLB (the small, fast cache in front of it), and a bounded pool of physical frames.
+
+The frame pool is bounded because demand paging only becomes observable once frames can run out ([[Virtual Memory, Paging and the TLB#Multi-level page tables]]).
 
 ```go
 // MMU models one process's address translation.
@@ -113,7 +131,9 @@ func offset(addr uint64) uint64 { return addr % pageSize }
 
 ### Step 3: Translate — the fast paths
 
-**Concept.** `Translate` is the code form of the theory note's translation-path flowchart: check the TLB first, and if that misses, check the page table for an already-resident mapping ([[Virtual Memory, Paging and the TLB#The translation path]]). This piece handles the two cheap outcomes; the next step handles the two fault outcomes.
+**Concept.** `Translate` is the code form of the theory note's translation-path flowchart: check the TLB first, and if that misses, check the page table for an already-resident mapping ([[Virtual Memory, Paging and the TLB#The translation path]]).
+
+This piece handles the two cheap outcomes; the next step handles the two fault outcomes.
 
 ```go
 // Translate converts a virtual address to a physical address, simulating the
@@ -143,7 +163,9 @@ func (m *MMU) Translate(vaddr uint64) (paddr uint64, event Event) {
 
 ### Step 4: Translate — the two fault outcomes
 
-**Concept.** The theory note draws a sharp line between a minor fault (no disk I/O) and a major fault (data must come back from "swap") ([[Virtual Memory, Paging and the TLB#The translation path]]). `handleFault` is where that distinction actually lives in code: it is entirely about whether a page-table entry already exists in the swapped state.
+**Concept.** The theory note draws a sharp line between a minor fault (no disk I/O) and a major fault (data must come back from "swap") ([[Virtual Memory, Paging and the TLB#The translation path]]).
+
+`handleFault` is where that distinction actually lives in code: it is entirely about whether a page-table entry already exists in the swapped state.
 
 ```go
 // handleFault resolves the two possible fault outcomes: a page that was
@@ -187,7 +209,11 @@ func (m *MMU) allocateFrame(forPage uint64) uint64 {
 	}
 	return m.evictAndReuse(forPage)
 }
+```
 
+The fast path above is just a counter: while the process is under its frame cap, it hands out the next unused frame number. Only when the cap is hit does the slower eviction path below run.
+
+```go
 // evictAndReuse picks the lowest-numbered occupied frame as the eviction
 // victim (a simplified stand-in for a real clock/LRU page-replacement
 // policy), marks its page swapped out, and hands the freed frame to forPage.
@@ -368,7 +394,7 @@ func TestRepeatedAccessHitsTheTLB(t *testing.T) {
 }
 ```
 
-**How it works.** `0x1000` and `0x1004` both fall in the same 4 KB page (page 0, since `4096 ∤ 0x1004` lands well inside it), so the second call's `vpn` is identical to the first — this test is specifically checking that a *different byte in the same page* is still a hit, not just a literally repeated address.
+**How it works.** `0x1000` and `0x1004` both fall in the same 4 KB page (page 1, since `0x1000` is exactly 4096 and `0x1004` is 4 bytes past it), so the second call's `vpn` is identical to the first — this test is specifically checking that a *different byte in the same page* is still a hit, not just a literally repeated address.
 
 **If it fails.** Getting `TLBMiss` instead of `TLBHit` would mean the first call's `MinorFault` path forgot to call `m.tlb.insert` before returning.
 
@@ -396,7 +422,9 @@ func TestTLBEvictionStillHitsThePageTable(t *testing.T) {
 
 **How it works.** With `maxFrames = 8`, no physical frame is ever reclaimed in this test — only the 2-entry TLB is under pressure — so the third access necessarily evicts `0x1000` from the TLB (least recently used) while its page-table entry, and its physical frame, stay fully intact.
 
-**If it fails.** Getting `TLBHit` would mean the TLB's capacity enforcement in `insert`/`evictOldest` isn't actually evicting. Getting `MinorFault` or `MajorFault` instead of `TLBMiss` would mean the page-table entry was somehow lost or marked swapped when only the TLB, not the frame pool, was supposed to be under pressure.
+**If it fails.** Getting `TLBHit` would mean the TLB's capacity enforcement in `insert`/`evictOldest` isn't actually evicting.
+
+Getting `MinorFault` or `MajorFault` instead of `TLBMiss` would mean the page-table entry was somehow lost or marked swapped when only the TLB, not the frame pool, was supposed to be under pressure.
 
 ### Test 4: frame exhaustion causes a major fault on re-access
 
@@ -421,15 +449,23 @@ func TestFrameExhaustionCausesMajorFaultOnReaccess(t *testing.T) {
 }
 ```
 
-**How it works.** With `maxFrames = 2`, the third distinct page forces `allocateFrame` into `evictAndReuse`, which marks whichever page it evicts (the lowest-numbered frame, here frame 0, holding page `0x1000`) as `swapped`; the fourth call then finds that `swapped` entry and takes the major-fault branch in `handleFault`.
+**How it works.** With `maxFrames = 2`, the third distinct page forces `allocateFrame` into `evictAndReuse`.
 
-**If it fails.** Getting `MinorFault` instead of `MajorFault` would mean `evictAndReuse` deleted the page-table entry entirely instead of marking it swapped — a correctness bug that would look like "re-accessing lost data silently becomes a fresh zero-filled page," which is a much worse failure than a slow major fault.
+That function marks whichever page it evicts (the lowest-numbered frame, here frame 0, holding page `0x1000`) as `swapped`; the fourth call then finds that `swapped` entry and takes the major-fault branch in `handleFault`.
+
+**If it fails.** Getting `MinorFault` instead of `MajorFault` would mean `evictAndReuse` deleted the page-table entry entirely instead of marking it swapped.
+
+That is a correctness bug that would look like "re-accessing lost data silently becomes a fresh zero-filled page," which is a much worse failure than a slow major fault.
 
 ## Pitfalls in the code
 
-- **The eviction policy is not a real LRU over frames.** `evictAndReuse` picks the *lowest-numbered* occupied frame, not the least-recently-accessed page — two different things. A real kernel's clock algorithm (or true LRU, which is expensive to implement exactly in hardware) approximates "least recently used page," not "smallest frame number." This simulation's choice is simpler and deterministic (useful for tests), but it does not model realistic eviction behavior under a mixed access pattern.
+- **The eviction policy is not a real LRU over frames.** `evictAndReuse` picks the *lowest-numbered* occupied frame, not the least-recently-accessed page — two different things.
+  - A real kernel's clock algorithm (or true LRU, which is expensive to implement exactly in hardware) approximates "least recently used page," not "smallest frame number."
+  - This simulation's choice is simpler and deterministic (useful for tests), but it does not model realistic eviction behavior under a mixed access pattern.
 - **`lruTLB`'s `order` is `O(capacity)` per touch.** Fine at TLB-sized capacities (tens to low thousands); the same pattern at, say, a 1,000,000-entry application-level cache would need a doubly linked list with O(1) splice instead of a slice with linear search-and-remove.
-- **No concurrency safety anywhere in this file.** `MMU` and `lruTLB` both mutate shared state with no locking. A real kernel's MMU-adjacent data structures are protected by fine-grained locks (or per-CPU structures) precisely because multiple CPUs can fault concurrently; sharing one `*MMU` across goroutines here without external synchronization will race.
+- **No concurrency safety anywhere in this file.** `MMU` and `lruTLB` both mutate shared state with no locking.
+  - A real kernel's MMU-adjacent data structures are protected by fine-grained locks (or per-CPU structures) precisely because multiple CPUs can fault concurrently.
+  - Sharing one `*MMU` across goroutines here without external synchronization will race.
 - **`handleFault`'s major-fault branch never actually reads data from anywhere.** This simulation only tracks *that* a major fault would occur and updates the bookkeeping state; it doesn't model an actual backing store (disk or swap file) with its own latency, since the theory note's point is the event sequence, not a disk I/O simulator.
 - **Frame numbers are never reused across different `MMU` instances or returned to a shared pool.** `freeFrame` only ever increments within one `MMU`'s lifetime; this is a single-process model, not a multi-process physical-memory allocator.
 

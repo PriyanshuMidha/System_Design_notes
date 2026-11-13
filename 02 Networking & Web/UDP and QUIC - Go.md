@@ -11,13 +11,22 @@ sources:
   - "RFC 9001, Using TLS to Secure QUIC"
   - "RFC 9114, HTTP/3"
   - "Iyengar & Thomson (eds.), QUIC Working Group documents (IETF)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # UDP and QUIC - Go
 
 > [!summary] TL;DR
 > This code demonstrates the two transports side by side: a plain UDP echo exchange that times out silently on loss, and a QUIC connection carrying two independent streams over loopback, proving that a large, slow stream never blocks a small, fast one. See the theory in [[UDP and QUIC]].
+
+## Before the code
+
+- **`net.UDPConn`**: the standard library's UDP socket; `ReadFromUDP` / `WriteToUDP` send and receive single datagrams.
+- **Deadlines (`SetReadDeadline`)**: make a blocking read give up after a time limit; the only way a UDP client learns a reply is missing.
+- **Goroutines**: lightweight threads; the QUIC server runs one per stream so streams never wait on each other.
+- **`context.Context`**: carries a timeout so `Accept`, `Dial` and stream calls stop instead of hanging.
+- **`sync.WaitGroup`**: lets the test wait until all goroutines finish.
+- **Run it:** the commands in Setup below (`go vet ./...` and `go test -race ./...`); needs the `quic-go` module.
 
 ## What this code shows
 
@@ -70,7 +79,9 @@ func EchoUDP(conn *net.UDPConn) error {
 }
 ```
 
-**Concept.** This is the UDP side of [[UDP and QUIC#UDP a datagram nothing more]]: a server that never calls `Accept`, because UDP has no concept of an accepted connection. The alternative design — a connected `UDPConn` per client, the way TCP servers work — doesn't exist for UDP at the protocol level; `ReadFromUDP` returning the sender's address on every call *is* the mechanism UDP servers use instead.
+**Concept.** This is the UDP side of [[UDP and QUIC#UDP a datagram nothing more]]: a server that never calls `Accept`, because UDP has no concept of an accepted connection.
+
+The alternative design — a connected `UDPConn` per client, the way TCP servers work — doesn't exist for UDP at the protocol level; `ReadFromUDP` returning the sender's address on every call *is* the mechanism UDP servers use instead.
 
 **How it works.**
 1. `buf` is sized to 1500 bytes, a conservative bound that fits inside a standard Ethernet frame's MTU without IP fragmentation — a UDP datagram bigger than the path MTU risks being silently fragmented or dropped.
@@ -103,7 +114,9 @@ func SendAndWaitUDP(addr string, msg []byte, timeout time.Duration) ([]byte, err
 }
 ```
 
-**Concept.** This implements the client side of [[UDP and QUIC#UDP a datagram nothing more]]'s central claim: there is no way to distinguish "the server is down" from "my reply got lost in transit" except by timing out. An alternative design using `net.ListenUDP` directly (instead of `DialUDP`) was rejected because `DialUDP` filters incoming datagrams to only those from `raddr`, which is the correct behavior for a client expecting one specific peer's reply and avoids accidentally processing an unrelated datagram from a different source on the same local port.
+**Concept.** This implements the client side of [[UDP and QUIC#UDP a datagram nothing more]]'s central claim: there is no way to distinguish "the server is down" from "my reply got lost in transit" except by timing out.
+
+An alternative design using `net.ListenUDP` directly (instead of `DialUDP`) was rejected because `DialUDP` filters incoming datagrams to only those from `raddr`, which is the correct behavior for a client expecting one specific peer's reply and avoids accidentally processing an unrelated datagram from a different source on the same local port.
 
 **How it works.**
 1. `net.DialUDP` with a non-nil remote address does not send anything on the wire — it only remembers `raddr` locally so later `Read`/`Write` calls don't need to repeat it. This is the detail the theory note's "common mistake" callout warns about.
@@ -167,7 +180,9 @@ func selfSignedTLSConfig() (*tls.Config, error) {
 }
 ```
 
-**Concept.** This builds the certificate [[UDP and QUIC#QUICs handshake TLS 13 isnt bolted on its structural]] refers to: QUIC's spec has no cleartext mode, so even a loopback demo needs a real (if self-signed) TLS 1.3 certificate to exist before a connection can be dialed. The alternative — writing cert/key files to disk — was rejected for a test module, since generating them in memory keeps the test hermetic and avoids leaving artifacts around.
+**Concept.** This builds the certificate [[UDP and QUIC#QUICs handshake TLS 13 isnt bolted on its structural]] refers to: QUIC's spec has no cleartext mode, so even a loopback demo needs a real (if self-signed) TLS 1.3 certificate to exist before a connection can be dialed.
+
+The alternative — writing cert/key files to disk — was rejected for a test module, since generating them in memory keeps the test hermetic and avoids leaving artifacts around.
 
 **How it works.**
 1. A fresh 2048-bit RSA key and a minimal self-signed certificate template are generated purely in memory; no certificate authority is involved, which is why the client side below must explicitly opt out of chain verification.
@@ -196,7 +211,9 @@ func RunQUICEchoServer(ctx context.Context, ln *quic.Listener) error {
 }
 ```
 
-**Concept.** This is the direct implementation of [[UDP and QUIC#QUIC reliable streams multiplexed over UDP]]: one goroutine per stream means a slow stream's blocking `io.Copy` never stalls any other stream's goroutine. An alternative design — one shared loop reading all streams round-robin — was rejected because it would reintroduce exactly the head-of-line blocking QUIC is meant to avoid, just moved into application code instead of the transport.
+**Concept.** This is the direct implementation of [[UDP and QUIC#QUIC reliable streams multiplexed over UDP]]: one goroutine per stream means a slow stream's blocking `io.Copy` never stalls any other stream's goroutine.
+
+An alternative design — one shared loop reading all streams round-robin — was rejected because it would reintroduce exactly the head-of-line blocking QUIC is meant to avoid, just moved into application code instead of the transport.
 
 **How it works.**
 1. `ln.Accept(ctx)` completes the QUIC handshake and returns a single logical connection; everything after this point operates on streams within that one connection, not new connections.
@@ -226,7 +243,11 @@ func OpenStreamAndEcho(ctx context.Context, conn quic.Connection, msg []byte) ([
 
 **Concept.** This is the client-side half of the same exchange: opening a stream is independent per call, so two goroutines calling `OpenStreamAndEcho` concurrently on the same `conn` get two genuinely separate streams, never sharing sequence state.
 
-**How it works.** `stream.Close()` half-closes only the write direction — "I'm done sending" — which is what lets `io.Copy` on the server see EOF and finish, without needing to close the whole connection. `io.ReadFull` then blocks until exactly `len(msg)` bytes have come back, which is safe here because the server always echoes exactly what it received.
+**How it works.**
+
+`stream.Close()` half-closes only the write direction — "I'm done sending" — which is what lets `io.Copy` on the server see EOF and finish, without needing to close the whole connection.
+
+`io.ReadFull` then blocks until exactly `len(msg)` bytes have come back, which is safe here because the server always echoes exactly what it received.
 
 ```mermaid
 sequenceDiagram

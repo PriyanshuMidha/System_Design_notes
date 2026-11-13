@@ -9,7 +9,7 @@ sources:
   - "Intel Firmware Support Package and Platform Innovation Framework documentation (legacy BIOS/POST)"
   - "systemd.io documentation (init, unit ordering, boot targets)"
   - "AWS Nitro System documentation (hypervisor-managed instance boot)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # ROM, Flash, Firmware and the Boot Process
@@ -23,9 +23,58 @@ updated: 2026-11-09
 > - Firmware is software, stored in that flash, that runs on a device's own microcontroller before (or instead of) any general-purpose OS — the BIOS/UEFI on a PC's motherboard is one example among many (SSDs, NICs, baseboard management controllers all have their own firmware).
 > - The boot sequence is: power on → firmware runs POST and initializes hardware → firmware hands off to a bootloader → bootloader loads the OS kernel → kernel starts `init`/`systemd` → services start, including, eventually, your Go binary.
 
+## Start here: the basics
+
+**The problem in one story.**
+You turn off your laptop and unplug it.
+Everything in RAM is gone the moment power drops.
+Yet when you press the power button again, the machine somehow knows how to wake up, find the disk and load the OS.
+That "how to wake up" code lives in memory that survives power loss: ROM and flash, holding firmware.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Volatile | Loses its contents when power is cut | RAM after you unplug the PC |
+| Non-volatile | Keeps its contents with no power | A USB stick in a drawer |
+| ROM | Memory written once (or rarely) and mostly read | The chip holding a calculator's program |
+| Flash | Rewritable non-volatile memory, erased in blocks | Your phone's storage, an SSD |
+| Firmware | Small software stored on a device's own chip | The BIOS/UEFI on a motherboard |
+| Bootloader | Tiny program whose only job is to load the OS | GRUB on Linux |
+| Kernel | The core of the operating system | Linux itself |
+| POST | Power-On Self-Test: firmware checking the hardware | The beep codes on an old PC |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Power on"] --> F["Firmware in flash<br/>(POST, init hardware)"]
+    F --> B["Bootloader"]
+    B --> K["OS kernel"]
+    K --> I["init / systemd"]
+    I --> G["Your Go service"]
+```
+
+**Analogy.** Booting is like a relay race. The firmware runner starts with the baton because it is already on the track (in flash), then hands off to the bootloader, which hands off to the kernel.
+Where it breaks: relay runners are equals; here each stage is bigger and more capable than the one before, and the early stages mostly vanish once the kernel takes over.
+
+**How the rest of this note builds up**
+
+- First, why non-volatile memory exists (section 1) and a mental model of "survives power loss" (section 2).
+- Then how it works: the ROM family from mask ROM to NOR/NAND flash, firmware, and the boot chain (section 3).
+- Then a worked boot example and a comparison of memory types (sections 4-5).
+- Finally the SDE-3 view: trade-offs, firmware in production fleets and the deep dive (sections 6-8).
+
+> [!tip] Remember
+> RAM forgets when power goes; ROM and flash remember, and the firmware stored there is what starts the boot relay.
+
 ## 1. Why it exists
 
-Power on a bare CPU and it starts fetching instructions from a fixed, hardwired address (the "reset vector") — but RAM is empty at that instant: DRAM holds nothing meaningful until something writes real data into it, and even if it did, DRAM is volatile and would have lost everything the moment power was off. Something has to exist at that fixed address, intact, the instant power returns, with no operating system, no file system, and no loader yet in sight. That something is ROM (in practice, flash): memory that keeps its contents without power, specifically so the very first instructions a CPU ever fetches after power-on are already sitting there waiting.
+Power on a bare CPU and it starts fetching instructions from a fixed, hardwired address (the "reset vector") — but RAM is empty at that instant: DRAM holds nothing meaningful until something writes real data into it, and even if it did, DRAM is volatile and would have lost everything the moment power was off.
+
+Something has to exist at that fixed address, intact, the instant power returns, with no operating system, no file system, and no loader yet in sight.
+
+That something is ROM (in practice, flash): memory that keeps its contents without power, specifically so the very first instructions a CPU ever fetches after power-on are already sitting there waiting.
 
 Everything this note describes — POST, the bootloader, the kernel handoff — exists to get from "CPU with nothing but a fixed first address" to "a scheduler is running your Go binary," which is the process-creation side of what [[How a Computer Runs a Program]] covers for a single program once an OS already exists to load it.
 
@@ -34,7 +83,9 @@ Everything this note describes — POST, the bootloader, the kernel handoff — 
 
 ## 2. Mental model
 
-Think of ROM/flash as a sealed instruction card taped to a vending machine, readable even if the machine's internal lights (RAM, which needs constant power) are off. The boot process is reading that card step by step: first a short self-test ("are the coin slot and dispenser working?" — POST), then "hand control to whatever's loaded in slot 2" (the bootloader), which in turn says "now load and run the big program from the shelf" (the OS kernel).
+Think of ROM/flash as a sealed instruction card taped to a vending machine, readable even if the machine's internal lights (RAM, which needs constant power) are off.
+
+The boot process is reading that card step by step: first a short self-test ("are the coin slot and dispenser working?" — POST), then "hand control to whatever's loaded in slot 2" (the bootloader), which in turn says "now load and run the big program from the shelf" (the OS kernel).
 
 This analogy breaks down in one place: a vending machine's card never changes. A motherboard's flash chip can be rewritten in place (a firmware update), something a sealed card can never do.
 
@@ -76,7 +127,9 @@ flowchart LR
 
 ### In plain words: what firmware actually is
 
-Firmware is software, just like an application — written in C or assembly, compiled, and stored as a binary image. Two things set it apart from an ordinary application: it lives in the device's own flash chip rather than on a general-purpose file system, and it runs on the device's own microcontroller (or, for the main system BIOS/UEFI, directly on the CPU) rather than waiting for an operating system to schedule it.
+Firmware is software, just like an application — written in C or assembly, compiled, and stored as a binary image.
+
+Two things set it apart from an ordinary application: it lives in the device's own flash chip rather than on a general-purpose file system, and it runs on the device's own microcontroller (or, for the main system BIOS/UEFI, directly on the CPU) rather than waiting for an operating system to schedule it.
 
 **Example:** every SSD runs firmware that manages its flash translation layer (see [[Storage Devices - HDD, SSD, NVMe]]); every network interface card runs firmware; a server's baseboard management controller (BMC) runs its own independent firmware and OS for out-of-band management (IPMI), entirely separate from whatever OS the main CPU boots.
 
@@ -128,7 +181,9 @@ stateDiagram-v2
 
 ### Picture it: why the kernel needs initramfs, and what `switch_root` does
 
-The kernel binary itself is kept small and generic — it doesn't ship a driver for every possible disk controller or encryption scheme. But to mount the *real* root filesystem it might need exactly those drivers. `initramfs` solves this chicken-and-egg problem: it's a small, temporary root filesystem, loaded into RAM by the bootloader alongside the kernel, that holds just enough (storage drivers, disk-encryption unlock logic, sometimes network drivers) to find and mount the real root filesystem.
+The kernel binary itself is kept small and generic — it doesn't ship a driver for every possible disk controller or encryption scheme. But to mount the *real* root filesystem it might need exactly those drivers.
+
+`initramfs` solves this chicken-and-egg problem: it's a small, temporary root filesystem, loaded into RAM by the bootloader alongside the kernel, that holds just enough (storage drivers, disk-encryption unlock logic, sometimes network drivers) to find and mount the real root filesystem.
 
 ```mermaid
 sequenceDiagram
@@ -177,7 +232,9 @@ NOR flash supports random-access reads at the bit/byte level directly, so a CPU 
 
 ### In plain words: cloud instances boot through the same stages, one layer down
 
-An AWS EC2 instance, a GCP Compute Engine VM, or any cloud VM boots through this exact sequence from the guest OS's point of view — but the "firmware" the guest sees is itself emulated or passed through by the hypervisor. AWS's Nitro System, for example, handles instance boot largely in dedicated hardware/firmware outside the main host CPU, which is part of why modern cloud instances can report very fast boot times: much of the traditional POST and hardware-discovery work is short-circuited or parallelized by the virtualization layer, rather than every instance repeating a full physical-machine POST from scratch.
+An AWS EC2 instance, a GCP Compute Engine VM, or any cloud VM boots through this exact sequence from the guest OS's point of view — but the "firmware" the guest sees is itself emulated or passed through by the hypervisor.
+
+AWS's Nitro System, for example, handles instance boot largely in dedicated hardware/firmware outside the main host CPU, which is part of why modern cloud instances can report very fast boot times: much of the traditional POST and hardware-discovery work is short-circuited or parallelized by the virtualization layer, rather than every instance repeating a full physical-machine POST from scratch.
 
 This matters operationally: a cold-started container or Lambda-style function pays none of this boot cost (it starts inside an already-booted kernel), while a freshly launched VM instance does pay some version of it — one reason serverless cold starts and VM cold starts have very different latency profiles.
 
@@ -294,3 +351,7 @@ Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
 - **Next:** [[Storage Devices - HDD, SSD, NVMe]], [[System Calls and User vs Kernel Mode]]
 - **Compare with:** [[How a Computer Runs a Program]] (the compile/link/load pipeline that produces what the kernel eventually runs)
 - **Runnable code:** [[ROM, Flash, Firmware and the Boot Process - Go]]
+
+### Watch on YouTube
+
+- [BIOS vs UEFI Explained: How Your Computer Really Starts](https://www.youtube.com/watch?v=R1EOEEbE_dQ) · Turtle Code · walks through firmware/boot handoff from power-on to OS

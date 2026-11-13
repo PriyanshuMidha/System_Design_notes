@@ -13,13 +13,15 @@ sources:
   - "Prometheus docs, Storage (head block, WAL, 2-hour blocks, compaction, default retention 15d)"
   - "PostgreSQL 17 docs, Table Partitioning and BRIN Indexes (pages_per_range default 128)"
   - "Apache Parquet format specification (row groups, column chunks, pages); Apache Iceberg table spec"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Time-Series and Columnar Storage
 
 > [!summary] TL;DR
-> Analytics queries read a few columns from millions of rows, so analytics databases store each **column** together on disk instead of each **row**. Same-type values sitting side by side compress 5–20× (an estimate that depends on the data) and can be summed in tight loops. Time-series stores add one more trick: data arrives in time order, so they partition by time, compress timestamps as tiny deltas, and drop old data by deleting whole files.
+> Analytics queries read a few columns from millions of rows, so analytics databases store each **column** together on disk instead of each **row**. Same-type values sitting side by side compress 5–20× (an estimate that depends on the data) and can be summed in tight loops.
+>
+> Time-series stores add one more trick: data arrives in time order, so they partition by time, compress timestamps as tiny deltas, and drop old data by deleting whole files.
 
 > [!abstract] Core idea
 > - A row store keeps a whole row together, which is fast for "fetch invoice 42". A column store keeps a whole column together, which is fast for "sum `total_minor` over a year".
@@ -27,6 +29,52 @@ updated: 2026-11-03
 > - Time-series data is append-only and time-ordered, so stores partition it by time and delete old partitions instead of rows.
 > - Raw data is expensive to keep forever: keep raw for days, rollups for years, and the full archive in cheap object storage.
 > - Analytics belongs off the primary OLTP database: a replica for small loads, a separate column store for big ones.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app stores every invoice as one row: id, customer, total, date and 16 other fields.
+Finance asks, "what was the total revenue each month last year?"
+To answer, the database reads every whole row, even though it only needs two fields.
+Storing data column by column, and by time, makes that question hundreds of times cheaper.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| OLTP | Many small reads and writes for the live app | "Fetch invoice 42", "insert one payment" |
+| OLAP / analytics | Few big queries that scan and summarise lots of data | "Sum revenue per month for 2025" |
+| Row store | Keeps all fields of one row next to each other on disk | PostgreSQL, MySQL |
+| Column store | Keeps all values of one column next to each other | ClickHouse, Parquet files |
+| Time-series data | Measurements stamped with a time, mostly appended | CPU usage every 10 seconds |
+| Compression | Storing the same data in fewer bytes | 1000 copies of "paid" stored as "paid ×1000" |
+| Partition | A slice of a table, often one per day or month | `invoices_2025_03` |
+| Rollup | A pre-summarised copy of raw data | Hourly totals instead of every event |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    APP["App writes rows"] --> OLTP["Row store<br/>(PostgreSQL)"]
+    OLTP -- "copy / stream" --> COL["Column store<br/>(one file per column)"]
+    COL --> Q["SUM(total) by month:<br/>read 2 columns only"]
+    COL -- "old days" --> ROLL["Rollups + archive<br/>in object storage"]
+```
+
+**Analogy.** A row store is a stack of filled-in forms; a column store is a spreadsheet where you can grab just the "amount" column.
+Adding up one column of a spreadsheet is much faster than flipping every form.
+Where it breaks: changing one person's details is easy on a form but touches many separate column files in a column store.
+
+**How the rest of this note builds up**
+
+- First, why analytics on the primary database hurts (section 1) and the row-vs-column mental model (section 2).
+- Then how column layout, compression, vectorized execution, data skipping and retention work (section 3).
+- Then worked examples in ClickHouse and PostgreSQL, plus compression traced by hand (section 4).
+- Then variants, trade-offs and production setups (sections 5-7).
+- Finally the SDE-3 deep dive on MergeTree, TimescaleDB, Prometheus TSDB, lakehouse files and late data.
+
+> [!tip] Remember
+> Rows for "fetch one thing", columns for "summarise many things"; partition time-series by time and drop old partitions whole.
 
 ## 1. Why it exists
 
@@ -41,9 +89,13 @@ WHERE event_type = 'paid' AND occurred_at >= now() - interval '365 days'
 GROUP BY 1 ORDER BY 1;
 ```
 
-The query needs **3 columns** (`occurred_at`, `event_type`, `amount_minor`). In PostgreSQL, a heap table is a row store: every 8 KB page holds whole rows, so scanning one year (about a third of the table, 40 GB) reads all 20 columns of every row. At 500 MB/s of effective sequential read, that is about **80 seconds** (an estimate), and it evicts hot OLTP pages from the cache while it runs.
+The query needs **3 columns** (`occurred_at`, `event_type`, `amount_minor`). In PostgreSQL, a heap table is a row store: every 8 KB page holds whole rows, so scanning one year (about a third of the table, 40 GB) reads all 20 columns of every row.
 
-A column store reads only the 3 columns it needs. Those columns are about 20 bytes of the 120 per row before compression, and a time-sorted timestamp, a 5-value enum and an integer amount compress very well. A realistic result is a few hundred MB to 2 GB read instead of 40 GB (an estimate), and the scan runs on separate hardware from the payment path.
+At 500 MB/s of effective sequential read, that is about **80 seconds** (an estimate), and it evicts hot OLTP pages from the cache while it runs.
+
+A column store reads only the 3 columns it needs. Those columns are about 20 bytes of the 120 per row before compression, and a time-sorted timestamp, a 5-value enum and an integer amount compress very well.
+
+A realistic result is a few hundred MB to 2 GB read instead of 40 GB (an estimate), and the scan runs on separate hardware from the payment path.
 
 Two more pressures make it worse over time:
 
@@ -155,7 +207,9 @@ In a table sorted by `(workspace_id, occurred_at)`, the `workspace_id` column be
 
 ### Vectorized execution
 
-A row-at-a-time engine (PostgreSQL's executor, for example) calls a function per row per operator. A **vectorized** engine runs each operator over a batch of thousands of values from one column at once. The inner loop is a plain array walk the CPU can pipeline and turn into SIMD (single instruction, multiple data) instructions, and the per-row overhead of function calls and branching disappears. ClickHouse, DuckDB, Snowflake and BigQuery all execute this way.
+A row-at-a-time engine (PostgreSQL's executor, for example) calls a function per row per operator. A **vectorized** engine runs each operator over a batch of thousands of values from one column at once. The inner loop is a plain array walk the CPU can pipeline and turn into SIMD (single instruction, multiple data) instructions, and the per-row overhead of function calls and branching disappears.
+
+ClickHouse, DuckDB, Snowflake and BigQuery all execute this way.
 
 ```mermaid
 flowchart LR
@@ -533,11 +587,15 @@ flowchart TB
     CC2 --> PG["pages with encoding and min/max statistics"]
 ```
 
-**Parquet** stores a file as **row groups** (often 128 MB), each holding one **column chunk** per column, split into **pages** with their own encodings and min/max statistics. Engines prune by row group statistics. A **table format** such as Apache Iceberg or Delta Lake adds a metadata layer over many Parquet files: snapshots for time travel, atomic commits, schema evolution and hidden partitioning. Many engines (Spark, Trino, Athena, Snowflake, DuckDB) can read the same table, so raw history is stored once at object-storage prices.
+**Parquet** stores a file as **row groups** (often 128 MB), each holding one **column chunk** per column, split into **pages** with their own encodings and min/max statistics. Engines prune by row group statistics. A **table format** such as Apache Iceberg or Delta Lake adds a metadata layer over many Parquet files: snapshots for time travel, atomic commits, schema evolution and hidden partitioning.
+
+Many engines (Spark, Trino, Athena, Snowflake, DuckDB) can read the same table, so raw history is stored once at object-storage prices.
 
 ### Late and out-of-order data
 
-Time partitioning assumes data arrives roughly on time. A mobile client that syncs a day late writes into an old partition: Prometheus rejects samples older than the head window unless out-of-order ingestion is enabled (experimental since v2.39, enabled with `out_of_order_time_window`); ClickHouse accepts them but creates small parts in old partitions; TimescaleDB may have to decompress a compressed chunk. Decide how late is acceptable and route anything later to a correction path.
+Time partitioning assumes data arrives roughly on time. A mobile client that syncs a day late writes into an old partition: Prometheus rejects samples older than the head window unless out-of-order ingestion is enabled (experimental since v2.39, enabled with `out_of_order_time_window`); ClickHouse accepts them but creates small parts in old partitions; TimescaleDB may have to decompress a compressed chunk.
+
+Decide how late is acceptable and route anything later to a correction path.
 
 ```mermaid
 flowchart TD
@@ -555,7 +613,9 @@ flowchart TD
 > Timestamps arrive at near-regular intervals, so the delta-of-delta is usually 0 and costs about one bit or byte. Values are XORed with the previous value (Gorilla), and slowly changing gauges share sign, exponent and high mantissa bits, so only a few middle bits are stored. Random noise does not compress this way.
 
 > [!question]- What is a sparse primary index in ClickHouse and how does it differ from a PostgreSQL B-tree?
-> Each part is sorted by the `ORDER BY` key, and the index stores only the key of the first row of each 8,192-row granule. A query binary-searches those marks and reads whole granules. A B-tree has one entry per row and finds single rows; the sparse index is tiny, fits in memory, and is built for range scans, not point lookups.
+> Each part is sorted by the `ORDER BY` key, and the index stores only the key of the first row of each 8,192-row granule. A query binary-searches those marks and reads whole granules.
+>
+> A B-tree has one entry per row and finds single rows; the sparse index is tiny, fits in memory, and is built for range scans, not point lookups.
 
 > [!question]- Why not run dashboards on the primary database?
 > Dashboards scan and aggregate lots of history. On the primary they compete for CPU, I/O and buffer cache with the payment path and can slow user-facing writes. Move them to rollup tables, a read replica, or a separate column store, depending on scale.
@@ -589,3 +649,8 @@ flowchart TD
 - **Implementation:** [[Time-Series and Columnar Storage - Go]]
 - **Next:** [[Distributed SQL]], [[Materialized Views and Denormalization]], [[Transactional Outbox and CDC]]
 - **Compare with:** [[Wide-Column Stores and Cassandra]] (wide rows, not columnar files), [[Metrics and Prometheus]] (the metrics side in depth), [[Case Study - Metrics and Logging Platform]]
+
+### Watch on YouTube
+
+- [An intro to column-based storage](https://www.youtube.com/watch?v=a7rmLeGK1v8) · ClickHouse · official explainer on column pruning and compression, matching the note's core idea
+- [What is ClickHouse Database in 2026? The Fastest Open-Source OLAP Explained!](https://www.youtube.com/watch?v=Tk3Xmayopy8) · Brendan Metcalfe · concrete example of a columnar OLAP engine applying these ideas

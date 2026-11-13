@@ -11,13 +11,17 @@ sources:
   - "soheilhy/cmux v0.1.5 docs (connection-sniffing multiplexer)"
   - "golang.org/x/net v0.29.0, http2/h2c package docs"
   - "protocolbuffers/protobuf-go v1.34.2, protojson package docs (UseProtoNames, EmitUnpopulated)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Serving REST and gRPC Together
 
 > [!summary] TL;DR
-> A production Go backend usually needs both a gRPC API for internal services and a JSON/REST API for browsers and third parties. **grpc-gateway** generates a reverse-proxy layer that translates REST+JSON into gRPC calls against the same service code, so you write and test the RPC once. **ConnectRPC** is the newer alternative: one handler natively speaks gRPC, gRPC-Web and a plain JSON/HTTP protocol, with no translation layer at all.
+> A production Go backend usually needs both a gRPC API for internal services and a JSON/REST API for browsers and third parties.
+>
+> **grpc-gateway** generates a reverse-proxy layer that translates REST+JSON into gRPC calls against the same service code, so you write and test the RPC once.
+>
+> **ConnectRPC** is the newer alternative: one handler natively speaks gRPC, gRPC-Web and a plain JSON/HTTP protocol, with no translation layer at all.
 
 > [!abstract] Core idea
 > - Define the service once in a `.proto` file; annotate each RPC with `google.api.http` to say which REST path and method map to it.
@@ -26,11 +30,62 @@ updated: 2026-11-07
 > - ConnectRPC skips the translation: its generated handler accepts gRPC, gRPC-Web, or Connect's own JSON-over-HTTP protocol on the same `net/http` handler, using the same `.proto`.
 > - Serve REST and gRPC on one port with `cmux` (or h2c for both over HTTP/2), or keep two ports. Two ports is simpler and is the default; one port is for platforms that only expose one.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your invoice service is called by two kinds of clients.
+Other backend services want fast, typed gRPC calls.
+A browser and a partner company want plain JSON over HTTP.
+You do not want to write and test every endpoint twice.
+So you describe the API once, and let a tool serve it both ways.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| REST / JSON API | HTTP URLs and methods carrying JSON text | `GET /v1/invoices/42` |
+| gRPC | A fast RPC system using binary Protobuf over HTTP/2 | `GetInvoice(GetInvoiceRequest)` |
+| Protobuf (`.proto`) | A file describing messages and services | `message Invoice { int64 id = 1; }` |
+| Code generation | A tool writing Go code from the `.proto` | `buf generate` |
+| Reverse proxy | A server that receives a request and forwards it on | grpc-gateway turns JSON into gRPC |
+| HTTP/2 | Newer HTTP that sends many requests on one connection | gRPC needs it |
+| Port | A numbered door on a server for network traffic | `:8080` for REST, `:9090` for gRPC |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Browser<br/>(JSON)"] --> GW["grpc-gateway<br/>(JSON to gRPC)"]
+    GW --> S["Your gRPC service<br/>code, written once"]
+    I["Internal service<br/>(gRPC)"] --> S
+    C["Any client"] --> CR["ConnectRPC handler<br/>(speaks both)"]
+    CR --> S
+```
+
+**Analogy.** grpc-gateway is a translator at the front desk who turns English questions into the office's own language; ConnectRPC is an office where staff already speak both.
+Where it breaks: a translator can relay a long conversation easily, but streaming through the gateway is limited and awkward.
+
+**How the rest of this note builds up**
+
+- First, why one API needs two faces (section 1) and the mental model of one `.proto`, many protocols (section 2).
+- Then how it works: the codegen pipeline, gateway options, in-process vs network registration, error mapping, ConnectRPC, and one port vs two (section 3).
+- Then a full Go worked example and a comparison of approaches (sections 4-5).
+- Finally the SDE-3 deep dive: trade-offs, production concerns and streaming limits (sections 6-8).
+
+> [!tip] Remember
+> Write the RPC once in `.proto`; let generated code serve JSON and gRPC from the same handler.
+
 ## 1. Why it exists
 
-InvoiceOps' internal services call each other over gRPC: compact binary encoding, generated client stubs, deadlines and streaming built in (see [[gRPC Services in Go]]). But the billing dashboard is a browser, and browsers cannot easily speak gRPC — it's framed over HTTP/2 in a way `fetch` doesn't expose, and gRPC-Web needs a client library and a translating proxy of its own. Partners who want to poll an invoice's status from a cron job want a `curl`-able REST endpoint, not a `.proto` file and a generated client.
+InvoiceOps' internal services call each other over gRPC: compact binary encoding, generated client stubs, deadlines and streaming built in (see [[gRPC Services in Go]]).
 
-The naive fix is to hand-write a second REST API that calls the same business logic, in parallel with the gRPC one. Now every new field, every new error case, and every new endpoint is written and tested twice, and the two APIs drift: the REST handler forgets a validation the gRPC handler has, or returns a different error shape for the same failure.
+But the billing dashboard is a browser, and browsers cannot easily speak gRPC — it's framed over HTTP/2 in a way `fetch` doesn't expose, and gRPC-Web needs a client library and a translating proxy of its own.
+
+Partners who want to poll an invoice's status from a cron job want a `curl`-able REST endpoint, not a `.proto` file and a generated client.
+
+The naive fix is to hand-write a second REST API that calls the same business logic, in parallel with the gRPC one.
+
+Now every new field, every new error case, and every new endpoint is written and tested twice, and the two APIs drift: the REST handler forgets a validation the gRPC handler has, or returns a different error shape for the same failure.
 
 grpc-gateway and ConnectRPC remove the duplication by generating the REST (or Connect-JSON) layer from the same `.proto` that defines the gRPC service. One implementation of `InvoiceService`, two protocols on the wire.
 
@@ -150,7 +205,9 @@ flowchart LR
 
 ### Status and error mapping
 
-A gRPC `status.Error` crosses the gateway and becomes an HTTP status via `runtime.HTTPStatusFromCode` (`NotFound` → 404, `InvalidArgument` → 400, `Unauthenticated` → 401, …) and a default JSON error body. Override both with `runtime.WithErrorHandler` when the API needs its own error shape or a status mapping the defaults get wrong for your domain — for example, treating `codes.AlreadyExists` as 200 for an idempotent create instead of the default 409.
+A gRPC `status.Error` crosses the gateway and becomes an HTTP status via `runtime.HTTPStatusFromCode` (`NotFound` → 404, `InvalidArgument` → 400, `Unauthenticated` → 401, …) and a default JSON error body.
+
+Override both with `runtime.WithErrorHandler` when the API needs its own error shape or a status mapping the defaults get wrong for your domain — for example, treating `codes.AlreadyExists` as 200 for an idempotent create instead of the default 409.
 
 ### ConnectRPC
 
@@ -173,15 +230,25 @@ There is no second serialization pass and no annotation to keep in sync with the
 
 Two ports — gRPC on `:9090`, the gateway's REST handler on `:8080` — is the simpler default: each is a plain `http.Server` or `grpc.Server`, independently health-checked, independently scaled in front of its own load-balancer listener.
 
-Sharing one port needs `cmux`, which peeks at each new connection's opening bytes and routes it: gRPC's HTTP/2 connection preface and `content-type: application/grpc` go to the `grpc.Server`, everything else to the gateway's `http.Handler`. `h2c` (`golang.org/x/net/http2/h2c`) lets the gateway accept HTTP/2 without TLS in development; terminate real TLS in front of both in production (see [[TLS, HTTPS and HTTP2 in Go Servers]]). A cmux-free alternative is to put one `http.Handler` behind h2c (or TLS) that checks `r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")` and calls `grpcServer.ServeHTTP` for gRPC, the gateway otherwise; grpc-go documents `ServeHTTP` as experimental and slower than `Serve`, so the dedicated listener stays preferable.
+Sharing one port needs `cmux`, which peeks at each new connection's opening bytes and routes it: gRPC's HTTP/2 connection preface and `content-type: application/grpc` go to the `grpc.Server`, everything else to the gateway's `http.Handler`.
+
+`h2c` (`golang.org/x/net/http2/h2c`) lets the gateway accept HTTP/2 without TLS in development; terminate real TLS in front of both in production (see [[TLS, HTTPS and HTTP2 in Go Servers]]).
+
+A cmux-free alternative is to put one `http.Handler` behind h2c (or TLS) that checks `r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")` and calls `grpcServer.ServeHTTP` for gRPC, the gateway otherwise; grpc-go documents `ServeHTTP` as experimental and slower than `Serve`, so the dedicated listener stays preferable.
 
 ### Limits of streaming over the gateway
 
-A gRPC server-streaming RPC routed through the network-hop gateway becomes a stream of newline-delimited JSON objects on one long-lived HTTP response — there is no HTTP/2 push or WebSocket involved, just one response body that never ends until the stream does. grpc-gateway v2 can also accept a client-streaming request as a stream of JSON objects in the request body (and bidirectional streams in a limited form), but browsers' `fetch` cannot reliably stream a request body and nothing reconnects or resumes for you, so treat those as awkward. Expose client-streaming and bidirectional RPCs over gRPC (or Connect) directly, or redesign the client-facing surface around [[Real-time APIs - WebSocket, SSE and Long Polling]] (see [[WebSockets and SSE in Go]]).
+A gRPC server-streaming RPC routed through the network-hop gateway becomes a stream of newline-delimited JSON objects on one long-lived HTTP response — there is no HTTP/2 push or WebSocket involved, just one response body that never ends until the stream does.
+
+grpc-gateway v2 can also accept a client-streaming request as a stream of JSON objects in the request body (and bidirectional streams in a limited form), but browsers' `fetch` cannot reliably stream a request body and nothing reconnects or resumes for you, so treat those as awkward.
+
+Expose client-streaming and bidirectional RPCs over gRPC (or Connect) directly, or redesign the client-facing surface around [[Real-time APIs - WebSocket, SSE and Long Polling]] (see [[WebSockets and SSE in Go]]).
 
 ### When not to bother
 
-A small internal system with one Go client and one Go server has no browser or third party to serve JSON to — skip the gateway and ConnectRPC entirely and call the gRPC client directly. Add the translation layer only once something outside the gRPC world (a browser, a partner's HTTP client, a `curl` health check a non-Go team wants) needs to reach the same service.
+A small internal system with one Go client and one Go server has no browser or third party to serve JSON to — skip the gateway and ConnectRPC entirely and call the gRPC client directly.
+
+Add the translation layer only once something outside the gRPC world (a browser, a partner's HTTP client, a `curl` health check a non-Go team wants) needs to reach the same service.
 
 ## 4. Worked example
 
@@ -590,7 +657,9 @@ func TestConnectHandler_ServesJSONAndConnectProtocol(t *testing.T) {
 }
 ```
 
-**Measured:** the tests above (`TestInProcessGateway_CreateThenGet`, `TestInProcessGateway_NotFoundMapsTo404`, `TestInProcessGateway_InvalidArgumentMapsTo400` (same pattern as the 404 test, posting a body without `customer_id`, not shown), `TestNetworkHopGateway`, `TestServeOnePort` and the Connect test) pass with `go test -race ./...` on Go 1.24.4, `grpc-gateway v2.22.0`, `grpc-go v1.68.1`, `connectrpc.com/connect v1.18.1` (2026-11-07), run twice with no flakes. `go vet ./...` is clean. The note shows only the hand-written code; the generated `invoicepb` package is not reproduced.
+**Measured:** the tests above (`TestInProcessGateway_CreateThenGet`, `TestInProcessGateway_NotFoundMapsTo404`, `TestInProcessGateway_InvalidArgumentMapsTo400` (same pattern as the 404 test, posting a body without `customer_id`, not shown), `TestNetworkHopGateway`, `TestServeOnePort` and the Connect test) pass with `go test -race ./...` on Go 1.24.4, `grpc-gateway v2.22.0`, `grpc-go v1.68.1`, `connectrpc.com/connect v1.18.1` (2026-11-07), run twice with no flakes.
+
+`go vet ./...` is clean. The note shows only the hand-written code; the generated `invoicepb` package is not reproduced.
 
 ## 5. Variants and comparison
 
@@ -622,10 +691,20 @@ func TestConnectHandler_ServesJSONAndConnectProtocol(t *testing.T) {
 
 ## 8. Deep dive
 
-- **Why in-process registration can't stream.** `RegisterXHandlerServer` calls your `InvoiceServiceServer` methods as plain Go function calls. A unary RPC is one call, one return value — trivially translatable to one HTTP response. A streaming RPC's `grpc.ServerStream` has no plain-function equivalent in this path; the generated in-process code does not try to build one and simply returns `codes.Unimplemented`. The network-hop path has a real gRPC client stream to read from and write JSON lines to, which is why it can translate streams.
-- **The OpenAPI document is generated, not hand-written.** `protoc-gen-openapiv2` turns the same `google.api.http` annotations into an OpenAPI v2 (Swagger) document. This is a real asset — publish it as the gateway's public contract per [[API Contract Design and OpenAPI]] — but it inherits the proto's naming and nesting, so a REST API that needs to look hand-designed (concise URLs, resource-oriented naming distinct from the proto's field names) needs its annotations written with that target shape in mind from the start, not left to whatever's convenient in the `.proto`.
-- **Content-type sniffing in cmux.** `cmux.HTTP2MatchHeaderFieldSendSettings` doesn't just check `Content-Type: application/grpc` on the first request; it inspects the HTTP/2 connection preface and the first HEADERS frame, because by the time a `Content-Type` header value matters, cmux already needs to know whether to hand the raw bytes to the gRPC server (which expects to run its own HTTP/2 framing) or the `net/http` server. This is also why cmux needs HTTP/2-aware matchers at all, rather than just sniffing the first bytes of an HTTP/1.1 request line.
-- **gRPC-Web vs ConnectRPC's gRPC-Web support.** Classic gRPC-Web needs a separate translating proxy (Envoy, or the `grpcweb` wrapper around a grpc-go server) because gRPC-Web's wire format differs from both HTTP/2 gRPC and REST/JSON. ConnectRPC's generated handler detects gRPC-Web's `Content-Type: application/grpc-web` directly and speaks it natively — one less proxy to deploy, at the cost of depending on `connectrpc.com/connect` instead of grpc-go's own ecosystem for that path.
+- **Why in-process registration can't stream.** `RegisterXHandlerServer` calls your `InvoiceServiceServer` methods as plain Go function calls. A unary RPC is one call, one return value — trivially translatable to one HTTP response.
+
+  A streaming RPC's `grpc.ServerStream` has no plain-function equivalent in this path; the generated in-process code does not try to build one and simply returns `codes.Unimplemented`.
+
+  The network-hop path has a real gRPC client stream to read from and write JSON lines to, which is why it can translate streams.
+- **The OpenAPI document is generated, not hand-written.** `protoc-gen-openapiv2` turns the same `google.api.http` annotations into an OpenAPI v2 (Swagger) document.
+
+  This is a real asset — publish it as the gateway's public contract per [[API Contract Design and OpenAPI]] — but it inherits the proto's naming and nesting, so a REST API that needs to look hand-designed (concise URLs, resource-oriented naming distinct from the proto's field names) needs its annotations written with that target shape in mind from the start, not left to whatever's convenient in the `.proto`.
+- **Content-type sniffing in cmux.** `cmux.HTTP2MatchHeaderFieldSendSettings` doesn't just check `Content-Type: application/grpc` on the first request; it inspects the HTTP/2 connection preface and the first HEADERS frame, because by the time a `Content-Type` header value matters, cmux already needs to know whether to hand the raw bytes to the gRPC server (which expects to run its own HTTP/2 framing) or the `net/http` server.
+
+  This is also why cmux needs HTTP/2-aware matchers at all, rather than just sniffing the first bytes of an HTTP/1.1 request line.
+- **gRPC-Web vs ConnectRPC's gRPC-Web support.** Classic gRPC-Web needs a separate translating proxy (Envoy, or the `grpcweb` wrapper around a grpc-go server) because gRPC-Web's wire format differs from both HTTP/2 gRPC and REST/JSON.
+
+  ConnectRPC's generated handler detects gRPC-Web's `Content-Type: application/grpc-web` directly and speaks it natively — one less proxy to deploy, at the cost of depending on `connectrpc.com/connect` instead of grpc-go's own ecosystem for that path.
 
 ## 9. Interview questions
 
@@ -633,13 +712,17 @@ func TestConnectHandler_ServesJSONAndConnectProtocol(t *testing.T) {
 > grpc-gateway puts a translating reverse proxy in front of a real gRPC server: REST/JSON in, gRPC call out, JSON back. ConnectRPC's generated handler natively understands gRPC, gRPC-Web and its own JSON protocol on one `net/http.Handler` — there's no second protocol being translated into a first one.
 
 > [!question]- Why can't you register a streaming RPC with `RegisterXHandlerServer`?
-> That function calls your gRPC service's methods as plain Go functions, in-process. A streaming RPC has no plain-function shape to call — it needs a real stream, which only exists with an actual gRPC client connection. The generated code does not panic: it registers a handler that returns `codes.Unimplemented` ("streaming calls are not yet supported in the in-process transport") on every request, so the failure shows up at request time. Use `RegisterXHandlerFromEndpoint` for streaming methods.
+> That function calls your gRPC service's methods as plain Go functions, in-process. A streaming RPC has no plain-function shape to call — it needs a real stream, which only exists with an actual gRPC client connection.
+>
+> The generated code does not panic: it registers a handler that returns `codes.Unimplemented` ("streaming calls are not yet supported in the in-process transport") on every request, so the failure shows up at request time. Use `RegisterXHandlerFromEndpoint` for streaming methods.
 
 > [!question]- A REST client reports a 500 where you expected a 404. What do you check first?
 > Whether `WithErrorHandler` is installed and whether the domain error on the gRPC side is actually wrapped in `status.Error(codes.NotFound, ...)` rather than returned as a bare Go error. A bare error (not a `status.Status`) reaches the gateway as `codes.Unknown`, which maps to 500.
 
 > [!question]- Trap: your REST API needs a URL structure the proto's field names don't match. Do you redesign the proto?
-> No — redesigning the wire message to fit a REST URL couples your internal gRPC contract to an external API's naming, which is backwards. Either accept the REST surface the annotations naturally produce, or put a thin hand-written REST layer in front that calls the gRPC client itself for the handful of endpoints that genuinely need bespoke shaping, rather than forcing every RPC through the gateway.
+> No — redesigning the wire message to fit a REST URL couples your internal gRPC contract to an external API's naming, which is backwards.
+>
+> Either accept the REST surface the annotations naturally produce, or put a thin hand-written REST layer in front that calls the gRPC client itself for the handful of endpoints that genuinely need bespoke shaping, rather than forcing every RPC through the gateway.
 
 > [!question]- When would you choose two ports over one?
 > By default. Two ports need no `cmux`, no content-type sniffing edge cases, and let gRPC and REST scale, health-check and rate-limit independently behind different load-balancer listeners. Pick one port only when the deployment platform genuinely allows exactly one exposed port per service.
@@ -663,3 +746,8 @@ func TestConnectHandler_ServesJSONAndConnectProtocol(t *testing.T) {
 - **Before this:** [[gRPC Services in Go]], [[Building REST Endpoints]], [[gRPC]]
 - **Next:** [[gRPC Streaming in Go]], [[WebSockets and SSE in Go]]
 - **Compare with:** [[API Contract Design and OpenAPI]] (the generated OpenAPI document as the gateway's public contract), [[REST and HTTP API Design]] (hand-designed REST, for when the gateway's derived shape doesn't fit)
+
+### Watch on YouTube
+
+- [GopherCon UK 2019: Johan Brandhorst - Writing REST Services for the gRPC curious](https://www.youtube.com/watch?v=Pq1paKC-fXk) · GopherCon UK · conference talk on grpc-gateway from its core contributor
+- [(Backend #43) gRPC gateway: write code once, serve both gRPC & HTTP requests](https://www.youtube.com/watch?v=3FfDH3d0aHs) · TECH SCHOOL · step-by-step grpc-gateway implementation walkthrough

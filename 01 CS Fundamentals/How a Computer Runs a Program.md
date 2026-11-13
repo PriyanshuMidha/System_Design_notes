@@ -8,7 +8,7 @@ sources:
   - "System V Application Binary Interface, AMD64 Architecture Processor Supplement (ELF)"
   - "Go documentation, cmd/link and cmd/cgo"
   - "Patterson & Hennessy, Computer Organization and Design, RISC-V Edition, ch. 4"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # How a Computer Runs a Program
@@ -22,13 +22,69 @@ updated: 2026-11-09
 > - Your source code becomes a running process through four stages: **compile** (source → assembly), **assemble** (assembly → machine code in an object file), **link** (object files + libraries → one executable), **load** (executable → process in memory).
 > - **Static linking** copies library code into the executable; **dynamic linking** leaves a reference for the OS loader to resolve at run time. Go defaults to static binaries; linking C code via `cgo` forces dynamic linking against `libc`.
 
+## Start here: the basics
+
+**The problem in one story**
+
+You type a short program and press run. A second later, "hi" appears on the screen.
+But the chip inside your computer cannot read words like `print`. It only reads numbers.
+Something has to translate your text into numbers, put them in memory, and tell the chip where to start.
+This note is about that journey.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| CPU | The chip that does the actual work, one small step at a time | Adds two numbers |
+| Instruction | One tiny command the CPU understands, stored as a number | "add register A to register B" |
+| Register | A tiny, very fast storage slot inside the CPU | Holds the number 5 while adding |
+| Program counter (PC) | A register holding the address of the next instruction | PC = 0x401000 |
+| Memory (RAM) | Big storage outside the CPU where code and data live | Your string "hi" sits here |
+| Compiler | A program that turns source code into lower-level instructions | `go build` |
+| Linker | A program that joins pieces of compiled code into one file | Connects your code to `fmt` |
+| Executable | The final file the operating system can run | `./main` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Your code
+main.go"] --> B["Compile + assemble
+(into machine code)"]
+    B --> C["Link
+(one executable file)"]
+    C --> D["Load
+(OS puts it in memory)"]
+    D --> E["CPU loop:
+fetch, decode, execute"]
+```
+
+**Analogy**
+
+A recipe written in English is translated into a cook's shorthand, bound into one recipe book, opened on the counter, and a cook follows it one line at a time without thinking.
+Where it breaks: a real CPU works on many instructions at once in a pipeline, not strictly one line at a time.
+
+**How the rest of this note builds up**
+
+- First, why the CPU cannot read your source code (section 1) and a simple mental model of the CPU (section 2).
+- Then the fetch-decode-execute loop and the four stages: compile, assemble, link, load (section 3).
+- Then a full trace of `fmt.Println("hi")` and static vs dynamic linking (sections 4-6).
+- Finally, the SDE-3 deep dive on relocations, PIE, the loader, and why Go builds static binaries (sections 7-8).
+
+> [!tip] Remember
+> Source code is translated into numbered instructions, placed in memory, and the CPU runs them one by one from the program counter.
+
 ## 1. Why it exists
 
 Say you write a Go program with one line, `fmt.Println("hi")`, and run `go build`. Nothing about that sentence is something silicon understands.
 
 ### 1.1 The CPU understands only one thing
 
-**In plain words:** a CPU is a fixed circuit, not a flexible interpreter of ideas. It has no notion of a string, a function call, or what `Println` means. It understands exactly one thing: read a fixed-width number from a fixed address, treat it as an **instruction**, and change some fixed-size registers and memory locations accordingly.
+**In plain words:** a CPU is a fixed circuit, not a flexible interpreter of ideas.
+
+It has no notion of a string, a function call, or what `Println` means.
+
+It understands exactly one thing: read a fixed-width number from a fixed address, treat it as an **instruction**, and change some fixed-size registers and memory locations accordingly.
 
 **Picture it:**
 
@@ -59,9 +115,19 @@ The compile/assemble/link pipeline closes the first gap; the operating system's 
 
 ## 2. Mental model
 
-**The desk-with-sticky-notes analogy:** think of the CPU as a reader at a desk with eight sticky notes (registers) and a pointer finger (the **program counter**, PC) that always points at the next instruction. The reader can only do five things: read a sticky note, write a sticky note, do arithmetic on two sticky notes, look at a memory address and copy it onto a sticky note (or back), and move the pointer finger.
+**The desk-with-sticky-notes analogy:** think of the CPU as a reader at a desk with eight sticky notes (registers) and a pointer finger (the **program counter**, PC) that always points at the next instruction.
 
-**Where the analogy breaks down:** a real CPU reads and executes many instructions in an overlapping pipeline at once (covered briefly in the deep dive), not strictly one-at-a-time the way a human reader would — but for understanding correctness (not raw speed), the one-at-a-time mental model is exactly right.
+The reader can only do five things:
+
+1. Read a sticky note.
+2. Write a sticky note.
+3. Do arithmetic on two sticky notes.
+4. Look at a memory address and copy it onto a sticky note (or back).
+5. Move the pointer finger.
+
+**Where the analogy breaks down:** a real CPU reads and executes many instructions in an overlapping pipeline at once (covered briefly in the deep dive), not strictly one-at-a-time the way a human reader would.
+
+But for understanding correctness (not raw speed), the one-at-a-time mental model is exactly right.
 
 ```mermaid
 flowchart LR
@@ -71,7 +137,9 @@ flowchart LR
     E --> M["Move pointer finger\nto instruction 6, or wherever a jump says"]
 ```
 
-**Why it matters:** the reader never "understands" the program — it just keeps doing whatever the instruction under its finger says, then moves the finger to the next one (or wherever a jump instruction says to). Turning your source file into a stack of instructions for that reader, in the right order, at the right addresses, is the whole job of compiling, assembling, linking and loading.
+**Why it matters:** the reader never "understands" the program — it just keeps doing whatever the instruction under its finger says, then moves the finger to the next one (or wherever a jump instruction says to).
+
+Turning your source file into a stack of instructions for that reader, in the right order, at the right addresses, is the whole job of compiling, assembling, linking and loading.
 
 > [!tip] Remember
 > The CPU's "intelligence" is entirely in what the instructions say to do — the reader itself is mechanical and understands nothing.
@@ -97,7 +165,9 @@ flowchart LR
 3. **Execute.** Perform the operation — an arithmetic-logic-unit (ALU) computation, a memory load/store, or a branch.
 4. **Writeback.** Store the result in a register (or memory), and update the program counter: usually to the very next instruction, or to a jump/branch target if the instruction was a jump.
 
-**Example:** on a simple CPU this takes several clock cycles per instruction; a real superscalar CPU pipelines and reorders this across many instructions in flight at once (covered in [[CPU Scheduling]] for the OS-level analogue, and left as hardware-internals detail here).
+**Example:** on a simple CPU this takes several clock cycles per instruction.
+
+A real superscalar CPU pipelines and reorders this across many instructions in flight at once (covered in [[CPU Scheduling]] for the OS-level analogue, and left as hardware-internals detail here).
 
 **Why it matters:** the architectural registers — general-purpose ones, the PC, and a stack pointer — are the only state the CPU can read or write directly; everything else is one load or store instruction away in the memory hierarchy (see [[Memory Hierarchy and CPU Caches]]).
 
@@ -167,9 +237,13 @@ flowchart TB
     B -. execve zero-fills .-> MB
 ```
 
-**Example:** `.bss` stores no actual bytes on disk at all — just a size — because a zeroed global variable doesn't need its zeros written to the executable file; the kernel zero-fills that memory region at load time, which is why a program with a 1 GB global zeroed buffer doesn't produce a 1 GB executable file.
+**Example:** `.bss` stores no actual bytes on disk at all — just a size — because a zeroed global variable doesn't need its zeros written to the executable file.
 
-**Why it matters:** this is why `readelf -S ./a.out` (section headers) or `objdump -d ./a.out` (disassembly back to assembly mnemonics) can tell you so much about a binary without running it — the structure is fully described by the header, before a single instruction executes.
+The kernel zero-fills that memory region at load time, which is why a program with a 1 GB global zeroed buffer doesn't produce a 1 GB executable file.
+
+**Why it matters:** this is why `readelf -S ./a.out` (section headers) or `objdump -d ./a.out` (disassembly back to assembly mnemonics) can tell you so much about a binary without running it.
+
+The structure is fully described by the header, before a single instruction executes.
 
 > [!tip] Remember
 > Different sections get different memory permissions for a reason: `.text` is executable but not writable (so running code can't be overwritten by a bug), and `.data`/`.bss` are writable but not executable (so injected data can't be run as code).
@@ -244,7 +318,8 @@ flowchart TD
 
 ## 7. In production
 
-- **Real systems:** Go's own toolchain (`go build`) runs exactly this pipeline (`compile` → `go tool asm` → `go tool link`), and its default output is a statically linked, single-file ELF (or Mach-O/PE) binary — the reason a `FROM scratch` Docker image containing nothing but a Go binary can run at all. C and C++ build systems (`make`, `cmake`) expose the same four stages explicitly, often as separate `cc -c` (compile+assemble) and `cc` (link) invocations.
+- **Real systems:** Go's own toolchain (`go build`) runs exactly this pipeline (`compile` → `go tool asm` → `go tool link`), and its default output is a statically linked, single-file ELF (or Mach-O/PE) binary — the reason a `FROM scratch` Docker image containing nothing but a Go binary can run at all.
+  - C and C++ build systems (`make`, `cmake`) expose the same four stages explicitly, often as separate `cc -c` (compile+assemble) and `cc` (link) invocations.
 - **Failure modes → fixes:**
   - `undefined reference to 'foo'` at link time → a symbol was declared but never defined, or its object file was never passed to the linker; fix the build graph.
   - `cgo` silently turning a static build into a dynamic one → set `CGO_ENABLED=0` to force a pure static build, or `go build -ldflags '-linkmode external -extldflags "-static"'` if `cgo` is required but a static binary is still wanted.
@@ -255,11 +330,17 @@ flowchart TD
 
 ### Why Go defaults to static binaries
 
-The Go linker statically links the entire Go runtime (the scheduler, garbage collector, and standard library) into every binary by default, because the runtime needs tight control over stacks, goroutine scheduling (see [[Runtime - Goroutine Scheduler (GMP)]]) and memory management (see [[Runtime - Memory Allocator and Garbage Collector]]) that a dynamically-loaded, independently-versioned runtime could not guarantee. `cgo` breaks this: once C code is linked in, the C runtime's own startup and threading expectations force at least `libc` to be linked dynamically (on Linux; `CGO_ENABLED=0` avoids this entirely by disabling `cgo` and using Go's pure-Go standard-library implementations, e.g. for DNS resolution, instead of calling into `libc`).
+The Go linker statically links the entire Go runtime (the scheduler, garbage collector, and standard library) into every binary by default, because the runtime needs tight control over stacks, goroutine scheduling (see [[Runtime - Goroutine Scheduler (GMP)]]) and memory management (see [[Runtime - Memory Allocator and Garbage Collector]]) that a dynamically-loaded, independently-versioned runtime could not guarantee.
+
+`cgo` breaks this: once C code is linked in, the C runtime's own startup and threading expectations force at least `libc` to be linked dynamically on Linux.
+
+`CGO_ENABLED=0` avoids this entirely by disabling `cgo` and using Go's pure-Go standard-library implementations, e.g. for DNS resolution, instead of calling into `libc`.
 
 ### Relocations, concretely
 
-When the assembler emits an object file for a call to a function defined elsewhere, it cannot know that function's final address yet, so it emits a relocation entry: "at byte offset N in `.text`, write the address of symbol `fmt.Println`, interpreted as a PC-relative 32-bit offset." The linker's job is mechanical: assign every symbol an address, then process every relocation entry and write the real bytes.
+When the assembler emits an object file for a call to a function defined elsewhere, it cannot know that function's final address yet, so it emits a relocation entry: "at byte offset N in `.text`, write the address of symbol `fmt.Println`, interpreted as a PC-relative 32-bit offset."
+
+The linker's job is mechanical: assign every symbol an address, then process every relocation entry and write the real bytes.
 
 ```mermaid
 flowchart LR
@@ -281,7 +362,9 @@ Most modern Linux distributions build executables as PIE by default so the kerne
 
 ### The instruction-cycle detail elided above
 
-Real CPUs do not execute one instruction fully before starting the next; they pipeline fetch/decode/execute for many instructions simultaneously and predict branches ahead of the fetch stage. That hardware-scheduling layer, and the OS-level scheduling layer that decides which process's instructions the CPU fetches next, are both covered in [[CPU Scheduling]].
+Real CPUs do not execute one instruction fully before starting the next. They pipeline fetch/decode/execute for many instructions simultaneously and predict branches ahead of the fetch stage.
+
+That hardware-scheduling layer, and the OS-level scheduling layer that decides which process's instructions the CPU fetches next, are both covered in [[CPU Scheduling]].
 
 ## 9. Interview questions
 
@@ -322,3 +405,8 @@ Real CPUs do not execute one instruction fully before starting the next; they pi
 - **Before this:** none — this is the entry point for 01 CS Fundamentals.
 - **Next:** [[Memory Hierarchy and CPU Caches]], [[Processes, Threads and Context Switching]], [[System Calls and User vs Kernel Mode]]
 - **Compare with:** [[Process Memory Layout - Stack vs Heap]] (the address space the loader builds), [[Runtime - Goroutine Scheduler (GMP)]] (how Go schedules work once a process is running)
+
+### Watch on YouTube
+
+- [Editor, Compiler, Assembler, Linker, and Loader: Understanding Their Roles and Functions](https://www.youtube.com/watch?v=g-wYLY-li9g) · Engineering Funda · Walks through the compile-assemble-link-load pipeline this note covers
+- [Fetch Decode Execute Cycle in more detail](https://www.youtube.com/watch?v=jFDMZpkUWCw) · Computer Science Lessons · Covers the CPU's fetch-decode-execute loop and register usage in detail

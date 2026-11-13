@@ -8,7 +8,7 @@ sources:
   - "OpenFeature spec, openfeature.dev (vendor-neutral flag evaluation API)"
   - "LaunchDarkly docs, Flag evaluation architecture (streaming, local evaluation)"
   - "Unleash docs, Architecture (SDK polling/streaming, offline fallback)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Feature Flags
@@ -23,9 +23,54 @@ updated: 2026-11-07
 > - Percentage rollouts use a deterministic hash of `(flag, user ID)`, so a user's bucket never changes as the percentage ramps up.
 > - Flags are not free: every flag left in the code after its decision is made is a small amount of permanent complexity and a branch nobody tests both sides of.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your team builds a new checkout page, but marketing wants to launch it next Tuesday, not today.
+Waiting means the code sits on a branch and goes stale.
+With a feature flag you ship the code now, switched off, and flip it on Tuesday without a new deploy.
+If it misbehaves, you flip it off in seconds.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Deploy | Put new code onto the servers | New binary running in production |
+| Release | Let users actually see the feature | Checkout v2 visible to users |
+| Flag / toggle | A named on/off (or percentage) setting checked in code | `new-checkout = on for 10%` |
+| SDK | A library your service uses to read flags | LaunchDarkly or OpenFeature Go SDK |
+| Default value | What the code uses if flag rules are unavailable | `false` = keep old checkout |
+| Hash | A function that turns input into a fixed-looking number | `hash("user42")` → bucket 37 |
+| Rollout percentage | Share of users who get the feature | 10% → 50% → 100% |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Req["Request from user42"] --> Eval{"Flag check<br/>(local, cached rules)"}
+    Eval -->|"on for this user"| New["New code path"]
+    Eval -->|"off"| Old["Old code path"]
+    Svc["Flag service"] -.->|"rules pushed / polled"| Eval
+```
+
+**Analogy.** A feature flag is a light switch wired in before the lamp is shown to guests: the lamp is installed (deployed), but the room stays dark until you flip it (release).
+Where it breaks: a light switch has two positions; a flag can be on for just 10% of users, chosen consistently by hashing their ID.
+
+**How the rest of this note builds up**
+
+- First, why separating deploy from release matters (section 1) and the mental model (section 2).
+- Then how evaluation works locally with cached rules and safe defaults (section 3).
+- Then a Go implementation of percentage bucketing (section 4), and comparisons of flag types and tools (section 5).
+- Finally the SDE-3 deep dive: flag debt, production practice and evaluation internals (sections 6-8).
+
+> [!tip] Remember
+> Deploy the code off, release it by flipping a flag, and delete the flag once the decision is final.
+
 ## 1. Why it exists
 
-Say a team is rewriting the checkout flow. Without flags, that rewrite ships as one all-or-nothing deploy: merge, build, deploy, and every user hits the new checkout the moment the rollout finishes. If it has a bug, the only way back is a full redeploy of the previous version — minutes, not seconds — while real orders are failing.
+Say a team is rewriting the checkout flow. Without flags, that rewrite ships as one all-or-nothing deploy: merge, build, deploy, and every user hits the new checkout the moment the rollout finishes.
+
+If it has a bug, the only way back is a full redeploy of the previous version — minutes, not seconds — while real orders are failing.
 
 With a flag:
 
@@ -38,9 +83,15 @@ The flag turns "redeploy under pressure, with a live incident running" into "cha
 
 ## 2. Mental model
 
-A feature flag is a named, cached decision table the application consults before running a branch of code: "for this flag, for this user/request, true or false (or which variant)?" The key mental shift from a naive implementation is that this table is **not fetched over the network on every request** — a real flag SDK fetches or streams the rules once, caches them in memory, and evaluates locally, so flag checks cost a map lookup and a hash, not an RPC.
+A feature flag is a named, cached decision table the application consults before running a branch of code: "for this flag, for this user/request, true or false (or which variant)?"
 
-A flag's rules are usually more than one percentage number. A real targeting configuration is an ordered list: match an **attribute** first ("`plan == enterprise`" or "`country in {IN, US}`"), fall back to a named **segment** (a saved, reusable group of users — "beta testers", "internal staff"), and only once nothing more specific matches, fall through to the **percentage rollout** this note's code implements. The percentage bucket is the last, catch-all rule in the list, not the whole targeting model.
+The key mental shift from a naive implementation is that this table is **not fetched over the network on every request**.
+
+Instead, a real flag SDK fetches or streams the rules once, caches them in memory, and evaluates locally, so flag checks cost a map lookup and a hash, not an RPC.
+
+A flag's rules are usually more than one percentage number. A real targeting configuration is an ordered list: match an **attribute** first ("`plan == enterprise`" or "`country in {IN, US}`"), fall back to a named **segment** (a saved, reusable group of users — "beta testers", "internal staff"), and only once nothing more specific matches, fall through to the **percentage rollout** this note's code implements.
+
+The percentage bucket is the last, catch-all rule in the list, not the whole targeting model.
 
 ## 3. How it works
 
@@ -98,7 +149,12 @@ The full version below adds the edge cases that matter in production: percentage
 
 ### Local percentage evaluation, in Go
 
-This models what an OpenFeature-style SDK does per request: no network call, just a deterministic hash against a cached percentage. A real OpenFeature client call looks like `client.BooleanValue(ctx, "new-checkout", false /* default */, evalCtx)` — `evalCtx` carries the attributes (user ID, plan, country) the provider's targeting rules match against before ever reaching a percentage bucket; `Enabled` below is the percentage-bucket piece of that evaluation, written directly instead of through the OpenFeature API so it stays a dependency-free, readable example. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+This models what an OpenFeature-style SDK does per request: no network call, just a deterministic hash against a cached percentage. A real OpenFeature client call looks like `client.BooleanValue(ctx, "new-checkout", false /* default */, evalCtx)`.
+
+`evalCtx` carries the attributes (user ID, plan, country) the provider's targeting rules match against before ever reaching a percentage bucket; `Enabled` below is the percentage-bucket piece of that evaluation.
+It is written directly instead of through the OpenFeature API so it stays a dependency-free, readable example.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 // Package flags implements the local, deterministic percentage-rollout
@@ -240,19 +296,27 @@ func TestEnabled_Bounds(t *testing.T) {
 > Deploying means the code is running in production; releasing means users (or some percentage of them) can actually reach it. A feature flag is what lets those happen at different times — code can be deployed disabled, and released later by flipping a config value, with no redeploy.
 
 > [!question]- Why must flag evaluation be local, not a network call per request?
-> A per-request call to the flag service adds latency to every request and makes the flag service a new single point of failure: if it's down, the app blocks or errors on every request that checks a flag. A local SDK caches the rules (via polling or streaming) and evaluates in-process, so a flag check costs a map lookup, and the flag service being unreachable only means rules go briefly stale, not that requests fail.
+> A per-request call to the flag service adds latency to every request and makes the flag service a new single point of failure: if it's down, the app blocks or errors on every request that checks a flag.
+>
+> A local SDK caches the rules (via polling or streaming) and evaluates in-process, so a flag check costs a map lookup, and the flag service being unreachable only means rules go briefly stale, not that requests fail.
 
 > [!question]- How does percentage bucketing guarantee a user's result never flips as you ramp the rollout up?
-> By hashing the user's ID together with the flag key into a fixed number (a bucket), and comparing that fixed number to the percentage threshold. The bucket never changes for that user and flag; only the threshold moves as the percentage ramps, so raising the percentage can only ever add users whose bucket falls below the new, higher threshold — never remove someone already under the old one.
+> By hashing the user's ID together with the flag key into a fixed number (a bucket), and comparing that fixed number to the percentage threshold.
+>
+> The bucket never changes for that user and flag; only the threshold moves as the percentage ramps, so raising the percentage can only ever add users whose bucket falls below the new, higher threshold — never remove someone already under the old one.
 
 > [!question]- Should a client-side (browser or mobile) flag ever gate access to a paid feature?
 > No — this is the trap. Client-side flag rules and values are visible to anyone inspecting network traffic or the app's bundle, so a user can bypass a client-only check. Client-side flags control what the UI shows; the server must independently enforce any access-control decision regardless of what the client believes the flag says.
 
 > [!question]- What happens to a feature flag after its rollout is complete and stable?
-> It should be deleted, along with the old code path it replaced — a flag left in place after it is permanently on (or off) is pure debt: a branch nobody needs, that still has to be kept correct and still adds to the untested-combinations problem. Mature flag systems track an owner and an expected cleanup date per flag for exactly this reason.
+> It should be deleted, along with the old code path it replaced — a flag left in place after it is permanently on (or off) is pure debt: a branch nobody needs, that still has to be kept correct and still adds to the untested-combinations problem.
+>
+> Mature flag systems track an owner and an expected cleanup date per flag for exactly this reason.
 
 > [!question]- How do feature flags relate to canary deployments — aren't they solving the same problem?
-> They solve related but distinct problems at different layers. A canary deployment controls which *binary* (version of the whole service) serves a request; a feature flag controls which *code path inside one binary* runs. You can run 100% of traffic on the new binary while a risky feature inside it stays flagged off for everyone, and ramp the flag independently of any deploy — see [[Deployment Strategies - Rolling, Blue-Green, Canary]].
+> They solve related but distinct problems at different layers. A canary deployment controls which *binary* (version of the whole service) serves a request; a feature flag controls which *code path inside one binary* runs.
+>
+> You can run 100% of traffic on the new binary while a risky feature inside it stays flagged off for everyone, and ramp the flag independently of any deploy — see [[Deployment Strategies - Rolling, Blue-Green, Canary]].
 
 ## 10. Cheat sheet
 
@@ -270,3 +334,8 @@ func TestEnabled_Bounds(t *testing.T) {
 - **Before this:** [[Deployment Strategies - Rolling, Blue-Green, Canary]]
 - **Next:** [[Rollback and Safe Migrations]]
 - **Compare with:** [[Rollback and Safe Migrations]], [[Testing in CI-CD, Flaky Tests and Testing in Production]], [[SLIs, SLOs, SLAs and Error Budgets]]
+
+### Watch on YouTube
+
+- [How To Build Feature Flags Like A Senior Dev In 20 Minutes](https://www.youtube.com/watch?v=VBCYqp8l3Lc) · Web Dev Simplified · 20 min · 186,678 views
+- [What are Feature Flags?](https://www.youtube.com/watch?v=AJa2B-twtG4) · IBM Technology · 6 min · 73,954 views

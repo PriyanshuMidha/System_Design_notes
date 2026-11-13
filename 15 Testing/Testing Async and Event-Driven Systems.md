@@ -7,7 +7,7 @@ related: ["[[Test Doubles and Mocking in Go]]", "[[Test Data Strategy]]", "[[Con
 sources:
   - "Go release notes 1.24 (testing/synctest, GOEXPERIMENT=synctest) and 1.25 (testing/synctest promoted to stable)"
   - "testcontainers-go documentation (Kafka module)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Testing Async and Event-Driven Systems
@@ -21,6 +21,51 @@ updated: 2026-11-04
 > - For queue/stream consumers, use an in-memory fake for handler-logic tests and a real broker (testcontainers) only for the few tests that must prove wire-level behavior.
 > - For results that become true only *after* async work settles, poll with a short interval and a hard timeout (an `Eventually` helper), never a single assertion.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your code puts an "order placed" message on a queue, and another goroutine sends the email later.
+Your test checks "was the email sent?" right away, and it fails, because the email has not been sent yet.
+So someone adds `time.Sleep(1 * time.Second)`. It passes on a laptop and fails on a busy CI machine.
+This note shows how to wait for async work correctly.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Async | Work that finishes later, not before the call returns | Sending email in the background |
+| Goroutine | A lightweight Go function running concurrently | `go sendEmail()` |
+| Channel | A Go pipe goroutines use to pass values or signal "done" | `close(done)` |
+| `WaitGroup` | A counter that lets you wait for N goroutines | `wg.Wait()` |
+| Message queue / broker | A service that holds messages between producer and consumer | Kafka, RabbitMQ, SQS |
+| Consumer | Code that reads and handles messages | The email sender |
+| Flaky test | A test that sometimes passes and sometimes fails with no code change | Fails 1 run in 20 |
+| Fake | A simple in-memory stand-in for a real dependency | An in-memory queue |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    T["Test"] --> P["Publish event"]
+    P --> Q["Queue (fake or real)"]
+    Q --> C["Consumer goroutine"]
+    C --> S["Side effect<br/>(email, DB row)"]
+    T -. "Eventually: poll<br/>with timeout" .-> S
+```
+
+**Analogy.** Testing async code is like waiting for a parcel: don't stand at the door for exactly 10 minutes (sleep); check the tracking page every few seconds until it says delivered, or give up after a deadline (poll with timeout).
+Where it breaks: in tests you can often control the "courier" directly (a fake clock or a done channel), which real life never allows.
+
+**How the rest of this note builds up**
+
+- First, why async tests go flaky (section 1) and the "signal, don't sleep" model (section 2).
+- Then the tools: channels, `WaitGroup`, fake clocks, fake queues and `Eventually` (section 3), with a worked example (section 4).
+- Then real brokers vs fakes, trade-offs and production practice (sections 5-7).
+- Finally the SDE-3 deep dive on ordering, retries and idempotency, plus interview questions (sections 8-9).
+
+> [!tip] Remember
+> Wait for a signal or poll with a deadline; never guess with `time.Sleep`.
+
 ## 1. Why it exists
 
 A naive test for an async pipeline looks like this:
@@ -31,7 +76,9 @@ time.Sleep(100 * time.Millisecond) // "surely it's done by now"
 assertProcessed(t, job.ID)
 ```
 
-On a fast, quiet CI runner this passes in 2 ms of real work plus 100 ms of waiting — 50× slower than it needs to be. On a loaded runner, 100 ms isn't always enough, so the test fails about 1 run in 200. That failure rate is exactly what turns into a flaky test nobody trusts, and the team starts re-running the suite instead of fixing it. The fix is not a bigger sleep; it's removing the guess.
+On a fast, quiet CI runner this passes in 2 ms of real work plus 100 ms of waiting — 50× slower than it needs to be. On a loaded runner, 100 ms isn't always enough, so the test fails about 1 run in 200.
+
+That failure rate is exactly what turns into a flaky test nobody trusts, and the team starts re-running the suite instead of fixing it. The fix is not a bigger sleep; it's removing the guess.
 
 ## 2. Mental model
 
@@ -74,11 +121,21 @@ flowchart LR
 
 ### Injected clocks instead of real sleeps
 
-Production code depends on a `Clock` interface (`Now()`, `After(d)`) rather than calling `time.Now`/`time.After` directly. The real implementation wraps the standard library; the test implementation is a *fake clock* that only advances when the test tells it to, and only fires a goroutine's timer once that goroutine has actually reached it — otherwise the test could advance time before the goroutine is scheduled, and the signal would be lost.
+Production code depends on a `Clock` interface (`Now()`, `After(d)`) rather than calling `time.Now`/`time.After` directly.
+
+The real implementation wraps the standard library; the test implementation is a *fake clock* that only advances when the test tells it to, and only fires a goroutine's timer once that goroutine has actually reached it — otherwise the test could advance time before the goroutine is scheduled, and the signal would be lost.
 
 ### `testing/synctest` (Go 1.24 → 1.25)
 
-Go 1.24 shipped an experimental `testing/synctest` package, gated behind `GOEXPERIMENT=synctest` at build time. It runs a test inside an isolated "bubble": a fake, controllable clock plus a goroutine scheduler that detects when every goroutine in the bubble is durably blocked, so `synctest.Wait()` can block until that point instead of the test guessing a sleep duration. **As of Go 1.25 (released August 2025), `testing/synctest` is stable and no longer needs `GOEXPERIMENT=synctest`** — `go test` on 1.25+ can use it directly. On Go 1.24 it still requires the experiment flag, and its API in 1.24 differs slightly from the stabilized 1.25 one (check your installed version's docs before relying on exact signatures). The fake-clock pattern in this note is the general technique; `synctest` automates the same idea for code that already uses the standard `time` package directly.
+Go 1.24 shipped an experimental `testing/synctest` package, gated behind `GOEXPERIMENT=synctest` at build time.
+
+It runs a test inside an isolated "bubble": a fake, controllable clock plus a goroutine scheduler that detects when every goroutine in the bubble is durably blocked, so `synctest.Wait()` can block until that point instead of the test guessing a sleep duration.
+
+**As of Go 1.25 (released August 2025), `testing/synctest` is stable and no longer needs `GOEXPERIMENT=synctest`** — `go test` on 1.25+ can use it directly.
+
+On Go 1.24 it still requires the experiment flag, and its API in 1.24 differs slightly from the stabilized 1.25 one (check your installed version's docs before relying on exact signatures).
+
+The fake-clock pattern in this note is the general technique; `synctest` automates the same idea for code that already uses the standard `time` package directly.
 
 ### Testing Kafka/queue consumers
 
@@ -399,9 +456,15 @@ Run with `go test -race ./...`: both tests pass in under 20 ms of wall time, det
 
 ## 8. Deep dive
 
-`testing/synctest`'s bubble concept generalizes the fake-clock pattern: instead of the test author building a `fakeClock` and a manual `registered` signal (as in the worked example), the runtime tracks every goroutine spawned inside the bubble and considers the bubble "settled" once all of them are blocked on a channel, a timer, or similar — at that point `synctest.Wait()` returns, and the test can advance the bubble's virtual clock with full confidence that nothing is still in flight. This removes the hand-rolled `WaitForWaiters` counting shown above, at the cost of requiring code that calls `time.Now`/`time.After` from the standard library rather than through an injected interface — the bubble intercepts those calls directly. Projects that already use a `Clock` interface (for mockability independent of `synctest`) get the same determinism without depending on the experimental-to-stable transition between Go 1.24 and 1.25; projects starting fresh on Go 1.25+ can lean on `synctest` and skip the interface.
+`testing/synctest`'s bubble concept generalizes the fake-clock pattern: instead of the test author building a `fakeClock` and a manual `registered` signal (as in the worked example), the runtime tracks every goroutine spawned inside the bubble and considers the bubble "settled" once all of them are blocked on a channel, a timer, or similar — at that point `synctest.Wait()` returns, and the test can advance the bubble's virtual clock with full confidence that nothing is still in flight.
 
-A second subtlety: fakes versus real infrastructure is not all-or-nothing. A consumer test pyramid typically has many fast in-memory-fake tests for handler logic and error paths, a handful of testcontainers tests for serialization and rebalancing, and zero tests that spin up a full multi-broker cluster — that belongs in a load or chaos test (see [[Load and Performance Testing]] and [[Chaos Engineering]]), not a correctness suite.
+This removes the hand-rolled `WaitForWaiters` counting shown above, at the cost of requiring code that calls `time.Now`/`time.After` from the standard library rather than through an injected interface — the bubble intercepts those calls directly.
+
+Projects that already use a `Clock` interface (for mockability independent of `synctest`) get the same determinism without depending on the experimental-to-stable transition between Go 1.24 and 1.25; projects starting fresh on Go 1.25+ can lean on `synctest` and skip the interface.
+
+A second subtlety: fakes versus real infrastructure is not all-or-nothing.
+
+A consumer test pyramid typically has many fast in-memory-fake tests for handler logic and error paths, a handful of testcontainers tests for serialization and rebalancing, and zero tests that spin up a full multi-broker cluster — that belongs in a load or chaos test (see [[Load and Performance Testing]] and [[Chaos Engineering]]), not a correctness suite.
 
 ## 9. Interview questions
 
@@ -437,3 +500,8 @@ A second subtlety: fakes versus real infrastructure is not all-or-nothing. A con
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Unit, Integration and E2E Tests]]
 - **Next:** [[Load and Performance Testing]]
 - **Compare with:** [[Test Doubles and Mocking in Go]] (fakes vs mocks in general), [[Testing LLD Code]] (17 LLD's test-structure guidance for class-design rounds, independent of async concerns)
+
+### Watch on YouTube
+
+- [Event-Driven Architecture(EDA) vs. Request/Response (RR): System Design Explained](https://www.youtube.com/watch?v=7fkS-18KBlw) · Confluent, an IBM Company · 12 min · 311,560 views
+- [Messaging, Event-Driven Architecture, and Backpressure Explained / Building Reliable Async Systems](https://www.youtube.com/watch?v=XWX8jOqtPpk) · Ultimate System Design · 6 min · 267 views

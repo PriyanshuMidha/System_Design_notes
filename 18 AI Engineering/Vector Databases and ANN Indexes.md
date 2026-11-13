@@ -8,13 +8,15 @@ sources:
   - "Malkov & Yashunin, Efficient and Robust Approximate Nearest Neighbor Search Using HNSW Graphs (2016/2018)"
   - "Jégou, Douze & Schmid, Product Quantization for Nearest Neighbor Search (2011)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Vector Databases and ANN Indexes
 
 > [!summary] TL;DR
-> A vector database stores embeddings (see [[Embeddings]]) alongside metadata and answers "find the k vectors closest to this one" queries fast, at the cost of occasionally missing the true nearest neighbor. That trade — approximate nearest neighbor (ANN) search — is the whole point of the category.
+> A vector database stores embeddings (see [[Embeddings]]) alongside metadata and answers "find the k vectors closest to this one" queries fast, at the cost of occasionally missing the true nearest neighbor.
+>
+> That trade — approximate nearest neighbor (ANN) search — is the whole point of the category.
 
 > [!abstract] Core idea
 > - Comparing a query to every stored vector (exact k-NN) costs `O(N·d)`; an ANN index trades a small, tunable amount of accuracy for a large drop in that cost.
@@ -23,9 +25,60 @@ updated: 2026-11-07
 > - Metadata filtering (tenant, permissions, date) has to compose correctly with the ANN index, or it silently returns fewer than k results.
 > - Most teams do not need a dedicated vector database: pgvector on the Postgres you already run covers single-digit-million-row RAG workloads.
 
+## Start here: the basics
+
+**The problem in one story.**
+You have a million help articles and a user types "my payment failed twice".
+None of the articles contains those exact words, but some mean the same thing.
+An AI model turns every article and the question into lists of numbers, where similar meaning means nearby numbers.
+Now you need to find the closest lists fast, without comparing against all million every time.
+That is the job of a vector database and its ANN index.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Vector | A fixed-length list of numbers | `[0.12, -0.80, 0.33]` |
+| Embedding | A vector a model produced so that similar meaning sits close together | "refund" and "money back" land near each other |
+| Dimension (`d`) | How many numbers are in each vector | 768 or 1,536 |
+| Distance / similarity | A score for how close two vectors are | Cosine similarity, dot product |
+| k-NN | "Find the k nearest neighbors" of a query | Top 10 closest chunks |
+| Index | An extra structure that makes lookups faster | A book's index vs reading every page |
+| Recall@k | Share of the true top-k that the search actually returned | Found 9 of the real top 10 = 0.9 |
+| Metadata filter | A normal condition applied with the search | `tenant_id = 42` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Q["Question text"] --> E["Embedding model"]
+    E --> V["Query vector"]
+    V --> I["ANN index<br/>(graph or clusters)"]
+    I --> C["Small set of candidates"]
+    C --> T["Top-k closest chunks"]
+```
+
+**Analogy.** Finding a book in a library: you do not read every book, you walk to the right shelf section and look nearby.
+Where it breaks: a library has exact labels, while an ANN index only guesses the right area, so it can occasionally miss the truly closest item.
+
+**How the rest of this note builds up**
+
+- First, why brute-force search stops scaling (section 1) and the two tricks, graphs and clusters (section 2).
+- Then how exact search, HNSW, IVF, quantization and filtering work (section 3).
+- Then a Go worked example measuring recall vs work, and a comparison of vector stores (sections 4-5).
+- Finally the SDE-3 deep dive: RAM sizing, tuning `efSearch`/`nprobe`, sharding, re-indexing and backups (sections 6-8).
+
+> [!tip] Remember
+> A vector database finds "close enough" neighbors fast; recall@k tells you how close enough really is.
+
 ## 1. Why it exists
 
-Say you have 5 million support-ticket chunks, each embedded as a 1,536-dimension vector (a common OpenAI-style embedding size), and a user asks a question. To find the 10 most similar chunks by brute force, you compute 5,000,000 dot products of length 1,536 — about 7.7 billion floating-point multiply-adds per query. At even 10 queries per second that is 77 billion multiply-adds/sec just for retrieval, before the LLM call. Exact search does not scale past roughly a million vectors at interactive latency on one machine.
+Say you have 5 million support-ticket chunks, each embedded as a 1,536-dimension vector (a common OpenAI-style embedding size), and a user asks a question.
+
+To find the 10 most similar chunks by brute force, you compute 5,000,000 dot products of length 1,536 — about 7.7 billion floating-point multiply-adds per query.
+At even 10 queries per second that is 77 billion multiply-adds/sec just for retrieval, before the LLM call.
+
+Exact search does not scale past roughly a million vectors at interactive latency on one machine.
 
 An **approximate nearest neighbor (ANN)** index restructures the data (a graph, or clusters) so a query only compares against a small fraction of the vectors, in exchange for occasionally missing the true closest match. In practice, a well-tuned ANN index recovers 95–99% of the exact top-k while touching 1–10% of the data.
 
@@ -164,7 +217,12 @@ A stored record is more than the raw vector. A typical shape:
 }
 ```
 
-`version` matters for the re-index procedure below: a query can filter to the current version only, so a half-finished re-embed never surfaces stale and new chunks mixed together. The optional `sparse_values` field is how a vector database stores a learned-sparse vector (see [[Keyword, Semantic and Hybrid Search]]) alongside the dense one, so a single query can combine both signals server-side instead of running two separate systems — Qdrant, Weaviate and OpenSearch support this "hybrid" mode natively, Milvus supports it to varying degrees depending on version (verify against current docs before relying on it); pgvector has no single built-in hybrid operator, so a Postgres-based hybrid setup runs BM25 (via `tsvector`) and `pgvector` as two queries fused in the application.
+`version` matters for the re-index procedure below: a query can filter to the current version only, so a half-finished re-embed never surfaces stale and new chunks mixed together.
+
+The optional `sparse_values` field is how a vector database stores a learned-sparse vector (see [[Keyword, Semantic and Hybrid Search]]) alongside the dense one, so a single query can combine both signals server-side instead of running two separate systems.
+
+- Qdrant, Weaviate and OpenSearch support this "hybrid" mode natively, Milvus supports it to varying degrees depending on version (verify against current docs before relying on it).
+- pgvector has no single built-in hybrid operator, so a Postgres-based hybrid setup runs BM25 (via `tsvector`) and `pgvector` as two queries fused in the application.
 
 ## 4. Worked example
 
@@ -464,7 +522,12 @@ func TestIVFRecallImprovesWithNprobe(t *testing.T) {
 | 8        | 800                          | 0.806          |
 | 20 (all) | 2,000                        | 1.000          |
 
-This is the whole trade-off in one table: scanning 40% of the data (`nprobe=8`) recovers roughly 80% of the true top-10, while scanning everything trivially recovers 100% (at `nprobe = nlist`, every record is scanned exactly once, so it must match exact search — a useful invariant to assert in a test, not just a tuning target). Two further tests in the same package assert that invariant directly and confirm that a tenant filter never leaks another tenant's records through either index — all three tests pass under `go test -race` on Go 1.24.
+This is the whole trade-off in one table.
+
+- Scanning 40% of the data (`nprobe=8`) recovers roughly 80% of the true top-10.
+- Scanning everything trivially recovers 100% (at `nprobe = nlist`, every record is scanned exactly once, so it must match exact search — a useful invariant to assert in a test, not just a tuning target).
+
+Two further tests in the same package assert that invariant directly and confirm that a tenant filter never leaks another tenant's records through either index — all three tests pass under `go test -race` on Go 1.24.
 
 ## 5. Variants and comparison
 
@@ -488,7 +551,9 @@ This is the whole trade-off in one table: scanning 40% of the data (`nprobe=8`) 
 | FAISS | Embedding this logic inside your own service | **It is a library, not a database** — no server, no persistence, no CRUD, no metadata filtering; you build all of that yourself |
 
 > [!warning] Interview trap
-> FAISS shows up in lists of "vector databases." It is an in-process ANN **library** (indexes, search algorithms) with no server, no durability and no built-in metadata filtering. If an interviewer asks you to design a multi-tenant semantic search service, bolting FAISS directly onto an API is not an answer by itself — you still need storage, CRUD, filtering and operational tooling around it.
+> FAISS shows up in lists of "vector databases." It is an in-process ANN **library** (indexes, search algorithms) with no server, no durability and no built-in metadata filtering.
+>
+> If an interviewer asks you to design a multi-tenant semantic search service, bolting FAISS directly onto an API is not an answer by itself — you still need storage, CRUD, filtering and operational tooling around it.
 
 ## 6. Trade-offs and when not to use
 
@@ -507,7 +572,8 @@ This is the whole trade-off in one table: scanning 40% of the data (`nprobe=8`) 
 - **Failure modes → fixes:**
 	- Post-filter returns fewer than k results for a selective tenant → raise `efSearch`/`nprobe`, or switch to an index with in-graph/in-list filtering.
 	- Recall silently degrades after a bulk import → re-measure recall@k against a flat baseline after every large data change, not just at launch.
-	- Stale data after a document update → a correct re-index procedure: (1) mark old chunks inactive or delete by `document_id`, (2) parse and chunk the new version, (3) embed the new chunks, (4) upsert with version metadata, (5) verify the old version no longer appears in retrieval. Visibility is eventually consistent during this window in most managed stores — do not assume synchronous consistency.
+	- Stale data after a document update → a correct re-index procedure: (1) mark old chunks inactive or delete by `document_id`, (2) parse and chunk the new version, (3) embed the new chunks, (4) upsert with version metadata, (5) verify the old version no longer appears in retrieval.
+	  Visibility is eventually consistent during this window in most managed stores — do not assume synchronous consistency.
 	- Cross-tenant leakage → every record carries tenant/workspace metadata, every query includes a tenant filter, and tests assert cross-tenant records never appear (not just that authorization headers are checked).
 - **What to monitor:**
 	- Recall@k against a periodic flat-search sample (ground truth drifts as data grows).
@@ -517,10 +583,15 @@ This is the whole trade-off in one table: scanning 40% of the data (`nprobe=8`) 
 
 ## 8. Deep dive
 
-- **RAM sizing.** A back-of-envelope budget for an all-in-memory HNSW index: `N × (d × 4 bytes + M × 8 bytes × average layers) ` plus the engine's own overhead (often 1.3–2×). For 10 million 768-dimension vectors at `M=16`: raw vectors alone are `10,000,000 × 768 × 4 bytes ≈ 28.6 GiB` — this is why quantization and IVF+PQ exist at this scale (estimate; actual overhead varies by engine and must be measured against your own data).
-- **Why more vnodes-like parameters help, and where they stop.** HNSW's `efSearch` and IVF's `nprobe` both trade latency for recall, but neither moves it to 1.0 for free: HNSW's graph can still miss a far-flung true neighbor regardless of `efSearch` if the graph wasn't built with enough connectivity (`M`, `efConstruction`) in the first place, and IVF's `nprobe = nlist` only *fully* recovers exact search if no vector was ever assigned to the wrong cluster — which is guaranteed here because cluster assignment is deterministic, but a vector near a cluster boundary found by one centroid may genuinely be closer to a neighboring cluster that `nprobe` didn't reach at lower settings.
+- **RAM sizing.** A back-of-envelope budget for an all-in-memory HNSW index: `N × (d × 4 bytes + M × 8 bytes × average layers) ` plus the engine's own overhead (often 1.3–2×).
+  For 10 million 768-dimension vectors at `M=16`: raw vectors alone are `10,000,000 × 768 × 4 bytes ≈ 28.6 GiB` — this is why quantization and IVF+PQ exist at this scale (estimate; actual overhead varies by engine and must be measured against your own data).
+- **Why more vnodes-like parameters help, and where they stop.** HNSW's `efSearch` and IVF's `nprobe` both trade latency for recall, but neither moves it to 1.0 for free.
+  - HNSW's graph can still miss a far-flung true neighbor regardless of `efSearch` if the graph wasn't built with enough connectivity (`M`, `efConstruction`) in the first place.
+  - IVF's `nprobe = nlist` only *fully* recovers exact search if no vector was ever assigned to the wrong cluster — which is guaranteed here because cluster assignment is deterministic.
+  - But a vector near a cluster boundary found by one centroid may genuinely be closer to a neighboring cluster that `nprobe` didn't reach at lower settings.
 - **Choosing `nlist`/`nprobe` for IVF.** Rule of thumb: `nlist ≈ √N` to `4√N`, then tune `nprobe` by measuring recall@k on a held-out query sample — target recall first, then see what latency that costs, not the other way around.
-- **Sharding and replication.** Beyond single-machine capacity, vector indexes shard the same way other data stores do: partition by a hash of the id (even distribution, no range locality) or by tenant (noisy-neighbor isolation, uneven shard sizes). Each shard still answers an ANN query independently; the service fans a query out to all shards and merges the top-k results (scatter-gather), so tail latency is bounded by the slowest shard.
+- **Sharding and replication.** Beyond single-machine capacity, vector indexes shard the same way other data stores do: partition by a hash of the id (even distribution, no range locality) or by tenant (noisy-neighbor isolation, uneven shard sizes).
+  Each shard still answers an ANN query independently; the service fans a query out to all shards and merges the top-k results (scatter-gather), so tail latency is bounded by the slowest shard.
 - **Backups.** A vector index is derived data (it can be rebuilt from the source documents plus the embedding model), but rebuilding at scale is slow and costs API or GPU time — back up the index snapshots themselves, not just the source documents, for any index past a few hundred thousand vectors.
 
 ## 9. Interview questions
@@ -529,19 +600,32 @@ This is the whole trade-off in one table: scanning 40% of the data (`nprobe=8`) 
 > Exact search is `O(N·d)` per query and always correct. ANN indexes (HNSW, IVF) restructure the data so a query touches a small fraction of it, in exchange for sometimes missing the true nearest neighbor. The trade is tuned and measured with recall@k against an exact-search baseline, not assumed.
 
 > [!question]- Compare HNSW and IVF. When would you pick each?
-> HNSW is a multi-layer graph with greedy search, very good recall/latency, but memory-heavy and the hardest to size in advance. IVF clusters the data and scans only the nearest `nprobe` lists; lighter on memory, needs representative training data, and rebuilds are more disruptive. Pick HNSW as the latency-sensitive default; pick IVF (often with PQ) when memory is the binding constraint at very large scale.
+> HNSW is a multi-layer graph with greedy search, very good recall/latency, but memory-heavy and the hardest to size in advance.
+>
+> IVF clusters the data and scans only the nearest `nprobe` lists; lighter on memory, needs representative training data, and rebuilds are more disruptive.
+>
+> Pick HNSW as the latency-sensitive default; pick IVF (often with PQ) when memory is the binding constraint at very large scale.
 
 > [!question]- A post-filtered query for a selective tenant sometimes returns only 3 results when the caller asked for 10. Why, and how do you fix it?
-> Post-filtering runs ANN search first and drops non-matching results afterward. If the filter is selective (say 1% of the index) and the candidate pool (`efSearch`/`nprobe`) is smaller than that math requires, too few survivors remain. Fix it by raising the candidate pool well above `k / selectivity`, or by using an index that filters during the graph/list walk instead of after it.
+> Post-filtering runs ANN search first and drops non-matching results afterward.
+>
+> If the filter is selective (say 1% of the index) and the candidate pool (`efSearch`/`nprobe`) is smaller than that math requires, too few survivors remain.
+>
+> Fix it by raising the candidate pool well above `k / selectivity`, or by using an index that filters during the graph/list walk instead of after it.
 
 > [!question]- Is FAISS a vector database?
 > No — it is an in-process ANN library: indexes and search algorithms, with no server, persistence, CRUD or metadata filtering. Using it means you build storage, durability and filtering yourself.
 
 > [!question]- Design a multi-tenant semantic search system over 50 million chunks. What do you say first?
-> Start with the record shape (vector + tenant/document/version metadata), then the index choice (HNSW if memory budget allows at this scale, else IVF+PQ or a managed store with built-in sharding), then how filtering composes with the index (in-graph/in-list filtering to avoid the post-filter trap), then operational concerns: re-index procedure on document updates, recall@k monitoring, and tests that assert cross-tenant isolation, not just that a filter parameter was passed.
+> 1. Start with the record shape (vector + tenant/document/version metadata).
+> 2. Then the index choice (HNSW if memory budget allows at this scale, else IVF+PQ or a managed store with built-in sharding).
+> 3. Then how filtering composes with the index (in-graph/in-list filtering to avoid the post-filter trap).
+> 4. Then operational concerns: re-index procedure on document updates, recall@k monitoring, and tests that assert cross-tenant isolation, not just that a filter parameter was passed.
 
 > [!question]- Does adding more vnodes-style tuning (higher `efSearch`, higher `nprobe`) always get you to 100% recall?
-> Not for free, and not always at all. IVF reaches exact-search recall only at `nprobe = nlist` (scanning everything). HNSW's ceiling depends on how well-connected the graph was at build time (`M`, `efConstruction`); a poorly built graph can keep missing the same far neighbor no matter how high `efSearch` goes at query time.
+> Not for free, and not always at all. IVF reaches exact-search recall only at `nprobe = nlist` (scanning everything).
+>
+> HNSW's ceiling depends on how well-connected the graph was at build time (`M`, `efConstruction`); a poorly built graph can keep missing the same far neighbor no matter how high `efSearch` goes at query time.
 
 > [!question]- When would you *not* reach for a vector database at all?
 > Below roughly 100k vectors, exact (flat) search is often fast enough on a single machine and sidesteps an entire class of recall bugs. Add an ANN index only once you've measured that exact search doesn't meet your latency budget.
@@ -562,3 +646,8 @@ This is the whole trade-off in one table: scanning 40% of the data (`nprobe=8`) 
 - **Before this:** [[Embeddings]], [[Index Types and Index Design]]
 - **Next:** [[Keyword, Semantic and Hybrid Search]], [[RAG Pipeline]]
 - **Compare with:** [[Search Engines and Inverted Indexes]] (lexical indexing internals), [[Partitioning and Sharding]] (sharding an ANN index at scale)
+
+### Watch on YouTube
+
+- [Vector Databases Explained for System Design Interviews](https://www.youtube.com/watch?v=Fq73E8DQprc) · Hello Interview · 24 min · 74,374 views
+- [Vector Databases simply explained! (Embeddings & Indexes)](https://www.youtube.com/watch?v=dN0lsF2cvm4) · AssemblyAI · 4 min · 699,855 views

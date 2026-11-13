@@ -6,7 +6,7 @@ prereqs: ["[[Layered Architecture]]"]
 related: ["[[Clean Architecture]]", "[[SOLID in Go]]", "[[Service Project Layout and Wiring]]", "[[Capstone - InvoiceOps]]", "[[API Gateway and BFF]]"]
 sources:
   - "Alistair Cockburn, Hexagonal Architecture (original 2005 article, alistair.cockburn.us)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Hexagonal Architecture (Ports and Adapters)
@@ -34,15 +34,68 @@ flowchart LR
 
 The handler calls the core; the core calls two ports it declared itself. Swap `sandboxpay.Client` for a Razorpay client, or `memory.InvoiceRepo` for a Postgres one, and `core.Service` does not change one line, because it never imported either concrete type.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your app charges customers through one payment company.
+The code that talks to that company is sprinkled all over the app.
+One day the business wants a second payment company for another country.
+Now you must hunt down every scattered call. Hexagonal architecture keeps "talk to the payment company" in exactly one plug-in piece.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Interface | A list of methods a type promises to have, without saying how | `type PaymentProvider interface { Charge(...) }` |
+| Core (domain) | The business rules, with no tech details | "An invoice is paid when a charge succeeds" |
+| Port | An interface the core declares for what it needs or offers | `InvoiceRepo` port |
+| Adapter | A concrete type outside the core that fits a port | `postgres.InvoiceRepo`, an HTTP handler |
+| Driving adapter | Something that calls into the core | HTTP handler, CLI, test |
+| Driven adapter | Something the core calls out to | Database, payment SDK, email sender |
+| Import / dependency | Package A uses package B's code | `import "invoiceops/core"` |
+| Composition root | The one place (usually `main`) that wires adapters to the core | `core.NewService(pgRepo, razorpay)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    T["Test / HTTP / CLI<br/>(driving adapters)"] --> Core["Core<br/>business rules"]
+    Core --> P1["Port: InvoiceRepo"]
+    Core --> P2["Port: PaymentProvider"]
+    A1["Postgres adapter"] -. implements .-> P1
+    A2["Razorpay adapter"] -. implements .-> P2
+```
+
+**Analogy.** A laptop with standard sockets (USB-C, HDMI). The laptop defines the socket shape; any brand of charger or monitor that fits can plug in, and the laptop never changes.
+Where it breaks: real sockets are fixed by a standards body, while in code the core itself designs each port to fit exactly what it needs.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the hexagon mental model (section 2).
+- Then how ports, adapters and dependency direction work (section 3), and a full Go worked example on InvoiceOps (section 4).
+- Then variants vs layered and clean architecture, and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production use, call vs import direction, interview questions (sections 7-9).
+
+> [!tip] Remember
+> The core declares the sockets; everything outside is a plug that imports the core, never the other way round.
+
 ## 1. Why it exists
 
-InvoiceOps's payment webhook handler, written without ports, ends up with Razorpay's signature-verification function call, its SDK's error types, and its specific status-code mapping scattered across the handler, the service, and a few helper functions — because nothing forced "talk to Razorpay" to live in one place. The day InvoiceOps needs to support Stripe for a second market, every one of those scattered call sites needs auditing, and the business rule "an invoice becomes paid when a charge succeeds" is tangled up with "this is specifically how Razorpay tells you that."
+InvoiceOps's payment webhook handler, written without ports, ends up with Razorpay's signature-verification function call, its SDK's error types, and its specific status-code mapping scattered across the handler, the service, and a few helper functions — because nothing forced "talk to Razorpay" to live in one place.
 
-Hexagonal architecture's fix: declare a `PaymentProvider` port inside the core — `Charge(ctx, amount, currency, token) (chargeID string, err error)` — and make every provider-specific detail live in one adapter package that implements it. Swapping providers becomes "write a new adapter package, change one line in the composition root," with the core untouched and every existing test against the core still valid.
+The day InvoiceOps needs to support Stripe for a second market, every one of those scattered call sites needs auditing, and the business rule "an invoice becomes paid when a charge succeeds" is tangled up with "this is specifically how Razorpay tells you that."
+
+Hexagonal architecture's fix: declare a `PaymentProvider` port inside the core — `Charge(ctx, amount, currency, token) (chargeID string, err error)` — and make every provider-specific detail live in one adapter package that implements it.
+
+Swapping providers becomes "write a new adapter package, change one line in the composition root," with the core untouched and every existing test against the core still valid.
 
 ## 2. Mental model
 
-Picture the application core as a hexagon (the shape is arbitrary — it just has more than two sides, so you stop thinking "top" and "bottom"). Every side has a port: a socket of a specific shape, declared by the core itself, saying exactly what it needs or offers. Adapters plug into those sockets from outside. An HTTP adapter plugs into a driving port to call the core. A Postgres adapter plugs into a driven port the core calls. Both plugs look the same from the hexagon's point of view — an interface call — even though one adapter answers to "the web" and the other answers to "the database."
+Picture the application core as a hexagon (the shape is arbitrary — it just has more than two sides, so you stop thinking "top" and "bottom"). Every side has a port: a socket of a specific shape, declared by the core itself, saying exactly what it needs or offers.
+
+Adapters plug into those sockets from outside. An HTTP adapter plugs into a driving port to call the core. A Postgres adapter plugs into a driven port the core calls.
+
+Both plugs look the same from the hexagon's point of view — an interface call — even though one adapter answers to "the web" and the other answers to "the database."
 
 The test suite is just another plug. Nothing about the core's ports says "and this socket is only for production adapters" — an in-memory fake implementing `InvoiceRepo` is exactly as valid a plug as a real Postgres repository, which is precisely why the core can be tested with zero infrastructure running.
 
@@ -75,7 +128,9 @@ flowchart TD
     class P1,P2 port
 ```
 
-Read the arrows carefully: `S -->` (solid) is a **call**. `SB -.->` and `MEM -.->` (dashed, labeled "implements") are **dependencies** — and they point from the adapter *into* the core, because an adapter must import the core's port type to implement it. The core package itself has zero imports of `httpapi`, `cli`, `sandboxpay`, or `memory`. That is the one fact that makes this hexagonal rather than just "a service with interfaces": nothing inside the hexagon ever names anything outside it.
+Read the arrows carefully: `S -->` (solid) is a **call**. `SB -.->` and `MEM -.->` (dashed, labeled "implements") are **dependencies** — and they point from the adapter *into* the core, because an adapter must import the core's port type to implement it. The core package itself has zero imports of `httpapi`, `cli`, `sandboxpay`, or `memory`.
+
+That is the one fact that makes this hexagonal rather than just "a service with interfaces": nothing inside the hexagon ever names anything outside it.
 
 ### Driving vs. driven, concretely
 
@@ -86,9 +141,15 @@ Read the arrows carefully: `S -->` (solid) is a **call**. `SB -.->` and `MEM -.-
 | Where the interface is declared | The core exposes a plain method (`Service.Pay`); no interface needed on this side unless you want to mock the whole core | The core declares the port interface (`PaymentProvider`, `InvoiceRepo`) |
 | Who must change to add a new one | Nothing in the core; write a new adapter and call `Service.Pay` from it | Nothing in the core; write a new adapter type satisfying the port |
 
-InvoiceOps's own core ([[Capstone - InvoiceOps]]) has three driven ports built this way: `PaymentProvider` (shown in full below), `EmailSender` (send a reminder or a receipt, one method, any provider behind it), and `FileStorage` (store and fetch a generated PDF, one method each way, S3 or local disk behind it). All three are declared next to the service that needs them and are swappable the same way.
+InvoiceOps's own core ([[Capstone - InvoiceOps]]) has three driven ports built this way: `PaymentProvider` (shown in full below), `EmailSender` (send a reminder or a receipt, one method, any provider behind it), and `FileStorage` (store and fetch a generated PDF, one method each way, S3 or local disk behind it).
 
-**Testing strategy differs by side.** The core and every driving adapter are tested against **in-memory driven adapters** — no network, no real database, the way every test in this note's worked example runs. Each driven adapter is additionally tested on its own, separately, against the real thing it wraps: `adapters/sandboxpay` (or a real `adapters/razorpay`) gets its own test suite hitting a sandbox API or a recorded fixture, and a Postgres-backed `InvoiceRepo` gets its own test suite against a real (or test-container) Postgres. The core's tests never need that infrastructure; the adapter's tests are the only place that infrastructure is required at all.
+All three are declared next to the service that needs them and are swappable the same way.
+
+**Testing strategy differs by side.** The core and every driving adapter are tested against **in-memory driven adapters** — no network, no real database, the way every test in this note's worked example runs.
+
+Each driven adapter is additionally tested on its own, separately, against the real thing it wraps: `adapters/sandboxpay` (or a real `adapters/razorpay`) gets its own test suite hitting a sandbox API or a recorded fixture, and a Postgres-backed `InvoiceRepo` gets its own test suite against a real (or test-container) Postgres.
+
+The core's tests never need that infrastructure; the adapter's tests are the only place that infrastructure is required at all.
 
 ### Go: where each piece lives
 
@@ -496,13 +557,25 @@ func TestPay_Concurrent(t *testing.T) {
 
 ## 8. Deep dive
 
-**Swap Razorpay for Stripe: what actually changes.** Nothing in `core` changes, because `core.PaymentProvider` was never shaped around Razorpay. A new `adapters/stripe` package is written, implementing `Charge(ctx, amount, currency, token) (string, error)` against Stripe's SDK, mapping Stripe's own error types onto `core.ErrDeclined` the same way `sandboxpay` does above. The only other change is one line in the composition root (`main.go`) constructing `stripe.Client{}` instead of `sandboxpay.Client{}`. Every existing test against `core.Service` — all of them built against fakes — keeps passing unchanged, because they never depended on which provider was wired in.
+**Swap Razorpay for Stripe: what actually changes.** Nothing in `core` changes, because `core.PaymentProvider` was never shaped around Razorpay. A new `adapters/stripe` package is written, implementing `Charge(ctx, amount, currency, token) (string, error)` against Stripe's SDK, mapping Stripe's own error types onto `core.ErrDeclined` the same way `sandboxpay` does above.
 
-**Vs. layered, more precisely.** [[Layered Architecture]]'s persistence layer is structurally special: everything funnels through it, and there is exactly one of it per service. Hexagonal architecture removes that specialness. A database port and a payment-provider port are both just "a driven port," and the core treats them identically — it does not know, or need to know, that one happens to involve SQL and the other happens to involve an HTTP call to a third party. This is why hexagonal generalizes better once a service accumulates several different kinds of external dependency: nothing about the shape changes as you add the third, fourth, or fifth port.
+The only other change is one line in the composition root (`main.go`) constructing `stripe.Client{}` instead of `sandboxpay.Client{}`. Every existing test against `core.Service` — all of them built against fakes — keeps passing unchanged, because they never depended on which provider was wired in.
 
-**Vs. clean/onion, more precisely.** Clean Architecture (Martin, 2012) and the Onion Architecture (Palermo, 2008) are the same dependency-inversion idea Cockburn described in 2005, expressed as concentric rings with explicit names (entities, use cases, interface adapters, frameworks and drivers) instead of a hexagon with ports on its sides. Hexagonal is unopinionated about how many kinds of thing sit "inside" versus "outside" — it just says "ports in, adapters out." Clean Architecture is more prescriptive: it names the use-case layer specifically, requires an explicit DTO at every ring boundary, and gives dependency inversion a stricter home. See [[Clean Architecture]] for exactly how that differs in Go code.
+**Vs. layered, more precisely.** [[Layered Architecture]]'s persistence layer is structurally special: everything funnels through it, and there is exactly one of it per service. Hexagonal architecture removes that specialness.
 
-**Composition root.** The one place allowed to know every concrete adapter type is the `main.go` that constructs `core.NewService(memory.NewInvoiceRepo(...), sandboxpay.Client{...})` and passes the result into `httpapi.New(...)`. This is the exact same manual-DI pattern [[Service Project Layout and Wiring]] covers for Go services generally — hexagonal architecture doesn't add a new wiring mechanism, it just makes the wiring step unavoidable, because the core genuinely cannot construct its own dependencies without knowing their concrete types.
+A database port and a payment-provider port are both just "a driven port," and the core treats them identically — it does not know, or need to know, that one happens to involve SQL and the other happens to involve an HTTP call to a third party.
+
+This is why hexagonal generalizes better once a service accumulates several different kinds of external dependency: nothing about the shape changes as you add the third, fourth, or fifth port.
+
+**Vs. clean/onion, more precisely.** Clean Architecture (Martin, 2012) and the Onion Architecture (Palermo, 2008) are the same dependency-inversion idea Cockburn described in 2005, expressed as concentric rings with explicit names (entities, use cases, interface adapters, frameworks and drivers) instead of a hexagon with ports on its sides.
+
+Hexagonal is unopinionated about how many kinds of thing sit "inside" versus "outside" — it just says "ports in, adapters out." Clean Architecture is more prescriptive: it names the use-case layer specifically, requires an explicit DTO at every ring boundary, and gives dependency inversion a stricter home.
+
+See [[Clean Architecture]] for exactly how that differs in Go code.
+
+**Composition root.** The one place allowed to know every concrete adapter type is the `main.go` that constructs `core.NewService(memory.NewInvoiceRepo(...), sandboxpay.Client{...})` and passes the result into `httpapi.New(...)`.
+
+This is the exact same manual-DI pattern [[Service Project Layout and Wiring]] covers for Go services generally — hexagonal architecture doesn't add a new wiring mechanism, it just makes the wiring step unavoidable, because the core genuinely cannot construct its own dependencies without knowing their concrete types.
 
 ## 9. Interview questions
 
@@ -542,3 +615,8 @@ func TestPay_Concurrent(t *testing.T) {
 - **Before this:** [[Layered Architecture]]
 - **Next:** [[Clean Architecture]]
 - **Compare with:** [[SOLID in Go]] (dependency inversion at the class/interface level; hexagonal is the same idea at the service's architectural boundary), [[Capstone - InvoiceOps]] (the running example this note's ports mirror), [[API Gateway and BFF]] (a different kind of driving-adapter concern: shaping the entry point itself, not isolating the core)
+
+### Watch on YouTube
+
+- [The HEXAGONAL Architecture Explained / Ports and Adapters Pattern](https://www.youtube.com/watch?v=92eWCQrcsvQ) · Marco Lenzo · 11 min · 19,071 views
+- [How Ports and Adapters aka Hexagonal Architecture Can Benefit Your Node.js Application?](https://www.youtube.com/watch?v=JF_IJnkIAPw) · Alex Rusin · 12 min · 3,577 views

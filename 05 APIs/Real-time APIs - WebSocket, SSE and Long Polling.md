@@ -16,7 +16,7 @@ sources:
   - "OWASP WebSocket Security Cheat Sheet (Origin checks, cross-site WebSocket hijacking)"
   - "AWS Architecture Blog, Exponential Backoff and Jitter (Marc Brooker, 2015)"
   - "zlib zconf.h, memory requirements for deflate ((1 << (windowBits+2)) + (1 << (memLevel+9)), 256 KiB at defaults)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Real-time APIs - WebSocket, SSE and Long Polling
@@ -29,6 +29,50 @@ updated: 2026-11-02
 > - Long polling holds a request until there is news; SSE streams events down one HTTP response; WebSocket is a two-way channel.
 > - Rule: pick SSE for server-to-client updates, WebSocket only when the client also sends often.
 > - Classic mistake: no heartbeats, no resume after reconnect, and unbounded buffers for slow clients.
+
+## Start here: the basics
+
+**The problem in one story.**
+A chat app needs to show a friend's new message the moment it is sent.
+With normal web requests, your phone only hears from the server when it asks, so it would have to keep asking "anything new?".
+That wastes battery and server work, and messages still arrive late.
+Real-time APIs keep a connection open so the server can push the message to you as soon as it exists.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Request/response | The client asks, the server answers once | `GET /messages` returns a list |
+| Connection | An open link between two machines that carries data | One TCP connection from phone to server |
+| TCP | The protocol that delivers bytes reliably and in order | What HTTP and WebSocket run on |
+| Polling | Asking again and again on a timer | Ask every 5 s "anything new?" |
+| Push | The server sends without being asked | A new chat message appears instantly |
+| Heartbeat (ping/pong) | A tiny message that proves the link is still alive | Ping every 30 s |
+| Event ID / offset | A number on each event so a client can resume | "Send me everything after 41" |
+| Fan-out | Sending one event to many listeners | One price update to 100,000 screens |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    LP["Long polling:<br/>request waits for news"] --> S["Server"]
+    SSE["SSE: one response<br/>streams events down"] --> S
+    WS["WebSocket: two-way<br/>message channel"] <--> S
+    S --> B["Broker or log<br/>(Redis, Kafka)"]
+```
+
+**Analogy.** Short polling is phoning a shop every five minutes; long polling is staying on hold until it is ready; SSE is a radio channel announcing updates; WebSocket is an open phone line both sides can talk on.
+Where it breaks: a phone line drops obviously; a network connection can die silently, so you need heartbeats and a resume-from-last-ID step.
+
+**How the rest of this note builds up**
+
+- First, why polling is wasteful (section 1) and the four-way mental model (section 2).
+- Then how long polling, SSE and WebSocket work on the wire, including handshakes and close codes (section 3).
+- Then a worked example, trade-offs, and production concerns: auth, heartbeats, resume, backpressure and scaling.
+- Finally, the SDE-3 deep dive on head-of-line blocking, compression memory and durable event IDs.
+
+> [!tip] Remember
+> Use SSE for server-to-client updates, WebSocket only when the client also sends often, and always add heartbeats, resume and bounded buffers.
 
 ## 1. Why it exists
 
@@ -131,7 +175,8 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
 - Opcodes: `0x1` text (must be UTF-8), `0x2` binary, `0x0` continuation, and the control frames `0x8` close, `0x9` ping and `0xA` pong.
 - **Client-to-server frames must be masked**, and server-to-client frames must not be. Masking XORs the payload with a random key so that a malicious page cannot make the bytes look like a valid HTTP request to a confused intermediary (a cache-poisoning attack). It is not encryption; use `wss://` (TLS) for that.
 - **Fragmentation:** a large message can be split into a first frame (FIN=0), continuation frames, and a final frame (FIN=1). Control frames carry at most 125 bytes, are never fragmented, and may be sent between fragments, so a ping is not stuck behind a 50 MB message.
-- **Close codes:** `1000` normal closure, `1001` going away (server shutdown or page navigation), `1008` policy violation (for example a failed auth check), `1009` message too big, `1011` server internal error. `1006` is never sent on the wire: it is what the API reports when the connection died **without** a close frame, such as a network drop or an idle timeout.
+- **Close codes:** `1000` normal closure, `1001` going away (server shutdown or page navigation), `1008` policy violation (for example a failed auth check), `1009` message too big, `1011` server internal error.
+	- `1006` is never sent on the wire: it is what the API reports when the connection died **without** a close frame, such as a network drop or an idle timeout.
 
 ```mermaid
 sequenceDiagram
@@ -545,10 +590,16 @@ Side by side, topic by topic:
 ### Authentication on connect
 
 - **Browsers cannot set an `Authorization` header** on a WebSocket or an `EventSource`. That leaves:
-	- **A cookie**, sent automatically with the upgrade request. Then you **must check the `Origin` header** against an allowlist. Same-origin policy and CORS do not protect WebSocket handshakes, so without the check any site the user visits can open a socket with their cookie and read their data. This is **cross-site WebSocket hijacking**. `SameSite=Lax` or `Strict` cookies reduce the risk, because browsers do not send them on cross-site handshakes, but not every browser applies `Lax` by default and a sibling subdomain counts as same-site. Check `Origin` anyway. See [[CORS and Same-Origin Policy]] and [[Sessions and Cookies]].
+	- **A cookie**, sent automatically with the upgrade request.
+		- Then you **must check the `Origin` header** against an allowlist.
+		- Same-origin policy and CORS do not protect WebSocket handshakes, so without the check any site the user visits can open a socket with their cookie and read their data. This is **cross-site WebSocket hijacking**.
+		- `SameSite=Lax` or `Strict` cookies reduce the risk, because browsers do not send them on cross-site handshakes, but not every browser applies `Lax` by default and a sibling subdomain counts as same-site.
+		- Check `Origin` anyway. See [[CORS and Same-Origin Policy]] and [[Sessions and Cookies]].
 	- **A short-lived ticket:** the client calls an authenticated `POST /ws-ticket`, gets a random single-use ticket valid for about 30 s, and connects to `wss://.../ws?ticket=...`. The server redeems and deletes it. Query strings end up in access logs, which is why the ticket must be short-lived and single-use. A long-lived JWT in the URL is not acceptable.
 	- **An auth message** as the first frame. The server closes with `1008` if it does not arrive within a few seconds.
-- **Re-auth:** a socket can outlive the token that opened it. Store the token's expiry per connection. Before it passes, ask the client to send a fresh token in-band, or close with an application code (the 4000–4999 range is reserved for applications) so the client reconnects with new credentials. Revoked users must be disconnected actively, because nothing re-checks them otherwise. Token rules are in [[JWT - Structure, Validation and Pitfalls]].
+- **Re-auth:** a socket can outlive the token that opened it. Store the token's expiry per connection.
+	- Before it passes, ask the client to send a fresh token in-band, or close with an application code (the 4000–4999 range is reserved for applications) so the client reconnects with new credentials.
+	- Revoked users must be disconnected actively, because nothing re-checks them otherwise. Token rules are in [[JWT - Structure, Validation and Pitfalls]].
 
 ### Heartbeats and idle timeouts
 
@@ -560,7 +611,10 @@ Side by side, topic by topic:
 ### Reconnect and resume
 
 - **Exponential backoff with full jitter:** wait a random time between 0 and `min(cap, base × 2^attempt)`, for example base 1 s and cap 30 s. After a deploy drops 50,000 sockets at once, jitter spreads the reconnects over seconds instead of one spike.
-- **Resume from the last offset:** every event carries a sequence number. The client remembers the last one it processed and sends it on reconnect (`Last-Event-ID` for SSE, a resume message or query parameter for WebSocket). The server replays from a buffer or a durable log (a Redis Stream ID, a Kafka offset). If the gap is too old, tell the client to reload its state, as the `reset` event above does.
+- **Resume from the last offset:** every event carries a sequence number.
+	- The client remembers the last one it processed and sends it on reconnect (`Last-Event-ID` for SSE, a resume message or query parameter for WebSocket).
+	- The server replays from a buffer or a durable log (a Redis Stream ID, a Kafka offset).
+	- If the gap is too old, tell the client to reload its state, as the `reset` event above does.
 - **Graceful deploys:** send close `1001` (or end the SSE response) and let clients reconnect elsewhere. Drain over minutes rather than dropping everyone in one second.
 
 ### Scaling, briefly
@@ -600,7 +654,19 @@ flowchart LR
 
 ### Implementing in Go
 
-Use one **reader goroutine** and one **writer goroutine** per WebSocket connection. `gorilla/websocket` allows at most one concurrent reader and one concurrent writer. `github.com/coder/websocket` allows concurrent writes but still only one reader. With either library, a single writer goroutine is the simplest way to keep a bounded queue per client. The writer goroutine owns every write, including pings, and drains the bounded send channel. The reader goroutine sets read deadlines, extends them on each pong, and exits on error, which cancels the writer. In gorilla, a nil `Upgrader.CheckOrigin` rejects cross-origin handshakes; replacing it with a function that always returns true reopens cross-site WebSocket hijacking for cookie auth. Full handlers are in [[WebSockets and SSE in Go]].
+Use one **reader goroutine** and one **writer goroutine** per WebSocket connection.
+
+- `gorilla/websocket` allows at most one concurrent reader and one concurrent writer.
+- `github.com/coder/websocket` allows concurrent writes but still only one reader.
+
+With either library, a single writer goroutine is the simplest way to keep a bounded queue per client.
+
+- The writer goroutine owns every write, including pings, and drains the bounded send channel.
+- The reader goroutine sets read deadlines, extends them on each pong, and exits on error, which cancels the writer.
+
+In gorilla, a nil `Upgrader.CheckOrigin` rejects cross-origin handshakes; replacing it with a function that always returns true reopens cross-site WebSocket hijacking for cookie auth.
+
+Full handlers are in [[WebSockets and SSE in Go]].
 
 ### What to monitor
 
@@ -613,9 +679,17 @@ Use one **reader goroutine** and one **writer goroutine** per WebSocket connecti
 ## 8. Deep dive
 
 - **Half-open connections:** if a phone loses its network, the server's TCP stack may not learn about it for many minutes. Only heartbeats with a read deadline detect it. Without them, dead connections accumulate along with their buffers and goroutines.
-- **Head-of-line blocking:** one WebSocket is one TCP stream. A 5 MB binary message delays every chat message behind it. WebSocket fragmentation does not help here: only control frames (ping, pong, close) may go between the fragments of one message, never another data message. Split large payloads into several application-level chunks (separate messages) with chat messages sent between them, or upload them over HTTP and send only a URL.
-- **Compression:** the `permessage-deflate` extension compresses messages but can keep a compression context per connection between messages ("context takeover"). zlib documents about 256 KiB for one deflate stream at default settings, so 100,000 sockets could hold about 25 GB of compressor state (an estimate: 100,000 × 256 KiB). Enable it only for large, compressible messages, or disable context takeover. Compressing secrets alongside attacker-controlled text also enables CRIME-style attacks.
-- **Event IDs must survive restarts.** An in-memory counter, like the hub's `nextID`, resets when the process restarts. A client resuming "after 9,000" then gets no replay and no `reset`, because the hub sees no gap, and if it deduplicates by sequence number it discards every new event (IDs 1, 2, 3...) as already seen. Production IDs come from a durable log (a Redis Stream ID, a Kafka offset, or a database sequence), and the replay buffer is that log.
+- **Head-of-line blocking:** one WebSocket is one TCP stream.
+	- A 5 MB binary message delays every chat message behind it.
+	- WebSocket fragmentation does not help here: only control frames (ping, pong, close) may go between the fragments of one message, never another data message.
+	- Split large payloads into several application-level chunks (separate messages) with chat messages sent between them, or upload them over HTTP and send only a URL.
+- **Compression:** the `permessage-deflate` extension compresses messages but can keep a compression context per connection between messages ("context takeover").
+	- zlib documents about 256 KiB for one deflate stream at default settings, so 100,000 sockets could hold about 25 GB of compressor state (an estimate: 100,000 × 256 KiB).
+	- Enable it only for large, compressible messages, or disable context takeover.
+	- Compressing secrets alongside attacker-controlled text also enables CRIME-style attacks.
+- **Event IDs must survive restarts.** An in-memory counter, like the hub's `nextID`, resets when the process restarts.
+	- A client resuming "after 9,000" then gets no replay and no `reset`, because the hub sees no gap, and if it deduplicates by sequence number it discards every new event (IDs 1, 2, 3...) as already seen.
+	- Production IDs come from a durable log (a Redis Stream ID, a Kafka offset, or a database sequence), and the replay buffer is that log.
 - **Thundering herd on deploy:** draining 50,000 connections in one second makes them all reconnect to the remaining nodes at once, and the newest node gets few of them. Drain in batches, add jitter, and use least-connections balancing for new connections.
 - **Ordering across nodes:** two messages for the same room published from different nodes can arrive in different orders at different members. Give each room a single sequencer (one partition key in Kafka, or one Redis Stream) when order matters ([[Message Ordering and Partition Keys]]).
 
@@ -658,3 +732,8 @@ Use one **reader goroutine** and one **writer goroutine** per WebSocket connecti
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[TCP - Handshake, Reliability, Flow and Congestion Control]]
 - **Next:** [[Scaling WebSockets]], [[WebSockets and SSE in Go]], [[Case Study - Chat System]], [[Case Study - Notification System]]
 - **Compare with:** [[gRPC]] (streaming between services), [[GraphQL]] (subscriptions), [[Webhooks - Sending and Receiving]] (server-to-server push over plain HTTP)
+
+### Watch on YouTube
+
+- [Long Polling vs SSE vs WebSockets vs QUIC / Simply Explained](https://www.youtube.com/watch?v=3Ud6Ds2abO8) · TechPrep · side-by-side comparison matching exactly the note's three (plus QUIC) mechanisms
+- [WebSockets vs Polling vs Server Sent Events](https://www.youtube.com/watch?v=WS352jTTkPU) · Piyush Garg · practical walkthrough of when to use each real-time transport

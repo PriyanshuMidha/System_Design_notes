@@ -27,27 +27,27 @@ updated: 2026-11-08
 
 ## By folder
 
-| Folder | Notes | Depth | Ease | Quality | Diagrams |
-|---|---|---|---|---|---|
-| 01 CS Fundamentals | 27 | 8.6 | 7.3 | 9.0 | 2.7 |
-| 02 Networking & Web | 14 | 8.7 | 7.7 | 9.0 | 3.5 |
-| 03 Frontend | 12 | 7.8 | 7.3 | 9.0 | 2.7 |
-| 04 Go Language | 23 | 8.6 | 7.1 | 9.0 | 2.6 |
-| 05 APIs | 15 | 8.8 | 6.9 | 9.0 | 3.2 |
-| 06 Backend Engineering in Go | 29 | 8.6 | 6.9 | 8.8 | 2.8 |
-| 07 Databases | 45 | 8.4 | 7.4 | 8.9 | 7.7 |
-| 08 Caching & Redis | 12 | 8.8 | 7.2 | 9.0 | 3.6 |
-| 09 Messaging & Async | 15 | 9.1 | 7.1 | 9.2 | 4.1 |
-| 10 Distributed Systems & Resilience | 20 | 9.0 | 7.0 | 9.1 | 3.0 |
-| 11 System Design | 29 | 8.9 | 7.1 | 9.2 | 4.0 |
-| 12 Security & Auth | 12 | 8.8 | 6.8 | 9.0 | 3.0 |
-| 13 DevOps & Cloud | 29 | 8.7 | 7.1 | 8.9 | 3.6 |
-| 14 Observability & SRE | 14 | 8.6 | 7.2 | 8.9 | 4.0 |
-| 15 Testing | 10 | 8.3 | 7.1 | 8.8 | 2.2 |
-| 16 Software Architecture | 12 | 8.4 | 6.4 | 8.8 | 3.0 |
-| 17 LLD | 51 | 8.7 | 6.6 | 9.0 | 3.3 |
-| 18 AI Engineering | 20 | 8.5 | 7.2 | 8.9 | 3.7 |
-| 19 Interview & Career | 6 | 6.8 | 8.0 | 8.2 | 2.2 |
+| Folder                              | Notes | Depth | Ease | Quality | Diagrams |
+| ----------------------------------- | ----- | ----- | ---- | ------- | -------- |
+| 01 CS Fundamentals                  | 27    | 8.6   | 7.3  | 9.0     | 2.7      |
+| 02 Networking & Web                 | 14    | 8.7   | 7.7  | 9.0     | 3.5      |
+| 03 Frontend                         | 12    | 7.8   | 7.3  | 9.0     | 2.7      |
+| 04 Go Language                      | 23    | 8.6   | 7.1  | 9.0     | 2.6      |
+| 05 APIs                             | 15    | 8.8   | 6.9  | 9.0     | 3.2      |
+| 06 Backend Engineering in Go        | 29    | 8.6   | 6.9  | 8.8     | 2.8      |
+| 07 Databases                        | 45    | 8.4   | 7.4  | 8.9     | 7.7      |
+| 08 Caching & Redis                  | 12    | 8.8   | 7.2  | 9.0     | 3.6      |
+| 09 Messaging & Async                | 15    | 9.1   | 7.1  | 9.2     | 4.1      |
+| 10 Distributed Systems & Resilience | 20    | 9.0   | 7.0  | 9.1     | 3.0      |
+| 11 System Design                    | 29    | 8.9   | 7.1  | 9.2     | 4.0      |
+| 12 Security & Auth                  | 12    | 8.8   | 6.8  | 9.0     | 3.0      |
+| 13 DevOps & Cloud                   | 29    | 8.7   | 7.1  | 8.9     | 3.6      |
+| 14 Observability & SRE              | 14    | 8.6   | 7.2  | 8.9     | 4.0      |
+| 15 Testing                          | 10    | 8.3   | 7.1  | 8.8     | 2.2      |
+| 16 Software Architecture            | 12    | 8.4   | 6.4  | 8.8     | 3.0      |
+| 17 LLD                              | 51    | 8.7   | 6.6  | 9.0     | 3.3      |
+| 18 AI Engineering                   | 20    | 8.5   | 7.2  | 8.9     | 3.7      |
+| 19 Interview & Career               | 6     | 6.8   | 8.0  | 8.2     | 2.2      |
 
 ## Factual errors to fix
 

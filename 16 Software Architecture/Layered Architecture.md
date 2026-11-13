@@ -6,7 +6,7 @@ prereqs: []
 related: ["[[Hexagonal Architecture (Ports and Adapters)]]", "[[Clean Architecture]]", "[[Monolith vs Microservices]]", "[[Service Project Layout and Wiring]]", "[[Backend Request Lifecycle and Layering]]"]
 sources:
   - "go.dev/doc/modules/layout (official Go module layout guidance)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Layered Architecture
@@ -31,17 +31,68 @@ flowchart LR
 
 A client-creation request: the handler checks the JSON is well-formed, the service checks the business rule (is this email already a client of this workspace?), the repository runs one `INSERT`, and the database stores the row. Three layers, three different jobs, one direction.
 
+## Start here: the basics
+
+**The problem in one story.**
+A tiny app starts as one function: read the request, run SQL, send the reply.
+Then a CSV import job needs the same "no duplicate email" rule.
+Copying the rule means two copies can disagree.
+Layers give that rule one home that every caller goes through.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Layer | A group of code with one kind of job | All HTTP handlers |
+| Presentation layer | Talks to the outside world (HTTP, JSON) | `createClientHandler` |
+| Service / application layer | Runs the use case and business rules | `ClientService.Create` |
+| Domain | The core business objects and rules | `Client` struct, "email must be unique" |
+| Persistence / repository | Saves and loads data | `ClientRepo.Insert` running SQL |
+| DTO | A struct shaped for transport, not for logic | `CreateClientRequest` JSON body |
+| Dependency direction | Which package imports which | handler imports service, never reverse |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    H["Presentation<br/>(handlers)"] --> S["Application<br/>(services)"]
+    S --> D["Domain<br/>(models, rules)"]
+    S --> R["Persistence<br/>(repositories)"]
+    R --> DB[("Database")]
+```
+
+**Analogy.** A restaurant: waiter takes the order, chef decides how to cook it, storeroom clerk fetches ingredients. The waiter never walks into the storeroom.
+Where it breaks: in a restaurant the storeroom clerk can shout back to the waiter; in code a lower layer must never import an upper one.
+
+**How the rest of this note builds up**
+
+- First, why layers exist (section 1) and the "rooms in a line" mental model (section 2).
+- Then how the layers and their separate types work (section 3), and a full Go worked example (section 4).
+- Then variants (strict vs relaxed, comparison with hexagonal and clean) and trade-offs like the sinkhole anti-pattern (sections 5-6).
+- Finally the SDE-3 deep dive: production practice, deeper pitfalls and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Each layer has one job, and calls only point downward.
+
 ## 1. Why it exists
 
 A small service starts as one `main.go` with a handler function that decodes JSON, runs a SQL query inline, and writes the response — fine for a prototype, unworkable once a second feature needs the same validation rule, or once you want to test the business rule without a running Postgres.
 
-Concretely: InvoiceOps's "create a client" operation needs the same duplicate-email check whether it's called from the REST handler, a CSV bulk-import job, or a test. Write that check inside an `http.HandlerFunc` and the bulk-import job either calls the HTTP endpoint over loopback (slow, fragile) or duplicates the check (now two places can disagree). Layered architecture's fix is to give that rule its own layer — a `service` package with no `net/http` import — so every caller goes through the same function and the business rule is tested once, with no database or HTTP server running at all.
+Concretely: InvoiceOps's "create a client" operation needs the same duplicate-email check whether it's called from the REST handler, a CSV bulk-import job, or a test. Write that check inside an `http.HandlerFunc` and the bulk-import job either calls the HTTP endpoint over loopback (slow, fragile) or duplicates the check (now two places can disagree).
+
+Layered architecture's fix is to give that rule its own layer — a `service` package with no `net/http` import — so every caller goes through the same function and the business rule is tested once, with no database or HTTP server running at all.
 
 ## 2. Mental model
 
-Picture four rooms in a line, and a rule painted on every doorway: **you may only walk toward the room on your right.** The presentation room (handlers) can walk into the application room (services). The application room can walk into the domain room (the model and its rules) and the persistence room (repositories). Nothing downstream ever walks back left: a repository does not call a service, and a service never imports `net/http`.
+Picture four rooms in a line, and a rule painted on every doorway: **you may only walk toward the room on your right.** The presentation room (handlers) can walk into the application room (services). The application room can walk into the domain room (the model and its rules) and the persistence room (repositories).
 
-Compare this to [[Hexagonal Architecture (Ports and Adapters)]]: hexagonal draws the same "the inside must not depend on the outside" rule but arranges it as a hexagon with symmetric ports on every side, specifically so that the persistence room is not structurally a "bottom" layer the whole stack must pass through. Layered architecture is simpler to picture and build; hexagonal buys you the ability to swap persistence or add a second kind of "front door" (a CLI, a consumer) without the core caring which one called it. [[Clean Architecture]] takes the same inward-dependency rule and makes it stricter by naming each ring and requiring you to cross every ring boundary with an explicit DTO.
+Nothing downstream ever walks back left: a repository does not call a service, and a service never imports `net/http`.
+
+Compare this to [[Hexagonal Architecture (Ports and Adapters)]]: hexagonal draws the same "the inside must not depend on the outside" rule but arranges it as a hexagon with symmetric ports on every side, specifically so that the persistence room is not structurally a "bottom" layer the whole stack must pass through.
+
+Layered architecture is simpler to picture and build; hexagonal buys you the ability to swap persistence or add a second kind of "front door" (a CLI, a consumer) without the core caring which one called it.
+
+[[Clean Architecture]] takes the same inward-dependency rule and makes it stricter by naming each ring and requiring you to cross every ring boundary with an explicit DTO.
 
 ## 3. How it works
 
@@ -70,7 +121,11 @@ flowchart TD
     class H noImport
 ```
 
-The dashed "never calls" arrows are the whole rule. `handler` only knows `service`'s exported API; it has never heard of `repo.Store`. `service` declares the `ClientRepo` interface it needs (the consumer owns the interface, the same pattern [[Service Project Layout and Wiring]] uses for a whole service's package layout), and `repo` implements it without `service` importing `repo` back. That's what keeps this a layered architecture and not a tangle: the compiler enforces the one-way arrow, because `repo` importing `service` would be a Go import cycle if `service` ever imported `repo`'s concrete type.
+The dashed "never calls" arrows are the whole rule. `handler` only knows `service`'s exported API; it has never heard of `repo.Store`.
+
+`service` declares the `ClientRepo` interface it needs (the consumer owns the interface, the same pattern [[Service Project Layout and Wiring]] uses for a whole service's package layout), and `repo` implements it without `service` importing `repo` back.
+
+That's what keeps this a layered architecture and not a tangle: the compiler enforces the one-way arrow, because `repo` importing `service` would be a Go import cycle if `service` ever imported `repo`'s concrete type.
 
 A single create-client request traced through the layers, including the part most layered-architecture diagrams leave out — the transaction:
 
@@ -101,11 +156,19 @@ sequenceDiagram
 
 ### Strict vs. relaxed layering
 
-**Strict layering** means a layer may only call the layer immediately below it — presentation can never call persistence directly, even to skip a trivial pass-through in the service. **Relaxed layering** allows a layer to call any layer below it, not just the next one, which is common for cross-cutting reads (a handler calling a read-only cache layer directly for a health check). Pick strict by default: it is what keeps the service layer the single place business rules live, and it is what makes the service layer testable without an HTTP server. Relax it deliberately and narrowly (health checks, metrics reads), never as a habit, or the "why does this handler have a database connection" question starts coming up in code review.
+**Strict layering** means a layer may only call the layer immediately below it — presentation can never call persistence directly, even to skip a trivial pass-through in the service.
+
+**Relaxed layering** allows a layer to call any layer below it, not just the next one, which is common for cross-cutting reads (a handler calling a read-only cache layer directly for a health check).
+
+Pick strict by default: it is what keeps the service layer the single place business rules live, and it is what makes the service layer testable without an HTTP server.
+
+Relax it deliberately and narrowly (health checks, metrics reads), never as a habit, or the "why does this handler have a database connection" question starts coming up in code review.
 
 ### Logical layers vs. physical tiers
 
-The four rooms above are **logical layers**: a way of organizing code inside one process. A **physical tier** is a separate deployable — a separate binary, container, or machine, usually talking over the network. A monolith with a layered internal structure has four logical layers and one physical tier. A classic "three-tier" web app (web server, application server, database server) has physical tiers that happen to line up with layers, but the two ideas are independent: you can have logical layers with no tier boundaries (this note's whole example), and you can have tier boundaries that don't line up with the logical layers at all (a CDN in front of a monolith adds a tier, not a layer).
+The four rooms above are **logical layers**: a way of organizing code inside one process. A **physical tier** is a separate deployable — a separate binary, container, or machine, usually talking over the network. A monolith with a layered internal structure has four logical layers and one physical tier.
+
+A classic "three-tier" web app (web server, application server, database server) has physical tiers that happen to line up with layers, but the two ideas are independent: you can have logical layers with no tier boundaries (this note's whole example), and you can have tier boundaries that don't line up with the logical layers at all (a CDN in front of a monolith adds a tier, not a layer).
 
 ### Where validation lives
 
@@ -600,11 +663,23 @@ func TestCreateClient_ConcurrentCallsDoNotCorruptState(t *testing.T) {
 
 ## 8. Deep dive
 
-**DTO vs. domain vs. DB model mapping.** Three different structs for the same "client" is not accidental duplication — it is what lets each layer change for its own reason. A transport DTO changes because the API contract changes (a new optional field in a request body). A domain model changes because a business rule changes (clients now require a tax ID in one country). A database row changes because a migration changes a column type. Collapsing all three into one struct (common with code generators that produce one struct from a SQL schema) means an API consumer sees your database schema, and a schema migration becomes an API-breaking change.
+**DTO vs. domain vs. DB model mapping.** Three different structs for the same "client" is not accidental duplication — it is what lets each layer change for its own reason. A transport DTO changes because the API contract changes (a new optional field in a request body).
 
-**The sinkhole anti-pattern in more detail.** A layer is a sinkhole when, for a given operation, it does nothing but call the layer below unchanged: no added validation, no transformation, no cross-cutting concern (logging, auth, metrics) applied. A small amount of sinkhole behavior is normal and fine — not every operation needs every layer to do real work. It becomes a design smell when it's the majority of operations through a layer: at that point the layer is pure ceremony, and either it should be removed, or it is a sign the "layer" you added was actually meant to be a cross-cutting concern (observability, authorization) that belongs in middleware, not in the call stack.
+A domain model changes because a business rule changes (clients now require a tax ID in one country). A database row changes because a migration changes a column type.
 
-**When to evolve to hexagonal.** Layered architecture's persistence layer is implicitly "the" backing store. The moment a second kind of external dependency shows up that needs the same isolation treatment — a payment provider, an email sender, a second storage engine for search — the single "repository" concept stops fitting, and naming each one a **port** the core depends on (regardless of whether it is a database, an HTTP API, or a queue) is what [[Hexagonal Architecture (Ports and Adapters)]] formalizes. The trigger is not line count; it's "do I now have more than one kind of adapter to isolate and swap".
+Collapsing all three into one struct (common with code generators that produce one struct from a SQL schema) means an API consumer sees your database schema, and a schema migration becomes an API-breaking change.
+
+**The sinkhole anti-pattern in more detail.** A layer is a sinkhole when, for a given operation, it does nothing but call the layer below unchanged: no added validation, no transformation, no cross-cutting concern (logging, auth, metrics) applied.
+
+A small amount of sinkhole behavior is normal and fine — not every operation needs every layer to do real work.
+
+It becomes a design smell when it's the majority of operations through a layer: at that point the layer is pure ceremony, and either it should be removed, or it is a sign the "layer" you added was actually meant to be a cross-cutting concern (observability, authorization) that belongs in middleware, not in the call stack.
+
+**When to evolve to hexagonal.** Layered architecture's persistence layer is implicitly "the" backing store.
+
+The moment a second kind of external dependency shows up that needs the same isolation treatment — a payment provider, an email sender, a second storage engine for search — the single "repository" concept stops fitting, and naming each one a **port** the core depends on (regardless of whether it is a database, an HTTP API, or a queue) is what [[Hexagonal Architecture (Ports and Adapters)]] formalizes.
+
+The trigger is not line count; it's "do I now have more than one kind of adapter to isolate and swap".
 
 ## 9. Interview questions
 
@@ -644,3 +719,8 @@ func TestCreateClient_ConcurrentCallsDoNotCorruptState(t *testing.T) {
 - **Before this:** [[Monolith vs Microservices]]
 - **Next:** [[Hexagonal Architecture (Ports and Adapters)]], [[Clean Architecture]]
 - **Compare with:** [[Service Project Layout and Wiring]] (the Go package layout this pattern runs on top of), [[Backend Request Lifecycle and Layering]] (one request's full path through a Go service)
+
+### Watch on YouTube
+
+- [Understanding Layered Architecture in Spring Boot / Best Practices and Implementation](https://www.youtube.com/watch?v=Kzrm-BdLckE) · CodeSnippet by Chetan · 21 min · 76,591 views
+- [Layered Architecture Explained: Best Practices & Design Patterns / layered architecture tutorial](https://www.youtube.com/watch?v=atyNGAf2Ss0) · Topictrick · 14 min · 13,883 views

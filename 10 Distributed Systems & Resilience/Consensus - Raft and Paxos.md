@@ -16,7 +16,7 @@ sources:
   - "Kafka KIP-500 and KIP-595 (KRaft); Kafka 4.0 release notes (ZooKeeper mode removed)"
   - "Elhemali et al., Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022): Multi-Paxos per partition"
   - "Corbett et al., Spanner (OSDI 2012): Paxos group per split"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Consensus - Raft and Paxos
@@ -30,6 +30,52 @@ updated: 2026-11-04
 > - An entry is **committed** once a majority stores it; committed entries are never lost or reordered.
 > - You almost never implement this yourself: you use etcd, ZooKeeper, Consul or a database that embeds Raft.
 > - Classic mistake: thinking a 4-node cluster is safer than 3. It tolerates the same single failure and needs one more vote.
+
+## Start here: the basics
+
+**The problem in one story.**
+Three friends keep the same shared shopping list on their own phones.
+Phones go offline, messages arrive late, and one phone dies mid-update.
+They still need one list, in one order, that nobody later "un-writes".
+Consensus is the rule book that gets them there: nothing counts until most of the group has written it down.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Replica / node | One copy of the service on one machine | Server A of a 3-server etcd cluster |
+| Majority (quorum) | More than half of the servers | 2 of 3, or 3 of 5 |
+| Leader | The one server that accepts writes and orders them | Server A decides "job 7 comes after job 6" |
+| Follower | A server that copies the leader's decisions | Servers B and C |
+| Log | An ordered, append-only list of commands | `1: add job 6`, `2: add job 7` |
+| Term | A numbered "era" with at most one leader | Term 4 began when A won an election |
+| Committed | Stored on a majority, so it can never be lost | Entry 2 is on A and B: committed |
+| Split brain | Two servers both believing they are the leader | Both accept writes; histories diverge |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] --> L["Leader"]
+    L --> F1["Follower 1"]
+    L --> F2["Follower 2"]
+    F1 -- "stored" --> L
+    L --> M{"Majority stored?"}
+    M -- "yes" --> OK["Committed:<br/>reply to client"]
+```
+
+**Analogy.** A committee where a motion passes only when more than half of the members sign the minutes. Any two "more than half" groups share at least one member, so two contradicting motions cannot both pass.
+Where it breaks: real committee members do not crash and forget mid-sentence; servers do, so Raft also needs disk writes, terms and election rules.
+
+**How the rest of this note builds up**
+
+- First, why agreement is hard and why primary-backup with a timeout causes split brain (section 1), then the quorum mental model (section 2).
+- Then how Raft works: terms, leader election, log replication and the safety rule (section 3).
+- Then a Go worked example and the cost of one write (section 4), and Paxos, Multi-Paxos and other variants (section 5).
+- Finally the SDE-3 deep dive: production pitfalls in etcd and ZooKeeper, membership changes, leases and linearizable reads (sections 6-8).
+
+> [!tip] Remember
+> Nothing is decided until a majority has written it down, and any two majorities always share a server.
 
 ## 1. Why it exists
 
@@ -74,7 +120,11 @@ Raft (2014) splits consensus into three parts: leader election, log replication 
 
 ### Roles and terms
 
-Time is divided into **terms** numbered 1, 2, 3 and so on. Each term has at most one leader. Every message carries the sender's term; a server that sees a higher term updates its own and becomes a follower, and a server that receives a message with a lower term rejects it. Terms act as a logical clock that exposes stale leaders.
+Time is divided into **terms** numbered 1, 2, 3 and so on. Each term has at most one leader.
+
+Every message carries the sender's term; a server that sees a higher term updates its own and becomes a follower, and a server that receives a message with a lower term rejects it.
+
+Terms act as a logical clock that exposes stale leaders.
 
 ```mermaid
 stateDiagram-v2
@@ -457,3 +507,8 @@ A committed write needs: the leader's fsync, one network round trip to the follo
 - **Next:** [[Leader Election]], [[Distributed Locks and Fencing Tokens]], [[Two-Phase Commit]]
 - **Compare with:** [[Quorums and Leaderless Replication]] (overlapping quorums without a leader or agreement), [[Distributed SQL]] (Raft per range in practice)
 - **Code to read:** `go.etcd.io/raft` (etcd's Raft library), `github.com/hashicorp/raft`, and the Raft visualization at raft.github.io
+
+### Watch on YouTube
+
+- [Distributed Consensus - Raft Leader Election / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=Al2JNJBGG30) · Jordan has no life · 8 min · 26,516 views
+- [Consensus Algorithms Explained: Raft, Paxos & PBFT for Beginners](https://www.youtube.com/watch?v=-5ESi61Z7is) · CodeLucky · 4 min · 2,150 views

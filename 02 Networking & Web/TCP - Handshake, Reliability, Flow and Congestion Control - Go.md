@@ -11,7 +11,7 @@ sources:
   - "RFC 6298, Computing TCP's Retransmission Timer"
   - "RFC 9293, Transmission Control Protocol (STD 7, obsoletes RFC 793)"
   - "Cardwell et al., BBR: Congestion-Based Congestion Control (ACM Queue, 2016)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # TCP - Handshake, Reliability, Flow and Congestion Control - Go
@@ -19,9 +19,20 @@ updated: 2026-11-09
 > [!summary] TL;DR
 > This code models the two windows that gate every TCP sender — a flow-control `Window` (the receiver's buffer limit) and a congestion-control `Sender` (slow start, congestion avoidance, loss response) — and then proves the handshake and byte-stream behavior for real over a loopback socket. See the theory in [[TCP - Handshake, Reliability, Flow and Congestion Control]].
 
+## Before the code
+
+- **Structs with methods:** `Window` and `Sender` are plain structs; methods like `OnACK` change their fields through a pointer receiver.
+- **Two packages:** `wb` holds pure flow-control math with no networking; `main` holds congestion control and real sockets.
+- **`net.Listener` / `net.Conn`:** Go's interfaces for a listening socket and one open connection; `Accept` and `Dial` hide the 3-way handshake.
+- **Type assertion:** `conn.(*net.TCPConn)` turns the general `net.Conn` into the TCP-specific type that has `SetNoDelay` and `SetKeepAlive`.
+- **Goroutine + channel:** the echo test runs `Serve` in a goroutine and collects its error on a buffered channel.
+- **What to run:** `go vet ./...` then `go test -race ./...` in a module containing both packages.
+
 ## What this code shows
 
-This note turns three separate pieces of the theory note into runnable code, each testable in isolation: a pure flow-control model with no network involved, a pure congestion-control state machine with no network involved, and then a real TCP connection over loopback that exercises the actual kernel handshake and socket options. Keeping the first two network-free is deliberate — it lets the tests below assert exact `cwnd` values on every simulated RTT, something that would be far harder to pin down reliably against a real, jittery network path.
+This note turns three separate pieces of the theory note into runnable code, each testable in isolation: a pure flow-control model with no network involved, a pure congestion-control state machine with no network involved, and then a real TCP connection over loopback that exercises the actual kernel handshake and socket options.
+
+Keeping the first two network-free is deliberate — it lets the tests below assert exact `cwnd` values on every simulated RTT, something that would be far harder to pin down reliably against a real, jittery network path.
 
 | Code | Theory concept | Theory section |
 | --- | --- | --- |
@@ -36,7 +47,9 @@ This note turns three separate pieces of the theory note into runnable code, eac
 - **Module layout:** two packages — `wb` (the whiteboard flow-control model, in its own `wb/` subdirectory) and `main` (congestion control plus the real socket code), each with its own `_test.go` file.
 - **Go version:** 1.24.
 - **Dependencies:** standard library only (`net`, `io`, `time`).
-- **Why two packages instead of one.** `wb` is kept separate on purpose: it has no dependency on `net` at all, so its tests run in microseconds and can never be flaky from network timing, unlike the socket tests in `main`. Splitting them this way mirrors a real codebase's instinct to keep pure, deterministic logic (flow control's arithmetic) apart from anything that touches the outside world (a real listener and dialer).
+- **Why two packages instead of one.** `wb` is kept separate on purpose: it has no dependency on `net` at all, so its tests run in microseconds and can never be flaky from network timing, unlike the socket tests in `main`.
+
+  Splitting them this way mirrors a real codebase's instinct to keep pure, deterministic logic (flow control's arithmetic) apart from anything that touches the outside world (a real listener and dialer).
 - **Run it:**
 
 ```text
@@ -80,7 +93,11 @@ func (w *Window) OnAck(ackSeq, newRecvWin int) {
 }
 ```
 
-**Concept.** This is the theory note's sliding-window diagram turned into state: `NextSeq - UnackedAt` is "bytes in flight," and `CanSend` is exactly the gate the theory note describes as `in-flight < rwnd`. It deliberately knows nothing about congestion control — keeping flow control and congestion control as two separate types, rather than one combined "window" struct, mirrors the real protocol's own separation and makes each easy to test alone. A single merged type was considered and rejected: it would make it impossible to write a test that proves flow control behaves correctly independent of whatever congestion control is doing.
+**Concept.** This is the theory note's sliding-window diagram turned into state: `NextSeq - UnackedAt` is "bytes in flight," and `CanSend` is exactly the gate the theory note describes as `in-flight < rwnd`.
+
+It deliberately knows nothing about congestion control — keeping flow control and congestion control as two separate types, rather than one combined "window" struct, mirrors the real protocol's own separation and makes each easy to test alone.
+
+A single merged type was considered and rejected: it would make it impossible to write a test that proves flow control behaves correctly independent of whatever congestion control is doing.
 
 **How it works.**
 1. `NextSeq` and `UnackedAt` are the two ends of "bytes in flight" — the same gap the handshake's sequence numbers track in the theory note's ACK diagram.
@@ -107,7 +124,9 @@ func NewSender() *Sender {
 }
 ```
 
-**Concept.** This implements the three-step algorithm in [[TCP - Handshake, Reliability, Flow and Congestion Control#Congestion control cwnd slow start CUBIC and BBR]]: `Cwnd` is the number the theory note calls the sender's own estimate of the network's capacity, and `Ssthresh` is the remembered "last known safe ceiling" that keeps a reconnecting sender from re-discovering capacity from zero. `float64` was chosen over an integer segment count so the multiplicative-decrease math (`Cwnd / 2`) never needs separate rounding logic — real kernels track this in bytes with their own fixed-point rules, but segments-as-floats is the clearest model for teaching the shape of the curve.
+**Concept.** This implements the three-step algorithm in [[TCP - Handshake, Reliability, Flow and Congestion Control#Congestion control cwnd slow start CUBIC and BBR]]: `Cwnd` is the number the theory note calls the sender's own estimate of the network's capacity, and `Ssthresh` is the remembered "last known safe ceiling" that keeps a reconnecting sender from re-discovering capacity from zero.
+
+`float64` was chosen over an integer segment count so the multiplicative-decrease math (`Cwnd / 2`) never needs separate rounding logic — real kernels track this in bytes with their own fixed-point rules, but segments-as-floats is the clearest model for teaching the shape of the curve.
 
 ```go
 // OnACK runs once per RTT's worth of ACKs (one simulated round trip).
@@ -168,7 +187,11 @@ func Serve(ln net.Listener) error {
 }
 ```
 
-**Concept.** `ln.Accept()` is where the 3-way handshake from [[TCP - Handshake, Reliability, Flow and Congestion Control#Connection setup the 3-way handshake]] actually happens — the kernel completes SYN/SYN-ACK/ACK before `Accept` ever returns a connection to this code, so the handshake is real but invisible at this layer. `SetNoDelay` and `SetKeepAlivePeriod` are the two knobs the theory note names directly: disabling Nagle for latency, and tuning keepalive so a silently dead peer (a dropped NAT mapping, a crashed host) is eventually detected instead of held open forever. The alternative of leaving both at their OS defaults was rejected specifically because this demo wants to show the knobs exist, not just that an echo server works.
+**Concept.** `ln.Accept()` is where the 3-way handshake from [[TCP - Handshake, Reliability, Flow and Congestion Control#Connection setup the 3-way handshake]] actually happens — the kernel completes SYN/SYN-ACK/ACK before `Accept` ever returns a connection to this code, so the handshake is real but invisible at this layer.
+
+`SetNoDelay` and `SetKeepAlivePeriod` are the two knobs the theory note names directly: disabling Nagle for latency, and tuning keepalive so a silently dead peer (a dropped NAT mapping, a crashed host) is eventually detected instead of held open forever.
+
+The alternative of leaving both at their OS defaults was rejected specifically because this demo wants to show the knobs exist, not just that an echo server works.
 
 **How it works.**
 1. `ln.Accept()` blocks until a client's handshake completes; everything before this line is below Go's visibility, handled entirely by the kernel's TCP stack.
@@ -250,7 +273,9 @@ func DialAndRoundtrip(addr string, msg []byte) ([]byte, time.Duration, error) {
 
 ## Design decisions
 
-A reader coming from the theory note might expect this code to model CUBIC or BBR directly, since those are what Linux and most production stacks actually run. It deliberately doesn't: the goal here is a state machine small enough to assert an exact `cwnd` trace against, which only the simpler Reno-style rules in RFC 5681 allow. The table below lays out each choice and what it costs.
+A reader coming from the theory note might expect this code to model CUBIC or BBR directly, since those are what Linux and most production stacks actually run.
+
+It deliberately doesn't: the goal here is a state machine small enough to assert an exact `cwnd` trace against, which only the simpler Reno-style rules in RFC 5681 allow. The table below lays out each choice and what it costs.
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -393,7 +418,9 @@ PASS
 ok  	tcpdemo/wb	1.468s
 ```
 
-**Measured** (Go 1.24.4, darwin/arm64, loopback, 2026-11-09): the full connect + write + echo + read round trip over `127.0.0.1` took **331µs**, including one complete 3-way handshake hidden inside `net.Dial`. Reading the output line by line: `go vet` printed nothing (no suspicious constructs found); every test ran under `-race`, Go's data-race detector, so a pass here is proof the two packages have no unsynchronized concurrent access, not just that the assertions happened to be true this run.
+**Measured** (Go 1.24.4, darwin/arm64, loopback, 2026-11-09): the full connect + write + echo + read round trip over `127.0.0.1` took **331µs**, including one complete 3-way handshake hidden inside `net.Dial`.
+
+Reading the output line by line: `go vet` printed nothing (no suspicious constructs found); every test ran under `-race`, Go's data-race detector, so a pass here is proof the two packages have no unsynchronized concurrent access, not just that the assertions happened to be true this run.
 
 **Representative output (Linux, `ss` from iproute2)** — inspecting an established connection's congestion-control state (illustrative values, not from a live capture, since this machine is darwin and `ss` is Linux-only):
 
@@ -408,7 +435,9 @@ ESTAB  0      0       10.0.4.7:51342       10.0.4.12:443
 
 Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segments (about 58KB at this `mss`) is currently allowed in flight, `ssthresh:28` shows a previous loss already happened (an ssthresh below the Reno default of ~2³¹ means a loss event set it), `rtt:3.4/1.1` is the smoothed RTT and its mean deviation in milliseconds, and `bytes_retrans:1448` shows exactly one segment was retransmitted so far.
 
-Across all four tests, the shape to notice is the same one the theory note argues for: flow control and congestion control are proven as two entirely separate, independently-testable mechanisms, and only the socket test touches a real network at all. That separation is also why a bug in one almost never shows up as a failure in another — each test's blast radius is exactly one mechanism.
+Across all four tests, the shape to notice is the same one the theory note argues for: flow control and congestion control are proven as two entirely separate, independently-testable mechanisms, and only the socket test touches a real network at all.
+
+That separation is also why a bug in one almost never shows up as a failure in another — each test's blast radius is exactly one mechanism.
 
 ## Pitfalls in the code
 

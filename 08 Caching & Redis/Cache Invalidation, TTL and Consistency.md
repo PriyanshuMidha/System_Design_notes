@@ -10,7 +10,7 @@ sources:
   - "Redis docs, EVAL and Lua scripting (atomic execution)"
   - "Debezium documentation, PostgreSQL connector"
   - "PostgreSQL 17 docs, Logical Decoding"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Cache Invalidation, TTL and Consistency
@@ -24,6 +24,51 @@ updated: 2026-11-04
 > - The order is: commit to the database, **then** delete the cache key. Even then a slow reader can put the old value back (the **stale-set race**).
 > - Fixes for the race: leases, versioned values, versioned keys, or invalidation driven by the database's change log.
 > - Add **jitter** to TTLs so keys written together do not expire together.
+
+## Start here: the basics
+
+**The problem in one story.**
+A user changes their display name from "Ravi" to "Ravi K".
+The database now says "Ravi K", but the cache still holds "Ravi".
+Friends keep seeing the old name until the cached copy is removed or expires.
+Deciding when and how to remove that copy is cache invalidation.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Stale | The cached copy is older than the database | Cache "Ravi", DB "Ravi K" |
+| Invalidate | Delete or replace a cached value because data changed | `DEL user:7` |
+| TTL (time to live) | Seconds before a key expires on its own | `SET user:7 ... EX 60` |
+| Consistency | How closely reads match the latest write | Strong = always latest |
+| Race condition | Two actions interleave in an unlucky order | Old read lands after the delete |
+| Commit | The moment a DB write becomes permanent | `COMMIT;` in a transaction |
+| Jitter | A small random amount added to a time | TTL 300 s ± 30 s |
+| CDC (change data capture) | Reading the DB's change log to react to writes | Debezium streaming row updates |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W["User edits data"] --> DB["1 Commit to DB"]
+    DB --> D["2 Delete cache key"]
+    D --> N["Next read misses"]
+    N --> L["Loads fresh value"]
+    T["TTL expires"] -. "safety net" .-> N
+```
+
+**Analogy.** A printed price tag on a shelf. When the price changes, staff should swap the tag (invalidation); the tags also get reprinted every night anyway (TTL).
+Where it breaks: a shop worker cannot accidentally re-hang yesterday's tag after the new one went up, but a slow cache reader can (the stale-set race).
+
+**How the rest of this note builds up**
+
+- First, why stale data is a problem (section 1) and the freshness mental model (section 2).
+- Then how it works: freshness models, TTLs in Redis, jitter, invalidation strategies (section 3).
+- Then the stale-set race and the lease fix, with Go code and tests (sections 3-4).
+- Finally the SDE-3 deep dive: versioned keys, CDC-driven invalidation, production trade-offs (sections 5-8).
+
+> [!tip] Remember
+> Commit to the DB, then delete the cache key, and always keep a TTL as the safety net.
 
 ## 1. Why it exists
 
@@ -141,7 +186,11 @@ sequenceDiagram
     Note over C: Next reader gets a new lease and loads 399
 ```
 
-A lease token is issued on a miss; a set is accepted only with the current token; a delete cancels the token. A lease must also expire on its own (a short timeout), or a filler that crashes after taking the lease blocks every later fill of that key; the teaching code below omits this timeout for brevity. Facebook's leases also rate-limit tokens per key (one every 10 seconds in the paper), which doubles as stampede protection: other readers wait briefly or take a slightly stale value instead of all querying the database.
+A lease token is issued on a miss; a set is accepted only with the current token; a delete cancels the token.
+
+A lease must also expire on its own (a short timeout), or a filler that crashes after taking the lease blocks every later fill of that key; the teaching code below omits this timeout for brevity.
+
+Facebook's leases also rate-limit tokens per key (one every 10 seconds in the paper), which doubles as stampede protection: other readers wait briefly or take a slightly stale value instead of all querying the database.
 
 ## 4. Worked example
 
@@ -282,7 +331,11 @@ func Jitter(ttl time.Duration, frac float64, r *rand.Rand) time.Duration {
 }
 ```
 
-Why the version guard works: the version comes from the database row (for example, an `updated_version bigint` column incremented by every `UPDATE`, or the commit LSN from the change stream). A slow reader carries the version it read. Redis runs a Lua script atomically, so the compare and the write cannot interleave with another client's write. A late fill of version 4 cannot overwrite version 5. The guard needs the newer value to be **written** (update-on-write or CDC), not just deleted: after a plain `DEL` there is nothing left to compare against.
+Why the version guard works: the version comes from the database row (for example, an `updated_version bigint` column incremented by every `UPDATE`, or the commit LSN from the change stream).
+
+A slow reader carries the version it read. Redis runs a Lua script atomically, so the compare and the write cannot interleave with another client's write. A late fill of version 4 cannot overwrite version 5.
+
+The guard needs the newer value to be **written** (update-on-write or CDC), not just deleted: after a plain `DEL` there is nothing left to compare against.
 
 Measured on Redis 8.2 with the same script through `redis-cli EVAL`: writing version 5 returned `1`, a later write of version 4 returned `0`, and `HGETALL product:7` still showed `ver 5, val price=399`.
 
@@ -432,7 +485,11 @@ flowchart LR
     INV -- "DEL product:{id}:v1 or SetIfNewer(lsn)" --> R[("Redis")]
 ```
 
-The database's write-ahead log already records every committed change in commit order. A connector such as Debezium reads it through PostgreSQL logical decoding and publishes change events; a consumer deletes or version-sets the affected keys. No application code path can forget to invalidate, rollbacks never reach the cache (only commits are in the log), and the commit position (LSN) is a natural version. The cost is a pipeline to run and a lag of typically well under a second to a few seconds (an estimate; measure your connector's lag). See [[Transactional Outbox and CDC]].
+The database's write-ahead log already records every committed change in commit order. A connector such as Debezium reads it through PostgreSQL logical decoding and publishes change events; a consumer deletes or version-sets the affected keys.
+
+No application code path can forget to invalidate, rollbacks never reach the cache (only commits are in the log), and the commit position (LSN) is a natural version.
+
+The cost is a pipeline to run and a lag of typically well under a second to a few seconds (an estimate; measure your connector's lag). See [[Transactional Outbox and CDC]].
 
 ## 5. Variants and comparison
 
@@ -509,3 +566,7 @@ The database's write-ahead log already records every committed change in commit 
 - **Before this:** [[Caching Fundamentals]], [[Caching Patterns]]
 - **Next:** [[Cache Eviction Policies - LRU, LFU, TTL]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]
 - **Compare with:** [[Consistency Models]], [[Transactional Outbox and CDC]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] (validation with ETags instead of invalidation)
+
+### Watch on YouTube
+
+- [Caching Strategies: TTL, LRU - System Design Interview #cacheinvalidation #ttl #lru](https://www.youtube.com/watch?v=Lt3N5GLBoYo) · The Code Architect · interview-style walkthrough of TTL and invalidation tradeoffs

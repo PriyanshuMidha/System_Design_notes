@@ -10,13 +10,19 @@ sources:
   - "Redis docs: Diagnosing latency issues (fork, transparent huge pages, AOF fsync)"
   - "Redis 7.0 release notes (multi-part AOF)"
   - "AWS ElastiCache docs: reserved-memory-percent, backups"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis Persistence - RDB and AOF
 
 > [!summary] TL;DR
-> Redis keeps data in RAM and can save it to disk in two ways. **RDB** writes a compact snapshot of all data every so often, so you can lose the writes since the last snapshot. **AOF** (append-only file) logs every write command and replays the log on restart, so with `appendfsync everysec` you lose at most about a second of writes. Most production setups that care about data use both.
+> Redis keeps data in RAM and can save it to disk in two ways.
+>
+> **RDB** writes a compact snapshot of all data every so often, so you can lose the writes since the last snapshot.
+>
+> **AOF** (append-only file) logs every write command and replays the log on restart, so with `appendfsync everysec` you lose at most about a second of writes.
+>
+> Most production setups that care about data use both.
 
 > [!abstract] Core idea
 > - RDB = point-in-time snapshot, made by a forked child process using copy-on-write memory. Small file, fast restart, but minutes of data loss.
@@ -24,6 +30,50 @@ updated: 2026-11-04
 > - Since Redis 7.0 the AOF is a directory: an RDB-format base file plus incremental log files plus a manifest.
 > - Persistence protects against a restart, not against losing the machine. That needs replicas and off-host backups.
 > - Classic mistake: thinking `appendfsync always` makes Redis a fully durable database. It is durable on that disk, but replication is still asynchronous.
+
+## Start here: the basics
+
+**The problem in one story.**
+Redis keeps everything in RAM, which is fast but forgets everything when the power goes off.
+One night the server reboots for an update.
+Without a saved copy, every cached page, counter and queued job is gone.
+Persistence means Redis also writes its data to disk so it can come back after a restart.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Persistence | Saving in-memory data to disk so it survives a restart | `dump.rdb` file on disk |
+| Snapshot | A full copy of all data at one moment | "Everything as of 03:00" |
+| Log (append-only) | A file you only add to, one line per change | `SET a 1`, then `INCR a`, ... |
+| `fsync` | Asking the OS to really push file data onto the disk | Without it, data can sit in OS memory |
+| Process / `fork()` | A running program / making a copy of it as a child process | Redis forks a child to write the snapshot |
+| Copy-on-write (COW) | Parent and child share memory pages until one of them writes | Only changed pages get duplicated |
+| Durability | Once acknowledged, a write is not lost | Bank deposit stays after a crash |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W["Write commands"] --> M["Redis memory"]
+    M -- "every few minutes<br/>(fork child)" --> RDB["RDB snapshot file"]
+    W -- "each write" --> AOF["AOF log<br/>(fsync every second)"]
+    RDB --> Re["Restart: load data back"]
+    AOF --> Re
+```
+
+**Analogy.** RDB is taking a photo of a whiteboard every hour; AOF is writing down every change in a notebook as it happens. The photo is quick to restore, the notebook loses less.
+Where it breaks: a notebook replays changes in order, but Redis also compacts its notebook (AOF rewrite) into a fresh "photo plus new notes", which a real notebook never does.
+
+**How the rest of this note builds up**
+
+- First, what a restart costs without persistence (section 1) and the photo-vs-notebook mental model (section 2).
+- Then how RDB, AOF, fsync policies and AOF rewrite work (section 3), with a measured worked example (section 4).
+- Then how to choose: variants, trade-offs and production settings (sections 5-7).
+- Finally the SDE-3 deep dive: fork latency, copy-on-write cost, the real meaning of `everysec`, and interview questions (sections 8-9).
+
+> [!tip] Remember
+> RDB = periodic photo (fast restore, more loss); AOF = write log (less loss, bigger file); use both when data matters.
 
 ## 1. Why it exists
 
@@ -87,7 +137,9 @@ flowchart LR
 ```
 
 - The AOF stores commands in the Redis protocol format. Relative expiries are rewritten as absolute ones, so replay does not extend TTLs. Measured on Redis 8.2: `EXPIRE probe 100` appeared in the file as `PEXPIREAT probe 1793776272290`.
-- **AOF rewrite** (`BGREWRITEAOF`, or automatic when the AOF has grown by `auto-aof-rewrite-percentage` (100%) and is at least `auto-aof-rewrite-min-size` (64 MB); defaults measured on Redis 8.2) forks a child that writes the current dataset as a new base file. With `aof-use-rdb-preamble yes` (added in Redis 4.0, the default since Redis 5.0) that base is in RDB format, which is smaller and faster to load.
+- **AOF rewrite** (`BGREWRITEAOF`, or automatic when the AOF has grown by `auto-aof-rewrite-percentage` (100%) and is at least `auto-aof-rewrite-min-size` (64 MB); defaults measured on Redis 8.2)
+	- It forks a child that writes the current dataset as a new base file.
+	- With `aof-use-rdb-preamble yes` (added in Redis 4.0, the default since Redis 5.0) that base is in RDB format, which is smaller and faster to load.
 - **Multi-part AOF (Redis 7.0+).** The AOF is a directory (`appenddirname`, default `appendonlydir`) holding a base file, one or more incremental files, and a manifest that lists them. A rewrite creates a new base and a new incremental file and swaps the manifest, so Redis never has to merge a rewrite buffer into the old file.
 
 ### Restart
@@ -107,7 +159,15 @@ stateDiagram-v2
     Refuse --> [*]: run redis-check-aof --fix
 ```
 
-When AOF is enabled, Redis loads only the AOF, because it is the more complete record. A common outage: someone enables `appendonly yes` in the config file of a server that only had `dump.rdb`, restarts it, and Redis loads an empty AOF. The safe way is `CONFIG SET appendonly yes` on the running server (it writes a fresh AOF from memory), wait until `aof_rewrite_in_progress:0`, then update the config file.
+When AOF is enabled, Redis loads only the AOF, because it is the more complete record.
+
+A common outage: someone enables `appendonly yes` in the config file of a server that only had `dump.rdb`, restarts it, and Redis loads an empty AOF.
+
+The safe way is:
+
+1. Run `CONFIG SET appendonly yes` on the running server (it writes a fresh AOF from memory).
+2. Wait until `aof_rewrite_in_progress:0`.
+3. Then update the config file.
 
 ## 4. Worked example
 
@@ -345,7 +405,11 @@ func TestCheck(t *testing.T) {
 
 ## 8. Deep dive
 
-- **Why fork latency grows with memory.** `fork()` copies the page tables, not the pages. A page table entry maps 4 KB, so a 25 GB dataset has about 6.5 million entries to copy, and the main thread is blocked while that happens. That is why `latest_fork_usec` matters and why very large single instances are split into shards. Our 151.6 MB dataset took 4.6 ms on an M4; the cost on a large Linux VM is an estimate you should measure, not assume.
+- **Why fork latency grows with memory.**
+	- `fork()` copies the page tables, not the pages.
+	- A page table entry maps 4 KB, so a 25 GB dataset has about 6.5 million entries to copy, and the main thread is blocked while that happens.
+	- That is why `latest_fork_usec` matters and why very large single instances are split into shards.
+	- Our 151.6 MB dataset took 4.6 ms on an M4; the cost on a large Linux VM is an estimate you should measure, not assume.
 - **What COW costs.** Each page the parent writes during a save is duplicated. A write-heavy workload during a long save can approach 2× memory; `rdb_last_cow_size` reports the real figure.
 - **`everysec` is "about" one second.** The fsync runs in a background thread. If the previous fsync is still running (slow disk), Redis delays further writes for up to 2 seconds, then writes without waiting, which is why the docs say you can lose up to 2 seconds in that case.
 - **What a write returns.** With `always`, Redis fsyncs before sending replies for the commands in that event-loop iteration, so an acknowledged write is on this host's disk. With `everysec` a client can receive `OK` for a write that is not yet on disk.
@@ -391,3 +455,8 @@ func TestCheck(t *testing.T) {
 - **Before this:** [[Redis Fundamentals]], [[Page Cache, File Systems and fsync]], [[Virtual Memory, Paging and the TLB]]
 - **Next:** [[Redis Replication, Sentinel and Cluster]], [[Redis in Production - Memory, Latency, Security]]
 - **Compare with:** [[Storage Engines - B-tree vs LSM and WAL]] (database WAL), [[Redis as a Queue - Lists, Streams and Pub-Sub]] (why queues need AOF), [[Replication]]
+
+### Watch on YouTube
+
+- [Implementing AOF Persistence / Redis Internals](https://www.youtube.com/watch?v=5SnkVoatBpA) · Arpit Bhayani · 21 min · 4,248 views
+- [Understanding Redis Persistence - AOF & RDB + Docker](https://www.youtube.com/watch?v=1pfvz24BAUs) · Coding with Raphael De Lio · 19 min · 11,393 views

@@ -7,7 +7,7 @@ related: ["[[React Hooks]]", "[[React Rendering - Virtual DOM, Reconciliation, L
 sources:
   - "react.dev, Describing the UI"
   - "react.dev, React 19 release notes"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # React Fundamentals - Components, JSX, Props, State
@@ -22,13 +22,59 @@ updated: 2026-11-09
 > - Calling the state setter schedules a re-render; it does not mutate anything immediately, and React batches multiple setter calls from one event into a single re-render.
 > - Lists need a stable `key` per item so React can tell which item is which across renders.
 
+## Start here: the basics
+
+**The problem in one story.**
+A shopping site shows a cart badge with "3 items".
+The number must change when you add, remove or check out.
+Updating the page by hand in each of those places is easy to forget.
+React lets you say "the badge shows `count`" once, and it keeps the page in sync whenever `count` changes.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| DOM | The browser's live tree of page elements | a `<button>` node you can click |
+| Component | A function that returns a piece of UI | `function Badge() { ... }` |
+| JSX | HTML-like syntax inside JavaScript | `<h1>Hello</h1>` in a `.jsx` file |
+| Props | Inputs a parent passes to a child component | `<Badge count={3} />` |
+| State | A component's own memory that survives re-renders | `const [n, setN] = useState(0)` |
+| Render | React calling your component to get its UI description | clicking re-runs `Badge()` |
+| Event handler | A function run when the user does something | `onClick={() => setN(n + 1)}` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["props<br/>(from parent)"] --> C["Component function"]
+    S["state<br/>(own memory)"] --> C
+    C --> J["JSX: UI description"]
+    J --> D["React updates<br/>the real page"]
+    D -- "user clicks" --> S
+```
+
+**Analogy.** A component is a spreadsheet formula cell: change an input cell and the result recalculates by itself.
+Where it breaks: a formula has no memory of its own, but a component can hold state between runs.
+
+**How the rest of this note builds up**
+
+- First, why React exists (section 1) and the "UI is a function of data" model (section 2).
+- Then JSX, props and state, conditional and list rendering, and code splitting (section 3).
+- Then one click traced step by step, controlled inputs, lifting state up and batching (section 4).
+- Finally the SDE-3 view: variants, trade-offs, production practice and the deep dive (sections 5-8).
+
+> [!tip] Remember
+> Write what the UI should look like for the current props and state; React works out the page updates.
+
 ## 1. Why it exists
 
 Before component frameworks, updating a page meant hand-written `document.getElementById(...).innerHTML = ...` calls scattered across the codebase. Every place that could change the DOM had to remember every other place that depended on the same data.
 
 A shopping cart badge that should update after three different actions — add, remove, checkout — needed three separate manual DOM-update call sites. Each one was a chance to forget, and leave the badge showing a stale count.
 
-React's answer: describe the UI as a pure function of data, `UI = f(props, state)`, and let React figure out which DOM nodes actually need to change. You write what the page should look like for the *current* data. React re-runs the function on every relevant change and reconciles the difference (see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for how that diffing works).
+React's answer: describe the UI as a pure function of data, `UI = f(props, state)`, and let React figure out which DOM nodes actually need to change. You write what the page should look like for the *current* data.
+
+React re-runs the function on every relevant change and reconciles the difference (see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for how that diffing works).
 
 > [!tip] Remember
 > You describe the end result for the current data, not the sequence of DOM edits to get there — React works out the edits.
@@ -110,7 +156,11 @@ flowchart TD
     Child -->|"calls onAdd(item) — a function prop"| Parent
 ```
 
-**Why it matters:** props are **read-only** inside the child — `Greeting` must never do `name = "Bob"`. If a child needs to change something the parent owns, the parent passes a callback prop down, and the child calls that callback. The change still happens in the parent, which then re-renders with new props (see "Lifting state up" below). This one-way flow is what makes a large component tree's data predictable: you can always find where a value changes by looking at who owns the state, not by searching the whole tree for mutations.
+**Why it matters:** props are **read-only** inside the child — `Greeting` must never do `name = "Bob"`. If a child needs to change something the parent owns, the parent passes a callback prop down, and the child calls that callback.
+
+The change still happens in the parent, which then re-renders with new props (see "Lifting state up" below).
+
+This one-way flow is what makes a large component tree's data predictable: you can always find where a value changes by looking at who owns the state, not by searching the whole tree for mutations.
 
 > [!tip] Remember
 > Data flows down as props; changes flow up as function calls the parent handed down.
@@ -150,7 +200,9 @@ flowchart LR
     B1 -.->|"key=B gone: unmounted, not confused with C"| X["removed"]
 ```
 
-**Example:** with a stable id as the key, removing item `B` from `[A, B, C]` leaves React able to see that `A` and `C` are the *same* items as before — any internal state they held (like a focused input) survives. If the key were the array *index* instead (`0, 1, 2`), after removing `B` the item now at index `1` (previously `C`, key `1`) is treated as "the same" element that used to be `B` at index `1` — and `C`'s state gets wrongly attached to what is now `C`'s row but was recognized as index `1`'s old identity.
+**Example:** with a stable id as the key, removing item `B` from `[A, B, C]` leaves React able to see that `A` and `C` are the *same* items as before — any internal state they held (like a focused input) survives.
+
+If the key were the array *index* instead (`0, 1, 2`), after removing `B` the item now at index `1` (previously `C`, key `1`) is treated as "the same" element that used to be `B` at index `1` — and `C`'s state gets wrongly attached to what is now `C`'s row but was recognized as index `1`'s old identity.
 
 **Why it matters:** this is one of the most common React bugs in practice — a list that reorders or filters and an input loses focus, or shows the wrong row's typed text, because the key was the index instead of a real id.
 
@@ -284,7 +336,9 @@ function Cart() {
 }
 ```
 
-**An analogy:** this is like two departments in a company that both need the same budget number — instead of each guessing or copying a number that can drift out of sync, the number lives with their shared manager, and both departments read it from the same source whenever they need it. The analogy breaks down because in React the "manager" (the parent component) is re-created on every render, not a long-lived object — only its *state* persists across those re-creations.
+**An analogy:** this is like two departments in a company that both need the same budget number — instead of each guessing or copying a number that can drift out of sync, the number lives with their shared manager, and both departments read it from the same source whenever they need it.
+
+The analogy breaks down because in React the "manager" (the parent component) is re-created on every render, not a long-lived object — only its *state* persists across those re-creations.
 
 `ProductList` and `CartBadge` never talk to each other directly; both are driven by `Cart`'s state.
 
@@ -308,7 +362,9 @@ Use the **functional updater** form (`setCount((c) => c + 1)`) rather than `setC
 
 ### Data fetching pattern
 
-A component typically renders a loading state immediately, fetches inside a `useEffect`, and re-renders once the data arrives; see [[React Hooks]] for the full pattern including the race-condition fix. In new code, a data-fetching library (TanStack Query, RTK Query) or a framework's built-in data layer (Next.js Server Components, React Router loaders) usually replaces this pattern — see [[React Routing and Rendering Strategies - CSR, SSR, SSG]].
+A component typically renders a loading state immediately, fetches inside a `useEffect`, and re-renders once the data arrives; see [[React Hooks]] for the full pattern including the race-condition fix.
+
+In new code, a data-fetching library (TanStack Query, RTK Query) or a framework's built-in data layer (Next.js Server Components, React Router loaders) usually replaces this pattern — see [[React Routing and Rendering Strategies - CSR, SSR, SSG]].
 
 ## 5. Variants and comparison
 
@@ -380,3 +436,8 @@ A component typically renders a loading state immediately, fetches inside a `use
 - **Before this:** [[JavaScript Objects, Arrays and Iteration]], [[DOM, Events and Timers]]
 - **Next:** [[React Hooks]], [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]
 - **Compare with:** [[React State Management - Props, Context, Redux]] (what to do once prop drilling stops scaling)
+
+### Watch on YouTube
+
+- [⚛️ React Components Explained! Props, State, useEffect & Composition (2025 Crash Course)](https://www.youtube.com/watch?v=qPtVIKgWzek) · Learn Web Dev with Norbert · up-to-date crash course on components, JSX, props and state
+- [05 - Understanding React Components - What are States - What are Props - State vs. Props - Reactjs](https://www.youtube.com/watch?v=GgurJ_3y0Jg) · tapaScript by Tapas Adhikary · focused state-vs-props comparison, a common point of confusion

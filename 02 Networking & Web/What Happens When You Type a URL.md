@@ -11,7 +11,7 @@ sources:
   - "RFC 9114, HTTP/3"
   - "RFC 9111, HTTP Caching"
   - "curl(1) and dig(1) manuals"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # What Happens When You Type a URL
@@ -44,13 +44,67 @@ flowchart LR
 
 Every box after this is one of those nine steps, with its own explanation below; this note's job is only the order, the timing, and the handoffs between them.
 
+## Start here: the basics
+
+**The problem in one story.** You type a shop's address and press Enter.
+Your computer doesn't know where that shop lives, so it asks for directions (DNS).
+It then calls the shop, agrees on a secret code so nobody can listen in, and asks for your cart.
+A nearby branch may answer, or pass the question to the head office and its records room.
+The answer comes back and the browser draws the page.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| URL | The full address of a page | `https://shop.example.com/cart` |
+| IP address | The numeric address computers actually use | `93.184.215.14` |
+| DNS | The internet's phone book: name in, IP address out | `shop.example.com` → an IP |
+| Cache | A saved copy kept so work isn't repeated | The browser remembering an IP |
+| Round trip (RTT) | Time for a message to go there and back | ~220 ms Mumbai ↔ US east coast |
+| TCP / TLS | TCP makes a reliable connection; TLS encrypts it (the "S" in HTTPS) | The lock icon in the browser |
+| CDN edge | A server near the user that keeps copies of content | A Mumbai server for a US shop |
+| Reverse proxy | The front door at the origin that forwards requests to app servers | Nginx in front of the app |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U[You press Enter] --> D["DNS: find the IP"]
+    D --> C["TCP + TLS: connect securely"]
+    C --> E["CDN edge: nearby copy?"]
+    E -->|no| O["Origin: proxy, app, database"]
+    E -->|yes| R[Browser renders page]
+    O --> R
+```
+
+**Analogy.** It's like phoning a company: look up the number, dial, agree on a code word, and ask; a local branch may answer before head office is needed.
+Where it breaks: a phone call is one conversation, but loading a page is several separate exchanges, each skippable if cached.
+
+**How the rest of this note builds up**
+
+- First, why the chain exists and a mental model (sections 1-2).
+- Then each stage in order: caches and DNS, TCP and TLS, CDN to database, render, and a timing table (section 3).
+- Then a real `curl` timing breakdown and a comparison of warm vs cold paths (sections 4-5).
+- Finally trade-offs, production failure modes and the SDE-3 deep dive on handshake round trips and warm pools (sections 6-8).
+
+> [!tip] Remember
+> Loading a URL = find the address, connect securely, ask, and draw; every step can be skipped if something is already cached or kept open.
+
 ## 1. Why it exists
 
-A single page load for a shopping cart touches a browser cache, a DNS resolver, a CDN, a reverse proxy, an application server and a database — six systems owned by different teams or companies. Nobody designed "load a URL" as one system; it works because each layer has a narrow contract with the one above and below it (DNS resolves a name to an address and nothing else; TCP delivers bytes reliably and nothing else; TLS adds confidentiality and nothing else).
+A single page load for a shopping cart touches a browser cache, a DNS resolver, a CDN, a reverse proxy, an application server and a database — six systems owned by different teams or companies.
+
+Nobody designed "load a URL" as one system; it works because each layer has a narrow contract with the one above and below it (DNS resolves a name to an address and nothing else; TCP delivers bytes reliably and nothing else; TLS adds confidentiality and nothing else).
 
 Understanding the full chain is what separates "the page is slow" from "the TLS handshake to the origin is adding 180 ms because the CDN cache is missing" — the second sentence names the box to fix.
 
-**Concrete scenario, used throughout this note.** A user in Mumbai requests `https://shop.example.com/cart` for the first time this session (cold browser cache, cold TLS session, cold CDN edge cache for this exact URL since it's personalized). The origin's app servers and primary database sit in `us-east-1`, 220 ms round-trip away. A CDN with an edge PoP in Mumbai fronts the origin.
+**Concrete scenario, used throughout this note.** A user in Mumbai requests `https://shop.example.com/cart` for the first time this session.
+
+- Cold browser cache.
+- Cold TLS session.
+- Cold CDN edge cache for this exact URL, since it's personalized.
+- The origin's app servers and primary database sit in `us-east-1`, 220 ms round-trip away.
+- A CDN with an edge PoP in Mumbai fronts the origin.
 
 > [!tip] Remember
 > Each layer's narrow contract is what lets six independently-owned systems cooperate without ever agreeing on a shared design — DNS, TCP, TLS, the CDN, the proxy and the app each only need to keep their own one promise.
@@ -81,20 +135,28 @@ flowchart LR
 
 Every "look it up first" step in that list is a cache; every "ring and pick up" step is a handshake that costs a round trip.
 
-**Where the analogy breaks down:** a phone call is one continuous conversation once connected. The real chain is not one conversation — it's several separate request/response pairs (DNS is its own exchange, the TLS handshake is its own exchange, the HTTP request is yet another), each of which can independently be skipped if its own cache already holds the answer. The switchboard picture is useful for ordering, not for "it's all one call."
+**Where the analogy breaks down:** a phone call is one continuous conversation once connected.
+
+The real chain is not one conversation — it's several separate request/response pairs (DNS is its own exchange, the TLS handshake is its own exchange, the HTTP request is yet another), each of which can independently be skipped if its own cache already holds the answer.
+
+The switchboard picture is useful for ordering, not for "it's all one call."
 
 > [!tip] Remember
 > If you can name which "call" in this chain is slow, you've already found the box to fix — the fix for a slow DNS call is never the same fix as a slow database call.
 
 ## 3. How it works
 
-The full request below is the Mumbai-to-`us-east-1`, CDN-miss scenario from section 1, broken into the stages the whiteboard flowchart named. Each stage gets its own explanation; the exact round-trip costs for every stage are gathered once, in the table at the end of this section, so the numbers live in one place instead of being repeated in every diagram.
+The full request below is the Mumbai-to-`us-east-1`, CDN-miss scenario from section 1, broken into the stages the whiteboard flowchart named.
+
+Each stage gets its own explanation; the exact round-trip costs for every stage are gathered once, in the table at the end of this section, so the numbers live in one place instead of being repeated in every diagram.
 
 ### Browser cache and DNS: checking the notebook first
 
 **In plain words:** before sending anything onto the network, the browser asks itself two questions it can answer from memory: "do I already have this exact response cached?" and "do I already know this hostname's IP address?" Both checks are local, in-process lookups — no network round trip, no handshake.
 
-**Example:** `/cart` is a personalized, `Cache-Control: no-store` response, so the browser cache check is a guaranteed miss (under 1 ms to find that out). The hostname `shop.example.com` has never been looked up this session, so the DNS cache is also a miss, which sends the request to a recursive resolver, which asks the authoritative server, caches the answer for the record's TTL, and hands the IP back.
+**Example:** `/cart` is a personalized, `Cache-Control: no-store` response, so the browser cache check is a guaranteed miss (under 1 ms to find that out).
+
+The hostname `shop.example.com` has never been looked up this session, so the DNS cache is also a miss, which sends the request to a recursive resolver, which asks the authoritative server, caches the answer for the record's TTL, and hands the IP back.
 
 ```mermaid
 sequenceDiagram
@@ -119,7 +181,11 @@ sequenceDiagram
 
 ### TCP and TLS: two handshakes before one byte of HTTP moves
 
-**In plain words:** TCP has to confirm both sides are listening and agree on starting sequence numbers before any payload can ride on the connection — that's the three-packet SYN / SYN-ACK / ACK handshake. TLS then has to agree on an encryption key and prove the server's identity before the connection is safe to send real data over. With TLS 1.3, both sides' first messages carry enough information that the whole security handshake finishes in one more round trip, not two.
+**In plain words:** TCP has to confirm both sides are listening and agree on starting sequence numbers before any payload can ride on the connection — that's the three-packet SYN / SYN-ACK / ACK handshake.
+
+TLS then has to agree on an encryption key and prove the server's identity before the connection is safe to send real data over.
+
+With TLS 1.3, both sides' first messages carry enough information that the whole security handshake finishes in one more round trip, not two.
 
 **Picture it:**
 
@@ -146,7 +212,12 @@ sequenceDiagram
 
 ### CDN edge, reverse proxy, app and database: who actually answers
 
-**In plain words:** once the secure connection exists, the browser sends one HTTP request. The CDN edge checks its own cache first; only a miss (as it is here, since `/cart` is personalized) forwards the request onward, over a connection the CDN already keeps open to the origin's reverse proxy. The reverse proxy picks which application server instance should handle it, that server authenticates the session and queries the database, and the answer travels back the same chain.
+**In plain words:** once the secure connection exists, the browser sends one HTTP request.
+
+1. The CDN edge checks its own cache first; only a miss (as it is here, since `/cart` is personalized) forwards the request onward, over a connection the CDN already keeps open to the origin's reverse proxy.
+2. The reverse proxy picks which application server instance should handle it.
+3. That server authenticates the session and queries the database.
+4. The answer travels back the same chain.
 
 **Picture it:**
 
@@ -169,7 +240,11 @@ sequenceDiagram
     Edge-->>Br: response
 ```
 
-**Example:** the edge-to-origin hop crosses the real 220 ms Mumbai-to-`us-east-1` distance, but it's only one round trip, because the CDN keeps a pool of connections to the origin already open and already TLS-handshaked (see [[Connection Pooling]]) — without that pool, this single hop would cost three round trips of its own (its own TCP + TLS handshake, on top of its own distance).
+**Example:** the edge-to-origin hop crosses the real 220 ms Mumbai-to-`us-east-1` distance, but it's only one round trip.
+
+That's because the CDN keeps a pool of connections to the origin already open and already TLS-handshaked (see [[Connection Pooling]]).
+
+Without that pool, this single hop would cost three round trips of its own (its own TCP + TLS handshake, on top of its own distance).
 
 **Picture it — why the warm pool matters:**
 
@@ -214,7 +289,11 @@ sequenceDiagram
     Note over Br: builds DOM + CSSOM, computes layout, paints
 ```
 
-**Why it matters:** none of these subresource fetches pay for a new DNS lookup, TCP handshake or TLS handshake if they share the page's origin and connection — the only new cost is each request's own round trip and the server's own response time, which is why HTTP/2's multiplexing (reusing one connection for many requests at once) matters so much for a typical page with dozens of subresources. The full mechanism is covered in [[How Browsers Load and Render a Page]].
+**Why it matters:** none of these subresource fetches pay for a new DNS lookup, TCP handshake or TLS handshake if they share the page's origin and connection.
+
+The only new cost is each request's own round trip and the server's own response time, which is why HTTP/2's multiplexing (reusing one connection for many requests at once) matters so much for a typical page with dozens of subresources.
+
+The full mechanism is covered in [[How Browsers Load and Render a Page]].
 
 > [!tip] Remember
 > "The page loaded" is not one request-response pair — it's one primary request plus a second, usually-parallel chain of subresource requests, most of them riding the same already-warm connection.
@@ -256,11 +335,18 @@ curl -s -o /dev/null -w \
 dns:0.002563s connect:0.003054s tls:0.180100s ttfb:0.231865s total:0.232011s
 ```
 
-Read it as cumulative, not per-phase: DNS finished at 2.6 ms, the TCP handshake finished at 3.1 ms (so TCP itself took ~0.5 ms here, a nearby server), the TLS handshake finished at 180.1 ms (so TLS alone cost ~177 ms — the one long round trip in this path), and the first response byte arrived 51.8 ms after that.
+Read it as cumulative, not per-phase:
+
+1. DNS finished at 2.6 ms.
+2. The TCP handshake finished at 3.1 ms (so TCP itself took ~0.5 ms here, a nearby server).
+3. The TLS handshake finished at 180.1 ms (so TLS alone cost ~177 ms — the one long round trip in this path).
+4. The first response byte arrived 51.8 ms after that.
 
 ### Tracing the same four phases in Go
 
-The same breakdown can be measured from inside an application instead of from the command line, using `net/http/httptrace` — the mechanism both `curl -w` and the browser's own waterfall panel are built on. A Go package built around it confirms two things a learner should predict before running anything: a plain `http://` URL pays nothing for TLS, and a second request on a kept-alive connection skips both connect and TLS entirely.
+The same breakdown can be measured from inside an application instead of from the command line, using `net/http/httptrace` — the mechanism both `curl -w` and the browser's own waterfall panel are built on.
+
+A Go package built around it confirms two things a learner should predict before running anything: a plain `http://` URL pays nothing for TLS, and a second request on a kept-alive connection skips both connect and TLS entirely.
 
 **Measured** (Go 1.24.4, darwin/arm64, `go test -race -run TestDo -v`, 2026-11-06):
 
@@ -307,7 +393,9 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
 
 ## 8. Deep dive
 
-- **Why TCP+TLS cost "2 round trips" and not 3.** TLS 1.3's client sends its key share in the very first flight (the `ClientHello`), so the server can reply with everything needed to finish the handshake in its one response; the client's `Finished` message can carry the first HTTP request piggybacked on it. TLS 1.2 needed its own separate `ClientKeyExchange`/`Finished` round trip on top of the `ClientHello`/`ServerHello` exchange, which is the round trip TLS 1.3 removes.
+- **Why TCP+TLS cost "2 round trips" and not 3.** TLS 1.3's client sends its key share in the very first flight (the `ClientHello`), so the server can reply with everything needed to finish the handshake in its one response; the client's `Finished` message can carry the first HTTP request piggybacked on it.
+
+  TLS 1.2 needed its own separate `ClientKeyExchange`/`Finished` round trip on top of the `ClientHello`/`ServerHello` exchange, which is the round trip TLS 1.3 removes.
 
   ```mermaid
   flowchart TB
@@ -324,7 +412,9 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
   **Why it matters:** the practical cost is 1 RTT for TCP and 1 RTT for TLS, and the first HTTP bytes move in the third flight — never 3 full round trips the way TLS 1.2 needed.
 - **Why the CDN hop to origin is cheap even at 220 ms distance.** The CDN keeps a pool of already-established, already-TLS-handshaked connections to the origin (see [[Connection Pooling]]). A browser paying for DNS+TCP+TLS to the edge, plus the edge forwarding over an already-warm connection, is cheaper than the browser doing DNS+TCP+TLS directly to the far origin.
 - **Where the application and database time actually goes.** A well-indexed point lookup (by primary key or a covering index) costs low single-digit milliseconds; an unindexed scan or an N+1 pattern of many small queries can dominate the entire request — see [[Query Plans and EXPLAIN]] and [[N+1 Query Problem]].
-- **What "render" hides.** The browser doesn't wait for the whole response before starting work: it streams-parses HTML, discovers subresources (CSS, JS, images, fonts) and fires new requests for each, builds the DOM and CSSOM, computes layout, and paints — a second request-response chain per subresource, each going through some or all of the same phases (often on the same warm connection via HTTP/2 multiplexing). The mechanism is covered in full in [[How Browsers Load and Render a Page]].
+- **What "render" hides.** The browser doesn't wait for the whole response before starting work: it streams-parses HTML, discovers subresources (CSS, JS, images, fonts) and fires new requests for each, builds the DOM and CSSOM, computes layout, and paints.
+
+  That is a second request-response chain per subresource, each going through some or all of the same phases (often on the same warm connection via HTTP/2 multiplexing). The mechanism is covered in full in [[How Browsers Load and Render a Page]].
 - **Load balancing is invisible here on purpose.** Both the CDN's and the reverse proxy's "pick an upstream" step is a load-balancing decision; the algorithms (round robin, least connections, consistent hashing) live in [[Load Balancing]], and this note only shows that the decision happens.
 
 ## 9. Interview questions
@@ -367,3 +457,8 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
 - **Compare with:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[CDN and Edge]], [[Forward and Reverse Proxies - L4 vs L7]], [[Nginx]], [[Load Balancing]], [[Connection Pooling]], [[Query Plans and EXPLAIN]]
 - **Also in this folder:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]], [[IP Addressing, Subnets, NAT and VPC Basics]], [[UDP and QUIC]]
 - **Code:** [[What Happens When You Type a URL - Go]]
+
+### Watch on YouTube
+
+- [90% Fail This Interview Question: What Happens When You Type google.com?](https://www.youtube.com/watch?v=8fR9E2iXB44) · Abisheik M · interview-style walkthrough of the full DNS/TCP/TLS/HTTP chain
+- [what happens when you type a URL into your browser? all 6 Steps Explained](https://www.youtube.com/watch?v=-ynxNpYqcYI) · Gbemisola Oladetoun · quick 6-step visual overview of the same request lifecycle

@@ -10,13 +10,19 @@ sources:
   - "Martin Kleppmann, Designing Data-Intensive Applications, ch. 1: Twitter timeline example (materialising timelines vs joining at read time)"
   - "Discord engineering blog: message storage in Cassandra, later ScyllaDB; messages are partitioned by channel and read per channel (read-time model, no per-user copy)"
   - "WhatsApp, public descriptions: messages queue server-side per recipient until delivered (per-recipient inbox)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Fan-out on Write vs Fan-out on Read
 
 > [!summary] TL;DR
-> When one person posts and many people must see it, you choose **when to do the work**. **Fan-out on write (push)** copies the post into every follower's inbox when it is posted, so reading is one cheap lookup. **Fan-out on read (pull)** stores the post once and assembles each reader's view when they open the app. Real systems use a **hybrid**: push for normal accounts, pull for celebrities.
+> When one person posts and many people must see it, you choose **when to do the work**.
+>
+> **Fan-out on write (push)** copies the post into every follower's inbox when it is posted, so reading is one cheap lookup.
+>
+> **Fan-out on read (pull)** stores the post once and assembles each reader's view when they open the app.
+>
+> Real systems use a **hybrid**: push for normal accounts, pull for celebrities.
 
 > [!abstract] Core idea
 > - Both models do the same total "delivery" work in the end. They differ in **when** (at post time or at read time) and **who pays** (the writer's path or the reader's path).
@@ -24,6 +30,51 @@ updated: 2026-11-09
 > - The cost of push is **write amplification** (one post becomes N writes) and wasted work for inactive users. The cost of pull is **read amplification** (one read becomes N lookups and a merge) and slow reads.
 > - The same pattern, the **inbox**, shows up in feeds, chat, notifications and live comments. Learn it once.
 > - Interview trap: saying "just push everything". A user with 50 million followers makes that a 50-million-write event.
+
+## Start here: the basics
+
+**The problem in one story.**
+You post a holiday photo. 500 friends follow you.
+Each of them opens the app later and expects to see your photo near the top.
+Someone has to put your photo in front of 500 people.
+The only question is: do you do that work now, when you post, or later, when each friend opens the app?
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Follower | A user who wants to see your posts | 500 friends follow you |
+| Feed / timeline | The list of recent posts a user sees on opening the app | Your home screen |
+| Inbox | A ready-made per-user list of post ids, stored for fast reading | Bob's list: [p9, p7, p3] |
+| Fan-out | One event causing many deliveries | 1 post sent to 500 inboxes |
+| Push / pull | Do the work at post time / do it at read time | Mail delivered vs fetching it yourself |
+| Cache (Redis) | Fast in-memory store used to keep inboxes | `LPUSH inbox:bob p9` |
+| Read-to-write ratio | How many reads happen per write | 100 reads per post |
+| Celebrity / hot account | An account with a huge audience | 50 M followers |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A[Alice posts] --> W{When to do the work?}
+    W -->|push: at post time| I1[Copy into every follower inbox]
+    I1 --> R1[Reader: one cheap lookup]
+    W -->|pull: at read time| S[Store post once]
+    S --> R2[Reader: fetch from each followed account and merge]
+```
+
+**Analogy.** Push is a newspaper delivered to every door each morning. Pull is walking to the shop to pick one up when you want it.
+Where it breaks: a real reader buys one paper, but a pull feed must visit many "shops" (one per followed account) and merge the results.
+
+**How the rest of this note builds up**
+
+- First, why it exists (sections 1-2): the read-to-write numbers and the celebrity problem.
+- Then how push, pull, the hybrid and the inactive-user cap work (section 3).
+- Then a worked estimate and a comparison of where each model appears (sections 4-5).
+- Finally the SDE-3 deep dive (section 8): merging, cursors, ordering, tiering and sharding the inbox.
+
+> [!tip] Remember
+> Push pays at write time, pull pays at read time; pick by read-to-write ratio and audience size.
 
 ## 1. Why it exists
 
@@ -36,7 +87,11 @@ Take a feed with 300 million users. Suppose the average user follows 200 account
 
 So the feed is read about 100 times more often than it is written. That ratio is what makes "do the work at write time" attractive: do the work once per post, so each of the 100 reads is trivial.
 
-But look at the other side. One celebrity with 50 million followers posts. Pushing means 50 million inbox writes for one post. At 100,000 inbox writes per second per cluster (an estimate), that one post keeps the fan-out workers busy for **500 seconds**, over 8 minutes. During that time the celebrity's post is not visible to most followers, and every other user's post is stuck in the same queue.
+But look at the other side. One celebrity with 50 million followers posts. Pushing means 50 million inbox writes for one post.
+
+At 100,000 inbox writes per second per cluster (an estimate), that one post keeps the fan-out workers busy for **500 seconds**, over 8 minutes.
+
+During that time the celebrity's post is not visible to most followers, and every other user's post is stuck in the same queue.
 
 > [!tip] Remember
 > The right model depends on two numbers: the read-to-write ratio, and the size of the audience per post.
@@ -388,7 +443,9 @@ flowchart TD
 
 ### 8.2 Merging and ranking at read time
 
-A hybrid read merges two sorted lists: the inbox (newest first) and each celebrity's recent posts. Because each list is already sorted, a **k-way merge** with a heap runs in O(n log k), where n is items returned and k is the number of lists (5 to 20). That is microseconds of CPU. The expensive part is not the merge, it is the **network round trips** to fetch lists, so batch and parallelise them.
+A hybrid read merges two sorted lists: the inbox (newest first) and each celebrity's recent posts. Because each list is already sorted, a **k-way merge** with a heap runs in O(n log k), where n is items returned and k is the number of lists (5 to 20). That is microseconds of CPU.
+
+The expensive part is not the merge, it is the **network round trips** to fetch lists, so batch and parallelise them.
 
 When a ranker scores items instead of sorting by time, the pipeline becomes: candidate generation (inbox + celebrity posts + recommendations), then ranking (a model scores about 500 candidates), then filtering (blocked, seen, deleted), then page assembly. Push and pull are the **candidate generation** step; ranking is a separate stage.
 
@@ -460,3 +517,8 @@ flowchart LR
 - **Before this:** [[Caching Patterns]], [[Partitioning and Sharding]], [[Back-of-the-Envelope Estimation]]
 - **Case studies that use it:** [[Case Study - News Feed]], [[Case Study - Chat System]], [[Case Study - Notification System]], [[Case Study - Live Comments and Reactions]], [[Case Study - Photo Sharing (Instagram)]]
 - **Related:** [[Hot Keys and Hot Partitions]], [[Kafka and Event Streaming]], [[Backpressure and Flow Control]], [[Unique ID Generation]]
+
+### Watch on YouTube
+
+- [Fan-Out on Read vs Fan-Out on Write](https://www.youtube.com/watch?v=ktOoq3M9SBQ) · Kartikeya Sharma · 3 min · 2,378 views
+- [Timeline Architecture / Fanout on Read vs Fanout on Write / System Design](https://www.youtube.com/watch?v=SeeKlGMxyBQ) · Kartikeya Sharma · 18 min · 1,120 views

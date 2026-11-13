@@ -11,7 +11,7 @@ sources:
   - "PostgreSQL 17 docs, 'Routine Vacuuming' (autovacuum and bloat)"
   - "Go `database/sql` package docs, `DBStats`"
   - "PgBouncer docs, 'Running-modes' (transaction pooling)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Debugging Database Performance
@@ -26,11 +26,58 @@ updated: 2026-11-07
 > - Go's connection pool exhaustion (`sql.DBStats.WaitCount`) looks identical to a slow query from the outside — the client just waits longer — so check it before blaming the database.
 > - Stale planner statistics make PostgreSQL pick a bad plan even with the right index in place; `ANALYZE` is often the one-line fix nobody tries first.
 
+## Start here: the basics
+
+**The problem in one story.**
+A web page that used to load in a blink now takes 4 seconds.
+You look closer and almost all of that time is spent waiting on the database.
+But "the database is slow" can mean five different things.
+Guessing wastes days; this note shows how to find the real one with evidence.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Query | One request you send to the database | `SELECT * FROM invoices WHERE tenant_id = 7` |
+| Index | A sorted lookup structure that finds rows without reading the whole table | Like a book's index |
+| Seq scan | Reading every row of a table one by one | Scanning 1.2M rows to find 50 |
+| Query plan | The database's chosen recipe for running a query | "use index X, then sort" |
+| Lock | A rule that makes one transaction wait for another | An `UPDATE` blocking another `UPDATE` on the same row |
+| Connection pool | A fixed set of open DB connections your app reuses | Go's `sql.DB` with 20 connections |
+| N+1 queries | One query for a list, then one more per item | 1 + 100 queries to show 100 orders |
+| Span / trace | A timed record of one step in a request | "db.query took 3.9s" |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    S["Slow DB span"] --> A["Bad plan?"]
+    S --> B["Missing index?"]
+    S --> C["Waiting on a lock?"]
+    S --> D["Waiting for a pool connection?"]
+    S --> E["Too many queries (N+1)?"]
+```
+
+**Analogy.** A slow checkout line in a supermarket: the cashier may be slow (bad plan), the item has no barcode (missing index), someone ahead is arguing (lock), there are too few open tills (pool), or you went through the line once per item (N+1).
+Where it breaks: in a database, several of these can happen at once and feed each other.
+
+**How the rest of this note builds up**
+
+- First, a real-looking slowdown story (section 1) and the five-suspects model (section 2).
+- Then the four-step method: `pg_stat_statements`, `EXPLAIN (ANALYZE, BUFFERS)`, `pg_stat_activity`, and Go's `sql.DBStats` (section 3).
+- Then a worked example with Go code (section 4) and how other databases compare (sections 5-6).
+- Finally the SDE-3 deep dive: PgBouncer, generic vs custom plans, why `EXPLAIN` under-reports, N+1 from traces and safe remediation (sections 7-8).
+
+> [!tip] Remember
+> A slow DB span has five suspects; collect evidence for each before you change anything.
+
 ## 1. Why it exists
 
 A dashboard-rendering endpoint goes from 80ms p99 to 4 seconds p99 over a week, with no deploy in between. The trace shows 3.9 of those 4 seconds inside a single DB span. Three engineers independently assume three different causes: "we need an index," "the pool is too small," "it's locks from the backup job." Only one measurement settles it — and it's rarely the first guess, because the real distribution of root causes in production is wider than "add an index": data growth silently changing a plan from an index scan to a sequential scan, a long-running report holding a row lock, or a connection pool sized for yesterday's traffic.
 
-**Representative incident** (plausible numbers, PostgreSQL 17): a single tenant with 1.2M invoice rows now dominates a table that was 200K rows three months ago. The query planner's cached plan used to choose an index scan (fine at 200K rows); at 1.2M rows with stale statistics, it switches to a sequential scan. Every query against that table now reads 1.2M rows end to end, average query time goes from 4ms to 850ms, every connection serving that tenant now holds a database connection nearly 200× longer, and the pool that served 25 concurrent requests comfortably now queues.
+**Representative incident** (plausible numbers, PostgreSQL 17): a single tenant with 1.2M invoice rows now dominates a table that was 200K rows three months ago. The query planner's cached plan used to choose an index scan (fine at 200K rows); at 1.2M rows with stale statistics, it switches to a sequential scan.
+
+Every query against that table now reads 1.2M rows end to end, average query time goes from 4ms to 850ms, every connection serving that tenant now holds a database connection nearly 200× longer, and the pool that served 25 concurrent requests comfortably now queues.
 
 ## 2. Mental model
 
@@ -76,7 +123,9 @@ LIMIT 5;
  SELECT * FROM line_items WHERE ...      | 198400|   540,112 |    2.7  |       9.5
 ```
 
-Sort by **total time** (`calls × mean_exec_time`), not mean time alone: a query that runs 40,000 times at 85ms costs more total database time than one that runs 10 times at 900ms, even though the second looks scarier in isolation. `calls` also tells you N+1 at a glance: 198,400 calls to fetch line items for an endpoint hit 50 times a second is a strong N+1 signal before you even look at the query text.
+Sort by **total time** (`calls × mean_exec_time`), not mean time alone: a query that runs 40,000 times at 85ms costs more total database time than one that runs 10 times at 900ms, even though the second looks scarier in isolation.
+
+`calls` also tells you N+1 at a glance: 198,400 calls to fetch line items for an endpoint hit 50 times a second is a strong N+1 signal before you even look at the query text.
 
 ### Step 2 — Read the plan: `EXPLAIN (ANALYZE, BUFFERS)`
 
@@ -107,7 +156,9 @@ Three things to read, in order:
 2. **Buffers.** `shared hit` is pages found in PostgreSQL's cache; `read` is pages fetched from disk. A high `read` count on a query you expect to be cache-resident points at either a cold cache after a restart or a working set bigger than `shared_buffers`.
 3. **Planning vs. execution time.** Planning time here is negligible; if planning time itself were large (milliseconds to seconds), suspect a very complex query or (rarely) catalog bloat.
 
-**The fix** is a composite index that makes the tenant filter sargable first: `CREATE INDEX CONCURRENTLY ON invoices (tenant_id, created_at DESC)` — equality columns before range/sort columns is the rule for composite index column order. `CONCURRENTLY` avoids taking the write lock that a plain `CREATE INDEX` would hold for the build's duration — essential on a table serving live traffic. A partial index (`WHERE status = 'open'`, if only open invoices are ever queried this way) or a covering index (`INCLUDE (total_cents)` to let the query answer from the index alone) can shrink this further once the base composite index is in place — see [[Indexing Fundamentals]] for when each applies.
+**The fix** is a composite index that makes the tenant filter sargable first: `CREATE INDEX CONCURRENTLY ON invoices (tenant_id, created_at DESC)` — equality columns before range/sort columns is the rule for composite index column order.
+
+`CONCURRENTLY` avoids taking the write lock that a plain `CREATE INDEX` would hold for the build's duration — essential on a table serving live traffic. A partial index (`WHERE status = 'open'`, if only open invoices are ever queried this way) or a covering index (`INCLUDE (total_cents)` to let the query answer from the index alone) can shrink this further once the base composite index is in place — see [[Indexing Fundamentals]] for when each applies.
 
 ### Step 3 — Rule out locks: `pg_stat_activity`
 
@@ -145,7 +196,11 @@ sequenceDiagram
     DB-->>W2: lock released, UPDATE proceeds
 ```
 
-The first row is the actual culprit: a session opened a transaction, ran `SELECT ... FOR UPDATE`, and never committed — `idle in transaction` for almost five minutes, holding row locks the whole time. Every other session trying to update those rows (`wait_event = transactionid`) queues behind it. **This never shows up in `EXPLAIN`** — the blocked query's own plan looks perfectly fine; it's just waiting its turn. Fix: `statement_timeout` and `idle_in_transaction_session_timeout` as blast-radius limits, and fix the application code that opened a transaction and forgot to close it (commonly a connection checked out of a pool, used for a read, and never returned because an error path skipped the `defer tx.Rollback()`). If two sessions instead each hold a lock the other needs, PostgreSQL's deadlock detector picks one and kills it (`ERROR: deadlock detected`) rather than waiting forever — that is a different, self-resolving failure from the one-sided wait shown above, and the killed transaction's error path still needs a retry.
+The first row is the actual culprit: a session opened a transaction, ran `SELECT ... FOR UPDATE`, and never committed — `idle in transaction` for almost five minutes, holding row locks the whole time. Every other session trying to update those rows (`wait_event = transactionid`) queues behind it.
+
+**This never shows up in `EXPLAIN`** — the blocked query's own plan looks perfectly fine; it's just waiting its turn. Fix: `statement_timeout` and `idle_in_transaction_session_timeout` as blast-radius limits, and fix the application code that opened a transaction and forgot to close it (commonly a connection checked out of a pool, used for a read, and never returned because an error path skipped the `defer tx.Rollback()`).
+
+If two sessions instead each hold a lock the other needs, PostgreSQL's deadlock detector picks one and kills it (`ERROR: deadlock detected`) rather than waiting forever — that is a different, self-resolving failure from the one-sided wait shown above, and the killed transaction's error path still needs a retry.
 
 ### Step 4 — Rule out the pool: `sql.DBStats`
 
@@ -156,7 +211,9 @@ stats := db.Stats()
 // stats.InUse, stats.Idle, stats.WaitCount, stats.WaitDuration, stats.MaxOpenConnections
 ```
 
-`WaitCount > 0` means at least one query blocked waiting for a free connection — queueing time, not query time. If `InUse` sits at `MaxOpenConnections` continuously, the pool is undersized for the current load (or something upstream is holding connections too long — go back to Step 3). `MaxOpenConns` caps total connections; `MaxIdleConns` caps how many sit ready between requests (too low and the pool churns new connections constantly); `ConnMaxLifetime` forces periodic recycling so connections don't outlive a failover or a PgBouncer-side timeout.
+`WaitCount > 0` means at least one query blocked waiting for a free connection — queueing time, not query time. If `InUse` sits at `MaxOpenConnections` continuously, the pool is undersized for the current load (or something upstream is holding connections too long — go back to Step 3).
+
+`MaxOpenConns` caps total connections; `MaxIdleConns` caps how many sit ready between requests (too low and the pool churns new connections constantly); `ConnMaxLifetime` forces periodic recycling so connections don't outlive a failover or a PgBouncer-side timeout.
 
 ## 4. Worked example
 
@@ -275,7 +332,9 @@ func TestDiagnosePlanNodeStaleStatistics(t *testing.T) {
 }
 ```
 
-**Measured** (this scratch module, Go 1.24, 2026-11-07): the two tests above pass, confirming pool exhaustion is flagged only when both `WaitCount > 0` and the pool is at its ceiling (not merely busy), and a 900,000-actual-row node against an estimate of 10 is flagged stale. Two further cases behave the same way under the same logic: a sequential scan reading 1,000,000 actual rows against an estimate of 1,000,000 (no staleness, since estimate and actual agree) is flagged as a missing index, while the same node type reading 42 rows on a 40-row estimate is left `DiagnosisOK` (small lookup tables are fine to scan sequentially).
+**Measured** (this scratch module, Go 1.24, 2026-11-07): the two tests above pass, confirming pool exhaustion is flagged only when both `WaitCount > 0` and the pool is at its ceiling (not merely busy), and a 900,000-actual-row node against an estimate of 10 is flagged stale.
+
+Two further cases behave the same way under the same logic: a sequential scan reading 1,000,000 actual rows against an estimate of 1,000,000 (no staleness, since estimate and actual agree) is flagged as a missing index, while the same node type reading 42 rows on a 40-row estimate is left `DiagnosisOK` (small lookup tables are fine to scan sequentially).
 
 ## 5. Variants and comparison
 
@@ -306,9 +365,13 @@ func TestDiagnosePlanNodeStaleStatistics(t *testing.T) {
 
 ## 8. Deep dive
 
-- **Generic vs. custom plans for prepared statements.** PostgreSQL decides, after a handful of executions, whether to keep re-planning a parameterized query (a "custom" plan, tailored to the actual parameter values) or switch to a single cached "generic" plan. For a skewed column like `tenant_id` where one tenant is 1000× larger than another, the generic plan picked for a small tenant can be disastrous for a large one — this is a subtler version of the plan-regression problem above and is specific to prepared statements (`database/sql` uses them under the hood via the driver).
+- **Generic vs. custom plans for prepared statements.** PostgreSQL decides, after a handful of executions, whether to keep re-planning a parameterized query (a "custom" plan, tailored to the actual parameter values) or switch to a single cached "generic" plan.
+
+  For a skewed column like `tenant_id` where one tenant is 1000× larger than another, the generic plan picked for a small tenant can be disastrous for a large one — this is a subtler version of the plan-regression problem above and is specific to prepared statements (`database/sql` uses them under the hood via the driver).
 - **Why `EXPLAIN` alone under-reports.** `EXPLAIN ANALYZE` actually executes the query, which means a query whose slowness comes from lock contention under concurrent load may run fast in isolation (no contender) and look completely healthy — the plan was never the problem on a quiet connection. Always correlate with `pg_stat_activity` from the live incident, not just a plan re-run afterward.
-- **N+1 from the trace, not from reading code.** The most reliable way to catch N+1 in production is the trace: 200 nearly-identical child spans under one parent request span is the signature, regardless of whether the code "looks fine." `pg_stat_statements.calls` spiking for one query shape in lockstep with a specific endpoint's request rate is the same signal from the database side. See [[N+1 Query Problem]] for the fix patterns (batching, `JOIN`, dataloader-style batching).
+- **N+1 from the trace, not from reading code.** The most reliable way to catch N+1 in production is the trace: 200 nearly-identical child spans under one parent request span is the signature, regardless of whether the code "looks fine." `pg_stat_statements.calls` spiking for one query shape in lockstep with a specific endpoint's request rate is the same signal from the database side.
+
+  See [[N+1 Query Problem]] for the fix patterns (batching, `JOIN`, dataloader-style batching).
 - **Safe production remediation.** `pg_cancel_backend(pid)` politely asks a session to cancel its current statement (SIGINT-equivalent); `pg_terminate_backend(pid)` kills the whole connection (SIGTERM-equivalent) and is the only option for a session stuck `idle in transaction`. Prefer `statement_timeout` and `idle_in_transaction_session_timeout` as standing guardrails so you rarely need either manually, mid-incident.
 
 ## 9. Interview questions
@@ -346,3 +409,8 @@ func TestDiagnosePlanNodeStaleStatistics(t *testing.T) {
 - **Before this:** [[Query Plans and EXPLAIN]], [[Indexing Fundamentals]], [[Connection Pooling]]
 - **Next:** [[N+1 Query Problem]], [[Hot Keys and Hot Partitions]]
 - **Compare with:** [[Latency, Percentiles and Bottleneck Analysis]] (the general triage this note specializes for databases), [[Replication]] (read-replica lag as a distinct failure mode)
+
+### Watch on YouTube
+
+- [Performance Debugging in YugabyteDB / YugabyteDB Friday Tech Talks / Episode 63](https://www.youtube.com/watch?v=byHWkarjhJw) · Yugabyte · 41 min · 354 views
+- [SAP debugging  and Performance analysis](https://www.youtube.com/watch?v=izhx2HNwchY) · Rohini Kumar · 14 min · 67 views

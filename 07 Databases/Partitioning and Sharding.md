@@ -14,7 +14,7 @@ sources:
   - "Figma blog, How Figma's databases team lived to tell the scale (2024)"
   - "AWS docs, DynamoDB: best practices for designing partition keys (per-partition throughput limits)"
   - "Kleppmann, Designing Data-Intensive Applications (2017), chapter 6: Partitioning"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Partitioning and Sharding
@@ -27,6 +27,51 @@ updated: 2026-11-02
 > - Everything depends on the key: it should spread load evenly and keep each request on one piece.
 > - The rule: hash keys into many fixed logical shards, and keep a map from logical shard to database, so moving data is a map change.
 > - Classic mistakes: sharding by ranges of a growing ID (all new writes hit one shard) and routing with `hash(key) % servers` (adding a server moves almost every key).
+
+## Start here: the basics
+
+**The problem in one story.**
+Your invoices table grows to billions of rows.
+One server can no longer store it all or handle every write.
+You split the data into pieces by some key, like the workspace ID.
+If you pick the key well, each request touches one piece and the load spreads evenly.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Partition | One piece of a table inside a single database | `invoices_2026_11` |
+| Shard | One piece of the data on its own machine | `db-3` holds some workspaces |
+| Shard key | The column used to decide which piece a row goes to | `workspace_id` |
+| Hash | A function that turns a key into a well-mixed number | `fnv32("acme")` |
+| Hot shard | One piece that gets far more traffic than the others | All new writes on the newest range |
+| Fan-out | Sending one query to every shard and merging results | "Search all invoices" |
+| Shard map | A table that says which database owns which piece | logical shard 42 → `db-2` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request<br/>workspace_id"] --> H["hash → logical shard<br/>(e.g. 1 of 1024)"]
+    H --> M["Shard map"]
+    M --> D1["db-1"]
+    M --> D2["db-2"]
+    M --> D3["db-3"]
+```
+
+**Analogy.** A post office sorts letters into many numbered pigeonholes, then a chart says which van takes each pigeonhole.
+Where it breaks: letters to "everyone" must go in every van, just like a query without the shard key must ask every shard.
+
+**How the rest of this note builds up**
+
+- First, why to split data and the scaling ladder before sharding (section 1), then the mental model (section 2).
+- Then PostgreSQL partitioning, pruning and retention (sections 3.1-3.3).
+- Then sharding across machines, strategies, the hot-shard trap and choosing a key (sections 3.4-3.7).
+- Then routing with a versioned map and moving a workspace online (section 4).
+- Finally the SDE-3 view: trade-offs, production, logical shards, global indexes and fan-out tail latency (sections 5-8).
+
+> [!tip] Remember
+> Hash into many fixed logical shards and map them to databases; a move is then a map change, not a rehash.
 
 ## 1. Why it exists
 
@@ -68,7 +113,11 @@ flowchart TD
 
 ## 2. Mental model
 
-Partitioning is a filing cabinet with one drawer per month: the same office, but you only open the drawer you need, and throwing away last year means emptying one drawer. Sharding is several offices, each with its own cabinets, plus a receptionist with a directory who tells you which office holds customer X. The **shard key** is the label every file is sorted by. Choose it badly and one office is overwhelmed while the others sit idle.
+Partitioning is a filing cabinet with one drawer per month: the same office, but you only open the drawer you need, and throwing away last year means emptying one drawer.
+
+Sharding is several offices, each with its own cabinets, plus a receptionist with a directory who tells you which office holds customer X. The **shard key** is the label every file is sorted by.
+
+Choose it badly and one office is overwhelmed while the others sit idle.
 
 | Technique | What it solves | InvoiceOps example |
 | --- | --- | --- |
@@ -350,7 +399,9 @@ Joins and transactions inside a workspace stay on one shard. What does not fit, 
 
 ### Whiteboard version
 
-The bare idea: key, then a fixed logical shard, then a database from a map. A request for workspace 42 hashes to logical shard 906 (of 1,024, fixed forever) and the map says shard 906 lives on db-3. Moving shard 906 to a new database is one map update; the hash is never recomputed with a different modulus. The runnable whiteboard code is the `dbFor` function in [[Partitioning and Sharding - Go]].
+The bare idea: key, then a fixed logical shard, then a database from a map. A request for workspace 42 hashes to logical shard 906 (of 1,024, fixed forever) and the map says shard 906 lives on db-3.
+
+Moving shard 906 to a new database is one map update; the hash is never recomputed with a different modulus. The runnable whiteboard code is the `dbFor` function in [[Partitioning and Sharding - Go]].
 
 ### Routing and the versioned map, traced
 
@@ -603,3 +654,8 @@ sequenceDiagram
 - **Before this:** [[Replication]], [[Indexing Fundamentals]], [[Query Plans and EXPLAIN]]
 - **Next:** [[Consistent Hashing]], [[Hot Keys and Hot Partitions]], [[Distributed SQL]]
 - **Compare with:** [[Wide-Column Stores and Cassandra]] (partitioning built into the data model), [[Unique ID Generation]] (IDs without a central sequence), [[Two-Phase Commit]] and [[Saga Pattern]] (work that spans shards)
+
+### Watch on YouTube
+
+- [Database Sharding vs Partitioning (Explained)](https://www.youtube.com/watch?v=KWyVn0aC3kc) · Brendan Metcalfe · clarifies the partitioning-vs-sharding distinction the note opens with
+- [How Billion-User Apps Actually Work: Database Sharding & Partitioning Explained](https://www.youtube.com/watch?v=Ra0amcm2s-w) · ThatNotesGuy · scale-driven walkthrough of sharding keys and hot-partition pitfalls

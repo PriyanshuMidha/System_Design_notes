@@ -10,7 +10,7 @@ sources:
   - "Go blog, New unique package (2024): interned values are reclaimed once no handle refers to them"
   - "Go standard library docs: log/slog Logger and Handler, database/sql and database/sql/driver, net/http Request.Clone and Header.Clone, crypto/tls Config.Clone, slices.Clone and maps.Clone (shallow), go/ast Walk and Inspect, text/template, regexp/syntax, io/fs WalkDir, sync.Pool"
   - "cel-go and expr-lang/expr project docs"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Rare GoF Patterns in Go
@@ -23,6 +23,47 @@ updated: 2026-11-02
 > - Bridge = two independent hierarchies joined by a field; Prototype = copy then fix shared slices/maps; Flyweight = share the immutable part.
 > - Visitor = a type switch in Go; Interpreter = parse to a tree of nodes, each with `Eval`; Mediator = colleagues talk only to a hub.
 > - Classic mistake: reaching for the full pattern when a function value or a `switch` does the job.
+
+## Start here: the basics
+
+**The problem in one story.**
+A 1994 book (the "Gang of Four", GoF) named 23 design patterns, written for C++ and Smalltalk.
+Some of them were workarounds for features those languages lacked.
+In an interview you are asked "implement Visitor in Go". The good answer shows the small Go way first, then when the full pattern still helps.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Design pattern | A named, reusable shape of code for a common problem | Observer, Factory |
+| Closure | A function value that remembers its surroundings | `func(x int) int { return x + n }` |
+| Type switch | Branch on the concrete type inside an interface | `switch v := n.(type) { case Num: ... }` |
+| Implicit interface | A type satisfies an interface just by having the methods | No `implements` keyword in Go |
+| Shallow copy | Copying a struct but sharing its slices and maps | Two copies editing one `[]string` |
+| Immutable | Never changed after creation, so safe to share | A glyph's shape in a font |
+| AST | A tree of nodes built from parsed text | `1 + 2` -> `Add(Num 1, Num 2)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Q["GoF pattern<br/>asked in interview"] --> G["Go-native answer<br/>(func, switch, copy)"]
+    G -->|"enough"| D["Done: small code"]
+    G -->|"many types x many ops,<br/>or shared state"| F["Full pattern<br/>still wins"]
+```
+
+**Analogy.** Old car manuals explain how to use a hand crank to start the engine; a modern car has a key, so you only need the crank story for vintage cars.
+Where it breaks: unlike the crank, some of these patterns (Interpreter, Mediator) are still the best tool in Go for the right problem.
+
+**How the rest of this note builds up**
+
+- First, why these patterns still come up (section 1) and the mental model (section 2).
+- Then each pattern in Go: Bridge, Prototype, Flyweight, Visitor, Interpreter, Mediator (section 3).
+- Then a combined worked example (section 4) and a side-by-side table (section 5).
+- Finally the SDE-3 depth: trade-offs, production examples, the deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> In Go, try a function or a switch first; reach for the full GoF shape only when it clearly pays.
 
 ## 1. Why it exists
 
@@ -835,3 +876,8 @@ Why each is rare in Go backends:
 - **Next:** [[Concurrency for LLD]], [[Testing LLD Code]]
 - **Compare with:** [[Command, Undo and Memento]] (Memento in full), [[Facade (vs Mediator)]], [[Observer and Event Bus]], [[Composite]] (the trees that visitors and interpreters walk), [[Iterator and range-over-func]] (`fs.WalkDir` and callbacks)
 - **Practice:** [[File Search (Unix find)]]
+
+### Watch on YouTube
+
+- [Software Design Patterns (GoF): explained without jargon + real-world examples](https://www.youtube.com/watch?v=FyYLZ1xygNw) · C# straight to the point · 7 min · 739 views
+- [All 23 GoF Design Patterns Explained with Real C# Code (.NET 8 eCommerce API)](https://www.youtube.com/watch?v=jKh1qg21tUQ) · Real World Devs · 45 min · 185 views

@@ -8,7 +8,7 @@ sources:
   - "Kubernetes docs, Deployments (rollout history and rollout undo)"
   - "AWS docs, Amazon ECS deployment circuit breaker"
   - "Google SRE Book, Release Engineering and Managing Incidents"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Rollback and Safe Migrations
@@ -23,6 +23,50 @@ updated: 2026-11-07
 > - Automate the trigger (error-rate and latency alarms, SLO burn rate) — a human watching a dashboard is slower than the alarm that pages them.
 > - A rollback is itself a deploy. It needs the same health checks, canary and monitoring as a forward deploy, or it just trades one bad version for a different kind of surprise.
 
+## Start here: the basics
+
+**The problem in one story.**
+You ship version 2 of your app on Friday evening.
+Ten minutes later, checkout errors jump from 0.1% to 8%.
+You want to go back to version 1 *now*, but version 2 already changed the database table.
+Rolling back code is easy; rolling back data is the hard part this note is about.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Deploy | Putting a new version of code into production | Shipping `v2` of the API |
+| Rollback | Going back to the previous known-good version | Redeploying `v1` image |
+| Roll forward | Fixing the bug with a new version instead of going back | Shipping `v2.1` with the fix |
+| Schema migration | A change to database structure | `ALTER TABLE users ADD COLUMN email` |
+| Backward compatible | Old code still works with the new thing | `v1` ignores a new nullable column |
+| Canary | Sending a small slice of traffic to the new version first | 5% of users get `v2` |
+| Feature flag | A switch to turn behaviour on/off without deploying | `new_checkout=false` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D["Deploy v2"] --> W{"Metrics<br/>healthy?"}
+    W -- "yes" --> K["Keep v2"]
+    W -- "no, code only" --> R["Roll back to v1"]
+    W -- "no, data changed" --> F["Roll forward<br/>with a fix"]
+```
+
+**Analogy.** Undo in a text editor works for typing, but not after you have emailed the document to 1,000 people.
+Code is the typing; data written by the new version is the sent email.
+Where it breaks: with careful design (expand/contract migrations) you *can* make the "email" readable by both old and new versions, which an editor has no equivalent for.
+
+**How the rest of this note builds up**
+
+- First, why rollback is harder than it looks (section 1) and the mental model of what is reversible (section 2).
+- Then roll back vs roll forward, what does and does not roll back, and mechanisms per layer (section 3).
+- Then a worked example with automatic canary-based rollback (section 4).
+- Finally the SDE-3 deep dive: expand/contract migrations, trade-offs, and production failure modes.
+
+> [!tip] Remember
+> Code can always go back; data usually cannot, so make every schema change safe for both versions.
+
 ## 1. Why it exists
 
 A team ships a new pricing-calculation path to production at 2 p.m. By 2:05 p.m., the error-rate dashboard for that service jumps from 0.1% to 9%. Checkout requests are failing.
@@ -32,15 +76,29 @@ The on-call engineer has two choices:
 1. **Diagnose live**, under pressure, with checkout broken for every user, for as long as it takes to find and fix the bug.
 2. **Roll back**: redeploy the previous version, which was serving traffic cleanly five minutes ago, and diagnose the bug offline with no user impact.
 
-Rollback exists because (2) is almost always faster and safer than (1). The previous version is not a guess — it is the exact artifact that was passing health checks and serving real traffic a few minutes earlier. Reverting to it takes the time of a deploy, typically under a minute with a pre-built image and an orchestrator that already knows how to roll a Deployment back. Finding and fixing a live bug under incident pressure routinely takes 10–60 minutes, during which users keep failing.
+Rollback exists because (2) is almost always faster and safer than (1). The previous version is not a guess — it is the exact artifact that was passing health checks and serving real traffic a few minutes earlier.
 
-The catch: rollback only returns *code* to its old version instantly. If the bad deploy also changed something that doesn't roll back with it — a database column it dropped, an event schema a downstream consumer already started reading, a payment it already captured — the rollback does not undo that. This note is about designing deploys so the rollback path is actually safe to take.
+Reverting to it takes the time of a deploy, typically under a minute with a pre-built image and an orchestrator that already knows how to roll a Deployment back.
+
+Finding and fixing a live bug under incident pressure routinely takes 10–60 minutes, during which users keep failing.
+
+The catch: rollback only returns *code* to its old version instantly.
+
+If the bad deploy also changed something that doesn't roll back with it — a database column it dropped, an event schema a downstream consumer already started reading, a payment it already captured — the rollback does not undo that.
+
+This note is about designing deploys so the rollback path is actually safe to take.
 
 ## 2. Mental model
 
-Think of a release as **two independent axes that must stay compatible with each other**: the **code** axis (which version of the binary is running) and the **data/contract** axis (the schema, event format, and config that code reads). A rollback moves the code axis backward in seconds. The data axis usually can't move backward at all — you don't un-capture a payment or un-drop a column.
+Think of a release as **two independent axes that must stay compatible with each other**: the **code** axis (which version of the binary is running) and the **data/contract** axis (the schema, event format, and config that code reads).
 
-So the rule is: **never let the data axis require a specific code version**. Change the data axis in small, reversible-feeling steps (expand, then migrate, then contract) so that at every instant, both the old code and the new code can read and write it correctly. Then a rollback of the code axis is always safe, because the data axis never moved out from under it.
+A rollback moves the code axis backward in seconds. The data axis usually can't move backward at all — you don't un-capture a payment or un-drop a column.
+
+So the rule is: **never let the data axis require a specific code version**.
+
+Change the data axis in small, reversible-feeling steps (expand, then migrate, then contract) so that at every instant, both the old code and the new code can read and write it correctly.
+
+Then a rollback of the code axis is always safe, because the data axis never moved out from under it.
 
 ## 3. How it works
 
@@ -228,9 +286,15 @@ flowchart LR
     D1 --> D2 --> D3
 ```
 
-At every point up to the start of deploy 3, a rollback to the *previous* deploy's code is safe: the column that code expects still exists and is still kept correct. Only deploy 3 (dropping the column) is irreversible — which is exactly why it is the last step, done only once deploy 2 has run in production long enough to prove nothing still reads the old column. See [[Zero-Downtime Schema Migrations]] for the database-side mechanics of the backfill (batch size, lock avoidance, replication lag) and [[Schema Migrations in Go Services]] for how the migration tool and the dual-write code are structured in a Go service.
+At every point up to the start of deploy 3, a rollback to the *previous* deploy's code is safe: the column that code expects still exists and is still kept correct.
 
-The same shape applies to **event schemas**: add a new field as optional, have producers start sending it while consumers still work without it, wait for all consumers to read it, only then make it required or remove the old field. An event consumed by a service you don't control (a partner's webhook) may never let you remove the old field at all — you carry it forever or version the event type.
+Only deploy 3 (dropping the column) is irreversible — which is exactly why it is the last step, done only once deploy 2 has run in production long enough to prove nothing still reads the old column.
+
+See [[Zero-Downtime Schema Migrations]] for the database-side mechanics of the backfill (batch size, lock avoidance, replication lag) and [[Schema Migrations in Go Services]] for how the migration tool and the dual-write code are structured in a Go service.
+
+The same shape applies to **event schemas**: add a new field as optional, have producers start sending it while consumers still work without it, wait for all consumers to read it, only then make it required or remove the old field.
+
+An event consumed by a service you don't control (a partner's webhook) may never let you remove the old field at all — you carry it forever or version the event type.
 
 ## 5. Variants and comparison
 
@@ -307,3 +371,8 @@ The same shape applies to **event schemas**: add a new field as optional, have p
 - **Before this:** [[Deployment Strategies - Rolling, Blue-Green, Canary]]
 - **Next:** [[Kubernetes Fundamentals]], [[Autoscaling]]
 - **Compare with:** [[Feature Flags]] (deploy vs. release, the fastest rollback path), [[Schema Migrations in Go Services]] (the migration code itself), [[Zero-Downtime Schema Migrations]] (the database-side mechanics this note's expand/contract relies on)
+
+### Watch on YouTube
+
+- [The safe way to run zero-downtime database migrations](https://www.youtube.com/watch?v=l_jjjgwNRI0) · programmerCave · 8 min · 219 views
+- [Flyway Tutorial: Database Schema Migrations in a Live MySQL Project / Safe Deployment #BVRK](https://www.youtube.com/watch?v=XRgB2XhSpNk) · BVRK Tech Tutorial · 12 min · 13 views

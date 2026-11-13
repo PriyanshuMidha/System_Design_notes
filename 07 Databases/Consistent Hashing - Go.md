@@ -12,13 +12,22 @@ sources:
   - "Mirrokni, Thorup & Zadimoghaddam, Consistent Hashing with Bounded Loads (Google, 2016)"
   - "Eisenbud et al., Maglev: A Fast and Reliable Software Network Load Balancer (NSDI 2016)"
   - "Redis Cluster specification (hash slots)"
-updated: 2026-11-01
+updated: 2026-11-13
 ---
 
 # Consistent Hashing - Go
 
 > [!summary] TL;DR
 > A hash ring with virtual nodes in about 80 lines of Go: `Add`, `Remove`, `Get` and `GetN`, plus tests that prove the two promises of [[Consistent Hashing]]: keys only move to a joining node, and only about `1/N` of them.
+
+## Before the code
+
+- **Sorted slices plus `slices.BinarySearch`**: the ring is a sorted `[]uint64` and lookup is a binary search for the first point at or after the key.
+- **Maps** (`map[uint64]string`): from a point on the ring back to the physical node that owns it.
+- **`sync.RWMutex`**: many readers (lookups) can run together; writers (`Add`, `Remove`) get exclusive access.
+- **`crypto/sha256`**: a well-mixing hash so similar names like `a#1` and `a#2` land far apart.
+- **Multiple return values** (`(string, bool)`): `Get` reports "no node" with `false` instead of panicking.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module (includes the `wb/` sub-package).
 
 ## What this code shows
 
@@ -64,7 +73,13 @@ The code is small because the idea is small: two data structures (a sorted slice
 
 ### Whiteboard version
 
-**Concept.** The ring in [[Consistent Hashing#3.1 The ring is a sorted array]] is just a sorted array of numbers that is treated as a circle. A server is placed by hashing its name; a key is placed by hashing the key; the owner is the first server at or after the key's position, wrapping to the start after the last one. The alternative, `hash(key) % N`, is simpler but remaps about 80% of keys when N goes from 4 to 5. The ring costs a sort on every change and a binary search per lookup, which is cheap. The whiteboard version assumes at least one server was added, and `NewRing` initialises the map so `Add` does not write to a nil map.
+**Concept.** The ring in [[Consistent Hashing#3.1 The ring is a sorted array]] is just a sorted array of numbers that is treated as a circle.
+
+A server is placed by hashing its name; a key is placed by hashing the key; the owner is the first server at or after the key's position, wrapping to the start after the last one.
+
+The alternative, `hash(key) % N`, is simpler but remaps about 80% of keys when N goes from 4 to 5. The ring costs a sort on every change and a binary search per lookup, which is cheap.
+
+The whiteboard version assumes at least one server was added, and `NewRing` initialises the map so `Add` does not write to a nil map.
 
 ```go
 package wb
@@ -120,7 +135,11 @@ The full version adds virtual nodes, removal, collision handling, replica lookup
 
 ### Step 1: the ring type and the hash function
 
-**Concept.** Virtual nodes ([[Consistent Hashing#3.5 Virtual nodes]]) fix the uneven spread of one point per server: each physical node gets many points, so its share of the circle is the sum of many small random arcs and approaches `1/N`. The struct therefore keeps three things: how many vnodes per node, the sorted positions, and a map from position back to the physical node. A `sync.RWMutex` protects them because lookups are frequent and changes are rare. SHA-256 is slow but mixes its output well, so similar names such as `a#1` and `a#2` land far apart; cheaper hashes like CRC32 or FNV can clump them ([[Consistent Hashing#8. Deep dive]]).
+**Concept.** Virtual nodes ([[Consistent Hashing#3.5 Virtual nodes]]) fix the uneven spread of one point per server: each physical node gets many points, so its share of the circle is the sum of many small random arcs and approaches `1/N`.
+
+The struct therefore keeps three things: how many vnodes per node, the sorted positions, and a map from position back to the physical node. A `sync.RWMutex` protects them because lookups are frequent and changes are rare.
+
+SHA-256 is slow but mixes its output well, so similar names such as `a#1` and `a#2` land far apart; cheaper hashes like CRC32 or FNV can clump them ([[Consistent Hashing#8. Deep dive]]).
 
 ```go
 package ring
@@ -165,7 +184,13 @@ func position(s string) uint64 {
 
 ### Step 2: adding and removing nodes
 
-**Concept.** Adding and removing nodes is where the minimal-movement promise comes from ([[Consistent Hashing#3.3 Adding a node]], [[Consistent Hashing#3.4 Removing a node]]). A new node only inserts points; each new point takes over part of the arc of the point that was next clockwise, so keys only move to the new node. Removing a node deletes its points; the keys on its arcs automatically fall to the next point clockwise, with no explicit hand-off code. Because each node has many vnodes, those arcs go to many different survivors, which spreads the load of a failure. The alternative is rebuilding the whole ring on each change, which is simpler but loses the property that unaffected keys stay put.
+**Concept.** Adding and removing nodes is where the minimal-movement promise comes from ([[Consistent Hashing#3.3 Adding a node]], [[Consistent Hashing#3.4 Removing a node]]).
+
+A new node only inserts points; each new point takes over part of the arc of the point that was next clockwise, so keys only move to the new node.
+
+Removing a node deletes its points; the keys on its arcs automatically fall to the next point clockwise, with no explicit hand-off code. Because each node has many vnodes, those arcs go to many different survivors, which spreads the load of a failure.
+
+The alternative is rebuilding the whole ring on each change, which is simpler but loses the property that unaffected keys stay put.
 
 ```go
 func (r *Ring) Add(node string) {
@@ -226,7 +251,11 @@ Keys that used to land on `b` at 40 (positions 11 to 40) now continue clockwise 
 
 ### Step 3: lookup and replica lookup
 
-**Concept.** Lookup is the binary search in [[Consistent Hashing#3.2 Lookup is a binary search]]: find the first point at or after the key, wrapping at the end. Replication ([[Consistent Hashing#3.7 Replication uses the next distinct nodes]]) extends this by continuing clockwise and collecting nodes until it has `n` distinct physical ones. It must skip further vnodes of a node it already chose, otherwise all replicas could be on one machine. Dynamo-style stores call the result the preference list. The design returns an `ok` flag or a shorter slice rather than panicking, so callers can handle an empty ring.
+**Concept.** Lookup is the binary search in [[Consistent Hashing#3.2 Lookup is a binary search]]: find the first point at or after the key, wrapping at the end.
+
+Replication ([[Consistent Hashing#3.7 Replication uses the next distinct nodes]]) extends this by continuing clockwise and collecting nodes until it has `n` distinct physical ones. It must skip further vnodes of a node it already chose, otherwise all replicas could be on one machine.
+
+Dynamo-style stores call the result the preference list. The design returns an `ok` flag or a shorter slice rather than panicking, so callers can handle an empty ring.
 
 ```go
 // Get returns the owner of key: the first vnode clockwise from position(key).

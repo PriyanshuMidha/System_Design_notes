@@ -9,7 +9,7 @@ sources:
   - "Razorpay docs, Webhooks: validate signatures (X-Razorpay-Signature over the raw body)"
   - "Go crypto/hmac docs, Equal (constant-time comparison)"
   - "PostgreSQL 17 docs, INSERT ... ON CONFLICT"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Receiving Webhooks Idempotently
@@ -23,11 +23,62 @@ updated: 2026-11-07
 > - Acknowledge fast, process after: store the event and return `200` immediately, then apply the business effect from a worker, so a slow downstream call never causes the provider to time out and retry a delivery that actually succeeded.
 > - Classic mistake: treating "duplicate" and "invalid" the same way. A duplicate is success (ack, skip); a bad signature is a client error; your own failure to process is the only case that should make the provider retry.
 
+## Start here: the basics
+
+**The problem in one story.**
+A payment company tells your server "invoice 42 was paid" by calling your URL.
+The network hiccups, they never hear back, so they send the same message again.
+If your code emails a receipt and credits the ledger each time, the customer gets two receipts and you count the money twice.
+An idempotent webhook handler does the work once, however many copies arrive.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Webhook | A server calling *your* URL to tell you something happened | Stripe POSTs `invoice.paid` to `/webhooks/stripe` |
+| Retry | Sending the same message again after no success reply | Provider re-sends after a timeout |
+| Idempotent | Doing it twice has the same effect as doing it once | Setting status to `paid` twice |
+| Event ID | The provider's unique ID for one event | `evt_1Nq...` |
+| HMAC signature | A hash of the body made with a shared secret, proving who sent it | `Stripe-Signature: t=...,v1=...` |
+| Unique constraint | A database rule that rejects a second row with the same key | `UNIQUE (provider, event_id)` |
+| `2xx` / `4xx` / `5xx` | Success / your-request-is-bad / server-failed status codes | `200`, `400`, `500` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Provider sends event"] --> V{"Signature valid?"}
+    V -- "no" --> E["400: reject"]
+    V -- "yes" --> D{"Event ID<br/>already stored?"}
+    D -- "yes" --> A["200: duplicate, skip"]
+    D -- "no" --> S["Store event, 200"]
+    S --> W["Worker applies<br/>business effect"]
+```
+
+**Analogy.** A bank teller stamping each cheque number in a ledger: a second copy of cheque #1001 is recognized and not cashed again.
+Where it breaks: a teller handles one cheque at a time, but two webhook retries can arrive in the same millisecond, so the "seen it?" check must be atomic in the database.
+
+**How the rest of this note builds up**
+
+- First, why retries make duplicates unavoidable (section 1) and the mental model (section 2).
+- Then how it works: raw body, size cap, signature check, replay window, atomic dedupe, response codes (section 3).
+- Then a full Go worked example with tests (section 4).
+- Finally the SDE-3 deep dive: outbox hand-off, out-of-order events, trade-offs and production failures (sections 5-8).
+
+> [!tip] Remember
+> Verify the signature, record the event ID atomically, answer fast, and treat a duplicate as success.
+
 ## 1. Why it exists
 
-InvoiceOps's payment provider calls `POST /webhooks/stripe` when an invoice is paid. The network between the provider and InvoiceOps is not reliable: the provider's retry policy assumes it is not, and will re-send the same event if it does not see a `2xx` within its timeout (Stripe's default webhook timeout is seconds, not minutes), or if its own queue redelivers after a transient failure on its side.
+InvoiceOps's payment provider calls `POST /webhooks/stripe` when an invoice is paid.
 
-If the handler updates the invoice to `paid` and sends a receipt email on every delivery it receives, a retried delivery of an event InvoiceOps already processed sends a second receipt email and, worse, re-runs any side effect that was not itself idempotent (crediting a ledger twice is a real-money bug, not a cosmetic one). The handler has to tell "an event I have not seen" from "a retry of an event I have already fully handled" — and it has to do that correctly even when two retries of the same event arrive within milliseconds of each other, racing each other through the handler concurrently.
+The network between the provider and InvoiceOps is not reliable: the provider's retry policy assumes it is not, and will re-send the same event if it does not see a `2xx` within its timeout (Stripe's default webhook timeout is seconds, not minutes), or if its own queue redelivers after a transient failure on its side.
+
+If the handler updates the invoice to `paid` and sends a receipt email on every delivery it receives, a retried delivery of an event InvoiceOps already processed sends a second receipt email.
+
+Worse, it re-runs any side effect that was not itself idempotent (crediting a ledger twice is a real-money bug, not a cosmetic one).
+
+The handler has to tell "an event I have not seen" from "a retry of an event I have already fully handled" — and it has to do that correctly even when two retries of the same event arrive within milliseconds of each other, racing each other through the handler concurrently.
 
 A second, unrelated failure mode: anyone who finds the endpoint URL can `POST` a forged "invoice.paid" body to it. Without a signature check, that forged request marks a real invoice paid. The fix for both problems is the same shape of code: verify first, then deduplicate, then process once.
 
@@ -103,7 +154,13 @@ func VerifyStripeStyle(header string, body []byte, secrets [][]byte, tolerance t
 
 Checking against a **slice** of secrets, not one, is what makes secret rotation possible without downtime: during a rotation window the provider is told the new secret while the handler still accepts signatures made with the old one, until every in-flight delivery signed with the old secret has drained.
 
-Not every provider's scheme has this shape. Razorpay's `X-Razorpay-Signature` is a single hex HMAC-SHA256 over the raw body with no timestamp bound into it at all, so there is no signed freshness window to check the way Stripe's is checked above. Razorpay's own guidance leans on the `x-razorpay-event-id` header for deduplication instead of a timestamp check (see the dedupe section below); if you still want a staleness check, the payload's own `created_at` field is the only candidate, but — unlike Stripe's `t=` value — it is not itself covered by the signature, so treat it as a best-effort sanity check against badly delayed delivery, not a security control an attacker can't forge:
+Not every provider's scheme has this shape.
+
+Razorpay's `X-Razorpay-Signature` is a single hex HMAC-SHA256 over the raw body with no timestamp bound into it at all, so there is no signed freshness window to check the way Stripe's is checked above.
+
+Razorpay's own guidance leans on the `x-razorpay-event-id` header for deduplication instead of a timestamp check (see the dedupe section below).
+
+If you still want a staleness check, the payload's own `created_at` field is the only candidate, but — unlike Stripe's `t=` value — it is not itself covered by the signature, so treat it as a best-effort sanity check against badly delayed delivery, not a security control an attacker can't forge:
 
 ```go
 func VerifyRazorpayStyle(sigHex string, body []byte, secrets [][]byte) error {
@@ -138,7 +195,9 @@ if err != nil {
 }
 ```
 
-`MaxBytesReader` makes `io.ReadAll` return an error once the limit is crossed, instead of letting an unauthenticated caller push an arbitrarily large body into memory before any check has run. The cap is set once, comfortably above the provider's real payload size, and it runs before the signature check — size limiting an endpoint has to come first, because nothing past it should run at all on an oversized request.
+`MaxBytesReader` makes `io.ReadAll` return an error once the limit is crossed, instead of letting an unauthenticated caller push an arbitrarily large body into memory before any check has run.
+
+The cap is set once, comfortably above the provider's real payload size, and it runs before the signature check — size limiting an endpoint has to come first, because nothing past it should run at all on an oversized request.
 
 ### Deduplicating atomically
 
@@ -151,7 +210,11 @@ VALUES ($1, $2, $3, now())
 ON CONFLICT (provider, event_id) DO NOTHING;
 ```
 
-This is the fix for the race the older version of this note's source material had: it checked "does this event id exist?" with a `SELECT` *before* starting a transaction, so two concurrent retries of the same delivery could both pass that check before either one committed its insert, and both would go on to apply the business update. `INSERT ... ON CONFLICT DO NOTHING` makes the check and the write one atomic statement: exactly one of two concurrent inserts for the same key reports a row written (`RowsAffected() == 1`); the other reports zero, and only the caller that got a row written goes on to enqueue the business update.
+This is the fix for the race the older version of this note's source material had.
+
+It checked "does this event id exist?" with a `SELECT` *before* starting a transaction, so two concurrent retries of the same delivery could both pass that check before either one committed its insert, and both would go on to apply the business update.
+
+`INSERT ... ON CONFLICT DO NOTHING` makes the check and the write one atomic statement: exactly one of two concurrent inserts for the same key reports a row written (`RowsAffected() == 1`); the other reports zero, and only the caller that got a row written goes on to enqueue the business update.
 
 ```mermaid
 sequenceDiagram
@@ -189,17 +252,35 @@ h.jobs <- job{eventID: evt.ID, invoiceID: evt.Data.Object.InvoiceID, amount: evt
 w.WriteHeader(http.StatusOK) // ack before the status update runs
 ```
 
-Response-code policy follows directly from what each outcome means to the *provider*, not from how InvoiceOps feels about the event: `2xx` for "processed" and for "duplicate, already processed" alike (both mean "do not retry"); `4xx` for a bad signature or malformed body (retrying an unfixable request wastes both sides' time); `5xx` reserved for InvoiceOps's own failure to even store the event, which is the one case where the provider retrying is exactly the right behaviour.
+Response-code policy follows directly from what each outcome means to the *provider*, not from how InvoiceOps feels about the event:
+
+- `2xx` for "processed" and for "duplicate, already processed" alike (both mean "do not retry").
+- `4xx` for a bad signature or malformed body (retrying an unfixable request wastes both sides' time).
+- `5xx` reserved for InvoiceOps's own failure to even store the event, which is the one case where the provider retrying is exactly the right behaviour.
 
 ### Why the hand-off to the worker needs an outbox, not just a channel
 
-The `h.jobs <- job{...}` send shown above is the simplest version of "hand off to a worker," and it has a real gap: `job` only lives in process memory. If the process is killed between the `INSERT ... ON CONFLICT` commit (which already marked this event as seen) and a worker actually draining that job off the channel, the business effect — marking the invoice paid — never happens, and nothing will ever retry it: the event row says "already handled," so a provider retry of the same delivery is acknowledged and dropped as a duplicate before it reaches the business logic again. That is a real, permanent loss of a payment update, not a latency blip.
+The `h.jobs <- job{...}` send shown above is the simplest version of "hand off to a worker," and it has a real gap: `job` only lives in process memory.
 
-The fix is the same one duplicate inserts already lean on: make the hand-off part of the same durable write instead of a separate in-memory step. An **outbox** table (see [[Transactional Outbox and CDC]]) holds the row `(event_id, invoice_id, target_status, amount, dispatched_at)`, written in the *same* transaction as the `INSERT ... ON CONFLICT` into `webhook_events`; a separate relay — a goroutine in this same process, or a standalone poller — claims undispatched rows with the identical `FOR UPDATE SKIP LOCKED` pattern used for scheduled jobs (see [[Scheduled Jobs]]) and only marks a row dispatched after the downstream effect (the invoice update, an email send, a WebSocket push) has actually been applied or durably queued. A process crash now loses nothing: the outbox row is still sitting there, undispatched, waiting for any replica's relay to pick it up on its next pass. An in-memory channel is an acceptable simplification for a demo or a single-instance service where "the handler process and the worker are the same process and never crash between insert and dispatch" is an assumption you have actually decided to accept — it is not a substitute for an outbox in anything that has to not lose a payment update.
+If the process is killed between the `INSERT ... ON CONFLICT` commit (which already marked this event as seen) and a worker actually draining that job off the channel, the business effect — marking the invoice paid — never happens, and nothing will ever retry it.
+
+The event row says "already handled," so a provider retry of the same delivery is acknowledged and dropped as a duplicate before it reaches the business logic again. That is a real, permanent loss of a payment update, not a latency blip.
+
+The fix is the same one duplicate inserts already lean on: make the hand-off part of the same durable write instead of a separate in-memory step.
+
+An **outbox** table (see [[Transactional Outbox and CDC]]) holds the row `(event_id, invoice_id, target_status, amount, dispatched_at)`, written in the *same* transaction as the `INSERT ... ON CONFLICT` into `webhook_events`.
+
+A separate relay — a goroutine in this same process, or a standalone poller — claims undispatched rows with the identical `FOR UPDATE SKIP LOCKED` pattern used for scheduled jobs (see [[Scheduled Jobs]]) and only marks a row dispatched after the downstream effect (the invoice update, an email send, a WebSocket push) has actually been applied or durably queued.
+
+A process crash now loses nothing: the outbox row is still sitting there, undispatched, waiting for any replica's relay to pick it up on its next pass.
+
+An in-memory channel is an acceptable simplification for a demo or a single-instance service where "the handler process and the worker are the same process and never crash between insert and dispatch" is an assumption you have actually decided to accept — it is not a substitute for an outbox in anything that has to not lose a payment update.
 
 ### Out-of-order events
 
-At-least-once, unordered delivery means a late "payment.pending" can arrive *after* "payment.paid" already landed, if the pending notification was merely delayed in transit rather than actually happening later. Applying every event's status verbatim would let that late arrival un-pay a paid invoice. The fix is a transition guard, not a timestamp comparison (timestamps from different events can themselves arrive out of the order they were generated):
+At-least-once, unordered delivery means a late "payment.pending" can arrive *after* "payment.paid" already landed, if the pending notification was merely delayed in transit rather than actually happening later.
+
+Applying every event's status verbatim would let that late arrival un-pay a paid invoice. The fix is a transition guard, not a timestamp comparison (timestamps from different events can themselves arrive out of the order they were generated):
 
 ```go
 var allowedFrom = map[InvoiceStatus]map[InvoiceStatus]bool{
@@ -461,3 +542,8 @@ All of the above pass, including a full concurrent-delivery test (`TestHandler_C
 - **Before this:** [[Webhooks - Sending and Receiving]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[File Uploads and Object Storage]], [[Observability in Go Services]]
 - **Compare with:** [[Scheduled Jobs]] (the reconciliation job that backstops missed webhooks), [[Background Workers and Job Queues]] (where the slow phase actually runs), [[Transactional Outbox and CDC]] (the crash-safe hand-off from fast phase to slow phase), [[Secure Coding for Go Services]]
+
+### Watch on YouTube
+
+- [Implementing Signature Verification for Webhooks (GitHub HMAC verification)](https://www.youtube.com/watch?v=I2ZYUulreI4) · Hookdeck · walkthrough of HMAC signature verification for inbound webhooks
+- [Handling Webhook Requests - Advanced Integration](https://www.youtube.com/watch?v=reTc0t0rnTo) · Prismatic · covers idempotency/dedup handling alongside signature checks

@@ -9,13 +9,15 @@ sources:
   - "Go 1.24 release notes, runtime: maps (Swiss Tables)"
   - "Go std lib docs, package slices, package maps (go.dev/pkg/slices, go.dev/pkg/maps)"
   - "Go std lib docs, encoding/json (nil vs empty slice/map marshaling)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Arrays, Slices and Maps (with internals)
 
 > [!summary] TL;DR
-> This note covers the Go-specific API and semantics of arrays, slices and maps — `make` vs `new`, `nil` vs empty, the `slices` and `maps` standard-library packages, and the parts of map behaviour the language spec itself guarantees. The data-structure mechanics (the slice header and its growth, and hash-table internals) live in [[Arrays and Dynamic Arrays (Go Slices)]] and [[Hash Tables and Go Maps]] — read those first if the words "slice header" or "load factor" aren't already familiar.
+> This note covers the Go-specific API and semantics of arrays, slices and maps — `make` vs `new`, `nil` vs empty, the `slices` and `maps` standard-library packages, and the parts of map behaviour the language spec itself guarantees.
+>
+> The data-structure mechanics (the slice header and its growth, and hash-table internals) live in [[Arrays and Dynamic Arrays (Go Slices)]] and [[Hash Tables and Go Maps]] — read those first if the words "slice header" or "load factor" aren't already familiar.
 
 > [!abstract] Core idea
 > - `make` allocates a usable slice, map or channel; `new` just zeros memory and almost never shows up in real slice/map code.
@@ -23,6 +25,50 @@ updated: 2026-11-07
 > - The `slices` and `maps` standard-library packages (Go 1.21+) replace most hand-written loops over containers: `Sort`, `BinarySearch`, `Insert`, `Compact`, `Clone`, `Equal`, `DeleteFunc`.
 > - Go's map spec guarantees: comma-ok tells "absent" from "present, zero value"; `range` order over a map is deliberately randomized, not merely unspecified; deleting the current key mid-`range` is safe; map values aren't addressable; writing to a `nil` map panics, reading one does not; concurrent writes crash the process outright.
 > - A map only ever grows. `clear(m)` empties it without releasing that growth, which is exactly what a map you plan to refill wants.
+
+## Start here: the basics
+
+**The problem in one story.**
+You keep a shopping list on a notepad with room for 10 items.
+On item 11 you buy a bigger notepad and copy everything over.
+A Go slice works the same way: it is a view onto a fixed-size array, and when it runs out of room Go quietly copies it into a bigger one.
+A map is your phone's contact list: you look up by name, not by position.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Array | Fixed-size row of values; the size is part of its type | `[3]int{1, 2, 3}` |
+| Slice | A window onto an array: pointer, length, capacity | `s := []int{1, 2}` |
+| Length (`len`) | How many elements the slice shows right now | `len(s) == 2` |
+| Capacity (`cap`) | How many fit before Go must allocate a bigger array | `make([]int, 0, 8)` has cap 8 |
+| Map | Key-to-value lookup table | `m["alice"] = 30` |
+| Zero value | The value a variable has before you set it | `0`, `""`, `nil` |
+| `nil` | "No storage allocated yet" for slices and maps | `var s []int` is `nil` |
+| Allocation | Asking the runtime for fresh memory | `make([]int, 100)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Slice header<br/>ptr, len=2, cap=4"] --> A["Backing array<br/>[a, b, _, _]"]
+    S2["Another slice<br/>s[0:1]"] --> A
+    S -- "append past cap" --> B["New, bigger array<br/>(copied over)"]
+    M["Map m"] --> H["Hash table<br/>key → value"]
+```
+
+**Analogy.** A slice is a bookmark range over a shelf of books: two bookmarks can cover the same shelf, so moving a book changes what both see.
+Where it breaks: when the shelf is full, `append` moves to a new shelf, and an old bookmark keeps pointing at the old one.
+
+**How the rest of this note builds up**
+
+- First, why containers need care in Go (section 1) and a mental model of header vs backing storage (section 2).
+- Then the API: `make` vs `new`, nil vs empty slices, `copy`, the `slices` and `maps` packages, and map rules (section 3).
+- Then a worked example with tests (section 4) and comparisons with other containers (sections 5-6).
+- Finally the SDE-3 deep dive: map growth that never shrinks, concurrent-write crashes, and production habits (sections 7-8).
+
+> [!tip] Remember
+> A slice is a small header pointing at a shared array; a map is a hash table that only grows; `nil` means "no storage yet".
 
 ## 1. Why it exists
 
@@ -45,11 +91,17 @@ var counts map[string]int
 counts["paid"]++ // bug: "assignment to entry in nil map" — counts was never make()'d
 ```
 
-Both bugs come from the same root cause: Go's zero value for a slice or map (`nil`) is deliberately usable for *reading* (`len`, `range`, a map lookup) but not always for *writing* — a nil slice can be appended to (append allocates a backing array on first use), but a nil map panics the instant you try to write through it. Knowing exactly which operations are safe on a zero-value container, and where Go's own API quietly tells `nil` apart from "empty", is what this note covers.
+Both bugs come from the same root cause: Go's zero value for a slice or map (`nil`) is deliberately usable for *reading* (`len`, `range`, a map lookup) but not always for *writing*.
+
+A nil slice can be appended to (append allocates a backing array on first use), but a nil map panics the instant you try to write through it.
+
+Knowing exactly which operations are safe on a zero-value container, and where Go's own API quietly tells `nil` apart from "empty", is what this note covers.
 
 ## 2. Mental model
 
-Treat `nil` for a slice or map as "I haven't allocated storage yet," not as "this variable is broken." Reading from it behaves exactly like reading from an allocated-but-empty one. Writing is where the two containers diverge: `append` on a nil slice silently allocates on demand (the slice header starts as `{nil, 0, 0}` and `append` treats `cap == 0` as "time to allocate," same as any other out-of-room append); indexing into a nil map to *write* has nothing to allocate into and panics instead of guessing.
+Treat `nil` for a slice or map as "I haven't allocated storage yet," not as "this variable is broken." Reading from it behaves exactly like reading from an allocated-but-empty one.
+
+Writing is where the two containers diverge: `append` on a nil slice silently allocates on demand (the slice header starts as `{nil, 0, 0}` and `append` treats `cap == 0` as "time to allocate," same as any other out-of-room append); indexing into a nil map to *write* has nothing to allocate into and panics instead of guessing.
 
 The `slices` and `maps` packages are the standard library admitting that most code written against a slice or map was re-deriving the same ten operations by hand (sort, search, dedupe, clone, equality-check) — they are thin, generic, well-tested wrappers, not a different way of thinking about the containers.
 
@@ -71,7 +123,11 @@ flowchart LR
     callMake["make([]int, 0, 4)"] --> makeT --> slc["[]int, len 0, cap 4,<br/>backing array allocated"]
 ```
 
-`new(T)` allocates zeroed storage for one `T` and returns `*T` — for `T = []int`, that's a pointer to a `nil` slice, rarely what anyone wants. `make` is the allocator that actually knows how to build a usable slice (optionally with a length and capacity), map (optionally with a capacity hint), or channel (optionally buffered); it returns the container itself, not a pointer to it. In practice, `new` shows up for scalar types and structs (`new(bytes.Buffer)`), essentially never for slices, maps or channels — those three always go through `make` or a composite literal.
+`new(T)` allocates zeroed storage for one `T` and returns `*T` — for `T = []int`, that's a pointer to a `nil` slice, rarely what anyone wants.
+
+`make` is the allocator that actually knows how to build a usable slice (optionally with a length and capacity), map (optionally with a capacity hint), or channel (optionally buffered); it returns the container itself, not a pointer to it.
+
+In practice, `new` shows up for scalar types and structs (`new(bytes.Buffer)`), essentially never for slices, maps or channels — those three always go through `make` or a composite literal.
 
 ```go
 var s []int               // nil slice: len 0, cap 0 — zero value, no allocation yet
@@ -105,7 +161,9 @@ flowchart LR
 {"nil":null,"empty":[]}
 ```
 
-If `omitempty` is added to the tag, **both** forms are dropped from the output — `omitempty` treats a zero-length slice (nil or not) as "empty" and omits the field entirely, which is a separate decision from the nil-vs-`[]` one above. Pick deliberately: `omitempty` to drop an empty list from the payload, a plain tag with a non-nil default (`[]T{}`) to always send `[]` instead of risking `null`.
+If `omitempty` is added to the tag, **both** forms are dropped from the output — `omitempty` treats a zero-length slice (nil or not) as "empty" and omits the field entirely, which is a separate decision from the nil-vs-`[]` one above.
+
+Pick deliberately: `omitempty` to drop an empty list from the payload, a plain tag with a non-nil default (`[]T{}`) to always send `[]` instead of risking `null`.
 
 ### copy and slices.Clone
 
@@ -114,7 +172,9 @@ dst := make([]int, 2)
 n := copy(dst, []int{1, 2, 3}) // n == 2: copy() moves min(len(dst), len(src)) elements, never grows dst
 ```
 
-`copy` is the bounded, no-surprise-reallocation primitive: it never allocates and never grows `dst`, which is exactly why it is the right tool for copying into a pre-sized buffer. To get an independent copy of a whole slice without pre-sizing anything yourself, `slices.Clone` (Go 1.21+) is `make` + `copy` in one call — and the one to reach for instead of a bare re-slice when you need to stop aliasing a big backing array (see the "aliasing-leak trap" in [[Arrays and Dynamic Arrays (Go Slices)]]).
+`copy` is the bounded, no-surprise-reallocation primitive: it never allocates and never grows `dst`, which is exactly why it is the right tool for copying into a pre-sized buffer.
+
+To get an independent copy of a whole slice without pre-sizing anything yourself, `slices.Clone` (Go 1.21+) is `make` + `copy` in one call — and the one to reach for instead of a bare re-slice when you need to stop aliasing a big backing array (see the "aliasing-leak trap" in [[Arrays and Dynamic Arrays (Go Slices)]]).
 
 ### The `slices` package: Sort, BinarySearch, Insert, Compact
 
@@ -128,7 +188,13 @@ idx, found := slices.BinarySearch(sorted, target) // requires sorted input; idx 
 sorted = slices.Insert(sorted, idx, v)            // shifts everything at/after idx right by one
 ```
 
-`slices.Compact` only removes **adjacent** duplicates — it assumes the input is sorted (or that equal elements are already next to each other); running it on unsorted data silently leaves non-adjacent duplicates in place. `slices.Delete(s, i, j)` removes elements `[i:j)` and explicitly zeroes the vacated tail slots it shifted away from — not just an optimisation detail, but the reason `slices.Delete` is the safe choice over a hand-rolled `append(s[:i], s[j:]...)` when the element type holds pointers or interfaces: zeroing lets the garbage collector reclaim whatever those tail elements pointed to, instead of the old values lingering, unreachable from the live slice but still referenced in the backing array (the GC scans backing arrays by length actually used in some paths, but relying on that rather than on an explicit zeroing is the fragile choice).
+`slices.Compact` only removes **adjacent** duplicates — it assumes the input is sorted (or that equal elements are already next to each other); running it on unsorted data silently leaves non-adjacent duplicates in place.
+
+`slices.Delete(s, i, j)` removes elements `[i:j)` and explicitly zeroes the vacated tail slots it shifted away from — not just an optimisation detail.
+
+It is the reason `slices.Delete` is the safe choice over a hand-rolled `append(s[:i], s[j:]...)` when the element type holds pointers or interfaces.
+
+Zeroing lets the garbage collector reclaim whatever those tail elements pointed to, instead of the old values lingering, unreachable from the live slice but still referenced in the backing array (the GC scans backing arrays by length actually used in some paths, but relying on that rather than on an explicit zeroing is the fragile choice).
 
 ### Maps: comma-ok, capacity hints, delete during range
 
@@ -141,9 +207,15 @@ for _, s := range statuses {
 value, present := m[key] // comma-ok: tells "absent" apart from "present with the zero value"
 ```
 
-A bare `m[key]` read is enough when you only need the value (a missing key already gives you the zero value for free); comma-ok exists for the cases where "missing" and "present but zero" must be told apart — a counter that needs to distinguish "never seen" from "seen zero times isn't actually possible for a counter, but a boolean flag defaulting to false is a real example," or a cache that must tell "not cached" from "cached a false/0/empty-string result."
+A bare `m[key]` read is enough when you only need the value (a missing key already gives you the zero value for free); comma-ok exists for the cases where "missing" and "present but zero" must be told apart.
 
-**`for k, v := range m` visits entries in a randomized order, on purpose.** The Go spec leaves map iteration order unspecified, and the runtime goes further than just "unspecified": it deliberately starts each `range` at a random bucket/group and a random offset within it, specifically so code cannot come to depend on any particular order — including insertion order — surviving between runs, between map resizes, or even between two `range` statements over the same map value in the same program. Code that needs a stable order must sort the keys explicitly (`slices.Sort` over `maps.Keys(m)` collected into a slice) rather than relying on `range`.
+A counter that needs to distinguish "never seen" from "seen zero times isn't actually possible for a counter, but a boolean flag defaulting to false is a real example," or a cache that must tell "not cached" from "cached a false/0/empty-string result."
+
+**`for k, v := range m` visits entries in a randomized order, on purpose.** The Go spec leaves map iteration order unspecified, and the runtime goes further than just "unspecified": it deliberately starts each `range` at a random bucket/group and a random offset within it, specifically so code cannot come to depend on any particular order.
+
+Including insertion order — surviving between runs, between map resizes, or even between two `range` statements over the same map value in the same program.
+
+Code that needs a stable order must sort the keys explicitly (`slices.Sort` over `maps.Keys(m)` collected into a slice) rather than relying on `range`.
 
 ```mermaid
 flowchart TD
@@ -153,7 +225,9 @@ flowchart TD
     Next --> R
 ```
 
-The Go spec explicitly permits deleting the entry for the **current** key during a `range` over that same map — it is well-defined and safe, unlike mutating a slice's length while ranging over it. Adding a new key during the same range is the one thing the spec leaves unspecified: the new key may or may not be produced by later iterations.
+The Go spec explicitly permits deleting the entry for the **current** key during a `range` over that same map — it is well-defined and safe, unlike mutating a slice's length while ranging over it.
+
+Adding a new key during the same range is the one thing the spec leaves unspecified: the new key may or may not be produced by later iterations.
 
 ### Sets: `map[T]struct{}`
 
@@ -192,7 +266,11 @@ These (Go 1.21+) replace the hand-written loops every codebase used to carry for
 clear(m) // removes every entry; keeps the map's already-grown backing storage
 ```
 
-A Go map's backing storage only ever grows to accommodate more entries — deleting entries (even all of them) does not return that memory to the allocator. `clear(m)` (Go 1.21+) is the fast path for "empty this map and keep using it": it drops every entry in roughly one pass without walking through `delete` one key at a time, and it deliberately keeps the map's existing capacity rather than discarding it, which is exactly right for a map a request handler plans to refill on the next call. If the map grew to an unusually large size for one unusual request and genuinely needs to shrink, the only way is to replace it: `m = make(map[K]V, normalSize)`, letting the old one be garbage collected.
+A Go map's backing storage only ever grows to accommodate more entries — deleting entries (even all of them) does not return that memory to the allocator.
+
+`clear(m)` (Go 1.21+) is the fast path for "empty this map and keep using it": it drops every entry in roughly one pass without walking through `delete` one key at a time, and it deliberately keeps the map's existing capacity rather than discarding it, which is exactly right for a map a request handler plans to refill on the next call.
+
+If the map grew to an unusually large size for one unusual request and genuinely needs to shrink, the only way is to replace it: `m = make(map[K]V, normalSize)`, letting the old one be garbage collected.
 
 ### Concurrent writes, map value addressability (spec guarantees, not internals)
 
@@ -201,7 +279,9 @@ These two rules are guaranteed by the language, not accidents of the current imp
 - **Concurrent map writes crash the process.** A write racing another write (or a write racing a read) on the same map triggers `fatal error: concurrent map writes` — a hard runtime crash, not a `panic`, and `recover()` cannot catch it.
 - **Map values aren't addressable.** `m["k"].Field = x` for a struct-valued map does not compile (`cannot assign to struct field m["k"].Field`); read the value out, mutate the copy, write it back — or store `map[K]*V` instead.
 
-**Measured** (Go 1.24.4, darwin/arm64, four goroutines writing the same map 100,000 times each, no `-race` flag so the runtime's own check — not the race detector — is what fires). As with any crash across concurrent goroutines, the specific goroutine number varies run to run (observed values included 18 and 34); only the error text and the general shape of the trace are representative:
+**Measured** (Go 1.24.4, darwin/arm64, four goroutines writing the same map 100,000 times each, no `-race` flag so the runtime's own check — not the race detector — is what fires).
+
+As with any crash across concurrent goroutines, the specific goroutine number varies run to run (observed values included 18 and 34); only the error text and the general shape of the trace are representative:
 
 ```text
 fatal error: concurrent map writes
@@ -335,7 +415,9 @@ func TestResetAndReuseEmptiesWithoutReallocating(t *testing.T) {
 }
 ```
 
-**Measured** (Go 1.24.4, darwin/arm64, `go vet ./...` then `go test ./... -race`): all four tests above pass — the nil-map panic, the nil-vs-empty JSON round trip, delete-during-range, and `clear` leaving the map writable. The concurrent-write crash is a process-level `fatal error`, not an assertion `go test` can make (the process exits before any test could report a result), so it was checked separately by building and running the small helper program shown above.
+**Measured** (Go 1.24.4, darwin/arm64, `go vet ./...` then `go test ./... -race`): all four tests above pass — the nil-map panic, the nil-vs-empty JSON round trip, delete-during-range, and `clear` leaving the map writable.
+
+The concurrent-write crash is a process-level `fatal error`, not an assertion `go test` can make (the process exits before any test could report a result), so it was checked separately by building and running the small helper program shown above.
 
 ## 5. Variants and comparison
 
@@ -367,18 +449,32 @@ func TestResetAndReuseEmptiesWithoutReallocating(t *testing.T) {
 
 ## 8. Deep dive
 
-- **Why `make`'s capacity hint matters for maps, not just slices.** `make(map[K]V, n)` tells the runtime roughly how many entries to expect, letting it size the initial Swiss Table groups close to their final count instead of growing (and rehashing) through several intermediate sizes as entries are added one at a time — the same amortised-cost argument as slice growth, applied to maps. See [[Hash Tables and Go Maps]] for the Swiss Table layout this hint is sizing.
-- **Why reading a nil map is safe but writing isn't.** A lookup on a nil map has a well-defined answer (the zero value, `ok == false`) without needing any storage at all — there's nothing to find, so nothing to allocate. A write has no such out: there is no backing storage to write into, and Go chose to panic loudly rather than silently allocate on first write (which `append` does do for slices) — partly because a map write that must allocate is a heavier, less predictable operation than a slice append, and partly for symmetry with "an uninitialized map is a programmer error to write to."
-- **`omitempty` vs the nil/empty JSON difference are two separate levers.** `omitempty` decides whether the field appears in the output *at all* (any zero-length slice/map, nil or not, is treated as empty and dropped); the plain-tag nil-vs-`[]` behaviour decides what gets written *when the field does appear*. Getting both right for an API contract means choosing deliberately, not assuming one implies the other.
+- **Why `make`'s capacity hint matters for maps, not just slices.** `make(map[K]V, n)` tells the runtime roughly how many entries to expect, letting it size the initial Swiss Table groups close to their final count instead of growing (and rehashing) through several intermediate sizes as entries are added one at a time.
+
+  The same amortised-cost argument as slice growth, applied to maps.
+
+  See [[Hash Tables and Go Maps]] for the Swiss Table layout this hint is sizing.
+- **Why reading a nil map is safe but writing isn't.** A lookup on a nil map has a well-defined answer (the zero value, `ok == false`) without needing any storage at all — there's nothing to find, so nothing to allocate.
+
+  A write has no such out: there is no backing storage to write into, and Go chose to panic loudly rather than silently allocate on first write (which `append` does do for slices).
+
+  Partly because a map write that must allocate is a heavier, less predictable operation than a slice append, and partly for symmetry with "an uninitialized map is a programmer error to write to."
+- **`omitempty` vs the nil/empty JSON difference are two separate levers.** `omitempty` decides whether the field appears in the output *at all* (any zero-length slice/map, nil or not, is treated as empty and dropped); the plain-tag nil-vs-`[]` behaviour decides what gets written *when the field does appear*.
+
+  Getting both right for an API contract means choosing deliberately, not assuming one implies the other.
 - **`DeleteFunc` and `Compact` share a pattern:** both `slices.DeleteFunc`/`slices.Compact` and `maps.DeleteFunc` walk their container once, moving or skipping entries in place, and return/leave a shortened result — the same "compact in place" strategy the runtime itself uses internally when deleting map entries, rather than the allocate-a-new-container-and-copy strategy `slices.Insert` sometimes needs.
 
 ## 9. Interview questions
 
 > [!question]- What's the actual difference between `make([]int, 0, 4)` and `new([]int)`?
-> `make` returns a usable, non-nil slice with length 0 and capacity 4 — a backing array is already allocated. `new([]int)` returns a `*[]int` pointing at a zeroed slice header, which is `nil` — you'd have to dereference it and then still `make` or append to get anything usable. In practice `new` is essentially never used for slices, maps or channels.
+> `make` returns a usable, non-nil slice with length 0 and capacity 4 — a backing array is already allocated. `new([]int)` returns a `*[]int` pointing at a zeroed slice header, which is `nil` — you'd have to dereference it and then still `make` or append to get anything usable.
+>
+> In practice `new` is essentially never used for slices, maps or channels.
 
 > [!question]- Trap: is a `nil` slice different from an empty slice in Go?
-> Not in ordinary Go code — `len()`, `range`, and `append` all behave identically on both. The one place they differ is `encoding/json`: a `nil` slice marshals to `null`, a non-nil empty slice marshals to `[]`. An API that needs to guarantee `[]` for "no items" must construct a non-nil empty slice deliberately, not rely on a `nil` one happening to look the same in Go.
+> Not in ordinary Go code — `len()`, `range`, and `append` all behave identically on both. The one place they differ is `encoding/json`: a `nil` slice marshals to `null`, a non-nil empty slice marshals to `[]`.
+>
+> An API that needs to guarantee `[]` for "no items" must construct a non-nil empty slice deliberately, not rely on a `nil` one happening to look the same in Go.
 
 > [!question]- Why does writing to a `nil` map panic, but reading from one doesn't?
 > Reading has a well-defined, zero-cost answer without any storage (the zero value, with `ok == false` from comma-ok) — there's nothing to allocate. Writing has no backing storage to write into at all, and Go panics explicitly (`assignment to entry in nil map`) rather than silently allocating on first write, unlike a slice's `append`, which does allocate for you.
@@ -387,10 +483,14 @@ func TestResetAndReuseEmptiesWithoutReallocating(t *testing.T) {
 > Yes, for the entry at the **current** key — the Go spec explicitly permits it, and the deleted key is simply skipped if iteration would otherwise have reached it. Adding a new key during the same range is different: whether it appears in later iterations is unspecified, so don't rely on it.
 
 > [!question]- Why does `map[T]struct{}` beat `map[T]bool` for a set?
-> `struct{}` has zero size, so the map only stores keys — no per-entry value byte at all. `map[T]bool` works identically for membership testing (`if v, ok := m[k]; ok` still works, as does the simpler `if m[k]`), but it wastes a byte per entry and, worse, lets a bug set a key's value to `false` while the key is still present, which reads as "member, but false" instead of "not a member" if checked with a bare `if m[k]` instead of comma-ok.
+> `struct{}` has zero size, so the map only stores keys — no per-entry value byte at all.
+>
+> `map[T]bool` works identically for membership testing (`if v, ok := m[k]; ok` still works, as does the simpler `if m[k]`), but it wastes a byte per entry and, worse, lets a bug set a key's value to `false` while the key is still present, which reads as "member, but false" instead of "not a member" if checked with a bare `if m[k]` instead of comma-ok.
 
 > [!question]- What happens to a map's memory after you `delete` every entry from it, or call `clear(m)`?
-> Nothing shrinks. A Go map's backing storage only grows; deleting entries (one at a time or via `clear`) frees the entries but keeps the map's already-allocated capacity, so the map is ready to be refilled without regrowing. If a map genuinely needs to release that memory — because of one unusually large spike — the only way is to replace it with a freshly `make`'d map and let the old one be garbage collected.
+> Nothing shrinks. A Go map's backing storage only grows; deleting entries (one at a time or via `clear`) frees the entries but keeps the map's already-allocated capacity, so the map is ready to be refilled without regrowing.
+>
+> If a map genuinely needs to release that memory — because of one unusually large spike — the only way is to replace it with a freshly `make`'d map and let the old one be garbage collected.
 
 ## 10. Cheat sheet
 
@@ -408,3 +508,8 @@ func TestResetAndReuseEmptiesWithoutReallocating(t *testing.T) {
 - **Before this:** [[Syntax, Types and Control Flow]], [[Arrays and Dynamic Arrays (Go Slices)]], [[Hash Tables and Go Maps]]
 - **Next:** [[Functions, Closures, Defer, Panic and Recover]], [[Generics and Iterators]]
 - **Compare with:** [[sync Primitives and Atomics]] (making a shared map safe for concurrent writers), [[Pointers, Values and Escape Analysis]] (whether `make`'s backing storage lands on the stack or the heap)
+
+### Watch on YouTube
+
+- [8. Go Programming Language : Slices & Slice Internals](https://www.youtube.com/watch?v=5K4ezviqYaU) · Kishore · covers slice header, growth and internals
+- [Internals of Maps in Golang](https://www.youtube.com/watch?v=ACQs6mdylxo) · Sreekanth · deep dive on Go map hash table internals

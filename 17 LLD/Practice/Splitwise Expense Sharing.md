@@ -9,13 +9,17 @@ sources:
   - "Go 1.21 release notes: min builtin, maps and slices packages"
   - "ISO 4217: minor units per currency (JPY 0, INR 2, KWD 3)"
   - "PostgreSQL 17 docs: foreign keys, UNIQUE constraints, UPDATE"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Splitwise Expense Sharing
 
 > [!summary] TL;DR
-> Keep money as `int64` paise, make each split type a **Strategy** (equal, exact, percent) picked by a **Factory**, and keep **one net balance per user per group**: payers go up, participants go down, and the nets always sum to zero. An expense stores its computed payer and share maps, so delete applies the same deltas negated. Simplify debts greedily: the biggest debtor pays the biggest creditor until everyone is at zero, in at most n−1 transfers.
+> Keep money as `int64` paise, make each split type a **Strategy** (equal, exact, percent) picked by a **Factory**, and keep **one net balance per user per group**: payers go up, participants go down, and the nets always sum to zero.
+> 
+> An expense stores its computed payer and share maps, so delete applies the same deltas negated.
+> 
+> Simplify debts greedily: the biggest debtor pays the biggest creditor until everyone is at zero, in at most n−1 transfers.
 
 > [!abstract] Core idea
 > - Money is `int64` paise, never `float64` rupees.
@@ -23,6 +27,48 @@ updated: 2026-11-02
 > - Keep one net balance per user per group: payers go up, participants go down, and all nets sum to zero.
 > - Delete applies the expense's stored deltas with a minus sign; simplify pays the biggest debtor to the biggest creditor until everyone is at zero.
 > - Classic mistake: re-running the split to delete (rules or rounding may have changed), or using floats so a paisa disappears.
+
+## Start here: the basics
+
+**The problem in one story.** Four friends go on a trip.
+One pays for the hotel, another for dinner, a third for the taxi, and not everyone shares every bill.
+At the end they want to know who owes whom, with as few payments as possible, and no paisa lost to rounding.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Paise | 1/100 of a rupee, kept as a whole number | Rs 10.01 = 1001 paise |
+| `int64` vs `float64` | Whole numbers are exact; floats can round | 0.1 + 0.2 is not exactly 0.3 as a float |
+| Split | How one bill is divided among people | Equal, exact amounts, or percentages |
+| Net balance | What the group owes you minus what you owe the group | +300 means others owe you Rs 3 |
+| Strategy | One interface, many swappable implementations | `EqualSplit`, `ExactSplit`, `PercentSplit` |
+| Factory | A function that picks the right implementation by name | `"percent"` → `PercentSplit` |
+| Invariant | A fact that must always stay true | All nets in a group add up to zero |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    E[Expense: A paid 900 for A, B, C] --> S[Split strategy: 300 each]
+    S --> N1[A net +600]
+    S --> N2[B net -300]
+    S --> N3[C net -300]
+    N1 & N2 & N3 --> G[Simplify: B pays A 300, C pays A 300]
+```
+
+**Analogy.** It is like a shared notebook where each person has one running score: paying for others raises your score, being paid for lowers it.
+It breaks down because a notebook can be erased and rewritten freely, while here a deleted expense must be undone with the exact numbers it first wrote.
+
+**How the rest of this note builds up**
+
+- First the problem statement and requirements (Steps 1-2): groups, expenses, split types and settle-up.
+- Then entities, relationships and APIs (Steps 3-5): one net per user per group instead of a debt graph.
+- Then storage and patterns (Steps 6-7): stored share maps, Strategy plus Factory.
+- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): leftover paise, exact delete, greedy simplify, idempotency and multi-currency.
+
+> [!tip] Remember
+> Integer paise, shares that sum exactly to the total, and nets that always sum to zero.
 
 ## Problem statement
 
@@ -43,7 +89,11 @@ support deleting an expense.
 6. Code greedy `SimplifyDebts`.
 7. Test rounding, validation, delete as exact undo and simplify.
 
-It tests a clean Strategy for split types, strict validation, and **exact money math with no lost paise**. It also tests the balance model (one net per user per group), reversibility (delete is an exact undo) and a small greedy algorithm. Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
+It tests a clean Strategy for split types, strict validation, and **exact money math with no lost paise**.
+
+It also tests the balance model (one net per user per group), reversibility (delete is an exact undo) and a small greedy algorithm.
+
+Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
 ## Step 1: Clarify requirements
 
@@ -81,7 +131,9 @@ The hardest use case: `AddExpense` (normalise payers, pick the strategy, split e
 | `Rounding` | `func(total, users, weights)` | Who gets the leftover paise: sorted order or largest remainder |
 | `Transfer` | `From`, `To`, `Amount` | Output of simplify, or a recorded settlement |
 
-Two modeling insights. First, **store one net per user per group, not a pairwise debt graph**: "A owes B" edges are derived by simplify, add and delete cost O(payers + participants), and the invariant is easy (nets sum to zero). Second, **an expense stores its computed maps**: delete reverses those exact numbers and never re-runs the strategy, whose rounding could change between versions.
+Two modeling insights. First, **store one net per user per group, not a pairwise debt graph**: "A owes B" edges are derived by simplify, add and delete cost O(payers + participants), and the invariant is easy (nets sum to zero).
+
+Second, **an expense stores its computed maps**: delete reverses those exact numbers and never re-runs the strategy, whose rounding could change between versions.
 
 ## Step 4: Relationships
 
@@ -282,7 +334,11 @@ How it works:
 2. **Where they differ.** 101 paise at 66.67% / 33.33%: exact shares are 67.3367 and 33.6633, floors are 67 and 33, one paisa is left. Sorted order gives it to `a` (68 / 33); largest remainder gives it to `b`, whose remainder 0.6633 is larger (67 / 34). For EQUAL splits every remainder ties, so both give the same answer.
 3. **`AddExpense`** validates cheap things without the lock, normalises payers (`PaidBy` becomes `{PaidBy: total}`; `Payers` must be positive and sum to the total; setting both is an error), runs the pure strategy, then locks, checks the idempotency key and membership of every payer and participant. Nothing has changed yet, so a reject is clean.
 4. **`applyDeltas(+1)`**: each payer's net goes up by what they paid, each participant's down by their share. Both maps sum to the total, so nets still sum to zero. Delete calls it with −1 on the stored maps.
-5. **`CreateGroup` refuses an existing ID.** Assigning `s.groups[groupID]` unconditionally would let a second create with the same ID replace the group and silently wipe every balance in it. It returns `ErrGroupExists` instead, matching the primary key in SQL. The idempotency key is scoped the same way as in SQL: `(group, RequestID)`, so a reused key in another group never returns the wrong group's expense.
+5. **`CreateGroup` refuses an existing ID.** Assigning `s.groups[groupID]` unconditionally would let a second create with the same ID replace the group and silently wipe every balance in it.
+
+   It returns `ErrGroupExists` instead, matching the primary key in SQL.
+
+   The idempotency key is scoped the same way as in SQL: `(group, RequestID)`, so a reused key in another group never returns the wrong group's expense.
 6. **`SimplifyDebts`** copies the nets (no lock held while computing), matches the biggest creditor with the biggest debtor (ties by user ID), moves `min(credit, debt)`, and repeats. Each step zeroes at least one person, so there are at most n−1 transfers.
 
 ```go
@@ -709,7 +765,11 @@ func copyExpense(e *Expense) Expense {
 | Taxi 2 | c | 50% a, 50% d | −1 | | +2 | −1 |
 | **Net** | | | **+8** | **+1** | **−3** | **−6** |
 
-Before simplifying there are 7 raw debts (b→a 3, c→a 3, d→a 3, c→b 2, d→b 2, a→c 1, d→c 1). Greedy: d (−6) pays a (+8) 6, leaving a +2; c (−3) pays a 2, leaving c −1; c pays b 1. Three transfers: d→a 6, c→a 2, c→b 1. Deleting the taxi gives a +9, b +1, c −5, d −5.
+Before simplifying there are 7 raw debts (b→a 3, c→a 3, d→a 3, c→b 2, d→b 2, a→c 1, d→c 1).
+
+Greedy: d (−6) pays a (+8) 6, leaving a +2; c (−3) pays a 2, leaving c −1; c pays b 1.
+
+Three transfers: d→a 6, c→a 2, c→b 1. Deleting the taxi gives a +9, b +1, c −5, d −5.
 
 ```mermaid
 flowchart LR
@@ -975,7 +1035,13 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 **Multi-currency groups.** Two designs, and the interview answer is to name both:
 
 - **Balances per currency** (`net[currency][user]`). Every expense keeps its own currency, simplify and settle run per currency, and nobody argues about exchange rates. The cost: a user can owe ₹500 and be owed $10 at once.
-- **Convert into the group's base currency when the expense is added.** Store the original amount, currency and the rate used on the expense. Use integer math with a scaled rate, for example base minor units per foreign minor unit × 10^6 with half-up rounding: `base = (amount × rateMicros + 500_000) / 1_000_000`, after checking the product cannot overflow int64. Convert the **total once** and then split it, so shares still sum exactly; delete reverses the stored converted maps, never re-converts at today's rate. Currencies have different minor units (ISO 4217: JPY has 0 decimals, INR 2, KWD 3), so store amounts in each currency's own minor unit.
+- **Convert into the group's base currency when the expense is added.** Store the original amount, currency and the rate used on the expense.
+
+  Use integer math with a scaled rate, for example base minor units per foreign minor unit × 10^6 with half-up rounding: `base = (amount × rateMicros + 500_000) / 1_000_000`, after checking the product cannot overflow int64.
+
+  Convert the **total once** and then split it, so shares still sum exactly; delete reverses the stored converted maps, never re-converts at today's rate.
+
+  Currencies have different minor units (ISO 4217: JPY has 0 decimals, INR 2, KWD 3), so store amounts in each currency's own minor unit.
 
 Choices made: nets over a pairwise ledger (O(participants) updates, a simple invariant); a running balance table over recomputing (fast reads, expense rows remain the source of truth); soft delete with exact reversal; greedy simplify (deterministic, at most n−1 transfers, not always the minimum); one mutex, then per-group locks if contention appears.
 
@@ -983,7 +1049,9 @@ Choices made: nets over a pairwise ledger (O(participants) updates, a simple inv
 
 ![[Splitwise LLD Drawing.excalidraw]]
 
-The drawing shows the entities (Group, User, Expense, Share, `SplitStrategy` with three implementations, Transfer), the `AddExpense` flow with red reject branches (bad split, user not in group) and delete as negated deltas, the worked example (7 raw debts become 3 transfers), and the tables with their keys. Redraw from memory: the strategy and factory, where each validation error comes from, the nets for the three-expense example, and why delete reverses stored shares instead of re-splitting.
+The drawing shows the entities (Group, User, Expense, Share, `SplitStrategy` with three implementations, Transfer), the `AddExpense` flow with red reject branches (bad split, user not in group) and delete as negated deltas, the worked example (7 raw debts become 3 transfers), and the tables with their keys.
+
+Redraw from memory: the strategy and factory, where each validation error comes from, the nets for the three-expense example, and why delete reverses stored shares instead of re-splitting.
 
 ## Interview questions
 
@@ -1026,3 +1094,8 @@ I keep money as int64 paise and make splitting a Strategy: equal, exact and perc
 - **Before this:** [[Strategy and Template Method]], [[Factory and Abstract Factory]], [[Movie Ticket Booking]]
 - **Next:** [[Food Ordering System]], [[Digital Wallet and Ledger]] (double-entry money movement)
 - **Compare with:** [[Case Study - Payment System]] (settling real money), [[Command, Undo and Memento]] (reversible operations)
+
+### Watch on YouTube
+
+- [Splitwise LLD: UML + Code (FREE) / Build Expense Sharing App Step-by-Step! low level design / #easy](https://www.youtube.com/watch?v=syH7axOpqhA) · Mrunmai Dahare · 31 min · 12,936 views
+- [Splitwise lld / Hindi /Expense Sharing System LLD Explained with SOLID #lld](https://www.youtube.com/watch?v=SRIjfCuExxg) · Khauf se coder - System Design Interviews · 60 min · 285 views

@@ -11,13 +11,17 @@ sources:
   - "Redis documentation, High availability with Redis Sentinel and Redis Cluster specification"
   - "golang.org/x/sync/singleflight package documentation"
   - "oliver006/redis_exporter metric names (redis_up, redis_keyspace_hits_total, redis_evicted_keys_total)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Cache Outage and Stampede
 
 > [!summary] TL;DR
-> When a cache dies, fills up, or loses its keys, every request falls through to the database, which was never sized for that load, and a fast cache problem becomes a slow database outage. The playbook is: confirm the hit ratio collapsed, check what changed, protect the database first (shed load, collapse duplicate loads, rate limit), then restore the cache and warm it back slowly. A stampede is the same failure caused by one hot key or many keys expiring at once.
+> When a cache dies, fills up, or loses its keys, every request falls through to the database, which was never sized for that load, and a fast cache problem becomes a slow database outage.
+>
+> The playbook is: confirm the hit ratio collapsed, check what changed, protect the database first (shed load, collapse duplicate loads, rate limit), then restore the cache and warm it back slowly.
+>
+> A stampede is the same failure caused by one hot key or many keys expiring at once.
 
 > [!abstract] Core idea
 > - **A cache hides database load.** If 95 percent of reads hit the cache, the database sees only 5 percent. A drop to 0 percent hit ratio multiplies database read load by 20 in seconds.
@@ -39,9 +43,64 @@ flowchart LR
     Y --> Z["Retries add more load<br/>cascading failure"]
 ```
 
+## Start here: the basics
+
+**The problem in one story**
+
+An online shop shows product pages. Most pages come from a fast memory store.
+One morning that store restarts and forgets everything.
+Now every page request goes to the slow main database at once.
+The database chokes, pages time out, and users hit refresh, which makes it worse.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Cache | A fast store that keeps copies of popular data | Redis holding `product:42` |
+| Hit / miss | Hit: data found in cache. Miss: not found, go to the database | 95 hits out of 100 reads |
+| Hit ratio | Share of reads served by the cache | 0.95 means 95 percent hits |
+| TTL | Time to live: how long a cached copy is kept before it expires | `SET k v EX 300` keeps it 5 minutes |
+| Eviction | Cache deletes keys to make room when memory is full | Redis `allkeys-lru` drops old keys |
+| Stampede | Many requests miss the same key at once and all query the database | A hot key expires at noon |
+| Connection pool | A fixed set of open database connections the app shares | Pool of 50, all busy means waiting |
+| Load shedding | Rejecting some requests on purpose to save the system | Return 503 for low-priority calls |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Users"] --> A["App"]
+    A --> C{"In cache?"}
+    C -->|"yes, fast"| R["Reply"]
+    C -->|"no"| D["Database, slow"]
+    D --> R
+    X["Cache empty or down"] -.-> C
+```
+
+**Analogy**
+
+A shop counter keeps popular items within reach, and a warehouse sits down a long corridor. If the counter is cleared, every customer walks to the warehouse and the corridor jams.
+
+Where it breaks: real customers do not automatically retry, but software clients do, so the jam grows faster than in a shop.
+
+**How the rest of this note builds up**
+
+- First, **Why it exists** and **Mental model** explain why a cache hides database load.
+- Then **How it works** covers the three shapes: outage, eviction, stampede.
+- Next, **First 5 minutes**, **Diagnosis flowchart** and **Investigation steps** are the on-call playbook.
+- Then **Fixes** and the **Worked example** show request collapsing, TTL jitter and stale serving.
+- Finally, the SDE-3 **Deep dive** and **Interview questions** cover why stampedes feed themselves.
+
+> [!tip] Remember
+> When the cache fails, protect the database first, then refill the cache slowly.
+
 ## 1. Why it exists
 
-Imagine a shop with a front counter that keeps the 100 most asked-for items within arm's reach, and a warehouse behind a long corridor. Almost every customer is served at the counter. If the counter is suddenly cleared (or the counter staff are gone), every customer walks to the warehouse, the corridor jams, and even the customers who need rare items can no longer be served. The analogy breaks down because in software the jam also causes retries, which are more customers lining up.
+Imagine a shop with a front counter that keeps the 100 most asked-for items within arm's reach, and a warehouse behind a long corridor. Almost every customer is served at the counter.
+
+If the counter is suddenly cleared (or the counter staff are gone), every customer walks to the warehouse, the corridor jams, and even the customers who need rare items can no longer be served.
+
+The analogy breaks down because in software the jam also causes retries, which are more customers lining up.
 
 **Symptoms:**
 
@@ -120,7 +179,9 @@ sequenceDiagram
     R2->>C: "SET product:42 x 499 wasted"
 ```
 
-**Example with numbers:** a product page query takes 40 ms normally. At 800 requests per second on one hot key, a miss window of 40 ms lets about 32 requests miss before the first one refills the cache. If the query slows to 2 s under load, the window is 2 s and about 1,600 requests miss. The slower the database, the longer the window, the more misses: a **positive feedback loop**.
+**Example with numbers:** a product page query takes 40 ms normally. At 800 requests per second on one hot key, a miss window of 40 ms lets about 32 requests miss before the first one refills the cache.
+
+If the query slows to 2 s under load, the window is 2 s and about 1,600 requests miss. The slower the database, the longer the window, the more misses: a **positive feedback loop**.
 
 ### The avalanche
 
@@ -138,7 +199,9 @@ flowchart LR
 
 ### Eviction when memory is full
 
-When used memory reaches `maxmemory`, Redis applies the `maxmemory-policy`. With `noeviction`, writes fail with `OOM command not allowed`. With `allkeys-lru` or `allkeys-lfu`, Redis deletes keys to make room, which lowers the hit ratio, and `evicted_keys` climbs. With `volatile-*` policies, only keys that have a TTL are candidates, so if keys have no TTL, nothing can be evicted and writes fail. See [[Cache Eviction Policies - LRU, LFU, TTL]].
+When used memory reaches `maxmemory`, Redis applies the `maxmemory-policy`. With `noeviction`, writes fail with `OOM command not allowed`. With `allkeys-lru` or `allkeys-lfu`, Redis deletes keys to make room, which lowers the hit ratio, and `evicted_keys` climbs.
+
+With `volatile-*` policies, only keys that have a TTL are candidates, so if keys have no TTL, nothing can be evicted and writes fail. See [[Cache Eviction Policies - LRU, LFU, TTL]].
 
 ### Failover pauses
 
@@ -400,7 +463,11 @@ func (l *Loader) Get(ctx context.Context, key string) (string, error) {
 }
 ```
 
-How it works: 1) check the cache. 2) On a miss, `group.Do(key, ...)` runs the function once per key even if 100 goroutines call it at the same time. 3) The others block and share the result, so the database sees one query instead of 100. 4) The TTL has up to 60 seconds of random jitter so related keys do not expire together. Write a test with 100 concurrent goroutines and a slow fake loader to check that exactly one load runs, and run it with `go test -race`. Note this collapses requests inside one process only. With 50 pods, the database still sees up to 50 loads per hot key, which is usually fine; a distributed lock (for example `SET lock:key token NX PX 5000`) can reduce it further at the cost of complexity.
+How it works: 1) check the cache. 2) On a miss, `group.Do(key, ...)` runs the function once per key even if 100 goroutines call it at the same time. 3) The others block and share the result, so the database sees one query instead of 100. 4) The TTL has up to 60 seconds of random jitter so related keys do not expire together.
+
+Write a test with 100 concurrent goroutines and a slow fake loader to check that exactly one load runs, and run it with `go test -race`. Note this collapses requests inside one process only.
+
+With 50 pods, the database still sees up to 50 loads per hot key, which is usually fine; a distributed lock (for example `SET lock:key token NX PX 5000`) can reduce it further at the cost of complexity.
 
 ### Warm-up after recovery
 
@@ -483,7 +550,9 @@ flowchart TD
 | Fail open (go to DB on cache error) | Availability | Database may be overwhelmed |
 | Fail closed (error when cache down) | Protects database | Users see errors |
 
-**When this playbook is not the right tool:** if the cache is behaving as designed and the database is slow for an unrelated reason, use [[Playbook - Database Overload and Connection Exhaustion]]. If Redis is used as a primary datastore or queue rather than a cache, an outage means data loss, which needs a different recovery plan (see [[Redis Persistence - RDB and AOF]]).
+**When this playbook is not the right tool:** if the cache is behaving as designed and the database is slow for an unrelated reason, use [[Playbook - Database Overload and Connection Exhaustion]].
+
+If Redis is used as a primary datastore or queue rather than a cache, an outage means data loss, which needs a different recovery plan (see [[Redis Persistence - RDB and AOF]]).
 
 ## 7. In production
 
@@ -496,13 +565,17 @@ flowchart TD
 
 ## 8. Deep dive
 
-**Why stampedes are self-reinforcing.** A miss triggers a slow query. The slow query keeps the key missing for longer. More requests miss in that longer window, adding more load, which makes the query slower. This feedback loop explains why a mild trigger can tip a system over a cliff. Request collapsing breaks the loop by capping concurrent loads per key at one.
+**Why stampedes are self-reinforcing.** A miss triggers a slow query. The slow query keeps the key missing for longer. More requests miss in that longer window, adding more load, which makes the query slower.
+
+This feedback loop explains why a mild trigger can tip a system over a cliff. Request collapsing breaks the loop by capping concurrent loads per key at one.
 
 **Probabilistic early expiration.** Instead of waiting for expiry, each reader may refresh early with probability that rises as the key nears expiry, weighted by how long the load takes (the "XFetch" idea from a 2015 VLDB paper on optimal probabilistic cache stampede prevention). The refresh happens before the cliff, spreading load without locks.
 
 **Stale-while-revalidate.** Store a soft TTL and a hard TTL. After the soft TTL, return the old value immediately and refresh in the background. Users never wait on a miss, and the database sees one refresh. The trade-off is bounded staleness, which you must accept per data type.
 
-**Why a fork can look like an outage.** Redis saves snapshots by forking. On a large dataset, the fork itself can pause the main thread for milliseconds to hundreds of milliseconds, and copy-on-write during the save can raise memory use by up to the write rate times the save duration. If the container limit has no headroom, the kernel OOM killer takes Redis, which is exactly the worked example.
+**Why a fork can look like an outage.** Redis saves snapshots by forking. On a large dataset, the fork itself can pause the main thread for milliseconds to hundreds of milliseconds, and copy-on-write during the save can raise memory use by up to the write rate times the save duration.
+
+If the container limit has no headroom, the kernel OOM killer takes Redis, which is exactly the worked example.
 
 **Fail open or fail closed.** On cache errors, falling through to the database keeps users served but risks the database. Failing closed returns errors but keeps the database alive. A hybrid, such as fall through for a small fraction of traffic using a token bucket, gives a controlled trickle that also warms the cache.
 
@@ -561,3 +634,8 @@ flowchart TD
 - **Related playbooks:** [[Playbook - Database Overload and Connection Exhaustion]], [[Playbook - High Latency]], [[Playbook - Bad Deploy and Rollback]]
 - **Resilience:** [[Circuit Breaker]], [[Load Shedding and Graceful Degradation]], [[Timeouts, Retries and Backoff]], [[Connection Pooling]]
 - **Next:** [[Postmortems and Root Cause Analysis]], [[Debugging Database Performance]]
+
+### Watch on YouTube
+
+- [Why One Cache Expiry Can Crash Your System / Cache Stampede Explained](https://www.youtube.com/watch?v=GVyOZo__F70) · Tech Is Easy Actually · 6 min · 873 views
+- [Major Caching Strategies Explained for Beginners in 5 Minutes / LRU, LFU, TTL, Cache Stampede & More](https://www.youtube.com/watch?v=Mx8tR03NVQc) · Learn with Whiteboard · 5 min · 1,155 views

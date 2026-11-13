@@ -8,7 +8,7 @@ sources:
   - "Go spec, Method sets and Address operators (go.dev/ref/spec)"
   - "Go Wiki, Compiler And Runtime Optimizations: Escape Analysis (go.dev/wiki/CompilerOptimizations)"
   - "go vet copylocks analyzer docs (golang.org/x/tools/go/analysis/passes/copylocks)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Pointers, Values and Escape Analysis
@@ -22,6 +22,50 @@ updated: 2026-11-07
 > - A value's address can only "escape" to the heap if the compiler cannot prove it stays inside the current function's stack frame — returning it, closing over it, or boxing it into an interface are the common ways that happens.
 > - Classic trap: a `T` value does not satisfy an interface whose methods have `*T` receivers, because those methods aren't in `T`'s method set at all.
 
+## Start here: the basics
+
+**The problem in one story.**
+You lend a friend a photocopy of your notes. They scribble on it, and your original stays clean.
+If you lend them the notebook itself, their scribbles show up in your copy.
+Go passes copies by default; a pointer is how you hand over "the notebook itself".
+And where that notebook is stored (a short-lived desk or a long-term shelf) is decided by the compiler.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Value | The actual data, copied when passed | `x := 5; y := x` gives `y` its own 5 |
+| Pointer | A variable holding the address of another variable | `p := &x` |
+| Dereference | Follow a pointer to the data it points at | `*p = 7` changes `x` |
+| Stack | Per-function scratch memory, freed when the function returns | Locals in a short helper |
+| Heap | Shared memory that lives until the garbage collector frees it | Data returned by pointer |
+| Escape analysis | Compiler check: "can this stay on the stack?" | `return &x` makes `x` escape |
+| Receiver | The value a method is called on | `func (u *User) Rename()` |
+| `nil` | A pointer that points at nothing | `var p *int` is `nil` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Variable x<br/>(value 5)"] -- "&x" --> P["Pointer p<br/>(address of x)"]
+    P -- "*p = 7" --> A
+    C["Compiler: does x<br/>outlive its function?"] -- "no" --> ST["Stack<br/>(free, fast)"]
+    C -- "yes" --> HP["Heap<br/>(GC must clean up)"]
+```
+
+**Analogy.** A value is a photocopy; a pointer is a house address written on a slip of paper.
+Where it breaks: you choose where to build a house, but in Go the compiler, not you, chooses stack or heap.
+
+**How the rest of this note builds up**
+
+- First, why pointers exist and a mental model of boxes and slips (sections 1-2).
+- Then `&`, `*`, pass-by-value, pointer vs value receivers, method sets and nil (section 3).
+- Then a worked example reading `-gcflags=-m` escape output, plus comparisons and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive: allocation cost in production, escape analysis limits, interview questions (sections 7-9).
+
+> [!tip] Remember
+> Go always copies; a pointer copies an address, and the compiler decides whether the data lives on the stack or the heap.
+
 ## 1. Why it exists
 
 A payment service has a function that marks an invoice paid:
@@ -34,13 +78,21 @@ func markPaid(inv Invoice) {
 
 Every call to `markPaid` copies the whole `Invoice` struct, mutates the copy, and the caller's original is untouched — the change silently vanishes. The fix is a pointer: `func markPaid(inv *Invoice)` lets the function reach back into the caller's actual struct through its address instead of a copy.
 
-The same question — copy or point at it? — comes up constantly: method receivers, function parameters, struct fields that model "this value may be absent." Each choice has a real memory cost, because a pointer that escapes a function's stack frame forces the compiler to allocate it on the heap, where the garbage collector must later scan and reclaim it. **Measured** on this note's benchmark (Go 1.24.4, darwin/arm64, Apple M4): copying a two-field, 16-byte struct by value costs 1.0 ns/op and 0 allocations; returning the same struct via a heap-escaping pointer costs 8.0 ns/op and one 16-byte allocation. Getting pointer vs. value right is not a style preference — it is a measurable allocation decision.
+The same question — copy or point at it? — comes up constantly: method receivers, function parameters, struct fields that model "this value may be absent." Each choice has a real memory cost, because a pointer that escapes a function's stack frame forces the compiler to allocate it on the heap, where the garbage collector must later scan and reclaim it.
+
+**Measured** on this note's benchmark (Go 1.24.4, darwin/arm64, Apple M4): copying a two-field, 16-byte struct by value costs 1.0 ns/op and 0 allocations; returning the same struct via a heap-escaping pointer costs 8.0 ns/op and one 16-byte allocation.
+
+Getting pointer vs. value right is not a style preference — it is a measurable allocation decision.
 
 ## 2. Mental model
 
 A variable is a **labeled box**. `&x` gives you the box's street address, written on a slip of paper (the pointer); `*p` walks to that address and opens the box. Copying a pointer copies the slip of paper, not the box — both slips now point at the same box, so writing through either one changes what's inside it.
 
-**Where a box lives is not up to you.** Every function call gets a fresh stack frame — a shelf that's torn down the instant the function returns. If you hand out a slip of paper to a box on that shelf and the function returns, the shelf is gone and the slip points at nothing. So whenever the compiler can prove a box's address might be read after the function returns, it quietly puts the box on the **heap** instead — a shared warehouse that stays around until nothing points at it any more, which the garbage collector decides by scanning for addresses still in use. You write `&x`; the compiler decides where `x` actually lives.
+**Where a box lives is not up to you.** Every function call gets a fresh stack frame — a shelf that's torn down the instant the function returns. If you hand out a slip of paper to a box on that shelf and the function returns, the shelf is gone and the slip points at nothing.
+
+So whenever the compiler can prove a box's address might be read after the function returns, it quietly puts the box on the **heap** instead — a shared warehouse that stays around until nothing points at it any more, which the garbage collector decides by scanning for addresses still in use.
+
+You write `&x`; the compiler decides where `x` actually lives.
 
 ## 3. How it works
 
@@ -60,7 +112,9 @@ p3 := &Invoice{ID: "x"}   // build + take address in one step: the idiomatic for
 
 ### Everything is pass-by-value — including pointers, slice headers and map headers
 
-A function parameter always receives a **copy** of whatever was passed: a copy of an `int`, a copy of a `*T` (the address value, not the pointee), a copy of a slice's 3-word header (pointer, length, capacity), a copy of a map's internal pointer. Reassigning the *parameter* inside the function — `inv = &Invoice{...}`, `s = append(s, x)` without returning `s` — never affects the caller's variable, because the caller's variable was never touched, only its copy was.
+A function parameter always receives a **copy** of whatever was passed: a copy of an `int`, a copy of a `*T` (the address value, not the pointee), a copy of a slice's 3-word header (pointer, length, capacity), a copy of a map's internal pointer.
+
+Reassigning the *parameter* inside the function — `inv = &Invoice{...}`, `s = append(s, x)` without returning `s` — never affects the caller's variable, because the caller's variable was never touched, only its copy was.
 
 ```mermaid
 flowchart LR
@@ -101,7 +155,9 @@ flowchart TD
 
 A type's **method set** is which methods you can call on it directly. The rule: `T`'s method set contains only the methods declared with a `T` (value) receiver. `*T`'s method set contains **both** — value-receiver and pointer-receiver methods. A pointer-receiver method is never in a plain `T`'s method set.
 
-This matters most for interface satisfaction: if `Greeter` requires `Greet()` and `Greet` is declared on `*Service`, then `*Service` satisfies `Greeter` but a bare `Service` value does not — even though you can write `svc.Greet()` directly in code, because the compiler automatically inserts `(&svc).Greet()` **when `svc` is addressable**. A map value is not addressable (`m["a"].Greet()` does not compile, because there's no stable memory location to take the address of — the map could rehash and move it), so a pointer-receiver method is unreachable on `m["a"]` even though it is on a local variable of the same type.
+This matters most for interface satisfaction: if `Greeter` requires `Greet()` and `Greet` is declared on `*Service`, then `*Service` satisfies `Greeter` but a bare `Service` value does not — even though you can write `svc.Greet()` directly in code, because the compiler automatically inserts `(&svc).Greet()` **when `svc` is addressable**.
+
+A map value is not addressable (`m["a"].Greet()` does not compile, because there's no stable memory location to take the address of — the map could rehash and move it), so a pointer-receiver method is unreachable on `m["a"]` even though it is on a local variable of the same type.
 
 ```mermaid
 flowchart LR
@@ -113,7 +169,9 @@ flowchart LR
 
 ### Nil pointers
 
-Dereferencing a nil pointer (`*p` or `p.Field`) panics with `runtime error: invalid memory address or nil pointer dereference`. But **calling a method on a nil pointer does not panic by itself** — the method only panics if its body actually dereferences the nil receiver. This makes "nil means empty" a deliberate, idiomatic pattern for recursive structures like linked lists: `(*IntList)(nil).Len()` can validly return `0` without ever dereferencing `nil`.
+Dereferencing a nil pointer (`*p` or `p.Field`) panics with `runtime error: invalid memory address or nil pointer dereference`. But **calling a method on a nil pointer does not panic by itself** — the method only panics if its body actually dereferences the nil receiver.
+
+This makes "nil means empty" a deliberate, idiomatic pattern for recursive structures like linked lists: `(*IntList)(nil).Len()` can validly return `0` without ever dereferencing `nil`.
 
 ### `&s[i]` and append reallocation
 
@@ -164,15 +222,21 @@ By contrast, `sumStaysOnStack` never lets `total`'s address leave the function, 
 
 ### Cost model: heap allocation + GC scan vs. copying small structs
 
-A stack allocation is free: the stack pointer moves and nothing more happens. A heap allocation has three costs a copy doesn't: the allocator must find free space (and may trigger a GC assist if the heap is under pressure), the object must be scanned by the garbage collector on every mark pass until it's unreachable, and the memory isn't reclaimed until the next GC cycle actually runs. Copying a small, pointer-free struct is just a `memmove` of a few bytes — almost always cheaper than a heap allocation, until the struct is large enough that the copy itself dominates.
+A stack allocation is free: the stack pointer moves and nothing more happens. A heap allocation has three costs a copy doesn't: the allocator must find free space (and may trigger a GC assist if the heap is under pressure), the object must be scanned by the garbage collector on every mark pass until it's unreachable, and the memory isn't reclaimed until the next GC cycle actually runs.
+
+Copying a small, pointer-free struct is just a `memmove` of a few bytes — almost always cheaper than a heap allocation, until the struct is large enough that the copy itself dominates.
 
 ### Copying structs that hold locks
 
-A `sync.Mutex`, once used, must never be copied: a copy starts in whatever lock state the original happened to be in, and the two copies' internal state immediately diverges from reality. `go vet`'s `copylocks` analyzer flags this — passing such a struct by value, or taking it as a value receiver, or assigning it with `:=` all count as copies. The fix is always the same: give the type a pointer receiver on every method, and pass `*T` everywhere.
+A `sync.Mutex`, once used, must never be copied: a copy starts in whatever lock state the original happened to be in, and the two copies' internal state immediately diverges from reality. `go vet`'s `copylocks` analyzer flags this — passing such a struct by value, or taking it as a value receiver, or assigning it with `:=` all count as copies.
+
+The fix is always the same: give the type a pointer receiver on every method, and pass `*T` everywhere.
 
 ### The pointer-to-interface anti-pattern
 
-An interface value is already a 2-word descriptor: a pointer to the concrete type's method table, and a pointer (or small value) to the data. Wrapping that in a pointer (`*io.Reader` instead of `io.Reader`) adds an extra indirection without adding any capability — you cannot do anything through `*io.Reader` that you couldn't do by holding the `io.Reader` value directly, and it breaks the common idiom of checking `r == nil` directly on the interface. Hold interface values directly; reserve pointers for concrete types.
+An interface value is already a 2-word descriptor: a pointer to the concrete type's method table, and a pointer (or small value) to the data. Wrapping that in a pointer (`*io.Reader` instead of `io.Reader`) adds an extra indirection without adding any capability — you cannot do anything through `*io.Reader` that you couldn't do by holding the `io.Reader` value directly, and it breaks the common idiom of checking `r == nil` directly on the interface.
+
+Hold interface values directly; reserve pointers for concrete types.
 
 ### No pointer arithmetic outside `unsafe`
 
@@ -501,3 +565,8 @@ For a 16-byte struct, the heap-allocating version is about 8× slower and costs 
 - **Before this:** [[Syntax, Types and Control Flow]], [[Structs, Methods and Embedding]], [[Process Memory Layout - Stack vs Heap]]
 - **Next:** [[Interfaces]], [[Runtime - Memory Allocator and Garbage Collector]]
 - **Compare with:** [[Arrays and Dynamic Arrays (Go Slices)]] (slice headers and `append` reallocation in full), [[Concurrency Primitives - Mutex, Semaphore, Atomics]] (why no-copy types exist)
+
+### Watch on YouTube
+
+- [Understanding Allocations: the Stack and the Heap - GopherCon SG 2019](https://www.youtube.com/watch?v=ZMZpH4yT7M0) · Singapore Gophers · conference-level deep dive on stack vs heap and escape analysis
+- [Escape Analysis in Go — Stack vs Heap & How the Compiler Decides](https://www.youtube.com/watch?v=Ff2qB4XySOk) · nihonsensei · focused explainer on how the compiler decides stack vs heap

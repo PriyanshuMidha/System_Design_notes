@@ -12,13 +12,17 @@ sources:
   - "PostgreSQL 17 docs: Appendix A, SQLSTATE 23P01 exclusion_violation"
   - "PostgreSQL 17 docs: Concurrency Control, Read Committed (UPDATE re-checks the WHERE on the newest row version)"
   - "Go 1.22 release notes: range over integers, per-iteration loop variables"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Hotel Booking
 
 > [!summary] TL;DR
-> Hotel booking is **inventory per room type per night**. A stay from the 10th to the 12th uses the nights of the 10th and the 11th; the check-out day is not a night. A guest first places a **hold** that reserves every night and **expires** after a few minutes. Payment turns the hold into a booking. "No overbooking" means checking and reserving all the nights as one atomic step. Refunds come from a swappable **cancellation policy**. In PostgreSQL the same rule is a guarded counter update per night, or an **exclusion constraint** on date ranges when you assign real rooms.
+> Hotel booking is **inventory per room type per night**. A stay from the 10th to the 12th uses the nights of the 10th and the 11th; the check-out day is not a night.
+>
+> A guest first places a **hold** that reserves every night and **expires** after a few minutes. Payment turns the hold into a booking. "No overbooking" means checking and reserving all the nights as one atomic step.
+>
+> Refunds come from a swappable **cancellation policy**. In PostgreSQL the same rule is a guarded counter update per night, or an **exclusion constraint** on date ranges when you assign real rooms.
 
 > [!abstract] Core idea
 > - The unit of inventory is (room type, night): `free = total - booked - held`.
@@ -27,6 +31,52 @@ updated: 2026-11-04
 > - Confirm is idempotent: a retried confirm returns the same booking.
 > - Refunds are a `CancellationPolicy` strategy: free until 48 hours before check-in, then the first night is kept; or non-refundable.
 > - Classic mistakes: counting the check-out day as a night, checking nights one by one with separate locks, and holds that never expire.
+
+## Start here: the basics
+
+**The problem in one story.**
+A small hotel has 2 Deluxe rooms.
+Two guests on two phones both see "1 Deluxe left for Friday" and tap Book at the same second.
+If both bookings go through, one guest arrives to find no room.
+This note designs a system where one guest wins, the other is told "sold out", and nobody's money is lost.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Room type | A kind of room with a count and a price | Deluxe: 2 rooms, 5000 per night |
+| Night | One unit of stay, named by its start date | Stay 10th to 12th uses nights 10 and 11 |
+| Half-open range `[a, b)` | Includes the start, excludes the end | `[10, 12)` = 10 and 11, not 12 |
+| Hold | A short reservation while the guest pays | Rooms kept for 10 minutes |
+| Idempotent | Doing it twice has the same effect as once | Retried confirm returns the same booking |
+| Mutex / lock | Lets only one goroutine change shared data at a time | `mu.Lock()` around the counters |
+| Strategy | A swappable piece of behaviour behind an interface | Flexible vs non-refundable refund rule |
+| Transaction | A group of DB changes that all happen or none do | Reserve 3 nights or none |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Search dates"] --> H{"Every night<br/>has a free room?"}
+    H -- "no" --> X["Sold out"]
+    H -- "yes" --> HO["Hold: reserve all nights<br/>(expires in minutes)"]
+    HO -- "pay in time" --> B["Booking"]
+    HO -- "timer runs out" --> R["Rooms go back"]
+    B -- "cancel" --> P["Refund by policy"]
+```
+
+**Analogy.** A hold is like a shop keeping an item at the counter while you fetch your wallet: it is off the shelf, but if you do not return in ten minutes it goes back.
+Where it breaks: a shop holds one item, while a hotel hold must grab every night of the stay together or none of them.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and requirements (Step 1) and the actors (Step 2): what to ask and what to assume.
+- Then the model: entities, relationships and the public API (Steps 3-5), built around per-night counters.
+- Then storage: counters per night versus specific rooms with a PostgreSQL exclusion constraint (Step 6), and the patterns used (Step 7).
+- Finally the code, tests, edge cases and the SDE-3 follow-ups on concurrency, expiry and idempotency (Step 8 onwards).
+
+> [!tip] Remember
+> A stay is a set of nights; check every night, then reserve every night, in one atomic step, and let holds expire.
 
 ## Problem statement
 
@@ -260,7 +310,11 @@ RETURNING h.room_type_id, h.check_in, h.check_out, h.rooms;
 -- locking the night rows in (room_type_id, night) order like PlaceHold does
 ```
 
-Rows for each night must exist before anyone books, so a nightly job creates them a year ahead. Under Read Committed, an `UPDATE` that waits on a locked row re-checks its `WHERE` against the newest row version, so the `total - booked - held >= $4` guard sees the other transaction's hold. The `CHECK` constraint is the last line of defence. Row locks in general are in [[Locking - Optimistic vs Pessimistic]]; transaction rules in [[Transactions and ACID]].
+Rows for each night must exist before anyone books, so a nightly job creates them a year ahead.
+
+Under Read Committed, an `UPDATE` that waits on a locked row re-checks its `WHERE` against the newest row version, so the `total - booked - held >= $4` guard sees the other transaction's hold.
+
+The `CHECK` constraint is the last line of defence. Row locks in general are in [[Locking - Optimistic vs Pessimistic]]; transaction rules in [[Transactions and ACID]].
 
 ### Model B: specific rooms with an exclusion constraint
 
@@ -975,7 +1029,9 @@ stateDiagram-v2
 ## Interview questions
 
 > [!question]- Why model inventory per night instead of per booking?
-> Two stays conflict only on the nights they share, and a stay needs room on every one of its nights. Per-night counters turn that into "free >= rooms on each night", one O(nights) check, and the invariant `booked + held <= total` can be a `CHECK` constraint. Scanning bookings for overlaps grows with the number of bookings and cannot be a simple constraint.
+> Two stays conflict only on the nights they share, and a stay needs room on every one of its nights.
+>
+> Per-night counters turn that into "free >= rooms on each night", one O(nights) check, and the invariant `booked + held <= total` can be a `CHECK` constraint. Scanning bookings for overlaps grows with the number of bookings and cannot be a simple constraint.
 
 > [!question]- Trap: a guest checks out on the 12th and another checks in on the 12th. Is that a conflict?
 > No. A stay is half-open `[checkIn, checkOut)`, so the first stay's nights are the 10th and 11th and the second starts with the 12th. Closed intervals wrongly reject back-to-back stays. PostgreSQL `daterange` is `[)` by default, so the exclusion constraint gets this right.
@@ -984,7 +1040,9 @@ stateDiagram-v2
 > It checks every night first and only then reserves every night, both under one lock. If any night is short, nothing has been touched. In SQL the guarded `UPDATE` runs in one transaction; if it updates fewer rows than there are nights, the transaction rolls back.
 
 > [!question]- How do you prevent overbooking in PostgreSQL?
-> For room types: lock the night rows in date order with `FOR UPDATE`, then `UPDATE ... SET held = held + n WHERE ... AND total - booked - held >= n`, and back it with `CHECK (booked + held <= total)`. For specific rooms: `EXCLUDE USING gist (room_id WITH =, stay WITH &&)` with `btree_gist`, which rejects an overlapping stay with SQLSTATE 23P01 even if the app has a bug.
+> For room types: lock the night rows in date order with `FOR UPDATE`, then `UPDATE ... SET held = held + n WHERE ... AND total - booked - held >= n`, and back it with `CHECK (booked + held <= total)`.
+>
+> For specific rooms: `EXCLUDE USING gist (room_id WITH =, stay WITH &&)` with `btree_gist`, which rejects an overlapping stay with SQLSTATE 23P01 even if the app has a bug.
 
 > [!question]- The payment succeeds one second after the hold expired. What happens?
 > The sweep has already returned the rooms to inventory, so `Confirm` returns `ErrHoldExpired` and the payment is refunded. You could try to re-hold the same rooms, but only through a fresh `PlaceHold` that re-checks availability; never confirm a dead hold. In SQL, `UPDATE holds ... WHERE status = 'held' AND expires_at > now()` returns 0 rows.
@@ -1015,3 +1073,8 @@ I model inventory per room type per night, with total, booked and held counters,
 - **Before this:** [[Strategy and Template Method]], [[Concurrency for LLD]], [[Movie Ticket Booking]], [[Ride Sharing]]
 - **Next:** [[Order Book Matching Engine]]
 - **Compare with:** [[Meeting Room Scheduler]] (interval overlap for one resource), [[Case Study - Ticket Booking]] (holds and inventory at system scale), [[Locking - Optimistic vs Pessimistic]] and [[Transactions and ACID]] (the database guarantees), [[Index Types and Index Design]] (GiST and range indexes)
+
+### Watch on YouTube
+
+- [✅ System Design 5: Design Hotel Booking App like AirBnb / Booking.com / Proximity / HLD / LLD](https://www.youtube.com/watch?v=mH2Ye3_vErw) · InterviewWithBunny · 64 min · 30,488 views
+- [Low Level Designing (LLD-3): Hotel Booking System / Booking.com / AirBnB / MakeMyTrip #lld #lowlevel](https://www.youtube.com/watch?v=6zZALeDMFew) · InterviewWithBunny · 21 min · 16,231 views

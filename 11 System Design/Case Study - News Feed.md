@@ -8,13 +8,15 @@ sources:
   - "Raffi Krikorian, Timelines at Scale (QCon San Francisco 2012): Twitter home timelines kept in Redis, about 800 entries per timeline, fan-out on write with a high-follower exception"
   - "Bronson et al., TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC 2013)"
   - "Redis documentation: LPUSH, LTRIM, LRANGE, MGET, list encoding (listpack and quicklist)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - News Feed
 
 > [!summary] TL;DR
-> A news feed (also called a home timeline) is the list of recent posts from the accounts a user follows, shown newest-first or ranked. The core design choice is **when** to build each user's list: when a post is written (fan-out on write, also called push), when the feed is read (fan-out on read, also called pull), or a hybrid of the two.
+> A news feed (also called a home timeline) is the list of recent posts from the accounts a user follows, shown newest-first or ranked.
+>
+> The core design choice is **when** to build each user's list: when a post is written (fan-out on write, also called push), when the feed is read (fan-out on read, also called pull), or a hybrid of the two.
 
 > [!abstract] Core idea
 > - Keep a small cached list of **post IDs** per user (about 800), not the posts themselves. Fill in post bodies at read time with one batched lookup.
@@ -22,6 +24,52 @@ updated: 2026-11-04
 > - Celebrities (authors with millions of followers) are **pulled**: their recent posts are merged in when a follower opens the feed.
 > - Paginate with a cursor (the last post ID seen), never with an offset, so new posts never shift the next page.
 > - The hard parts are the celebrity write storm, cache memory, and undoing a post (delete, block, privacy change) everywhere it was copied.
+
+## Start here: the basics
+
+**The problem in one story.**
+You follow 300 friends. You open the app and expect their newest posts in under a second.
+The app cannot ask 300 friends "anything new?" every time 500 million people open it.
+So it has to prepare each person's list somewhere, either ahead of time or very quickly on demand.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Feed / timeline | The list of recent posts from people you follow | Your Twitter home page |
+| Follower | A user who subscribed to another user's posts | You follow a friend |
+| Cache | Fast in-memory storage for data read often | Redis list of post IDs |
+| Fan-out | Copying one item to many places | One post copied to 300 feeds |
+| Push / pull | Prepare at write time / build at read time | Mail delivered vs going to the post office |
+| Celebrity | An author with millions of followers | A pop star account |
+| Cursor | A bookmark saying "continue after this item" | `?before=post_981` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Author posts"] --> W["Fan-out worker"]
+    W --> F1["Follower 1 feed list"]
+    W --> F2["Follower 2 feed list"]
+    R["Reader opens app"] --> F1
+    R --> CEL["Celebrity posts<br/>(pulled at read)"]
+    F1 --> MX["Merge and show"]
+    CEL --> MX
+```
+
+**Analogy.** Push is a newspaper delivered to every subscriber's door; pull is each reader walking to the newsstand.
+Where it breaks: no newspaper has 100 million subscribers who all need delivery in seconds, which is why celebrities are pulled instead.
+
+**How the rest of this note builds up**
+
+- First, requirements and the mental model (sections 1-2).
+- Then the high-level design: push, pull and the hybrid (section 3).
+- Then the worked example: estimates, API, data model and the merge step in Go (section 4).
+- Then variants, trade-offs and production lessons (sections 5-7).
+- Finally the SDE-3 deep dive: celebrity storms, cache memory, ranking and undoing posts everywhere (section 8).
+
+> [!tip] Remember
+> Store post IDs per user, push for normal authors, pull for celebrities, paginate with a cursor.
 
 ## 1. Why it exists - requirements
 
@@ -36,7 +84,9 @@ ORDER BY p.created_at DESC
 LIMIT 20;
 ```
 
-With 300 million daily users opening the feed 10 times a day, that is about 35,000 such queries per second on average, each touching 200 authors' recent posts spread across many database shards. The query cost grows with the number of followees, and the work is repeated on every open even though almost nothing changed. A feed system exists to do this work once, ahead of time, for most users.
+With 300 million daily users opening the feed 10 times a day, that is about 35,000 such queries per second on average, each touching 200 authors' recent posts spread across many database shards.
+
+The query cost grows with the number of followees, and the work is repeated on every open even though almost nothing changed. A feed system exists to do this work once, ahead of time, for most users.
 
 **Functional requirements**
 - Create a post (text, optional images or video).
@@ -270,7 +320,9 @@ CREATE TABLE followers_of (followee_id bigint, follower_id bigint, created_at ti
                            PRIMARY KEY (followee_id, follower_id));
 ```
 
-The feed itself is not a table. It is a Redis list per user, `feed:{user_id}`, holding post IDs newest-first and capped with `LTRIM feed:{user_id} 0 799`. If the list is lost (eviction, node failure), the feed service rebuilds it with a pull query over the user's followees, then writes it back. The cache is a derived copy, not a source of truth.
+The feed itself is not a table. It is a Redis list per user, `feed:{user_id}`, holding post IDs newest-first and capped with `LTRIM feed:{user_id} 0 799`.
+
+If the list is lost (eviction, node failure), the feed service rebuilds it with a pull query over the user's followees, then writes it back. The cache is a derived copy, not a source of truth.
 
 ### The merge step in Go
 
@@ -394,7 +446,13 @@ The second test is the reason for cursor pagination: a post that lands between t
 
 ## 8. Deep dive
 
-**Choosing the celebrity threshold.** Pushing a post costs one cache insert per follower, paid once, and the last follower sees the post only after all inserts finish. Pulling costs nothing at write time, but every feed open by every follower pays one extra lookup for that author. For most authors push is cheaper, because each follower opens the feed several times per post. Push stops being acceptable when the delay itself is too long: at a worker capacity of, say, 1 M inserts/s (an estimate), 50 M followers take 50 s for one post, and several such posts at once block everyone else's fan-out. Teams pick a threshold in the tens or hundreds of thousands of followers and tune it from fan-out lag metrics; the 100k in the diagram is an example, not a rule.
+**Choosing the celebrity threshold.** Pushing a post costs one cache insert per follower, paid once, and the last follower sees the post only after all inserts finish.
+
+Pulling costs nothing at write time, but every feed open by every follower pays one extra lookup for that author. For most authors push is cheaper, because each follower opens the feed several times per post.
+
+Push stops being acceptable when the delay itself is too long: at a worker capacity of, say, 1 M inserts/s (an estimate), 50 M followers take 50 s for one post, and several such posts at once block everyone else's fan-out.
+
+Teams pick a threshold in the tens or hundreds of thousands of followers and tune it from fan-out lag metrics; the 100k in the diagram is an example, not a rule.
 
 **Bounding read-time pulls.** A user who follows 300 celebrities would trigger 300 lookups per read. Keep a per-celebrity cache of the latest 100 post IDs (`celeb:{author_id}`), cap how many celebrities are pulled per read (for example the 50 most interacted with), and fetch them in one pipelined round trip.
 
@@ -453,3 +511,8 @@ A 45-minute script:
 - **Before this:** [[Back-of-the-Envelope Estimation]], [[System Design Interview Framework]], [[Caching Patterns]], [[Kafka and Event Streaming]], [[Unique ID Generation]]
 - **Next:** [[Case Study - Chat System]], [[Case Study - Notification System]]
 - **Compare with:** [[Pub-Sub Message Queue]] (the class-level design of a topic with many subscribers), [[Notification Service]] (LLD twin for delivery to many users), [[Materialized Views and Denormalization]] (a feed list is a per-user materialized view)
+
+### Watch on YouTube
+
+- [Design FB News Feed System Design Interview w/ ex: Meta Senior Manager](https://www.youtube.com/watch?v=Qj4-GruzyDU) · Hello Interview · 26 min · 144,605 views
+- [Designing INSTAGRAM: System Design of News Feed](https://www.youtube.com/watch?v=QmX2NPkJTKg) · Gaurav Sen · 24 min · 765,449 views

@@ -8,7 +8,7 @@ sources:
   - "OWASP API Security Top 10 2023 (API1 Broken Object Level Authorization, API5 Broken Function Level Authorization)"
   - "Google Zanzibar: Google's Consistent, Global Authorization System (OSDI 2019)"
   - "Open Policy Agent documentation, policy evaluation model"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Authentication vs Authorization
@@ -22,6 +22,50 @@ updated: 2026-11-07
 > - "Logged in" is not "allowed": every object a request touches needs its own ownership/permission check, or you get BOLA.
 > - RBAC (role → permission), ABAC (attribute rules), and ReBAC (relationship graphs, à la Google Zanzibar) are three different ways to answer the AuthZ question; pick the simplest one that fits the data shape.
 > - Where the check runs matters: coarse checks belong at the edge (gateway), object-level checks belong in the service that owns the data.
+
+## Start here: the basics
+
+**The problem in one story.**
+At an office building, the front desk checks your ID and gives you a badge.
+That proves who you are, but it does not mean you may enter every room.
+Each door still checks: "is this badge allowed in *this* room?"
+Websites need the same two steps: who are you, and are you allowed to do this?
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Credential | Something you present to prove identity | Password, passkey, API key |
+| Authentication (AuthN) | Checking who you are | Login with email + password |
+| Authorization (AuthZ) | Checking what you may do | Only the author may delete a post |
+| Principal | The identity the server works with after login | `user=u9, workspace=w3` |
+| Role | A named bundle of permissions | `admin`, `viewer` |
+| HTTP 401 | "I do not know who you are" | Missing or expired token |
+| HTTP 403 | "I know who you are, but no" | Viewer tries to delete |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request + token"] --> N{"AuthN:<br/>who is this?"}
+    N -- "unknown" --> E1["401"]
+    N -- "user u9" --> Z{"AuthZ: may u9<br/>do this?"}
+    Z -- "no" --> E2["403"]
+    Z -- "yes" --> OK["200 OK"]
+```
+
+**Analogy.** Airport: passport control checks who you are (AuthN); your boarding pass decides which plane you may board (AuthZ).
+Where it breaks: an airport checks once per trip, but an API must run the AuthZ check on every request and every object it touches.
+
+**How the rest of this note builds up**
+
+- First, why "logged in" is not "allowed" (section 1) and the two-gate mental model (section 2).
+- Then issuing an identity, 401 vs 403 vs 404, and where checks live (section 3).
+- Then RBAC vs ABAC vs ReBAC on one request and a Go object-level check (section 4), with a comparison (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production failures like BOLA, and policy engines (sections 6-8).
+
+> [!tip] Remember
+> AuthN answers "who are you?" once; AuthZ answers "may you do this to this object?" on every request.
 
 ### Whiteboard version
 
@@ -45,7 +89,9 @@ A public blogging API has two endpoints: `GET /posts/{id}` (anyone can read a pu
 1. **Authentication:** is there a valid session or token at all, and whose is it?
 2. **Authorization:** given that identity, is *this* action on *this* post allowed?
 
-Concretely: user `u9` is authenticated (their JWT is valid, not expired, correctly signed). They send `DELETE /posts/482`. Post 482 belongs to user `u77`. A server that only checks "is the token valid" returns 204 and deletes someone else's post. A server with both checks runs the second gate — "does `u9` own post 482, or hold a role that may delete any post?" — and returns 403.
+Concretely: user `u9` is authenticated (their JWT is valid, not expired, correctly signed). They send `DELETE /posts/482`. Post 482 belongs to user `u77`. A server that only checks "is the token valid" returns 204 and deletes someone else's post.
+
+A server with both checks runs the second gate — "does `u9` own post 482, or hold a role that may delete any post?" — and returns 403.
 
 This is not a hypothetical: unauthorized object access is the single most common API vulnerability reported in Postman and Salt Security's annual API security surveys, and it is OWASP's #1 API risk for two editions running.
 
@@ -93,7 +139,11 @@ flowchart LR
     Edge --> Svc
 ```
 
-The gateway can reject a forged or expired token cheaply, before it reaches any service. It cannot know whether *this* principal owns *that specific* invoice — that check needs the invoice's row, which only the owning service has. So coarse, identity-shaped checks (is the token valid? does this role exist?) belong at the edge; object-level checks belong in the service, scoped by a `WHERE workspace_id = $1` (or equivalent) on every query that touches tenant data. A policy engine like OPA (Rego policies evaluated as a sidecar or library call) or Casbin can centralize the *rule* while the *object lookup* still happens where the data lives.
+The gateway can reject a forged or expired token cheaply, before it reaches any service. It cannot know whether *this* principal owns *that specific* invoice — that check needs the invoice's row, which only the owning service has.
+
+So coarse, identity-shaped checks (is the token valid? does this role exist?) belong at the edge; object-level checks belong in the service, scoped by a `WHERE workspace_id = $1` (or equivalent) on every query that touches tenant data.
+
+A policy engine like OPA (Rego policies evaluated as a sidecar or library call) or Casbin can centralize the *rule* while the *object lookup* still happens where the data lives.
 
 ## 4. Worked example
 
@@ -289,3 +339,8 @@ Both tests pass under `go test -race` on Go 1.24 (no shared mutable state in thi
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Next:** [[Password Storage and Login Security]], [[Sessions and Cookies]]
 - **Compare with:** [[JWT - Structure, Validation and Pitfalls]] (bearer tokens as one way to carry the authenticated identity), [[Authentication and Authorization in Go]] (full middleware wiring), [[OAuth 2.0 and OpenID Connect]] (delegated authentication/authorization across services)
+
+### Watch on YouTube
+
+- [8. Authentication and authorization for backend engineers](https://www.youtube.com/watch?v=A95rliroC8Q) · Sriniously · 95 min · 191,525 views
+- [Authentication vs Authorization Explained](https://www.youtube.com/watch?v=7ijBiXddB7w) · xplodivity · 3 min · 43,758 views

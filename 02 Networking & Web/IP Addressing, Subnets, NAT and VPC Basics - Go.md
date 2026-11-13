@@ -10,7 +10,7 @@ sources:
   - "RFC 4291, IP Version 6 Addressing Architecture"
   - "RFC 3021, Using 31-Bit Prefixes on IPv4 Point-to-Point Links"
   - "AWS VPC User Guide, Subnets and Route Tables"
-updated: 2026-11-09
+updated: 2026-11-13
 type: implementation
 ---
 
@@ -18,6 +18,15 @@ type: implementation
 
 > [!summary] TL;DR
 > This code implements the subnet arithmetic from [[IP Addressing, Subnets, NAT and VPC Basics]]: counting usable hosts in a prefix, finding a block's network/broadcast bounds, splitting a parent block into equal child subnets (the VPC `/16 → /20` example), and checking RFC 1918 membership.
+
+## Before the code
+
+- **`net` package:** `net.ParseCIDR` parses `"10.0.0.0/16"` into an address and a `*net.IPNet` (address + mask).
+- **`net.IP`:** a byte slice holding an address; `To4()` gives its 4-byte IPv4 form.
+- **Bit shifts on `uint32`:** `toUint32`/`fromUint32` pack 4 bytes into one integer so address math is plain addition.
+- **Errors as values:** functions return `(result, error)` instead of panicking on bad input.
+- **Table-driven tests:** tests loop over a `map` of input to expected output and report each mismatch with `t.Errorf`.
+- **What to run:** `go vet ./... && go test -race ./...` in the module folder.
 
 ## What this code shows
 
@@ -64,7 +73,11 @@ go test -race -v ./...
 
 ### Counting usable hosts
 
-**Concept.** The theory note's prefix-math table says a `/24` has 254 usable hosts, a `/31` has 2 (not 0), and a `/32` has exactly 1 — the RFC 3021 special cases. `UsableHosts` encodes exactly that table as a function instead of a lookup, so it generalizes to any prefix length rather than only the handful of rows shown in the note. An alternative design would hardcode a map for common prefixes only; computing it from the prefix length instead handles every value from `/0` to `/32` uniformly.
+**Concept.** The theory note's prefix-math table says a `/24` has 254 usable hosts, a `/31` has 2 (not 0), and a `/32` has exactly 1 — the RFC 3021 special cases.
+
+`UsableHosts` encodes exactly that table as a function instead of a lookup, so it generalizes to any prefix length rather than only the handful of rows shown in the note.
+
+An alternative design would hardcode a map for common prefixes only; computing it from the prefix length instead handles every value from `/0` to `/32` uniformly.
 
 ```go
 // Package cidr does the subnet arithmetic every IPv4 addressing scheme needs:
@@ -105,7 +118,9 @@ func UsableHosts(ones int) (int, error) {
 
 ### Finding a block's network and broadcast address
 
-**Concept.** Given any address inside a CIDR block, `Bounds` finds the block's first address (network) and last address (broadcast) — the same two addresses `UsableHosts` subtracts out, made concrete. The alternative of doing this bit-by-bit on a raw byte slice (rather than going through `net.ParseCIDR`) was rejected because the standard library's `net.IPNet` already carries the parsed mask, and reusing it avoids re-implementing CIDR parsing from scratch.
+**Concept.** Given any address inside a CIDR block, `Bounds` finds the block's first address (network) and last address (broadcast) — the same two addresses `UsableHosts` subtracts out, made concrete.
+
+The alternative of doing this bit-by-bit on a raw byte slice (rather than going through `net.ParseCIDR`) was rejected because the standard library's `net.IPNet` already carries the parsed mask, and reusing it avoids re-implementing CIDR parsing from scratch.
 
 ```go
 // Bounds returns the network address and the broadcast (last) address of
@@ -143,7 +158,9 @@ func Bounds(cidr string) (network, broadcast net.IP, err error) {
 
 ### Splitting a block into equal subnets
 
-**Concept.** This is the function behind the theory note's `/16 → /20` VPC worked example: given a parent CIDR block and a longer (more specific) prefix, it returns every equal-sized child subnet, in address order. The alternative of returning an iterator instead of a fully materialized slice was rejected because the counts involved in a VPC's typical subnet split (tens, not millions) are small enough that a slice is simpler to test and to consume.
+**Concept.** This is the function behind the theory note's `/16 → /20` VPC worked example: given a parent CIDR block and a longer (more specific) prefix, it returns every equal-sized child subnet, in address order.
+
+The alternative of returning an iterator instead of a fully materialized slice was rejected because the counts involved in a VPC's typical subnet split (tens, not millions) are small enough that a slice is simpler to test and to consume.
 
 ```go
 // Subnets splits a CIDR block into n equal subnets of the given new prefix
@@ -179,7 +196,9 @@ func Subnets(parentCIDR string, newPrefix int) ([]string, error) {
 2. `step := uint32(1) << (32 - newPrefix)` is the address-count size of each child subnet — `4096` for a `/20`, matching the worked example's step size.
 3. The loop produces each subnet's base address by adding `i * step` to the parent block's own base address (converted to and from a plain integer by the two helpers below), then formats it back as a CIDR string — this is the literal computation behind every row of the theory note's `/16 → /20` table.
 
-**Concept — the integer conversion helpers.** `toUint32`/`fromUint32` convert between `net.IP`'s 4-byte representation and a single 32-bit integer. This is what turns "add a fixed step to an address" from byte-by-byte carry arithmetic into a plain integer addition, which is both shorter to write and far less error-prone — manual carry logic across 4 bytes is exactly the kind of code that hides an off-by-one in one specific byte boundary.
+**Concept — the integer conversion helpers.** `toUint32`/`fromUint32` convert between `net.IP`'s 4-byte representation and a single 32-bit integer.
+
+This is what turns "add a fixed step to an address" from byte-by-byte carry arithmetic into a plain integer addition, which is both shorter to write and far less error-prone — manual carry logic across 4 bytes is exactly the kind of code that hides an off-by-one in one specific byte boundary.
 
 ```go
 func toUint32(ip net.IP) uint32 {
@@ -199,7 +218,11 @@ func fromUint32(v uint32) net.IP {
 
 ### Checking RFC 1918 membership
 
-**Concept.** `IsPrivate` answers the question the theory note's private-ranges table poses: does this address fall inside one of the three reserved RFC 1918 blocks? It is deliberately a membership check against exactly three hardcoded CIDR blocks, rather than a general "is this address globally routable" classifier, because those are the only ranges the theory note's table claims to cover — scope creep here (handling loopback, link-local, multicast, and so on) would test claims the theory note does not make.
+**Concept.** `IsPrivate` answers the question the theory note's private-ranges table poses: does this address fall inside one of the three reserved RFC 1918 blocks?
+
+It is deliberately a membership check against exactly three hardcoded CIDR blocks, rather than a general "is this address globally routable" classifier, because those are the only ranges the theory note's table claims to cover.
+
+Scope creep here (handling loopback, link-local, multicast, and so on) would test claims the theory note does not make.
 
 ```go
 // IsPrivate reports whether ip falls in an RFC 1918 private range.

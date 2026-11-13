@@ -8,13 +8,15 @@ sources:
   - "Es et al., RAGAS: Automated Evaluation of Retrieval Augmented Generation (2023)"
   - "Zheng et al., Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena (NeurIPS 2023)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # RAG Evaluation
 
 > [!summary] TL;DR
-> A RAG pipeline has two places to be wrong — retrieval can return the wrong chunks, and generation can write a wrong or unfaithful answer even from the right ones — so evaluating "is the answer good?" alone can't tell you which stage to fix. RAG evaluation measures retrieval and generation separately, on a labeled golden set, with metrics that don't require a human to read every answer, so quality regressions are caught in CI before they reach production.
+> A RAG pipeline has two places to be wrong — retrieval can return the wrong chunks, and generation can write a wrong or unfaithful answer even from the right ones — so evaluating "is the answer good?" alone can't tell you which stage to fix.
+>
+> RAG evaluation measures retrieval and generation separately, on a labeled golden set, with metrics that don't require a human to read every answer, so quality regressions are caught in CI before they reach production.
 
 > [!abstract] Core idea
 > - Retrieval metrics (recall@k, MRR, nDCG) need a golden set of queries with known-relevant chunk IDs, and measure whether the right chunks were found, and how high they were ranked.
@@ -22,6 +24,52 @@ updated: 2026-11-07
 > - "Vibes" (reading a few answers and deciding they look fine) doesn't scale, doesn't catch regressions, and doesn't tell you which stage broke.
 > - LLM-as-judge is the practical way to score faithfulness and relevance at scale, but the judge itself needs calibration against human labels before you trust its scores.
 > - Wire a subset of these metrics into CI as a quality gate with a minimum threshold, so a change that silently degrades retrieval or generation fails the build instead of shipping unnoticed.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your "chat with our docs" bot gives a wrong answer about the refund policy.
+Did search fetch the wrong page, or did the model misread the right page?
+Reading a few answers by eye cannot tell you, and cannot warn you when next week's change makes things worse.
+RAG evaluation gives each stage its own score so you know what broke.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| RAG | Search your documents, then let the model answer from what it found | Bot answers from the policy page |
+| Chunk | A small piece of a document stored for search | One paragraph of the policy |
+| Top-k | The k best search results | The top 5 chunks |
+| Golden set | Test questions with known correct chunks | "Refund window?" → chunk 42 |
+| Recall@k | Did a correct chunk appear in the top k? | Yes = 1, no = 0 |
+| Faithfulness | Does the answer stick to the retrieved text? | No invented numbers |
+| LLM-as-judge | Using a model to grade another model's answer | Judge scores 1-5 |
+| CI gate | An automatic test that blocks a bad change | Build fails if recall drops |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Q["Test question"] --> R["Retrieval"]
+    R --> RM["Retrieval score:<br/>recall@k, MRR, nDCG"]
+    R --> G["Generation"]
+    G --> GM["Answer score:<br/>faithfulness"]
+    RM --> CI{"Above threshold?"}
+    GM --> CI
+```
+
+**Analogy.** It is an open-book exam with two graders: one checks if the student opened the right page, the other checks if the answer matches that page.
+Where it breaks: a school grader is a person, while an LLM judge can be biased and must be checked against human labels.
+
+**How the rest of this note builds up**
+
+- First, why "looks fine to me" fails (section 1) and the two-stage exam model (section 2).
+- Then the golden set, retrieval metrics, generation metrics and LLM-as-judge (section 3).
+- Then a tested Go worked example computing recall@k, MRR and nDCG@k (section 4), and variants (sections 5-6).
+- Finally the SDE-3 deep dive: monitoring, diagnosing which stage broke, CI thresholds and growing the golden set (sections 7-9).
+
+> [!tip] Remember
+> Score retrieval and generation separately, against a fixed golden set, and fail the build when either drops.
 
 ## 1. Why it exists
 
@@ -35,7 +83,11 @@ Concretely: after switching from a 500-token to a 1,000-token chunk size, answer
 
 ## 2. Mental model
 
-Treat a RAG pipeline like a two-stage exam: **retrieval** is "did the student open the right page of the textbook," and **generation** is "given that page, did the student answer correctly from it." A student who opens the wrong page and still happens to write a correct answer from memory passed the exam but failed the lesson you were testing — and a student who opened the right page but copied it wrong failed for the opposite reason. RAG evaluation tests each stage with a metric built for that stage, instead of only grading the final answer and shrugging about why it was wrong.
+Treat a RAG pipeline like a two-stage exam: **retrieval** is "did the student open the right page of the textbook," and **generation** is "given that page, did the student answer correctly from it."
+
+A student who opens the wrong page and still happens to write a correct answer from memory passed the exam but failed the lesson you were testing — and a student who opened the right page but copied it wrong failed for the opposite reason.
+
+RAG evaluation tests each stage with a metric built for that stage, instead of only grading the final answer and shrugging about why it was wrong.
 
 ```mermaid
 flowchart LR
@@ -73,7 +125,9 @@ flowchart LR
 Every metric below needs a **golden set**: a list of `(query, relevant chunk IDs, reference answer)` rows. Three ways to build one, usually combined:
 
 - **Hand-labeled.** A domain expert writes realistic questions and marks which chunks should answer them. Expensive per row, but the most trustworthy — this is what you calibrate an LLM judge against (see below).
-- **Synthetically generated.** An LLM reads a chunk and generates a question it answers, giving you a `(question, chunk_id)` pair almost for free; useful for bulk recall@k coverage, but systematically easier than real user questions (it was generated *from* the answer, so it tends to use the chunk's own vocabulary) — don't rely on it alone for a representative difficulty distribution.
+- **Synthetically generated.** An LLM reads a chunk and generates a question it answers, giving you a `(question, chunk_id)` pair almost for free.
+
+  It is useful for bulk recall@k coverage, but systematically easier than real user questions (it was generated *from* the answer, so it tends to use the chunk's own vocabulary) — don't rely on it alone for a representative difficulty distribution.
 - **Production-sampled.** Real user queries, sampled and then labeled (by a human, or by promoting a query where a human gave explicit feedback). These are the hardest and most representative rows, and the ones most worth adding over time as the eval set's "adversarial" cases.
 
 A golden set of 50–100 rows, covering the easy cases, the known-hard cases (ambiguous phrasing, multi-hop questions), and a few known-unanswerable questions (to check the pipeline says "I don't know" instead of guessing) is enough to start; grow it as production surfaces new failure patterns.
@@ -97,9 +151,15 @@ These check the *answer* against the *context it was actually given*, which is w
 
 ### LLM-as-judge, and why it needs calibration
 
-Faithfulness and context precision are both naturally posed as "read this context and this answer, and judge X" — exactly the kind of task an LLM grades well, at a fraction of the cost of a human reviewer reading every case. A judge call typically asks for a verdict and a short justification via structured output (see [[Structured Outputs and Tool Calling]]), e.g. `{"faithful": true, "unsupported_claims": []}`.
+Faithfulness and context precision are both naturally posed as "read this context and this answer, and judge X" — exactly the kind of task an LLM grades well, at a fraction of the cost of a human reviewer reading every case.
 
-But an LLM judge is itself a model that can be wrong, biased (some judges systematically favor longer or more confident-sounding answers), or simply miscalibrated against what your team actually means by "faithful." The fix is the same one used for any model you depend on: **measure the judge against a small set of human-labeled cases first.** Compute agreement (does the judge's verdict match the human's, case by case) before trusting the judge's verdict at scale; re-check periodically, and whenever the grading prompt or the judge model changes.
+A judge call typically asks for a verdict and a short justification via structured output (see [[Structured Outputs and Tool Calling]]), e.g. `{"faithful": true, "unsupported_claims": []}`.
+
+But an LLM judge is itself a model that can be wrong, biased (some judges systematically favor longer or more confident-sounding answers), or simply miscalibrated against what your team actually means by "faithful."
+
+The fix is the same one used for any model you depend on: **measure the judge against a small set of human-labeled cases first.**
+
+Compute agreement (does the judge's verdict match the human's, case by case) before trusting the judge's verdict at scale; re-check periodically, and whenever the grading prompt or the judge model changes.
 
 ## 4. Worked example
 
@@ -119,7 +179,9 @@ func recallHitsTopK(relevant, retrieved []string, k int) bool {
 }
 ```
 
-The full version below implements recall@k, MRR, nDCG@k over a batch of labeled queries, plus a `Judge` interface for LLM-as-judge-style faithfulness and context-precision scoring, and a `Gate` type for wiring thresholds into CI. It compiles and passes `go vet` and `go test -race` on Go 1.24; the judge is an interface so the metrics are tested against a scripted fake, with no model call or API key needed.
+The full version below implements recall@k, MRR, nDCG@k over a batch of labeled queries, plus a `Judge` interface for LLM-as-judge-style faithfulness and context-precision scoring, and a `Gate` type for wiring thresholds into CI.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24; the judge is an interface so the metrics are tested against a scripted fake, with no model call or API key needed.
 
 ```go
 // Package rageval implements the retrieval and answer metrics a RAG
@@ -501,25 +563,45 @@ ok  	rageval	1.96s
   - LLM judge drifts after a model or grading-prompt change → re-run the human-agreement calibration check whenever either changes, not only once at setup.
   - A CI gate's threshold was picked arbitrarily and blocks releases on noise → set thresholds from the actual variance of repeated runs on an unchanged pipeline, not a round number; a metric that naturally varies ±0.03 run to run needs a gate with headroom above that noise floor.
   - Evaluating only on a fixed golden set misses emerging real-world failure patterns → periodically sample and label production queries (especially ones with negative user feedback) and fold them into the golden set.
-- **What to monitor:** recall@k / MRR / nDCG@k trend over time per pipeline version (tag eval runs with the model, chunking, and prompt version that produced them); faithfulness and context-precision trend from judge-scored production samples, not only the static golden set; judge-human agreement rate, re-checked on a schedule; the specific queries that regressed between two pipeline versions, not only the aggregate score.
+- **What to monitor:** recall@k / MRR / nDCG@k trend over time per pipeline version (tag eval runs with the model, chunking, and prompt version that produced them).
+
+  Also watch faithfulness and context-precision trend from judge-scored production samples, not only the static golden set; judge-human agreement rate, re-checked on a schedule; the specific queries that regressed between two pipeline versions, not only the aggregate score.
 
 ## 8. Deep dive
 
-- **Diagnosing retrieval vs. generation from the metrics alone.** High recall@k with low faithfulness means retrieval is working and generation is the problem (check the prompt's instruction to answer only from context, check for context the model is ignoring). Low recall@k regardless of faithfulness score means fix retrieval first — a faithfulness score computed against the wrong context tells you the model was honest about bad information, not that the system gave a good answer.
-- **Why nDCG generalizes MRR.** MRR only rewards the position of the *first* relevant result and ignores every relevant result after it. nDCG's discounted-gain sum credits every relevant result in the list, discounted by its rank, which matters once your golden set has queries with several correct chunks (a question answerable from any of three overlapping paragraphs) where MRR would treat "found 1 of 3" and "found all 3" identically as long as the first one ranked the same.
-- **Setting CI thresholds without picking numbers out of the air.** Run the eval suite several times against an *unchanged* pipeline first and look at the natural run-to-run variance (sampling order, any non-determinism in the judge or the model's temperature setting) — that variance is your noise floor. A gate threshold needs headroom above it, or the gate fails intermittently on noise rather than on a real regression, training the team to ignore it.
-- **Promoting production failures into the golden set.** A production query where a user clicked "this didn't help," or where a human support agent had to step in, is exactly the kind of hard, representative case a synthetic or hand-written golden set tends to miss. Building a lightweight pipeline to sample, label, and fold these into the golden set is one of the highest-leverage ongoing investments in an eval suite, because it makes the suite's coverage track what actually goes wrong in production instead of what the team guessed might go wrong.
+- **Diagnosing retrieval vs. generation from the metrics alone.** High recall@k with low faithfulness means retrieval is working and generation is the problem (check the prompt's instruction to answer only from context, check for context the model is ignoring).
+
+  Low recall@k regardless of faithfulness score means fix retrieval first — a faithfulness score computed against the wrong context tells you the model was honest about bad information, not that the system gave a good answer.
+- **Why nDCG generalizes MRR.**
+
+  MRR only rewards the position of the *first* relevant result and ignores every relevant result after it.
+
+  nDCG's discounted-gain sum credits every relevant result in the list, discounted by its rank, which matters once your golden set has queries with several correct chunks (a question answerable from any of three overlapping paragraphs) where MRR would treat "found 1 of 3" and "found all 3" identically as long as the first one ranked the same.
+- **Setting CI thresholds without picking numbers out of the air.**
+
+  Run the eval suite several times against an *unchanged* pipeline first and look at the natural run-to-run variance (sampling order, any non-determinism in the judge or the model's temperature setting) — that variance is your noise floor.
+
+  A gate threshold needs headroom above it, or the gate fails intermittently on noise rather than on a real regression, training the team to ignore it.
+- **Promoting production failures into the golden set.** A production query where a user clicked "this didn't help," or where a human support agent had to step in, is exactly the kind of hard, representative case a synthetic or hand-written golden set tends to miss.
+
+  Building a lightweight pipeline to sample, label, and fold these into the golden set is one of the highest-leverage ongoing investments in an eval suite, because it makes the suite's coverage track what actually goes wrong in production instead of what the team guessed might go wrong.
 
 ## 9. Interview questions
 
 > [!question]- Recall@5 is high but users still complain about hallucinated answers. What's wrong?
-> High recall@k means retrieval is finding the right chunks; the problem is on the generation side — check faithfulness/groundedness specifically. A model can ignore good context and answer from its own memory, or extrapolate beyond what the context actually says, and recall@k has no way to catch either, because it only measures whether the right chunk was retrieved, not whether it was used correctly.
+> High recall@k means retrieval is finding the right chunks; the problem is on the generation side — check faithfulness/groundedness specifically.
+>
+> A model can ignore good context and answer from its own memory, or extrapolate beyond what the context actually says, and recall@k has no way to catch either, because it only measures whether the right chunk was retrieved, not whether it was used correctly.
 
 > [!question]- Why do you need both recall@k and nDCG@k instead of just one?
-> Recall@k only answers whether a relevant chunk is anywhere in the top k; nDCG@k additionally scores *how high* it ranked and credits multiple relevant results, not just the first one. A pipeline can have perfect recall@5 while burying the relevant chunk at rank 5 just inside the token budget — nDCG would catch that as a lower score where recall@5 would look identical to a pipeline that ranked it first.
+> Recall@k only answers whether a relevant chunk is anywhere in the top k; nDCG@k additionally scores *how high* it ranked and credits multiple relevant results, not just the first one.
+>
+> A pipeline can have perfect recall@5 while burying the relevant chunk at rank 5 just inside the token budget — nDCG would catch that as a lower score where recall@5 would look identical to a pipeline that ranked it first.
 
 > [!question]- Trap: "We used GPT/Claude to grade our own answers, so the eval scores are objective." Why is this wrong?
-> An LLM judge is itself a model with its own biases and failure modes (it can favor longer or more confident-sounding answers, or be miscalibrated against what your team actually means by "faithful"). The scores are only as trustworthy as the judge's measured agreement with human labels on a calibration set — skipping that calibration step means you're reporting a number without knowing what it actually tracks.
+> An LLM judge is itself a model with its own biases and failure modes (it can favor longer or more confident-sounding answers, or be miscalibrated against what your team actually means by "faithful").
+>
+> The scores are only as trustworthy as the judge's measured agreement with human labels on a calibration set — skipping that calibration step means you're reporting a number without knowing what it actually tracks.
 
 > [!question]- How would you set a CI gate's threshold for nDCG@5 without an arbitrary round number?
 > Run the eval suite repeatedly against an unchanged pipeline to measure its natural run-to-run variance, then set the gate's minimum with headroom above that noise floor. A threshold set without this step either fails intermittently on normal variance (and gets ignored) or is set too loose to catch a real regression.
@@ -531,7 +613,9 @@ ok  	rageval	1.96s
 > Those questions tend to reuse the chunk's own vocabulary, since they were generated directly from its text, so they're systematically easier to retrieve for than real user questions, which are often differently worded or more ambiguous. Recall@k measured only on this set will overstate real-world retrieval quality; supplement it with hand-written and production-sampled queries.
 
 > [!question]- Design the eval setup for a RAG system before its first production release. What would you build?
-> A golden set of 50–100 queries (hand-written plus a few synthetic, covering easy cases, known-hard phrasings, and deliberately unanswerable questions), scored for recall@k/MRR/nDCG@k on retrieval and faithfulness/context precision on generation via an LLM judge calibrated against a small human-labeled subset, wired into CI as a gate with thresholds set from repeated-run variance — then a lightweight process to sample and label production queries over time and fold the hard ones back into the golden set.
+> A golden set of 50–100 queries (hand-written plus a few synthetic, covering easy cases, known-hard phrasings, and deliberately unanswerable questions), scored for recall@k/MRR/nDCG@k on retrieval and faithfulness/context precision on generation via an LLM judge calibrated against a small human-labeled subset.
+>
+> Wire it into CI as a gate with thresholds set from repeated-run variance — then a lightweight process to sample and label production queries over time and fold the hard ones back into the golden set.
 
 ## 10. Cheat sheet
 
@@ -549,3 +633,8 @@ ok  	rageval	1.96s
 - **Before this:** [[RAG Pipeline]], [[Advanced RAG Patterns]]
 - **Next:** [[LLM Evals in Production]]
 - **Compare with:** [[Testing Strategy and the Test Pyramid]] (the same "golden set + CI gate" discipline applied to LLM behavior instead of deterministic code), [[Keyword, Semantic and Hybrid Search]] (precision@k/recall@k/MRR/nDCG apply there too)
+
+### Watch on YouTube
+
+- [Mastering LLM Chatbots And RAG Evaluation Crash Course](https://www.youtube.com/watch?v=NebOSOTp-zA) · Krish Naik · 66 min · 81,769 views
+- [RAG Evaluation: Precision, Recall, Faithfulness, RAGAS Explained Clearly](https://www.youtube.com/watch?v=7_LTU0LA374) · Logical Lenses · 12 min · 41,377 views

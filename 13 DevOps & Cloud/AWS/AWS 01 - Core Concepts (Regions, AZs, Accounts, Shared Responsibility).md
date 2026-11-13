@@ -9,7 +9,7 @@ sources:
   - "AWS Compute SLA for Amazon EC2, aws.amazon.com/compute/sla (accessed 2026-11-07)"
   - "AWS Shared Responsibility Model, aws.amazon.com/compliance/shared-responsibility-model (accessed 2026-11-07)"
   - "AWS Organizations User Guide, Service control policies"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)
@@ -23,6 +23,53 @@ updated: 2026-11-07
 > - An **account** is AWS's billing and isolation boundary: every resource, every IAM policy, every service limit is scoped to one account unless you explicitly share across accounts.
 > - **Shared responsibility**: AWS secures "of the cloud" (facilities, hardware, the host OS and hypervisor, and the managed service's own code); you secure "in the cloud" (your data, your IAM policies, your guest OS if you run one, your network configuration).
 > - As of this writing AWS documents 39 Regions and 124 Availability Zones (AWS Global Infrastructure page, accessed 2026-11-07) — the exact count keeps growing, so treat it as a magnitude, not a fact to memorize precisely.
+
+## Start here: the basics
+
+**The problem in one story.**
+You build a small shop website and run it on one computer in your office.
+One night the power goes out, and the shop is offline until morning.
+You could buy more computers, more buildings and more staff, but that is slow and expensive.
+AWS rents you computers in many buildings around the world, so you can spread your site out and pay only for what you use.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Server | A computer that runs your program for other people | The machine serving your shop's web pages |
+| Data center | A building full of servers, power and cooling | One warehouse of racks in Mumbai |
+| Region | A group of AWS data centers in one geography | `ap-south-1` (Mumbai) |
+| Availability Zone (AZ) | One isolated data center (or group) inside a Region | `ap-south-1a` |
+| Account | Your private AWS space: login, bill and limits | A "prod" account separate from "dev" |
+| Latency | Time for a message to travel and come back | ~1 ms between AZs vs ~100 ms across oceans |
+| Replication | Keeping copies of data in more than one place | A database copy in a second AZ |
+| Blast radius | How much breaks when one thing goes wrong | One bad deploy only hits the dev account |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    AWS["AWS worldwide"] --> R1["Region: us-east-1"]
+    AWS --> R2["Region: ap-south-1"]
+    R2 --> AZ1["AZ a<br/>(own power)"]
+    R2 --> AZ2["AZ b<br/>(own power)"]
+    R2 --> AZ3["AZ c<br/>(own power)"]
+    ACC["Your account<br/>(bill + fence)"] -.->|"you place resources in"| AZ1
+    ACC -.-> AZ2
+```
+
+**Analogy.** AWS is like a bank with branches in many cities (Regions), each branch spread over a few separate buildings (AZs); your account is your private locker in the bank.
+Where it breaks: a bank moves your money between branches for you, but AWS never copies your data to another Region unless you set it up.
+
+**How the rest of this note builds up**
+
+- First, why the cloud exists (section 1) and the utility-company mental model (section 2).
+- Then how Regions, AZs, accounts, Organizations/SCPs and the Shared Responsibility Model work (section 3).
+- Then a worked availability calculation for one vs two AZs (section 4) and comparisons (section 5).
+- Finally the SDE-3 view: trade-offs, production practice and the deep dive on correlated failures (sections 6-8).
+
+> [!tip] Remember
+> Region = a city, AZ = a separate building in that city, account = your private fence; you, not AWS, decide how far your app is spread out.
 
 ## 1. Why it exists
 
@@ -60,7 +107,11 @@ A Region failure (rare, but it has happened) does not fail over to another Regio
 
 ## 2. Mental model
 
-Think of AWS as a utility company with branch offices in many cities (Regions), and each branch office actually runs out of two or three separate buildings on opposite sides of town (AZs) so that one building catching fire doesn't take down the branch. Your **account** is your personal contract with that utility company — your bill, your login, your own private fence around everything you've asked them to run for you. Nobody else's resources appear inside your fence unless you explicitly invite them in (cross-account sharing).
+Think of AWS as a utility company with branch offices in many cities (Regions), and each branch office actually runs out of two or three separate buildings on opposite sides of town (AZs) so that one building catching fire doesn't take down the branch.
+
+Your **account** is your personal contract with that utility company — your bill, your login, your own private fence around everything you've asked them to run for you.
+
+Nobody else's resources appear inside your fence unless you explicitly invite them in (cross-account sharing).
 
 The **Shared Responsibility Model** is the line in that contract: the utility company is responsible for the power plant, the wires, and the meter box being safe and working (security *of* the cloud); you are responsible for locking your own front door, deciding who gets a key, and not leaving sensitive documents on the porch (security *in* the cloud).
 
@@ -68,9 +119,15 @@ The **Shared Responsibility Model** is the line in that contract: the utility co
 
 ### Regions, AZs, and why the distinction matters operationally
 
-A **Region** (`us-east-1`, `ap-south-1`, `eu-west-1`, …) is an independent cluster of data centers with its own copy of most AWS services, its own separate set of endpoints, and — by design — no automatic data replication to any other Region. If you need disaster recovery across Regions, you build and test that yourself (cross-region replication, Route 53 failover, and so on).
+A **Region** (`us-east-1`, `ap-south-1`, `eu-west-1`, …) is an independent cluster of data centers with its own copy of most AWS services, its own separate set of endpoints, and — by design — no automatic data replication to any other Region.
 
-Inside a Region, AWS groups data centers into **Availability Zones**. Each AZ has independent power, cooling, and physical location (different flood plain, different power substation), but AZs within one Region are linked by private fiber with latency low enough to run synchronous replication across them — this is what makes a Multi-AZ RDS deployment or a load balancer spanning two AZs practical, where spanning two separate Regions would add tens to hundreds of milliseconds and would not be synchronous.
+If you need disaster recovery across Regions, you build and test that yourself (cross-region replication, Route 53 failover, and so on).
+
+Inside a Region, AWS groups data centers into **Availability Zones**.
+
+Each AZ has independent power, cooling, and physical location (different flood plain, different power substation), but AZs within one Region are linked by private fiber with latency low enough to run synchronous replication across them.
+
+This is what makes a Multi-AZ RDS deployment or a load balancer spanning two AZs practical, where spanning two separate Regions would add tens to hundreds of milliseconds and would not be synchronous.
 
 | Boundary | Independent failure domain? | Typical link latency | What it's for |
 | --- | --- | --- | --- |
@@ -91,9 +148,15 @@ sequenceDiagram
 
 ### Accounts and Organizations
 
-Every resource — an EC2 instance, an S3 bucket, an IAM role — belongs to exactly one **account**, which is also the unit of billing, the unit of most service quotas, and the default IAM trust boundary (an IAM role in account A cannot be assumed from account B unless its trust policy explicitly allows it). A single engineer's side project might use one account; a real company almost always uses several: one per environment (dev/staging/prod) or one per team, to limit the blast radius of a mistake or a compromised credential.
+Every resource — an EC2 instance, an S3 bucket, an IAM role — belongs to exactly one **account**, which is also the unit of billing, the unit of most service quotas, and the default IAM trust boundary (an IAM role in account A cannot be assumed from account B unless its trust policy explicitly allows it).
 
-**AWS Organizations** lets you link many accounts under one management account and apply a **Service Control Policy (SCP)** — a guardrail that caps what any identity in a member account can ever do, no matter what its own IAM policies say. An SCP that excludes `s3:DeleteBucket` means no IAM policy in that account, however permissive, can grant that action; SCPs can only take permissions away, never grant them (AWS Organizations User Guide, Service control policies). [[AWS 02 - IAM]] covers how an SCP combines with identity and resource policies in the full evaluation logic.
+A single engineer's side project might use one account; a real company almost always uses several: one per environment (dev/staging/prod) or one per team, to limit the blast radius of a mistake or a compromised credential.
+
+**AWS Organizations** lets you link many accounts under one management account and apply a **Service Control Policy (SCP)** — a guardrail that caps what any identity in a member account can ever do, no matter what its own IAM policies say.
+
+An SCP that excludes `s3:DeleteBucket` means no IAM policy in that account, however permissive, can grant that action; SCPs can only take permissions away, never grant them (AWS Organizations User Guide, Service control policies).
+
+[[AWS 02 - IAM]] covers how an SCP combines with identity and resource policies in the full evaluation logic.
 
 ```mermaid
 flowchart TB
@@ -221,7 +284,9 @@ func TestAnnualDowntimeMatchesSLATiers(t *testing.T) {
 | 2 instances, 2 AZs | 99.5% each | 99.9975% (computed) | ~2.2 hours |
 | AWS's own commitment, 2+ AZs | — | 99.99% (documented) | ~52.6 minutes |
 
-Two lessons: the raw independence math (99.9975%) actually beats AWS's own documented commitment (99.99%) — AWS's SLA is conservative on purpose, because real AZ failures are not perfectly independent (see "Trade-offs"). And going from one AZ to two is where almost all of the availability gain happens; adding a third AZ helps far less in percentage terms than the first redundant AZ did.
+Two lessons: the raw independence math (99.9975%) actually beats AWS's own documented commitment (99.99%) — AWS's SLA is conservative on purpose, because real AZ failures are not perfectly independent (see "Trade-offs").
+
+And going from one AZ to two is where almost all of the availability gain happens; adding a third AZ helps far less in percentage terms than the first redundant AZ did.
 
 ## 5. Variants and comparison
 
@@ -290,3 +355,8 @@ Two lessons: the raw independence math (99.9975%) actually beats AWS's own docum
 - **Before this:** none — this is the entry point for 13 DevOps & Cloud's AWS sequence.
 - **Next:** [[AWS 02 - IAM]], [[AWS 03 - VPC Networking]]
 - **Compare with:** [[Load Balancing]] (how traffic is actually spread across the AZs described here)
+
+### Watch on YouTube
+
+- [AWS Shared Responsibility Model for Beginners / Understanding Cloud Security (2025)](https://www.youtube.com/watch?v=WopTpel6DUY) · BeSA Cloud Academy · 7 min · 8,296 views
+- [AWS Shared Responsibility Model Explained / AWS Best Practices / Tech Concept Hub](https://www.youtube.com/watch?v=a25ZkQ00oFQ) · TECH CONCEPT HUB · 5 min · 937 views

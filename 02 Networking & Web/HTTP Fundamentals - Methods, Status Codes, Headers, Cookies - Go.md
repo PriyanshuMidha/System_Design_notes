@@ -10,13 +10,22 @@ sources:
   - "RFC 9111, HTTP Caching"
   - "RFC 6265bis (draft), HTTP State Management Mechanism (Set-Cookie attributes)"
   - "MDN Web Docs, HTTP response status codes"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HTTP Fundamentals - Methods, Status Codes, Headers, Cookies - Go
 
 > [!summary] TL;DR
 > This code is a tiny in-memory item store exposed over `net/http` that demonstrates method semantics from [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]] directly in running behavior: `GET` is safe and supports conditional `304` requests, `PUT`/`DELETE` are idempotent, `POST` is not, and a helper sets a correctly-attributed session cookie.
+
+## Before the code
+
+- **`net/http` handlers**: functions `func(w http.ResponseWriter, r *http.Request)` that read a request and write a status, headers and body.
+- **`r.PathValue("id")`**: Go 1.22+ routing that pulls `{id}` out of a pattern like `GET /items/{id}`.
+- **`sync.Mutex`**: a lock so concurrent requests cannot corrupt the shared map.
+- **`atomic.Int64`**: a counter safe to bump from many goroutines without a lock.
+- **`httptest`**: fake requests and a response recorder, so tests run handlers without a real network.
+- **Run it**: `go vet ./...` then `go test -race ./...` from the module root.
 
 ## What this code shows
 
@@ -47,7 +56,9 @@ flowchart LR
 
 ### Step 1: the store and its fingerprint helper
 
-**Concept.** A real resource store would be a database table; this one is a mutex-guarded map, kept deliberately simple so the test focuses on HTTP semantics rather than storage mechanics. `etag` mirrors [[HTTP Caching - Cache-Control, ETag, Conditional Requests#ETag and conditional requests]]'s approach of hashing the current content rather than trusting a separately-maintained version counter, for the same reason: it cannot drift out of sync with what is actually stored.
+**Concept.** A real resource store would be a database table; this one is a mutex-guarded map, kept deliberately simple so the test focuses on HTTP semantics rather than storage mechanics.
+
+`etag` mirrors [[HTTP Caching - Cache-Control, ETag, Conditional Requests#ETag and conditional requests]]'s approach of hashing the current content rather than trusting a separately-maintained version counter, for the same reason: it cannot drift out of sync with what is actually stored.
 
 ```go
 package httpdemo
@@ -87,7 +98,9 @@ func etag(body string) string {
 
 ### Step 2: `GET` — safe, with conditional request support
 
-**Concept.** This is the safe-method half of [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies#Methods safe and idempotent are two different properties]]: `HandleGet` only ever reads from the store, never writes to it, which is what makes it legal for a browser or crawler to call speculatively. Layering the conditional-`304` check on top (rather than a separate endpoint) keeps the caching contract attached to the same handler that owns the data, instead of splitting cache logic into a wrapper that has to independently know the resource's shape.
+**Concept.** This is the safe-method half of [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies#Methods safe and idempotent are two different properties]]: `HandleGet` only ever reads from the store, never writes to it, which is what makes it legal for a browser or crawler to call speculatively.
+
+Layering the conditional-`304` check on top (rather than a separate endpoint) keeps the caching contract attached to the same handler that owns the data, instead of splitting cache logic into a wrapper that has to independently know the resource's shape.
 
 ```go
 // HandleGet is safe: it never changes state, so it may be cached, retried
@@ -122,7 +135,9 @@ func (s *Store) HandleGet(w http.ResponseWriter, r *http.Request) {
 
 ### Step 3: `PUT` and `DELETE` — idempotent, but not safe
 
-**Concept.** Both handlers change state, so neither is safe — but both leave the store in the same place no matter how many times they are called with the same input, which is the idempotency promise from the theory note. `HandleDelete` always returns `204` whether or not the item existed, which is the direct code expression of "idempotency is about end state, not about the response being identical."
+**Concept.** Both handlers change state, so neither is safe — but both leave the store in the same place no matter how many times they are called with the same input, which is the idempotency promise from the theory note.
+
+`HandleDelete` always returns `204` whether or not the item existed, which is the direct code expression of "idempotency is about end state, not about the response being identical."
 
 ```go
 // HandlePut is idempotent: setting the same body twice leaves the exact

@@ -8,7 +8,7 @@ sources:
   - "Go spec, Struct types and Selectors (go.dev/ref/spec)"
   - "Effective Go, Embedding (go.dev/doc/effective_go)"
   - "golang.org/x/tools fieldalignment analyzer docs"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Structs, Methods and Embedding
@@ -21,6 +21,49 @@ updated: 2026-11-07
 > - A method is sugar for a function whose first parameter is the receiver; a pointer receiver can mutate the caller's value, a value receiver cannot.
 > - Embedding promotes an inner type's fields and methods to the outer type by name, until two embedded types collide or the outer type defines its own method of the same name.
 > - Field order affects struct size through padding, not through behavior — the compiler inserts padding so each field lands at an aligned memory offset.
+
+## Start here: the basics
+
+**The problem in one story.**
+You are building a shop app and need to track a customer: a name, an email, an age.
+Passing three loose variables everywhere gets messy fast, and it is easy to mix them up.
+A struct bundles them into one named thing, `Customer`.
+Methods then let you write `c.Greet()` instead of `Greet(c)`, and embedding lets one struct reuse another's fields and methods.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Type | A name for a kind of value | `int`, `string`, `Customer` |
+| Field | One named slot inside a struct | `Name string` |
+| Value / copy | Assigning a struct duplicates all its fields | `b := a` makes a second struct |
+| Pointer | An address that refers to a value instead of copying it | `p := &a`; `p.Name = "x"` changes `a` |
+| Method | A function attached to a type | `func (c Customer) Greet()` |
+| Receiver | The value a method is called on | `c` in `c.Greet()` |
+| Embedding | Putting a type inside a struct without a field name | `type Admin struct{ Customer }` |
+| Padding | Unused bytes the compiler adds so fields line up in memory | `bool` then `int64` wastes 7 bytes |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["struct Customer<br/>Name, Email, Age"] --> M["methods<br/>c.Greet()"]
+    S --> E["embedded in<br/>struct Admin"]
+    E --> P["Admin gets<br/>a.Name, a.Greet()"]
+```
+
+**Analogy.** A struct is a paper form with labelled boxes; a method is an instruction printed on the form ("sign here"). Embedding is stapling one form inside another, so the outer form shows the inner form's boxes too.
+Where it breaks: stapled forms are still two forms; the inner method still only sees the inner struct, so it is not inheritance and there is no overriding through it.
+
+**How the rest of this note builds up**
+
+- First, why structs and methods exist (section 1) and a mental model of values, copies and receivers (section 2).
+- Then how methods, pointer vs value receivers, method sets and embedding work (section 3), with a worked example (section 4).
+- Then variants, trade-offs and production habits (sections 5-7).
+- Finally the SDE-3 deep dive on comparability, the empty struct, struct tags, field alignment/padding and custom types vs aliases (section 8).
+
+> [!tip] Remember
+> A struct is a bundle of fields copied as one value; methods attach behavior; embedding reuses, it does not inherit.
 
 ## 1. Why it exists
 
@@ -37,7 +80,9 @@ Embedding solves a related, narrower problem: many domain types need the same ba
 
 ## 2. Mental model
 
-A struct is a **labeled box of fields**, stored contiguously in memory. A method is a function where the type whose box you're operating on is written before the function name instead of as the first argument in parentheses — `func (c Counter) Value() int` instead of `func Value(c Counter) int`. That's purely syntax; mechanically a method call `c.Value()` compiles to the same thing as `Value(c)`.
+A struct is a **labeled box of fields**, stored contiguously in memory. A method is a function where the type whose box you're operating on is written before the function name instead of as the first argument in parentheses — `func (c Counter) Value() int` instead of `func Value(c Counter) int`.
+
+That's purely syntax; mechanically a method call `c.Value()` compiles to the same thing as `Value(c)`.
 
 Embedding is like **inheriting a wing of a building, not a whole blueprint**: if `Record` embeds `Base`, then `Record` gets a copy of `Base`'s floor plan placed inside it, and anyone standing in `Record` can walk straight to `Base`'s rooms (`record.ID`) without saying "go through Base first" (`record.Base.ID`) — unless two embedded wings both have a room called the same thing, in which case you must say which wing you mean.
 
@@ -72,7 +117,9 @@ flowchart LR
     D -- no --> OK["return Invoice{..., Status: StatusDraft}, nil"]
 ```
 
-**Methods and receivers.** Every method is really a plain function with the receiver as a hidden first parameter. The choice between a value receiver and a pointer receiver decides whether the method sees (and can modify) the caller's actual data or a copy of it — covered fully, including method sets and `go build -gcflags=-m` escape output, in [[Pointers, Values and Escape Analysis]]. The rule of thumb here: **use a pointer receiver whenever the method must mutate the receiver**, and keep it consistent across all of a type's methods so callers don't have to remember which methods mutate.
+**Methods and receivers.** Every method is really a plain function with the receiver as a hidden first parameter. The choice between a value receiver and a pointer receiver decides whether the method sees (and can modify) the caller's actual data or a copy of it — covered fully, including method sets and `go build -gcflags=-m` escape output, in [[Pointers, Values and Escape Analysis]].
+
+The rule of thumb here: **use a pointer receiver whenever the method must mutate the receiver**, and keep it consistent across all of a type's methods so callers don't have to remember which methods mutate.
 
 **Embedding resolution.** When you embed a type, the compiler builds a field-and-method lookup table that includes the embedded type's exported members at "depth 1." A selector like `r.ID` or `r.Describe()` is resolved by searching outward by increasing depth:
 
@@ -351,3 +398,8 @@ Same fields, same behavior, 33% less memory per value just from reordering — t
 - **Before this:** [[Syntax, Types and Control Flow]], [[Strings, Bytes, Runes and Unicode]]
 - **Next:** [[Interfaces]], [[Pointers, Values and Escape Analysis]]
 - **Compare with:** [[OOP in Go - Structs, Interfaces, Embedding]] (the same mechanics applied to LLD-style class design), [[Go Interview Questions and Traps]]
+
+### Watch on YouTube
+
+- [Embedded Structs in Go](https://www.youtube.com/watch?v=j3d89BBVBcY) · Gary Clarke · Focused explainer on struct embedding and method/field promotion
+- [Mastering Embedding (Composition) and Promotion in Go with Code Examples](https://www.youtube.com/watch?v=SY34nId4qQA) · Code & Learn · Code-example-driven walkthrough of composition over inheritance via embedding

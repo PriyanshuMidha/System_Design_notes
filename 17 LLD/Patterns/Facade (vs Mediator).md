@@ -8,7 +8,7 @@ sources:
   - "Gamma, Helm, Johnson, Vlissides, Design Patterns (1994), Facade and Mediator"
   - "Go standard library docs: net/http Get and DefaultClient, os.ReadFile"
   - "Go 1.20 release notes: errors.Join; Go 1.21 release notes: context.WithoutCancel"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Facade (vs Mediator)
@@ -22,11 +22,64 @@ updated: 2026-11-02
 > - The rule that matters: a facade talks one way (down to its parts); a mediator talks both ways (between its colleagues).
 > - Classic mistake: forgetting compensation, so a declined payment leaves stock reserved forever.
 
+## Start here: the basics
+
+**The problem in one story.**
+You order a pizza by phone. Behind the counter, someone checks stock, takes payment and tells the kitchen.
+You never call the kitchen or the bank yourself; one person does it in the right order.
+If the card is declined, that person also cancels the kitchen ticket.
+That one person is a facade. A mediator is different: a hub that many peers report to, which decides who acts next.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Service | A piece of code (or server) that does one job | Inventory, Payments, Orders |
+| Interface | A list of methods a type promises to have | `type Payments interface { Charge(...) error }` |
+| Subsystem | The group of parts hidden behind the facade | The three services behind `Checkout` |
+| Compensation | Undoing an earlier step after a later one fails | Release the reserved stock when payment fails |
+| Coupling | How much one piece depends on another | Every handler calling all three services is tight coupling |
+| Colleague | A peer object that talks only to the mediator | One plane talking to the control tower |
+| Orchestration | One coordinator calling steps in order | `Checkout` calling reserve, charge, create |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Caller"] --> F["Facade: Checkout"]
+    F --> I["Inventory"]
+    F --> P["Payments"]
+    F --> O["Orders"]
+    A["Plane A"] <--> T["Mediator: tower"]
+    B["Plane B"] <--> T
+```
+
+**Analogy.** A facade is a hotel concierge: you ask once, and they book the taxi, table and tickets. A mediator is an air-traffic control tower that every plane reports to.
+Where it breaks: a real concierge improvises when things fail; code compensation must be written explicitly, step by step, or nothing gets undone.
+
+**How the rest of this note builds up**
+
+- First, why both exist (section 1) and the one-way vs two-way mental model (section 2).
+- Then how a facade orders and compensates its calls, with a whiteboard version (section 3).
+- Then a full worked example in Go with tests (section 4) and a comparison table (section 5).
+- Finally the SDE-3 view: trade-offs, production concerns such as sagas, the deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Facade: one simple door down into many parts. Mediator: one hub that peers talk through.
+
 ## 1. Why it exists
 
-**Facade.** Placing an order touches three services: reserve 2 units of milk in inventory, charge ₹136 through payments, create the order. If the HTTP handler, the mobile BFF and the admin tool each make those three calls themselves, each one must also get the order right and undo the earlier steps when a later one fails. One of them will forget: the payment is declined, the 2 reserved units are never released, and the product shows "out of stock" while 2 units sit in a dead reservation. A facade puts the sequence and its undo logic in one place, so every caller makes one call.
+**Facade.** Placing an order touches three services: reserve 2 units of milk in inventory, charge ₹136 through payments, create the order.
 
-**Mediator.** Thirty planes approach one runway. If each plane talks to every other plane to agree who lands next, that is 30 × 29 = 870 one-way links, and the landing rule is copied into every plane. With a control tower, each plane talks only to the tower (30 links) and the rule lives in one object. The mediator turns many-to-many coupling into many-to-one.
+If the HTTP handler, the mobile BFF and the admin tool each make those three calls themselves, each one must also get the order right and undo the earlier steps when a later one fails.
+
+One of them will forget: the payment is declined, the 2 reserved units are never released, and the product shows "out of stock" while 2 units sit in a dead reservation.
+
+A facade puts the sequence and its undo logic in one place, so every caller makes one call.
+
+**Mediator.** Thirty planes approach one runway. If each plane talks to every other plane to agree who lands next, that is 30 × 29 = 870 one-way links, and the landing rule is copied into every plane.
+
+With a control tower, each plane talks only to the tower (30 links) and the rule lives in one object. The mediator turns many-to-many coupling into many-to-one.
 
 ## 2. Mental model
 

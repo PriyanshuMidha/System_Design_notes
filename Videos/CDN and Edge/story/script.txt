@@ -1,0 +1,97 @@
+# id | speaker | tone | spoken text.  Speakers: N MAYA OSCAR PIA SAM.  Lines starting with # are comments.  "== name" starts a scene.
+== s1 One kitchen, one planet
+l1 | N | hook | This is Oscar. Oscar runs the only bakery in the world, in Virginia. His website is his shop, and every loaf is a file. A photo, a page, a video.
+l2 | N | normal | And this is Maya. She lives in Mumbai. She taps to open his shop.
+l3 | MAYA | punch | One loaf, please!
+l4 | N | normal | Her request has to cross half the planet. Typically one hundred eighty to two hundred fifty milliseconds, each way. Add the handshakes, and the first byte of a cold connection can take four to six hundred milliseconds.
+l5 | N | punch | Now imagine fifty thousand Mayas, every single day. Every one of them held open by Oscar. Every loaf baked and carried by Oscar.
+l6 | OSCAR | calm | I cannot keep doing this.
+== s2 Pia opens a branch
+l7 | N | normal | So Oscar has an idea. He opens a small branch right inside Mumbai, and puts Pia in charge.
+l8 | N | normal | A chain of branches, placed close to the customers. That is a C D N, a content delivery network. And each branch is called a pop, a point of presence.
+l9 | PIA | hook | Welcome! I keep copies of Oscar's loaves on my shelf.
+l10 | MAYA | normal | One loaf, please.
+l11 | PIA | punch | Right here!
+l12 | N | punch | That is a cache hit. Milliseconds, not hundreds. And Oscar never even heard about it.
+== s3 A loaf Pia does not have
+l13 | N | normal | Next, a customer asks for a loaf Pia has never stocked. That is a cache miss. Pia does not run to Virginia. She phones Sam.
+l14 | PIA | question | Sam, do you have the rye?
+l15 | SAM | calm | Not today. I will ask Oscar.
+l16 | N | normal | Sam is the origin shield. One regional tier, between the branches and the bakery. Oscar bakes the loaf once. It travels back through Sam to Pia, and Pia keeps a copy.
+l17 | PIA | normal | And the next customer gets it straight from the shelf.
+l18 | N | normal | This is called a pull C D N. The branch fetches a loaf only when someone first asks. The other way is a push C D N. Oscar delivers loaves to every shelf in advance, for example before a big launch. More work to manage, but nobody ever waits for a first miss.
+== s4 How Maya finds Pia
+l19 | MAYA | question | But how do I reach the Mumbai branch, and not the Virginia one?
+l20 | N | normal | Two ways. With anycast, every branch shares one phone number, and the phone network itself rings the nearest one. Cloudflare and Fastly work like this.
+l21 | N | normal | With geo D N S, the directory gives out a different number for each region. Cloud Front works like this, and Akamai mixes both.
+== s5 Labels and freshness
+l22 | N | normal | Oscar sticks a label on every loaf.
+l23 | OSCAR | normal | Fresh for one hour.
+l24 | N | normal | That is max age, the T T L, how long a copy counts as fresh. A label just for branches is S max age. One that says check with me first is no cache. And one that says never shelve this is no store.
+l25 | N | question | So what happens when the hour is up?
+l26 | PIA | normal | I do not throw it away. I phone Oscar. Is the sourdough still the same batch?
+l27 | OSCAR | calm | Same recipe. Keep it.
+l28 | N | normal | That is a three oh four. No new loaf is sent, only a cheap yes. The copy is fresh again.
+l29 | N | normal | There is a smarter label too, stale while revalidate. Pia hands over the slightly old loaf instantly, and checks with Oscar in the background. The customer never waits.
+== s6 Which loaf is which
+l30 | N | normal | Pia needs to know which orders share one loaf. That is the cache key, normally the address of the order. Sourdough sliced is one loaf. Sourdough whole is another.
+l31 | MAYA | hook | The ribbon is blue!
+l32 | PIA | normal | A ribbon does not change the bread. Same loaf.
+l33 | N | warn | Those are tracking parameters, like U T M source. A good key ignores them, or the same loaf is stored a thousand times. But the opposite mistake is worse. If the key included a different cookie for every customer, that is Vary on Cookie, no two customers would ever share a loaf, and the shelf would be useless.
+== s7 Friday morning rush
+l34 | N | normal | Friday, nine a m. The sourdough's label runs out, and a hundred customers ask within five milliseconds, at branches all over the city.
+l35 | N | warn | If every one of them phoned Oscar, he would be buried. A stampede, and one the shop caused itself.
+l36 | PIA | punch | Everyone wait. I will phone once, for all of you.
+l37 | N | normal | That is request collapsing. Sam does the same, one tier up.
+l38 | SAM | calm | One call to Oscar. Not a hundred.
+l39 | N | punch | A hundred requests. Exactly one for Oscar.
+== s8 What must never be shelved
+l40 | N | normal | Then Maya orders a birthday cake, with her own name on it.
+l41 | PIA | normal | This one is private. It never goes on a shared shelf.
+l42 | N | warn | Private and no store exist for exactly this. Never let a response with a Set Cookie sit in a shared cache. A cake with one person's details, shelved publicly, goes home with a stranger.
+l43 | N | warn | Two tricks to know. Cache poisoning. A prankster slips a fake label onto a loaf, the shelf ignores that detail when matching orders, and the fake loaf is handed to everyone. And cache deception. The prankster asks for Maya's private page with a fake ending, like slash nonexistent dot C S S. The shelf thinks it is a plain style file, shelves it, and hands Maya's page to strangers.
+l44 | N | normal | The fix for both. The shelf code must include everything that makes a loaf different, and the bakery must reject strange endings, instead of quietly serving the same page.
+l45 | N | normal | For paid downloads, Oscar uses a signed ticket in the address, a signed U R L, with an expiry time and a signature the branch checks. For a whole video, one signed cookie opens a whole aisle.
+== s9 Changing the recipe
+l46 | N | normal | Oscar improves his sourdough. How do the old loaves leave a hundred shelves?
+l47 | OSCAR | punch | I do not recall anything. I rename it. Sourdough Two.
+l48 | N | normal | That is a versioned U R L. The old name is simply abandoned, and nothing has to expire.
+l49 | N | normal | Or Oscar can recall only the loaves with one tag. That is a tag purge. Or mark old loaves stale while fresh ones arrive. That is a soft purge.
+l50 | N | warn | But never shout, throw away everything. All the branches phone Oscar in the same second, and a routine change becomes an outage.
+== s10 Pia has a brain
+l51 | N | normal | Pia is more than a shelf. At the door she checks tickets, an expiry check on a token. She redirects people, runs taste tests, and turns troublemakers away. That is edge compute, your own code at the branch.
+l52 | PIA | normal | But I never decide what a member may order. Oscar keeps the real member list. My copy is only eventually up to date.
+l53 | N | normal | And custom orders, like checkout, cannot be shelved. Still, Pia helps. The slow handshakes happen with the customer right here in Mumbai, over a short hop. Pia keeps a warm phone line to Oscar always open, and may even use a private road, the provider's own backbone, for the long leg. That is dynamic site acceleration, a product of its own. A newer protocol, H T T P three, even lets Maya's connection survive a switch from wifi to mobile data.
+== s11 Video and the scoreboard
+l54 | N | normal | Videos are loaves too, but huge. So Oscar slices a video into short segments, called H L S or dash. Every slice is cached separately, and Maya's player can switch quality mid stream by asking for a different slice.
+l55 | PIA | normal | I keep score two ways. Hit ratio counts requests. Byte hit ratio counts weight, because one giant video can make the request count look better than it really is.
+l56 | N | normal | A good manager also watches origin offload, the share of requests that never reached Oscar. First byte time in each region. How fast purges finish. And the bandwidth bill, per region.
+== s12 Who sells branches, and the trade-offs
+l57 | N | normal | Many companies sell this. Cloudflare puts cache, security and code at every branch. Fastly and Akamai are known for fine control and fast purges. Cloud Front fits neatly with Amazon's own services. Or a team can build a few branches themselves, with Varnish or Engine X, but then owns the hardware, the routing, and the pager.
+l58 | N | calm | Branches are not free. Pia may serve a stale loaf. A problem in Brazil means checking a branch Oscar does not own. A branch cannot cure one viral loaf, because every request for it still funnels to one shelf slot. Rarely repeated custom orders gain little from the shelf. And a cafeteria with only local staff does not need branches at all.
+== s13 Deep dive: the details that bite
+l58a | N | normal | A few deeper points. First, why does S max age exist? Max age came before anyone needed a shared versus private split. S max age lets the operator give the C D N a different freshness window from the browser, without serving two different bodies.
+l58b | N | normal | Next, stale if error. Like stale while revalidate, but it hides origin outages. If Oscar is down, Pia serves the old loaf instead of an error. Both are nearly free wins.
+l58c | N | warn | Anycast has a risk, route flapping. If the routes change in the middle of a session, a connection can suddenly land at a different branch, and a long lived stream or web socket can break. So providers keep their announcements very stable.
+l58d | N | normal | Cost has a shape too. Egress is priced per gigabyte, and the price swings a lot by region. A high hit ratio also cuts the origin's own bandwidth bill. And edge key value stores are fast to read everywhere, but slow to write, seconds to tens of seconds to spread. Fine for a feature flag. Wrong for a counter.
+l58e | N | normal | Last, collapsing has a limit. It only helps while a fetch is in flight. A key that is cold everywhere, asked at different moments, is just normal traffic. There the shield's only job is to be the tier that holds the warm copy everyone else asks.
+== s14 Reading real cache headers
+l58f | N | normal | Let us read real headers. The note measured this with curl, against the Cloudflare marketing page. The answer carried cache control, no store. On purpose. That page is personalised and full of experiments, so the origin opts out of every shared cache, rather than show one visitor's version to everyone.
+l58g | N | normal | Compare a public static file. Its header says cache control public, max age three thousand six hundred, plus an age field and a cache status field. You can literally watch a real cache holding it for an hour. Reading these few headers tells you what any response will do.
+== s15 In Go: a tiny origin shield
+l58h | N | normal | Now the code. In Go, a tiny origin shield, in under forty lines. It holds one map, from a cache key to a call that is already in flight, guarded by a mutex.
+l58i | N | normal | Get takes the lock, and checks the map. If a fetch for this key is already running, it counts itself as one more waiter, drops the lock, and waits on a channel.
+l58j | N | normal | If not, it registers a new call first, and only then drops the lock and calls the origin. Registering before unlocking is the whole point. Anyone arriving in that window sees the entry, not a second fetch.
+l58k | N | normal | When the origin answers, the call is removed, and the channel is closed. Closing wakes every waiter at once, and the result is safe to read. The test fires one hundred concurrent misses, and proves exactly one origin call, with the race detector on.
+== s16 Interview round
+l58l | N | hook | Interview round. Five questions you will really get.
+l58m | N | normal | One. Max age versus S max age? Max age applies to every cache, browsers included. S max age overrides it, but only for shared caches like a C D N. Browsers ignore it. Set both to hold a response longer, or shorter, in the C D N than in the browser.
+l58n | N | normal | Two. The hit ratio falls to nearly zero after someone adds Vary on Cookie. Why? Almost every request now has a different cookie, so almost every request becomes its own cache key. Nothing is shared. Strip the cookie before the lookup, or stop varying on it.
+l58o | N | normal | Three. True or false: a C D N cannot help a logged in dashboard. False. Even uncacheable pages gain from dynamic acceleration. T L S ends at the nearby branch, the origin connection stays warm, and H T T P three helps.
+l58p | N | normal | Four. Poisoning versus deception? Poisoning: the key misses an input the origin varies on, so one bad response is shared with everyone. Deception: the cache is tricked into storing a private page that only looks static.
+l58q | N | normal | Five. What runs at the edge, and what stays at the origin? The edge can check a token's signature and expiry, for a fast reject. The real permission decision stays at the origin, because the edge's view can be stale. And geo D N S versus anycast? Anycast fails over almost instantly and ignores resolver location, but needs routing. Geo D N S is simpler, but coarse, and bounded by the T T L.
+== s17 Summary
+l59 | N | normal | So, in short. Copies sit close to the customers. Labels say how long they stay fresh. The key says what is shared. Collapsing protects Oscar. Rename instead of recall. Private stays private. Quick checks at the edge, real decisions at the origin.
+l59n | N | calm | To go deeper, open the note called C D N and Edge, and its Go note, in your vault. Before it, read H T T P fundamentals, and D N S. After it, forward and reverse proxies, and what happens when you type a U R L.
+l60 | MAYA | hook | Thank you, Pia!
+l61 | PIA | punch | Next!

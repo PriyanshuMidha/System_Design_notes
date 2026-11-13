@@ -12,13 +12,22 @@ sources:
   - "pgx v5.8 source: QueryTracer, CollectRows, SendBatch, statement_cache_capacity default 512"
   - "GORM docs, Preloading (Preload vs Joins)"
   - "graphql/dataloader README (batching within one event-loop tick)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # N+1 Query Problem - Go
 
 > [!summary] TL;DR
 > The runnable side of [[N+1 Query Problem]]: an invoice-list handler written twice (one query per row, then one batched query), the pgx query that sends all IDs as a single `bigint[]` parameter, a query counter for pgx, a generic per-request DataLoader, and tests that pin the query count so it cannot grow with the page size.
+
+## Before the code
+
+- **Interfaces**: the handler depends on a small `Store` interface, so tests use a fake store that counts queries.
+- **Generics**: `Loader[K, V]` batches lookups for any key and value type.
+- **`slices.Chunk`** (Go 1.23+): splits a long ID list into fixed-size chunks.
+- **Goroutines, `sync.Once`, `time.Timer` and channels**: the loader collects keys for a short window, then fetches once and wakes every waiter.
+- **`context.Context`**: a waiting `Load` returns early if the request is cancelled.
+- **Run**: `go mod tidy && go vet ./... && go test -race -v ./...` (no database needed).
 
 ## What this code shows
 
@@ -51,7 +60,9 @@ flowchart LR
 
 ## How to read this note
 
-Every step has a Concept paragraph that ties the code to the theory note and names the alternatives, a block of at most about 25 lines, and a numbered How it works list. Where a file is long, it is cut into consecutive pieces; read them in order and they form the file. Every piece beginning without a `package` line belongs to the file of the piece above it.
+Every step has a Concept paragraph that ties the code to the theory note and names the alternatives, a block of at most about 25 lines, and a numbered How it works list.
+
+Where a file is long, it is cut into consecutive pieces; read them in order and they form the file. Every piece beginning without a `package` line belongs to the file of the piece above it.
 
 ## Code map
 
@@ -71,7 +82,11 @@ The recurring theme is that the fix changes the shape of the work, not the speed
 
 ### Step 1: the repository interface and the types
 
-**Concept.** The N+1 problem lives in the gap between "what the handler wants" (invoices with client names) and "what the repository offers" (one lookup per ID). The handler therefore depends on a `Store` interface with both a single lookup (`GetClient`) and a batch lookup (`ClientsByIDs`), so the same handler logic can run against the naive loop, the batched version, or a fake that counts queries ([[N+1 Query Problem#1. Why it exists]]). The alternatives are a concrete `*pgxpool.Pool` in the handler, which cannot be tested without a database, or an ORM relation, which hides the query count. The interface was chosen so that a test can assert the number of queries, which is the property that matters.
+**Concept.** The N+1 problem lives in the gap between "what the handler wants" (invoices with client names) and "what the repository offers" (one lookup per ID).
+
+The handler therefore depends on a `Store` interface with both a single lookup (`GetClient`) and a batch lookup (`ClientsByIDs`), so the same handler logic can run against the naive loop, the batched version, or a fake that counts queries ([[N+1 Query Problem#1. Why it exists]]).
+
+The alternatives are a concrete `*pgxpool.Pool` in the handler, which cannot be tested without a database, or an ORM relation, which hides the query count. The interface was chosen so that a test can assert the number of queries, which is the property that matters.
 
 ```go
 package n1
@@ -124,7 +139,9 @@ classDiagram
 
 ### Step 2: the naive list handler
 
-**Concept.** This is the textbook N+1: one query for the page, then a query inside the loop for each row ([[N+1 Query Problem#1. Why it exists]]). It is correct, and it is fast on a developer laptop with five rows, which is why it ships. The cost is N round trips, each paying network latency, a pool checkout and a query parse. It is kept in the code on purpose, as the baseline that the tests compare the batched version against.
+**Concept.** This is the textbook N+1: one query for the page, then a query inside the loop for each row ([[N+1 Query Problem#1. Why it exists]]). It is correct, and it is fast on a developer laptop with five rows, which is why it ships.
+
+The cost is N round trips, each paying network latency, a pool checkout and a query parse. It is kept in the code on purpose, as the baseline that the tests compare the batched version against.
 
 ```go
 // Row is one line of the invoice list page.
@@ -175,7 +192,13 @@ sequenceDiagram
 
 ### Step 3: the batched list handler
 
-**Concept.** The fix follows the steps in [[N+1 Query Problem#The batching steps]]: collect the foreign keys, remove duplicates, fetch them in a few queries, and stitch the results in memory with a map. Sorting first matters because `slices.Compact` only removes adjacent duplicates. Chunking bounds the size of each `ANY` list, so a page of ten thousand IDs does not become one enormous statement. The alternatives are a SQL join, which fetches the client columns in the same query but repeats them on every row and is awkward to compose, and an ORM preload, which does the same two-query pattern under the hood. The code does it by hand so that every step, and the failure on a missing client, is visible. The first piece collects IDs and fetches.
+**Concept.** The fix follows the steps in [[N+1 Query Problem#The batching steps]]: collect the foreign keys, remove duplicates, fetch them in a few queries, and stitch the results in memory with a map. Sorting first matters because `slices.Compact` only removes adjacent duplicates.
+
+Chunking bounds the size of each `ANY` list, so a page of ten thousand IDs does not become one enormous statement.
+
+The alternatives are a SQL join, which fetches the client columns in the same query but repeats them on every row and is awkward to compose, and an ORM preload, which does the same two-query pattern under the hood.
+
+The code does it by hand so that every step, and the failure on a missing client, is visible. The first piece collects IDs and fetches.
 
 ```go
 // ListBatched runs 1 query for the page plus 1 query per chunk of distinct
@@ -246,7 +269,13 @@ flowchart LR
 
 ### Step 4: the Postgres side of the batch
 
-**Concept.** On the wire, a batch of IDs must be one statement with one parameter. `id = ANY($2)` takes a PostgreSQL array, and pgx sends a Go `[]int64` as a `bigint[]`, so the statement text and the number of bind parameters stay constant for any list size ([[N+1 Query Problem#The difference on the wire]]). The alternative is building `IN ($1, $2, ... $n)` by string concatenation, which creates a new statement text for every list length, defeats the prepared-statement cache and has a protocol limit on the number of parameters. The `workspace_id` filter is part of the query, not an afterthought, so a bad ID cannot read another tenant's client.
+**Concept.** On the wire, a batch of IDs must be one statement with one parameter.
+
+`id = ANY($2)` takes a PostgreSQL array, and pgx sends a Go `[]int64` as a `bigint[]`, so the statement text and the number of bind parameters stay constant for any list size ([[N+1 Query Problem#The difference on the wire]]).
+
+The alternative is building `IN ($1, $2, ... $n)` by string concatenation, which creates a new statement text for every list length, defeats the prepared-statement cache and has a protocol limit on the number of parameters.
+
+The `workspace_id` filter is part of the query, not an afterthought, so a bad ID cannot read another tenant's client.
 
 ```go
 package n1
@@ -285,7 +314,13 @@ The same query as an sqlc declaration is in [[N+1 Query Problem]].
 
 ### Step 5: counting queries per request
 
-**Concept.** The cheapest way to find N+1 in a running service is to count queries per request and alert when the count is large ([[N+1 Query Problem#7. In production]]). A pgx `QueryTracer` is called at the start of every query, and a counter stored in the request context lets the tracer attribute each query to its request. The alternatives are `pg_stat_statements`, which shows a hot statement with a huge call count but not which request caused it, and a distributed trace, which shows each query as a span but needs more infrastructure. The tracer is the lightweight option. The first piece creates the counter.
+**Concept.** The cheapest way to find N+1 in a running service is to count queries per request and alert when the count is large ([[N+1 Query Problem#7. In production]]).
+
+A pgx `QueryTracer` is called at the start of every query, and a counter stored in the request context lets the tracer attribute each query to its request.
+
+The alternatives are `pg_stat_statements`, which shows a hot statement with a huge call count but not which request caused it, and a distributed trace, which shows each query as a span but needs more infrastructure. The tracer is the lightweight option.
+
+The first piece creates the counter.
 
 ```go
 package n1
@@ -356,7 +391,13 @@ sequenceDiagram
 
 ### Step 6: a per-request DataLoader
 
-**Concept.** In GraphQL, resolvers for different fields run independently, so no single function can collect all the IDs. A DataLoader solves that by letting every resolver ask for one key and then running one batch for all keys asked within a short window ([[N+1 Query Problem#How a DataLoader works without an event loop]], [[N+1 Query Problem#The GraphQL flow it enables]]). The JavaScript original batches within one event-loop tick; Go has no tick, so this loader uses a wait window plus a maximum batch size. The alternative is to prefetch in the parent resolver, which works but couples resolvers to each other. The loader is created per request because it caches every key and shares the request's context. The first piece defines the types.
+**Concept.** In GraphQL, resolvers for different fields run independently, so no single function can collect all the IDs.
+
+A DataLoader solves that by letting every resolver ask for one key and then running one batch for all keys asked within a short window ([[N+1 Query Problem#How a DataLoader works without an event loop]], [[N+1 Query Problem#The GraphQL flow it enables]]).
+
+The JavaScript original batches within one event-loop tick; Go has no tick, so this loader uses a wait window plus a maximum batch size. The alternative is to prefetch in the parent resolver, which works but couples resolvers to each other.
+
+The loader is created per request because it caches every key and shares the request's context. The first piece defines the types.
 
 ```go
 package n1
@@ -510,7 +551,9 @@ func (l *Loader[K, V]) dispatch(ctx context.Context, b *batch[K, V]) {
 
 ### Step 7: the whiteboard version
 
-**Concept.** The bare idea from [[N+1 Query Problem#Whiteboard version]], with no interface, no errors and no chunking, so it fits on a whiteboard: the slow function queries inside the loop, the fast one collects IDs, queries once and joins in a map. It shows that the fix is a change of shape, not a faster database. It deliberately ignores missing clients, which the full version handles.
+**Concept.** The bare idea from [[N+1 Query Problem#Whiteboard version]], with no interface, no errors and no chunking, so it fits on a whiteboard: the slow function queries inside the loop, the fast one collects IDs, queries once and joins in a map.
+
+It shows that the fix is a change of shape, not a faster database. It deliberately ignores missing clients, which the full version handles.
 
 ```go
 package wb
@@ -739,7 +782,9 @@ func TestQueryCountDoesNotGrowWithPageSize(t *testing.T) {
 }
 ```
 
-**How it works.** `queries.Swap(0)` reads the naive count and resets it in one atomic step, so the batched run starts from zero. The chunk size is 1,000, larger than any list here, so the batched run is always one list query plus one client query. `slices.Equal` compares the two row slices, which proves the fix is not just faster but identical.
+**How it works.** `queries.Swap(0)` reads the naive count and resets it in one atomic step, so the batched run starts from zero. The chunk size is 1,000, larger than any list here, so the batched run is always one list query plus one client query.
+
+`slices.Equal` compares the two row slices, which proves the fix is not just faster but identical.
 
 **If it fails.** A naive count different from `1 + n` means the fake or the handler changed. A batched count above 2 means the code is querying per row or per client. Different rows mean the stitching is wrong.
 

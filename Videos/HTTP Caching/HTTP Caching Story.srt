@@ -1,0 +1,336 @@
+1
+00:00:02,399 --> 00:00:21,210
+Narrator: Nine in the morning. Olga, who runs the price office, changes the price of a loaf from one forty nine to one ninety nine. By ten, customers are still seeing the old price, and the shop is losing money on every sale. The price changed at the source. So why does nobody see it? Detective Olga, and her rookie Ben, are on the case.
+
+2
+00:00:21,640 --> 00:00:31,353
+Olga: Ben, a copy of my answer is hiding somewhere between my office and the customer. We find every hiding place, and learn the rules that put it there.
+
+3
+00:00:31,783 --> 00:00:45,002
+Narrator: Ben opens the shopping site every morning. The logo, the fonts, the layout, and the price are the same as yesterday. If his browser downloaded all of it again every time, pages would be slow, and the servers would do the same work millions of times.
+
+4
+00:00:45,432 --> 00:01:02,945
+Narrator: H T T P caching lets a browser, and servers in between, keep a copy of an answer and reuse it safely. Think of milk in a fridge, with a best before date. Before the date, you just drink it. After the date, you sniff it. If it is fine, you keep it. If not, you buy a new carton.
+
+5
+00:01:03,375 --> 00:01:17,049
+Narrator: Meet the cast. Fran is Ben's fridge, the browser cache. Carl runs a warehouse near the street, a shared cache, like a C D N. And Olga runs the price office. She is the origin server, the only one who owns the truth.
+
+6
+00:01:17,480 --> 00:01:35,329
+Narrator: The words you need. A request is the question, a response is the answer. A header is a labelled line of extra information. The body is the content. A status code says how it went, two hundred is okay, three oh four is not modified. And a fingerprint is a short string that changes whenever the content changes.
+
+7
+00:01:38,280 --> 00:01:56,370
+Narrator: Picture a price page that rarely changes, but a thousand people load it every minute. Without caching, each of those loads fetches the same styles, images, fonts, and price data from Olga's office, even when nothing changed. Wasted bandwidth, wasted processing, and delay that Ben feels on every click.
+
+8
+00:01:56,799 --> 00:02:14,145
+Narrator: The rules, mostly in R F C ninety one eleven, solve this with two different tools, working at different moments. Freshness avoids the trip entirely, for a window of time Olga names up front. Validation avoids resending the body, once that window has passed, by letting the server answer, still the same, cheaply.
+
+9
+00:02:14,575 --> 00:02:30,193
+Narrator: A concrete case. A price file is only fourteen bytes. Served fresh from a cache with max age sixty, a full minute of traffic costs Olga zero requests. After that, a conditional request costs her one cheap comparison, and a three oh four with no body.
+
+10
+00:02:30,623 --> 00:02:41,801
+Fran: Every time Ben asks, I ask myself two questions, in order. Do I already have a recent enough copy? And if not, has it actually changed since I last checked?
+
+11
+00:02:42,331 --> 00:02:52,141
+Narrator: Remember. A cache always asks, can I skip the trip, before it asks, can I skip the resend. Freshness and validation are two separate gates, not one setting.
+
+12
+00:02:55,092 --> 00:03:03,918
+Narrator: Suspect one. Fran, Ben's fridge, the browser cache. A copy of the old price could be sitting in her fridge, still within its best before date.
+
+13
+00:03:04,348 --> 00:03:16,102
+Narrator: Gate one. Olga sends a header called Cache control. It tells every cache on the way, the browser, a company proxy, a C D N edge, how long this exact response counts as current, and who may keep a copy.
+
+14
+00:03:16,532 --> 00:03:20,222
+Olga: Cache control, public, max age sixty.
+
+15
+00:03:20,651 --> 00:03:33,030
+Narrator: Fran stores it at time zero. For every request up to second sixty, she answers from memory, with no contact with Olga at all. At second sixty one, the copy is stale, and she must at least ask.
+
+16
+00:03:33,460 --> 00:03:42,502
+Narrator: Now the directives, one by one. Max age, N, means fresh for N seconds, for any cache, browser or shared. Like a best before date on a food label.
+
+17
+00:03:42,931 --> 00:03:51,542
+Narrator: S max age overrides max age, but only for shared caches, like Carl's warehouse. A separate shelf life for the warehouse, not your home fridge.
+
+18
+00:03:51,972 --> 00:04:06,461
+Narrator: No cache. Many people think it forbids caching. It does the opposite. The cache may store the response, but must check with Olga before every reuse. Like a librarian who keeps a copy on the desk, but phones ahead before lending it.
+
+19
+00:04:06,891 --> 00:04:13,990
+Narrator: No store means do not keep any part of it, anywhere. A message that destroys itself. Nothing is ever written down.
+
+20
+00:04:14,419 --> 00:04:29,870
+Narrator: Private means only one user's own browser may store it. Shared caches must not. A locker that opens only with your own key. Public explicitly allows shared caches to store it, even when the request carried a login. A notice board anyone may read.
+
+21
+00:04:30,300 --> 00:04:46,158
+Narrator: Immutable says this exact address will never change, so skip even the check, even when the user presses reload. It is for file names containing a content hash, like app dot three f eight a two one dot j s. Never for an address that gets reused with new content.
+
+22
+00:04:46,588 --> 00:05:06,069
+Narrator: Stale while revalidate, N. Serve the stale copy at once, and refresh in the background for up to N seconds. Like handing over yesterday's newspaper while someone runs for today's. And stale if error, N, serve the stale copy if the origin errors or cannot be reached. Yesterday's weather forecast, in case today's station is down.
+
+23
+00:05:06,500 --> 00:05:25,189
+Narrator: The mix up to avoid. No cache and no store answer different questions. No cache says, keep it, but always check first. No store says, keep nothing, so there is nothing to check. Max age answers, how long. No cache and no store answer, under what conditions. And public and private answer, who.
+
+24
+00:05:28,139 --> 00:05:36,533
+Narrator: Suspect two. What happens after the best before date? Does Fran throw the old copy away, or check it? The check is the next gate.
+
+25
+00:05:36,963 --> 00:05:47,062
+Narrator: Gate two. The copy has gone stale. Fran does not have to download everything blind. She sends back a short fingerprint of what she holds, and asks, is this still current?
+
+26
+00:05:47,492 --> 00:06:01,237
+Narrator: That fingerprint is an E tag. An opaque string the server chooses. A hash of the content, a version number, or a database row's updated time. Last modified is the same idea, using a timestamp instead of a fingerprint.
+
+27
+00:06:01,668 --> 00:06:03,581
+Ben: What is the price today?
+
+28
+00:06:04,012 --> 00:06:13,750
+Fran: My copy is stale. Olga, I hold the tag zero f two six d zero f one. If none match. Is it still current?
+
+29
+00:06:14,180 --> 00:06:26,197
+Olga: Same tag. Nothing changed. Three oh four, not modified. And I did not even read the body, I only compared two short strings.
+
+30
+00:06:26,627 --> 00:06:35,262
+Narrator: That is validation working. A three oh four has no body. The fourteen bytes are never sent a second time, and Fran's copy is fresh again.
+
+31
+00:06:35,692 --> 00:06:53,110
+Narrator: If Ben sends both validators, if none match and if modified since, the E tag wins. E tags are exact, byte for byte. Last modified has only one second resolution, and cannot detect a change that goes back to identical content within the same second. The rule is in R F C ninety one ten.
+
+32
+00:06:53,540 --> 00:07:11,701
+Narrator: A classic mistake. Putting something that changes on every response, a timestamp, or a per process random number, inside the bytes the E tag hashes. Then every request gets a new tag, even when nothing meaningful changed, and the server never answers three oh four again. Caching silently stops working.
+
+33
+00:07:14,651 --> 00:07:21,317
+Narrator: Suspect three. The sorter, Vera. Could one address hold several versions, so that a customer gets the wrong one?
+
+34
+00:07:21,747 --> 00:07:36,069
+Narrator: Some responses are not one thing. The same address may return compressed bytes to one client, and plain bytes to another. Meet Vera, the sorter at Carl's warehouse. The Vary header tells her which request header splits the shelf into separate copies.
+
+35
+00:07:36,500 --> 00:07:48,350
+Vera: Vary, accept encoding. So I keep one copy for clients that accept gzip, and one for those that do not. They are not interchangeable, even at the same address.
+
+36
+00:07:48,779 --> 00:08:03,173
+Narrator: And the famous anti pattern. Vary cookie. Cookies are usually unique per visitor, so Vera must keep one copy per person. A near infinite number of shelves. Technically correct, and a shared cache that almost never hits.
+
+37
+00:08:03,603 --> 00:08:19,317
+Narrator: If a response really differs per user, mark it private, and do not count on a shared cache at all. Or split the cacheable, cookie free parts from the personal parts. Vary is a correctness tool, not a speed tool. It only pays off when the named header has few distinct values.
+
+38
+00:08:22,267 --> 00:08:30,757
+Narrator: Suspect four. Carl's shared warehouse, a C D N, sits between every customer and Olga. The old price may be on his shelf.
+
+39
+00:08:31,187 --> 00:08:43,662
+Carl: I am Carl. Olga's label says S max age three hundred. So I keep the price for five minutes, and I never ask her. But Ben's browser has max age zero.
+
+40
+00:08:44,091 --> 00:09:04,653
+Narrator: That explains it. S max age governs only shared caches, like Carl's. It does not set the browser's own freshness. With max age missing or zero, the browser revalidates on every load, while the C D N serves its own fresh copy for three hundred seconds without reaching the origin. Two audiences, two directives, and they must be set deliberately.
+
+41
+00:09:07,604 --> 00:09:25,717
+Narrator: Now trace one resource, price dot json, across two requests. Cold request first. No if none match header arrives, because Ben has nothing stored. Olga computes the E tag, sets cache control, E tag, last modified, and vary, and writes a two hundred with the full fourteen byte body.
+
+42
+00:09:26,148 --> 00:09:38,717
+Narrator: Fran stores the body, and the tag. Sixty seconds pass, and the max age window closes. The next time Ben asks, the copy is stale, so Fran sends a conditional request, with if none match, and the tag she holds.
+
+43
+00:09:39,148 --> 00:09:51,861
+Narrator: Olga recomputes the current tag, and compares. They match. So she writes three oh four, not modified, and returns. The body is never written again. That is not caching failing. That is caching working.
+
+44
+00:09:54,812 --> 00:10:02,197
+Narrator: Now the code, in Go. A small handler that serves a resource with cache control, an E tag, and conditional requests.
+
+45
+00:10:02,628 --> 00:10:15,942
+Narrator: A resource holds its body and a last modified time. Its E tag is a hash of the body. Sha two fifty six, the first eight bytes, in hex, wrapped in quotes. A real fingerprint of the content, not of a timestamp.
+
+46
+00:10:16,371 --> 00:10:34,317
+Narrator: The handler gets the resource, computes the tag, and sets the headers once, up front. Cache control, public, max age, must revalidate. The E tag. Last modified. And vary, accept encoding. Setting headers before branching keeps the two hundred path and the three oh four path from drifting apart.
+
+47
+00:10:34,748 --> 00:10:48,614
+Narrator: Then it checks the validators. If the request has if none match, and it equals the tag, write three oh four and return. Only when if none match is absent does it fall back to if modified since, and compare times. Otherwise, write two hundred and the body.
+
+48
+00:10:49,043 --> 00:11:00,101
+Narrator: The tests prove it. A repeat request carrying the current tag gets a three oh four. And the last modified fallback also works, when no tag is sent. Both pass with the race detector on.
+
+49
+00:11:03,052 --> 00:11:27,501
+Narrator: A few deeper points. First, strong versus weak validators. An E tag with no W slash prefix is strong, byte identical guaranteed. W slash marks a weak one, equivalent in meaning, not necessarily in bytes, for example the same data with keys in a different order. Range requests, resuming a partial download, require a strong validator, because stitching ranges from a weakly equivalent copy would be silently wrong.
+
+50
+00:11:27,932 --> 00:11:43,789
+Narrator: Second, must revalidate. Without it, the rules allow a cache to serve a stale copy anyway in some situations, for example when the origin is unreachable. Must revalidate forbids serving stale without a successful check. Use it whenever stale data would be a real problem.
+
+51
+00:11:44,220 --> 00:11:56,549
+Narrator: Third, why a three oh four still carries headers. It must repeat the headers the cache needs to update its stored copy, a fresh cache control, or a changed E tag. The body is what is left out, not the metadata.
+
+52
+00:11:56,980 --> 00:12:16,557
+Narrator: And last, request collapsing. When many requests for the same stale address reach a cache at once, a well built cache sends only one revalidation upstream, and lets the others wait for it. Otherwise Olga is hit by a thundering herd of identical checks. That is a C D N and proxy detail, not an H T T P header.
+
+53
+00:12:19,508 --> 00:12:35,509
+Narrator: Caching trades freshness for speed and origin load. Anything that must show the absolute latest state on every read, a live auction bid, a real time stock ticker, needs no store, or a very short max age. Never rely on revalidation alone for that.
+
+54
+00:12:35,940 --> 00:12:53,022
+Narrator: And never use stale while revalidate or stale if error where a stale read is a correctness bug, not just a nuisance. An inventory count near zero. A payment status. Also, E tags cost a hash per response. For very large bodies, last modified is cheaper, but coarser.
+
+55
+00:12:53,451 --> 00:13:13,750
+Narrator: Four failures, and fixes. Stale data served silently, because max age was far too long. Shorten it, or use no cache with strong E tags, so every request still revalidates cheaply. A per user page cached at a shared cache, so Ben sees someone else's account. Mark it private, and never mark anything with a login or cookie as public.
+
+56
+00:13:14,179 --> 00:13:25,453
+Narrator: Vary cookie silently disabling shared caching. Split the cacheable parts from the personal ones. And an E tag that changes every request. Hash only the stable, meaningful fields.
+
+57
+00:13:25,884 --> 00:13:54,846
+Narrator: What to watch. The cache hit ratio, requests served without reaching the origin. And the three oh four ratio, requests that reached the origin but needed no body. A persistently low three oh four ratio on stable content usually means an unstable E tag. The usual production recipe for static files is a content hashed file name, with cache control public, max age thirty one million five hundred thirty six thousand, immutable. A changed file gets a new address, instead of ever being invalidated.
+
+58
+00:13:57,796 --> 00:14:02,182
+Ben: Olga, test me. Six questions you will really get.
+
+59
+00:14:02,611 --> 00:14:05,149
+Ben: No cache versus no store?
+
+60
+00:14:05,679 --> 00:14:19,761
+Olga: No cache allows storing, but requires revalidation before every reuse, so a three oh four still saves the download. No store forbids keeping any copy, for genuinely sensitive one time responses.
+
+61
+00:14:20,192 --> 00:14:23,785
+Ben: Why does if none match win over if modified since?
+
+62
+00:14:24,316 --> 00:14:35,854
+Olga: E tags are exact, and can detect any change, including one that returns to identical content within the same second. Last modified has only one second resolution.
+
+63
+00:14:36,283 --> 00:14:41,822
+Ben: Every request to an endpoint returns two hundred. Is caching broken?
+
+64
+00:14:42,351 --> 00:14:57,346
+Olga: Not necessarily. On a first visit, or after eviction, two hundred is correct. The real bug is when a repeat request with a correct if none match still gets two hundred. That points to an unstable E tag.
+
+65
+00:14:57,775 --> 00:15:01,970
+Ben: Stale while revalidate, instead of shortening max age?
+
+66
+00:15:02,500 --> 00:15:18,573
+Olga: Use it when the user must never wait on the origin, but the data can be a little stale. It serves instantly, and refreshes in the background, so the next request is fresh. A shorter max age alone would make some requests pay the full round trip.
+
+67
+00:15:19,004 --> 00:15:22,357
+Ben: Why is vary cookie almost always a mistake?
+
+68
+00:15:22,888 --> 00:15:34,618
+Olga: Cookies are unique per user, so it creates one cache entry per visitor, and the shared cache almost never hits. If the response truly differs per user, mark it private.
+
+69
+00:15:35,048 --> 00:15:42,961
+Ben: The C D N has S max age three hundred, but the browser still refetches on every load. Why might that be right?
+
+70
+00:15:43,491 --> 00:15:59,278
+Olga: S max age governs only shared caches. If max age is absent or zero, the browser must revalidate every time, even though the C D N serves its own fresh copy. Set both, deliberately, for the two audiences.
+
+71
+00:16:02,227 --> 00:16:13,741
+Olga: Found it. Three hiding places. Carl's three hundred second label, Fran's best before date, and no validator to tell them the price changed.
+
+72
+00:16:14,172 --> 00:16:29,501
+Narrator: The fix. A shorter max age and a longer S max age only where staleness is safe. A strong E tag, built from the content, so a check can say, changed. And for a price, no cache with an E tag, so every reuse is checked, yet a three oh four still saves the download.
+
+73
+00:16:29,932 --> 00:16:35,038
+Narrator: At ten fifteen, the new price, one ninety nine, appears everywhere. Case closed.
+
+74
+00:16:37,988 --> 00:16:39,782
+Narrator: Let us put it all together.
+
+75
+00:16:40,211 --> 00:16:49,302
+Narrator: One. Caching avoids paying for the same answer twice. Freshness skips the network trip. Validation skips the resend, once the copy is stale.
+
+76
+00:16:49,731 --> 00:17:06,405
+Narrator: Two. Cache control says how long, under what conditions, and who. Max age and S max age for how long. No cache means always check first. No store means keep nothing. Private for one user, public for shared caches. Immutable for content hashed files.
+
+77
+00:17:06,836 --> 00:17:14,630
+Narrator: Three. Stale while revalidate and stale if error trade a little staleness for speed and resilience. Never for data where stale is a bug.
+
+78
+00:17:15,059 --> 00:17:26,526
+Narrator: Four. An E tag is an exact fingerprint, last modified is a one second timestamp, and if none match wins. A match gets a three oh four, with no body. That is caching working.
+
+79
+00:17:26,955 --> 00:17:37,294
+Narrator: Five. Vary splits the cache by a request header. Accept encoding is fine. Cookie kills sharing. Never hash a changing timestamp into an E tag.
+
+80
+00:17:37,723 --> 00:17:51,230
+Narrator: Six. Strong tags are byte exact, and needed for range requests. Must revalidate forbids serving stale unchecked. A three oh four still carries headers. And good caches collapse concurrent revalidations into one.
+
+81
+00:17:51,660 --> 00:17:57,846
+Narrator: And the one line to keep. A cache always asks, can I skip the trip, before it asks, can I skip the resend.
+
+82
+00:18:00,796 --> 00:18:22,678
+Narrator: To go deeper, open the H T T P caching note, and its Go note, in your vault. Before it, read H T T P one versus two versus three, and H T T P fundamentals. After it, C D N and edge, and caching fundamentals. Compare it with cache invalidation, T T L and consistency, which covers application level caches like Redis.
+
+83
+00:18:23,107 --> 00:18:27,230
+Ben: Thank you, Olga. The right price, everywhere.
+
+84
+00:18:27,660 --> 00:18:29,549
+Olga: Next case.
+

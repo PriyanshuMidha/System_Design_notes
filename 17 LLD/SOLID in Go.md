@@ -13,13 +13,15 @@ sources:
   - "Go Wiki, Go Code Review Comments: Interfaces (define interfaces in the consuming package)"
   - "Rob Pike, Go Proverbs (2015): 'The bigger the interface, the weaker the abstraction'"
   - "Go command docs: internal packages and the ban on import cycles"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # SOLID in Go
 
 > [!summary] TL;DR
-> **SOLID** is five design rules for keeping code easy to change: Single Responsibility, Open-Closed, Liskov Substitution, Interface Segregation and Dependency Inversion. Go has no classes or inheritance, so in Go SOLID mostly means **small interfaces declared by the code that uses them** and **dependencies passed in through constructors**, plus one rule people forget: every implementation of an interface must keep the interface's promises, including its error behaviour.
+> **SOLID** is five design rules for keeping code easy to change: Single Responsibility, Open-Closed, Liskov Substitution, Interface Segregation and Dependency Inversion.
+>
+> Go has no classes or inheritance, so in Go SOLID mostly means **small interfaces declared by the code that uses them** and **dependencies passed in through constructors**, plus one rule people forget: every implementation of an interface must keep the interface's promises, including its error behaviour.
 
 > [!abstract] Core idea
 > - Split code by **who asks for changes** (HTTP, business rules, storage, payment provider), not by size.
@@ -27,6 +29,51 @@ updated: 2026-11-04
 > - Wire concrete types together once, in `main`, and pass them in through constructors.
 > - Substitutability is about **behaviour**: a fake that returns `(zero, nil)` where the contract says `ErrNotFound` breaks callers even though it compiles.
 > - Apply SOLID where change or testing actually happens; everywhere else it is just indirection.
+
+## Start here: the basics
+
+**The problem in one story.**
+One function handles a whole food order: reads the request, applies discounts, saves to the database, charges the card.
+Four teams each need a small change to it in the same month.
+Every change risks breaking the other three, and nobody can test it without a real database and payment sandbox.
+SOLID is five rules for cutting such code into small pieces that change and test on their own.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Struct | A Go type that groups fields | `type Order struct{ ID string }` |
+| Method | A function attached to a type | `func (o Order) Total() int` |
+| Interface | A list of methods; any type that has them fits | `io.Writer` needs only `Write` |
+| Dependency | Something your code needs to do its job | The service needs a database repo |
+| Constructor | A function that builds a value and hands it its dependencies | `NewService(repo, pay)` |
+| Fake | A small in-memory stand-in used in tests | A map-backed order store |
+| Contract | What an interface promises, including errors | "Missing ID returns `ErrNotFound`" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    M["main<br/>(wires everything)"] --> S["Order service<br/>(business rules)"]
+    S --> I1["OrderStore<br/>interface"]
+    S --> I2["Payment<br/>interface"]
+    PG["Postgres repo"] -. "satisfies" .-> I1
+    F["In-memory fake"] -. "satisfies" .-> I1
+    RZ["Razorpay adapter"] -. "satisfies" .-> I2
+```
+
+**Analogy.** A restaurant kitchen: the chef asks the storeroom for "2 kg rice" and does not care which supplier filled it, as long as the answer is rice or "out of stock".
+Where it breaks: a kitchen hires people once; in Go, `main` can swap a whole implementation (real DB for a fake) in one line.
+
+**How the rest of this note builds up**
+
+- First, why a 400-line handler hurts (section 1) and the kitchen mental model (section 2).
+- Then each of the five principles as one Go move, with before/after class diagrams (section 3).
+- Then tested code, including what a broken substitute (LSP) does, and a step-by-step refactor (section 4).
+- Finally the SDE-3 view: when not to apply SOLID, production habits and deep-dive edge cases (sections 5-8).
+
+> [!tip] Remember
+> Small interfaces declared by the user, real types passed in from `main`, and every implementation keeps the same promises.
 
 ## 1. Why it exists
 
@@ -37,11 +84,17 @@ A food-delivery team has one 400-line HTTP handler, `CreateOrderHandler`. It par
 - the platform team moves orders from MySQL to PostgreSQL,
 - the payments team adds Stripe for international cards.
 
-All four edits land in the same function, so every change risks breaking the other three, every code review needs all four teams, and the function cannot be unit-tested without a database, a payment sandbox and a push service. SOLID is a set of rules for splitting such code so that each of those four changes touches one small, testable piece.
+All four edits land in the same function, so every change risks breaking the other three, every code review needs all four teams, and the function cannot be unit-tested without a database, a payment sandbox and a push service.
+
+SOLID is a set of rules for splitting such code so that each of those four changes touches one small, testable piece.
 
 ## 2. Mental model
 
-Think of a restaurant kitchen. The waiter takes orders (HTTP), the chef decides how to cook (business rules), the storeroom keeps ingredients (storage) and the cashier takes money (payment). The chef does not care which supplier filled the storeroom, only that "give me 2 kg of rice" either returns rice or says "out of stock". That promise is the **interface**. Any storeroom that keeps the promise can replace any other (Liskov). The chef writes down the few requests they make (Interface Segregation), and the manager decides which supplier and which cashier to hire on day one (Dependency Inversion through constructor injection).
+Think of a restaurant kitchen. The waiter takes orders (HTTP), the chef decides how to cook (business rules), the storeroom keeps ingredients (storage) and the cashier takes money (payment).
+
+The chef does not care which supplier filled the storeroom, only that "give me 2 kg of rice" either returns rice or says "out of stock". That promise is the **interface**. Any storeroom that keeps the promise can replace any other (Liskov).
+
+The chef writes down the few requests they make (Interface Segregation), and the manager decides which supplier and which cashier to hire on day one (Dependency Inversion through constructor injection).
 
 Terms used below:
 
@@ -157,7 +210,9 @@ type UserRepository interface {
 }
 ```
 
-Every consumer depends on five methods, every fake implements five, and a change to `SendEmail` recompiles code that never sends email. The fix is the standard library's style: `io.Reader` and `io.Writer` have one method each and are composed into `io.ReadWriter` only where a caller needs both. In the service, declare `OrderStore` with exactly the two methods it calls.
+Every consumer depends on five methods, every fake implements five, and a change to `SendEmail` recompiles code that never sends email.
+
+The fix is the standard library's style: `io.Reader` and `io.Writer` have one method each and are composed into `io.ReadWriter` only where a caller needs both. In the service, declare `OrderStore` with exactly the two methods it calls.
 
 **DIP.** The service never calls `sql.Open` or `razorpay.NewClient`. It receives interfaces:
 
@@ -553,14 +608,18 @@ Three ways to supply a dependency:
 
 Put this in the interface's doc comment, as `OrderStore` does, and encode it in the contract test.
 
-**OCP and closed sets.** OCP assumes the set of variants is open. When the set is closed and small (order statuses, seat types), a `switch` over a typed constant is clearer than an interface per case, and the `exhaustive` linter can flag a missing case. Use an interface when variants are added by other teams or at runtime; use a switch when you own every case.
+**OCP and closed sets.** OCP assumes the set of variants is open. When the set is closed and small (order statuses, seat types), a `switch` over a typed constant is clearer than an interface per case, and the `exhaustive` linter can flag a missing case.
+
+Use an interface when variants are added by other teams or at runtime; use a switch when you own every case.
 
 **DIP versus DI.** Dependency *Inversion* is about the direction of source-code dependencies (policy does not import detail). Dependency *Injection* is the mechanism (passing things in). You can inject concrete types without inverting anything, and in Go that is often fine: inject `*sql.DB` directly into a repository, because the repository *is* the detail.
 
 ## 9. Interview questions
 
 > [!question]- What does SOLID look like in Go, which has no classes or inheritance?
-> Mostly ISP and DIP through consumer-side interfaces: the package that uses a dependency declares a one- or two-method interface, concrete types satisfy it implicitly, and `main` injects them through constructors. SRP becomes package and type boundaries per actor, OCP becomes new implementations, function values or registries, and LSP becomes "every implementation keeps the documented contract".
+> Mostly ISP and DIP through consumer-side interfaces: the package that uses a dependency declares a one- or two-method interface, concrete types satisfy it implicitly, and `main` injects them through constructors.
+>
+> SRP becomes package and type boundaries per actor, OCP becomes new implementations, function values or registries, and LSP becomes "every implementation keeps the documented contract".
 
 > [!question]- Trap: your in-memory fake and your Postgres repo both implement `OrderStore`, and all tests pass. Can they still violate LSP?
 > Yes. Compiling only proves the method signatures match. If the fake returns `(Order{}, nil)` for an unknown id while the contract says `ErrNotFound`, a service that treats `err == nil` as "already exists" skips the payment. Catch it with a contract test run against every implementation.
@@ -595,3 +654,8 @@ Put this in the interface's doc comment, as `OrderStore` does, and encode it in 
 - **Before this:** [[OOP in Go - Structs, Interfaces, Embedding]], [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]], [[Interfaces]]
 - **Next:** [[UML for LLD]], [[Design Patterns Overview and Chooser]]
 - **Compare with:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]], [[Hexagonal Architecture (Ports and Adapters)]], [[Repository and Unit of Work]], [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [KISS, SOLID, CAP, BASE: Important Terms You Might Not Know!](https://www.youtube.com/watch?v=cTyZ_hbmbDw) · ByteByteGo · 6 min · 67,187 views
+- [Golang UK Conference 2016 - Dave Cheney - SOLID Go Design](https://www.youtube.com/watch?v=zzAdEt3xZ1M) · GopherCon UK · 27 min · 117,651 views

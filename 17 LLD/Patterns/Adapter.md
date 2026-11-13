@@ -10,7 +10,7 @@ sources:
   - "Go standard library docs: net/http (HandlerFunc), net/http/httptest, io (NopCloser), log/slog (NewLogLogger), context (WithTimeout), errors (Is, As; multiple %w since Go 1.20)"
   - "Effective Go: Interface checks (var _ I = (*T)(nil))"
   - "Razorpay API docs: error codes BAD_REQUEST_ERROR, GATEWAY_ERROR, SERVER_ERROR"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Adapter
@@ -23,6 +23,49 @@ updated: 2026-11-02
 > - It translates three things: the call (names and units), the context (cancellation and timeout) and the errors (SDK errors become your domain errors).
 > - The rule that matters: SDK types never leak past the adapter into business code.
 > - Classic mistake: an adapter that ignores `ctx` and returns raw SDK errors, so callers cannot cancel or decide what to retry.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your shop takes payments through Razorpay today.
+Next month the business adds Stripe, whose library uses different method names and error types.
+You do not want to rewrite checkout every time a provider changes.
+So checkout talks to one shape you design, and a small translator per provider does the rest.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Interface | A list of methods a type promises to have | `Charge(ctx, req) error` |
+| SDK | A library a vendor gives you to call their service | Razorpay's Go client |
+| Wrapper | A type that holds another and forwards calls to it | `RazorpayAdapter{client: sdk}` |
+| Context (`ctx`) | Go value carrying a deadline and a cancel signal | `context.WithTimeout(ctx, 3*time.Second)` |
+| Domain error | An error your own code defines and understands | `ErrCardDeclined` |
+| Translate | Convert one format into another | rupees `int64` paise to SDK's `float64` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Checkout code"] --> I["PaymentGateway<br/>(your interface)"]
+    I --> A1["RazorpayAdapter"]
+    I --> A2["StripeAdapter"]
+    A1 --> S1["Razorpay SDK"]
+    A2 --> S2["Stripe SDK"]
+```
+
+**Analogy.** A travel plug adapter lets the same laptop charger fit any country's socket.
+Where it breaks: a plug adapter only changes shape; a software adapter also has to translate errors, units and timeouts.
+
+**How the rest of this note builds up**
+
+- First, why it exists and the mental model (sections 1-2).
+- Then how it works and a full Go worked example with Razorpay-style errors (sections 3-4).
+- Then variants, trade-offs and how it differs from Facade, Decorator and Proxy (sections 5-6).
+- Finally the SDE-3 view: production concerns like timeouts and safe retries, plus the deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Your code owns the interface; the adapter bends the outside world to fit it, and SDK types never leak past it.
 
 ## 1. Why it exists
 
@@ -37,7 +80,11 @@ The adapter below avoids the last two problems: it honours `ctx` and translates 
 
 ## 2. Mental model
 
-A travel plug adapter. Your laptop charger (your code) has one plug shape (your interface). Each country's socket (each SDK) is different. You do not rewire the laptop for each country; you carry a small adapter per socket. A good travel adapter also has a fuse: it protects your side from whatever the wall does. In software the fuse is the timeout and the error translation.
+A travel plug adapter.
+
+Your laptop charger (your code) has one plug shape (your interface). Each country's socket (each SDK) is different. You do not rewire the laptop for each country; you carry a small adapter per socket.
+
+A good travel adapter also has a fuse: it protects your side from whatever the wall does. In software the fuse is the timeout and the error translation.
 
 The key point is **direction**: you own the target interface, written in your domain's words, and adapt the external thing **to it**. If you shape your interface after one SDK, the next SDK will not fit.
 
@@ -567,3 +614,8 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 - **Before this:** [[Interfaces]], [[Error Handling]], [[Context Package]]
 - **Next:** [[Decorator and Middleware]]
 - **Compare with:** [[Facade (vs Mediator)]], [[Proxy]], [[Decorator and Middleware]], [[Calling External APIs]]
+
+### Watch on YouTube
+
+- [The Adapter Pattern Explained and Implemented in Java / Structural Design Patterns / Geekific](https://www.youtube.com/watch?v=wA3keqCeKtM) · Geekific · 5 min · 105,363 views
+- [Adapter Pattern – Design Patterns (ep 8)](https://www.youtube.com/watch?v=2PKQtcJjYvc) · Christopher Okhravi · 26 min · 268,904 views

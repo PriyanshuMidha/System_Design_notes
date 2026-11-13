@@ -10,19 +10,67 @@ sources:
   - "Go 1.16 release notes: path.Match reports a malformed pattern even when the match fails early"
   - "Go 1.18 release notes: native fuzzing with go test -fuzz"
   - "GNU findutils manual: -P, -L, -maxdepth, -type f"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # File Search (Unix find)
 
 > [!summary] TL;DR
-> Model the file system as a **Composite** tree (File, Directory, Symlink all implement `Node`) and model the query as a second tree of small **filters** joined by AND, OR and NOT. One loop walks the first tree and asks the second tree about each file. Popping from the end of the frontier gives depth-first search (DFS), popping from the front gives breadth-first search (BFS), and a `visited` set stops symlink cycles.
+> Model the file system as a **Composite** tree (File, Directory, Symlink all implement `Node`) and model the query as a second tree of small **filters** joined by AND, OR and NOT.
+>
+> One loop walks the first tree and asks the second tree about each file. Popping from the end of the frontier gives depth-first search (DFS), popping from the front gives breadth-first search (BFS), and a `visited` set stops symlink cycles.
 
 > [!abstract] Core idea
 > - Two trees: the file tree (Composite: `File`, `Directory`, `Symlink` share one `Node` interface) and the filter tree (small filters joined by `And`, `Or`, `Not`).
 > - One loop keeps a frontier, the list of nodes found but not yet visited. Pop from the end and it is DFS; pop from the front and it is BFS.
 > - A `visited` set of directories reached through symlinks stops cycles; a max depth stops the walk early.
 > - Classic mistakes: one search function with a growing list of flag parameters, and following symlinks without a visited set (an infinite loop).
+
+## Start here: the basics
+
+**The problem in one story.**
+You want every `.go` file under 1 MB in a big project folder.
+The Unix `find` command does that: it walks every folder and tests every file against your rules.
+Folders contain folders, and a shortcut (symlink) can even point back up, making a loop.
+This note designs that walker and the rule language in Go.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Tree | Data where each item has children, with no loops | Folders inside folders |
+| Symlink | A shortcut file that points to another path | `link → ../src` |
+| Filter | One yes/no test on a file | "name ends with `.go`" |
+| AND / OR / NOT | Ways to combine filters | `.go` AND NOT size > 1 MB |
+| DFS | Go deep into one folder before the next | Like reading a book chapter by chapter |
+| BFS | Visit all items at one level before going deeper | Floor by floor |
+| Frontier | The list of items found but not visited yet | A to-do stack or queue |
+| Interface | A Go type that lists methods; many types can satisfy it | `Node` for file, dir, link |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Root folder"] --> F["Frontier<br/>(to-do list)"]
+    F --> P["Pop one node"]
+    P --> Q{"Filters<br/>match?"}
+    Q -- "yes" --> Out["Add to results"]
+    P -- "directory" --> Ch["Push children"]
+    Ch --> F
+```
+
+**Analogy.** Searching a library: walk aisle by aisle, and for each book ask "is it about Go and thin enough?".
+Where it breaks: a library has no aisle that leads back to an earlier aisle; symlinks can, so the walker needs a `visited` set.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and Steps 1-4: requirements, actors, the Composite file tree and the filter tree.
+- Then Steps 5-7: the API, storage, and the patterns (Composite, Specification-style filters).
+- Then Step 8 and the test cases: the Go walk loop, DFS versus BFS, depth limits and symlink cycles.
+- Finally the SDE-3 depth: real-disk walking with `io/fs.WalkDir`, a parallel walk, query parsing with fuzzing, and trade-offs.
+
+> [!tip] Remember
+> Two trees: walk the file tree, ask the filter tree about each file, and keep a visited set for symlinks.
 
 ## Problem statement
 
@@ -219,7 +267,9 @@ The walk in steps:
 
 1. `Search` rejects a nil root, defaults a nil filter to `MatchAll`, and seeds the frontier with `{path: "root", depth: 0}`.
 2. Each turn checks `ctx.Err()` first, so a huge walk can be cancelled. Then it pops: **DFS** from the end (a stack), **BFS** at `head` (a queue). That one line is the whole traversal strategy.
-3. **BFS memory fix.** A naive queue pops with `frontier = frontier[1:]`. The popped slots stay in the backing array, still holding path strings and node pointers, until `append` happens to reallocate. Here each popped slot is zeroed, and once the dead prefix is over half the slice the live part is copied to the front. Memory stays proportional to the tree's widest level.
+3. **BFS memory fix.** A naive queue pops with `frontier = frontier[1:]`. The popped slots stay in the backing array, still holding path strings and node pointers, until `append` happens to reallocate.
+
+   Here each popped slot is zeroed, and once the dead prefix is over half the slice the live part is copied to the front. Memory stays proportional to the tree's widest level.
 4. **Symlink:** skipped when `FollowSymlinks` is off (`find -P`); otherwise the node is swapped for its target and keeps the link's path.
 5. **File:** `filter.Match(file)`. `And` short-circuits on the first false, `Or` on the first true.
 6. **Directory:** three guards in order. Depth: a directory at `MaxDepth` is not expanded and **not** marked visited, because a shorter path may reach it later. Visited: breaks `loop -> root` and stops a second link to the same directory from producing duplicates. Denied: recorded in `Skipped`.
@@ -529,7 +579,17 @@ func Search(ctx context.Context, root *Directory, filter Filter, opt Options) (R
 }
 ```
 
-**Real disk, parallel walk.** `SearchFS` maps the same filters onto `io/fs.WalkDir`: each `fs.DirEntry` gives the type, and `d.Info()` returns an `fs.FileInfo` with `Size()` (and `ModTime()` for a future mtime filter). `WalkDir` does not follow symlinks inside the tree (only a symlinked root is resolved) and reads each directory in lexical order, so output is deterministic. A failed `ReadDir` (permission denied) reaches the callback as a second call with `err` set, which becomes a `Skipped` entry. `ParallelSearch` is a fork-join walk: a directory gives each child one result slot, runs child directories on a free worker if a token is available and inline if not (it never blocks, so a bounded pool cannot deadlock), then joins the slots in child order. On a tree, where no directory was added under two parents, the result equals the sequential DFS result exactly, whatever the scheduling. `ParallelSearch` keeps no `visited` set, so a directory shared by two parents is listed under both, while `Search` lists it once.
+**Real disk, parallel walk.** `SearchFS` maps the same filters onto `io/fs.WalkDir`: each `fs.DirEntry` gives the type, and `d.Info()` returns an `fs.FileInfo` with `Size()` (and `ModTime()` for a future mtime filter).
+
+`WalkDir` does not follow symlinks inside the tree (only a symlinked root is resolved) and reads each directory in lexical order, so output is deterministic.
+
+A failed `ReadDir` (permission denied) reaches the callback as a second call with `err` set, which becomes a `Skipped` entry.
+
+`ParallelSearch` is a fork-join walk: a directory gives each child one result slot, runs child directories on a free worker if a token is available and inline if not (it never blocks, so a bounded pool cannot deadlock), then joins the slots in child order.
+
+On a tree, where no directory was added under two parents, the result equals the sequential DFS result exactly, whatever the scheduling.
+
+`ParallelSearch` keeps no `visited` set, so a directory shared by two parents is listed under both, while `Search` lists it once.
 
 ```go
 package filesearch
@@ -959,13 +1019,21 @@ Run in a scratch module with Go 1.24.4: `go vet` clean, `go test -race` passes a
 | Fast repeated searches | An index like `locate`: a table of files, with the filter tree translated to SQL |
 | Parallel walk with symlinks | Needs a locked `visited` set, and then which path "wins" a shared directory depends on scheduling. Either drop determinism or sort the output |
 
-Choices made: an in-memory tree in the core, so tests are deterministic; closures (`FilterFunc`) instead of one struct per filter, which is less code but cannot print or optimize the tree; DFS by default (it matches `find` and uses less memory on wide trees); results collected into a slice, which is simple for the interview, with streaming for production-sized trees; skip unreadable directories instead of failing the whole search.
+Choices made:
+
+- An in-memory tree in the core, so tests are deterministic
+- Closures (`FilterFunc`) instead of one struct per filter, which is less code but cannot print or optimize the tree
+- DFS by default (it matches `find` and uses less memory on wide trees)
+- Results collected into a slice, which is simple for the interview, with streaming for production-sized trees
+- Skip unreadable directories instead of failing the whole search
 
 ## Drawing
 
 ![[File Search LLD Drawing.excalidraw]]
 
-The drawing has three parts: the Composite (`Node` with File, Directory and Symlink, the link pointing back to make a cycle), the filter tree for `ext=.go AND NOT size>1048576`, and the core loop (pop, then the per-type branch with the three directory guards in red). Redraw it from memory: the interface and its three implementations (mark the one that can create a cycle), the expression tree for a three-term query, the loop with its guards in order (depth, visited, denied), and where `visited` lives (one per search) and why pruned directories are not marked.
+The drawing has three parts: the Composite (`Node` with File, Directory and Symlink, the link pointing back to make a cycle), the filter tree for `ext=.go AND NOT size>1048576`, and the core loop (pop, then the per-type branch with the three directory guards in red).
+
+Redraw it from memory: the interface and its three implementations (mark the one that can create a cycle), the expression tree for a three-term query, the loop with its guards in order (depth, visited, denied), and where `visited` lives (one per search) and why pruned directories are not marked.
 
 ## Interview questions
 
@@ -973,7 +1041,11 @@ The drawing has three parts: the Composite (`Node` with File, Directory and Syml
 > Each rule is a `Filter`, and `And`, `Or`, `Not` combine them into a tree (Specification). A new rule is one constructor; traversal code never changes. The parser builds the same tree from a string, so the Go API and the query language share one evaluator.
 
 > [!question]- How do you stop symlink cycles, and why is a depth-pruned directory not marked visited?
-> Keep a `visited` set of directories per search; a second arrival is skipped. On a real disk the key is (device, inode), because two paths name the same directory. A directory pruned by `MaxDepth` was not expanded, so if it were marked visited, a shorter path reaching it later would wrongly skip it. One gap remains under DFS: a directory expanded through a long path had its subtree cut early, and the shorter path is skipped. BFS avoids it because it reaches every directory first by its shortest path.
+> Keep a `visited` set of directories per search; a second arrival is skipped. On a real disk the key is (device, inode), because two paths name the same directory.
+>
+> A directory pruned by `MaxDepth` was not expanded, so if it were marked visited, a shorter path reaching it later would wrongly skip it.
+>
+> One gap remains under DFS: a directory expanded through a long path had its subtree cut early, and the shorter path is skipped. BFS avoids it because it reaches every directory first by its shortest path.
 
 > [!question]- Trap: with symlinks followed, can the same file appear twice? Is that a bug?
 > Yes, if two paths lead to it (`b.go -> a.go`). It is not a bug: `find -L` prints both, because each path is a real way to reach the file. The visited set is for directories, to stop cycles, not for files. Dedupe by (device, inode) only if the caller asks for unique files.
@@ -985,7 +1057,9 @@ The drawing has three parts: the Composite (`Node` with File, Directory and Syml
 > Directory reads dominate, so read directories in parallel with a bounded pool. A fork-join walk gives each child a result slot and joins slots in child order, so the output stays deterministic. Try-acquire a worker token and walk inline when none is free; blocking would deadlock a bounded pool. For repeated searches, build an index instead.
 
 > [!question]- How do you make the parser safe against hostile input?
-> Validate every term at parse time (glob syntax, size integer, known key) and return a wrapped `ErrInvalidExpr`, so evaluation can never fail. Then fuzz it: `FuzzParse` checks that no input panics and every error wraps the sentinel. Seeds run on every `go test`; `-fuzz` explores new inputs. Behind an HTTP API, also cap the query length, because each `NOT` adds one level of recursion in the parser and in `Match`.
+> Validate every term at parse time (glob syntax, size integer, known key) and return a wrapped `ErrInvalidExpr`, so evaluation can never fail. Then fuzz it: `FuzzParse` checks that no input panics and every error wraps the sentinel.
+>
+> Seeds run on every `go test`; `-fuzz` explores new inputs. Behind an HTTP API, also cap the query length, because each `NOT` adds one level of recursion in the parser and in `Match`.
 
 ## Interview explanation
 
@@ -1008,3 +1082,8 @@ I model the file system as a Composite: File, Directory and Symlink all implemen
 - **Before this:** [[Composite]], [[Strategy and Template Method]], [[Logging Library]]
 - **Next:** [[ATM]], [[Iterator and range-over-func]] for a streaming result, [[Concurrency for LLD]] for worker pools
 - **Compare with:** [[Testing LLD Code]] (fuzzing and table tests), [[Chain of Responsibility and Pipelines]] (another way to chain filters)
+
+### Watch on YouTube
+
+- [Amazon LLD Python: Design Unix "find" Command for File Search](https://www.youtube.com/watch?v=KxQpZ_aIseE) · System Design and Gossip · 22 min · 270 views
+- [Amazon LLD: Design Unix "find" Command for File Search in Java](https://www.youtube.com/watch?v=bBqkk9yfjCs) · System Design and Gossip · 22 min · 413 views

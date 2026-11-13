@@ -15,13 +15,22 @@ sources:
   - "Amazon S3 User Guide, Object Lock (governance and compliance modes)"
   - "GitLab, Postmortem of database outage of January 31 (2017)"
   - "pgBackRest, WAL-G and Barman project documentation"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Backup, PITR and Disaster Recovery - Go
 
 > [!summary] TL;DR
 > A small Go package that answers "if we had to restore to time T, which base backup and which WAL segments would we use, and is the chain unbroken?", plus a restore-time estimator. It implements the catalog check described in [[Backup, PITR and Disaster Recovery]] and is tested with `go test -race`.
+
+## Before the code
+
+- **Structs** (`BaseBackup`, `Segment`, `Plan`): plain records that stand in for the backup catalog; no database or S3 is touched.
+- **`time.Time` and `time.Duration`**: the recovery target is a moment in time, and the restore estimate is a duration.
+- **Multiple return values with `error`** (`(Plan, error)`): the planner returns either a plan or a reason the restore is impossible.
+- **Slices** (`[]Segment`): the ordered list of archived WAL segments the planner walks.
+- **Unit tests** with the `testing` package and `errors.Is`: each test builds a fixture and checks one rule.
+- **What to run:** `go vet ./... && go test -race ./...` inside the module. No goroutines, interfaces or generics are needed.
 
 ## What this code shows
 
@@ -63,7 +72,13 @@ go test -race ./...
 
 ### Step 1: the catalog types
 
-**Concept.** A physical backup is a copy of the data files taken while the database kept running, so on its own it is inconsistent. It becomes consistent only after WAL has been replayed from `StartLSN` up past `EndLSN` ([[Backup, PITR and Disaster Recovery#3.2 Base backup plus WAL archive]]). The WAL archive is a series of 16 MB files, each covering a byte range of the log. Modelling both with LSNs (64-bit byte positions) lets "is there a gap?" become simple integer comparison. The alternative is to model files by name and parse timeline and segment numbers, which is closer to PostgreSQL but hides the idea behind string handling. `Segment` also carries commit timestamps, because a recovery target is a time, not a byte position.
+**Concept.** A physical backup is a copy of the data files taken while the database kept running, so on its own it is inconsistent.
+
+It becomes consistent only after WAL has been replayed from `StartLSN` up past `EndLSN` ([[Backup, PITR and Disaster Recovery#3.2 Base backup plus WAL archive]]). The WAL archive is a series of 16 MB files, each covering a byte range of the log.
+
+Modelling both with LSNs (64-bit byte positions) lets "is there a gap?" become simple integer comparison. The alternative is to model files by name and parse timeline and segment numbers, which is closer to PostgreSQL but hides the idea behind string handling.
+
+`Segment` also carries commit timestamps, because a recovery target is a time, not a byte position.
 
 ```go
 package pitr
@@ -112,7 +127,11 @@ flowchart LR
 
 ### Step 2: the planner
 
-**Concept.** `PlanRestore` implements the selection rule from [[Backup, PITR and Disaster Recovery#4.3 Checking that PITR is possible]]: use the newest backup that finished before the target, because it needs the least WAL replay and so gives the shortest RTO. The twist is the fallback. If the newest backup's WAL chain is broken, an older backup might still have an unbroken chain, so the loop keeps trying instead of failing on the first error. The alternative is to pick one backup and fail fast, which is simpler but turns one lost segment into "restore impossible" even when another path exists. The function also remembers the last error so the caller learns why the final attempt failed.
+**Concept.** `PlanRestore` implements the selection rule from [[Backup, PITR and Disaster Recovery#4.3 Checking that PITR is possible]]: use the newest backup that finished before the target, because it needs the least WAL replay and so gives the shortest RTO. The twist is the fallback.
+
+If the newest backup's WAL chain is broken, an older backup might still have an unbroken chain, so the loop keeps trying instead of failing on the first error.
+
+The alternative is to pick one backup and fail fast, which is simpler but turns one lost segment into "restore impossible" even when another path exists. The function also remembers the last error so the caller learns why the final attempt failed.
 
 ```go
 // Plan is what a restore to a target time needs.
@@ -169,7 +188,13 @@ sequenceDiagram
 
 ### Step 3: walking the WAL chain
 
-**Concept.** The chain check is the heart of [[Backup, PITR and Disaster Recovery#4.3 Checking that PITR is possible]]. Keep a cursor `next`, the next LSN byte we need. Skip segments that end at or before the cursor (already covered), fail if a segment starts after the cursor (a hole), otherwise take it and advance the cursor to its end. Stop as soon as two things are true: replay has passed the backup's `EndLSN` (the copy is consistent) and the segment reaches the target time. The alternative is to list expected file names and check each exists, which needs the naming scheme; comparing LSN ranges checks continuity directly and works for any segment size.
+**Concept.** The chain check is the heart of [[Backup, PITR and Disaster Recovery#4.3 Checking that PITR is possible]]. Keep a cursor `next`, the next LSN byte we need.
+
+Skip segments that end at or before the cursor (already covered), fail if a segment starts after the cursor (a hole), otherwise take it and advance the cursor to its end.
+
+Stop as soon as two things are true: replay has passed the backup's `EndLSN` (the copy is consistent) and the segment reaches the target time.
+
+The alternative is to list expected file names and check each exists, which needs the naming scheme; comparing LSN ranges checks continuity directly and works for any segment size.
 
 ```go
 func chain(wal []Segment, b BaseBackup, target time.Time) ([]Segment, error) {
@@ -212,7 +237,11 @@ Trace of the walk for the midday backup and a 14:41:59 target (segment `n` cover
 
 ### Step 4: the restore-time estimate
 
-**Concept.** RTO is not a promise, it is arithmetic you can do in advance ([[Backup, PITR and Disaster Recovery#4.2 Restore-time math]]). Restoring the database takes two phases: copying the base backup back onto disk, then replaying WAL on top. Copy speed is bounded by network or disk bandwidth, replay speed by how fast the server applies changes, and the two are usually very different. The function keeps both rates as parameters instead of constants, because the right numbers come from a restore drill, not from a datasheet.
+**Concept.** RTO is not a promise, it is arithmetic you can do in advance ([[Backup, PITR and Disaster Recovery#4.2 Restore-time math]]). Restoring the database takes two phases: copying the base backup back onto disk, then replaying WAL on top.
+
+Copy speed is bounded by network or disk bandwidth, replay speed by how fast the server applies changes, and the two are usually very different.
+
+The function keeps both rates as parameters instead of constants, because the right numbers come from a restore drill, not from a datasheet.
 
 ```go
 // RestoreTime estimates RTO for the database step: copy the base backup,
@@ -250,7 +279,9 @@ flowchart LR
 
 ## Tests
 
-The tests share one fixture: one WAL segment per hour from midnight (24 segments of 16 MB), and two backups, a nightly one finishing at 01:30 and a midday one finishing at 12:20. Five tests then cover the newest-backup choice, the fallback to the nightly backup, a lost segment, no backup, an archive that ends too early, and the restore-time arithmetic.
+The tests share one fixture: one WAL segment per hour from midnight (24 segments of 16 MB), and two backups, a nightly one finishing at 01:30 and a midday one finishing at 12:20.
+
+Five tests then cover the newest-backup choice, the fallback to the nightly backup, a lost segment, no backup, an archive that ends too early, and the restore-time arithmetic.
 
 ### The fixture
 

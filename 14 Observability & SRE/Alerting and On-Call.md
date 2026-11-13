@@ -8,7 +8,7 @@ sources:
   - "Google, Site Reliability Engineering (2016), ch. 11 \"Being On-Call\" and ch. 29 \"Dealing with Interrupts\""
   - "Prometheus docs, Alerting rules and Alertmanager configuration (prometheus.io/docs/alerting)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Alerting and On-Call
@@ -33,15 +33,65 @@ flowchart LR
 
 CPU at 85% might be a batch job finishing on schedule — nobody should be woken up for it. A sustained 8% error rate means real users are getting real failures right now — that pages. A slowly filling disk is real but not urgent at 3 a.m. — that's a ticket for tomorrow.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your phone buzzes at 3 a.m. with "CPU is high".
+You get up, look around, and nothing is broken for any customer.
+After a month of this you start ignoring the buzz.
+Then one night the site really is down, and you ignore that buzz too.
+Good alerting means the phone only buzzes when a real user is hurting.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Alert | An automatic rule that notices something and tells a person | "error rate over 5% for 5 minutes" |
+| Page | An alert loud enough to wake someone up | Phone call from PagerDuty |
+| Ticket | A non-urgent alert handled in work hours | "Disk will be full in 10 days" |
+| On-call | The engineer whose turn it is to answer pages | One person per week per team |
+| Symptom | Something users feel | Checkout returns errors |
+| Cause | Something inside the system that might lead to a symptom | CPU at 90% |
+| SLO / error budget | A reliability target, and the failures you are allowed under it | 99.9% success = 0.1% may fail |
+| Runbook | A short "what to do when this fires" page | Steps to check and roll back |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    M["Metric changes"] --> Q{"Are users hurt<br/>right now?"}
+    Q -- "yes, badly" --> P["Page on-call"]
+    Q -- "not yet, but soon" --> T["Ticket for tomorrow"]
+    Q -- "no" --> D["Dashboard only"]
+    P --> R["Runbook tells<br/>what to do"]
+```
+
+**Analogy.** A smoke alarm should go off for a fire, not for toast. If it screams at every slice of toast, people pull out the battery.
+Where it breaks: a smoke alarm has one sensor; a service alert can (and should) require two time windows to agree before it fires.
+
+**How the rest of this note builds up**
+
+- First, why noisy alerts hurt (section 1) and the "would a human need to act at 3 a.m.?" test (section 2).
+- Then alert anatomy, burn-rate alerts, Alertmanager routing, runbooks and on-call practice (section 3).
+- Then a Go burn-rate decision function with tests (section 4) and alternatives and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: cutting pages without missing outages, choosing burn-rate multipliers, per-tenant alerts and alerts-as-code (sections 7-8).
+
+> [!tip] Remember
+> Page on what users feel, ticket on what will hurt later, and give every page a runbook.
+
 ## 1. Why it exists
 
-A service alerts on "CPU > 80%" and "disk > 85%" and "GC pause > 100ms." All three fire during a Tuesday afternoon batch job that runs every week, is fully expected, and causes zero user impact. The on-call engineer gets paged, checks dashboards, finds nothing wrong, goes back to sleep (or doesn't), and next week ignores the page entirely — which is exactly the moment a real outage's page gets ignored too.
+A service alerts on "CPU > 80%" and "disk > 85%" and "GC pause > 100ms." All three fire during a Tuesday afternoon batch job that runs every week, is fully expected, and causes zero user impact.
+
+The on-call engineer gets paged, checks dashboards, finds nothing wrong, goes back to sleep (or doesn't), and next week ignores the page entirely — which is exactly the moment a real outage's page gets ignored too.
 
 **Measured (illustrative):** teams that migrate from cause-based thresholds to symptom-based, SLO-burn alerting commonly report their page volume dropping by an order of magnitude while they catch the same or more real incidents, because they stop paging on things that were never actually breaking anything for a user — this is the standard motivation cited in the SRE workbook's alerting chapter, not a number measured in this vault.
 
 ## 2. Mental model
 
-Ask of every potential alert: **"if a human saw this happen right now, at 3 a.m., would they need to act before morning?"** If the answer only matters in aggregate over days (disk slowly filling, a non-critical dependency slowly degrading), it's a ticket. If a user is being actively harmed right now, it's a page. Everything else — "this is interesting, keep an eye on it" — is a dashboard, not an alert at all.
+Ask of every potential alert: **"if a human saw this happen right now, at 3 a.m., would they need to act before morning?"** If the answer only matters in aggregate over days (disk slowly filling, a non-critical dependency slowly degrading), it's a ticket.
+
+If a user is being actively harmed right now, it's a page. Everything else — "this is interesting, keep an eye on it" — is a dashboard, not an alert at all.
 
 ## 3. How it works
 
@@ -81,7 +131,9 @@ The fix, from the Google SRE workbook, is to alert on **burn rate against the er
 burn_rate = (bad_event_fraction_over_window) / (1 - SLO_target)
 ```
 
-A burn rate of 1 means "exhaust the 30-day budget exactly at 30 days" (sustainable). A burn rate of 14.4 means "exhaust the 30-day budget in about 50 hours (~2 days) if it keeps up" — and because the fast-tier alert below only needs a 1-hour window to see that rate, it still pages within the hour (page promptly, not 50 hours later). The two-window requirement is what kills flapping: a 5-minute spike alone doesn't page unless the 1-hour window *also* shows elevated burn, which means a real, sustained problem, not one bad scrape.
+A burn rate of 1 means "exhaust the 30-day budget exactly at 30 days" (sustainable). A burn rate of 14.4 means "exhaust the 30-day budget in about 50 hours (~2 days) if it keeps up" — and because the fast-tier alert below only needs a 1-hour window to see that rate, it still pages within the hour (page promptly, not 50 hours later).
+
+The two-window requirement is what kills flapping: a 5-minute spike alone doesn't page unless the 1-hour window *also* shows elevated burn, which means a real, sustained problem, not one bad scrape.
 
 **The standard 99.9%/30-day policy (Google SRE workbook, ch. 5):**
 
@@ -147,7 +199,9 @@ groups:
 
 ### Precision, recall, flapping and hysteresis
 
-An alert's **precision** is "of the times it fired, how many were real problems"; its **recall** is "of the real problems, how many did it catch." Pushing threshold tighter raises recall but hurts precision (more false pages); the multi-window design above is specifically chosen to keep both high at once. **Flapping** — an alert repeatedly firing and resolving within minutes — is usually a threshold sitting exactly at the noise floor; fix it with `for:`, a wider window, or **hysteresis** (fire at one threshold, only resolve once it drops back below a lower one, so a value oscillating around a single line doesn't retrigger every few seconds).
+An alert's **precision** is "of the times it fired, how many were real problems"; its **recall** is "of the real problems, how many did it catch." Pushing threshold tighter raises recall but hurts precision (more false pages); the multi-window design above is specifically chosen to keep both high at once.
+
+**Flapping** — an alert repeatedly firing and resolving within minutes — is usually a threshold sitting exactly at the noise floor; fix it with `for:`, a wider window, or **hysteresis** (fire at one threshold, only resolve once it drops back below a lower one, so a value oscillating around a single line doesn't retrigger every few seconds).
 
 ### Alertmanager: grouping, inhibition, silences, routing
 
@@ -367,8 +421,14 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 
 ## 8. Deep dive
 
-- **Cutting pages by 80% without missing outages (a common interview prompt).** Start from the paging-hygiene review: for every alert that fired in the last quarter, classify it as "actionable" or not. Delete or widen the window on every alert where a human looked, found nothing wrong, and closed it — this alone typically removes most noise. Then replace surviving cause-based thresholds with symptom-based, multi-window burn-rate alerts against each service's SLO, and add inhibition rules so a dependency outage pages once (at the dependency) instead of N times (once per dependent service). The combination addresses both "too many alerts fire" and "we delete something we needed" — the burn-rate math still catches a real fast or slow outage even after the noisy thresholds are gone.
-- **Choosing the burn-rate multipliers.** `14.4×` isn't arbitrary: it's chosen so that a sustained outage at that rate consumes 2% of a 30-day budget in exactly the 1-hour long window, which is small enough that false positives are cheap but the 5-minute short window still lets it page within minutes. Different SLO targets or window lengths change the multiplier; the workbook's chapter 5 derives the formula rather than hardcoding "14.4" as magic.
+- **Cutting pages by 80% without missing outages (a common interview prompt).** Start from the paging-hygiene review: for every alert that fired in the last quarter, classify it as "actionable" or not. Delete or widen the window on every alert where a human looked, found nothing wrong, and closed it — this alone typically removes most noise.
+
+  Then replace surviving cause-based thresholds with symptom-based, multi-window burn-rate alerts against each service's SLO, and add inhibition rules so a dependency outage pages once (at the dependency) instead of N times (once per dependent service).
+
+  The combination addresses both "too many alerts fire" and "we delete something we needed" — the burn-rate math still catches a real fast or slow outage even after the noisy thresholds are gone.
+- **Choosing the burn-rate multipliers.** `14.4×` isn't arbitrary: it's chosen so that a sustained outage at that rate consumes 2% of a 30-day budget in exactly the 1-hour long window, which is small enough that false positives are cheap but the 5-minute short window still lets it page within minutes.
+
+  Different SLO targets or window lengths change the multiplier; the workbook's chapter 5 derives the formula rather than hardcoding "14.4" as magic.
 - **Multi-tenant and per-cohort alerting.** A top-line burn-rate alert averages across all traffic; a single large, broken tenant can be invisible if its traffic share is small relative to total volume. A second tier of alerts scoped `by (tenant)` with a much higher bar (page only if one tenant's own burn rate is extreme) catches this without multiplying noise for the common case.
 - **Alert-as-code.** Treating alerting rules as version-controlled YAML (Prometheus rule files, reviewed in pull requests, linted with `promtool check rules`) is what makes the owner/runbook/severity discipline enforceable at scale instead of relying on everyone remembering to fill them in by hand in a UI.
 
@@ -408,3 +468,8 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 - **Before this:** [[SLIs, SLOs, SLAs and Error Budgets]], [[Metrics and Prometheus]]
 - **Next:** [[Incident Response]], [[Production Debugging Playbook]]
 - **Compare with:** [[Observability Fundamentals]] (the signals an alert is built from), [[Postmortems and Root Cause Analysis]] (what happens after a page leads to a real incident)
+
+### Watch on YouTube
+
+- [DevOps Alerting and On-Call: Reduce Noise and Respond Faster](https://www.youtube.com/watch?v=orG2ybDD2dU) · Joshua Moses / Cybertrace Foundation · 8 min · 11 views
+- [Humane On Call  Alerting doesn't have to be painful by Mario Fernandez](https://www.youtube.com/watch?v=X59Sfaey5N4) · Devoxx · 43 min · 1,631 views

@@ -8,7 +8,7 @@ sources:
   - "Martin Fowler, MonolithFirst (martinfowler.com, 2015)"
   - "Melvin Conway, How Do Committees Invent? (Datamation, 1968)"
   - "James Lewis & Martin Fowler, Microservices (martinfowler.com, 2014)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Monolith vs Microservices
@@ -23,13 +23,68 @@ updated: 2026-11-07
 > - Conway's law means service boundaries tend to mirror team boundaries whether or not anyone plans it that way.
 > - Fowler's MonolithFirst: start with a monolith (ideally a modular one) and split out a service only when a concrete, measured need (independent scaling, independent deploys, a genuinely separate team) appears.
 
+## Start here: the basics
+
+**The problem in one story.**
+A small team ships one app that does everything: invoices, payments, reports.
+It is easy to run and change. Years later three teams step on each other's releases,
+and the busy payment part needs ten times more servers than the reports part.
+Should the app be split into separate services? This note answers when and how.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Deploy | Put a new version of code into production | Shipping a new container image |
+| Monolith | One deployable app holding all the logic | One Go binary for all of InvoiceOps |
+| Microservice | A small app that deploys and owns its data on its own | A separate `payments` service |
+| In-process call | A plain function call inside one program | `billing.Charge(inv)` |
+| Network call (RPC) | Asking another program over the network | HTTP/gRPC to `payments:8080` |
+| Transaction | A group of DB writes that all succeed or all fail | Insert invoice + payment together |
+| Eventual consistency | Data agrees across services, but after a delay | Report shows payment a second later |
+| Conway's law | Systems end up shaped like the teams that build them | Three teams, three services |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    subgraph Monolith
+      A["Invoices"] --- B["Payments"] --- C["Reports"]
+      A & B & C --> DB1[("One DB")]
+    end
+    subgraph Microservices
+      P["Payments svc"] --> DB2[("Payments DB")]
+      I["Invoices svc"] --> DB3[("Invoices DB")]
+      I -->|network| P
+    end
+```
+
+**Analogy.** A single restaurant kitchen sharing one fridge versus a food hall of separate stalls, each with its own fridge and staff.
+Where it breaks: stalls in a food hall rarely need each other's food, but services often must call each other for one request, so network failures matter much more.
+
+**How the rest of this note builds up**
+
+- First, why the question comes up (section 1) and the four axes: deployment, data, team, communication (section 2).
+- Then how calls, data and failures change when you split (section 3), with a Go worked example (section 4).
+- Then variants (modular monolith, distributed monolith) and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production signals, Conway's law, MonolithFirst, interview questions (sections 7-9).
+
+> [!tip] Remember
+> Split only when deployment, data and team ownership can all become independent, not just the code.
+
 ## 1. Why it exists
 
 InvoiceOps starts as one Go binary: an HTTP layer, invoice and payment logic, and one Postgres database, deployed as a single container. One engineer can run the whole thing locally with `docker compose up` and one `go run`.
 
-Eighteen months later: the payments path needs to scale to ten times the traffic of the reporting path, three teams now touch the codebase and keep blocking each other's deploys, and a slow reporting query occasionally saturates the same connection pool the payment webhook handler needs. These are not bugs; they are the actual, measured costs of one deployment unit once its parts have outgrown it together.
+Eighteen months later: the payments path needs to scale to ten times the traffic of the reporting path, three teams now touch the codebase and keep blocking each other's deploys, and a slow reporting query occasionally saturates the same connection pool the payment webhook handler needs.
 
-The tempting fix — "split it into microservices" — solves exactly these problems only if the split also separates the data each part owns and the team that owns each part. A split that keeps one shared Postgres database and one team touching every "service" buys network latency and operational complexity (service discovery, distributed tracing, more CI/CD pipelines) without buying independent scaling, deployment or ownership. That half-measure has a name: the **distributed monolith**, and it is strictly worse than the monolith it replaced, because it has a monolith's coupling and a microservices architecture's operational cost at the same time.
+These are not bugs; they are the actual, measured costs of one deployment unit once its parts have outgrown it together.
+
+The tempting fix — "split it into microservices" — solves exactly these problems only if the split also separates the data each part owns and the team that owns each part.
+
+A split that keeps one shared Postgres database and one team touching every "service" buys network latency and operational complexity (service discovery, distributed tracing, more CI/CD pipelines) without buying independent scaling, deployment or ownership.
+
+That half-measure has a name: the **distributed monolith**, and it is strictly worse than the monolith it replaced, because it has a monolith's coupling and a microservices architecture's operational cost at the same time.
 
 ## 2. Mental model
 
@@ -40,9 +95,13 @@ Four questions decide where a system sits on the monolith-to-microservices spect
 - **Team ownership**: does one team own a part end to end, including its on-call?
 - **Communication**: do parts call each other in-process (a function call) or over the network (sync RPC, or async events)?
 
-A monolith answers "one" to the first three and "in-process" to the fourth. Microservices answer "many, separately deployed, separately owned, separately scaled" to the first three, communicating over the network. A **modular monolith** is the useful middle ground: still one deployment and one process, but with the second and third questions already answered as if it were split — each module owns its data and its logic cleanly, so splitting it out later is a deployment change, not a redesign.
+A monolith answers "one" to the first three and "in-process" to the fourth. Microservices answer "many, separately deployed, separately owned, separately scaled" to the first three, communicating over the network.
 
-**Analogy:** a single restaurant kitchen (monolith) where every station shares one walk-in fridge versus a food-hall of independent stalls (microservices), each with its own fridge, its own staff, and its own hours — ordering between stalls now means walking over and placing an order rather than reaching across a shared counter. A kitchen that is internally organized into clean stations that never touch each other's ingredients, but still shares one walk-in and one lease (modular monolith) is the easiest of the three to later split into stalls.
+A **modular monolith** is the useful middle ground: still one deployment and one process, but with the second and third questions already answered as if it were split — each module owns its data and its logic cleanly, so splitting it out later is a deployment change, not a redesign.
+
+**Analogy:** a single restaurant kitchen (monolith) where every station shares one walk-in fridge versus a food-hall of independent stalls (microservices), each with its own fridge, its own staff, and its own hours — ordering between stalls now means walking over and placing an order rather than reaching across a shared counter.
+
+A kitchen that is internally organized into clean stations that never touch each other's ingredients, but still shares one walk-in and one lease (modular monolith) is the easiest of the three to later split into stalls.
 
 ## 3. How it works
 
@@ -119,19 +178,31 @@ sequenceDiagram
     Gateway-->>Client: 200 OK
 ```
 
-Chaining synchronous calls (`Gateway -> Inv -> Pay`, and potentially further) adds the full latency of every hop and makes every downstream failure a failure of everyone upstream — exactly the chatty-call symptom of a distributed monolith. The alternative is async: `Inv` publishes an `InvoiceChargeRequested` event and returns immediately; `Pay` consumes it on its own schedule and publishes `PaymentAuthorized` back. This trades immediate consistency (the client cannot be told "paid" synchronously) for isolation from `Pay`'s latency and availability — eventual consistency, coordinated with a saga or an outbox, is the price of removing that chain. [[Monolith vs Microservices]] draws the boundary at this decision; sagas, outbox delivery and the consistency models behind "eventually" are owned by 10 System Design and Distributed Systems, not repeated here.
+Chaining synchronous calls (`Gateway -> Inv -> Pay`, and potentially further) adds the full latency of every hop and makes every downstream failure a failure of everyone upstream — exactly the chatty-call symptom of a distributed monolith.
+
+The alternative is async: `Inv` publishes an `InvoiceChargeRequested` event and returns immediately; `Pay` consumes it on its own schedule and publishes `PaymentAuthorized` back.
+
+This trades immediate consistency (the client cannot be told "paid" synchronously) for isolation from `Pay`'s latency and availability — eventual consistency, coordinated with a saga or an outbox, is the price of removing that chain.
+
+[[Monolith vs Microservices]] draws the boundary at this decision; sagas, outbox delivery and the consistency models behind "eventually" are owned by 10 System Design and Distributed Systems, not repeated here.
 
 ### Operational cost that a split adds, independent of the code
 
-Splitting into services adds work that has nothing to do with business logic: each service needs its own CI/CD pipeline, its own on-call rotation and dashboards, a way to find the other services at runtime (service discovery or a fixed gateway registry), and distributed tracing to reconstruct a single user request across several services' logs. None of this is optional once a split happens — it is the fixed operational tax that buys independent scaling and deployment, and it is exactly the tax a distributed monolith pays without getting the benefit.
+Splitting into services adds work that has nothing to do with business logic: each service needs its own CI/CD pipeline, its own on-call rotation and dashboards, a way to find the other services at runtime (service discovery or a fixed gateway registry), and distributed tracing to reconstruct a single user request across several services' logs.
+
+None of this is optional once a split happens — it is the fixed operational tax that buys independent scaling and deployment, and it is exactly the tax a distributed monolith pays without getting the benefit.
 
 ### Conway's law as a decision input, not just an observation
 
-A split that does not match team boundaries tends to drift back toward a distributed monolith: two services "owned" by the same team, reviewed in the same PRs and deployed together in practice, behave like one deployment unit no matter what the architecture diagram says. Conversely, deliberately drawing service boundaries to match (or reshape) team boundaries — the "inverse Conway manoeuvre" — tends to produce splits that survive, because the team doing the owning can actually keep the boundary clean day to day.
+A split that does not match team boundaries tends to drift back toward a distributed monolith: two services "owned" by the same team, reviewed in the same PRs and deployed together in practice, behave like one deployment unit no matter what the architecture diagram says.
+
+Conversely, deliberately drawing service boundaries to match (or reshape) team boundaries — the "inverse Conway manoeuvre" — tends to produce splits that survive, because the team doing the owning can actually keep the boundary clean day to day.
 
 ### Migrating without a rewrite
 
-The practical path from monolith to microservices is almost never "rewrite it as services"; it is extracting one module at a time behind a routing facade while the rest keeps running, covered in full in [[Strangler Fig Pattern and Legacy Migration]]. The decision of *which* module to extract first, and whether to extract at all, is this note's job; the mechanics of extracting it safely are that note's.
+The practical path from monolith to microservices is almost never "rewrite it as services"; it is extracting one module at a time behind a routing facade while the rest keeps running, covered in full in [[Strangler Fig Pattern and Legacy Migration]].
+
+The decision of *which* module to extract first, and whether to extract at all, is this note's job; the mechanics of extracting it safely are that note's.
 
 ## 4. Worked example
 
@@ -380,13 +451,21 @@ Each arrow is a decision with evidence behind it, not a default next step: move 
 
 ## 8. Deep dive
 
-**The distributed monolith, precisely.** It is not "microservices done badly" in a vague sense; it has a specific, checkable cause: at least one piece of data or one deploy decision that two or more services still depend on jointly. A shared database table two services both write to, a shared library both services must upgrade in lockstep, or a release process that only works if three services deploy together are all the same root cause wearing different clothes. The fix is always the same shape: give the shared thing exactly one owner.
+**The distributed monolith, precisely.** It is not "microservices done badly" in a vague sense; it has a specific, checkable cause: at least one piece of data or one deploy decision that two or more services still depend on jointly.
 
-**Database-per-service, and what it actually removes.** Once each service owns its own database, cross-service joins are gone by construction — a "join" across invoice and payment data becomes two calls (or a pre-joined read model maintained by a consumer of both services' events) instead of one SQL query. This is the single biggest reason a genuine microservices split changes how queries and reports are written, not just how code is deployed.
+A shared database table two services both write to, a shared library both services must upgrade in lockstep, or a release process that only works if three services deploy together are all the same root cause wearing different clothes. The fix is always the same shape: give the shared thing exactly one owner.
 
-**Serverless as a fourth point on the spectrum, not a separate axis.** A serverless function is a microservice taken to its logical extreme on the deployment axis (one function, independently deployed and scaled, down to zero instances when idle) while handing team ownership of *how* it scales entirely to the platform. The same data-ownership and chatty-call risks from the microservices section apply to a system of many serverless functions calling each other, often more acutely, because each cold start adds the kind of latency a synchronous call chain already had to worry about.
+**Database-per-service, and what it actually removes.** Once each service owns its own database, cross-service joins are gone by construction — a "join" across invoice and payment data becomes two calls (or a pre-joined read model maintained by a consumer of both services' events) instead of one SQL query.
 
-**Why DDD's bounded contexts are the natural split lines.** A bounded context (see [[Domain-Driven Design - Strategic Design]]) is already a boundary where a model is internally consistent and a word like "Invoice" has one meaning; splitting along an existing bounded context means the new service's data ownership and its domain model boundary are the same line, which is why DDD and microservices are so often discussed together even though, as [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]] notes, DDD is orthogonal to the deployment decision itself.
+This is the single biggest reason a genuine microservices split changes how queries and reports are written, not just how code is deployed.
+
+**Serverless as a fourth point on the spectrum, not a separate axis.** A serverless function is a microservice taken to its logical extreme on the deployment axis (one function, independently deployed and scaled, down to zero instances when idle) while handing team ownership of *how* it scales entirely to the platform.
+
+The same data-ownership and chatty-call risks from the microservices section apply to a system of many serverless functions calling each other, often more acutely, because each cold start adds the kind of latency a synchronous call chain already had to worry about.
+
+**Why DDD's bounded contexts are the natural split lines.**
+
+A bounded context (see [[Domain-Driven Design - Strategic Design]]) is already a boundary where a model is internally consistent and a word like "Invoice" has one meaning; splitting along an existing bounded context means the new service's data ownership and its domain model boundary are the same line, which is why DDD and microservices are so often discussed together even though, as [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]] notes, DDD is orthogonal to the deployment decision itself.
 
 ## 9. Interview questions
 
@@ -426,3 +505,8 @@ Each arrow is a decision with evidence behind it, not a default next step: move 
 - **Before this:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Modular Monolith]], [[Strangler Fig Pattern and Legacy Migration]]
 - **Compare with:** [[Domain-Driven Design - Strategic Design]] (bounded contexts as natural split lines), [[API Gateway and BFF]] (the front door once there is more than one service), [[Capstone - InvoiceOps]] (the running example this note traces)
+
+### Watch on YouTube
+
+- [Moving from MONOLITHS to MICROSERVICES 🎂 → 🍰🍰🍰](https://www.youtube.com/watch?v=rckfN7xFig0) · Gaurav Sen · 19 min · 244,851 views
+- [What are MicroServices? When & Why is it used? / Monolithic vs Microservices Architecture](https://www.youtube.com/watch?v=7IFJb-uLEaI) · Apna College · 9 min · 805,293 views

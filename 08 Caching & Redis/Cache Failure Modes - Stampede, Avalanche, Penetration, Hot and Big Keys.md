@@ -11,7 +11,7 @@ sources:
   - "golang.org/x/sync/singleflight package docs"
   - "Redis docs: UNLINK, lazyfree, OBJECT FREQ, redis-cli --bigkeys/--memkeys/--hotkeys"
   - "Redis docs: Bloom filter (BF.RESERVE, BF.EXISTS)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys
@@ -25,6 +25,51 @@ updated: 2026-11-04
 > - Avalanche: spread expiry with TTL jitter, keep the cache tier highly available, and shield the database with rate limits.
 > - Penetration: cache "not found" briefly and reject impossible IDs before they reach the database.
 > - Hot and big keys: find them by measuring, then split, replicate or cache them locally; delete big keys with `UNLINK`.
+
+## Start here: the basics
+
+**The problem in one story.**
+A popular dashboard is cached and the database only serves 1 in 20 requests.
+At 9:00 the cached copy expires, and 2,000 users refresh at the same moment.
+All 2,000 requests miss and hit the database together.
+The database was never sized for that, so it slows down or falls over.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cache miss | The key is not in the cache, so the DB is asked | Expired key |
+| Expire / TTL | A key disappears after a set time | `EX 300` |
+| Rebuild | Recomputing a value and putting it back in the cache | Run the dashboard query again |
+| Coalesce | Merge many identical requests into one | Go `singleflight` |
+| Lock | Only one worker may do a job at a time | `SET lock:k tok NX PX 5000` |
+| Jitter | Random spread added to a time | TTL 300 s ± 10% |
+| Node | One server in the cache cluster | One Redis instance |
+| Bloom filter | Compact set that answers "definitely not" or "maybe" | Reject IDs that never existed |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    K["Hot key expires"] --> M["Many requests miss"]
+    M --> DB["Database overloaded"]
+    M -. "fix" .-> SF["One loader per key<br/>(coalesce)"]
+    SF --> DB2["One DB query"]
+    DB2 --> C["Cache refilled"]
+```
+
+**Analogy.** A shop's single door: if everyone arrives at opening time, it jams; letting one person fetch the item while others wait fixes it.
+Where it breaks: a shopper gives up and leaves, but software clients keep retrying, which makes the overload worse.
+
+**How the rest of this note builds up**
+
+- First, why a cache miss is not free (section 1) and the mental model of the DB being sized for the hit ratio (section 2).
+- Then each failure mode and its fixes: stampede, avalanche, penetration, hot keys and big keys (section 3).
+- Then Go code with tests and measurements of big and hot keys (section 4).
+- Finally the SDE-3 deep dive: comparison, production detection, and interview questions (sections 5-9).
+
+> [!tip] Remember
+> Stampede: one loader per key. Avalanche: jitter. Penetration: cache "not found". Hot/big keys: measure, then split.
 
 ## 1. Why it exists
 
@@ -97,7 +142,9 @@ sequenceDiagram
 
 The tools, from local to global:
 1. **In-process singleflight.** One rebuild per key per process. With 20 pods the database sees at most 20 queries instead of 2,000.
-2. **Distributed rebuild lock.** `SET lock:dashboard:{ws} <token> NX PX 5000` lets one pod in the fleet rebuild. The others serve the stale copy or wait briefly and re-read. Release with a compare-and-delete Lua script so you never delete another holder's lock (see [[Distributed Locks and Fencing Tokens]]). The lock is an optimisation, not a correctness guarantee: if it expires mid-rebuild, two pods rebuild, which is acceptable here.
+2. **Distributed rebuild lock.** `SET lock:dashboard:{ws} <token> NX PX 5000` lets one pod in the fleet rebuild. The others serve the stale copy or wait briefly and re-read.
+
+   Release with a compare-and-delete Lua script so you never delete another holder's lock (see [[Distributed Locks and Fencing Tokens]]). The lock is an optimisation, not a correctness guarantee: if it expires mid-rebuild, two pods rebuild, which is acceptable here.
 3. **Soft TTL / stale-while-revalidate.** Store the value with a soft expiry inside the payload and a longer Redis TTL (the hard expiry). After the soft expiry, one caller refreshes and everyone else keeps getting the old value. HTTP has the same idea in RFC 5861.
 4. **Refresh-ahead.** A background job re-computes known hot keys before they expire, so they never expire under load.
 5. **Probabilistic early expiration (XFetch).** Each reader refreshes early with a probability that rises as expiry approaches: refresh when `now − delta × beta × ln(rand()) ≥ expiry`, where `delta` is the rebuild time and `beta` is usually 1. No lock and no coordination, and in expectation only a few readers refresh.
@@ -651,3 +698,8 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 - **Before this:** [[Caching Fundamentals]], [[Caching Patterns]], [[Cache Invalidation, TTL and Consistency]], [[Cache Eviction Policies - LRU, LFU, TTL]]
 - **Next:** [[Redis Replication, Sentinel and Cluster]], [[Redis in Production - Memory, Latency, Security]], [[Hot Keys and Hot Partitions]]
 - **Compare with:** [[Bloom Filters and Probabilistic Data Structures]], [[Circuit Breaker]], [[Load Shedding and Graceful Degradation]], [[Distributed Locks and Fencing Tokens]], [[Redis in Go]]
+
+### Watch on YouTube
+
+- [Cache Stampede: How One Expired Key Crashes Your DB](https://www.youtube.com/watch?v=TAZGA-aScPA) · SystemDR - Scalable System Design  · focused explainer on the stampede/thundering-herd failure mode and fixes
+- [Cache Stampede (Thundering Herd) Explained: 9 Concepts Every Software Engineer Must Know](https://www.youtube.com/watch?v=4t7Tev-wILI) · BSSR Learn · interview-oriented deep dive connecting stampede to related caching concepts

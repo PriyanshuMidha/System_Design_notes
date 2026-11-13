@@ -14,13 +14,22 @@ sources:
   - "PostgreSQL 17 docs, pg_stat_statements and auto_explain modules; log_min_duration_statement"
   - "PostgreSQL 18 release notes (BUFFERS included by default with EXPLAIN ANALYZE)"
   - "MySQL 8.0 Reference Manual, EXPLAIN Output Format; EXPLAIN ANALYZE (8.0.18) and FORMAT=TREE (8.0.16)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Query Plans and EXPLAIN - Go
 
 > [!summary] TL;DR
 > This note parses `EXPLAIN (ANALYZE, FORMAT JSON)` output in Go and flags every plan node whose row estimate is off by a chosen factor, which is the mechanical version of the "compare estimated rows with actual rows" step from [[Query Plans and EXPLAIN]]. It uses only the standard library and needs no database.
+
+## Before the code
+
+- **Structs with JSON tags**: `json:"Node Type"` tells `encoding/json` which JSON key fills which Go field.
+- **Recursive types**: a `Node` holds a slice of child `Node`s, matching the plan tree.
+- **Recursive closure**: `var walk func(n Node)` is declared first so the function can call itself.
+- **Built-in `max`**: picks the larger value (Go 1.21+); used to treat 0 rows as 1.
+- **Table-free tests with `testing`**: each `TestXxx` feeds a small JSON plan and checks the findings.
+- **Run**: `go vet ./... && go test -race -v ./...` inside the `plans` module; no database needed.
 
 ## What this code shows
 
@@ -77,7 +86,13 @@ sequenceDiagram
 
 ### Step 1: model the JSON and the result
 
-**Concept.** The theory note teaches reading a plan as a tree of nodes, each with an estimate and an actual count ([[Query Plans and EXPLAIN#3.4 Reading a plan]]). `Node` is that node as a Go struct, and the `json` tags are the exact key names PostgreSQL emits in `FORMAT JSON`. Only six fields are kept, because a struct that decodes everything would be large and fragile across versions, while `encoding/json` simply ignores the keys that have no field. `Finding` is the output, kept separate from `Node` so callers get a small stable value instead of the whole tree.
+**Concept.** The theory note teaches reading a plan as a tree of nodes, each with an estimate and an actual count ([[Query Plans and EXPLAIN#3.4 Reading a plan]]).
+
+`Node` is that node as a Go struct, and the `json` tags are the exact key names PostgreSQL emits in `FORMAT JSON`.
+
+Only six fields are kept, because a struct that decodes everything would be large and fragile across versions, while `encoding/json` simply ignores the keys that have no field.
+
+`Finding` is the output, kept separate from `Node` so callers get a small stable value instead of the whole tree.
 
 ```go
 package plans
@@ -135,7 +150,9 @@ func (f Finding) String() string {
 
 ### Step 2: decode the document
 
-**Concept.** `EXPLAIN (FORMAT JSON)` returns an array with one element per statement, and each element wraps the tree under a `"Plan"` key. This is the first half of the "Finding misestimates mechanically" procedure ([[Query Plans and EXPLAIN#Finding misestimates mechanically]]): get the tree into memory. The function takes raw bytes and returns an error rather than panicking, because the input comes from outside the program. A streaming decoder or `json.RawMessage` would save memory on huge plans, but plan JSON is small, so a plain `Unmarshal` is clearer.
+**Concept.** `EXPLAIN (FORMAT JSON)` returns an array with one element per statement, and each element wraps the tree under a `"Plan"` key. This is the first half of the "Finding misestimates mechanically" procedure ([[Query Plans and EXPLAIN#Finding misestimates mechanically]]): get the tree into memory.
+
+The function takes raw bytes and returns an error rather than panicking, because the input comes from outside the program. A streaming decoder or `json.RawMessage` would save memory on huge plans, but plan JSON is small, so a plain `Unmarshal` is clearer.
 
 ```go
 // Misestimates walks the plan and returns nodes whose estimate and actual
@@ -163,7 +180,11 @@ func Misestimates(explainJSON []byte, minFactor float64) ([]Finding, error) {
 
 ### Step 3: walk the tree and score every node
 
-**Concept.** The mechanical check from the theory note is to compare `Plan Rows` with `Actual Rows` on every node ([[Query Plans and EXPLAIN#Plan 3: a bad estimate]]). Because plans are trees, the natural implementation is a recursive depth-first walk that visits the parent before its children. The score is `max(p/a, a/p)`, so overestimates and underestimates count equally, and `max(x, 1)` guards against a node that returned zero rows. A closure is used so that `walk` can append to `out` without passing it around.
+**Concept.** The mechanical check from the theory note is to compare `Plan Rows` with `Actual Rows` on every node ([[Query Plans and EXPLAIN#Plan 3: a bad estimate]]).
+
+Because plans are trees, the natural implementation is a recursive depth-first walk that visits the parent before its children. The score is `max(p/a, a/p)`, so overestimates and underestimates count equally, and `max(x, 1)` guards against a node that returned zero rows.
+
+A closure is used so that `walk` can append to `out` without passing it around.
 
 ```go
 	var walk func(n Node)

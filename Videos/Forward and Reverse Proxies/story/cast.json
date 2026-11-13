@@ -1,0 +1,11 @@
+{
+  "N":    {"voice": "en-US-EmmaMultilingualNeural", "rate": 4,  "pitch": 0,  "volume": 0},
+  "KAI":  {"voice": "en-US-ChristopherNeural",      "rate": 4,  "pitch": 2,  "volume": 0},
+  "FIONA":{"voice": "en-US-JennyNeural",            "rate": 8,  "pitch": 2,  "volume": 0},
+  "RHEA": {"voice": "en-US-AriaNeural",             "rate": 0,  "pitch": 0,  "volume": 0},
+  "LOU":  {"voice": "en-US-RogerNeural",            "rate": -6, "pitch": -4, "volume": 0},
+  "OLLY": {"voice": "en-US-GuyNeural",              "rate": -8, "pitch": -6, "volume": 0},
+  "MAL":  {"voice": "en-US-EricNeural",             "rate": 0,  "pitch": -2, "volume": 0},
+  "SID":  {"voice": "en-GB-RyanNeural",          "rate": 4,  "pitch": 0,  "volume": 0},
+  "CORA": {"voice": "en-AU-NatashaNeural",          "rate": 0,  "pitch": 0,  "volume": 0}
+}

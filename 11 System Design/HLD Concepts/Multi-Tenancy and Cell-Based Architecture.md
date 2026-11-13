@@ -13,19 +13,69 @@ sources:
   - "Microsoft Azure Architecture Center: Deployment Stamps pattern; Multitenancy architectural approaches"
   - "PostgreSQL docs: Row Security Policies"
   - "Google SRE Book, chapter on Handling Overload (per-client quotas)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Multi-Tenancy and Cell-Based Architecture
 
 > [!summary] TL;DR
-> A **tenant** is one customer (a company, a school, a shop) using your shared product. **Multi-tenancy** means many tenants share the same system to keep costs low, and the design problem is making sure one tenant cannot hurt, see or slow down another. **Cell-based architecture** takes that further: split the whole platform into many independent copies (**cells**), each serving a slice of tenants, so any failure hits only one slice.
+> A **tenant** is one customer (a company, a school, a shop) using your shared product.
+>
+> **Multi-tenancy** means many tenants share the same system to keep costs low, and the design problem is making sure one tenant cannot hurt, see or slow down another.
+>
+> **Cell-based architecture** takes that further: split the whole platform into many independent copies (**cells**), each serving a slice of tenants, so any failure hits only one slice.
 
 > [!abstract] Core idea
 > - Choose how much each tenant shares: a full stack each (**silo**), everything shared (**pool**), or a mix (**bridge**).
 > - Carry a **tenant id** everywhere and enforce it in the data layer, not just in application code.
 > - Stop **noisy neighbours** with per-tenant quotas, concurrency limits and fair queueing.
 > - Limit the **blast radius** with cells and **shuffle sharding**, so a bad tenant or a bad deploy touches a small, known set of customers.
+
+## Start here: the basics
+
+**The problem in one story.**
+You build an app that 5,000 small companies use to run payroll.
+They all share the same servers and the same database, because that is cheap.
+One big company runs a huge import and everyone else's payroll gets slow.
+Worse, a bug could show company A's salaries to company B.
+This note is about sharing safely: cheap like a shared building, safe like separate houses.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Tenant | One customer organisation using your shared product | "Acme Ltd" on your payroll SaaS |
+| Multi-tenancy | Many tenants share one running system | 5,000 companies on one cluster |
+| Tenant id | A number on every request and row saying whose it is | `tenant_id = 42` |
+| Shard | One slice of the data on its own database | Tenants 1-500 live on shard 3 |
+| Noisy neighbour | A tenant whose heavy use slows others down | A 4-million-job import |
+| Quota | A per-tenant limit on usage | Max 50 workers per tenant |
+| Blast radius | How many customers one failure can hurt | 1 cell of 20 = 5 percent |
+| Cell | A complete, independent copy of the whole service | Cell 7: app, queue, DB, cache |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U[Request with tenant id] --> R[Cell router]
+    R --> C1[Cell 1: app + DB]
+    R --> C2[Cell 2: app + DB]
+    R --> C3[Cell 3: app + DB]
+    C2 -.->|fails| X[Only cell 2 tenants hurt]
+```
+
+**Analogy.** Multi-tenancy is an apartment building: tenants share walls, pipes and the lift to save money. Cells are several separate buildings, so a fire in one does not reach the others.
+Where it breaks: apartment walls are physical, while software isolation exists only if you enforce the tenant id in every layer.
+
+**How the rest of this note builds up**
+
+- First, why it exists and the mental model (sections 1-2).
+- Then how it works (section 3): silo, pool and bridge; data isolation; tenant-aware sharding; noisy neighbours; cells; shuffle sharding.
+- Then a worked payroll example and a comparison of variants (sections 4-5).
+- Finally the SDE-3 deep dive (section 8): cell sizing, placement, evacuation, fairness, observability and security.
+
+> [!tip] Remember
+> Tag everything with a tenant id, limit each tenant, and split the platform into cells so one failure hurts only a slice.
 
 ## 1. Why it exists
 
@@ -117,7 +167,11 @@ flowchart LR
     end
 ```
 
-**Example.** With a `tenant_id` column in PostgreSQL you can turn on **row-level security (RLS)**. You attach a policy such as `USING (tenant_id = current_setting('app.tenant_id')::bigint)` to the table, and the application sets `app.tenant_id` on each connection or transaction. Even if a developer forgets the filter, the database returns only that tenant's rows. Caveat: RLS does not apply to superusers or roles with `BYPASSRLS`, and the table owner skips it unless you run `ALTER TABLE ... FORCE ROW LEVEL SECURITY`; the app must connect as a normal role.
+**Example.** With a `tenant_id` column in PostgreSQL you can turn on **row-level security (RLS)**. You attach a policy such as `USING (tenant_id = current_setting('app.tenant_id')::bigint)` to the table, and the application sets `app.tenant_id` on each connection or transaction.
+
+Even if a developer forgets the filter, the database returns only that tenant's rows.
+
+Caveat: RLS does not apply to superusers or roles with `BYPASSRLS`, and the table owner skips it unless you run `ALTER TABLE ... FORCE ROW LEVEL SECURITY`; the app must connect as a normal role.
 
 **Why it matters.** Enforcement in the data layer turns "every developer must remember" into "the database refuses". Always make `tenant_id` the leading column of the primary key and the main indexes, so queries stay local to one tenant.
 
@@ -145,7 +199,9 @@ flowchart LR
     RT -.->|"whale tenant 7 -> dedicated"| SW[("Dedicated shard")]
 ```
 
-**Example.** Tenant 42 maps to shard 3 in the directory. Moving a tenant is: copy its data to shard 5, catch up using change data capture, briefly pause its writes, flip the directory entry, resume. No other tenant is affected. A pure hash-based placement cannot do this without a rebalance, which is why directories (or hash plus overrides) are popular in multi-tenant systems. See [[Partitioning and Sharding]].
+**Example.** Tenant 42 maps to shard 3 in the directory. Moving a tenant is: copy its data to shard 5, catch up using change data capture, briefly pause its writes, flip the directory entry, resume. No other tenant is affected.
+
+A pure hash-based placement cannot do this without a rebalance, which is why directories (or hash plus overrides) are popular in multi-tenant systems. See [[Partitioning and Sharding]].
 
 **Why it matters.** Tenant sizes follow a long tail: a few tenants are 100 times bigger than the median. A directory lets you give the big ones their own shard and move them without downtime. This ties to [[Hot Keys and Hot Partitions]].
 
@@ -168,7 +224,10 @@ flowchart TD
     Q --> WK["Shared workers"]
 ```
 
-**Example.** The retail chain's import floods the queue with 4 million jobs. Without fairness, the shop's one job waits behind all of them. With a **per-tenant queue and round-robin dequeue**, each worker takes one job from each tenant in turn, so the shop's job runs next. With **per-tenant concurrency limits** (a bulkhead per tenant), the chain can use at most, say, 50 of 400 workers.
+**Example.** The retail chain's import floods the queue with 4 million jobs. Without fairness, the shop's one job waits behind all of them.
+
+- With a **per-tenant queue and round-robin dequeue**, each worker takes one job from each tenant in turn, so the shop's job runs next.
+- With **per-tenant concurrency limits** (a bulkhead per tenant), the chain can use at most, say, 50 of 400 workers.
 
 **Why it matters.** The quota belongs to the tenant, not to the shared pool. Otherwise the pool's global limit makes everyone suffer for one tenant. See [[Rate Limiting - Algorithms and Distributed Design]], [[Bulkheads and Concurrency Limits]] and [[Load Shedding and Graceful Degradation]].
 
@@ -179,7 +238,9 @@ Quotas should reflect plans (free, pro, enterprise) and be changeable without a 
 
 ### Cells: shrinking the blast radius
 
-**In plain words.** Even with perfect tenant isolation, one bad deploy, one poison request, or one overloaded dependency can take down the whole shared stack. So instead of one big stack, run many **cells**: complete, independent copies of the service (app, queues, database, cache). Each tenant is assigned to exactly one cell. A thin **cell router** sends each request to the right cell.
+**In plain words.** Even with perfect tenant isolation, one bad deploy, one poison request, or one overloaded dependency can take down the whole shared stack.
+
+So instead of one big stack, run many **cells**: complete, independent copies of the service (app, queues, database, cache). Each tenant is assigned to exactly one cell. A thin **cell router** sends each request to the right cell.
 
 **Picture it.**
 
@@ -193,7 +254,11 @@ flowchart TD
     C1 -. "no calls between cells" .- C2
 ```
 
-**Example.** You have 20 cells with equal tenants. A bug in cell 7 takes it down. 1/20 = 5 percent of tenants are affected, and the other 95 percent never notice. You can also **deploy cell by cell**: cell 1 first (a canary), then cells 2 to 5, then the rest, so a bad release is caught after hitting about 5 percent. A cell has a **maximum size**, so its behaviour is well understood and load-tested; you grow by adding cells, not by growing cells.
+**Example.** You have 20 cells with equal tenants. A bug in cell 7 takes it down. 1/20 = 5 percent of tenants are affected, and the other 95 percent never notice.
+
+You can also **deploy cell by cell**: cell 1 first (a canary), then cells 2 to 5, then the rest, so a bad release is caught after hitting about 5 percent.
+
+A cell has a **maximum size**, so its behaviour is well understood and load-tested; you grow by adding cells, not by growing cells.
 
 **Why it matters.** Without cells, blast radius is 100 percent of customers. With N cells it is about 1/N. AWS describes this in its cell-based architecture guidance, Slack has written about moving to a cellular architecture, and Shopify uses isolated "pods" of shops. Azure's Deployment Stamps pattern is the same idea.
 
@@ -209,7 +274,9 @@ The rules that make cells work:
 
 ### Shuffle sharding: isolation between tenants inside a pool
 
-**In plain words.** Plain sharding gives each tenant one fixed shard, so a poison tenant kills its whole shard and every tenant on it. **Shuffle sharding** gives each tenant a small, random-looking *set* of workers. Two tenants rarely have exactly the same set, so a poison tenant knocks out its own set while almost every other tenant still has at least one healthy worker left.
+**In plain words.** Plain sharding gives each tenant one fixed shard, so a poison tenant kills its whole shard and every tenant on it.
+
+**Shuffle sharding** gives each tenant a small, random-looking *set* of workers. Two tenants rarely have exactly the same set, so a poison tenant knocks out its own set while almost every other tenant still has at least one healthy worker left.
 
 **Picture it.**
 
@@ -238,7 +305,9 @@ flowchart LR
 - Number of possible pairs: C(8,2) = **28**. A tenant is totally down only if the poison tenant has exactly the same pair, which happens for 1 in 28 (about 3.6 percent) of other tenants.
 - 12 of the 28 pairs (about 43 percent) share exactly *one* of the two workers, but they still have their other worker available, so a client that retries on its second worker still gets served.
 
-Scale it up: 100 workers, 5 per tenant gives C(100,5) = 75,287,520 combinations. The chance another tenant shares *all five* with the poison tenant is about 1.3 in 100 million. AWS's Route 53 uses 2,048 virtual name servers with 4 per domain, which gives C(2048,4), roughly 730 billion combinations, so a domain under attack almost never takes another domain fully offline.
+Scale it up: 100 workers, 5 per tenant gives C(100,5) = 75,287,520 combinations. The chance another tenant shares *all five* with the poison tenant is about 1.3 in 100 million.
+
+AWS's Route 53 uses 2,048 virtual name servers with 4 per domain, which gives C(2048,4), roughly 730 billion combinations, so a domain under attack almost never takes another domain fully offline.
 
 **Why it matters.** It needs the client to retry on another worker in its set, and works best when poison is rare and per-tenant. Cells isolate by deployment unit; shuffle sharding isolates by combination inside one unit. You can use both: shuffle-shard within each cell.
 
@@ -374,7 +443,13 @@ Per-tenant encryption keys (one key per tenant in a KMS) allow "crypto-shredding
 ## 9. Interview questions
 
 > [!question]- Design a multi-tenant SaaS. How do you keep tenants isolated?
-> Put the tenant id in the authenticated token and carry it in context to every layer. Enforce it in the data layer (tenant_id as the leading key column plus row-level security, or schema or database per tenant for stricter tenants). Add per-tenant quotas for rate, concurrency and storage, and per-tenant queues with fair scheduling. Use a bridge model: pool for small tenants, silo or dedicated shards for big or regulated ones.
+> Put the tenant id in the authenticated token and carry it in context to every layer.
+>
+> Enforce it in the data layer (tenant_id as the leading key column plus row-level security, or schema or database per tenant for stricter tenants).
+>
+> Add per-tenant quotas for rate, concurrency and storage, and per-tenant queues with fair scheduling.
+>
+> Use a bridge model: pool for small tenants, silo or dedicated shards for big or regulated ones.
 
 > [!question]- What is a noisy neighbour, and how do you stop it?
 > One tenant using so much shared capacity that others slow down. Stop it with per-tenant rate limits, concurrency limits (bulkheads), fair queueing (round-robin or weighted), admission control that rejects over-quota work early, and by moving heavy tenants to dedicated capacity.
@@ -383,7 +458,9 @@ Per-tenant encryption keys (one key per tenant in a KMS) allow "crypto-shredding
 > The platform is split into many complete, independent copies (cells), each serving a fixed set of tenants, behind a thin router. A failure or bad deploy affects roughly 1/N of tenants. Cells share nothing, have a maximum size, and are deployed one at a time. The cost is extra capacity, the router and directory, and harder cross-tenant features.
 
 > [!question]- Explain shuffle sharding with an example.
-> Each tenant gets a small random set of workers instead of one shard. With 8 workers and 2 per tenant there are 28 combinations, so only about 1 in 28 other tenants have the same pair as a poison tenant, and others who share one worker can retry on their other worker. With 100 workers and 5 each, the full overlap chance is about one in 75 million. It needs retrying clients and per-tenant poison to be the main failure.
+> Each tenant gets a small random set of workers instead of one shard. With 8 workers and 2 per tenant there are 28 combinations, so only about 1 in 28 other tenants have the same pair as a poison tenant, and others who share one worker can retry on their other worker.
+>
+> With 100 workers and 5 each, the full overlap chance is about one in 75 million. It needs retrying clients and per-tenant poison to be the main failure.
 
 > [!question]- How would you shard a multi-tenant database, and what do you do with one huge tenant?
 > Shard by tenant id so a tenant's data and joins stay on one shard, and use a directory (tenant to shard) so you can move tenants. Give the huge tenant a dedicated shard or cell: copy, catch up via change data capture, brief write pause, flip the directory, resume. Hash-only placement makes this move hard.
@@ -409,3 +486,8 @@ Per-tenant encryption keys (one key per tenant in a KMS) allow "crypto-shredding
 - **Before this:** [[Partitioning and Sharding]], [[Rate Limiting - Algorithms and Distributed Design]], [[Bulkheads and Concurrency Limits]]
 - **Next:** [[Multi-Region Architecture]], [[Load Shedding and Graceful Degradation]]
 - **Compare with:** [[Hot Keys and Hot Partitions]] (the skew problem inside a shard), [[Load Balancing]] (routing inside a cell), [[Service Discovery]] (finding the cell), [[High Availability and Failover]]
+
+### Watch on YouTube
+
+- [AWS re:Invent 2024 - SaaS meets cell-based architecture: A natural multi-tenant fit (SAS315)](https://www.youtube.com/watch?v=wYm_PJc2U8c) · AWS Events · 56 min · 4,530 views
+- [Multitenancy Explained](https://www.youtube.com/watch?v=60ccSmOxpMw) · IBM Technology · 3 min · 121,078 views

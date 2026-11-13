@@ -9,13 +9,22 @@ sources:
   - "Go source, runtime/slice.go, function nextslicecap (Go 1.24, growth formula)"
   - "The Go Programming Language Specification, §Slice types"
   - "Go std lib docs, package slices (go.dev/pkg/slices)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Arrays and Dynamic Arrays (Go Slices) - Go
 
 > [!summary] TL;DR
 > A Go package demonstrating the growth formula, insert/delete, row-major 2-D indexing, and five classic array/slice interview patterns from [[Arrays and Dynamic Arrays (Go Slices)]], all backed by passing tests.
+
+## Before the code
+
+- **Slices** (`[]int`): Go's growable list, a header (`ptr`, `len`, `cap`) over a backing array.
+- **`append` and `copy`**: built-ins that grow a slice and move elements; `copy` handles overlapping ranges safely.
+- **Generics** (`func Insert[T any]`): one function that works for any element type `T`.
+- **Full slice expression** (`s[low:high:max]`): a sub-slice whose capacity is capped at `max`.
+- **Closures** (`canFinish := func(...)`): a function value that can read local variables like `piles` and `h`.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines or interfaces are needed here.
 
 ## What this code shows
 
@@ -36,7 +45,9 @@ updated: 2026-11-09
 
 ### Step 1: the growth formula
 
-**Concept.** [[Arrays and Dynamic Arrays (Go Slices)#append and growth, step by step]] describes `append`'s growth rule in words; `NextCap` is that rule as a function, so it can be tested against the measured table directly instead of trusting the description alone. The alternative design — always doubling — is simpler but wastes more memory at large capacities, which is why the real runtime decays toward 1.25x above 256 elements.
+**Concept.** [[Arrays and Dynamic Arrays (Go Slices)#append and growth, step by step]] describes `append`'s growth rule in words; `NextCap` is that rule as a function, so it can be tested against the measured table directly instead of trusting the description alone.
+
+The alternative design — always doubling — is simpler but wastes more memory at large capacities, which is why the real runtime decays toward 1.25x above 256 elements.
 
 ```go
 // NextCap implements the documented two-phase growth decision from the Go
@@ -79,7 +90,11 @@ flowchart LR
 
 ### Step 2: insert, delete and 2-D indexing
 
-**Concept.** `Insert` and `Delete` are the code form of the "shift the elements after the gap" picture in [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example]]: there's no way to make or close a gap in contiguous memory without moving everything on one side of it. `RowMajorIndex` is the one-line arithmetic behind the flat-array 2-D layout diagram in the same section. Both are generic (`[T any]`) so the same code works for any element type, which is the idiomatic Go alternative to writing one version per type.
+**Concept.** `Insert` and `Delete` are the code form of the "shift the elements after the gap" picture in [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example]]: there's no way to make or close a gap in contiguous memory without moving everything on one side of it.
+
+`RowMajorIndex` is the one-line arithmetic behind the flat-array 2-D layout diagram in the same section.
+
+Both are generic (`[T any]`) so the same code works for any element type, which is the idiomatic Go alternative to writing one version per type.
 
 ```go
 // Insert inserts v at index i, shifting everything after it one place right.
@@ -165,11 +180,17 @@ flowchart LR
 
 ### Step 4: the five interview patterns
 
-**Concept.** These five functions are what [[Arrays and Dynamic Arrays (Go Slices)]]'s cheat sheet calls "the five classic patterns" — two pointers, sliding window, prefix sums, Kadane's algorithm, and binary search on the answer. All five rely only on the contiguous-memory properties from the theory note's section 3 (`O(1)` index access, cheap sequential scans); none needs a different data structure. Alternative designs exist for some of them (e.g. a hash map for two-sum on an *unsorted* array, `O(n)` time and `O(n)` space) but are worse here because the input is already sorted or the problem has a monotonic structure to exploit.
+**Concept.** These five functions are what [[Arrays and Dynamic Arrays (Go Slices)]]'s cheat sheet calls "the five classic patterns" — two pointers, sliding window, prefix sums, Kadane's algorithm, and binary search on the answer.
+
+All five rely only on the contiguous-memory properties from the theory note's section 3 (`O(1)` index access, cheap sequential scans); none needs a different data structure.
+
+Alternative designs exist for some of them (e.g. a hash map for two-sum on an *unsorted* array, `O(n)` time and `O(n)` space) but are worse here because the input is already sorted or the problem has a monotonic structure to exploit.
 
 #### Two pointers
 
-**Concept.** `TwoSumSorted` exploits the fact the input is already sorted: instead of checking every pair (`O(n²)`), one pointer starts at each end and the sum's comparison to the target tells you unambiguously which pointer to move. The alternative — a hash map of seen values — works on *unsorted* input too, but costs `O(n)` extra space; here sortedness is given, so two pointers gets the same `O(n)` time for `O(1)` space.
+**Concept.** `TwoSumSorted` exploits the fact the input is already sorted: instead of checking every pair (`O(n²)`), one pointer starts at each end and the sum's comparison to the target tells you unambiguously which pointer to move.
+
+The alternative — a hash map of seen values — works on *unsorted* input too, but costs `O(n)` extra space; here sortedness is given, so two pointers gets the same `O(n)` time for `O(1)` space.
 
 ```go
 // TwoSumSorted finds a pair in a sorted slice that sums to target, using two
@@ -289,7 +310,9 @@ func MaxSubArray(nums []int) int {
 
 #### Binary search on the answer
 
-**Concept.** `MinEatingSpeed` doesn't binary-search the input array at all — it binary-searches the *space of possible answers* (eating speeds from 1 up to the largest pile), using a predicate that is monotonic: once a speed is fast enough to finish in time, every faster speed is too. That monotonicity is exactly what licenses binary search here, the same shape used for rate-limit and capacity-planning searches.
+**Concept.** `MinEatingSpeed` doesn't binary-search the input array at all — it binary-searches the *space of possible answers* (eating speeds from 1 up to the largest pile), using a predicate that is monotonic: once a speed is fast enough to finish in time, every faster speed is too.
+
+That monotonicity is exactly what licenses binary search here, the same shape used for rate-limit and capacity-planning searches.
 
 ```go
 // MinEatingSpeed is "binary search on the answer": instead of searching the
@@ -375,7 +398,9 @@ A failure here would mean the growth model no longer matches the runtime's docum
 
 ### TestAliasing, TestInsertDelete, TestRowMajorIndex
 
-**Property.** `TestAliasing` is shown in full above (Step 3): it proves both that aliasing happens and that the full slice expression prevents it. `TestInsertDelete` checks that `Insert(2,3)` then `Delete(2)` round-trips `[1,2,4,5]` back to itself. `TestRowMajorIndex` checks one concrete coordinate: row 1, column 2, width 4 is flat index 6.
+**Property.** `TestAliasing` is shown in full above (Step 3): it proves both that aliasing happens and that the full slice expression prevents it.
+
+`TestInsertDelete` checks that `Insert(2,3)` then `Delete(2)` round-trips `[1,2,4,5]` back to itself. `TestRowMajorIndex` checks one concrete coordinate: row 1, column 2, width 4 is flat index 6.
 
 | Test | Input | Expected |
 | --- | --- | --- |
@@ -396,7 +421,9 @@ A failure in `TestInsertDelete` would mean the shift direction or the placeholde
 | `TestMaxSubArray` | `[-2,1,-3,4,-1,2,1,-5,4]` | `6` (subarray `[4,-1,2,1]`) |
 | `TestMinEatingSpeed` | piles `[3,6,7,11]`, `h=8` | `4` |
 
-A failure in any of these means the pattern's core logic (the pointer-movement rule, the window update, the prefix formula, the restart condition, or the monotonic predicate) has a bug — these are the five patterns' textbook edge cases, so a wrong answer here usually generalizes to being wrong everywhere.
+A failure in any of these means the pattern's core logic (the pointer-movement rule, the window update, the prefix formula, the restart condition, or the monotonic predicate) has a bug.
+
+These are the five patterns' textbook edge cases, so a wrong answer here usually generalizes to being wrong everywhere.
 
 ## Running it
 
@@ -410,7 +437,9 @@ Measured with `go test -race ./...` on Go 1.24.4, darwin/arm64 (2026-11-09):
 ok  	rollscratch/arrdyn	1.474s
 ```
 
-**Reading the output.** `ok` means every test in the package passed, including under the race detector (relevant here because none of this code is concurrent — the race detector run is a cheap extra check that nothing in `copy`/`append` usage is doing anything unsafe). The elapsed time is dominated by compiling the test binary, not running the tests themselves, since none of them touch real I/O or sleep.
+**Reading the output.** `ok` means every test in the package passed, including under the race detector (relevant here because none of this code is concurrent — the race detector run is a cheap extra check that nothing in `copy`/`append` usage is doing anything unsafe).
+
+The elapsed time is dominated by compiling the test binary, not running the tests themselves, since none of them touch real I/O or sleep.
 
 ## Pitfalls in the code
 

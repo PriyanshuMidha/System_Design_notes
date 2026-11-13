@@ -12,13 +12,17 @@ sources:
   - "Twitch public documentation: chat built on IRC (Twitch IRC reference) with rate limits and slow mode"
   - "Sergey Kamardin, A Million WebSockets and Go (Mail.Ru Group, 2017): memory per connection and epoll-based servers"
   - "Hello Interview and ByteByteGo public system-design problem lists: FB Live Comments"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Live Comments and Reactions
 
 > [!summary] TL;DR
-> Design the comment stream and floating hearts under a live video watched by up to millions at once. The challenge is **fan-out**: one comment must reach every viewer within about a second, but you cannot literally send 50,000 comments per second to each of a million screens. The answer is a connection tier of gateways subscribed to per-stream channels, **sampling and batching** what each viewer sees, **aggregating** reactions into counts, and splitting a hot stream's channel across many shards.
+> Design the comment stream and floating hearts under a live video watched by up to millions at once.
+>
+> The challenge is **fan-out**: one comment must reach every viewer within about a second, but you cannot literally send 50,000 comments per second to each of a million screens.
+>
+> The answer is a connection tier of gateways subscribed to per-stream channels, **sampling and batching** what each viewer sees, **aggregating** reactions into counts, and splitting a hot stream's channel across many shards.
 
 > [!abstract] Core idea
 > - Viewers hold a long-lived connection (SSE or WebSocket) to a **gateway**. Gateways subscribe to the streams their viewers watch.
@@ -27,11 +31,62 @@ updated: 2026-11-09
 > - Reactions are not messages, they are **counters**. Aggregate per second, send totals, animate on the client.
 > - Delivery is **best effort** for the live view (loss is fine). Durability is only needed for the stored copy used for replay.
 
+## Start here: the basics
+
+**The problem in one story.**
+A cricket match is streaming live to a million people.
+Everyone can post comments and tap hearts.
+Each comment should appear on other screens within about a second.
+But if 50,000 comments arrive per second, nobody can read them all, and sending all of them to every phone would melt the servers.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Long-lived connection | A connection kept open so the server can push data | WebSocket or SSE |
+| Gateway | Server holding many viewers' open connections | 100k viewers per gateway box |
+| Fan-out | Copying one message to many receivers | 1 comment to 1M screens |
+| Pub/sub channel | A named topic; publishers send, subscribers receive | `stream:123:comments` |
+| Sampling | Showing only some items when there are too many | 10 comments per second per viewer |
+| Batching | Sending many small items together in one message | 5 comments in one push |
+| Counter | A number you add to instead of sending each event | `hearts = 81,204` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Viewer posts comment"] --> API["Comment service<br/>check and store"]
+    API --> CH["Channel for<br/>this stream"]
+    CH --> G1["Gateway 1"]
+    CH --> G2["Gateway 2"]
+    G1 --> V1["Its viewers"]
+    G2 --> V2["Its viewers"]
+```
+
+**Analogy.** A stadium announcer reads out a few fan messages over the speakers; the crowd hears a sample, not every message, and cheers are measured as noise level, not counted one by one.
+Where it breaks: the announcer is one person, while the system has many gateways that each must get the message and push it to their own viewers.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the high-level design: one comment step by step and the connection tier (section 3), plus estimates, API and data model (section 4).
+- Then deep dives: fan-out choices, sampling and batching, reactions as counters, and more (section 5).
+- Finally the SDE-3 view: trade-offs, production examples and interview questions in the later sections.
+
+> [!tip] Remember
+> Publish each comment once per stream, let gateways fan it out locally, and sample, batch and count so no one is flooded.
+
 ## 1. Why it exists - requirements
 
-Imagine a cricket final with 5 million people watching a live stream. People type "WHAT A SHOT!" and tap heart buttons. The comment section feels alive only if new comments appear within a second or two. If it lags 30 seconds, the conversation is about something that has already happened. If it breaks, the stream still plays but the event feels dead. This is the product that **live comments** solve, and the interesting part is that the audience size is huge and spiky, but each message is tiny.
+Imagine a cricket final with 5 million people watching a live stream. People type "WHAT A SHOT!" and tap heart buttons. The comment section feels alive only if new comments appear within a second or two.
 
-Real-life picture: a stadium announcer. One person (a comment) speaks into one microphone; the sound reaches the whole stadium through many speakers (gateways). Nobody replays each fan's shout individually to each seat. And if 10,000 fans shout at once, the announcer does not read them all aloud; the crowd noise is summarised ("the crowd goes wild"). That is sampling and aggregation.
+If it lags 30 seconds, the conversation is about something that has already happened. If it breaks, the stream still plays but the event feels dead.
+
+This is the product that **live comments** solve, and the interesting part is that the audience size is huge and spiky, but each message is tiny.
+
+Real-life picture: a stadium announcer. One person (a comment) speaks into one microphone; the sound reaches the whole stadium through many speakers (gateways). Nobody replays each fan's shout individually to each seat.
+
+And if 10,000 fans shout at once, the announcer does not read them all aloud; the crowd noise is summarised ("the crowd goes wild"). That is sampling and aggregation.
 
 **Functional requirements**
 - Viewers see new comments on a live video in near real time.
@@ -48,7 +103,9 @@ Real-life picture: a stadium announcer. One person (a comment) speaks into one m
 - **Graceful overload:** under a flood, degrade (sample, slow mode) rather than fall over.
 - **Safety:** spam and abuse are filtered before broad fan-out.
 
-**Glossary.** **Fan-out** is sending one item to many recipients. A **gateway** (or connection server) holds client connections. A **channel** (or topic) is a named pub/sub stream, here one per live video. A **hot stream** is a stream with so many viewers or events that it overwhelms one node. **Sampling** means showing only a subset of messages. **Slow mode** limits how often one user can post.
+**Glossary.** **Fan-out** is sending one item to many recipients. A **gateway** (or connection server) holds client connections. A **channel** (or topic) is a named pub/sub stream, here one per live video.
+
+A **hot stream** is a stream with so many viewers or events that it overwhelms one node. **Sampling** means showing only a subset of messages. **Slow mode** limits how often one user can post.
 
 > [!tip] Remember
 > One comment is tiny. The problem is the number of recipients, and the fix is to fan out as late as possible, near the viewer.
@@ -83,7 +140,8 @@ flowchart LR
 1. **Post.** The viewer sends `POST /streams/{id}/comments` (or sends a WebSocket frame). The request carries a client-generated id for deduplication.
 2. **Gate.** The API authenticates the user, checks stream rules (comments on, slow mode, followers-only) and applies a per-user rate limit.
 3. **Moderate.** A fast synchronous filter runs: banned words, link spam, duplicate text, user reputation. Heavy ML runs asynchronously and can retract later.
-4. **Id and persist.** Give the comment a time-sortable id and append it to a durable log (Kafka) for storage and replay. Acknowledge the poster. (Keying by `stream_id` keeps order per stream, but a 50,000 comments/s x ~200 B = ~10 MB/s stream is one hot partition; for the biggest streams key by `stream_id` plus a small salt, since replay sorts by `comment_id` anyway.)
+4. **Id and persist.** Give the comment a time-sortable id and append it to a durable log (Kafka) for storage and replay. Acknowledge the poster.
+   - (Keying by `stream_id` keeps order per stream, but a 50,000 comments/s x ~200 B = ~10 MB/s stream is one hot partition; for the biggest streams key by `stream_id` plus a small salt, since replay sorts by `comment_id` anyway.)
 5. **Publish.** Send the comment to the stream's **live channel** (Redis pub/sub or a similar broker, or the Kafka topic via a relay).
 6. **Fan-out at the edge.** Every gateway that has viewers for this stream receives the message once. The gateway puts it into each local viewer's outgoing buffer.
 7. **Batch and sample.** Every 200-500 ms the gateway flushes a batch of comments to each connection, capped at a rate the client can render (for example max 10 per second).
@@ -190,7 +248,9 @@ POST /v1/streams/{stream_id}/reactions    # or a WS frame
 204
 ```
 
-**SSE or WebSocket?** Comments flow mostly one way to the viewer, so **SSE** (server-sent events) is simpler: plain HTTP, built-in reconnect and `Last-Event-ID`, works through proxies. Posting uses a normal `POST`. Use WebSocket if you want one bidirectional channel (very chatty reactions, interactive polls). LinkedIn's engineering write-up on real-time likes on live video used SSE-style long-lived connections for the same reason. See [[Choosing an API and Communication Style - Decision Guide]].
+**SSE or WebSocket?** Comments flow mostly one way to the viewer, so **SSE** (server-sent events) is simpler: plain HTTP, built-in reconnect and `Last-Event-ID`, works through proxies. Posting uses a normal `POST`. Use WebSocket if you want one bidirectional channel (very chatty reactions, interactive polls).
+
+LinkedIn's engineering write-up on real-time likes on live video used SSE-style long-lived connections for the same reason. See [[Choosing an API and Communication Style - Decision Guide]].
 
 ### Data model
 
@@ -252,7 +312,9 @@ flowchart TD
 | Client polling (pull) | Client asks "anything new since X?" every 1-2 s | No long-lived connections; cacheable at CDN | Adds 1-2 s latency; request storm | Fallback for old clients, and the extreme-scale option |
 | Hybrid | Push for small streams, CDN-cached polling for the very biggest | Cost control | Two code paths | The biggest broadcasts |
 
-**Choice:** pub/sub to gateways with local fan-out, with sampling. **Why:** it keeps origin work proportional to the number of gateways (tens or hundreds), matches the data flow (one-to-many), and each gateway can protect itself. Polling with CDN-cached "recent comments in the last 2 s" is a good **fallback and extreme-scale option**: the response is identical for all viewers, so a CDN serves 1 M requests with few origin hits. See [[CDN and Edge]].
+**Choice:** pub/sub to gateways with local fan-out, with sampling. **Why:** it keeps origin work proportional to the number of gateways (tens or hundreds), matches the data flow (one-to-many), and each gateway can protect itself.
+
+Polling with CDN-cached "recent comments in the last 2 s" is a good **fallback and extreme-scale option**: the response is identical for all viewers, so a CDN serves 1 M requests with few origin hits. See [[CDN and Edge]].
 
 #### Example
 Stream with 1,000,000 viewers on 20 gateways. A comment is published once. The pub/sub cluster sends 20 messages (one per gateway). Each gateway writes to its ~50,000 local connections. Origin and pub/sub work: 20 deliveries, not 1,000,000.
@@ -457,7 +519,9 @@ flowchart TD
 
 ## 9. In production
 
-- **Real examples:** LinkedIn engineers described real-time likes and comments on live video using long-lived connections and a subscription layer, with the aim of delivering to many concurrent viewers per video (see sources). Twitch chat is built on IRC and uses slow mode, follower-only mode and rate limits to keep rooms readable, which show the same sampling-and-throttling ideas. Exact internal numbers of large platforms are not public, so the numbers in this note are estimates.
+- **Real examples:** LinkedIn engineers described real-time likes and comments on live video using long-lived connections and a subscription layer, with the aim of delivering to many concurrent viewers per video (see sources).
+  - Twitch chat is built on IRC and uses slow mode, follower-only mode and rate limits to keep rooms readable, which show the same sampling-and-throttling ideas.
+  - Exact internal numbers of large platforms are not public, so the numbers in this note are estimates.
 - **Metrics:** concurrent connections per gateway, message publish-to-deliver latency (p50, p95, p99), dropped-for-slow-client count, sampling ratio per stream, reconnect rate, pub/sub node CPU, egress Gbps, moderation retract rate.
 - **Alerts:** publish-to-deliver p95 above 3 s, reconnect rate spike, gateway memory per connection rising, a stream with sampling ratio below 0.1 percent (tell product).
 - **Deploys:** drain gateways gradually (stop accepting new, close with "go away" and a jittered reconnect delay). Never restart a whole fleet at once during an event. Freeze deploys during major events.
@@ -510,3 +574,10 @@ flowchart TD
 - Concepts: [[Scaling WebSockets]], [[Fan-out on Write vs Fan-out on Read]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Hot Keys and Hot Partitions]], [[Backpressure and Flow Control]], [[Load Shedding and Graceful Degradation]], [[Rate Limiting - Algorithms and Distributed Design]], [[CDN and Edge]]
 - Related case studies: [[Case Study - Chat System]], [[Case Study - News Feed]], [[Case Study - Notification System]], [[Case Study - Video Streaming]]
 - Framework: [[System Design Interview Framework]], [[HLD Round - Complete Step-by-Step Guide]]
+
+## Links
+
+### Watch on YouTube
+
+- [System Design Interview: Design Live Comments w/ a Ex-Meta Staff Engineer](https://www.youtube.com/watch?v=LjLx0fCd1k8) · Hello Interview · 56 min · 145,886 views
+- [Design FB Live Comments: Hello Interview Mock](https://www.youtube.com/watch?v=tgSe27eoBG0) · Hello Interview · 59 min · 132,414 views

@@ -13,13 +13,15 @@ sources:
   - "DeepMind blog: Traffic prediction with advanced Graph Neural Networks (2020), ETA models used in Google Maps"
   - "H3 (h3geo.org) and S2 (s2geometry.io) documentation for cell indexes"
   - "All user counts, sizes and rates in this note are labelled estimates, not published figures"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Maps and Navigation
 
 > [!summary] TL;DR
-> Design a Google Maps-style service: show a map you can pan and zoom, search for a place, compute a route, and give turn-by-turn navigation with a trustworthy **ETA** that reacts to live traffic. The three hard parts are **map tiles** (serve billions per day from a CDN), **routing** (shortest path on a graph of hundreds of millions of road segments in milliseconds) and **live traffic** (turn millions of GPS pings into per-road speeds).
+> Design a Google Maps-style service: show a map you can pan and zoom, search for a place, compute a route, and give turn-by-turn navigation with a trustworthy **ETA** that reacts to live traffic.
+>
+> The three hard parts are **map tiles** (serve billions per day from a CDN), **routing** (shortest path on a graph of hundreds of millions of road segments in milliseconds) and **live traffic** (turn millions of GPS pings into per-road speeds).
 
 > [!abstract] Core idea
 > - The map is **pre-cut into square tiles** addressed by `zoom/x/y`. A tile never depends on the user, so it is perfectly cacheable at a CDN.
@@ -28,9 +30,58 @@ updated: 2026-11-09
 > - Traffic is a **streaming aggregation** of anonymised GPS probes, after **map matching** snaps noisy points onto roads.
 > - Everything is partitioned by **geography**, because a route in Delhi never needs data from Lisbon.
 
+## Start here: the basics
+
+**The problem in one story.**
+You open a maps app, drag around the city, search "nearest petrol pump", and ask for a route home.
+The app draws the map instantly, finds the fastest road in under a second, and says "22 min".
+When a road jams, the time changes and you may get a new route.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Tile | A small square picture or data piece of the map | Tile `14/11713/6849` |
+| Zoom level | How close in you are; each level doubles detail | Zoom 0 = whole world in one tile |
+| Graph | Points joined by lines | Intersections joined by roads |
+| Edge weight | The cost of using one line | 40 seconds to drive this road |
+| Shortest path (Dijkstra) | Algorithm to find the cheapest route in a graph | Home to office |
+| GPS probe | A location ping from a phone or car | `(28.61, 77.20) at 09:01:05` |
+| ETA | Estimated time of arrival | "Arrive 9:42" |
+| CDN | Servers near users that hand out cached files | Tiles served from a city nearby |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["App"] --> T["Map tiles<br/>from CDN"]
+    A --> R["Route request"]
+    R --> G["Road graph<br/>in memory"]
+    G --> E["Route + ETA"]
+    P["GPS pings from<br/>many phones"] --> TR["Traffic speeds<br/>per road"]
+    TR --> G
+```
+
+**Analogy.** A paper atlas cut into numbered pages (tiles), plus a friend who knows every road's usual speed and listens to the traffic radio (routing and live traffic).
+Where it breaks: an atlas never changes, but real roads close, jams appear and the map data itself is rebuilt and versioned.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the high-level design (section 3), with tile math, estimates, API and data model (section 4).
+- Then variants, trade-offs and production lessons (sections 5-7).
+- Finally the SDE-3 deep dives: tile serving, routing on a huge graph, live traffic and ETA, search and offline maps, plus scaling and interview questions (sections 8-12).
+
+> [!tip] Remember
+> Pre-cut the map into cacheable tiles, route on an in-memory road graph, and turn GPS pings into road speeds for the ETA.
+
 ## 1. Why it exists - requirements
 
-You open the app at a bus stop. In under a second you want the map around you drawn sharply. You type "airport", get suggestions, pick one, and see three routes with times. You tap Start, the phone speaks "turn left in 200 metres", and when a road ahead jams, the app quietly reroutes you and tells you you will arrive 6 minutes later. Underneath is a pile of data and algorithms that must be both enormous (the whole planet) and instant (milliseconds).
+You open the app at a bus stop. In under a second you want the map around you drawn sharply. You type "airport", get suggestions, pick one, and see three routes with times.
+
+You tap Start, the phone speaks "turn left in 200 metres", and when a road ahead jams, the app quietly reroutes you and tells you you will arrive 6 minutes later.
+
+Underneath is a pile of data and algorithms that must be both enormous (the whole planet) and instant (milliseconds).
 
 **Functional requirements**
 - **Render the map:** pan and zoom with smooth, crisp map imagery at every zoom level (world to street).
@@ -63,7 +114,9 @@ You open the app at a bus stop. In under a second you want the map around you dr
 
 ## 2. Mental model
 
-Imagine a huge paper atlas. To show you a neighbourhood, a clerk does not redraw anything: they hand you the right pre-printed page (tile). Pages are numbered, so a copy shop on every street corner (CDN) can keep the popular ones. To plan a trip, a navigator uses a separate **road diagram** with times written on each road, and finds the quickest path with a pencil. A traffic desk listens to radio reports from drivers and rewrites the times on the diagram every minute.
+Imagine a huge paper atlas. To show you a neighbourhood, a clerk does not redraw anything: they hand you the right pre-printed page (tile). Pages are numbered, so a copy shop on every street corner (CDN) can keep the popular ones.
+
+To plan a trip, a navigator uses a separate **road diagram** with times written on each road, and finds the quickest path with a pencil. A traffic desk listens to radio reports from drivers and rewrites the times on the diagram every minute.
 
 Where the analogy breaks: a paper atlas page has one scale; real tiles come at 20+ zoom levels and the phone mixes them while you pinch. And the navigator does not trace the whole country by hand: it uses a precomputed "highway of highways" so the long middle of a trip is a few jumps.
 
@@ -290,7 +343,11 @@ flowchart TD
 
 ## 7. In production
 
-- **Real examples.** OpenStreetMap publishes the planet's road data; OSRM and Valhalla are open-source routing engines whose documentation describes contraction hierarchies and tiled graphs. Mapbox's public vector tile specification defines the tile format used by many providers. DeepMind published that graph neural networks improved ETA accuracy in Google Maps (see the DeepMind blog source above). Uber open-sourced the H3 cell index, widely used for grouping locations (see [[Case Study - Ride Sharing and Proximity]]).
+- **Real examples.** OpenStreetMap publishes the planet's road data.
+  - OSRM and Valhalla are open-source routing engines whose documentation describes contraction hierarchies and tiled graphs.
+  - Mapbox's public vector tile specification defines the tile format used by many providers.
+  - DeepMind published that graph neural networks improved ETA accuracy in Google Maps (see the DeepMind blog source above).
+  - Uber open-sourced the H3 cell index, widely used for grouping locations (see [[Case Study - Ride Sharing and Proximity]]).
 - **Failure: a CDN region loses cache.** The origin sees a stampede. Fix: request coalescing at the CDN (one origin fetch per tile), origin shield tier, and serving stale tiles while revalidating. See [[CDN and Edge]].
 - **Failure: bad map data.** A wrongly one-way street or a missing bridge sends cars the wrong way. Fix: map builds are **versioned**, validated by automated checks (graph connectivity, reroute sanity on sample trips), canaried to a small share of traffic, and **rolled back** by repointing to the previous version.
 - **Failure: traffic pipeline lag or outage.** Routing keeps working with historical speeds (graceful degradation). The route response includes a flag that live traffic was unavailable.
@@ -374,11 +431,19 @@ flowchart TB
     HG --> UP2
 ```
 
-**Example.** Bengaluru to Mumbai by road. Dijkstra expands tens of millions of nodes. With CH, the search climbs from a residential street to a main road to the highway network, a few hundred nodes, meets near the long highways in the middle, and unpacks shortcuts into the actual sequence of roads. Published results for continental road networks (Geisberger et al.) show query times well under a millisecond to about a millisecond, thousands of times faster than plain Dijkstra, at the cost of an offline preprocessing step.
+**Example.** Bengaluru to Mumbai by road. Dijkstra expands tens of millions of nodes.
 
-**Traffic and CH.** Classic CH bakes travel times into shortcuts. When live speeds change, you either recompute the shortcut weights (the **customisable** approach: topology order stays fixed, only weights are recomputed, which takes seconds) or search with time-dependent costs. Real systems keep a baseline hierarchy for historical speeds and apply live corrections on the part of the route near the traveller, where traffic matters most.
+With CH, the search climbs from a residential street to a main road to the highway network, a few hundred nodes, meets near the long highways in the middle, and unpacks shortcuts into the actual sequence of roads.
 
-**Sharding.** The planet does not need one process. Cut the graph into regions (by country or by a graph partitioning algorithm that minimises cut edges). A route inside a region is answered by one shard. A cross-region route is stitched: route to border nodes on each side and combine with a small high-level graph of border-to-border times, precomputed. See [[Partitioning and Sharding]].
+Published results for continental road networks (Geisberger et al.) show query times well under a millisecond to about a millisecond, thousands of times faster than plain Dijkstra, at the cost of an offline preprocessing step.
+
+**Traffic and CH.** Classic CH bakes travel times into shortcuts. When live speeds change, you either recompute the shortcut weights (the **customisable** approach: topology order stays fixed, only weights are recomputed, which takes seconds) or search with time-dependent costs.
+
+Real systems keep a baseline hierarchy for historical speeds and apply live corrections on the part of the route near the traveller, where traffic matters most.
+
+**Sharding.** The planet does not need one process. Cut the graph into regions (by country or by a graph partitioning algorithm that minimises cut edges). A route inside a region is answered by one shard.
+
+A cross-region route is stitched: route to border nodes on each side and combine with a small high-level graph of border-to-border times, precomputed. See [[Partitioning and Sharding]].
 
 **Snapping and turn costs.** The start and end points are first snapped to the nearest road edge using a spatial index (geohash or R-tree). Turn restrictions and turn costs (left across traffic is slower than right) are modelled by splitting nodes or using edge-based graphs, which increases graph size but gives realistic ETAs.
 
@@ -409,13 +474,23 @@ flowchart LR
     ML --> R
 ```
 
-**Map matching.** A GPS point can be 10 to 30 m off, and in an urban canyon far more. A point near a parallel service road could belong to either road. **Hidden Markov map matching** (Newson and Krumm) treats the true road as hidden state. For each point it scores candidate edges by distance (emission probability) and scores transitions between consecutive points by how plausible the driving path is compared with the straight-line move. Finding the best sequence is the Viterbi algorithm. Result: a path of edges, and the time spent on each.
+**Map matching.** A GPS point can be 10 to 30 m off, and in an urban canyon far more. A point near a parallel service road could belong to either road. **Hidden Markov map matching** (Newson and Krumm) treats the true road as hidden state.
 
-**Aggregating.** For each edge, collect speed samples in a tumbling or sliding window of one minute. Use the **median** (outliers such as a stopped delivery van do not dominate), publish only if at least N distinct devices contributed (privacy and accuracy), and smooth with the previous value. Stream processing frameworks window by event time and tolerate late events (see [[Stream Processing Basics]]).
+For each point it scores candidate edges by distance (emission probability) and scores transitions between consecutive points by how plausible the driving path is compared with the straight-line move. Finding the best sequence is the Viterbi algorithm.
+
+Result: a path of edges, and the time spent on each.
+
+**Aggregating.** For each edge, collect speed samples in a tumbling or sliding window of one minute.
+
+Use the **median** (outliers such as a stopped delivery van do not dominate), publish only if at least N distinct devices contributed (privacy and accuracy), and smooth with the previous value.
+
+Stream processing frameworks window by event time and tolerate late events (see [[Stream Processing Basics]]).
 
 **Blending with history.** For an edge with no fresh probes, use `typical_speed[hour_of_week]`. With a few probes, blend: `speed = w * live + (1 - w) * typical`, where `w` grows with the sample count.
 
-**ETA for a route.** Sum the edge times, but note when you will reach each edge: a 90-minute drive should use predicted speeds for the later edges, not the current ones. Add intersection and traffic-light delays. A learned model then corrects the residual (rain, events, driver style). Graph neural network models over the road network have been used for this (see the DeepMind source).
+**ETA for a route.** Sum the edge times, but note when you will reach each edge: a 90-minute drive should use predicted speeds for the later edges, not the current ones. Add intersection and traffic-light delays.
+
+A learned model then corrects the residual (rain, events, driver style). Graph neural network models over the road network have been used for this (see the DeepMind source).
 
 **Worked numbers.** Edge of 800 m. Free-flow 50 km/h gives 57.6 s. Live median 20 km/h gives 144 s. A route of 30 such edges moves from about 29 minutes to about 72 minutes, which shows why live traffic changes the route choice, not just the displayed time.
 
@@ -446,7 +521,11 @@ flowchart LR
 
 ### Offline maps
 
-The user picks a region. The app downloads the tiles for that bounding box up to a zoom cap, a compact routing graph for the region and a places index. Navigation then runs on the phone with historical speeds only. Rough size estimate (not a published figure): vector tiles for one city up to about z15 are tens to a few hundred MB depending on detail; the routing graph for a large country is on the order of hundreds of MB. Updates come as differential downloads keyed by map version.
+The user picks a region. The app downloads the tiles for that bounding box up to a zoom cap, a compact routing graph for the region and a places index. Navigation then runs on the phone with historical speeds only.
+
+Rough size estimate (not a published figure): vector tiles for one city up to about z15 are tens to a few hundred MB depending on detail; the routing graph for a large country is on the order of hundreds of MB.
+
+Updates come as differential downloads keyed by map version.
 
 > [!tip] Remember
 > Heavy preprocessing offline, tiny work online. That pattern appears in tiles, routing and offline maps.
@@ -471,7 +550,9 @@ flowchart LR
     end
 ```
 
-**What if usage grows 10x?** Tiles: the CDN scales almost linearly. Routing: add shards and replicas (CPU bound, stateless besides the graph). Probes: more partitions and workers. The first real wall is the **map-matching and aggregation** state per region; split big cities into sub-cells. Watch cost: probe processing and CDN egress dominate the bill, so shrink tile bytes (simplify geometry) and sample probes.
+**What if usage grows 10x?** Tiles: the CDN scales almost linearly. Routing: add shards and replicas (CPU bound, stateless besides the graph). Probes: more partitions and workers. The first real wall is the **map-matching and aggregation** state per region; split big cities into sub-cells.
+
+Watch cost: probe processing and CDN egress dominate the bill, so shrink tile bytes (simplify geometry) and sample probes.
 
 **Rush hour.** Demand follows time zones: peaks move across the planet. Autoscale shards by region and time, pre-warm caches before morning peaks, and shed low priority work first (alternative routes, prefetch, traffic overlay tiles) before cutting core route computation. See [[Load Shedding and Graceful Degradation]].
 
@@ -480,7 +561,9 @@ flowchart LR
 ## 10. Interview questions
 
 > [!question]- How do you serve the map to hundreds of millions of users cheaply?
-> Pre-cut the map into `zoom/x/y` tiles that do not depend on the user, store them in object storage and put a CDN in front with versioned URLs and long `max-age`. Use vector tiles to cut bytes. With a 95% hit rate, the origin sees about 17k requests per second at a 350k peak. Anything personal (blue dot, route line) is drawn on the client.
+> Pre-cut the map into `zoom/x/y` tiles that do not depend on the user, store them in object storage and put a CDN in front with versioned URLs and long `max-age`. Use vector tiles to cut bytes.
+>
+> With a 95% hit rate, the origin sees about 17k requests per second at a 350k peak. Anything personal (blue dot, route line) is drawn on the client.
 
 > [!question]- Why not just run Dijkstra for each route request?
 > It explores millions of nodes for a long trip, taking seconds, which cannot serve thousands of requests per second. Use preprocessing: contraction hierarchies add shortcut edges so a query searches only upward in a hierarchy and takes about a millisecond. Keep the graph in memory and shard by region.
@@ -492,7 +575,9 @@ flowchart LR
 > A general-purpose graph database generally cannot reach millisecond path queries over 1 billion edges at thousands of queries per second. A read-mostly graph that fits in RAM (about 20 GB) is better served from an in-memory binary structure built offline with a hierarchy. The database, if any, holds the source data for builds, not the serving path.
 
 > [!question]- How do you calculate ETA, and why is it sometimes wrong?
-> Sum of segment times plus intersection delays, using predicted speeds for the time you will reach each segment, then an ML correction. Errors come from new incidents, thin probe coverage on a road (falls back to history), unusual weather and events, and turn or traffic-light delays. Measure predicted vs actual per city and hour, and fall back to history when the live model degrades.
+> Sum of segment times plus intersection delays, using predicted speeds for the time you will reach each segment, then an ML correction.
+>
+> Errors come from new incidents, thin probe coverage on a road (falls back to history), unusual weather and events, and turn or traffic-light delays. Measure predicted vs actual per city and hour, and fall back to history when the live model degrades.
 
 > [!question]- How would you handle a route that crosses regions handled by different shards?
 > Precompute border nodes between regions and a small overlay graph of border-to-border travel times. Route from the origin to the border nodes in its region, across the overlay, and from the entry border node to the destination. This keeps each shard independent while giving a correct global path.
@@ -504,7 +589,12 @@ flowchart LR
 
 - **Level signals.** SDE-2: tiles with a CDN, Dijkstra, basic traffic idea. SDE-3: contraction hierarchies, map matching, traffic aggregation, versioned map builds, degradation. Staff: cross-region routing, customisable CH, ETA modelling and error budgets, privacy design, cost drivers and map data pipeline governance.
 - **Red flags.** Computing routes with SQL; no CDN for tiles; no preprocessing step; ignoring turn restrictions or one-way streets; treating GPS as exact; ignoring privacy of probes.
-- **Follow-ups to prepare.** "Add transit routing" (time-expanded or RAPTOR over schedules). "Add EV routing with charging stops" (battery state in the search label). "Avoid tolls and highways" (profile-specific graphs or penalty weights). "Show nearby gas stations on the route" (spatial query along a polyline: buffer then cell cover). "Multiple stops in best order" (travelling salesman heuristics over a distance matrix from the routing engine). "Real-time ETA sharing" (a pub-sub channel per share link; see [[Scaling WebSockets]]).
+- **Follow-ups to prepare.** "Add transit routing" (time-expanded or RAPTOR over schedules).
+  - "Add EV routing with charging stops" (battery state in the search label).
+  - "Avoid tolls and highways" (profile-specific graphs or penalty weights).
+  - "Show nearby gas stations on the route" (spatial query along a polyline: buffer then cell cover).
+  - "Multiple stops in best order" (travelling salesman heuristics over a distance matrix from the routing engine).
+  - "Real-time ETA sharing" (a pub-sub channel per share link; see [[Scaling WebSockets]]).
 - **Decision guides to cite.** [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]], [[Choosing a Database - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Compute, Scaling and Deployment - Decision Guide]].
 
 ## 12. Cheat sheet
@@ -524,3 +614,7 @@ flowchart LR
 - **Building blocks:** [[Heaps and Priority Queues]], [[CDN and Edge]], [[Caching Patterns]], [[Partitioning and Sharding]], [[Kafka and Event Streaming]], [[Stream Processing Basics]], [[Time-Series and Columnar Storage]], [[Search Engines and Inverted Indexes]], [[Load Shedding and Graceful Degradation]], [[Scaling WebSockets]]
 - **Decision guides:** [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]], [[Choosing a Database - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Compute, Scaling and Deployment - Decision Guide]]
 - **Compare with:** [[Case Study - Ride Sharing and Proximity]] (location index and ETA), [[Case Study - Search Autocomplete]] (typeahead), [[Case Study - Video Streaming]] (CDN-heavy static content)
+
+### Watch on YouTube
+
+- [Design Navigation Systems like Google Maps, Uber & Doordash / System Design](https://www.youtube.com/watch?v=HC-3J8ycXFs) · Irtiza Hafiz · 13 min · 13,825 views

@@ -8,7 +8,7 @@ sources:
   - "k6 documentation, thresholds and executors (constant-arrival-rate)"
   - "wrk2 README (coordinated omission)"
   - "Go release notes 1.24, testing.B.Loop"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Load and Performance Testing
@@ -22,9 +22,60 @@ updated: 2026-11-04
 > - Open-model tools (k6, wrk2, vegeta) keep sending requests at a fixed rate even while the system is slow; closed-model tools (plain wrk, ab) wait for a response before sending the next request, which hides exactly the tail latency you're trying to measure (coordinated omission).
 > - Go's own benchmarking (`testing.B`, `-bench`, `-benchmem`) measures a single function's cost in isolation — a different, smaller-scale tool than a load test against a whole running service.
 
+## Start here: the basics
+
+**The problem in one story.**
+A small shop handles 20 customers an hour without trouble.
+On a festival day, 200 customers arrive at once.
+The single cashier is swamped, the queue grows out the door, and people leave.
+The owner could have run a practice day with 250 friends to see where the queue starts growing.
+Load testing is that practice day for software.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Request | One call a client makes to your service | `GET /checkout` |
+| RPS / throughput | Requests handled per second | 2,000 req/s on sale day |
+| Latency | How long one request takes | 80 ms |
+| Percentile (p99) | 99% of requests are this fast or faster | p99 = 400 ms |
+| Average (mean) | Sum divided by count; hides slow outliers | 80 ms average while 1% take 2 s |
+| Connection pool | A fixed set of reusable DB connections | Max 500 open connections |
+| Saturation | A resource is full, so work waits in a queue | Pool full, requests queue |
+| SLO | The latency or error target you promise | p99 under 500 ms |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    G["Load generator<br/>(k6, vegeta)"] -- "N requests/s" --> S["Service under test"]
+    S --> DB["Database / pool"]
+    S --> M["Measure p50/p95/p99<br/>and error rate"]
+    M --> K{"p99 under SLO?"}
+    K -- "yes" --> U["Raise the rate"]
+    K -- "no" --> F["Found the knee:<br/>real capacity"]
+```
+
+**Analogy.** Testing a bridge by driving heavier and heavier trucks across it while watching how much it bends.
+Where it breaks: a bridge bends smoothly, while software often looks fine and then queues collapse suddenly at a "knee"; also, real traffic is a mix of different requests, not one identical truck.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the test types: load, stress, soak and spike (section 2).
+- Then how it works: open vs closed models, coordinated omission, percentiles and fan-out (section 3).
+- Then a worked example with k6 and a Go benchmark (section 4) and a tool comparison (section 5).
+- Finally the SDE-3 deep dive: finding the knee with Little's Law, realistic workload skew and benchmark statistics (sections 6-8).
+
+> [!tip] Remember
+> Push traffic up step by step and watch p99, not the average, to find where the system really breaks.
+
 ## 1. Why it exists
 
-A checkout service handles 200 requests/second comfortably with a p99 of 80 ms. On sale day, traffic jumps to 2,000 requests/second. Without a load test, the first time anyone learns the connection pool caps out at 500 concurrent requests and new requests start queuing is during the actual sale — in production, with real money on the line. A load test run against a staging environment the week before, pushed to 2,500 requests/second, would have shown the queueing start at 1,800 and the p99 cross 500 ms well before the real spike, giving time to add replicas or fix a pool size.
+A checkout service handles 200 requests/second comfortably with a p99 of 80 ms. On sale day, traffic jumps to 2,000 requests/second.
+
+Without a load test, the first time anyone learns the connection pool caps out at 500 concurrent requests and new requests start queuing is during the actual sale — in production, with real money on the line.
+
+A load test run against a staging environment the week before, pushed to 2,500 requests/second, would have shown the queueing start at 1,800 and the p99 cross 500 ms well before the real spike, giving time to add replicas or fix a pool size.
 
 ## 2. Mental model
 
@@ -66,7 +117,11 @@ sequenceDiagram
 
 ### Open vs closed workload models, and coordinated omission
 
-A **closed-model** tool holds a fixed number of virtual users, each of which waits for a response before sending its next request. If the server slows down, the generator automatically slows down too — it never measures how bad things get, because it stops asking. This blind spot is called **coordinated omission**, and it makes p99 numbers from tools like plain `wrk` or Apache Bench optimistic exactly when things are going wrong.
+A **closed-model** tool holds a fixed number of virtual users, each of which waits for a response before sending its next request.
+
+If the server slows down, the generator automatically slows down too — it never measures how bad things get, because it stops asking.
+
+This blind spot is called **coordinated omission**, and it makes p99 numbers from tools like plain `wrk` or Apache Bench optimistic exactly when things are going wrong.
 
 An **open-model** tool sends requests at a fixed arrival rate no matter how slow responses come back, the way real user traffic does. `wrk2` (a wrk fork) and k6's `constant-arrival-rate` executor are built this way; `vegeta` (a Go tool) is open-model by design. Prefer these for any percentile you intend to trust.
 
@@ -74,15 +129,26 @@ An **open-model** tool sends requests at a fixed arrival rate no matter how slow
 
 p50/p95/p99 mean: sort all recorded latencies, and take the value at the 50th/95th/99th position. With 10,000 requests, p99 is the 9,900th-smallest value — the 100 slowest requests are worse than it. Percentiles cannot be averaged across batches (averaging two p99s is not the combined p99); combine the underlying histograms instead, or recompute from raw data.
 
-A sharp consequence for fan-out: if one downstream call has a 1% chance of being slow (p99 threshold), and a request fans out to 100 such calls in parallel, the chance *none* of them is slow is `0.99^100 ≈ 0.366`, so about 63% of top-level requests hit at least one slow downstream call. A single-call p99 understates what users actually feel once calls compose.
+A sharp consequence for fan-out: if one downstream call has a 1% chance of being slow (p99 threshold), and a request fans out to 100 such calls in parallel, the chance *none* of them is slow is `0.99^100 ≈ 0.366`, so about 63% of top-level requests hit at least one slow downstream call.
+
+A single-call p99 understates what users actually feel once calls compose.
 
 ### Tools compared
 
-See the table in section 5. k6 and Locust write test scripts (JS and Python respectively) and support thresholds that fail a CI job automatically; wrk/wrk2 and h2load are lightweight C binaries for raw HTTP/1.1 and HTTP/2 throughput; ghz is the gRPC equivalent of wrk; vegeta is a Go-native open-model tool useful when you want to script load generation in Go itself.
+See the table in section 5.
+
+- k6 and Locust write test scripts (JS and Python respectively) and support thresholds that fail a CI job automatically.
+- wrk/wrk2 and h2load are lightweight C binaries for raw HTTP/1.1 and HTTP/2 throughput.
+- ghz is the gRPC equivalent of wrk.
+- vegeta is a Go-native open-model tool useful when you want to script load generation in Go itself.
 
 ### Go micro-benchmarks vs load tests
 
-A load test exercises the whole running service — network, serialization, database, connection pools — under realistic concurrent traffic. A Go benchmark (`go test -bench`) measures one function's CPU and allocation cost in a single process, with no network involved. Both matter, at different scales: a benchmark catches that a function allocates too much per call; a load test catches that the connection pool caps out at 500 concurrent requests. [[Benchmarks, Profiling and Tracing]] covers `testing.B`, `pprof`, and `go tool trace` in depth — this note only covers enough to place benchmarking in the test-type picture.
+A load test exercises the whole running service — network, serialization, database, connection pools — under realistic concurrent traffic. A Go benchmark (`go test -bench`) measures one function's CPU and allocation cost in a single process, with no network involved.
+
+Both matter, at different scales: a benchmark catches that a function allocates too much per call; a load test catches that the connection pool caps out at 500 concurrent requests.
+
+[[Benchmarks, Profiling and Tracing]] covers `testing.B`, `pprof`, and `go tool trace` in depth — this note only covers enough to place benchmarking in the test-type picture.
 
 ## 4. Worked example
 
@@ -229,9 +295,15 @@ Labeled **representative output** because no load-test runner is available in th
 
 ## 8. Deep dive
 
-**Finding the knee precisely.** Run a ramping test (start low, step RPS up every few minutes) rather than one fixed rate, and plot p99 against RPS. Throughput and latency are flat up to a point, then p99 rises sharply — that inflection is the system's practical capacity at your SLO, not its theoretical maximum throughput (which is usually higher but with unacceptable latency). Little's Law (`L = λW`, concurrency = arrival rate × average time in system) explains why: as service time grows under contention, the required concurrency to sustain a given arrival rate grows too, until a connection pool or goroutine limit caps it and requests start queuing — that queueing is what shows up as the sharp p99 rise.
+**Finding the knee precisely.** Run a ramping test (start low, step RPS up every few minutes) rather than one fixed rate, and plot p99 against RPS.
 
-**Realistic workload shape matters as much as the rate.** A flat, uniform key distribution during a load test can hide a hot-partition problem that only appears when a small number of keys get most of the traffic (a Zipfian skew), which is the realistic case for things like trending-event ticket pages. Model the endpoint mix and data skew from real traffic logs, not a uniform synthetic distribution, or the test will pass while production doesn't.
+Throughput and latency are flat up to a point, then p99 rises sharply — that inflection is the system's practical capacity at your SLO, not its theoretical maximum throughput (which is usually higher but with unacceptable latency).
+
+Little's Law (`L = λW`, concurrency = arrival rate × average time in system) explains why: as service time grows under contention, the required concurrency to sustain a given arrival rate grows too, until a connection pool or goroutine limit caps it and requests start queuing — that queueing is what shows up as the sharp p99 rise.
+
+**Realistic workload shape matters as much as the rate.** A flat, uniform key distribution during a load test can hide a hot-partition problem that only appears when a small number of keys get most of the traffic (a Zipfian skew), which is the realistic case for things like trending-event ticket pages.
+
+Model the endpoint mix and data skew from real traffic logs, not a uniform synthetic distribution, or the test will pass while production doesn't.
 
 **Benchmark statistical rigor.** A single `go test -bench` run on a shared or noisy machine can vary 10-20% run to run from scheduling noise alone. Run with `-count=10` and compare with `benchstat` to get a result with a reported confidence interval, rather than trusting one run's numbers — especially before claiming a regression or an improvement in a PR.
 
@@ -244,13 +316,17 @@ Labeled **representative output** because no load-test runner is available in th
 > An average can look fine while a meaningful fraction of requests are much slower — a p99 of 2s with an average of 80ms is common when 1% of requests hit a slow path (lock contention, a cold cache, a GC pause). Users feel the tail, and SLOs are usually defined on a percentile, not a mean.
 
 > [!question]- What is coordinated omission, and which tools avoid it?
-> It's the understatement of tail latency that happens when a closed-model load generator waits for each response before sending the next request — if the server slows down, the generator automatically "backs off" too, hiding exactly the slow period you wanted to measure. Open-model tools like wrk2, k6's constant-arrival-rate executor, and vegeta send at a fixed rate regardless of response time, avoiding this.
+> It's the understatement of tail latency that happens when a closed-model load generator waits for each response before sending the next request — if the server slows down, the generator automatically "backs off" too, hiding exactly the slow period you wanted to measure.
+>
+> Open-model tools like wrk2, k6's constant-arrival-rate executor, and vegeta send at a fixed rate regardless of response time, avoiding this.
 
 > [!question]- Trap: a team load-tests at a fixed 500 req/s for 5 minutes and declares the service ready for a sale expecting 2,000 req/s peak. What's wrong?
 > The test never exercised the actual target load, so it proves nothing about behavior near or past the real peak — it needs to be re-run at (and somewhat above) the expected peak rate, ideally ramping up to find the knee, not just a flat run well below it.
 
 > [!question]- How does a Go benchmark (`testing.B`) differ from a load test, and when do you need both?
-> A benchmark measures one function's cost (CPU time, allocations) in a single process with no network — useful for catching an inefficient hot-path function. A load test exercises the whole running service under concurrent traffic, catching capacity limits (pools, locks, saturation) a benchmark can't see. Use a benchmark to optimize a function flagged by profiling under load; use the load test to confirm the fix actually raised the service's capacity.
+> A benchmark measures one function's cost (CPU time, allocations) in a single process with no network — useful for catching an inefficient hot-path function.
+>
+> A load test exercises the whole running service under concurrent traffic, catching capacity limits (pools, locks, saturation) a benchmark can't see. Use a benchmark to optimize a function flagged by profiling under load; use the load test to confirm the fix actually raised the service's capacity.
 
 > [!question]- A fan-out request calls 100 downstream services in parallel, each with a 1% chance of hitting its own p99 threshold. Roughly what fraction of top-level requests will be slow?
 > About 63% (`1 − 0.99^100 ≈ 0.634`). Independent per-call tail probabilities compound quickly under fan-out, so a service's effective tail latency is much worse than any single dependency's p99 suggests.
@@ -270,3 +346,8 @@ Labeled **representative output** because no load-test runner is available in th
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Testing Async and Event-Driven Systems]]
 - **Next:** [[Chaos Engineering]]
 - **Compare with:** [[Benchmarks, Profiling and Tracing]] (Go-level `testing.B`/pprof/trace depth, link don't repeat)
+
+### Watch on YouTube
+
+- [Performance Testing Interview Questions And Answers - Load Testing Interview Questions-Load Testing](https://www.youtube.com/watch?v=oPgxXSpb4o4) · Software and Testing Training · 16 min · 68,910 views
+- [Types of Performance Testing Explained / Load, Stress, Spike & More](https://www.youtube.com/watch?v=k2zpZvqUWi4) · Develop with Aakash · 8 min · 421 views

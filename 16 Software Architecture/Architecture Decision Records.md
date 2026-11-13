@@ -8,7 +8,7 @@ sources:
   - "Michael Nygard, Documenting Architecture Decisions (blog, 2011)"
   - "MADR (Markdown Architectural Decision Records) template, adr.github.io"
   - "ThoughtWorks Technology Radar, Lightweight Architecture Decision Records"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Architecture Decision Records
@@ -32,17 +32,67 @@ flowchart LR
     C --> ADR[("ADR-0007\nstatus: accepted")]
 ```
 
-InvoiceOps needed a way to run invoice reminders reliably without losing one or sending it twice. The team considered a Kafka consumer group and a Postgres job table polled with `SELECT ... FOR UPDATE SKIP LOCKED`, picked the second, and wrote that choice down as ADR-0007 before building it. Everything below is what goes inside that one document, and what the decision implies for the code.
+InvoiceOps needed a way to run invoice reminders reliably without losing one or sending it twice. The team considered a Kafka consumer group and a Postgres job table polled with `SELECT ... FOR UPDATE SKIP LOCKED`, picked the second, and wrote that choice down as ADR-0007 before building it.
+
+Everything below is what goes inside that one document, and what the decision implies for the code.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your team picks a database queue instead of Kafka after a long debate.
+Nobody writes down why.
+A year later a new engineer sees the "odd" choice and starts replacing it.
+A one-page note from the day of the decision would have saved a week of arguing.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Architecture decision | A choice about the system's structure that is costly to undo | "Use Postgres as the job queue" |
+| Trade-off | Getting one benefit by giving up another | No new infra, but no fan-out |
+| Context | The facts and constraints true when the choice was made | "Team of 3, no Kafka experience" |
+| Consequence | What you accept as a result of the choice | "Workers must poll every second" |
+| Immutable | Never edited after it is final | ADR-0007 stays as written |
+| Supersede | Replace an old decision with a newer one | ADR-0012 supersedes ADR-0007 |
+| Pull request (PR) | A proposed change that teammates review before merge | The ADR file gets reviewed like code |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Problem"] --> O["Options<br/>considered"]
+    O --> D["Decision"]
+    D --> C["Consequences"]
+    C --> F[("docs/adr/0007.md")]
+    F -. "mind changes later" .-> N[("0012.md<br/>supersedes 0007")]
+```
+
+**Analogy.** An ADR is like a court ruling: it records the facts, the arguments and the verdict, and a later court overturns it with a new ruling instead of rewriting the old one.
+Where it breaks: courts are bound by precedent; a team can drop an ADR whenever the context changes, as long as it writes the superseding one.
+
+**How the rest of this note builds up**
+
+- First, why ADRs exist (section 1) and the "lab notebook" mental model (section 2).
+- Then the template and lifecycle: status, context, decision, alternatives, consequences (section 3).
+- Then a worked example, ADR-0007, with the Go code it implies (section 4), plus variants and comparisons (section 5).
+- Finally the SDE-3 view: when not to write one, running ADRs in production teams, and the deep dive (sections 6-8).
+
+> [!tip] Remember
+> An ADR records *why*, once, and is never edited; a changed mind gets a new ADR.
 
 ## 1. Why it exists
 
-A new engineer opens `reminder/` six months from now and finds a job table polled every second instead of a message queue, with no comment explaining why. Two things can happen: they assume it was an oversight and "fix" it by introducing Kafka mid-project, or they waste a day asking around to find out it was deliberate. Both cost more than the paragraph it would have taken to write the decision down at the time.
+A new engineer opens `reminder/` six months from now and finds a job table polled every second instead of a message queue, with no comment explaining why.
+
+Two things can happen: they assume it was an oversight and "fix" it by introducing Kafka mid-project, or they waste a day asking around to find out it was deliberate. Both cost more than the paragraph it would have taken to write the decision down at the time.
 
 An ADR is that paragraph, kept permanently. Teams that skip it do not avoid the decision-making cost — they just pay it again, from scratch, the next time someone touches the area, usually under more time pressure than the first time.
 
 ## 2. Mental model
 
-Think of an ADR as a **lab notebook entry for the architecture**, not a design document. A design document describes how something works; an ADR captures why it was chosen over the alternatives, at the moment the choice was made, with the information available then. It is deliberately short — a page, not a spec — and deliberately permanent: once accepted, nobody edits an ADR to match a later change of mind. If the decision is reversed, a new ADR is written that supersedes the old one, so the history of *why* stays intact.
+Think of an ADR as a **lab notebook entry for the architecture**, not a design document. A design document describes how something works; an ADR captures why it was chosen over the alternatives, at the moment the choice was made, with the information available then.
+
+It is deliberately short — a page, not a spec — and deliberately permanent: once accepted, nobody edits an ADR to match a later change of mind. If the decision is reversed, a new ADR is written that supersedes the old one, so the history of *why* stays intact.
 
 This is the same instinct as a database migration: you don't edit migration 0003 after 0007 has shipped, you write 0008. ADRs apply that discipline to decisions instead of schemas.
 
@@ -389,3 +439,8 @@ func (f *fakeStore) Release(id int64, err error) error {
 - **Before this:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Documenting Architecture - C4 Diagrams and Fitness Functions]]
 - **Compare with:** [[Hexagonal Architecture (Ports and Adapters)]] (the kind of boundary an ADR like ADR-0007 draws), [[Strangler Fig Pattern and Legacy Migration]] (a sequence of ADRs usually accompanies a migration like this)
+
+### Watch on YouTube
+
+- [Architecture Decision Records (ADR) as a LOG that answers "WHY?"](https://www.youtube.com/watch?v=6H6zfCNeqek) · CodeOpinion · 10 min · 27,311 views
+- [Lesson 55 - Architecture Decision Records](https://www.youtube.com/watch?v=LMBqGPLvonU) · Software Architecture Monday · 10 min · 17,777 views

@@ -10,7 +10,7 @@ sources:
   - "Linux kernel documentation, Documentation/scheduler/sched-eevdf.rst"
   - "Linux kernel documentation, Documentation/admin-guide/cgroup-v2.rst (CPU controller)"
   - "Go 1.25 release notes, runtime: container-aware GOMAXPROCS"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # CPU Scheduling - Go
@@ -18,9 +18,25 @@ updated: 2026-11-09
 > [!summary] TL;DR
 > Three simulators in Go — round robin, FCFS, and a simplified CFS-style vruntime picker — plus a cgroup v2 `cpu.max` parser, all tested against hand-worked traces from [[CPU Scheduling]].
 
+## Before the code
+
+- **Structs and slices** (`[]Proc`): a list of small records; `copy` makes a private copy so the caller's list is never changed.
+- **Maps** (`map[string]int`): Go's built-in hash table, used here to store each process's finish time by name.
+- **Multiple return values** (`cpus, unlimited, err`): Go functions can return several values; errors come back as a normal value, not an exception.
+- **`defer`**: runs `f.Close()` when the function returns, whichever path it takes.
+- **Table-driven tests with `t.Run`**: one test loops over a list of cases and runs each as a named subtest.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or generics are needed here.
+
 ## What this code shows
 
-The theory note describes four mechanisms in words and diagrams: quantum-based preemption, the convoy effect under no preemption at all, parsing a resource limit out of a config file, and a fairness rule that compares running totals instead of assigning fixed turns. Each has a direct code counterpart below, and each counterpart is tested against a number the theory note already worked out by hand, so the two notes check each other rather than one simply restating the other.
+The theory note describes four mechanisms in words and diagrams:
+
+1. quantum-based preemption,
+2. the convoy effect under no preemption at all,
+3. parsing a resource limit out of a config file,
+4. and a fairness rule that compares running totals instead of assigning fixed turns.
+
+Each has a direct code counterpart below, and each counterpart is tested against a number the theory note already worked out by hand, so the two notes check each other rather than one simply restating the other.
 
 | Code | Concept in [[CPU Scheduling]] |
 | --- | --- |
@@ -40,7 +56,9 @@ The theory note describes four mechanisms in words and diagrams: quantum-based p
 
 ### Step 1: round robin
 
-**Concept.** `RoundRobin` is the code form of the hand-traced example in [[CPU Scheduling#Whiteboard version: round robin vs. FCFS]]: a queue of processes, each one capped to a fixed `quantum` per turn, cycling until all are done. The alternative — not capping the run length — degrades to FCFS and reintroduces the convoy effect, which is exactly the problem round robin exists to avoid.
+**Concept.** `RoundRobin` is the code form of the hand-traced example in [[CPU Scheduling#Whiteboard version: round robin vs. FCFS]]: a queue of processes, each one capped to a fixed `quantum` per turn, cycling until all are done.
+
+The alternative — not capping the run length — degrades to FCFS and reintroduces the convoy effect, which is exactly the problem round robin exists to avoid.
 
 ```go
 // Proc is one runnable unit in the scheduling simulations below. Burst is
@@ -95,7 +113,9 @@ func RoundRobin(procs []Proc, quantum int) map[string]int {
 
 ### Step 2: FCFS, for comparison
 
-**Concept.** `FCFS` is deliberately the simplest possible scheduler: no preemption, no quantum, just "run everything in arrival order, to completion." It exists in this file specifically so a test can measure the convoy effect by comparing its completion times against `RoundRobin`'s on the same input.
+**Concept.** `FCFS` is deliberately the simplest possible scheduler: no preemption, no quantum, just "run everything in arrival order, to completion."
+
+It exists in this file specifically so a test can measure the convoy effect by comparing its completion times against `RoundRobin`'s on the same input.
 
 ```go
 // FCFS simulates first-come-first-served scheduling: each process runs to
@@ -124,7 +144,9 @@ flowchart LR
 
 ### Step 3: parsing a cgroup v2 quota
 
-**Concept.** `CPUQuota` implements the parsing and rounding described in [[CPU Scheduling#cgroups CPU quotas and throttling]]: read the two numbers out of `cpu.max`, divide quota by period, and round up — because a container that can use 1.5 CPUs' worth of time still needs 2 OS threads able to run simultaneously to ever actually use all of it. The "max" case (no limit) is handled as a distinct return value rather than, say, a very large number, so callers can't accidentally treat "unlimited" as "a specific large quota."
+**Concept.** `CPUQuota` implements the parsing and rounding described in [[CPU Scheduling#cgroups CPU quotas and throttling]]: read the two numbers out of `cpu.max`, divide quota by period, and round up — because a container that can use 1.5 CPUs' worth of time still needs 2 OS threads able to run simultaneously to ever actually use all of it.
+
+The "max" case (no limit) is handled as a distinct return value rather than, say, a very large number, so callers can't accidentally treat "unlimited" as "a specific large quota."
 
 ```go
 // CPUQuota reads a cgroup v2 cpu.max file (format "<quota> <period>", or
@@ -187,7 +209,9 @@ The function isn't done yet — the closing brace above is inside the `if`, not 
 
 ### Step 4: a worked vruntime trace
 
-**Concept.** `TraceVRuntime` is the simplified CFS model walked through by hand in [[CPU Scheduling#Linux: CFS and EEVDF, step by step]]: every thread starts at `vruntime = 0`, and each tick the scheduler runs whoever currently has the lowest `vruntime`, then adds 1 to it. Real CFS scales that increment by the inverse of a thread's `nice`-derived weight; this model assumes equal weight for every thread, which is enough to demonstrate the "always run whoever is furthest behind" rule without the weight arithmetic.
+**Concept.** `TraceVRuntime` is the simplified CFS model walked through by hand in [[CPU Scheduling#Linux: CFS and EEVDF, step by step]]: every thread starts at `vruntime = 0`, and each tick the scheduler runs whoever currently has the lowest `vruntime`, then adds 1 to it.
+
+Real CFS scales that increment by the inverse of a thread's `nice`-derived weight; this model assumes equal weight for every thread, which is enough to demonstrate the "always run whoever is furthest behind" rule without the weight arithmetic.
 
 ```go
 // VRuntimeStep is one scheduling decision in a simplified CFS trace: which
@@ -214,7 +238,9 @@ func TraceVRuntime(names []string, ticks int) []VRuntimeStep {
 	sort.Strings(sorted)
 ```
 
-**How it works, setup.** Every thread starts in `vr` at `0`. `sorted` is a stable, alphabetically ordered copy of the thread names, used only to make tie-breaking deterministic — the trace needs to be reproducible, not because alphabetical order has any scheduling meaning in real CFS.
+**How it works, setup.** Every thread starts in `vr` at `0`.
+
+`sorted` is a stable, alphabetically ordered copy of the thread names, used only to make tie-breaking deterministic — the trace needs to be reproducible, not because alphabetical order has any scheduling meaning in real CFS.
 
 ```go
 	steps := make([]VRuntimeStep, 0, ticks)
@@ -256,7 +282,9 @@ sequenceDiagram
 
 ## Design decisions
 
-None of this code touches a real OS scheduler — it's all in-process simulation, which is deliberate: the point is to make the *algorithm's* behavior checkable with exact, reproducible numbers, the same numbers the theory note works out by hand. A simulation that called into real scheduling APIs would be testing the OS and the Go runtime's own interaction with it, not the algorithm itself, and its results would vary machine to machine, defeating the purpose of having a reproducible, hand-checkable trace at all.
+None of this code touches a real OS scheduler — it's all in-process simulation, which is deliberate: the point is to make the *algorithm's* behavior checkable with exact, reproducible numbers, the same numbers the theory note works out by hand.
+
+A simulation that called into real scheduling APIs would be testing the OS and the Go runtime's own interaction with it, not the algorithm itself, and its results would vary machine to machine, defeating the purpose of having a reproducible, hand-checkable trace at all.
 
 This mirrors a broader pattern worth naming: when a theory note makes a claim about an *algorithm's* behavior (as opposed to a claim about a specific OS, kernel version or piece of hardware), the cleanest test is a small, deterministic, in-process model of just that algorithm — not an integration test against the real system the algorithm happens to run inside of in production.
 
@@ -416,11 +444,15 @@ Measured with `go test -race ./...` on Go 1.24.4, darwin/arm64 (2026-11-09):
 ok  	rollscratch/cpusched	1.619s
 ```
 
-**Reading the output.** `ok` means all five tests passed under the race detector. None of this code is concurrent, so the race detector run is a cheap extra check rather than testing anything genuinely racy; the elapsed time is dominated by test-binary compilation, since none of the simulators do real I/O (the `CPUQuota` test uses `t.TempDir()`, a fast in-memory-backed temp directory).
+**Reading the output.** `ok` means all five tests passed under the race detector.
+
+None of this code is concurrent, so the race detector run is a cheap extra check rather than testing anything genuinely racy; the elapsed time is dominated by test-binary compilation, since none of the simulators do real I/O (the `CPUQuota` test uses `t.TempDir()`, a fast in-memory-backed temp directory).
 
 ## Running it, what the numbers mean in context
 
-The `ok` result above says every behavior claim this note makes — the convoy effect, the exact hand-traced round-robin completion times, the cgroup quota rounding, and the vruntime alternation — is backed by a passing, repeatable check, not just prose description. If a future Go version changed `cpu.max` parsing semantics, or if a bug crept into the round-robin re-queueing logic, these tests would catch it before the theory note's claims went stale.
+The `ok` result above says every behavior claim this note makes — the convoy effect, the exact hand-traced round-robin completion times, the cgroup quota rounding, and the vruntime alternation — is backed by a passing, repeatable check, not just prose description.
+
+If a future Go version changed `cpu.max` parsing semantics, or if a bug crept into the round-robin re-queueing logic, these tests would catch it before the theory note's claims went stale.
 
 ## Pitfalls in the code
 
@@ -429,11 +461,15 @@ The `ok` result above says every behavior claim this note makes — the convoy e
 - **`TraceVRuntime`'s tie-break is alphabetical, not FIFO.** This differs from real CFS, which breaks ties by tree-insertion order (effectively arrival order); the alphabetical choice here is purely to make the trace reproducible in a doc, not a claim about kernel internals. Don't read anything into *which* thread happens to win a tie — only that one of them must, deterministically, for the trace to be checkable at all.
 - **None of the simulators model preemption cost.** A real context switch has a cost (see the theory note's deep dive on cache/TLB pollution); these simulators treat every switch as free, which is correct for comparing *algorithms* but would understate real wall-clock time if used to predict an actual system's throughput.
 
-Reading this code alongside the theory note is meant to work in both directions: if a claim in the theory note's "Why it matters" callouts ever seems off, the fastest way to check it is to run the matching test here and read the assertion failure, rather than re-deriving the numbers by hand again. Conversely, if one of these tests ever needs changing, the theory note's worked examples are the specification it must still satisfy — a passing test suite with a theory note that no longer matches it is a sign the two have drifted apart, not that either one is safely ignorable.
+Reading this code alongside the theory note is meant to work in both directions: if a claim in the theory note's "Why it matters" callouts ever seems off, the fastest way to check it is to run the matching test here and read the assertion failure, rather than re-deriving the numbers by hand again.
+
+Conversely, if one of these tests ever needs changing, the theory note's worked examples are the specification it must still satisfy — a passing test suite with a theory note that no longer matches it is a sign the two have drifted apart, not that either one is safely ignorable.
 
 ## Exercises
 
-These three exercises follow the same pattern as the theory note's own "what happens if" callouts: predict first, in writing, then run the code and compare. The value is in noticing *where* your prediction and the actual result diverge, not in getting every prediction right on the first try.
+These three exercises follow the same pattern as the theory note's own "what happens if" callouts: predict first, in writing, then run the code and compare.
+
+The value is in noticing *where* your prediction and the actual result diverge, not in getting every prediction right on the first try.
 
 1. Change `TraceVRuntime`'s tie-break from alphabetical to reverse-alphabetical (iterate `sorted` from the end) and predict the new `Ran` sequence for `["A","B"]` over 6 ticks. Then run it.
 2. Add a third thread `"C"` to `TestTraceVRuntimeAlternatesFairly`'s input and predict the `Ran` sequence for 9 ticks, matching the three-thread table in [[CPU Scheduling#Linux: CFS and EEVDF, step by step]]. Then verify.

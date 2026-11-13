@@ -1,0 +1,133 @@
+# TLS and HTTPS story: "The Password at the Cafe". id | SPEAKER | tone | text. Source: [[TLS and HTTPS]] and [[TLS and HTTPS - Go]]
+# Cast: IVY = security engineer on call (hero). NICO = her rookie (asks the interview questions). PIP = a customer's browser. MAL = the spy on the cafe Wi-Fi router. CASS = the certificate authority. SERA = the bank's server. LEO = the gate, a load balancer in front of the bank.
+== s1 The password at the café
+a1 | N | hook | Brightway Bank goes live at nine tomorrow morning. Tonight, in a cafe with free Wi-Fi, a spy named Mal is reading every password that passes through the router. If the bank launches like this, thousands of people will hand him their money. Ivy has one night to stop him.
+a2 | IVY | normal | I am Ivy, the security engineer on call. This is Nico, my rookie. Our job is to make the street between the customer and the bank safe, before sunrise.
+a3 | MAL | punch | I am Mal. I sit on the cafe router. Plain H T T P is a postcard. Everyone who carries it can read it. And if I want, I can rewrite it before it arrives.
+a4 | PIP | normal | I am Pip, a customer. I type my bank password on cafe Wi-Fi. It travels through the router, the internet provider, and many machines I have never met.
+a5 | N | normal | That is the whole problem in one picture. Plain H T T P sends passwords, cookies and page content as readable bytes. Anyone on the path can read them. Anyone who can inject packets can change them in transit, or pretend to be the bank and serve a fake login form.
+a6 | IVY | calm | T L S removes both problems, with three promises. Confidentiality, nobody else can read it. Authentication, you know which server you are really talking to. And integrity, nobody can tamper with it without being caught. H T T P S is simply H T T P sent over a T L S connection, instead of a plain T C P one.
+a7 | NICO | question | Wait, Ivy. Before we start, I need the words. Explain them to me one at a time.
+a8 | N | normal | Encryption scrambles data so only key holders can read it. A key is the secret number used to scramble and unscramble. A public and private key are a pair. Anyone can use the public one, only the owner holds the private one. A signature is proof made with a private key, that anyone can check with the public key. A certificate is a signed card saying, this public key belongs to this domain. A C A, a certificate authority, is a trusted organisation that signs certificates, like Let's Encrypt. A handshake is the first few messages where both sides agree how to talk. And a round trip is one message there and its reply back, about fifty milliseconds across a country.
+a9 | IVY | normal | Why was the web not already safe? For years a certificate cost money, and needed a manual renewal every year. Then Let's Encrypt, in twenty fifteen, made certificates free and automatic. Around twenty eighteen, browsers began marking plain H T T P as, Not Secure.
+a10 | IVY | calm | Tonight's plan, in five steps. One, the T C P handshake finishes. Two, the browser sends ClientHello. Three, the server replies with a certificate and finishes the key exchange. Four, both sides hold a secret key nobody else has seen. Five, all H T T P traffic is encrypted with it.
+== s2 Two jobs: a secret and an ID
+b1 | IVY | normal | The whole idea splits into two jobs. Job one, key exchange. Two strangers agree on a secret that nobody else can compute. Job two, identity. Prove that the other side is who it claims to be. Neither job alone is enough.
+b2 | NICO | question | How can two strangers agree on a secret out in the open, with Mal listening to every word?
+b3 | PIP | normal | Think of mixing paint. The server and I start from the same public yellow. I pick a private colour, mix it into the yellow, and send the result across the room.
+b4 | SERA | normal | I am Sera, the bank's server. I do the same with my own private colour. Then each of us mixes our private colour into the other's mixture. The final colour is identical on both sides. Mal only ever saw the two mixtures. Un-mixing paint is impossible.
+b5 | N | normal | The real version is E C D H E, elliptic curve Diffie Hellman, ephemeral. Both sides contribute a random number and a well known elliptic curve. Each side computes the same shared secret from its own number and the other side's public value. An eavesdropper who sees only the public values cannot compute it. The numbers are fresh for every handshake, which gives forward secrecy, and we will see why that matters.
+b6 | MAL | question | Fine. But what if I stand in the middle, and run the paint trick with Pip myself, pretending to be the bank?
+b7 | IVY | punch | That is exactly why job two exists. A certificate says, the holder of this private key is api dot example dot com. And it is signed by a certificate authority.
+b8 | CASS | normal | I am Cass, a certificate authority. But the browser does not trust a certificate because the certificate says so. It trusts it because my own certificate is signed by another authority, and that one by another, up to a root certificate. The operating system or browser ships with built in trust for the root. Root signs intermediate, intermediate signs the leaf, the leaf is the certificate for the bank. The client walks back up the chain until it reaches a root it already trusts. That is the chain of trust.
+b9 | NICO | question | So a valid certificate means the bank is honest?
+b10 | IVY | warn | No. That is the classic mistake. It means this is really the domain named in the certificate. Nothing about what that domain does with your data. It is like two people mixing paint while one shows a government I D. The I D proves the name is real. It does not prove the person is honest.
+b11 | IVY | punch | Remember. A certificate proves who you are talking to. The key exchange makes sure nobody else can read it.
+== s3 The old handshake: TLS 1.2
+c1 | N | normal | Now the handshake itself. First the older version, T L S one point two. It needs two round trips before any application data can flow.
+c2 | PIP | normal | After the T C P handshake, I send ClientHello. The ciphers I support, and a random number.
+c3 | SERA | normal | I reply with ServerHello, my chosen cipher and my own random number. Then my Certificate. Then ServerKeyExchange, my E C D H E public value. Then ServerHelloDone.
+c4 | PIP | normal | Now I send ClientKeyExchange, my public value. Both of us can derive the same shared secret. Then ChangeCipherSpec and Finished, already encrypted.
+c5 | SERA | normal | I answer with my own ChangeCipherSpec and Finished, encrypted. Two round trips are done. Only now can the H T T P request travel.
+c6 | NICO | question | Two round trips of waiting, fifty milliseconds each, before the page even starts. Can it be faster?
+== s4 The fast handshake: TLS 1.3 and 0-RTT
+d1 | IVY | punch | T L S one point three can. Its big idea. Do not wait to be told. Guess.
+d2 | PIP | normal | In my very first message I guess which key exchange group the server supports, say X twenty five five one nine, and I send my key share right inside ClientHello.
+d3 | SERA | normal | The guess is almost always right, because few groups are used in practice. So I derive the secret immediately, and answer in a single flight. ServerHello with my key share. Then EncryptedExtensions, Certificate, CertificateVerify and Finished. Everything after ServerHello is already encrypted.
+d4 | PIP | normal | I reply with Finished, and my first request. GET slash. One round trip before application data. Half the waiting.
+d5 | N | normal | There is one more trick, zero R T T. A client that holds a resumption ticket from an earlier visit, can send encrypted application data in its very first flight, before the handshake even finishes.
+d6 | MAL | punch | That is my moment. I capture that first flight, and I replay it, word for word. The server cannot tell my copy from the original. There was no round trip yet, to carry a fresh number it could check.
+d7 | SERA | warn | So I accept zero R T T only for requests that are safe to run twice, like an idempotent G E T. Never for moving money, or sending an email. And Go's crypto slash tls does not implement zero R T T at all, as of Go one point twenty four, so nobody exposes this by accident.
+d8 | NICO | question | So zero R T T is not simply free speed?
+d9 | IVY | punch | Correct. It trades a round trip for a real replay window. Use it only for harmless, repeatable requests.
+== s5 SNI and ALPN in the first hello
+e1 | N | normal | Two more things ride inside that first ClientHello, in plain text.
+e2 | PIP | normal | First, S N I, server name indication. It is the hostname I am trying to reach.
+e3 | LEO | normal | I am Leo, the gate in front of many banks that share one I P address. Without S N I I would not know which certificate to show. I would have to use one certificate for every site on this address.
+e4 | PIP | normal | Second, A L P N, application layer protocol negotiation. I list the protocols I can speak. H two, and H T T P one point one.
+e5 | SERA | normal | I pick one and return it in ServerHello. That is how a Go server decides to speak H T T P two instead of one point one.
+e6 | MAL | normal | And because S N I travels before any key exists, I can read the hostname. Not your password, not your page. But I can see which bank you visit. Encrypted Client Hello hides even that, but it is not widely deployed yet.
+== s6 The ID office: certificates in detail
+f1 | CASS | normal | Welcome to my office. Let me show you what is really on a certificate.
+f2 | CASS | normal | The S A N, subject alternative name. It is the list of hostnames, or a star dot example dot com wildcard, that the certificate is valid for. Browsers ignore the old common name field entirely. Only the S A N matters today.
+f3 | IVY | warn | So the common mistake is believing the C N is what a browser checks. It is not. A certificate with a correct C N but a missing S A N entry is rejected. Always issue with the right S A N list. Keep C N only as a label for logs and tools.
+f4 | CASS | normal | Three validation levels. D V, domain validation, proves control of the domain only. That is what Let's Encrypt issues. O V, organization validation, also checks the legal business. E V, extended validation, was the old green bar. It is largely abandoned, because users never noticed the difference.
+f5 | CASS | normal | Acme, R F C eight five five five, automates issuance and renewal. I give the server a challenge. Serve a specific file at a well known U R L, or publish a specific D N S T X T record. The server proves it, I issue a ninety day certificate, and an Acme client renews it automatically, well before expiry.
+f6 | PIP | question | And if a certificate is revoked? Do I have to phone Cass every time I connect?
+f7 | SERA | normal | O C S P stapling fixes that. I fetch the proof of validity ahead of time, and attach it, I staple it, to my handshake. It is faster, and Cass never learns which sites you visit.
+f8 | CASS | normal | One last guard. Certificate Transparency, R F C sixty nine sixty two. Every certificate I issue goes into public, append only logs. The real owner of a domain can watch those logs, and catch a mis-issued certificate for their name. That is how several real incidents were caught.
+== s7 Where does the lock end? Termination
+g1 | IVY | normal | Now, where does the lock actually end? Where the T L S connection terminates decides what is encrypted, and who can inspect the traffic. There are three patterns.
+g2 | LEO | normal | One, edge terminated. This is the most common. I hold the certificate and I decrypt. The hop to the app server is plain text, which is acceptable only inside a network you trust, a V P C, never the public internet. It gives the simplest certificate management.
+g3 | LEO | normal | Two, re-encrypt. I terminate the client's T L S, then I open a second, independent T L S connection to the app server. Use it when internal traffic must also be encrypted, in zero trust networks or for compliance. The cost is two handshakes, and two certificates to manage.
+g4 | LEO | normal | Three, passthrough with mutual T L S. I route on S N I alone, and never decrypt, so I need no certificate. The app server terminates T L S straight from the client, and can demand a client certificate. In Go that is tls dot RequireAndVerifyClientCert. The cost is that I cannot inspect requests.
+g5 | IVY | normal | Service meshes build identity on this idea. How that identity is then used for authorization is a different note, service to service auth.
+g6 | N | normal | Side by side. T L S one point two. Two round trips. The client proposes many ciphers, and a misconfigured server may pick a weak one. Key exchange may be R S A, which breaks forward secrecy. Renegotiation, the source of past C V Es. No zero R T T.
+g7 | N | normal | T L S one point three. One round trip, zero on resumption. A small fixed list of modern ciphers, no R C four, no export ciphers. E C D H E only, so forward secrecy is mandatory. Renegotiation removed. And zero R T T available, with the replay risk.
+== s8 Deep dive: the tricks that bite
+h1 | IVY | normal | Deep dive time. Why does E C D H E give forward secrecy, and R S A key exchange does not?
+h2 | MAL | warn | In R S A key exchange, the client encrypts the secret directly with the server's long term public key. So I record every session today. Someday I steal that private key. Then I decrypt every past session. Retroactively.
+h3 | SERA | normal | With E C D H E, every handshake uses a fresh, ephemeral key pair. The shared secret depends on both ephemeral values. My long term key is only used to sign. It never derives the secret. So a later leak exposes nothing from the past.
+h4 | IVY | normal | T L S one point three removed renegotiation, static R S A key exchange, compression, and most legacy cipher suites outright. Each had caused real C V Es. Renegotiation enabled man in the middle injection. Compression enabled an attack called Crime. A smaller, mandatory strong set is easier to audit.
+h5 | MAL | punch | One last trick. SSL stripping. On the first visit, the customer types the bank address over plain H T T P. I intercept it, and keep them on H T T P forever.
+h6 | SERA | normal | H S T S answers that. The Strict Transport Security header tells the browser, never try plain H T T P for this site again, for this long. The preload directive goes further, it bakes the promise into the browser itself, before the customer ever visits.
+h7 | IVY | warn | But H S T S only protects repeat visits, because the browser must see the header once. So the server still redirects every plain H T T P request to H T T P S, with a three oh one or three oh eight. The redirect covers the first visit. H S T S protects every visit after.
+h8 | N | normal | Post quantum readiness. Go one point twenty four's crypto slash tls enables a hybrid key exchange, X twenty five five one nine M L K E M seven six eight, by default. It combines classical X twenty five five one nine with a post quantum lattice based mechanism. It is hybrid so connections stay safe even if the post quantum half has an undiscovered weakness.
+h9 | N | normal | One more boundary. Changing A, quad A and C name records, and lowering the T T L before a migration, is a D N S concern, not a T L S one. See the D N S note for that half of the story.
+== s9 In Go: the code
+j1 | N | normal | Now let us prove it in Go. Three real handshakes with Go's crypto slash tls. A server negotiating T L S one point three. A one point two client rejected by a one point three server. And mutual T L S, with a throwaway certificate authority. Everything runs over a real listener with httptest, using only the standard library.
+j2 | IVY | normal | First, the smallest useful change for a production server. Set a minimum T L S version, and call ListenAndServeTLS with your certificate and key. Go's standard library then picks H T T P two on its own, through A L P N.
+j3 | N | normal | The test helper, newTLS13Server. httptest NewUnstartedServer creates the server but does not start it. We set srv dot TLS with MinVersion T L S one point three, and only then call StartTLS. That is the only way to inject a custom config.
+j4 | N | normal | Test one. srv dot Client returns a client that trusts the test server's own certificate authority. We avoid InsecureSkipVerify on purpose, so certificate checking is really exercised. Then we assert that resp dot TLS dot Version is T L S one point three.
+j5 | N | normal | Test two, a version mismatch failing closed. We clone the transport, and cap it at MaxVersion T L S one point two. The version ranges do not overlap, so Get must return an error. It is a handshake failure, not an H T T P status, because the connection never got past T L S.
+j6 | N | normal | Now a real chain of trust. testCA creates a P two fifty six key, and a certificate template. Passing the same template as certificate and as parent makes it self signed, like a real root. IsCA true lets it sign other certificates. One hour of validity is enough for a throwaway.
+j7 | N | normal | The issue function signs a leaf certificate with the C A's private key. One boolean decides client or server, through ExtKeyUsage. The server certificate gets DNSNames localhost, and the loopback address, as S A Ns.
+j8 | N | normal | Test three, mutual T L S. The server sets ClientAuth to RequireAndVerifyClientCert, with the C A pool. A client with no certificate fails during the handshake. A client with the signed certificate succeeds, and the server reads its identity from the verified peer certificates.
+j9 | N | normal | Measured result, Go one point twenty four point four. Go vet is clean. All three tests pass with the race detector. The negotiated cipher suite was T L S A E S one two eight G C M S H A two five six, which confirms T L S one point three, end to end.
+j10 | IVY | normal | On a real site you can look at the same facts. openssl s underscore client shows the protocol T L S v one point three, the cipher, the subject, and the issuer, here Let's Encrypt. And curl dash v shows the T L S version, and that the server accepted h two through A L P N.
+j11 | N | calm | The design choices. A real throwaway authority, instead of skipping verification. E C D S A keys, which are fast to generate. One issue function with a flag. And each test fails for exactly one reason.
+== s10 Trade-offs, failures and what to watch
+k1 | N | warn | Dawn. Launch is hours away. Ivy checks what can still go wrong, starting with the trade-offs.
+k2 | IVY | normal | T L S costs a real handshake, even at one round trip, plus encryption work on every connection. It is negligible for most traffic. But at millions of short connections a second, session resumption and connection reuse matter much more.
+k3 | IVY | normal | Mutual T L S adds operational weight. Every client needs a certificate, and rotation and revocation must be automated, or it becomes an outage waiting to happen. Use it for service to service inside a mesh, not for public A P Is, where bearer tokens are enough.
+k4 | IVY | normal | Zero R T T trades a round trip for a replay window, so take it only for harmless repeatable requests. And skipping T L S entirely is acceptable only inside one trusted process, or on loopback. Anything crossing a network should be encrypted by default.
+k5 | N | warn | Seven in the morning. An alarm. Failure number one.
+k6 | SERA | warn | I am down! My certificate expired at midnight. Every browser is showing a warning page.
+k7 | IVY | normal | The single most common H T T P S outage. Automate renewal with Acme well before the expiry window, and alert on days to expiry, not only on failure.
+k8 | LEO | normal | Failure two. A missing intermediate certificate. Some clients, older ones or ones with a stale trust store, cannot build the chain even though the leaf is valid. Always serve the full chain, not just the leaf.
+k9 | PIP | warn | Failure three. Clock skew. My phone thinks it is nineteen ninety nine, and rejects a perfectly good certificate as not yet valid. Server or client, a badly wrong clock breaks the check. Keep N T P running.
+k10 | PIP | normal | Failure four. Mixed content. An H T T P S page that loads an H T T P image gets that image blocked, or the page flagged. Rewrite everything to H T T P S, or protocol relative addresses.
+k11 | LEO | warn | Failure five. T L S terminated at the wrong layer. If I strip T L S and forward plain text over an untrusted network segment, the encryption silently stops at my hop. Know exactly which hops are encrypted.
+k12 | IVY | normal | What to monitor. Days until certificate expiry, with an alert well before thirty days out. The handshake failure rate. The T L S version and cipher mix real clients negotiate, so you know when it is safe to drop T L S one point two. O C S P responder latency, if you staple. And the H S T S header on every response.
+k13 | N | calm | In production, nearly all public H T T P S traffic is T L S one point three, with one point two kept for legacy clients. Let's Encrypt, A C M and ZeroSSL issue certificates automatically. C D Ns usually terminate T L S at the edge, then re-encrypt or pass through. And since Go one point twenty two, a Go server's default minimum is T L S one point two.
+== s11 Interview round
+q0 | N | hook | Interview round. Nico asks, Ivy answers.
+q1 | NICO | question | Why is the T L S one point three handshake one round trip instead of two?
+q2 | IVY | normal | The client guesses the key exchange group and sends its key share in the very first message. If the guess matches, which it almost always does, the server replies with its certificate and Finished in a single flight.
+q3 | NICO | question | What exactly does a certificate prove, and what does it not prove?
+q4 | IVY | normal | It proves the holder of the private key controls the names in the S A N list, vouched for by a C A that chains to a trusted root. It proves nothing about honesty or security practices.
+q5 | NICO | question | The trap. Does zero R T T make every request faster for free?
+q6 | IVY | normal | No. A network attacker can replay zero R T T data verbatim, and the server cannot tell at the handshake layer. Use it only for idempotent, side effect free requests, like a cacheable G E T.
+q7 | NICO | question | Why does removing R S A key exchange matter in practice?
+q8 | IVY | normal | With R S A, a leaked server key decrypts every recorded past session. T L S one point three allows only ephemeral E C D H E, so forward secrecy is mandatory.
+q9 | NICO | question | What is the difference between edge termination and mutual T L S passthrough? When would you pick each?
+q10 | IVY | normal | Edge termination is simplest, fine inside a trusted network. Passthrough routes on S N I only, and the app terminates T L S and verifies client certificates. Pick it for zero trust meshes.
+q11 | NICO | question | A client cannot connect, and the error is a protocol version mismatch. What is happening?
+q12 | IVY | normal | The server's minimum excludes what the client is capped at, for example a one point three only server and a one point two client. The handshake fails before any data. Lower the minimum, or upgrade the client.
+q13 | NICO | question | Why does S N I leak the hostname, even over an encrypted connection?
+q14 | IVY | normal | It is sent inside ClientHello, before any session key exists. A watcher sees which hostname you reach, though not the path or body. Encrypted Client Hello fixes this, but is not universal yet.
+== s12 Case closed: the summary
+s0 | N | calm | Nine o'clock. Brightway Bank goes live.
+s0b | MAL | warn | I see only noise. And when I pretended to be the bank, the browser showed a warning page. Nothing to steal here. I am going to get a coffee.
+s0c | N | calm | Let us put it all together.
+s1a | N | normal | One. H T T P S is H T T P over T L S, giving confidentiality, authentication and integrity.
+s2a | N | normal | Two. There are two separate jobs. E C D H E agrees a secret, and the certificate chain proves identity.
+s3a | N | normal | Three. T L S one point three needs one round trip, zero on resumption with a replay risk, and forward secrecy is mandatory.
+s4a | N | normal | Four. S N I and A L P N ride in ClientHello. Browsers check the S A N, not the C N. Acme, stapling and Certificate Transparency keep certificates healthy.
+s5a | N | normal | Five. Termination is a choice. Edge terminated, re-encrypt, or passthrough with mutual T L S.
+s6a | N | normal | Six. Most outages are boring. Expired certificates, missing intermediates, clock skew, mixed content. Monitor days to expiry.
+s7g | N | calm | And the one line to keep. A certificate proves who you are talking to, and the key exchange makes sure nobody else can read it.
+== s13 Where to go next
+rn1 | N | calm | To go deeper, open the note T L S and H T T P S, and its Go note, in your vault. Before it, read the T C P handshake note and H T T P one versus two versus three. After it, H T T P caching, and forward and reverse proxies. Compare it with D N S, service to service auth, and the fuller Go server note on T L S, H T T P S and H T T P two.
+z1 | NICO | hook | So that is how a postcard becomes a sealed letter, with a passport.
+z2 | IVY | punch | Case closed. Next case, on the next street.

@@ -13,7 +13,7 @@ sources:
   - "etcd Go client docs, go.etcd.io/etcd/client/v3/concurrency: Mutex, Session; etcd API docs, revisions"
   - "ZooKeeper Recipes and Solutions, Locks (ephemeral sequential znodes, watch predecessor)"
   - "PostgreSQL 17 docs, Advisory Locks and SELECT ... FOR UPDATE SKIP LOCKED"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Distributed Locks and Fencing Tokens
@@ -27,6 +27,50 @@ updated: 2026-11-04
 > - Fix: the lock service hands out a token that grows with every grant; the storage rejects any write with a token lower than one it has already seen.
 > - For efficiency (avoid doing work twice) a Redis lock is fine; for correctness (never corrupt data) use fencing plus a consensus store (etcd, ZooKeeper) or a database constraint.
 > - Classic mistake: `SET lock 1 NX` with the same value for every client, and `DEL lock` to release. A slow client then deletes someone else's lock.
+
+## Start here: the basics
+
+**The problem in one story.**
+Two cinema clerks in different branches both see seat A7 as free.
+Both sell it at the same moment, and one customer arrives to find someone in their seat.
+They need a shared "talking stick": only the clerk holding it may sell a seat.
+But a clerk can doze off holding the stick, and the stick must be taken back and given to someone else.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Lock / mutex | Permission that only one worker holds at a time | `sync.Mutex` inside one Go program |
+| Distributed lock | A lock stored outside any one process, shared by many machines | A key in Redis or etcd |
+| TTL (lease) | An expiry time after which the lock frees itself | Lock expires after 10 s |
+| Holder | The process that currently owns the lock | Worker 2 |
+| Process pause | A process stops running for a while without knowing | A 15 s garbage-collection pause |
+| Fencing token | A number that grows with every lock grant | Grant 33, then 34, then 35 |
+| Idempotent | Safe to do twice with the same result | "Set seat A7 to order 9" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W1["Worker 1<br/>token 33"] -- "paused, lock expired" --> S["Storage"]
+    LS["Lock service"] -- "grants token 34" --> W2["Worker 2"]
+    W2 -- "write, token 34" --> S
+    S --> Q{"Token below<br/>highest seen?"}
+    Q -- "33: reject" --> X["Stale write blocked"]
+```
+
+**Analogy.** A deli ticket machine: every customer gets a higher number, and the counter ignores anyone holding a number lower than the last one served.
+Where it breaks: a deli counter checks tickets by itself; your storage must be built to check the token, or the token protects nothing.
+
+**How the rest of this note builds up**
+
+- First, why in-process locks are not enough across machines (section 1) and the mental model of lock plus lease (section 2).
+- Then a correct single-Redis lock, the pause problem, and where fencing tokens come from (section 3).
+- Then a Go lock service with fenced storage (section 4), and Redlock, etcd, ZooKeeper and database locks compared (section 5).
+- Finally the SDE-3 deep dive: efficiency vs correctness locks, production failures and the Redlock debate (sections 6-8).
+
+> [!tip] Remember
+> A lock with a TTL can be lost without the holder knowing; only a fencing token checked by the storage makes it safe.
 
 ## 1. Why it exists
 
@@ -396,3 +440,8 @@ func TestConcurrentAcquireOneWinner(t *testing.T) {
 - **Before this:** [[Leader Election]], [[Consensus - Raft and Paxos]], [[Locking - Optimistic vs Pessimistic]]
 - **Next:** [[Two-Phase Commit]], [[Idempotency and Idempotency Keys]]
 - **Compare with:** [[Redis Use Cases]] (the Redis lock as one use case), [[Scheduled Jobs - Cron to Durable Schedulers]] (run-once without a lock)
+
+### Watch on YouTube
+
+- [Distributed Locks Explained: Why Yours Isn't Safe, and What Fencing Tokens Actually Fix](https://www.youtube.com/watch?v=OSZxn_tsj8U) · Elite Dev News · 18 min · 60 views
+- [Distributed Locks in Go: Fencing Tokens & Safety Guide](https://www.youtube.com/watch?v=w3wGI40segM) · Lets learn with Ajay · 6 min · 4 views

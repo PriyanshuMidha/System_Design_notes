@@ -8,7 +8,7 @@ sources:
   - "NIST SP 800-145, The NIST Definition of Cloud Computing"
   - "AWS Shared Responsibility Model, aws.amazon.com/compliance/shared-responsibility-model"
   - "AWS Global Infrastructure docs, aws.amazon.com/about-aws/global-infrastructure"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Cloud Computing Basics
@@ -22,9 +22,54 @@ updated: 2026-11-07
 > - Capacity lives in **regions** (independent geographic areas) built from **Availability Zones** (physically separate data centers), so you design around one AZ or even one region disappearing.
 > - Classic mistake: treating "cloud" as a synonym for "cheaper". A badly designed deployment (idle reserved capacity, a forgotten NAT gateway, unthrottled egress) can cost more than a fixed data center.
 
+## Start here: the basics
+
+**The problem in one story.**
+A small shop sells online and gets 10x more visitors during one festival sale each year.
+Buying enough computers for that one day means they sit idle the rest of the year.
+Buying too few means the site crashes on its biggest day.
+Cloud computing lets the shop rent extra computers for that day and hand them back after.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Server | A computer that answers requests from other computers | The machine that runs your Go API |
+| Data center | A building full of servers, power and cooling | An AWS facility near Mumbai |
+| Virtual machine (VM) | A pretend computer carved out of a real one by software | One EC2 instance on a big physical host |
+| Provider | The company you rent cloud resources from | AWS, Google Cloud, Azure |
+| Region | A geographic area where a provider runs data centers | `ap-south-1` (Mumbai) |
+| Availability Zone (AZ) | A separate data center (or group) inside a region | `ap-south-1a` |
+| Managed service | Something the provider runs and patches for you | RDS instead of Postgres you install yourself |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    You["You (code + data)"] -->|"API call: give me a server"| Cloud["Cloud provider"]
+    Cloud --> VM["Rented VM / service"]
+    VM -->|"meter: hours, GB, requests"| Bill["Monthly bill"]
+    You -->|"done? release it"| Cloud
+```
+
+**Analogy.** Cloud is like renting a car instead of buying one: you pay per day, someone else does servicing, and you can rent a bigger one for a road trip.
+Where it breaks: with a rented car you never share the engine with strangers; in the cloud your VM often shares physical hardware with other customers.
+
+**How the rest of this note builds up**
+
+- First, why renting beats owning for spiky load (section 1) and the apartment-vs-hotel mental model for IaaS, PaaS, FaaS, SaaS (section 2).
+- Then who secures what (shared responsibility) and how regions and AZs are laid out (section 3).
+- Then cost: fixed vs autoscaled, pricing models and cost traps (section 4), plus service and deployment models (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production failure modes, virtualization, managed vs self-hosted, and scalability vs elasticity (sections 6-8).
+
+> [!tip] Remember
+> Cloud = renting metered computers and services over the network; the provider runs the building, you own what you put inside it.
+
 ## 1. Why it exists
 
-Before cloud computing, running a web service meant buying physical servers, racking them in a data center you leased, wiring networking and power, and provisioning for your busiest day of the year year-round. A retailer sizing for a Black Friday spike at 10× normal traffic had to buy that capacity permanently and let it idle the other 364 days, or under-provision and fall over.
+Before cloud computing, running a web service meant buying physical servers, racking them in a data center you leased, wiring networking and power, and provisioning for your busiest day of the year year-round.
+
+A retailer sizing for a Black Friday spike at 10× normal traffic had to buy that capacity permanently and let it idle the other 364 days, or under-provision and fall over.
 
 Cloud computing turns that capital purchase into a rental. [NIST SP 800-145] defines it with five essential characteristics:
 
@@ -72,7 +117,9 @@ flowchart TB
     class Hyper,HW,DC theirs
 ```
 
-On an **IaaS** VM, "your responsibility" includes the guest OS. On a **PaaS** or **FaaS** service, the provider patches the OS and runtime too, and "yours" shrinks to just code, config and data. The line moving is the whole point of the shared-responsibility model: AWS is explicit that for EC2, you patch the guest OS and your application, while AWS patches the hypervisor and everything below it; for a managed service like RDS, AWS also patches the database engine's underlying OS, and your job shrinks to schema, queries and access control.
+On an **IaaS** VM, "your responsibility" includes the guest OS. On a **PaaS** or **FaaS** service, the provider patches the OS and runtime too, and "yours" shrinks to just code, config and data.
+
+The line moving is the whole point of the shared-responsibility model: AWS is explicit that for EC2, you patch the guest OS and your application, while AWS patches the hypervisor and everything below it; for a managed service like RDS, AWS also patches the database engine's underlying OS, and your job shrinks to schema, queries and access control.
 
 **Regions and Availability Zones**, concretely:
 
@@ -166,11 +213,19 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
 
 ## 8. Deep dive
 
-**Virtualization underneath IaaS.** A hypervisor (e.g., AWS's Nitro hypervisor, a thin KVM-based layer) partitions one physical host into multiple virtual machines, each with its own kernel, isolated from its neighbors. Containers (see [[Docker 01 - Why Containers]]) are a lighter-weight alternative that share one kernel instead of running a full guest OS per workload; a newer middle ground is a microVM (e.g., Firecracker, which backs AWS Lambda and Fargate) — a stripped-down VM that boots in milliseconds, giving container-like density with VM-like isolation boundaries.
+**Virtualization underneath IaaS.** A hypervisor (e.g., AWS's Nitro hypervisor, a thin KVM-based layer) partitions one physical host into multiple virtual machines, each with its own kernel, isolated from its neighbors.
 
-**Managed vs self-hosted, the RDS vs Postgres-on-EC2 question.** Running PostgreSQL yourself on an EC2 instance gives full control (any extension, any config flag) but makes you responsible for patching, backups, replication failover and storage scaling. RDS for PostgreSQL automates backups, point-in-time recovery, Multi-AZ failover and minor-version patching, at a higher per-hour price and with a smaller set of tunable parameters and a managed major-version upgrade path. The decision is rarely about cost per hour; it's about whether your team wants to own database operations.
+Containers (see [[Docker 01 - Why Containers]]) are a lighter-weight alternative that share one kernel instead of running a full guest OS per workload; a newer middle ground is a microVM (e.g., Firecracker, which backs AWS Lambda and Fargate) — a stripped-down VM that boots in milliseconds, giving container-like density with VM-like isolation boundaries.
 
-**Scalability vs elasticity**, a distinction worth keeping precise for interviews: scalability is the system's *ability* to handle more load if given more resources (a property of the architecture); elasticity is whether those resources are added and removed *automatically* in response to demand (a property of the operational setup). A system can be scalable (stateless, horizontally replicable) without being elastic (if nobody wired up autoscaling), and in principle something could autoscale a component that doesn't actually scale well, though in practice elasticity is built on top of an already-scalable design.
+**Managed vs self-hosted, the RDS vs Postgres-on-EC2 question.** Running PostgreSQL yourself on an EC2 instance gives full control (any extension, any config flag) but makes you responsible for patching, backups, replication failover and storage scaling.
+
+RDS for PostgreSQL automates backups, point-in-time recovery, Multi-AZ failover and minor-version patching, at a higher per-hour price and with a smaller set of tunable parameters and a managed major-version upgrade path.
+
+The decision is rarely about cost per hour; it's about whether your team wants to own database operations.
+
+**Scalability vs elasticity**, a distinction worth keeping precise for interviews: scalability is the system's *ability* to handle more load if given more resources (a property of the architecture); elasticity is whether those resources are added and removed *automatically* in response to demand (a property of the operational setup).
+
+A system can be scalable (stateless, horizontally replicable) without being elastic (if nobody wired up autoscaling), and in principle something could autoscale a component that doesn't actually scale well, though in practice elasticity is built on top of an already-scalable design.
 
 ## 9. Interview questions
 
@@ -178,19 +233,29 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
 > On-demand, self-service access to a shared pool of configurable compute, storage and network resources, provisioned and released with minimal effort, and billed by actual usage. If you only have one sentence: renting metered compute and services over the network instead of owning hardware.
 
 > [!question]- What's the difference between IaaS, PaaS, FaaS and SaaS?
-> They differ in how much of the stack the provider manages for you: IaaS gives you a VM and you manage the OS up; PaaS also manages the OS and runtime, leaving you just code and config; FaaS runs your code per-invocation and scales to zero, so you manage only the function; SaaS is a finished product you simply use. More managed means less control but less operational burden.
+> They differ in how much of the stack the provider manages for you: IaaS gives you a VM and you manage the OS up; PaaS also manages the OS and runtime, leaving you just code and config; FaaS runs your code per-invocation and scales to zero, so you manage only the function; SaaS is a finished product you simply use.
+>
+> More managed means less control but less operational burden.
 
 > [!question]- What is the shared-responsibility model, and why does it matter?
-> It's the split between what the cloud provider secures (physical hardware, hypervisor, and for managed services, more of the stack above that) and what you secure (your data, access control, and for IaaS, the guest OS and app). It matters because a breach caused by a misconfigured S3 bucket or an unpatched EC2 instance is on you, not the provider — "the cloud is secure" does not mean "my workload is secure".
+> It's the split between what the cloud provider secures (physical hardware, hypervisor, and for managed services, more of the stack above that) and what you secure (your data, access control, and for IaaS, the guest OS and app).
+>
+> It matters because a breach caused by a misconfigured S3 bucket or an unpatched EC2 instance is on you, not the provider — "the cloud is secure" does not mean "my workload is secure".
 
 > [!question]- Trap: "The cloud is always cheaper than on-prem." True or false?
-> False. It's cheaper for variable, unpredictable, or growing workloads because you avoid overprovisioning for peak and avoid capital expenditure. For large, steady-state workloads a company deeply understands, self-hosting can be cheaper at scale — Dropbox's 2016 move of its storage layer off AWS S3 to its own infrastructure is the standard example. The honest answer is "it depends on the shape of the workload and the cost of the team to run it yourself."
+> False. It's cheaper for variable, unpredictable, or growing workloads because you avoid overprovisioning for peak and avoid capital expenditure. For large, steady-state workloads a company deeply understands, self-hosting can be cheaper at scale — Dropbox's 2016 move of its storage layer off AWS S3 to its own infrastructure is the standard example.
+>
+> The honest answer is "it depends on the shape of the workload and the cost of the team to run it yourself."
 
 > [!question]- What's the difference between a region and an Availability Zone?
-> A region is an independent geographic area (e.g., Mumbai); an AZ is one or more physically separate data centers inside that region, linked by low-latency private networking to the other AZs in the same region. You spread stateful workloads across AZs for resilience within a region, and across regions only when you need resilience to an entire region going down or need to serve a different geography.
+> A region is an independent geographic area (e.g., Mumbai); an AZ is one or more physically separate data centers inside that region, linked by low-latency private networking to the other AZs in the same region.
+>
+> You spread stateful workloads across AZs for resilience within a region, and across regions only when you need resilience to an entire region going down or need to serve a different geography.
 
 > [!question]- Why would a mature team ever choose Reserved Instances or Savings Plans over on-demand pricing?
-> Because a known, steady baseline of usage (e.g., "we always run at least 20 instances") can be committed to a 1- or 3-year term for a documented discount (AWS pricing: roughly 30–72% depending on term and payment option), while still running on-demand or Spot for the variable portion above that baseline. It trades flexibility for a lower guaranteed cost on the part of the load you're confident about.
+> Because a known, steady baseline of usage (e.g., "we always run at least 20 instances") can be committed to a 1- or 3-year term for a documented discount (AWS pricing: roughly 30–72% depending on term and payment option), while still running on-demand or Spot for the variable portion above that baseline.
+>
+> It trades flexibility for a lower guaranteed cost on the part of the load you're confident about.
 
 > [!question]- What does "designing for AZ failure" actually look like for a database?
 > Deploy it Multi-AZ: a synchronously replicated standby in a second AZ, with automatic failover (RDS Multi-AZ typically completes within one to two minutes, per AWS documentation) so the application only sees a brief connection error and retries successfully against the new primary, rather than an extended outage.
@@ -211,3 +276,8 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
 - **Before this:** none — this is the entry point for 13 DevOps & Cloud.
 - **Next:** [[Cloud Native and the 12-Factor App]], [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]]
 - **Compare with:** [[Deploying a Go API on AWS (Reference Architecture)]] (one concrete architecture built on these building blocks)
+
+### Watch on YouTube
+
+- [What is Cloud Computing ?](https://www.youtube.com/watch?v=8C_kHJ5YEiA) · Apna College · 5 min · 2,896,003 views
+- [Cloud Computing In 6 Minutes / What Is Cloud Computing? / Cloud Computing Explained / Simplilearn](https://www.youtube.com/watch?v=M988_fsOSWo) · Simplilearn · 6 min · 3,159,544 views

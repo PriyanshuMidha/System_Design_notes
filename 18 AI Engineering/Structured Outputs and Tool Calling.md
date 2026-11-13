@@ -8,19 +8,66 @@ sources:
   - "Anthropic Go SDK (github.com/anthropics/anthropic-sdk-go), v1.84.0"
   - "OpenAI Platform docs, Structured Outputs and Function calling (2026)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Structured Outputs and Tool Calling
 
 > [!summary] TL;DR
-> A **structured output** is a model response constrained, at generation time, to match a JSON Schema you supplied. A **tool call** is a structured output your code recognizes as a request to run a function: the model emits `{"name": "get_weather", "input": {...}}` instead of prose, your backend executes `get_weather`, and you hand the result back for the model to use. Neither is "the model running code" — the model only ever produces structured text; your process does the executing.
+> A **structured output** is a model response constrained, at generation time, to match a JSON Schema you supplied.
+>
+> A **tool call** is a structured output your code recognizes as a request to run a function: the model emits `{"name": "get_weather", "input": {...}}` instead of prose, your backend executes `get_weather`, and you hand the result back for the model to use.
+>
+> Neither is "the model running code" — the model only ever produces structured text; your process does the executing.
 
 > [!abstract] Core idea
 > - Asking nicely in a prompt cannot guarantee valid JSON; constrained decoding (schema-restricted token sampling) can.
 > - A tool is a JSON Schema plus a name and a description; the model picks zero, one, or several tools per turn and emits a `tool_use` block for each.
 > - Your backend executes the call, wraps the result in a `tool_result`, and sends the whole turn back — the model never touches your systems directly.
 > - Schema-valid does not mean safe or correct: validate semantics and authorization in your own code regardless of how the output was produced.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app asks an AI model: "read this invoice and tell me the amount".
+Your Go code expects clean data like `{"amount": 1204.5}`.
+Sometimes the model replies "Sure! The amount is $1,204.50." and your parser crashes.
+Structured outputs force the reply into the exact shape your code expects, and tool calling lets the model ask your code to do things (look up weather, fetch an order).
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| LLM | A model that writes text one small piece at a time | Claude, GPT |
+| Token | One small piece of text the model emits | `"amount"` may be 1-2 tokens |
+| JSON | A text format for structured data | `{"city": "Pune"}` |
+| JSON Schema | A rulebook saying what a JSON object must look like | "`amount` is a number and is required" |
+| Parse / unmarshal | Turn text into a Go struct | `json.Unmarshal(b, &inv)` |
+| Tool (function) | A named action your backend can run for the model | `get_weather(location)` |
+| Round trip | One request to the model and its reply | Each tool call adds one more |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User question"] --> M["Model"]
+    M -- "plain answer" --> A["Reply to user"]
+    M -- "tool_use JSON" --> B["Your Go backend<br/>runs the function"]
+    B -- "tool_result" --> M
+```
+
+**Analogy.** A tax form with boxes: you cannot write a paragraph where a number goes, so the clerk can always read it. A tool call is a form that says "please run this errand for me".
+Where it breaks: a form only checks the shape of the answer; a box can still hold a wrong number, and the model never runs the errand itself.
+
+**How the rest of this note builds up**
+
+- First, why prompting for JSON is not enough (section 1) and the "aggressive autocomplete" mental model (section 2).
+- Then the request-response loop, the lifecycle of one tool call and tool design (section 3).
+- Then a full Go worked example and a comparison of variants (sections 4-5).
+- Finally the SDE-3 view: trade-offs, production failure modes, constrained decoding internals, streaming and parallel tool execution (sections 6-8).
+
+> [!tip] Remember
+> The model only writes structured text; a schema fixes its shape, and your code does the running and the checking.
 
 ## 1. Why it exists
 
@@ -32,17 +79,25 @@ That works most of the time and fails in ways that are easy to miss in a demo an
 - A field is missing, or `amount` comes back as the string `"$1,204.50"` instead of a number.
 - Under load, a fraction of responses — commonly cited in vendor docs as under 1% for simple schemas but rising sharply for deeply nested ones — fail to parse at all.
 
-For one invoice reviewed by a human, a markdown fence is a shrug. For ten thousand invoices a day parsed by `encoding/json`, a 1% unparseable rate is ten thousand incidents a month, each needing a special-cased retry path, logged separately from the "LLM said something reasonable but wrong" failures you already have to handle.
+For one invoice reviewed by a human, a markdown fence is a shrug.
+
+For ten thousand invoices a day parsed by `encoding/json`, a 1% unparseable rate is ten thousand incidents a month, each needing a special-cased retry path, logged separately from the "LLM said something reasonable but wrong" failures you already have to handle.
 
 Structured outputs and tool calling close most of that gap. The provider's inference server restricts what tokens are even legal at each step, so the output is guaranteed to parse as JSON and to match your schema's required fields and types — turning a parsing problem into a (much smaller) semantic-correctness problem.
 
 ## 2. Mental model
 
-Picture a text editor with autocomplete so aggressive it refuses to let you type a character that would make the file invalid. That is constrained decoding: the model's probability distribution over the next token is masked, at every step, down to only the tokens that keep the output a valid instance of your schema. The model cannot emit `amount": "abc"` if `amount` is typed `number`, because `"` after the colon is not in the allowed token set.
+Picture a text editor with autocomplete so aggressive it refuses to let you type a character that would make the file invalid.
+
+That is constrained decoding: the model's probability distribution over the next token is masked, at every step, down to only the tokens that keep the output a valid instance of your schema.
+
+The model cannot emit `amount": "abc"` if `amount` is typed `number`, because `"` after the colon is not in the allowed token set.
 
 **Structured outputs** apply this mask to any response: you want `{"vendor": "Acme", ...}` directly as the message content.
 
-**Tool calling** is the same mechanism aimed at a different target: instead of constraining the final answer, you give the model a menu of named actions (each with its own schema), and the mask instead constrains "if you call `get_weather`, your `input` must have a string `location`." The model's job changes from "answer the question" to "decide whether to answer directly or to request `get_weather(location="Bengaluru, IN")` first" — and your code is what actually calls the weather service.
+**Tool calling** is the same mechanism aimed at a different target: instead of constraining the final answer, you give the model a menu of named actions (each with its own schema), and the mask instead constrains "if you call `get_weather`, your `input` must have a string `location`."
+
+The model's job changes from "answer the question" to "decide whether to answer directly or to request `get_weather(location="Bengaluru, IN")` first" — and your code is what actually calls the weather service.
 
 ## 3. How it works
 
@@ -401,24 +456,38 @@ ok  	weather	1.56s
 
 - **Schema-valid is not correct.** Constrained decoding guarantees shape, not truth: a `get_weather` call with `location: "Atlantis"` is perfectly valid JSON for a place that doesn't exist. Validate business meaning and authorization yourself.
 - **Strict mode narrows the schema language.** Deeply nested `oneOf`/`anyOf`, recursive schemas, or very large enums may not be supported in strict mode; check the current docs and fall back to best-effort mode plus your own validation if your schema needs them.
-- **Latency doubles (at least) for any tool call.** Every tool-use turn is a second full round trip to the model; a chain of three dependent tool calls is three sequential inferences, not one. For latency-critical paths, consider whether a deterministic function call in your own code can replace the tool entirely.
-- **Not a sandbox.** Tool calling does not run anything — your code does. A tool that shells out or hits a payment API carries the same blast radius as any other code path that an untrusted caller (here, the model, steered by untrusted user and retrieved content) can trigger. Treat tool input as adversarial input, same as any other API request (see [[OWASP API Security Top 10]]).
+- **Latency doubles (at least) for any tool call.** Every tool-use turn is a second full round trip to the model; a chain of three dependent tool calls is three sequential inferences, not one.
+  For latency-critical paths, consider whether a deterministic function call in your own code can replace the tool entirely.
+- **Not a sandbox.** Tool calling does not run anything — your code does.
+  A tool that shells out or hits a payment API carries the same blast radius as any other code path that an untrusted caller (here, the model, steered by untrusted user and retrieved content) can trigger. Treat tool input as adversarial input, same as any other API request (see [[OWASP API Security Top 10]]).
 - **Simpler alternative:** for a fixed, small set of fields with no real decision to make, plain prompted output you validate with a Go struct and `json.Unmarshal` plus manual checks is sometimes less code than wiring up strict schemas and tool loops — reach for structured outputs when the parse-failure rate actually hurts.
 
 ## 7. In production
 
-- **Real systems:** Anthropic's Messages API (`tool_use`/`tool_result` blocks, `strict`), OpenAI's function calling and Structured Outputs (`response_format: json_schema`, `strict`), Google's Gemini function calling. Agent frameworks (LangGraph, the Go agent SDKs) build their tool loops on exactly this primitive — see [[LangChain and LangGraph]] and [[Model Context Protocol (MCP)]] for the transport that standardizes tool discovery across servers.
+- **Real systems:** Anthropic's Messages API (`tool_use`/`tool_result` blocks, `strict`), OpenAI's function calling and Structured Outputs (`response_format: json_schema`, `strict`), Google's Gemini function calling.
+  Agent frameworks (LangGraph, the Go agent SDKs) build their tool loops on exactly this primitive — see [[LangChain and LangGraph]] and [[Model Context Protocol (MCP)]] for the transport that standardizes tool discovery across servers.
 - **Failure modes → fixes:**
   - Model calls a tool with a plausible-looking but wrong ID (hallucinated `order_id`) → re-validate every ID against your own database before acting, never trust it because it parsed.
   - Two tool calls in one turn have a hidden ordering dependency → make the dependency explicit in the tool descriptions, or merge them into one tool if order always matters.
   - A tool call never returns (hung dependency) → put a timeout around every tool execution and return a `tool_result` with `is_error: true` on timeout so the model can tell the user instead of the whole request hanging.
   - Tool result contains attacker-controlled text (a fetched webpage, a user's own file) that includes instructions aimed at the model → treat tool_result content as data, not instructions; this is the same prompt-injection surface as retrieved RAG context.
-- **What to monitor:** tool call rate and which tools fire most; tool error rate by tool name; end-to-end latency split into "before first tool call" vs "after tool_result" (link [[Distributed Tracing with OpenTelemetry]] — trace each tool execution as its own span); schema-validation rejection rate (a rising rate often means your description or schema is ambiguous, not that the model got worse).
+- **What to monitor:**
+  - Tool call rate and which tools fire most.
+  - Tool error rate by tool name.
+  - End-to-end latency split into "before first tool call" vs "after tool_result" (link [[Distributed Tracing with OpenTelemetry]] — trace each tool execution as its own span).
+  - Schema-validation rejection rate (a rising rate often means your description or schema is ambiguous, not that the model got worse).
 
 ## 8. Deep dive
 
-- **How constrained decoding actually works.** Your JSON Schema is compiled into a grammar (conceptually a finite-state or pushdown automaton over JSON syntax plus your field constraints). At each decoding step, the inference server computes the model's normal next-token logits, then masks out (sets to `-inf`) every token that would leave the grammar's valid-continuation set, and samples from what remains. This is why it is a strict superset guarantee: the model still "decides" what to say within the grammar, but it is structurally incapable of leaving it. The performance cost is a grammar-state lookup per token, not a second model call — current implementations report it as a low single-digit percentage overhead, but treat any specific number as vendor-documented, not a cross-provider constant.
-- **Streaming tool calls.** Tool `input` can arrive incrementally as partial JSON deltas during a streamed response (`input_json_delta` events in Anthropic's streaming format). Accumulate the raw string and only attempt `json.Unmarshal` once the block closes — partial JSON is, by definition, invalid JSON, and parsing it early just produces confusing errors.
+- **How constrained decoding actually works.** Your JSON Schema is compiled into a grammar (conceptually a finite-state or pushdown automaton over JSON syntax plus your field constraints).
+  1. At each decoding step, the inference server computes the model's normal next-token logits.
+  2. It masks out (sets to `-inf`) every token that would leave the grammar's valid-continuation set.
+  3. It samples from what remains.
+
+  This is why it is a strict superset guarantee: the model still "decides" what to say within the grammar, but it is structurally incapable of leaving it.
+  The performance cost is a grammar-state lookup per token, not a second model call — current implementations report it as a low single-digit percentage overhead, but treat any specific number as vendor-documented, not a cross-provider constant.
+- **Streaming tool calls.** Tool `input` can arrive incrementally as partial JSON deltas during a streamed response (`input_json_delta` events in Anthropic's streaming format).
+  Accumulate the raw string and only attempt `json.Unmarshal` once the block closes — partial JSON is, by definition, invalid JSON, and parsing it early just produces confusing errors.
 - **Parallel tool execution in Go.** When a turn contains several independent `tool_use` blocks, execute them concurrently and collect results with `errgroup`, preserving each result's `tool_use_id` so you can still build the correct `tool_result` set even if calls finish out of order:
 
 ```go
@@ -477,3 +546,8 @@ _ = g.Wait()
 - **Before this:** [[LLM Fundamentals]], [[Prompt Engineering]], [[Calling LLM APIs from Go]]
 - **Next:** [[AI Agents and Agentic Workflows]], [[Model Context Protocol (MCP)]]
 - **Compare with:** [[Guardrails and LLM Security]] (validating and constraining tool use against abuse), [[OWASP API Security Top 10]] (excessive agency, broken object-level authorization apply to every tool call)
+
+### Watch on YouTube
+
+- [What is Tool Calling? Connecting LLMs to Your Data](https://www.youtube.com/watch?v=h8gMhXYAv1k) · IBM Technology · 4 min · 66,153 views
+- [LLM Function Calling Explained / Tool Integration & Structured Outputs / AI/ML Class 10](https://www.youtube.com/watch?v=9DThnOIue4I) · Fusionpact · 3 min · 86 views

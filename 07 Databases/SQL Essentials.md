@@ -15,13 +15,15 @@ sources:
   - "PostgreSQL wiki, Don't Do This (NOT IN)"
   - "MySQL 8.0 docs, Type Conversion in Expression Evaluation (string column compared with a number)"
   - "Codd, A Relational Model of Data for Large Shared Data Banks (CACM, 1970)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # SQL Essentials
 
 > [!summary] TL;DR
-> SQL is how you ask a relational database for data. You describe **what** you want (which tables, how they connect, which rows, how to group and sort them) and the database decides **how** to fetch it. Most SQL bugs come from three places: `NULL`, which makes a condition "unknown" instead of true or false; joins that multiply rows; and forgetting the order in which a query's clauses apply.
+> SQL is how you ask a relational database for data. You describe **what** you want (which tables, how they connect, which rows, how to group and sort them) and the database decides **how** to fetch it.
+>
+> Most SQL bugs come from three places: `NULL`, which makes a condition "unknown" instead of true or false; joins that multiply rows; and forgetting the order in which a query's clauses apply.
 
 > [!abstract] Core idea
 > - You describe the result, not the steps; the planner picks how to fetch it.
@@ -30,11 +32,60 @@ updated: 2026-11-07
 > - Joins multiply rows: joining a one-to-many table before summing double-counts money.
 > - Values always go in as parameters (`$1`), never by string concatenation.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your company keeps clients, invoices and payments in a database.
+Your manager asks: "Which clients owe us more than 1,000 rupees right now?"
+You could load everything into your program and loop, but SQL lets you ask the database that exact question in a few lines.
+This note teaches how to ask it correctly.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Table | A named grid of rows and columns | `invoices` |
+| Row | One record | Invoice 42 |
+| Query | A SQL statement that reads or changes data | `SELECT id FROM invoices` |
+| Join | Combining rows from two tables that match on a column | invoices joined to clients on `client_id` |
+| Aggregate | A function that turns many rows into one value | `SUM(amount)`, `COUNT(*)` |
+| `NULL` | "Unknown or missing value", not zero and not empty | `paid_at IS NULL` |
+| Parameter | A placeholder filled in safely by the driver | `WHERE id = $1` |
+| Transaction | A group of statements that succeed or fail together | `BEGIN; ... COMMIT;` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  A[FROM / JOIN] --> B[WHERE]
+  B --> C[GROUP BY]
+  C --> D[HAVING]
+  D --> E[SELECT]
+  E --> F[ORDER BY]
+  F --> G[LIMIT]
+```
+
+**Analogy.**
+SQL is like ordering at a restaurant: you say what dish you want, and the kitchen decides how to cook it.
+Where it breaks: the kitchen never changes your order, but SQL rules like `NULL` logic can silently change which rows you get.
+
+**How the rest of this note builds up**
+
+- First, why SQL exists and the mental model of "describe the result".
+- Then the core: the running schema, clause order, joins, grouping, window functions, CTEs, `NULL`, constraints and upserts.
+- Then a worked collections query traced row by row, and building SQL safely from Go.
+- Finally, variants, trade-offs, production practice and the SDE-3 deep dive.
+
+> [!tip] Remember
+> Describe the result you want, pass values as parameters, and watch out for `NULL` and joins that multiply rows.
+
 ## 1. Why it exists
 
 InvoiceOps' collections page asks: *which clients owe money on overdue invoices, and how late are they?*
 
-Without SQL, the Go service would load every invoice, loop over them and add up balances per client. That is fine for 1,000 invoices. For a report over a 10-million-row `invoices` table it means pulling about 1.5 GB over the network (an estimate at ~150 bytes per row) to compute three numbers, and rewriting the loop every time the question changes.
+Without SQL, the Go service would load every invoice, loop over them and add up balances per client. That is fine for 1,000 invoices.
+
+For a report over a 10-million-row `invoices` table it means pulling about 1.5 GB over the network (an estimate at ~150 bytes per row) to compute three numbers, and rewriting the loop every time the question changes.
 
 SQL sends the question to the data instead. The server filters, joins and adds up next to the storage, then returns three rows. Because the query states only the result, the same text keeps working when you add an index or the table grows tenfold: the planner simply picks a new way to run it.
 
@@ -286,7 +337,9 @@ flowchart TD
     D --> R["same for Bolt Foods and Cobalt;<br/>Acme Corp fails because 10 is in the list:<br/>0 rows"]
 ```
 
-Representative output (PostgreSQL 17): **0 rows**. The subquery returns `{NULL, 10, NULL, NULL}`. For Acme Labs (11) the test expands to `11 <> NULL AND 11 <> 10 AND …`, which is UNKNOWN, so the row is dropped. Bolt Foods and Cobalt Ltd are dropped the same way, and Acme Corp because 10 is in the list. `NOT EXISTS` asks the intended question and returns Acme Labs, Bolt Foods and Cobalt Ltd:
+Representative output (PostgreSQL 17): **0 rows**. The subquery returns `{NULL, 10, NULL, NULL}`. For Acme Labs (11) the test expands to `11 <> NULL AND 11 <> 10 AND …`, which is UNKNOWN, so the row is dropped.
+
+Bolt Foods and Cobalt Ltd are dropped the same way, and Acme Corp because 10 is in the list. `NOT EXISTS` asks the intended question and returns Acme Labs, Bolt Foods and Cobalt Ltd:
 
 ```sql
 SELECT c.name FROM clients c
@@ -523,3 +576,7 @@ The same question can often be written several ways. They differ in NULL behavio
 - **Next:** [[Relational Schema Design]], [[Transactions and ACID]], [[Indexing Fundamentals]]
 - **Code:** [[SQL Essentials - Go]] (schema DDL, long queries, the safe query builder with tests)
 - **Compare with:** [[SQL vs NoSQL]] (when not to use a relational store), [[Query Plans and EXPLAIN]] (how the planner executes what you declared), [[Pagination, Filtering and Sorting]] (keyset pagination)
+
+### Watch on YouTube
+
+- [Advanced SQL Tutorial 🔥 Learn JOIN, CTE, Window Functions & More in 15 Minutes](https://www.youtube.com/watch?v=Wu4ZNBlY5HY) · Hasu Tube · 15-min visual recap of joins, CTEs and window functions covered in the note

@@ -8,7 +8,7 @@ related: ["[[Facade (vs Mediator)]]", "[[Repository and Unit of Work]]", "[[Lock
 sources:
   - "PostgreSQL 17 docs, SELECT: The Locking Clause (FOR UPDATE, SKIP LOCKED)"
   - "PostgreSQL 17 docs, Partial Indexes (unique partial index)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Parking Lot
@@ -22,6 +22,46 @@ updated: 2026-11-02
 > - The one rule: "find a free spot" and "mark it taken" happen under the same lock, so two gates never get the same spot.
 > - Money is `int64` paise and the clock is injected, so fees are exact and testable.
 > - Classic mistake: checking for a free spot, unlocking, then marking it taken (a race), or using `float64` for money.
+
+## Start here: the basics
+
+**The problem in one story.** A mall car park has three floors and two entry gates. Two cars arrive at the two gates at the same second, and there is one free spot left. Only one car should get it. When a car leaves, the machine must charge the right fee for the time parked.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Spot | One parking place of a type | Floor 1, spot 7, car |
+| Ticket | Record of one visit: vehicle, spot, entry time | T-101 for KA01AB1234 |
+| Strategy | A swappable rule behind an interface | "Lowest floor first" vs "nearest gate" |
+| Facade | One simple front object hiding many parts | `ParkingLot.Park(vehicle)` |
+| Mutex (lock) | Lets only one goroutine run a piece of code at a time | Two gates take turns picking a spot |
+| Race condition | Two actions interleave and break the result | Both gates get spot 7 |
+| Paise (`int64`) | Money stored as whole smallest units | ₹40.50 = 4050 |
+| Injected clock | Code asks an interface for "now" so tests can fake it | Pretend 3 hours passed |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  V[Vehicle at gate] --> L[Take lot lock]
+  L --> A[Allocation strategy picks free spot]
+  A --> M[Mark spot taken + issue ticket]
+  M --> U[Release lock]
+  U --> X[Exit: pricing strategy computes fee]
+```
+
+**Analogy.** A valet desk with one key board: the valet takes a key from the board and hangs a tag in one motion, so two valets never grab the same spot. Where it breaks: with many gates on many servers there is no single board, so the database row lock plays that role.
+
+**How the rest of this note builds up**
+
+- First the problem, requirements and actors (Steps 1-2), then entities and relationships (Steps 3-4).
+- Then APIs and storage with `SELECT FOR UPDATE SKIP LOCKED` (Steps 5-6) and patterns (Step 7).
+- Then the Go code and tests (Step 8): allocation and pricing strategies, the atomic park step.
+- Finally the SDE-3 depth: edge cases (lost ticket, fallback spots), trade-offs and interview questions.
+
+> [!tip] Remember
+> Pick a free spot and mark it taken under one lock; money in paise, clock injected.
 
 ## Problem statement
 
@@ -883,7 +923,11 @@ sequenceDiagram
 ## Interview explanation
 
 ```text
-I model ParkingLot as a facade that owns the spots and tracks open tickets, where a ticket is one visit linking a vehicle to a spot. Spot choice and fee calculation are two Strategy interfaces, so lowest-floor-first or nearest-to-gate, and hourly or weekend pricing, change without touching the lot. The hard part is concurrent entry: picking a free spot and marking it occupied must be one atomic step, so in memory I do both under one mutex, and in a database I use SELECT FOR UPDATE SKIP LOCKED plus partial unique indexes on open tickets per spot and per plate. For a lost ticket the attendant looks up the open ticket by plate and charges the normal fee plus a penalty, which also kills the old ticket ID. The ticket stores the vehicle type, so a bike that falls back to a car spot still pays the bike rate. Money is int64 paise and the clock is injected so fee tests are deterministic.
+I model ParkingLot as a facade that owns the spots and tracks open tickets, where a ticket is one visit linking a vehicle to a spot. Spot choice and fee calculation are two Strategy interfaces, so lowest-floor-first or nearest-to-gate, and hourly or weekend pricing, change without touching the lot.
+
+The hard part is concurrent entry: picking a free spot and marking it occupied must be one atomic step, so in memory I do both under one mutex, and in a database I use SELECT FOR UPDATE SKIP LOCKED plus partial unique indexes on open tickets per spot and per plate.
+
+For a lost ticket the attendant looks up the open ticket by plate and charges the normal fee plus a penalty, which also kills the old ticket ID. The ticket stores the vehicle type, so a bike that falls back to a car spot still pays the bike rate. Money is int64 paise and the clock is injected so fee tests are deterministic.
 ```
 
 ## Cheat sheet
@@ -900,3 +944,8 @@ I model ParkingLot as a facade that owns the spots and tracks open tickets, wher
 - **Before this:** [[LLD Interview Method]], [[Strategy and Template Method]], [[Concurrency for LLD]]
 - **Next:** [[Vending Machine]]
 - **Compare with:** [[Locking - Optimistic vs Pessimistic]] (the database side of the claim), [[Case Study - Ticket Booking]] (the same "claim a scarce unit" race at system scale), [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [Parking Lot Design / Grokking The Object Oriented Design Interview Question](https://www.youtube.com/watch?v=tVRyb4HaHgw) · Think Software · 27 min · 421,214 views
+- [🚗  Parking Lot Design / System Design + LLD + Full Code Implementation](https://www.youtube.com/watch?v=NU16qSPUmus) · codeWithAryan · 44 min · 71,679 views

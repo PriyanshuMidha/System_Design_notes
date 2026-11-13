@@ -9,7 +9,7 @@ sources:
   - "Go runtime source, src/runtime/netpoll_epoll.go, src/runtime/netpoll.go (Go 1.24)"
   - "Go 1.24 standard library documentation, net and internal/poll"
 status: reviewed
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # I-O Models - Blocking, epoll, io_uring and the Go Netpoller
@@ -25,11 +25,68 @@ updated: 2026-11-09
 > - **`io_uring`** (Linux, kernel 5.1+): goes further — submit a whole batch of I/O operations (not just "tell me when ready"; the read/write itself) via a shared ring buffer, with the kernel completing them asynchronously and almost no syscalls per operation.
 > - **Go's netpoller** uses `epoll` (Linux), kqueue (BSD/Darwin) or IOCP (Windows) under the hood so that application code can write plain blocking-looking `conn.Read()` calls while the runtime parks the *goroutine*, not an OS thread, until data is ready.
 
+## Start here: the basics
+
+### The problem in one story
+
+A chat app has 50,000 people connected at once.
+Most of them are silent most of the time, but anyone might type at any moment.
+The server must notice each message quickly without wasting a worker on every silent person.
+This note is about how a program asks "who has something for me right now?"
+
+### Words you need first
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| I/O | Moving bytes in or out of the program (network, disk) | Reading a message from a socket |
+| Socket / connection | One open network link to another machine | One browser tab talking to your server |
+| File descriptor (fd) | A small number the kernel gives you to name an open file or socket | `fd 7` = the connection to Alice |
+| Kernel | The core of the OS that owns hardware and does real I/O | Linux |
+| Syscall | A request from your program to the kernel | `read(fd, buf)` |
+| Thread | A unit of execution the OS schedules; costs memory | One worker in a thread pool |
+| Blocking | The call waits until the result is ready | `read` sits until bytes arrive |
+| Goroutine | Go's very cheap task, run on a few OS threads by the runtime | `go handle(conn)` |
+
+### Picture it
+
+```mermaid
+flowchart LR
+    C1["Conn A (silent)"] --> K["Kernel watches all connections"]
+    C2["Conn B (has data)"] --> K
+    C3["Conn C (silent)"] --> K
+    K -- "only B is ready" --> T["1 worker thread"]
+    T --> H["handle B"]
+```
+
+### Analogy
+
+A waiter with many tables: instead of standing at one table, they watch for call buttons and only go where a button is lit.
+Where it breaks: a real waiter can't be in two places, but the kernel can also do the I/O itself for you (io_uring), which has no waiter equivalent.
+
+### How the rest of this note builds up
+
+- First, why one thread per connection fails at scale ("Why it exists") and the waiter model.
+- Then the mechanisms in order: blocking, `select`/`poll`, `epoll` (level vs edge triggered), `io_uring`.
+- Then how Go's netpoller hides `epoll` behind plain `conn.Read`, traced step by step.
+- Finally the SDE-3 deep dive: trade-offs, production failure modes, and the per-process netpoller and disk-I/O details.
+
+> [!tip] Remember
+> Don't give each connection its own waiting thread; let the kernel tell you which connections are ready.
+
 ## 1. Why it exists
 
-A single machine serving 50,000 concurrent long-lived connections (WebSocket fan-out, a chat server, long-polling clients) faces a hard constraint: an OS thread costs real memory for its stack (commonly 1–8 MB reserved address space per thread, even if resident usage is lower) and a real context switch cost (see [[CPU Scheduling]]) every time the kernel moves between threads. A naive "one blocking thread per connection" design for 50,000 connections means 50,000 OS threads, most of them asleep waiting for input at any moment — the kernel scheduler now has to manage all of them, and the memory alone can run into tens of gigabytes before the program does any real work.
+A single machine serving 50,000 concurrent long-lived connections (WebSocket fan-out, a chat server, long-polling clients) faces a hard constraint. An OS thread costs:
 
-The industry's answer, generalized across the C10K-and-beyond problem: don't dedicate an OS thread to each connection. Instead, use a small number of threads that each ask the kernel "which of these many connections have something ready right now?" and only do work for the ones that do. The mechanism for asking that question efficiently is the whole subject of this note.
+- real memory for its stack (commonly 1–8 MB reserved address space per thread, even if resident usage is lower), and
+- a real context switch cost (see [[CPU Scheduling]]) every time the kernel moves between threads.
+
+A naive "one blocking thread per connection" design for 50,000 connections means 50,000 OS threads, most of them asleep waiting for input at any moment.
+
+The kernel scheduler now has to manage all of them, and the memory alone can run into tens of gigabytes before the program does any real work.
+
+The industry's answer, generalized across the C10K-and-beyond problem: don't dedicate an OS thread to each connection.
+
+Instead, use a small number of threads that each ask the kernel "which of these many connections have something ready right now?" and only do work for the ones that do. The mechanism for asking that question efficiently is the whole subject of this note.
 
 ## 2. Mental model
 
@@ -73,11 +130,20 @@ flowchart LR
 
 ### `select` and `poll`: ask about everything, every time
 
-`select(2)` and `poll(2)` both take a list of file descriptors and block until at least one is ready, then return which ones. The cost that limits them at scale: every call passes the *entire* list to the kernel again, and the kernel scans all of it again, even if only one of 10,000 descriptors changed state since the last call. That makes each wait `O(N)` in the number of watched descriptors, not in the number that are actually ready — fine for a handful of file descriptors, a real bottleneck at thousands.
+`select(2)` and `poll(2)` both take a list of file descriptors and block until at least one is ready, then return which ones.
+
+The cost that limits them at scale: every call passes the *entire* list to the kernel again, and the kernel scans all of it again, even if only one of 10,000 descriptors changed state since the last call.
+
+That makes each wait `O(N)` in the number of watched descriptors, not in the number that are actually ready — fine for a handful of file descriptors, a real bottleneck at thousands.
 
 ### `epoll`: level-triggered vs edge-triggered
 
-`epoll` splits the work into two steps: `epoll_ctl` registers (or modifies, or removes) interest in a file descriptor *once*, storing it in a kernel-side data structure; `epoll_wait` then blocks and returns only the descriptors that became ready, without re-scanning everything that's merely being watched. This makes waiting proportional to how much is actually happening, not to how much is being watched.
+`epoll` splits the work into two steps:
+
+1. `epoll_ctl` registers (or modifies, or removes) interest in a file descriptor *once*, storing it in a kernel-side data structure.
+2. `epoll_wait` then blocks and returns only the descriptors that became ready, without re-scanning everything that's merely being watched.
+
+This makes waiting proportional to how much is actually happening, not to how much is being watched.
 
 `epoll` supports two triggering modes, and mixing them up is a classic source of bugs:
 
@@ -97,13 +163,24 @@ stateDiagram-v2
     end note
 ```
 
-Edge-triggered is more efficient (fewer redundant wake-ups under high throughput) but requires the application to loop reading until it hits `EAGAIN` on every notification, or it will silently stop receiving data that's actually sitting in the kernel buffer. Nginx and most high-performance event loops use edge-triggered mode for exactly this throughput reason, paired with disciplined drain-to-`EAGAIN` loops.
+Edge-triggered is more efficient (fewer redundant wake-ups under high throughput).
+
+But it requires the application to loop reading until it hits `EAGAIN` on every notification, or it will silently stop receiving data that's actually sitting in the kernel buffer.
+
+Nginx and most high-performance event loops use edge-triggered mode for exactly this throughput reason, paired with disciplined drain-to-`EAGAIN` loops.
 
 ### `io_uring`: shared ring buffers, not one syscall per operation
 
-`epoll` (and `select`/`poll`) only ever answer "is it ready?" — you still make a separate `read(2)`/`write(2)` syscall to actually move the bytes, and each syscall has real overhead (a user→kernel mode transition; see [[System Calls and User vs Kernel Mode]]) plus, since 2018's Meltdown/Spectre mitigations, extra cost from stricter CPU isolation between user and kernel space.
+`epoll` (and `select`/`poll`) only ever answer "is it ready?" — you still make a separate `read(2)`/`write(2)` syscall to actually move the bytes.
 
-`io_uring` (Linux 5.1+, 2019) takes a different approach: the application and kernel share two ring buffers in memory — a **submission queue (SQ)** and a **completion queue (CQ)**. The app writes a submission entry describing an operation (read this fd into this buffer, write that fd, accept a connection, …) directly into the SQ, with no syscall required to submit it in the common case; the kernel processes entries from the SQ asynchronously and writes results into the CQ. The app can batch many operations per actual syscall (or, with `IORING_SETUP_SQPOLL`, a dedicated kernel thread polls the SQ and the application never syscalls at all on the hot path), and can check for completions without blocking if it wants to do other work in between.
+Each syscall has real overhead (a user→kernel mode transition; see [[System Calls and User vs Kernel Mode]]) plus, since 2018's Meltdown/Spectre mitigations, extra cost from stricter CPU isolation between user and kernel space.
+
+`io_uring` (Linux 5.1+, 2019) takes a different approach: the application and kernel share two ring buffers in memory — a **submission queue (SQ)** and a **completion queue (CQ)**.
+
+1. The app writes a submission entry describing an operation (read this fd into this buffer, write that fd, accept a connection, …) directly into the SQ, with no syscall required to submit it in the common case.
+2. The kernel processes entries from the SQ asynchronously and writes results into the CQ.
+3. The app can batch many operations per actual syscall (or, with `IORING_SETUP_SQPOLL`, a dedicated kernel thread polls the SQ and the application never syscalls at all on the hot path).
+4. The app can check for completions without blocking if it wants to do other work in between.
 
 ```mermaid
 flowchart LR
@@ -113,11 +190,15 @@ flowchart LR
     CQ -- "app reads directly, no syscall" --> App
 ```
 
-This matters most for very high IOPS workloads (storage-heavy services, some proxies) where syscall overhead itself is the bottleneck; it is a genuinely different model from `epoll` (which only ever reports readiness) because `io_uring` can perform the I/O operation itself asynchronously, including operations `epoll` has no notion of at all, like file reads.
+This matters most for very high IOPS workloads (storage-heavy services, some proxies) where syscall overhead itself is the bottleneck.
+
+It is a genuinely different model from `epoll` (which only ever reports readiness) because `io_uring` can perform the I/O operation itself asynchronously, including operations `epoll` has no notion of at all, like file reads.
 
 ### How Go's netpoller makes blocking-style code use `epoll`
 
-This is the part that lets Go programmers write `conn.Read(buf)` and have it *look* blocking while the runtime does none of the one-thread-per-connection work described in "Why it exists". When a goroutine calls `conn.Read` and the socket has no data yet:
+This is the part that lets Go programmers write `conn.Read(buf)` and have it *look* blocking while the runtime does none of the one-thread-per-connection work described in "Why it exists".
+
+When a goroutine calls `conn.Read` and the socket has no data yet:
 
 1. The runtime issues a non-blocking `read(2)` first. If data is already there, it returns immediately — no parking needed.
 2. If it gets `EAGAIN` (not ready), the runtime registers the file descriptor's interest with the process-wide `epoll` instance it maintains internally (one per Go process on Linux), then **parks the goroutine** — not the OS thread — and hands that OS thread back to the scheduler to run other goroutines.
@@ -144,7 +225,13 @@ sequenceDiagram
     RT-->>G: Read returns with data
 ```
 
-The effect: thousands of goroutines can each be "blocked" in a `Read` call, costing only a few KB of goroutine stack each (growable, starting around 2 KB in Go 1.24), while the actual OS thread count stays near `GOMAXPROCS` plus however many are genuinely needed for blocked syscalls the netpoller can't cover (disk I/O mostly goes through blocking syscalls on separate OS threads, not the netpoller — only network-ish, pollable file descriptors use this path). This is the mechanism, not goroutines themselves, that lets Go's concurrency model scale to large connection counts without the application writing a single line of event-loop code; see [[Runtime - Goroutine Scheduler (GMP)]] for how the M:N scheduling of goroutines onto OS threads works more generally, and [[Goroutines and Channels]] for the concurrency-building-blocks side of the same model.
+The effect: thousands of goroutines can each be "blocked" in a `Read` call, costing only a few KB of goroutine stack each (growable, starting around 2 KB in Go 1.24).
+
+Meanwhile the actual OS thread count stays near `GOMAXPROCS` plus however many are genuinely needed for blocked syscalls the netpoller can't cover. Disk I/O mostly goes through blocking syscalls on separate OS threads, not the netpoller — only network-ish, pollable file descriptors use this path.
+
+This is the mechanism, not goroutines themselves, that lets Go's concurrency model scale to large connection counts without the application writing a single line of event-loop code.
+
+See [[Runtime - Goroutine Scheduler (GMP)]] for how the M:N scheduling of goroutines onto OS threads works more generally, and [[Goroutines and Channels]] for the concurrency-building-blocks side of the same model.
 
 ## 4. Worked example
 
@@ -159,7 +246,9 @@ func EchoServer(ln net.Listener) {
 }
 ```
 
-This looks like ordinary blocking code — `Accept`, `Read` and `Write` inside `io.Copy` all appear to block the calling goroutine. Underneath, every one of them goes through the sequence in "How it works": a non-blocking syscall attempt first, parking on the netpoller only if the kernel isn't ready yet.
+This looks like ordinary blocking code — `Accept`, `Read` and `Write` inside `io.Copy` all appear to block the calling goroutine.
+
+Underneath, every one of them goes through the sequence in "How it works": a non-blocking syscall attempt first, parking on the netpoller only if the kernel isn't ready yet.
 
 ### Tracing one request through the sequence diagram
 
@@ -167,16 +256,26 @@ Follow a single client through the "How Go's netpoller makes blocking-style code
 
 1. A client dials the listener. `ln.Accept()` returns immediately (in the common case), handing the new `net.Conn` to a fresh goroutine.
 2. That goroutine calls `conn.Read(buf)`. The runtime tries a non-blocking `read(2)` first. If the client hasn't sent anything yet, this returns `EAGAIN` instantly — no thread waits for it.
-3. The runtime registers this connection's file descriptor with the process-wide `epoll` instance (`epoll_ctl`), then parks the goroutine. The OS thread that was running it is immediately free to run other goroutines — nothing about this step is unique to this one connection; the same thread may now service hundreds of other parked goroutines' work.
+3. The runtime registers this connection's file descriptor with the process-wide `epoll` instance (`epoll_ctl`), then parks the goroutine.
+   The OS thread that was running it is immediately free to run other goroutines — nothing about this step is unique to this one connection; the same thread may now service hundreds of other parked goroutines' work.
 4. Some time later, the client actually sends data. The kernel marks that file descriptor ready.
 5. The scheduler's own loop (or the dedicated `sysmon` thread, if nothing else is runnable) calls `epoll_wait`, which returns this descriptor among the ready set.
 6. The runtime marks the parked goroutine runnable again. A scheduler `P` resumes it, and the non-blocking `read(2)` this time succeeds — `conn.Read` returns with data, exactly as if it had been an ordinary blocking call all along.
 
 ### A measured number for "many connections are cheap"
 
-**Measured** (this code, Go 1.24.4, darwin/arm64, `-race`, loopback, 2026-11-09): a goroutine-per-connection TCP echo server sustains roughly **56,000 round trips/sec** across 50 concurrent connections (1,000 total round trips in 17.8 ms), and separately handles 200 concurrent clients correctly with the live goroutine count returning to baseline once every client finishes — proving no goroutine was left parked forever. Both numbers come from the Go note's own tests, not from an external load generator, so they reflect Go scheduling and loopback-socket overhead specifically, not real network latency.
+**Measured** (this code, Go 1.24.4, darwin/arm64, `-race`, loopback, 2026-11-09):
 
-**Representative numbers (estimate):** on Linux, a single Go process handling 100,000 idle, mostly-silent WebSocket connections typically holds roughly 2–8 KB of goroutine stack per connection (much of it the minimum stack before growth) versus the 1–8 MB of address space an OS-thread-per-connection design would reserve per connection — two to three orders of magnitude less memory for the same connection count. (Documented behavior, not independently benchmarked here: see the Go runtime source for `netpoll_epoll.go`, and the initial goroutine stack size in `runtime/stack.go`, both in `sources`.)
+- a goroutine-per-connection TCP echo server sustains roughly **56,000 round trips/sec** across 50 concurrent connections (1,000 total round trips in 17.8 ms);
+- separately, it handles 200 concurrent clients correctly with the live goroutine count returning to baseline once every client finishes — proving no goroutine was left parked forever.
+
+Both numbers come from the Go note's own tests, not from an external load generator, so they reflect Go scheduling and loopback-socket overhead specifically, not real network latency.
+
+**Representative numbers (estimate):** on Linux, a single Go process handling 100,000 idle, mostly-silent WebSocket connections typically holds roughly 2–8 KB of goroutine stack per connection (much of it the minimum stack before growth).
+
+Compare that with the 1–8 MB of address space an OS-thread-per-connection design would reserve per connection — two to three orders of magnitude less memory for the same connection count.
+
+(Documented behavior, not independently benchmarked here: see the Go runtime source for `netpoll_epoll.go`, and the initial goroutine stack size in `runtime/stack.go`, both in `sources`.)
 
 Runnable Go version: [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller - Go]]
 
@@ -252,3 +351,8 @@ Runnable Go version: [[I-O Models - Blocking, epoll, io_uring and the Go Netpoll
 - **Next:** [[Runtime - Goroutine Scheduler (GMP)]], [[Goroutines and Channels]]
 - **Compare with:** [[Page Cache, File Systems and fsync]] (why disk I/O doesn't fit the epoll readiness model the way sockets do)
 - **Runnable Go version:** [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller - Go]]
+
+### Watch on YouTube
+
+- [How io_uring Actually Works — The Async I/O Interface Replacing epoll](https://www.youtube.com/watch?v=Yw-O5QWkhsQ) · State & Flow · Deep dive on io_uring's ring-buffer model and how it differs from epoll's readiness model
+- [All About Epoll - Scalable I/O Syscalls in Linux!](https://www.youtube.com/watch?v=WuwUk7Mk80E) · hoff._world · Focused explainer on epoll's O(ready) readiness notification model vs select/poll

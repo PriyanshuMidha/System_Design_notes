@@ -1,0 +1,113 @@
+# What Happens When You Type a URL story: "The Sixty Second Sale". id | SPEAKER | tone | text. Source: [[What Happens When You Type a URL]] and its Go note.
+# Cast: PIA = request courier (hero, carries one request). RAJ = her rookie (asks the interview questions). DEV = DNS directory clerk. TARA = TCP gatekeeper. TILLY = TLS vault keeper. EDGAR = CDN branch manager in Mumbai. ROY = reverse proxy switchboard operator. ANVI = app server chef. DARA = database records keeper.
+== s1 The sixty second sale
+l1 | N | hook | Mumbai, Black Friday, eleven fifty nine. A shopper named Mira taps checkout. The flash sale ends in sixty seconds. If her cart does not load in time, the shop loses the sale, and Mira loses her deal. Everything depends on one request.
+l2 | PIA | normal | I am Pia, the request courier. I carry one request, from the browser, to the shop, and back. This one is slash cart, on shop dot example dot com. And Raj, my rookie, is coming along.
+l3 | RAJ | question | Pia, it is just a web address. I type it, I press Enter, and a page appears. What is there to carry?
+l4 | PIA | punch | Between Enter and the page, nine steps happen. On a cold first visit they cost three hundred to eight hundred milliseconds. On a warm one, under fifty. Today we find out where every millisecond goes.
+l5 | N | normal | First the words. A U R L is the full address of a page. An I P address is the numeric address computers really use. D N S is the internet's phone book, a name goes in, an I P address comes out. A cache is a saved copy, so work is not repeated. A round trip, R T T, is the time for a message to go there and back, about two hundred twenty milliseconds between Mumbai and the American east coast.
+l6 | N | normal | T C P makes a reliable connection, and T L S encrypts it, that is the S in H T T P S. A C D N edge is a server near the user that keeps copies of content. And a reverse proxy is the front door at the origin, forwarding requests to the app servers.
+l7 | PIA | normal | Think of phoning a company. You look up the number, dial, agree a code word, and ask. A local branch may answer before head office is needed. Our shop has exactly that.
+l8 | N | normal | The nine boxes, left to right. Browser cache, D N S, T C P, T L S, the H T T P request, the C D N edge, the reverse proxy, the app server, and the database. Then the answer comes back, and the page is drawn. The board in the corner will tick each one off.
+== s2 Why this chain exists
+l9 | N | normal | Why is it a chain? A single cart page touches a browser cache, a D N S resolver, a C D N, a reverse proxy, an app server and a database. Six systems, owned by different teams or companies.
+l10 | PIA | normal | Nobody designed load a U R L as one system. It works because each layer keeps one narrow promise. D N S turns a name into an address, and nothing else. T C P delivers bytes reliably, and nothing else. T L S adds secrecy, and nothing else.
+l11 | PIA | punch | And knowing the whole chain is the difference between, the page is slow, and, the T L S handshake to the origin adds a hundred eighty milliseconds because the C D N cache is missing. The second sentence names the box to fix.
+l12 | N | normal | Our scenario, used all through the story. Mira in Mumbai asks for slash cart for the first time this session. Cold browser cache. Cold T L S session. A cold C D N cache for this exact U R L, because it is personal. The origin, with the app servers and the main database, sits in us east one, two hundred twenty milliseconds away. And a C D N has an edge in Mumbai.
+l13 | N | normal | The mental model. A customer phones a switchboard. First check your own notebook. If the number is not there, call directory assistance once and write it down. Dial, and wait for pickup. Agree a code word. Then ask the local branch, which may already know the answer. If not, the switchboard operator connects the right department, who checks the filing cabinet.
+l14 | PIA | warn | But the analogy breaks in one place. A phone call is one long conversation. Our chain is several separate exchanges. D N S is its own exchange, the handshake is another, the request is another. Each can be skipped, if its own cache already holds the answer.
+l15 | RAJ | punch | So every look it up first step is a cache, and every ring and pick up step is a handshake that costs a round trip!
+== s3 The notebook and the directory
+l16 | N | normal | Box one and two. Pia and Raj stand in the browser's home. Before sending anything onto the network, the browser asks itself two questions, from memory. Do I already have this exact response saved? And do I already know this host name's address? No network, no handshake.
+l17 | PIA | normal | Our cart is private, and marked no store. So the cache check is a guaranteed miss, found out in under one millisecond. And shop dot example dot com was never looked up this session. Another miss. To the directory.
+l18 | DEV | normal | Dev, directory clerk. First the operating system's own small cache. Miss. Then I ask the recursive resolver. It checks its cache, miss, and asks the authoritative server for shop dot example dot com.
+l19 | DEV | normal | The authoritative server answers with an A or A A A A record, and a T T L. The resolver keeps the answer for that time, and hands the address back to the browser. Cold, that costs twenty to a hundred twenty milliseconds. Warm, under one.
+l20 | N | normal | Why it matters. A cold D N S lookup is one of the few delays an application cannot fix by writing faster code. The only levers are the record's T T L, and whether the client may cache at all.
+l21 | DEV | warn | The common mistake. Thinking the answer is good for the whole session. It is good only until the T T L expires. A resolver that ignores a short T T L can serve a stale address, after the origin has moved.
+== s4 The gate and the vault
+l22 | N | normal | Box three and four. Two handshakes before one byte of H T T P moves. Pia walks to the gate. Tara guards it, and the gate belongs to the C D N edge in Mumbai.
+l23 | TARA | normal | Tara, gatekeeper. T C P must confirm that both sides are listening, and agree on starting sequence numbers. Three packets. The browser sends a SYN. The edge answers SYN ACK. The browser sends an ACK. Done. One round trip.
+l24 | PIA | normal | And the gate is the nearby edge in Mumbai, not the far origin. So this costs one local round trip, ten to forty milliseconds, not one across the ocean.
+l25 | TILLY | normal | Tilly, vault keeper. T L S must agree an encryption key and prove the server's identity. With T L S one point three, the client's very first message, the ClientHello, already carries its key share and the server name. So I answer in one reply, with the ServerHello, the certificate, and Finished.
+l26 | TILLY | normal | The browser sends its own Finished, and the first H T T P request rides along with it. One more round trip. That is two round trips in total, TCP plus T L S, and the request moves in the third flight.
+l27 | RAJ | question | But I heard T L S needed more than that.
+l28 | TILLY | punch | T L S one point two did. It needed a separate key exchange and a Finished round trip, on top of the hello. That is three round trips before data. One point three removes exactly that one.
+l29 | N | normal | Why this is the whole reason an edge exists at the T C P and T L S layer, not only for caching. Ending the connection near the browser turns two expensive long distance round trips into two cheap local ones.
+l30 | TILLY | warn | Remember the rule. One point three needs one round trip because the key share is in the first message. And a resumed session can even use zero R T T. Hold that thought, there is a trap in it later.
+== s5 The branch and head office
+l31 | N | normal | Box five, six, seven and eight. Now the secure line is open and the browser sends one H T T P request. Pia hands it to Edgar, the branch manager in Mumbai.
+l32 | EDGAR | normal | Edgar, C D N edge. I check my own cache first. For slash cart, the answer is private and no store, so it is a miss. The only way forward is to send it to head office, over a connection I already keep open to the origin's reverse proxy.
+l33 | N | normal | Now the long road. Across the ocean, two hundred twenty milliseconds each way. Pia follows the request to the head office, in us east one.
+l34 | ROY | normal | Roy, reverse proxy, the switchboard operator. I end the T L S, I pick which application server should handle this, that is layer seven routing, and I pass it on.
+l35 | ANVI | normal | Anvi, app server. I authenticate the session, build the query, and ask the filing cabinet for the cart rows.
+l36 | DARA | normal | Dara, database. A pooled connection, so no new handshake. A well indexed lookup. Here are the rows, in a few milliseconds.
+l37 | ANVI | normal | Two hundred O K, with a J S O N body. Back to Roy, Roy to Edgar, Edgar to the browser. The edge may cache it if the headers allow, and these do not.
+l38 | PIA | punch | And here is the trick that saves the sale. The long hop to head office costs just one round trip. Why? Because Edgar keeps a pool of connections to the origin already open, and already through T L S.
+l39 | EDGAR | normal | Without my warm pool, that single hop would cost three round trips of its own, a D N S, a T C P and a T L S, each at two hundred twenty milliseconds. With it, one. That is why a C D N fronted site still feels fast on a miss.
+l40 | N | warn | The common mistake. Believing a C D N miss is as costly as the browser doing the whole D N S, T C P and T L S dance to a far origin. It is not. The warm pool means the miss pays one round trip at the real distance, not three.
+== s6 The page is drawn
+l41 | N | normal | The answer arrives, but the work is not over. The browser still has to parse it, discover what else the page needs, fetch those things, and only then show anything. This is a smaller version of the whole chain, repeated for every subresource.
+l42 | PIA | normal | The browser reads the H T M L, and finds a style sheet, a script, a logo, a font. It fetches them in parallel, on the same warm connection. Then it builds the D O M and the C S S O M, computes layout, and paints.
+l43 | N | normal | None of these pay for a new D N S, T C P or T L S, if they share the page's origin and connection. The only new cost is each request's own round trip. That is why H T T P two multiplexing matters so much, with dozens of subresources.
+l44 | RAJ | punch | So the page loaded is not one request and one response. It is one main request, plus a second parallel chain of small ones!
+l45 | PIA | normal | Mira's cart appears. Fifty two seconds on the clock. Let me show you where the time went.
+== s7 Where the time went: the receipts
+l46 | N | normal | The table, for the cold Mumbai to us east one scenario. Browser cache check, under one millisecond. D N S, twenty to a hundred twenty cold, under one warm. T C P, one round trip to the nearest edge, ten to forty. T L S one point three, one round trip, often piggybacked with the first request.
+l47 | N | normal | Edge to origin on a miss, one round trip at the real distance, about two hundred twenty. App and database, single digit to tens of milliseconds. Render, tens to hundreds. And a warm repeat visit collapses all of it into one round trip to the edge, often under fifty milliseconds.
+l48 | PIA | punch | Every row is skippable by some cache or kept open connection, except the app and database row. That one has to run on every request.
+l49 | N | normal | A real measurement, from curl dash w, on a live H T T P S request. D N S finished at two point six milliseconds. Connect at three point one. T L S at a hundred eighty point one. First byte at two hundred thirty one point nine. Total, two hundred thirty two.
+l50 | PIA | warn | Read it as cumulative, not per phase. T C P took about half a millisecond, a nearby server. T L S alone cost about a hundred seventy seven, the one long round trip. And the server's own think time was about fifty two.
+== s8 Variants: what gets skipped
+l51 | N | normal | Variants, and what each skips. Fully cold, nothing is skipped, three hundred to eight hundred milliseconds. Warm D N S and connection with a C D N hit, everything is skipped, including the origin, ten to fifty milliseconds. Warm connection with a C D N miss on a personal page, pay one round trip to the edge, one to the origin, plus the app and database time.
+l52 | N | normal | T L S session resumption skips the certificate exchange and signature, saves tens of milliseconds, mostly on mobile. H T T P three, over Q U I C, skips the extra stall after a lost packet, because Q U I C fixes head of line blocking at the transport layer. And a same origin follow up request skips D N S, T C P and T L S, and maybe the whole request, if H T T P cached.
+== s9 Deep dive: the details that bite
+d1 | N | normal | Deep dive, one. Why T C P plus T L S cost two round trips and not three. The ClientHello carries the key share, so the server finishes the handshake in one reply, and the client's Finished can piggyback the first request. T L S one point two needed its own ClientKeyExchange round trip. That is the one removed.
+d2 | N | normal | Deep dive, two. Why the C D N hop to origin is cheap even at two hundred twenty milliseconds. The pool of established, T L S ready connections. Browser pays to the nearby edge, and the edge forwards over a warm line. That beats the browser paying everything to the far origin.
+d3 | N | normal | Deep dive, three. Where application and database time goes. A well indexed point lookup, by primary key or covering index, costs low single digit milliseconds. An unindexed scan, or an N plus one pattern of many small queries, can dominate the whole request.
+d4 | N | normal | Deep dive, four. What render hides. The browser does not wait for the whole response. It stream parses the H T M L, discovers subresources, fires new requests, builds the D O M and the C S S O M, computes layout and paints. A second chain of request and response per subresource.
+d5 | N | normal | Deep dive, five. Load balancing is invisible on purpose. Both the edge and the proxy pick an upstream, that is a load balancing decision. The algorithms, round robin, least connections, consistent hashing, live in their own note.
+== s10 In Go: the code
+g1 | N | normal | Pia can measure all this from inside a program. The Go note builds a package called url trace, standard library only. It uses net slash http slash http trace, the same mechanism curl dash w, and the browser's waterfall, are built on.
+g2 | PIA | normal | First, a struct called Timings, one field per phase. D N S lookup, connect, T L S handshake, time to first byte, and total. A phase is zero when the transport skipped it. A struct beats a map, because a typo in a field name fails at compile time.
+g3 | N | normal | Then the function Do. It builds a client trace, with one callback per phase boundary. D N S start records the time. D N S done stores the elapsed duration, guarded by a check that the start ever ran, because a skipped phase never calls its start.
+g4 | N | normal | Connect start and connect done do the same. So do T L S handshake start and done. And got first response byte stores the time to first byte, measured from the request start.
+g5 | N | normal | Then Do attaches the trace to the request's context, so it affects only that one request, safe on a shared client. It runs the request, and drains the body with io copy to discard. That drain is what lets the connection go back to the pool for reuse.
+g6 | PIA | normal | Two tests prove the story. Test do H T T P S. A local T L S test server sleeps five milliseconds. Expected, D N S zero, because it is a literal I P. Connect and T L S both above zero. Time to first byte at least five milliseconds. Total at least first byte.
+g7 | PIA | punch | And test do reuses connection. Two requests in a row on the same client. The first pays connect and T L S. The second must pay zero for both. That is the warm path, proven in code. Both tests pass, with the race detector on.
+== s11 Trade-offs, failures and what to watch
+t1 | N | warn | Trade-offs. First, this chain assumes a public page with a C D N in front. A call between two services inside one data center skips public D N S and the C D N, and is dominated by app and database time instead.
+t2 | N | warn | Second, pushing more into the C D N trades freshness for speed. Third, keeping connections warm, keep alive and session resumption, trades server memory and open file descriptors for lower latency. A server with a connection limit may need shorter keep alive timeouts.
+t3 | TILLY | warn | Fourth, zero R T T resumption removes a round trip, but the first flight of data can be replayed by an attacker who captured it. Use it only for idempotent requests. Never for charge this card.
+t4 | PIA | normal | Now the failures, and fixes. Slow time to first byte, but fast D N S, T C P and T L S, means the bottleneck is the origin. Check proxy, app and database, and use curl dash w and dig to localize it.
+t5 | PIA | normal | High D N S time on every request, means the T T L is not sane, or the client is not caching. High T L S time means a full handshake every time instead of resumption, or a slow certificate check, O C S P.
+t6 | PIA | normal | And a C D N hit ratio near zero on a cacheable page. Check that Cache Control and Vary are really cacheable. Always the same shape. Something cached, or kept warm, to save a round trip.
+t7 | N | normal | What to monitor. Per phase timing percentiles, p fifty, p ninety five, p ninety nine, from real user monitoring. The C D N cache hit ratio. The T L S handshake failure rate. And the latency from the edge to the origin.
+== s12 Interview round
+q0 | N | hook | Interview round. Raj asks, Pia answers.
+q1 | RAJ | question | Walk me through what happens between pressing Enter and the page starting to render.
+q2 | PIA | normal | Browser cache, then D N S, a T C P handshake, a T L S one point three handshake, then an H T T P request that a C D N may answer from cache, or forward to a reverse proxy, then an app server and a database. The answer comes back, and the browser renders. Each step is skippable if its own cache has the answer.
+q3 | RAJ | question | Why is the very first request to a site so much slower than the rest?
+q4 | PIA | normal | The first pays for D N S, a fresh T C P handshake and a fresh T L S handshake, two or more round trips before any H T T P byte, plus a guaranteed C D N miss. Later requests reuse all of it.
+q5 | RAJ | question | Trap. Does T L S zero R T T always make the first request faster, with no downside?
+q6 | TILLY | punch | No. An attacker who captured the early data can replay it. So it is only safe for idempotent requests, never for transfer funds.
+q7 | RAJ | question | Time to first byte is six hundred milliseconds, but D N S, T C P and T L S add up to forty. Where next?
+q8 | PIA | normal | The origin. Is the U R L even cacheable at the C D N? Then use curl dash w or server tracing to see whether the time is app logic or a slow query.
+q9 | RAJ | question | Does a C D N make T L S unnecessary between edge and origin?
+q10 | EDGAR | normal | No. T L S ends at the edge for the browser, but my hop to the origin crosses the open internet too. It runs its own T L S session, usually with the origin's own certificate.
+q11 | RAJ | question | Why does H T T P three help more on mobile than on fast wired networks?
+q12 | PIA | normal | It runs on Q U I C, where one lost packet stalls only its own stream. Mobile has more loss, and the I P changes, which Q U I C survives and T C P does not.
+q13 | RAJ | question | And where exactly does load balancing happen?
+q14 | ROY | normal | Twice. The edge picks which origin server gets a miss. And I, the reverse proxy, pick which app instance handles the request.
+== s13 Sale saved: the summary
+s0 | N | calm | The clock stops at eight seconds to spare. Mira's order goes through. Let us put it all together.
+s1a | N | normal | One. The order is browser cache, D N S, T C P, T L S, H T T P, C D N, reverse proxy, app, database, render.
+s1b | N | normal | Two. Every step below the app exists to avoid redoing work. A cache hit, a reused connection, a resumed session.
+s1c | N | normal | Three. A cold first visit pays DNS, one T C P round trip and one T L S round trip, before any H T T P byte.
+s1d | N | normal | Four. A C D N hit never reaches the origin. A miss adds one round trip at the real distance, thanks to warm pools.
+s1e | N | normal | Five. Zero R T T trades a round trip for replay risk. Idempotent requests only.
+s1f | N | normal | Six. Time to first byte high, but D N S, T C P and T L S fast, means look at the origin. Measure with curl dash w, or http trace.
+s1g | N | calm | And the one line to keep. Find the address, connect securely, ask, and draw. Every step can be skipped, if something is already cached or kept open.
+== s14 Where to go next
+rn1 | N | calm | To go deeper, open the note, and its Go note, in your vault. Before it, read D N S, T C P, T L S and H T T P Fundamentals. After it, the Network Debugging Toolkit, and how browsers load and render a page. Compare it with H T T P caching, C D N and Edge, and reverse proxies.
+e1 | RAJ | hook | Pia, I will never type a U R L the same way again.
+e2 | PIA | punch | Next request, Raj. And remember, find the box that is slow.

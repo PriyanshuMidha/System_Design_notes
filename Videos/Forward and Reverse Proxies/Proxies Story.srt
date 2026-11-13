@@ -1,0 +1,348 @@
+1
+00:00:02,399 --> 00:00:12,282
+Narrator: Welcome. We go from easy to advanced, in three levels. Level one, the words. Meet Kai. Kai works at a company, and wants to ask a website for his orders.
+
+2
+00:00:12,711 --> 00:00:29,121
+Narrator: Kai is the client, the program that asks. The website is the server, the program that answers, also called the backend. Every program listens at an address, an I P address, and a door number, a port. Like ten dot zero dot zero dot five, port eighty eighty.
+
+3
+00:00:29,551 --> 00:00:46,898
+Narrator: To talk, they open a T C P connection. A reliable two way pipe of bytes, like a phone line. Over it Kai sends an H T T P request, a short note saying, get slash orders, plus headers, name and value lines on the envelope. And T L S wraps the whole thing in encryption, the padlock in the browser.
+
+4
+00:00:47,328 --> 00:00:49,841
+Kai: Get slash orders, please.
+
+5
+00:00:50,271 --> 00:01:04,233
+Narrator: One more pair for later. L four means the network layer that sees connections and ports. L seven means the layer that sees the actual H T T P message. L four sees port four forty three. L seven sees slash orders.
+
+6
+00:01:07,183 --> 00:01:18,121
+Narrator: Behind the name api dot example dot com are not one machine, but three desks. Orders, users, and billing, each at a different internal address. Imagine Kai had to know all three.
+
+7
+00:01:18,552 --> 00:01:29,609
+Narrator: Every client would need three internal names. Every desk would need its own T L S certificate and its own rate limiting code. And none of it could change without redeploying every client.
+
+8
+00:01:30,040 --> 00:01:38,049
+Narrator: The fix is a machine in the middle. A proxy. A proxy is a go between. And there are two kinds, depending on whose side it stands on.
+
+9
+00:01:38,480 --> 00:01:47,786
+Narrator: The forward proxy speaks for the client. That is Fiona, Kai's personal assistant. She makes calls for him, so the other side only sees her number.
+
+10
+00:01:48,215 --> 00:01:51,762
+Fiona: Hi! I will make every outside call for you.
+
+11
+00:01:52,191 --> 00:02:03,034
+Narrator: The reverse proxy speaks for the server. That is Rhea, the receptionist at Orion Corp. Every visitor talks only to her, and she decides which desk handles them.
+
+12
+00:02:03,463 --> 00:02:08,593
+Rhea: Welcome to Orion. Tell me what you need, and I will connect you.
+
+13
+00:02:09,024 --> 00:02:15,330
+Narrator: Remember it like this. A forward proxy hides the client. A reverse proxy hides the server.
+
+14
+00:02:18,280 --> 00:02:33,298
+Narrator: Why would a company want a forward proxy? One controlled exit for every laptop. Block known bad sites, and log what left the building. The laptops are set up to use it, through the system proxy settings, or a P A C file pushed by the I T team.
+
+15
+00:02:33,728 --> 00:02:48,361
+Narrator: For plain H T T P, Fiona sees the whole request, and can inspect, filter, or cache it. But for H T T P S, the letter is sealed. So Kai sends a small request called connect, naming only the destination host and port.
+
+16
+00:02:48,792 --> 00:02:54,306
+Kai: Fiona, connect me to developer dot mozilla dot org, port four forty three.
+
+17
+00:02:54,735 --> 00:03:02,050
+Fiona: Done. I opened a tunnel. From now on I just carry sealed bytes both ways, and I cannot read them.
+
+18
+00:03:02,479 --> 00:03:12,985
+Narrator: That is a blind tunnel. Fiona can allow or block by destination hostname, because she saw it in the connect line. But not by path, or body. Those are inside the tunnel.
+
+19
+00:03:13,415 --> 00:03:30,978
+Narrator: Some companies go further. They install their own certificate authority on every laptop, so Fiona can open the envelope. She ends Kai's T L S herself, reads the plain text, and then seals a second T L S connection to the real site. Two connections, stitched together at the proxy.
+
+20
+00:03:31,407 --> 00:03:45,009
+Narrator: The notes measured this on a real corporate network. The certificate shown for developer dot mozilla dot org was signed by Zscaler, not by the site's real authority. Proof that a forward proxy was in the middle, and that the laptop trusted it.
+
+21
+00:03:47,960 --> 00:03:57,241
+Narrator: Now the other side. Rhea ends the client's connection, and makes her own separate connections to whichever desk should answer. Let us see what she does for Orion.
+
+22
+00:03:57,671 --> 00:04:10,794
+Rhea: First, T L S termination. I hold the certificate, and I unseal every request. Inside the building, I may pass it on plain, or re seal it, with mutual T L S.
+
+23
+00:04:11,223 --> 00:04:24,225
+Rhea: Second, routing. By host name, by path, or by header. Slash orders goes to Olly. Slash users goes to Uma. Slash billing goes to Bill.
+
+24
+00:04:24,656 --> 00:04:36,386
+Rhea: Third, buffering. If a visitor talks very slowly, I wait for the whole message first, so my desks are not tied up. It costs me memory or disk to hold it.
+
+25
+00:04:36,815 --> 00:04:47,730
+Rhea: Fourth, the shared chores. Compression, caching, rate limits, and a web application firewall. Done once, here, not in every desk.
+
+26
+00:04:48,160 --> 00:04:56,170
+Rhea: And fifth, I hide the building. Visitors only ever see my address. Never the internal ones.
+
+27
+00:04:59,120 --> 00:05:07,418
+Narrator: Now the big question. How much should a proxy look at? Meet two doormen. Lou works at layer four. Rhea works at layer seven.
+
+28
+00:05:07,848 --> 00:05:17,538
+Lou: I only read the envelope. The address, and the port. I move bytes, very fast, and I never open anything.
+
+29
+00:05:17,968 --> 00:05:27,514
+Rhea: I open the letter. The method, the path, the headers, the body. So I can route, rewrite, and apply rules per path.
+
+30
+00:05:27,944 --> 00:05:48,482
+Narrator: The comparison. L four sees I P addresses, ports, and for T L S, the server name in the unencrypted hello. It cannot route by path or header, and it cannot end T L S. It passes the encrypted bytes through. Very low overhead. Tools like the A W S network load balancer, I P tables and I P V S.
+
+31
+00:05:48,911 --> 00:06:05,153
+Narrator: L seven sees the full H T T P request. It can route by path or header, and it holds the certificate and decrypts. More overhead, because it parses, and often re encrypts. Tools like Nginx, Envoy, H A Proxy in layer seven mode, and A P I gateways.
+
+32
+00:06:05,584 --> 00:06:18,634
+Narrator: So when do you choose L four? When you need raw speed, or must keep end to end T L S, because the backend itself, not the proxy, holds the certificate. Choose L seven when you need routing, header changes, firewall rules, or per path policy.
+
+33
+00:06:19,064 --> 00:06:37,394
+Narrator: One clever trick. Even Lou can pick a desk without opening the letter. The T L S hello includes the server name, S N I, sent unencrypted on purpose. Lou reads that name, and picks a backend. This is how one L four listener can front many T L S backends, without ever touching the keys.
+
+34
+00:06:37,824 --> 00:06:50,442
+Narrator: And why does S N I exist? Before it, the server had to choose a certificate before it knew which host the client wanted, so each certificate needed its own I P. S N I puts the host name in the clear, so one address can serve many.
+
+35
+00:06:50,872 --> 00:06:58,906
+Narrator: Which desk gets picked, round robin, least connections, hashing, is a different topic, load balancing. Here we only study the proxying layer.
+
+36
+00:07:01,855 --> 00:07:13,682
+Narrator: Level three. The real world gets tricky. Rhea makes her own connection to Olly. So from Olly's view, every request now comes from Rhea's address. How does Olly learn who the client really was?
+
+37
+00:07:14,112 --> 00:07:26,370
+Narrator: Headers. X forwarded for is a comma separated list. Every hop appends the address it saw. And a newer standard, the forwarded header, carries the same facts in a structured form, for, proto, and host.
+
+38
+00:07:26,800 --> 00:07:34,233
+Mal: Hello Olly. My address is one point one point one point one. Trust me.
+
+39
+00:07:34,663 --> 00:07:46,874
+Narrator: The trap. A client can write anything into that header. If the backend trusts the left most value as the real client, an attacker just claims a fake address, to slip past an allow list or a rate limit.
+
+40
+00:07:47,303 --> 00:07:56,706
+Narrator: The only safe rule. Trust exactly as many entries from the right, as you have proxies you control. Everything further left is attacker controlled, and ignored.
+
+41
+00:07:57,136 --> 00:08:14,985
+Narrator: Example. The header says, attacker spoofed, two oh three dot zero dot one thirteen dot nine, ten dot zero dot zero dot five. You control two proxies. So trust the last two. Two oh three dot nine, the second from the right, is the real client. And attacker spoofed is thrown away.
+
+42
+00:08:15,415 --> 00:08:27,434
+Narrator: And the number of trusted hops is a fact about your own infrastructure, never something guessed from the request. With one proxy of yours, take the last entry only. If a C D N sits in front too, it is two.
+
+43
+00:08:27,863 --> 00:08:45,234
+Narrator: One related problem. An L four proxy forwards raw T C P, so there are no H T T P headers at all. The proxy protocol, from H A Proxy, adds a small fixed header at the start of the stream, with the real source and destination. Now even a non H T T P backend learns who called.
+
+44
+00:08:45,663 --> 00:08:53,745
+Narrator: And when you write a proxy yourself, always append to X forwarded for, never overwrite it. Overwriting throws away every earlier hop.
+
+45
+00:08:56,696 --> 00:09:02,833
+Narrator: A reverse proxy has two sides, and a timeout on each. And they fail differently, with two different codes.
+
+46
+00:09:03,264 --> 00:09:18,642
+Narrator: Five oh two, bad gateway, means the proxy could not get a valid answer at all. The connection was refused, reset, or the reply was malformed. Five oh four, gateway timeout, means the proxy reached Olly, but he took too long, and the proxy's own timer fired first.
+
+47
+00:09:19,072 --> 00:09:30,610
+Narrator: Three timers matter. The connect timeout, time to open the connection. Too short, you get five oh twos from a healthy but slow to accept backend. Too long, the proxy piles up waiting on a dead one.
+
+48
+00:09:31,039 --> 00:09:42,817
+Narrator: The read timeout, time waiting for the backend's reply. Too short, five oh fours on slow but legitimate pages, like a big report. Too long, client connections stay open long after the user gave up.
+
+49
+00:09:43,248 --> 00:09:54,618
+Narrator: And the idle timeout, how long a reused connection may sit unused. Too short, extra handshakes. Too long, the proxy reuses a connection the backend already closed, and the request fails.
+
+50
+00:09:55,048 --> 00:10:11,745
+Narrator: That reuse is upstream keep alive. Instead of a fresh connection and handshake for every request, the proxy keeps a pool of ready connections to each backend. Sized to roughly match the backend's own concurrency. Too few, and requests queue. Too many, and you exhaust the backend.
+
+51
+00:10:12,176 --> 00:10:34,418
+Narrator: Three more edge cases. Enforce a maximum body size at the proxy, and answer four thirteen, payload too large, instead of letting a huge upload eat memory. For web sockets, forward the upgrade handshake, then hold the connection as a raw two way pipe. And for H T T P two and g R P C, the proxy must speak H T T P two on both sides, or multiplexing breaks.
+
+52
+00:10:37,368 --> 00:10:49,289
+Narrator: Now the modern twist. In a fleet of many small services, every service instance gets its own personal proxy, running right beside it. A sidecar. Most often Envoy. Meet Sid.
+
+53
+00:10:49,720 --> 00:10:55,450
+Sid: I live next to Olly's code. All of his traffic, in and out, goes through me.
+
+54
+00:10:55,879 --> 00:11:01,562
+Olly: I just call localhost. I do not know how any of it works.
+
+55
+00:11:01,991 --> 00:11:16,073
+Narrator: Olly believes he is calling Uma directly. But Sid catches the call, opens a mutual T L S connection to Uma's own sidecar, retries on a temporary failure, and only then hands the request to Uma's code. Olly wrote none of that.
+
+56
+00:11:16,504 --> 00:11:25,953
+Cora: And I am the control plane. I push routing, retry, timeout and certificate settings to every sidecar, from one place.
+
+57
+00:11:26,384 --> 00:11:41,522
+Narrator: That whole arrangement is a service mesh, like Istio or Linkerd. It moves retries, mutual T L S and metrics out of application code. The price is an extra hop per call, extra memory and C P U across the fleet, and real operational complexity.
+
+58
+00:11:41,951 --> 00:11:54,330
+Narrator: And it changes trust. Instead of trusting the last N entries of a header, each sidecar shows a certificate with its own identity, often a spiffe identity, so every hop can verify who it is really talking to.
+
+59
+00:11:57,279 --> 00:12:13,258
+Narrator: Three words people mix up. A reverse proxy terminates and forwards. A load balancer spreads traffic across many copies of one backend. An A P I gateway fronts an A P I for outside clients, adding login checks, per client quotas, and request changes.
+
+60
+00:12:13,687 --> 00:12:21,409
+Narrator: One program, like Nginx or Envoy, often does all three at once. The difference is which job you are describing, not which software runs it.
+
+61
+00:12:24,360 --> 00:12:45,666
+Narrator: Nothing is free. Every proxy hop adds latency, and is a new single point of failure unless it is made redundant. Layer four passthrough keeps end to end T L S, but loses every H T T P feature. A mesh is not worth it for a handful of services that could share a library. And trusting forwarded headers blindly is worse than not using them.
+
+62
+00:12:46,096 --> 00:13:05,721
+Narrator: The classic failures, and fixes. Spoofed client address, trust only a fixed number of hops from the right. Five oh twos after a restart, use health checks, and keep the proxy's idle timeout shorter than the backend's. Five oh fours under load, decide if the backend is truly slow, or the timer is wrong for that route, before changing either.
+
+63
+00:13:06,152 --> 00:13:18,313
+Narrator: Huge uploads exhausting the proxy, cap the body, stream it, or skip the proxy with a presigned upload. And web sockets dropping when idle, raise the proxy's idle timeout, or add application pings.
+
+64
+00:13:18,744 --> 00:13:32,634
+Narrator: What to watch. Five oh two and five oh four counts at the proxy, kept separate from the backend's own five hundreds. Connect and response latency. Pool size. T L S handshake failures. And body size rejections.
+
+65
+00:13:33,063 --> 00:13:46,066
+Narrator: One last deep point. Buffering protects backends from slow clients, but for big uploads it doubles memory, and adds delay. Streaming avoids that, and brings back the slow client risk. So good proxies offer both.
+
+66
+00:13:49,015 --> 00:13:59,642
+Narrator: Now the code, in Go. Two pieces. A reverse proxy built on the standard library, with the forwarded header handled correctly. And a tiny function that finds the real client.
+
+67
+00:14:00,072 --> 00:14:18,690
+Narrator: The first function appends the forwarded header. It takes the immediate peer's address, and strips the port. If the header already has a value, it keeps it, and adds this hop after a comma. Append, never overwrite. And it sets the protocol header only if it is missing, so an earlier proxy's correct value is not clobbered.
+
+68
+00:14:19,120 --> 00:14:34,066
+Narrator: The second function is trusted client I P. It splits the header on commas, trims the spaces, and clamps the trusted hop count to the number of entries. Then it returns the entry counted from the right. That one line of index arithmetic is the whole rule.
+
+69
+00:14:34,495 --> 00:14:57,025
+Narrator: Around them, the proxy rewrites the host, appends the header, and forwards. If the backend is unreachable, a custom error handler writes a clean five oh two, instead of letting the client hang. Three tests prove it. Normal forwarding sets the headers. An unreachable backend gives a five oh two. And a forged header yields the right hop. All pass with the race detector on.
+
+70
+00:14:59,975 --> 00:15:03,210
+Narrator: Interview round. Six questions you will really get.
+
+71
+00:15:03,639 --> 00:15:19,690
+Narrator: One. Forward versus reverse proxy, in one line? A forward proxy is the client's agent, in front of clients, forwarding their outbound requests. A reverse proxy is the server's agent, in front of backends, accepting inbound requests on their behalf.
+
+72
+00:15:20,120 --> 00:15:35,162
+Narrator: Two. A trap. A user is rate limited, although they never made that many requests. What is the likely bug? The code trusts the left most value of the forwarded header, or an unvalidated one. Count only as many hops from the right as you control.
+
+73
+00:15:35,591 --> 00:15:47,850
+Narrator: Three. How can an L four proxy route T L S without decrypting? It reads the server name in the unencrypted hello, picks a backend, and forwards the raw bytes. The backend does the real handshake.
+
+74
+00:15:48,279 --> 00:16:06,033
+Narrator: Four. Five oh two for some requests, five oh four for others, in the same spike. What differs? Five oh two means no valid answer, so check health, refusals and crashes. Five oh four means the backend answered too slowly, so check latency, slow queries, and whether the timeout itself is miscalibrated.
+
+75
+00:16:06,464 --> 00:16:20,594
+Narrator: Five. Why is g R P C trickier than plain R E S T? It needs H T T P two, with long lived multiplexed streams. A proxy that speaks only H T T P one to the backend breaks multiplexing, or fails outright.
+
+76
+00:16:21,024 --> 00:16:39,090
+Narrator: Six. When would you deliberately choose L four passthrough? When end to end T L S is required and no middle box may see plain text. When the backend must see the client's own T L S session, for example for client certificates. Or when you need the least added latency, and need no H T T P features.
+
+77
+00:16:42,039 --> 00:16:45,201
+Narrator: Let us put it all together, from easy to advanced.
+
+78
+00:16:45,631 --> 00:16:55,225
+Narrator: Level one. A proxy is a go between. A forward proxy speaks for the client and hides the client. A reverse proxy speaks for the server and hides the server.
+
+79
+00:16:55,655 --> 00:17:10,074
+Narrator: Level two. A forward proxy tunnels H T T P S with connect, blind, or opens the envelope with a company certificate. A reverse proxy terminates T L S, routes, buffers, shares the chores, and hides the topology.
+
+80
+00:17:10,503 --> 00:17:20,769
+Narrator: L four reads the envelope, fast, and keeps end to end T L S. L seven reads the letter, and routes by path and header. S N I lets L four pick a backend by name.
+
+81
+00:17:21,200 --> 00:17:35,953
+Narrator: Level three. The backend only sees the proxy, so use X forwarded for, but trust only the last N entries, where N is the proxies you control. Always append, never overwrite. Use the proxy protocol for L four.
+
+82
+00:17:36,384 --> 00:17:48,185
+Narrator: Five oh two means no valid answer. Five oh four means too slow. Tune connect, read and idle timeouts, size the keep alive pool, cap bodies, and speak H T T P two for g R P C.
+
+83
+00:17:48,615 --> 00:17:59,218
+Narrator: Sidecars give every service its own proxy, and a control plane configures them all. A mesh moves retries and mutual T L S out of code, at the cost of hops and complexity.
+
+84
+00:17:59,647 --> 00:18:10,273
+Narrator: And the one line to keep: a proxy is a go between. Forward hides the client, reverse hides the server, L four moves bytes, L seven reads requests.
+
+85
+00:18:13,223 --> 00:18:31,433
+Narrator: To go deeper, open the note on forward and reverse proxies, and its Go note, in your vault. Before it, read H T T P fundamentals, and T C P. After it, Nginx, and T L S and H T T P S. Compare it with load balancing, A P I gateway and B F F, and C D N and edge.
+
+86
+00:18:31,864 --> 00:18:37,450
+Kai: Thanks, Fiona. Thanks, Rhea. I got my orders!
+
+87
+00:18:37,880 --> 00:18:39,602
+Rhea: Next!
+

@@ -8,7 +8,7 @@ sources:
   - "Fetch Standard (WHATWG), CORS protocol"
   - "MDN Web Docs, Cross-Origin Resource Sharing (CORS)"
   - "OWASP API Security Top 10 2023, API8 Security Misconfiguration"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # CORS and Same-Origin Policy
@@ -23,15 +23,66 @@ updated: 2026-11-07
 > - Credentialed requests (cookies, `Authorization`) can never be paired with a wildcard origin — only an exact, validated origin.
 > - CORS is not authentication, not authorization, and not CSRF protection. It only decides who may read a response in a browser.
 
+## Start here: the basics
+
+**The problem in one story.**
+You are logged into your bank in one browser tab.
+In another tab you open a random website.
+That website's JavaScript must not be able to read your bank balance using your logged-in session.
+Browsers block this by default; CORS is how a server allows the sites it trusts to read its responses.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Origin | Scheme + host + port of a page | `https://app.example.com:443` |
+| Cross-origin | A request from one origin to a different one | `app.example.com` calling `api.example.com` |
+| Same-origin policy (SOP) | Browser rule: scripts may not read other origins' responses | `evil.com` cannot read `bank.com` data |
+| HTTP header | A key-value line sent with a request or response | `Origin: https://app.example.com` |
+| Preflight | A browser's `OPTIONS` check before a non-simple request | Asking "may I send `PUT` with JSON?" |
+| Credentials | Cookies or `Authorization` sent with a request | Session cookie |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Script on<br/>app.example.com"] --> B["Browser sends request<br/>with Origin header"]
+    B --> S["api.example.com"]
+    S --> H{"Response has<br/>Allow-Origin match?"}
+    H -- "yes" --> R["Script can read it"]
+    H -- "no" --> X["Browser hides response"]
+```
+
+**Analogy.** A mailroom delivers every letter, but only hands the reply to the person the sender's letter names as allowed.
+Where it breaks: the letter was still delivered; CORS never stops the request from reaching the server, and non-browser clients ignore it entirely.
+
+**How the rest of this note builds up**
+
+- First, why SOP exists and what CORS relaxes (section 1), then the browser-as-gatekeeper mental model (section 2).
+- Then simple vs preflighted requests, the preflight exchange, the credentials rule, and why CORS is not server protection (section 3).
+- Then a Go CORS middleware with tests (section 4) and a comparison of setups (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production misconfigurations, caching and `Vary: Origin` (sections 6-8).
+
+> [!tip] Remember
+> CORS only decides which origins' scripts may *read* a response in a browser; it is not authentication and does not stop the request.
+
 ## 1. Why it exists
 
-Before CORS, the same-origin policy simply blocked all cross-origin reads: `https://app.example.com`'s JavaScript could not read a response from `https://api.example.com`, full stop, even when the two services belonged to the same company. That protected users from a malicious page silently reading their bank's dashboard in a background tab, but it also made splitting a frontend and API across subdomains or domains impossible for legitimate apps.
+Before CORS, the same-origin policy simply blocked all cross-origin reads: `https://app.example.com`'s JavaScript could not read a response from `https://api.example.com`, full stop, even when the two services belonged to the same company.
 
-CORS is the server's way to carve out exceptions to SOP: `api.example.com` can tell the browser "responses to `app.example.com` may be read by its scripts," while still blocking `evil.com` from reading the same response if a user happens to visit both. A concrete failure mode this prevents: without any CORS header, if `evil.com` embeds a `<script>` that calls `https://api.example.com/account` with the user's existing session cookie, the request still fires and the server still processes it — but the browser discards the response before `evil.com`'s JavaScript can read it, because no origin was allowlisted.
+That protected users from a malicious page silently reading their bank's dashboard in a background tab, but it also made splitting a frontend and API across subdomains or domains impossible for legitimate apps.
+
+CORS is the server's way to carve out exceptions to SOP: `api.example.com` can tell the browser "responses to `app.example.com` may be read by its scripts," while still blocking `evil.com` from reading the same response if a user happens to visit both.
+
+A concrete failure mode this prevents: without any CORS header, if `evil.com` embeds a `<script>` that calls `https://api.example.com/account` with the user's existing session cookie, the request still fires and the server still processes it — but the browser discards the response before `evil.com`'s JavaScript can read it, because no origin was allowlisted.
 
 ## 2. Mental model
 
-Same-origin policy is the browser acting as a **mail carrier who also has to approve who's allowed to open the mail**. Any script can address an envelope (send the request) to any origin — the carrier always delivers it, and the destination (the server) still opens and answers it. But when the response envelope comes back addressed to the page's own origin, the carrier only hands it to that page's script if the destination explicitly wrote the page's origin on an approval sticker (the `Access-Control-Allow-Origin` header). No sticker, or the wrong origin on it, and the carrier keeps the envelope sealed from the calling script — even though the destination already did whatever the letter asked.
+Same-origin policy is the browser acting as a **mail carrier who also has to approve who's allowed to open the mail**. Any script can address an envelope (send the request) to any origin — the carrier always delivers it, and the destination (the server) still opens and answers it.
+
+But when the response envelope comes back addressed to the page's own origin, the carrier only hands it to that page's script if the destination explicitly wrote the page's origin on an approval sticker (the `Access-Control-Allow-Origin` header).
+
+No sticker, or the wrong origin on it, and the carrier keeps the envelope sealed from the calling script — even though the destination already did whatever the letter asked.
 
 ## 3. How it works
 
@@ -287,3 +338,8 @@ func TestSuffixLookalikeOriginRejected(t *testing.T) {
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Authentication vs Authorization]]
 - **Next:** [[CSRF, XSS and Security Headers]]
 - **Compare with:** [[Access and Refresh Tokens]] (cookie storage this note's credentials rule applies to), [[TLS and HTTPS]] (origin scheme is part of what makes an origin)
+
+### Watch on YouTube
+
+- [CORS Explained Clearly / Same-Origin Policy, Preflight & Credentials](https://www.youtube.com/watch?v=ZQ_d3IadtyM) · BMR EDUCATION · 10 min · 934 views
+- [Same-origin policy / CORS / Web Security model 🌍](https://www.youtube.com/watch?v=b1EFZUcYvb0) · Dev Academy · 9 min · 6,707 views

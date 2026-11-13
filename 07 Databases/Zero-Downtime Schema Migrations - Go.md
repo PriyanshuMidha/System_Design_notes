@@ -13,13 +13,22 @@ sources:
   - "PostgreSQL 11 release notes (ADD COLUMN with a default without a rewrite); PostgreSQL 12 release notes (SET NOT NULL can skip the scan)"
   - "pgx v5.8 docs, QueryExecModeCacheStatement (cached statements fail after column changes)"
   - "golang-migrate v4.18.3 source (schema_migrations dirty flag, pg_advisory_lock); goose v3.24 (-- +goose NO TRANSACTION)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Zero-Downtime Schema Migrations - Go
 
 > [!summary] TL;DR
 > A throttled, resumable backfill job in Go for the data-migration step of expand, migrate, contract: it fills `invoices.total_minor` in short batches, waits while replicas lag, and can be interrupted and resumed without rewriting rows. The theory is in [[Zero-Downtime Schema Migrations]]. The store is an in-memory fake, so the tests need no PostgreSQL.
+
+## Before the code
+
+- **Interfaces** (`Store`): the backfill loop talks to an interface, so tests use an in-memory fake and production uses pgx.
+- **`context.Context`**: lets an operator cancel a long backfill; the loop stops cleanly and returns where to resume.
+- **`time.Duration` and `time.NewTimer`**: express batch pauses and replica-lag limits, and build a sleep that can be cancelled.
+- **`select`**: waits on whichever happens first, the timer firing or the context being cancelled.
+- **`errors.Is(err, context.Canceled)`**: tells "someone stopped us" apart from a real failure.
+- **What to run**: `go mod init example.com/backfill`, then `go vet ./... && go test -race ./...`.
 
 ## What this code shows
 
@@ -62,7 +71,9 @@ go test -race ./...
 
 ### Step 1: the SQL behind the interface
 
-**Concept.** This is the "migrate" step of expand, migrate, contract ([[Zero-Downtime Schema Migrations#4. Worked example]]). Updating 20 million rows in one statement would hold row locks for the whole run, produce a huge burst of WAL, and make replicas lag. Instead each statement touches a small id range. The `total_minor IS NULL` condition makes the statement idempotent: a rerun skips rows that are already filled, which is what makes the job safe to interrupt. The alternative is a single `UPDATE` in one transaction, which is simpler but is the classic way to cause an outage.
+**Concept.** This is the "migrate" step of expand, migrate, contract ([[Zero-Downtime Schema Migrations#4. Worked example]]). Updating 20 million rows in one statement would hold row locks for the whole run, produce a huge burst of WAL, and make replicas lag. Instead each statement touches a small id range.
+
+The `total_minor IS NULL` condition makes the statement idempotent: a rerun skips rows that are already filled, which is what makes the job safe to interrupt. The alternative is a single `UPDATE` in one transaction, which is simpler but is the classic way to cause an outage.
 
 ```sql
 UPDATE invoices
@@ -92,7 +103,9 @@ flowchart LR
 
 ### Step 2: the store interface and the config
 
-**Concept.** `Store` is the seam between the loop and the database. The loop knows nothing about SQL, and the database code knows nothing about throttling, so the loop can be tested with an in-memory fake. `Config` holds the three tuning knobs the theory note describes: batch size, pause, and the maximum acceptable lag. They are plain fields instead of constants because the right values depend on row width, hardware and traffic, and come from rehearsing on a production-size copy.
+**Concept.** `Store` is the seam between the loop and the database. The loop knows nothing about SQL, and the database code knows nothing about throttling, so the loop can be tested with an in-memory fake. `Config` holds the three tuning knobs the theory note describes: batch size, pause, and the maximum acceptable lag.
+
+They are plain fields instead of constants because the right values depend on row width, hardware and traffic, and come from rehearsing on a production-size copy.
 
 ```go
 package backfill
@@ -146,7 +159,9 @@ classDiagram
 
 ### Step 3: the resumable loop
 
-**Concept.** `Run` is the loop of the worked example in [[Zero-Downtime Schema Migrations#4. Worked example]]: check lag, run one batch, pause, repeat. It returns the id where a rerun should resume, which is the checkpoint. Checking the context between batches, never inside one, means a stop leaves every batch either fully committed or never started. The alternative is to persist a checkpoint row in the database after each batch; returning `next` keeps the loop free of extra state and leaves the choice of where to store it to the caller.
+**Concept.** `Run` is the loop of the worked example in [[Zero-Downtime Schema Migrations#4. Worked example]]: check lag, run one batch, pause, repeat. It returns the id where a rerun should resume, which is the checkpoint. Checking the context between batches, never inside one, means a stop leaves every batch either fully committed or never started.
+
+The alternative is to persist a checkpoint row in the database after each batch; returning `next` keeps the loop free of extra state and leaves the choice of where to store it to the caller.
 
 ```go
 // Run backfills ids from `from` up to MaxID and returns where to resume.
@@ -201,7 +216,9 @@ stateDiagram-v2
 
 ### Step 4: waiting for replicas
 
-**Concept.** Every updated row is a new row version, so a backfill produces a lot of WAL, and replicas that cannot replay it fast enough serve stale reads ([[Zero-Downtime Schema Migrations#7. In production]]). The loop therefore reads the lag before each batch and sleeps until it is acceptable. This is feedback control: the job runs as fast as the slowest replica allows. A fixed sleep alone would either be too slow when the system is idle or too fast when it is busy. The lag check costs one cheap query per batch.
+**Concept.** Every updated row is a new row version, so a backfill produces a lot of WAL, and replicas that cannot replay it fast enough serve stale reads ([[Zero-Downtime Schema Migrations#7. In production]]). The loop therefore reads the lag before each batch and sleeps until it is acceptable.
+
+This is feedback control: the job runs as fast as the slowest replica allows. A fixed sleep alone would either be too slow when the system is idle or too fast when it is busy. The lag check costs one cheap query per batch.
 
 ```go
 func waitForReplicas(ctx context.Context, s Store, cfg Config) error {
@@ -229,7 +246,9 @@ func waitForReplicas(ctx context.Context, s Store, cfg Config) error {
 
 ### Step 5: a cancellable sleep
 
-**Concept.** `time.Sleep` cannot be interrupted, so a deploy that cancels the job would wait out the pause. Waiting on a timer and on `ctx.Done()` in a `select` makes the sleep return the moment the context ends. The up-front context check is deliberate: with a zero pause both channels can be ready at once and `select` picks randomly, so without it a cancelled job could run one more batch.
+**Concept.** `time.Sleep` cannot be interrupted, so a deploy that cancels the job would wait out the pause. Waiting on a timer and on `ctx.Done()` in a `select` makes the sleep return the moment the context ends.
+
+The up-front context check is deliberate: with a zero pause both channels can be ready at once and `select` picks randomly, so without it a cancelled job could run one more batch.
 
 ```go
 // sleep waits for d or until ctx is done, whichever comes first.
@@ -272,7 +291,9 @@ The fake store keeps a `filled` map (has `total_minor` been written for this id?
 
 ### The fake store
 
-**Concept.** The fake models exactly the behaviour the loop depends on. `BackfillRange` honours the `IS NULL` rule by skipping ids that are already filled, which is what makes reruns harmless. It counts writes per id so a test can assert "written exactly once". The `onBatch` hook runs after a batch commits, which lets a test cancel the context at a precise moment, and `lags` replays a scripted series of lag readings.
+**Concept.** The fake models exactly the behaviour the loop depends on. `BackfillRange` honours the `IS NULL` rule by skipping ids that are already filled, which is what makes reruns harmless. It counts writes per id so a test can assert "written exactly once".
+
+The `onBatch` hook runs after a batch commits, which lets a test cancel the context at a precise moment, and `lags` replays a scripted series of lag readings.
 
 ```go
 package backfill
@@ -404,7 +425,9 @@ The second half of the same test resumes from `next` with a live context and the
 }
 ```
 
-**What a failure means.** A first-run `next` of 2001 or 4001 means the checkpoint is off by one batch: 2001 would redo work, 4001 would skip a batch and leave a hole. A `writes[id]` of 2 means a rerun rewrote finished rows, so the `IS NULL` guard is missing. A `filled` count below 10,000 means rows were skipped, which in production leaves NULLs that later break `SET NOT NULL`.
+**What a failure means.** A first-run `next` of 2001 or 4001 means the checkpoint is off by one batch: 2001 would redo work, 4001 would skip a batch and leave a hole. A `writes[id]` of 2 means a rerun rewrote finished rows, so the `IS NULL` guard is missing.
+
+A `filled` count below 10,000 means rows were skipped, which in production leaves NULLs that later break `SET NOT NULL`.
 
 ### Test 2: wait for replicas before the first batch
 

@@ -14,7 +14,7 @@ sources:
   - "Protocol Buffers documentation, Encoding (protobuf.dev/programming-guides/encoding)"
   - "RFC 9113, HTTP/2"
   - "Connect protocol reference (connectrpc.com/docs/protocol)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # gRPC
@@ -28,6 +28,49 @@ updated: 2026-11-02
 > - Rule: every call carries a deadline, and servers pass the remaining deadline on to the calls they make.
 > - Classic mistake: no deadline (calls hang forever) or retrying non-idempotent calls on every error code.
 
+## Start here: the basics
+
+**The problem in one story.**
+An Orders service needs a user's name from a Users service, thousands of times a second.
+Sending text JSON and hoping both sides agree on field names is slow and fragile.
+gRPC lets Orders call `GetUser(42)` like a normal function.
+A shared contract file guarantees both sides agree, and the data travels as small binary messages.
+
+**Words you need first.**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| RPC | Remote procedure call: calling a function that runs on another machine | `client.GetUser(ctx, req)` |
+| `.proto` file / IDL | A file describing functions and messages, used to generate code | `rpc GetUser(GetUserRequest) returns (User);` |
+| Protobuf | Compact binary encoding of messages | `{"id":42}` becomes 2 bytes `08 2A` |
+| Code generation | A tool writes client and server code from the contract | `protoc --go_out=...` |
+| HTTP/2 | Web protocol that carries many requests on one connection at once | 100 calls, 1 TCP connection |
+| Stream | One call's lane inside an HTTP/2 connection; can carry many messages | Server sending live price updates |
+| Deadline | The latest time by which a call must finish | "Give up after 300 ms" |
+| Status code | gRPC's error category on every response | `NOT_FOUND`, `UNAVAILABLE` |
+
+**Picture it.**
+
+```mermaid
+flowchart LR
+    P[user.proto contract] -->|generate| S[Client stub]
+    P -->|generate| H[Server code]
+    S -->|protobuf over HTTP/2 + deadline| H
+    H -->|response or status code| S
+```
+
+**Analogy.** gRPC is a phone call with a printed script both sides hold: the caller reads a line, the callee knows exactly what it means and answers in the agreed form.
+Where it breaks: a phone call has no built-in timer, while every gRPC call should carry a deadline, and the network can fail mid-call.
+
+**How the rest of this note builds up.**
+- First, why JSON over HTTP/1.1 hurts and the "function call over the network" mental model (sections 1-2).
+- Then protobuf encoding, HTTP/2 and the four call types (section 3).
+- Then one unary call traced on the wire and in Go code (section 4).
+- Finally, comparisons, production rules (deadlines, status codes and retries, interceptors, load balancing, keepalive) and the SDE-3 deep dive (sections 5-8).
+
+> [!tip] Remember
+> One `.proto` contract, generated code, protobuf over HTTP/2, and a deadline on every call.
+
 ## 1. Why it exists
 
 An Orders service calls a Users service 2,000 times per second with JSON over HTTP/1.1 (an example load):
@@ -37,7 +80,11 @@ An Orders service calls a Users service 2,000 times per second with JSON over HT
 - **One request per connection at a time.** HTTP/1.1 cannot interleave responses on a connection, so 100 concurrent calls need up to 100 connections or wait in line.
 - **Every team hand-writes clients**, each with its own timeout, retry and error conventions.
 
-gRPC fixes all four. The `.proto` file is the contract, and code generation turns contract drift into a compile error. Protobuf is compact binary. HTTP/2 multiplexes many calls on one connection. Deadlines, cancellation, status codes, metadata and retries are part of the framework, not team conventions. Google built it from its internal RPC system, Stubby, and open-sourced it in 2015.
+gRPC fixes all four. The `.proto` file is the contract, and code generation turns contract drift into a compile error. Protobuf is compact binary. HTTP/2 multiplexes many calls on one connection.
+
+Deadlines, cancellation, status codes, metadata and retries are part of the framework, not team conventions.
+
+Google built it from its internal RPC system, Stubby, and open-sourced it in 2015.
 
 ## 2. Mental model
 
@@ -45,7 +92,9 @@ gRPC fixes all four. The `.proto` file is the contract, and code generation turn
 
 **Analogy:** an international phone call with a shared phrasebook. Both sides own the same phrasebook (the `.proto` file), so they exchange short code numbers instead of full sentences. The phone network (HTTP/2) carries many calls on one line at the same time.
 
-gRPC ships one maintained client library per language (Go, Java, C++, Python, C#, Node and others). Each library hides HTTP/2 from your code, so application code never handles frames. Browsers are a separate problem. JavaScript in a browser cannot control HTTP/2 framing or read trailers, so a browser cannot speak native gRPC. It needs gRPC-Web or Connect, usually through a proxy (section 5).
+gRPC ships one maintained client library per language (Go, Java, C++, Python, C#, Node and others). Each library hides HTTP/2 from your code, so application code never handles frames.
+
+Browsers are a separate problem. JavaScript in a browser cannot control HTTP/2 framing or read trailers, so a browser cannot speak native gRPC. It needs gRPC-Web or Connect, usually through a proxy (section 5).
 
 ## 3. How it works
 
@@ -110,7 +159,9 @@ This file was compiled with `protocompile` v0.14.1 (a pure-Go protobuf compiler)
 
 ### From message to bytes
 
-Protobuf writes each field as a **tag** followed by a value. The tag packs the field number and a 3-bit **wire type**: `tag = field_number << 3 | wire_type`. Integers use **varints**: 7 bits per byte, with the high bit meaning "more bytes follow", so small numbers take one byte. Field names never travel; numbers do. That is why protobuf is smaller than JSON.
+Protobuf writes each field as a **tag** followed by a value. The tag packs the field number and a 3-bit **wire type**: `tag = field_number << 3 | wire_type`. Integers use **varints**: 7 bits per byte, with the high bit meaning "more bytes follow", so small numbers take one byte.
+
+Field names never travel; numbers do. That is why protobuf is smaller than JSON.
 
 ```mermaid
 flowchart LR
@@ -466,7 +517,8 @@ flowchart LR
 ### Deadlines, propagation and cancellation
 
 - **Always set a deadline.** Without one, a call to a hung server waits forever and holds a goroutine, a stream and memory.
-- **Propagation:** the client sends the remaining time as `grpc-timeout`. The server's handler context gets that deadline. If the handler passes the **same context** to its downstream calls, grpc-go sends each of them the time still left. Example: the edge sets 300 ms, spends 40 ms, and calls Users with about 260 ms left. Users spends 60 ms and calls its DB with about 200 ms left.
+- **Propagation:** the client sends the remaining time as `grpc-timeout`. The server's handler context gets that deadline. If the handler passes the **same context** to its downstream calls, grpc-go sends each of them the time still left.
+  - Example: the edge sets 300 ms, spends 40 ms, and calls Users with about 260 ms left. Users spends 60 ms and calls its DB with about 200 ms left.
 - **Cancellation:** when the deadline passes or the client cancels, the client sends `RST_STREAM`, and the server's context is cancelled. Handlers must watch `ctx.Done()` and stop work. A handler that calls downstream with `context.Background()` breaks both propagation and cancellation.
 - **`DEADLINE_EXCEEDED` does not mean "nothing happened".** The server may have committed the write just before the deadline. Retry only idempotent calls, or carry an idempotency key ([[Idempotency and Idempotency Keys]]).
 
@@ -508,7 +560,10 @@ Retries are configured per method in the **service config** (gRFC A6), not hand-
 ```
 
 - `maxAttempts` counts the original call, and values above 5 are treated as 5.
-- **Retry throttling is the retry budget.** The client keeps a token count that starts at `maxTokens`. Each failed call removes 1 token, and each success adds `tokenRatio`. Only failures with a retryable status code, or with server pushback saying "do not retry", count. When the count is at or below `maxTokens / 2`, the client stops retrying until it climbs back above. A struggling server therefore sees fewer retries, not three times its load. General backoff and budget theory lives in [[Timeouts, Retries and Backoff]].
+- **Retry throttling is the retry budget.** The client keeps a token count that starts at `maxTokens`. Each failed call removes 1 token, and each success adds `tokenRatio`.
+  - Only failures with a retryable status code, or with server pushback saying "do not retry", count.
+  - When the count is at or below `maxTokens / 2`, the client stops retrying until it climbs back above.
+  - A struggling server therefore sees fewer retries, not three times its load. General backoff and budget theory lives in [[Timeouts, Retries and Backoff]].
 - **Hedging** (also gRFC A6) sends extra copies of the same idempotent call, one per `hedgingDelay`, and takes the first successful answer. The copies typically land on different backends, but nothing guarantees it. Hedging cuts tail latency at the price of extra load.
 
 ### Metadata and interceptors
@@ -547,7 +602,9 @@ grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
 
 ## 8. Deep dive
 
-- **Keepalive:** clients can send HTTP/2 PING frames to detect dead connections behind NAT or load-balancer idle timeouts. grpc-go sends none unless you set `keepalive.ClientParameters`. Servers enforce a minimum ping interval: grpc-go's default `EnforcementPolicy.MinTime` is 5 minutes. A client that pings more often gets `GOAWAY` with `ENHANCE_YOUR_CALM` and the debug data `too_many_pings`, and its connection closes. Align the client's `keepalive.ClientParameters.Time` with the server's policy.
+- **Keepalive:** clients can send HTTP/2 PING frames to detect dead connections behind NAT or load-balancer idle timeouts. grpc-go sends none unless you set `keepalive.ClientParameters`. Servers enforce a minimum ping interval: grpc-go's default `EnforcementPolicy.MinTime` is 5 minutes.
+  - A client that pings more often gets `GOAWAY` with `ENHANCE_YOUR_CALM` and the debug data `too_many_pings`, and its connection closes.
+  - Align the client's `keepalive.ClientParameters.Time` with the server's policy.
 - **Message size:** grpc-go rejects received messages over 4 MiB by default, on both servers and clients, with `RESOURCE_EXHAUSTED`. Raise the limit deliberately, or better, stream the payload in chunks (for example 64 KiB each) or upload it to object storage and pass a key ([[File Upload Architecture]]).
 - **Flow control:** HTTP/2 has per-stream and per-connection windows. A slow consumer of a server stream stops granting window, and the sender's `Send` blocks. That is backpressure for free, but an unbounded fan-out goroutine behind `Send` still needs its own limit ([[Backpressure and Flow Control]]).
 - **Stream limits:** a server advertises `SETTINGS_MAX_CONCURRENT_STREAMS`. When a client reaches it on its one connection, new calls wait on the client side. Very high-concurrency clients may need several connections.
@@ -593,3 +650,8 @@ grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
 - **Before this:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[Choosing an API Style]], [[REST and HTTP API Design]]
 - **Next:** [[Protocol Buffers and Schema Evolution]], [[gRPC Services in Go]], [[gRPC Streaming in Go]], [[Serving REST and gRPC Together]]
 - **Compare with:** [[GraphQL]] (client-shaped queries), [[Real-time APIs - WebSocket, SSE and Long Polling]] (push to browsers), [[Load Balancing]] (L4 vs L7 balancing)
+
+### Watch on YouTube
+
+- [gRPC: The Tutorial I Wish I Had (Golang)](https://www.youtube.com/watch?v=6Ol6zeocR28) · HuseyinCodes · deep dive on gRPC + protobuf fundamentals in Go
+- [(Backend #40) Define gRPC API and generate Go code with protobuf](https://www.youtube.com/watch?v=mVWgEmyAhvM) · TECH SCHOOL · hands-on .proto + codegen walkthrough from a well-known Go backend course

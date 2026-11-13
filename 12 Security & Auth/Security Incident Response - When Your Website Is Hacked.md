@@ -13,7 +13,7 @@ sources:
   - "OWASP Top 10 (2021) and OWASP SQL Injection Prevention Cheat Sheet"
   - "AWS documentation, CloudTrail event history and IAM access key rotation"
   - "AWS documentation, EC2 IMDSv2 (session-oriented metadata requests)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Security Incident Response - When Your Website Is Hacked
@@ -28,11 +28,60 @@ updated: 2026-11-09
 > - You are not finished when the site looks normal. You are finished when you know how they got in and that door is closed.
 > - Never reuse the compromised machine. Rebuild from a known-good image and restore data from a backup older than the intrusion.
 
+## Start here: the basics
+
+**The problem in one story.**
+One morning your site shows a strange page, or users report unknown charges.
+Panicking and wiping the server destroys the evidence of how the attacker got in.
+Leaving it running lets them keep stealing.
+Incident response is the calm, ordered plan for exactly this moment.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Incident | A security event that actually harms or threatens the system | Attacker reading the users table |
+| Containment | Stopping the damage from spreading without destroying evidence | Blocking an IP, isolating a server |
+| Eradication | Removing the attacker's access and the hole they used | Patching the bug, deleting a backdoor |
+| Recovery | Bringing clean systems back into service | Redeploying from a known-good image |
+| Indicator of compromise (IOC) | A clue that shows an attack happened | Unknown admin account, odd outbound IP |
+| Forensics | Collecting and preserving evidence to learn what happened | Snapshotting a disk before rebuild |
+| Postmortem | A blameless write-up of cause and fixes | "Root cause: leaked key in CI log" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D["Detect"] --> T["Triage:<br/>how bad?"]
+    T --> C["Contain"]
+    C --> E["Eradicate"]
+    E --> R["Recover"]
+    R --> L["Learn<br/>(postmortem)"]
+    L -. "better detection" .-> D
+```
+
+**Analogy.** A kitchen fire. Get people out and stop it spreading (contain), put it out at the source (eradicate), check the wiring before cooking again (recover), then figure out why it started (learn).
+Where it breaks: a fire does not fight back; an attacker may still be inside and watching, so you must act quietly and assume every credential is known.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then the response phases step by step (section 3) and a walked-through breach (section 4).
+- Then how response differs by attack type (section 5).
+- Finally the SDE-3 deep dive: evidence handling, credential rotation at scale, disclosure duties and the deeper forensics (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> Contain first, preserve evidence, rotate everything the attacker could have seen, then learn.
+
 ## 1. Why it exists
 
-Picture a shop owner who arrives to find the back window broken. If they sweep up the glass, repaint, and reopen, the police find no fingerprints, the thief still has a copy of the keys, and the owner never learns what was stolen. The same thing happens to websites every day: someone sees a defaced page, restores it from a backup, and carries on, while the attacker still has a web shell, a stolen database password and a hidden admin account.
+Picture a shop owner who arrives to find the back window broken. If they sweep up the glass, repaint, and reopen, the police find no fingerprints, the thief still has a copy of the keys, and the owner never learns what was stolen.
 
-A concrete scenario. An online store with 200,000 customers notices three signs in one morning: a spike in outbound traffic at 03:10 UTC, a customer complaint about a strange redirect to a pharmacy site, and an unfamiliar admin user created two days ago. Each sign alone could be a glitch. Together they indicate compromise. The team has to answer five questions fast: how did they get in, what did they touch, are they still in, what data left, and who must we tell and by when.
+The same thing happens to websites every day: someone sees a defaced page, restores it from a backup, and carries on, while the attacker still has a web shell, a stolen database password and a hidden admin account.
+
+A concrete scenario. An online store with 200,000 customers notices three signs in one morning: a spike in outbound traffic at 03:10 UTC, a customer complaint about a strange redirect to a pharmacy site, and an unfamiliar admin user created two days ago.
+
+Each sign alone could be a glitch. Together they indicate compromise. The team has to answer five questions fast: how did they get in, what did they touch, are they still in, what data left, and who must we tell and by when.
 
 This note is the playbook for those hours. It is a response guide; preventing the incident in the first place is covered in [[Website Security Hardening Checklist]].
 
@@ -416,7 +465,9 @@ Preparation decides how the incident goes. Before anything happens, have:
 - A contact list for your hosting provider, payment processor and legal counsel.
 - Alerts for the early indicators in section 3.1: outbound traffic spikes, new IAM users, disabled logging, login anomalies. See [[Alerting and On-Call]].
 
-Real-world patterns, from public breach reports and well-known guides rather than any one company: most web breaches start with a known vulnerability, stolen or reused credentials, or a misconfiguration; dwell time before detection is often measured in weeks or months, which is why centralised logs matter; and attackers frequently reach cloud credentials through the application host. Verizon's Data Breach Investigations Report is the standard annual source for the statistics.
+Real-world patterns, from public breach reports and well-known guides rather than any one company: most web breaches start with a known vulnerability, stolen or reused credentials, or a misconfiguration; dwell time before detection is often measured in weeks or months, which is why centralised logs matter; and attackers frequently reach cloud credentials through the application host.
+
+Verizon's Data Breach Investigations Report is the standard annual source for the statistics.
 
 Monitoring examples (Prometheus, where you export these metrics):
 
@@ -520,3 +571,10 @@ Say it as: "I confirm and scope, isolate without powering off, snapshot, then wo
 - Prevention: [[Website Security Hardening Checklist]], [[OWASP API Security Top 10]], [[CSRF, XSS and Security Headers]]
 - Related security notes: [[Secrets Management]], [[Password Storage and Login Security]], [[API Abuse and Bot Protection]], [[Sessions and Cookies]], [[Access and Refresh Tokens]], [[JWT - Structure, Validation and Pitfalls]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]]
 - Operations: [[Incident Response]], [[Postmortems and Root Cause Analysis]], [[Production Debugging Playbook]], [[Alerting and On-Call]], [[Backup, PITR and Disaster Recovery]]
+
+## Links
+
+### Watch on YouTube
+
+- [8 Security Layers Explained - HTTPS Won’t Stop Your Website From Getting Hacked](https://www.youtube.com/watch?v=_ZY8SvgfuXE) · Webmind · 12 min · 140 views
+- [Cybersecurity IDR: Incident Detection & Response / Google Cybersecurity Certificate](https://www.youtube.com/watch?v=MsGl6lX-YaI) · Grow with Google · 103 min · 248,536 views

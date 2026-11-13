@@ -22,13 +22,22 @@ sources:
   - "Lu et al., WiscKey: Separating Keys from Values in SSD-conscious Storage (FAST 2016)"
   - "Go source, internal/poll/fd_fsync_darwin.go (File.Sync uses F_FULLFSYNC on macOS)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 3"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Storage Engines - B-tree vs LSM and WAL - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Storage Engines - B-tree vs LSM and WAL]]: a toy write-ahead log whose records carry a CRC-32C and a length so recovery can drop a torn tail, a benchmark that measures one `fsync` per commit against one `fsync` for a group, and a toy LSM tree that shows the write-amplification versus read-amplification trade-off of compaction.
+
+## Before the code
+
+- **Files and `fsync`** (`os.OpenFile`, `f.Sync()`): open a file for appending; `Sync` asks the OS to really put the bytes on disk, which is what makes a commit durable.
+- **`encoding/binary` and `hash/crc32`**: write lengths as little-endian integers and varints, and add a checksum so a half-written (torn) record is detected on replay.
+- **`bufio`**: buffered reading, so replaying the log does not make one system call per byte.
+- **`slices` and `maps` packages** (`slices.SortFunc`, `slices.BinarySearchFunc`, `maps.Values`): standard helpers for sorting the memtable and searching sorted runs.
+- **Tests and benchmarks**: `t.TempDir()` gives each test a real throwaway folder; `b.Loop()` is the Go 1.24 benchmark loop used to compare fsync-per-commit with group commit.
+- **What to run**: `go vet ./... && go test -race -v ./...`, then `go test -run xxx -bench Commit ./...` for the fsync cost.
 
 ## What this code shows
 
@@ -85,7 +94,9 @@ sequenceDiagram
 
 ### Step 1: the record frame and the types
 
-**Concept.** A log is only useful for recovery if recovery can tell a complete record from a half-written one ([[Storage Engines - B-tree vs LSM and WAL#Crash recovery in PostgreSQL]]). The fix used here is framing: every record carries a CRC-32C checksum and a length, the same idea PostgreSQL uses to find the end of its WAL. The alternative of a plain text log with newlines cannot detect a corrupt middle, and a database record may contain a newline anyway. CRC-32C is the Castagnoli polynomial, which is the one with hardware support on modern CPUs.
+**Concept.** A log is only useful for recovery if recovery can tell a complete record from a half-written one ([[Storage Engines - B-tree vs LSM and WAL#Crash recovery in PostgreSQL]]). The fix used here is framing: every record carries a CRC-32C checksum and a length, the same idea PostgreSQL uses to find the end of its WAL.
+
+The alternative of a plain text log with newlines cannot detect a corrupt middle, and a database record may contain a newline anyway. CRC-32C is the Castagnoli polynomial, which is the one with hardware support on modern CPUs.
 
 ```go
 package kv
@@ -129,7 +140,9 @@ flowchart LR
 
 ### Step 2: encode a record
 
-**Concept.** Encoding is the write side of the frame, and it must produce exactly what the reader in step 3 expects. The payload is built first, because the checksum and the length both describe the payload. The key length is stored as a varint so the reader knows where the key ends and the value begins, since neither has a terminator. Fixed-width little-endian integers are used for the checksum and the length so that the header is always 8 bytes and the reader can read it in one call.
+**Concept.** Encoding is the write side of the frame, and it must produce exactly what the reader in step 3 expects. The payload is built first, because the checksum and the length both describe the payload. The key length is stored as a varint so the reader knows where the key ends and the value begins, since neither has a terminator.
+
+Fixed-width little-endian integers are used for the checksum and the length so that the header is always 8 bytes and the reader can read it in one call.
 
 ```go
 func encode(r Record) []byte {
@@ -150,7 +163,9 @@ func encode(r Record) []byte {
 
 ### Step 3: open and recover
 
-**Concept.** Recovery replays the log from the start and stops at the first frame that is not provably whole, exactly as in [[Storage Engines - B-tree vs LSM and WAL#Crash recovery in PostgreSQL]]. Everything after a bad frame is untrusted, even if it looks valid, because the bad frame means the write that followed it may have been lost or reordered. After the loop, the file is truncated to the last good offset so new appends start on a clean edge. The alternative of leaving the garbage in place would put the next valid frame after unreadable bytes, and it would never be found on the next recovery.
+**Concept.** Recovery replays the log from the start and stops at the first frame that is not provably whole, exactly as in [[Storage Engines - B-tree vs LSM and WAL#Crash recovery in PostgreSQL]]. Everything after a bad frame is untrusted, even if it looks valid, because the bad frame means the write that followed it may have been lost or reordered.
+
+After the loop, the file is truncated to the last good offset so new appends start on a clean edge. The alternative of leaving the garbage in place would put the next valid frame after unreadable bytes, and it would never be found on the next recovery.
 
 ```go
 // OpenWAL replays every intact record through apply, in order, then cuts off
@@ -228,7 +243,11 @@ Where each failure kind is caught, for a log of three good frames followed by da
 
 ### Step 4: append, and group commit
 
-**Concept.** The WAL rule is to log before acknowledging, and the commit point is the `fsync` that makes the log durable ([[Storage Engines - B-tree vs LSM and WAL#Write-ahead logging]]). An `fsync` costs milliseconds because it waits for the device, while the write itself only copies into the OS page cache. So the cost is the flush, and group commit shares one flush among many records ([[Storage Engines - B-tree vs LSM and WAL#Group commit]]). `Append` takes a variadic list of records so a caller can pick one record per flush or many. A background goroutine that collects concurrent commits, as PostgreSQL does, is the production design, but a single batch call shows the arithmetic without concurrency.
+**Concept.** The WAL rule is to log before acknowledging, and the commit point is the `fsync` that makes the log durable ([[Storage Engines - B-tree vs LSM and WAL#Write-ahead logging]]). An `fsync` costs milliseconds because it waits for the device, while the write itself only copies into the OS page cache.
+
+So the cost is the flush, and group commit shares one flush among many records ([[Storage Engines - B-tree vs LSM and WAL#Group commit]]). `Append` takes a variadic list of records so a caller can pick one record per flush or many.
+
+A background goroutine that collects concurrent commits, as PostgreSQL does, is the production design, but a single batch call shows the arithmetic without concurrency.
 
 ```go
 // Append writes the records with one write call. With sync it also fsyncs,
@@ -273,7 +292,9 @@ flowchart LR
 
 ### Step 5: the LSM entry and the tree type
 
-**Concept.** An LSM tree turns random writes into sequential ones: updates go to an in-memory table and are written out later as sorted, immutable runs ([[Storage Engines - B-tree vs LSM and WAL#LSM write and read paths]]). The `Tree` type holds exactly those parts: a memtable, a list of runs ordered newest first, and counters that measure the trade-off. Runs are in-memory sorted slices standing in for SSTable files, so the test can run 100,000 writes without disk noise. An entry has a `tombstone` flag because a delete must be written as data, not as an absence.
+**Concept.** An LSM tree turns random writes into sequential ones: updates go to an in-memory table and are written out later as sorted, immutable runs ([[Storage Engines - B-tree vs LSM and WAL#LSM write and read paths]]). The `Tree` type holds exactly those parts: a memtable, a list of runs ordered newest first, and counters that measure the trade-off.
+
+Runs are in-memory sorted slices standing in for SSTable files, so the test can run 100,000 writes without disk noise. An entry has a `tombstone` flag because a delete must be written as data, not as an absence.
 
 ```go
 package kv
@@ -331,7 +352,9 @@ flowchart LR
 
 ### Step 6: write path and flush
 
-**Concept.** A write is a memory operation. Only when the memtable is full is it turned into a new sorted run, which is a sequential write. This is the write path from [[Storage Engines - B-tree vs LSM and WAL#LSM write and read paths]]. Flushing can trigger compaction, which is the policy step that keeps the run count bounded. Writing the flush check inside `write` keeps `Put` and `Delete` identical, since a delete is just a write of a tombstone.
+**Concept.** A write is a memory operation. Only when the memtable is full is it turned into a new sorted run, which is a sequential write. This is the write path from [[Storage Engines - B-tree vs LSM and WAL#LSM write and read paths]].
+
+Flushing can trigger compaction, which is the policy step that keeps the run count bounded. Writing the flush check inside `write` keeps `Put` and `Delete` identical, since a delete is just a write of a tombstone.
 
 ```go
 func (t *Tree) Put(k, v string) { t.write(entry{key: k, value: v}) }
@@ -368,7 +391,9 @@ func (t *Tree) flush() {
 
 ### Step 7: compaction and read
 
-**Concept.** Compaction merges runs so that reads probe fewer files and old versions and tombstones are discarded ([[Storage Engines - B-tree vs LSM and WAL#Deletes and compaction]]). The price is rewriting data, which is write amplification. This code uses the simplest policy, "merge everything into one run when there are more than `maxRuns`", which is enough to show the trade-off without levels or tiers. Real engines use leveled or size-tiered compaction because merging everything rewrites the whole database each time.
+**Concept.** Compaction merges runs so that reads probe fewer files and old versions and tombstones are discarded ([[Storage Engines - B-tree vs LSM and WAL#Deletes and compaction]]). The price is rewriting data, which is write amplification. This code uses the simplest policy, "merge everything into one run when there are more than `maxRuns`", which is enough to show the trade-off without levels or tiers.
+
+Real engines use leveled or size-tiered compaction because merging everything rewrites the whole database each time.
 
 ```go
 // compact merges every run into one, keeping only the newest version of each
@@ -581,7 +606,9 @@ func BenchmarkCommitGrouped(b *testing.B) {
 
 ### TestCompactionTradeoff
 
-**Property.** As `maxRuns` grows, write amplification falls and the runs probed per missing key rise, which is the write against read amplification trade-off ([[Storage Engines - B-tree vs LSM and WAL#Read, write and space amplification]]). The test writes 100,000 invoice keys with a 1,000-key memtable and looks up one absent key every 100 writes. There are no bloom filters, so every run is searched.
+**Property.** As `maxRuns` grows, write amplification falls and the runs probed per missing key rise, which is the write against read amplification trade-off ([[Storage Engines - B-tree vs LSM and WAL#Read, write and space amplification]]).
+
+The test writes 100,000 invoice keys with a 1,000-key memtable and looks up one absent key every 100 writes. There are no bloom filters, so every run is searched.
 
 | `maxRuns` | Expected write amp | Expected probes per miss |
 | --- | --- | --- |

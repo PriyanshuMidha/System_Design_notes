@@ -6,13 +6,15 @@ prereqs: ["[[LLD Interview Method]]"]
 related: ["[[Zepto-style Product LLD Round]]", "[[17 LLD MOC]]", "[[LLD Problem Cheat Sheet]]", "[[Testing LLD Code]]", "[[Concurrency for LLD]]", "[[System Design Interview Framework]]"]
 sources:
   - "Owner's LLD Practice Roadmap (daily method, interviewer checks), Zepto time table and interview-approach script"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # LLD Round Playbook
 
 > [!summary] TL;DR
-> How to run a low-level design (LLD) interview round on the day: which format you are in, how to split 45, 60 or 90 minutes, how to talk while you design, what the evaluator writes down, and how to recover when you get stuck. The solving steps themselves live in [[LLD Interview Method]]; this note is about the round around them.
+> How to run a low-level design (LLD) interview round on the day: which format you are in, how to split 45, 60 or 90 minutes, how to talk while you design, what the evaluator writes down, and how to recover when you get stuck.
+>
+> The solving steps themselves live in [[LLD Interview Method]]; this note is about the round around them.
 
 > [!abstract] Core idea
 > - First identify the format: design discussion, machine coding, or a hybrid. It decides how much code you write.
@@ -21,11 +23,59 @@ updated: 2026-11-04
 > - Silence and rewriting from scratch are the two most expensive mistakes; narrate, and change one thing at a time.
 > - Classic mistake: spending 30 minutes drawing classes and never coding the one method that holds the hard invariant.
 
+## Start here: the basics
+
+**The problem in one story.**
+You are asked to "design a parking lot" in 60 minutes, with an interviewer watching.
+You know the patterns, but you spend 35 minutes drawing boxes and never write the one method that matters.
+The interviewer leaves with nothing working to report.
+This note is the game plan for the hour itself: what to do, when, and what to say.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| LLD (low-level design) | Designing classes, methods and their rules for one feature | Parking lot: `Lot`, `Spot`, `Ticket` |
+| Machine coding round | A round where you must write runnable code | Working `Park()` and `Exit()` in Go |
+| Entity | A main "thing" in the problem that holds data | `Spot`, `Vehicle` |
+| Invariant | A rule that must always stay true | One spot never holds two cars |
+| Edge case | An unusual input that can break the code | Lot full, same car parks twice |
+| Trade-off | What you gain and what you give up with a choice | Lock per spot: faster, more complex |
+| Time-box | A fixed time limit for one phase | 10 minutes for scope, then move on |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    F["Spot the format"] --> S["Scope:<br/>ask, list, agree"]
+    S --> M["Model:<br/>entities + methods"]
+    M --> C["Code the core<br/>method + test"]
+    C --> E["Edge cases and<br/>extensions"]
+```
+
+**Analogy.** A cooking exam: cook one dish on time, taste it, and explain your choices, rather than reciting the whole cookbook.
+Where it breaks: an examiner rarely interrupts you, but an LLD interviewer will redirect you, and you should welcome it.
+
+**How the rest of this note builds up**
+
+- First, why good candidates still fail (section 1) and the "paired work session" mental model (section 2).
+- Then the round step by step: formats, time splits, talking while designing (section 3).
+- Then a worked parking-lot timeline and variants by company and format (sections 4-5).
+- Finally the SDE-3 view: what evaluators write down, recovering when stuck, and calibrating for senior signals (sections 6-8).
+
+> [!tip] Remember
+> Agree scope fast, code the method that guards the hard rule, and keep talking.
+
 ## 1. Why it exists
 
 Most candidates who fail an LLD round knew the content. They lose on execution: 25 minutes of clarifying questions, a beautiful class diagram, and no working method when the hour ends. Or they code from minute 2 and build the wrong thing.
 
-A concrete scenario: in a 60-minute round for "design a parking lot", candidate A spends 0–10 on scope, 10–25 on entities and methods, 25–50 on `Park` and `Exit` with a concurrency test, and 50–60 on extensions. Candidate B spends 0–35 on a full UML diagram with 14 classes and starts typing at minute 36. Both know the same patterns; A gets a hire signal because the evaluator saw working code, an invariant and trade-offs. This note exists so you are always candidate A.
+A concrete scenario: a 60-minute round for "design a parking lot".
+
+- Candidate A spends 0–10 on scope, 10–25 on entities and methods, 25–50 on `Park` and `Exit` with a concurrency test, and 50–60 on extensions.
+- Candidate B spends 0–35 on a full UML diagram with 14 classes and starts typing at minute 36.
+
+Both know the same patterns; A gets a hire signal because the evaluator saw working code, an invariant and trade-offs. This note exists so you are always candidate A.
 
 ## 2. Mental model
 
@@ -189,7 +239,15 @@ stateDiagram-v2
 
 ### Calibrating for SDE-3
 
-At SDE-1/2 a correct model and working method usually pass. At SDE-3 the same question is used to look for: invariants named before code, the failure path coded (not just mentioned), multi-instance correctness, testability (fake clock, interfaces at the consumer side), and a short, prioritised list of extensions with their cost. Language matters less than judgment; Go idioms help only when they make the design simpler ([[OOP in Go - Structs, Interfaces, Embedding]]).
+At SDE-1/2 a correct model and working method usually pass. At SDE-3 the same question is used to look for:
+
+- Invariants named before code.
+- The failure path coded (not just mentioned).
+- Multi-instance correctness.
+- Testability (fake clock, interfaces at the consumer side).
+- A short, prioritised list of extensions with their cost.
+
+Language matters less than judgment; Go idioms help only when they make the design simpler ([[OOP in Go - Structs, Interfaces, Embedding]]).
 
 ### Go-specific presentation tips
 
@@ -233,3 +291,8 @@ At SDE-1/2 a correct model and working method usually pass. At SDE-3 the same qu
 - **Before this:** [[LLD Interview Method]], [[17 LLD MOC]]
 - **Next:** [[Zepto-style Product LLD Round]], [[LLD Problem Cheat Sheet]], [[Learning Resources]]
 - **Compare with:** [[System Design Interview Framework]] (the HLD round), [[Go Interview Questions and Traps]] (language round)
+
+### Watch on YouTube
+
+- [LLD RoadMap / What to study for Low Level System Design Interviews / Object Oriented Design Round 🫣](https://www.youtube.com/watch?v=9_7jDlmexME) · Keerti Purswani · 9 min · 160,033 views
+- [Crack ZOHO LLD round Easily / Recently asked Question / Full Explanation / Tamil / English Subtitle](https://www.youtube.com/watch?v=gY3taMFlY8E) · Karthik Info Vlogs · 16 min · 5,374 views

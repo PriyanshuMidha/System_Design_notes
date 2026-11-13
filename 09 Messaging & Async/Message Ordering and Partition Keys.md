@@ -11,13 +11,17 @@ sources:
   - "Amazon Kinesis Data Streams Developer Guide, partition keys and shards"
   - "Google Cloud Pub/Sub documentation, Ordering messages (ordering keys)"
   - "RabbitMQ documentation, Queues (message ordering) and Single Active Consumer"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Message Ordering and Partition Keys
 
 > [!summary] TL;DR
-> Brokers can keep messages in order only **within** one partition (Kafka), message group (SQS FIFO) or queue with one consumer (RabbitMQ). A **partition key** such as `order_id` sends all messages about one entity to the same partition, so you get order **per key** and parallelism **across keys**. Global order for everything would mean one partition and one consumer, which caps throughput.
+> Brokers can keep messages in order only **within** one partition (Kafka), message group (SQS FIFO) or queue with one consumer (RabbitMQ).
+>
+> A **partition key** such as `order_id` sends all messages about one entity to the same partition, so you get order **per key** and parallelism **across keys**.
+>
+> Global order for everything would mean one partition and one consumer, which caps throughput.
 
 > [!abstract] Core idea
 > - Ask "order relative to what?" Almost always the answer is "per entity", not "globally".
@@ -25,6 +29,49 @@ updated: 2026-11-04
 > - Order breaks in quiet places: worker pools inside a consumer, retries and DLQs, producer retries, adding partitions, rebalances.
 > - Make consumers order-tolerant anyway: carry a per-entity version and ignore anything older than what you have.
 > - Pick the key for even load: a key that is too coarse (`tenant_id` of a huge tenant) creates a hot partition.
+
+## Start here: the basics
+
+**The problem in one story.**
+You deposit 100 and then withdraw 80 from your bank account.
+If the bank's computers handle the withdrawal first, it may bounce for "not enough money".
+When many workers process messages in parallel, this kind of mix-up happens unless we decide which messages must stay in order.
+Usually only messages about the same thing (one account, one order) need to stay in order.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Message | One piece of data sent between programs | `OrderPaid {order: o-881}` |
+| Topic | A named stream of messages | `orders` |
+| Partition | One ordered lane inside a topic | Topic `orders` has 12 lanes |
+| Key | A value attached to a message that picks its lane | `order_id = o-881` |
+| Hash | A function turning a value into a number, same input same output | `hash("o-881") % 12 = 4` |
+| Consumer | A program reading and processing messages | The view updater |
+| Parallelism | Doing several things at the same time | 12 consumers, one per lane |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    M1["o-881: Created, Paid, Shipped"] -->|"hash(o-881)"| P4["Partition 4"]
+    M2["o-900: Created, Paid"] -->|"hash(o-900)"| P9["Partition 9"]
+    P4 --> C1["Consumer A<br/>in order for o-881"]
+    P9 --> C2["Consumer B<br/>in order for o-900"]
+```
+
+**Analogy.** A bank assigns tellers by account number, so one account's transactions always go to the same teller, in order.
+Where it breaks: a teller who steps away (a rebalance) or a customer sent to the back of the line (a retry) can still reorder things.
+
+**How the rest of this note builds up**
+
+- First, a concrete bug from unkeyed messages (section 1) and the teller mental model (section 2).
+- Then how keys map to partitions and where order quietly breaks (section 3), with a Go worked example (section 4).
+- Then variants across brokers and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: hot keys, repartitioning, version checks and resequencing (sections 7-8), then interview questions.
+
+> [!tip] Remember
+> Ask "in order relative to what?": key by that entity, and get order per key with parallelism across keys.
 
 ## 1. Why it exists
 
@@ -40,7 +87,13 @@ The fix is to key by `order_id`: every event for `o-881` goes to one partition, 
 
 ## 2. Mental model
 
-A bank has 12 tellers. If customers join any queue at random, two deposits from the same person can be handled out of order by different tellers. So the bank assigns tellers by account number: account `…81` always goes to teller 9. Each teller works through their queue in order, so every account's transactions happen in order, and the 12 tellers still work in parallel. The bank gave up a single global order, which nobody needed, to keep per-account order, which everyone needs.
+A bank has 12 tellers. If customers join any queue at random, two deposits from the same person can be handled out of order by different tellers.
+
+So the bank assigns tellers by account number: account `…81` always goes to teller 9.
+
+Each teller works through their queue in order, so every account's transactions happen in order, and the 12 tellers still work in parallel.
+
+The bank gave up a single global order, which nobody needed, to keep per-account order, which everyone needs.
 
 Terms:
 
@@ -336,7 +389,10 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 ## 8. Deep dive
 
 - **Where versions come from.** The best source is the database row that changed: a `version` column incremented on each update (also used for optimistic locking), or the outbox table's sequence per aggregate. Wall-clock timestamps from different machines are not safe for ordering because clocks drift (see [[Clocks and Ordering]]).
-- **State events vs delta events.** If each event carries the full new state ("status = shipped, version 3"), consumers can skip stale ones: the latest wins. If events carry changes ("add 500 to balance"), a skipped event is lost money. Delta streams need gap detection: if the last applied version is 7 and 9 arrives, hold 9 until 8 arrives (resequencing), or fetch the current state from the source. This is why [[Event Sourcing]] stores ordered per-aggregate streams.
+- **State events vs delta events.** If each event carries the full new state ("status = shipped, version 3"), consumers can skip stale ones: the latest wins.
+  If events carry changes ("add 500 to balance"), a skipped event is lost money.
+  Delta streams need gap detection: if the last applied version is 7 and 9 arrives, hold 9 until 8 arrives (resequencing), or fetch the current state from the source.
+  This is why [[Event Sourcing]] stores ordered per-aggregate streams.
 - **Committing offsets with lanes.** If lane 1 finished offset 105 but lane 3 is still on offset 101, the consumer may only commit offset 101 (Kafka commits mean "everything before this is done"). Track the lowest unfinished offset per partition and commit that. Libraries such as Confluent's parallel consumer do this bookkeeping.
 - **SQS FIFO internals that matter.** Order is per `MessageGroupId`. When a message from a group is received and not yet deleted, SQS does not return later messages from that group until it is deleted or its visibility timeout expires. One slow message therefore blocks its group, which is exactly the head-of-line trade-off, made by the broker.
 - **Hot partitions with skewed keys.** If one key is 30% of traffic, adding partitions does not help, since one key always maps to one partition. Options: split the key (`account-42#shard-3`) when per-key order can be relaxed for sub-entities, or give the hot entity its own topic and consumer.
@@ -380,3 +436,8 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 - **Before this:** [[Queues vs Streams and Broker Comparison]], [[Delivery Semantics and Exactly-Once]], [[Partitioning and Sharding]]
 - **Next:** [[Kafka and Event Streaming]], [[Transactional Outbox and CDC]], [[Stream Processing Basics]]
 - **Compare with:** [[Clocks and Ordering]] (ordering without a single log), [[Hot Keys and Hot Partitions]] (the cost of a bad key), [[Dead Letter Queues and Poison Messages]] (how retries trade order for throughput)
+
+### Watch on YouTube
+
+- [Lesson 12 / Kafka Message Keys & Ordering Explained — How to Guarantee Event Order](https://www.youtube.com/watch?v=j9xAVG7I3Ew) · TechWithY · 8 min · 327 views
+- [Does Kafka Guarantee Message Ordering? 🤔 Microservices Fix Inside !](https://www.youtube.com/watch?v=Jl-nauqEtEo) · Java Techie · 28 min · 23,777 views

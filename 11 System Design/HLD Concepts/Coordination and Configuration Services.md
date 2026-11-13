@@ -15,7 +15,7 @@ sources:
   - "Tang et al., Holistic Configuration Management at Facebook (SOSP 2015)"
   - "PostgreSQL docs: advisory locks"
   - "Martin Kleppmann, How to do distributed locking (2016)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Coordination and Configuration Services
@@ -28,6 +28,55 @@ updated: 2026-11-09
 > - It exposes four primitives: **small values** (config), **ephemeral entries tied to a session or lease** (membership, locks), **watches** (push on change), and **atomic compare-and-set** (leader election, fencing).
 > - A lock or leader role is safe only together with a **fencing token**; a lease alone is not enough, because pauses and clock drift exist.
 > - Dynamic config is code. Roll it out in stages, validate it, version it and keep a rollback.
+
+## Start here: the basics
+
+**The problem in one story**
+
+You run 5 copies of a service. Exactly one of them must send the daily emails.
+If two send, customers get duplicate emails. If none sends, nobody gets one.
+The copies also need to agree on settings, like a feature flag, and notice when a copy dies.
+Agreeing like this across machines is hard, so one small trusted service does it for everyone.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Consensus | Machines agreeing on one value even when some fail | Raft in etcd |
+| Quorum | More than half of the nodes | 2 of 3, or 3 of 5 |
+| Leader election | Picking exactly one node to do a job | One scheduler instance active |
+| Session / lease | A time-limited claim that ends if the client stops renewing | Lock expires 10 s after a crash |
+| Ephemeral node | An entry deleted automatically when its session ends | ZooKeeper `/workers/w1` |
+| Watch | A push notification when a value changes | Service reloads config on change |
+| Compare-and-set | Write only if the value is still what you expect | Set leader only if no leader key exists |
+| Fencing token | A number that grows with each new lock holder | Storage rejects writes with an old token |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  A[Service A] --> K[Coordination cluster 3 or 5 nodes]
+  B[Service B] --> K
+  C[Service C] --> K
+  K --> L[Leader key]
+  K --> F[Config values]
+  K --> M[Live members list]
+```
+
+**Analogy**
+
+An office notice board: one place where everyone reads who is in charge today and what the rules are, and a note falls off if its owner stops renewing it.
+Where it breaks: a real notice board is one piece of wood, while this service is several machines that must agree before a note counts.
+
+**How the rest of this note builds up**
+
+- First why a shared coordination service exists and its mental model (sections 1-2).
+- Then how its primitives work: values, sessions, watches, compare-and-set (section 3).
+- Then a worked example of leader election and config (section 4).
+- Finally ZooKeeper vs etcd vs Consul, trade-offs, production practice and the SDE-3 deep dive on fencing and clocks (sections 5-8).
+
+> [!tip] Remember
+> Do not build consensus yourself; ask a small coordination cluster, and always pair locks with fencing tokens.
 
 ## 1. Why it exists
 
@@ -53,7 +102,9 @@ Think of the **notice board in a village hall with a caretaker who never lies**.
 - You can ask the caretaker, "tell me when note 7 changes" (a **watch**).
 - To claim the one meeting room, you try to pin a note that says "room: Alice". The caretaker allows only the first one (atomic create).
 
-Where the analogy breaks: a real notice board is one piece of wood. This board is replicated on 3 or 5 machines that vote on every change, so it survives the loss of a minority of them. The price is that every write waits for a majority round trip, so the board is slow compared with a cache and small compared with a database.
+Where the analogy breaks: a real notice board is one piece of wood. This board is replicated on 3 or 5 machines that vote on every change, so it survives the loss of a minority of them.
+
+The price is that every write waits for a majority round trip, so the board is slow compared with a cache and small compared with a database.
 
 ```mermaid
 flowchart LR
@@ -316,7 +367,9 @@ flowchart TD
 
 ### Why 3 or 5, never 4 or 6
 
-A quorum is more than half. Three nodes need 2 (tolerate 1 loss). Four need 3 (still tolerate only 1 loss). Five need 3 (tolerate 2). Even sizes add cost without adding fault tolerance, and a 2-2 split can leave neither side with a majority. Across three availability zones, 3 or 5 nodes spread 1-1-1 or 2-2-1 keeps a majority alive if one zone goes down.
+A quorum is more than half. Three nodes need 2 (tolerate 1 loss). Four need 3 (still tolerate only 1 loss). Five need 3 (tolerate 2). Even sizes add cost without adding fault tolerance, and a 2-2 split can leave neither side with a majority.
+
+Across three availability zones, 3 or 5 nodes spread 1-1-1 or 2-2-1 keeps a majority alive if one zone goes down.
 
 ### Reads: linearizable or fast?
 
@@ -328,7 +381,9 @@ A naive lock has all waiters watch the same key; when the holder leaves, everyon
 
 ### Sessions, TTLs and clocks
 
-A session expires according to the **server's** clock and timeouts, not the client's belief. After a pause, the client must treat all its locks as lost and check, for example, that its session or lease is still valid before acting, and still rely on the fencing token for the final say. Leases bound how long a dead owner holds a role, but never prove that a live owner is still the owner at this instant.
+A session expires according to the **server's** clock and timeouts, not the client's belief. After a pause, the client must treat all its locks as lost and check, for example, that its session or lease is still valid before acting, and still rely on the fencing token for the final say.
+
+Leases bound how long a dead owner holds a role, but never prove that a live owner is still the owner at this instant.
 
 ### Using a database instead
 
@@ -377,3 +432,8 @@ Treat each config as an immutable version with an id. Servers report the version
 - **Before this:** [[Consensus - Raft and Paxos]], [[Service Discovery]], [[Failure Detection, Gossip and Membership]]
 - **Next:** [[Leader Election]], [[Distributed Locks and Fencing Tokens]], [[Feature Flags]]
 - **Compare with:** [[Kubernetes Fundamentals]] (ConfigMaps and Leases on etcd), [[High Availability and Failover]], [[Case Study - Distributed Job Scheduler]] (singleton scheduling and leader election), [[Case Study - Key-Value Store]], [[Rollback and Safe Migrations]]
+
+### Watch on YouTube
+
+- [What is ZooKeeper? - Coordination Services / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=F06tdYgcz_A) · Jordan has no life · 7 min · 40,552 views
+- [Coordination Services / System Design / High Level Design](https://www.youtube.com/watch?v=6mX8pxmqA7w) · Reactify Labs · 20 min · 170 views

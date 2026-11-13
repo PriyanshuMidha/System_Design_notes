@@ -11,7 +11,7 @@ sources:
   - "sqlc docs: generated DBTX interface and Queries.WithTx"
   - "pgx v5 docs: ErrNoRows, BeginFunc; pgx CHANGELOG 5.7.0 (ErrNoRows wraps sql.ErrNoRows)"
   - "PostgreSQL 17 docs: Read Committed isolation (UPDATE re-checks its WHERE clause on the updated row), sequences are not rolled back"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Repository and Unit of Work
@@ -24,6 +24,52 @@ updated: 2026-11-02
 > - Because it is an interface, tests use an in-memory version and production uses PostgreSQL.
 > - A unit of work runs the changes of one business operation, across several repositories, in **one transaction**: all commit or none do.
 > - Classic mistakes: a generic `Update(entity)` that hides what changed, and slow remote calls (payment provider) inside the transaction.
+
+## Start here: the basics
+
+**The problem in one story.**
+A shop app places an order: it saves the order, lowers the stock, and records the payment.
+If the code is full of SQL, you cannot test it without a real database.
+And if the server crashes after saving the order but before lowering the stock, the data no longer adds up.
+A repository hides *where* data lives; a unit of work makes the three saves succeed or fail together.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Domain object | A thing your business cares about, as a Go struct | `Order{ID: 42, Total: 500}` |
+| Interface | A list of methods; any type that has them fits | `type OrderRepo interface { Get(id) }` |
+| Database transaction | A group of writes that all happen or none happen | `BEGIN; ...; COMMIT` |
+| Commit / rollback | Make the writes permanent / throw them all away | Rollback after an error |
+| In-memory fake | A test version backed by a Go map instead of a DB | `map[int64]Order` |
+| Persistence | Storing data so it survives a restart | Rows in PostgreSQL |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Service:<br/>PlaceOrder"] --> U["Unit of work<br/>(one transaction)"]
+    U --> R1["Order repo"]
+    U --> R2["Stock repo"]
+    R1 --> DB[("PostgreSQL<br/>or in-memory map")]
+    R2 --> DB
+    U --> C{"All ok?"}
+    C -- "yes" --> CM["Commit"]
+    C -- "no" --> RB["Rollback"]
+```
+
+**Analogy.** A repository is a librarian: you ask for "book 42" and do not care which shelf it was on. The unit of work is a shopping trolley at checkout: everything in it is paid for together, or you walk away with nothing.
+Where it breaks: a librarian cannot undo a loan made at another library, and a unit of work cannot roll back a remote call (like a payment provider) made inside it.
+
+**How the rest of this note builds up**
+
+- First, why the patterns exist (section 1) and the mental model (section 2).
+- Then how repositories and the unit of work are wired in Go (section 3) and a full worked example with tests (section 4).
+- Then variants, trade-offs and when not to bother (sections 5-6).
+- Finally the SDE-3 view: production pitfalls, transaction scope and the deep dive (sections 7-8).
+
+> [!tip] Remember
+> Repository = "where data lives" is hidden behind an interface; unit of work = one business operation is one transaction.
 
 ## 1. Why it exists
 
@@ -784,3 +830,8 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 - **Next:** [[Rare GoF Patterns in Go]], [[Testing LLD Code]]
 - **Compare with:** [[Transactions and the Repository Pattern]] (the backend view with pgx), [[Database Access (database-sql, pgx, sqlc)]], [[Locking - Optimistic vs Pessimistic]], [[Command, Undo and Memento]] (savepoints as a database memento), [[Case Study - Ticket Booking]] (reservations at system scale)
 - **Practice:** [[Inventory Order Assignment (Dark Store)]], [[Movie Ticket Booking]], [[Library Management]]
+
+### Watch on YouTube
+
+- [The Unit of Work Design Pattern Explained](https://www.youtube.com/watch?v=HX6vkP-QD7U) · ArjanCodes · 12 min · 36,996 views
+- [Unit of Work Pattern in .NET 7 - Repository Pattern Guide](https://www.youtube.com/watch?v=NNT0-6moCJM) · Tech Yatra(Nishant Gupta) · 17 min · 6,946 views

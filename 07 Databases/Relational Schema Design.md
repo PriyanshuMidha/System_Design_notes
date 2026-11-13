@@ -14,19 +14,72 @@ sources:
   - "ISO 4217 currency codes and minor units"
   - "Karwin, SQL Antipatterns (Pragmatic Bookshelf, 2010): Jaywalking, EAV, Polymorphic Associations"
   - "pkg.go.dev, github.com/google/uuid (NewV7 since v1.5.0)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Relational Schema Design
 
 > [!summary] TL;DR
-> Schema design decides which tables exist, which columns they hold, how they reference each other, and which rules the database itself enforces. A good relational schema stores each fact once (normalization), lets the database reject impossible data (constraints), and uses types that cannot lose money or time zones. You then denormalize on purpose, with a plan to keep the copies correct.
+> Schema design decides which tables exist, which columns they hold, how they reference each other, and which rules the database itself enforces.
+>
+> A good relational schema stores each fact once (normalization), lets the database reject impossible data (constraints), and uses types that cannot lose money or time zones. You then denormalize on purpose, with a plan to keep the copies correct.
 
 > [!abstract] Core idea
 > - Store each fact once (normalize), then copy facts only on purpose with a plan to keep the copy correct.
 > - Let the database reject bad data: primary keys, foreign keys, `UNIQUE`, `CHECK`, `NOT NULL`.
 > - Use types that cannot lose information: integer minor units for money, `timestamptz` for time.
 > - Classic mistake: copying a client's email into every invoice row, then updating one copy and missing the rest.
+
+## Start here: the basics
+
+**The problem in one story.**
+A small shop keeps its customers in a notebook and writes each customer's phone number on every order slip.
+A customer changes phone number, and the shop updates only some slips.
+Now the shop has two different numbers for one person and does not know which is right.
+Schema design is deciding where each fact lives so this cannot happen.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Table | A grid of rows and columns for one kind of thing | `clients`, `invoices` |
+| Row | One record in a table | One invoice |
+| Column | One named attribute with a type | `amount_minor BIGINT` |
+| Primary key | The column(s) that uniquely identify a row | `invoices.id` |
+| Foreign key | A column that must match a primary key in another table | `invoices.client_id → clients.id` |
+| Constraint | A rule the database enforces on every write | `CHECK (amount_minor >= 0)` |
+| Normalize | Store each fact in exactly one place | Client email lives only in `clients` |
+| Denormalize | Copy a fact on purpose, usually for read speed | Store a total on the invoice row |
+
+**Picture it**
+
+```mermaid
+erDiagram
+  CLIENT ||--o{ INVOICE : "is billed by"
+  INVOICE ||--|{ LINE_ITEM : contains
+  CLIENT {
+    bigint id PK
+    text email
+  }
+  INVOICE {
+    bigint id PK
+    bigint client_id FK
+  }
+```
+
+**Analogy.**
+A good schema is like a well-run filing cabinet: one folder per client, and invoices point to the folder instead of copying its contents.
+Where it breaks: a filing cabinet trusts the clerk to file correctly, while a database can refuse a bad write outright with constraints.
+
+**How the rest of this note builds up**
+
+- First, why schema design matters and a mental model of "one fact, one place".
+- Then the eight steps: questions, entities, normalization, keys, constraints, types, naming, soft deletes.
+- Then the full InvoiceOps schema in PostgreSQL 17 and how to handle money in Go.
+- Finally, variants, trade-offs, production practice and the SDE-3 deep dive.
+
+> [!tip] Remember
+> Store each fact once, and let the database reject bad data with keys and constraints.
 
 ## 1. Why it exists
 
@@ -338,7 +391,11 @@ sequenceDiagram
     Note over Pool: the connection goes back with no tenant setting left
 ```
 
-RLS is a backstop, not a replacement for `WHERE workspace_id = $1` (which the indexes need anyway). Two traps: the table owner, superusers and roles with `BYPASSRLS` skip policies, so the app must log in as a separate role (or the table needs `FORCE ROW LEVEL SECURITY`); and a setting made with `is_local = false` survives on the pooled connection into the next request. Also, `current_setting('app.workspace_id')` raises an error if the setting was never defined in the session, and once a transaction-local value has ended it reads as an empty string, so `''::bigint` fails: the query errors instead of leaking rows, which is the safe failure, but every request must set the tenant first.
+RLS is a backstop, not a replacement for `WHERE workspace_id = $1` (which the indexes need anyway).
+
+Two traps: the table owner, superusers and roles with `BYPASSRLS` skip policies, so the app must log in as a separate role (or the table needs `FORCE ROW LEVEL SECURITY`); and a setting made with `is_local = false` survives on the pooled connection into the next request.
+
+Also, `current_setting('app.workspace_id')` raises an error if the setting was never defined in the session, and once a transaction-local value has ended it reads as an empty string, so `''::bigint` fails: the query errors instead of leaking rows, which is the safe failure, but every request must set the tenant first.
 
 ### Money in Go: integer minor units
 
@@ -464,3 +521,7 @@ Most products start shared and move their largest tenants out later. Including `
 - **Code:** [[Relational Schema Design - Go]] (full DDL, trigger and RLS, the `money` package with tests)
 - **Next:** [[Transactions and ACID]], [[Indexing Fundamentals]], [[Zero-Downtime Schema Migrations]]
 - **Compare with:** [[NoSQL Data Modeling]] (modelling for access patterns instead of normalization), [[Materialized Views and Denormalization]] (planned copies for reads), [[Unique ID Generation]] (ids at scale)
+
+### Watch on YouTube
+
+- [Database Design: ER Modeling & Normalization (1NF, 2NF, 3NF) Tutorial for Beginners](https://www.youtube.com/watch?v=bcU4f2RVjJU) · Tech with Monir · covers normalization and constraints that form the note's core idea

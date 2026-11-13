@@ -9,13 +9,19 @@ sources:
   - "Go 1.20 release notes: fmt.Errorf with several %w verbs"
   - "Go 1.21 release notes: min builtin, slices.Contains"
   - "PostgreSQL 17 docs: UNIQUE constraints, UPDATE with a WHERE guard"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Food Ordering System
 
 > [!summary] TL;DR
-> Separate the **cart** (a mutable draft pinned to one restaurant) from the **order** (created once at checkout, with a price snapshot). `PlaceOrder` takes an idempotency key, freezes the cart, charges outside the lock and saves the order, so double taps never charge twice and a failed payment never loses the cart. Status changes go through a **transition table that checks the actor**. Refunds are written to an **outbox** in the same step as the status change and sent by a relay with retries, and a timer job **auto-rejects** orders the restaurant did not accept in time.
+> Separate the **cart** (a mutable draft pinned to one restaurant) from the **order** (created once at checkout, with a price snapshot).
+>
+> `PlaceOrder` takes an idempotency key, freezes the cart, charges outside the lock and saves the order, so double taps never charge twice and a failed payment never loses the cart.
+>
+> Status changes go through a **transition table that checks the actor**.
+>
+> Refunds are written to an **outbox** in the same step as the status change and sent by a relay with retries, and a timer job **auto-rejects** orders the restaurant did not accept in time.
 
 > [!abstract] Core idea
 > - The cart is a mutable draft pinned to one restaurant; the order is created once at checkout and keeps a snapshot of names and prices.
@@ -23,6 +29,54 @@ updated: 2026-11-02
 > - Every status change goes through one transition table that also checks who is allowed to make it.
 > - Refunds go into an outbox (a pending-work row written together with the status change, sent later by a relay with retries); a timer auto-rejects orders the restaurant ignores.
 > - Classic mistakes: computing the total from the live menu, and calling the refund gateway inline right after setting `REJECTED`.
+
+## Start here: the basics
+
+**The problem in one story.**
+You add a pizza and a cola to your cart and tap "Place order" twice because the app feels slow.
+You should be charged once, at the prices you saw, and the restaurant should get one order.
+If the restaurant never accepts, you should get your money back automatically.
+This note designs the cart, the order and its life from "placed" to "delivered".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cart | A draft list of items you can still change | 1 pizza, 1 cola |
+| Order | The fixed record created at checkout | Order #881, total 420 |
+| Snapshot | A copy of data frozen at one moment | Prices saved at checkout |
+| Idempotency key | A unique ID per checkout so a retry does not repeat it | Two taps, one charge |
+| State machine | An object in one state that moves only along allowed arrows | PLACED → ACCEPTED |
+| Actor | Who makes a change | Customer, restaurant, system |
+| Outbox | A "to do later" row saved with the change, sent by a background job | Refund task |
+| Port (interface) | A Go interface that hides an outside service | `PaymentGateway` |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+    [*] --> PLACED: checkout + charge
+    PLACED --> ACCEPTED: restaurant
+    PLACED --> REJECTED: restaurant or timeout
+    ACCEPTED --> PREPARING
+    PREPARING --> READY
+    READY --> PICKED_UP
+    PICKED_UP --> DELIVERED
+    REJECTED --> [*]: refund via outbox
+```
+
+**Analogy.** A restaurant order slip: the waiter copies your choices and prices onto the slip, and later menu price changes do not touch it.
+Where it breaks: a paper slip has no "only the kitchen may mark it ready" rule; the transition table also checks who is allowed to move each state.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and Steps 1-4: requirements, actors, entities (cart versus order) and relationships.
+- Then Steps 5-7: APIs, storage with `UNIQUE (user_id, idempotency_key)`, and the patterns.
+- Then Step 8 and the test cases: the Go code for `PlaceOrder`, the transition table, the refund outbox and SLA auto-reject.
+- Finally the SDE-3 depth: race conditions, edge cases and trade-offs.
+
+> [!tip] Remember
+> Freeze the cart, snapshot the prices, charge once per key, and move status only through the transition table.
 
 ## Problem statement
 
@@ -43,7 +97,11 @@ on every status change. Handle cancellation, payment failure and duplicate order
 6. Add the refund outbox and the auto-reject job.
 7. Test double taps, payment failure, illegal transitions and refunds.
 
-It tests an explicit order **state machine** with role-based transitions and a safe `PlaceOrder`: price snapshot, idempotency key, no double charge. It also tests whether payment, delivery and notifications stay behind interfaces instead of inside the order logic, and whether refunds survive a gateway outage. Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
+It tests an explicit order **state machine** with role-based transitions and a safe `PlaceOrder`: price snapshot, idempotency key, no double charge.
+
+It also tests whether payment, delivery and notifications stay behind interfaces instead of inside the order logic, and whether refunds survive a gateway outage.
+
+Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
 ## Step 1: Clarify requirements
 
@@ -373,11 +431,23 @@ sequenceDiagram
 How it works:
 
 1. **Idempotency.** `PlaceOrder` builds `userID|idemKey` and locks. If the key is known, this is a retry or a concurrent double tap: it waits for that call's result (or `ctx`) and returns the same order or error. Only one caller does the work, like `singleflight`.
-2. **Freeze, not take.** It validates the cart (not empty, restaurant open, items available), snapshots names and prices into `OrderLine`s and sets `CheckingOut`. Taking the cart out of the map instead would lose it: if the user started a new cart while the payment was in flight and the payment then failed, the old cart could only go back when no new cart existed, so it could vanish silently. With the freeze, `AddToCart` and a second checkout with another key get `ErrCheckoutInProgress`, and a failure simply unfreezes the same cart.
+2. **Freeze, not take.** It validates the cart (not empty, restaurant open, items available), snapshots names and prices into `OrderLine`s and sets `CheckingOut`.
+
+   Taking the cart out of the map instead would lose it: if the user started a new cart while the payment was in flight and the payment then failed, the old cart could only go back when no new cart existed, so it could vanish silently.
+
+   With the freeze, `AddToCart` and a second checkout with another key get `ErrCheckoutInProgress`, and a failure simply unfreezes the same cart.
 3. **Charge without the lock.** The gateway call is a network call, and it carries the idempotency key so a crash-and-retry is deduped there too. Success saves the order as PLACED and deletes the cart; failure releases the key so the client can retry.
-4. **Transitions.** `transitionLocked` checks `canMove(from, to, by)`: the edge must exist and list the actor. For REJECTED or CANCELLED it writes the `RefundTask` in the same critical section, so the status and the promise to refund can never disagree. A best-effort `_ = s.pay.Refund(...)` after unlocking would drop the error, and the refund with it. Rider assignment after ACCEPTED runs without the lock, so the code re-checks that the order is still ACCEPTED before recording the rider: a customer cancel can land in between.
+4. **Transitions.** `transitionLocked` checks `canMove(from, to, by)`: the edge must exist and list the actor. For REJECTED or CANCELLED it writes the `RefundTask` in the same critical section, so the status and the promise to refund can never disagree.
+
+   A best-effort `_ = s.pay.Refund(...)` after unlocking would drop the error, and the refund with it.
+
+   Rider assignment after ACCEPTED runs without the lock, so the code re-checks that the order is still ACCEPTED before recording the rider: a customer cancel can land in between.
 5. **Refund relay.** `ProcessRefunds` copies due rows under the lock, calls the gateway without it, then marks the row done or schedules a retry with exponential backoff. Delivery is at least once, so the refund call must be idempotent at the gateway (one full refund per payment ID).
-6. **SLA auto-reject.** `ExpireUnaccepted` runs on a ticker and moves every order still PLACED after the SLA to REJECTED as the `SYSTEM` actor, using the same transition path, so the refund row comes for free. A restaurant accept and the expiry race under one lock (or the SQL status guard): whichever commits first wins and the other gets `ErrInvalidTransition`. A sweeper beats one `time.AfterFunc` per order because timers are lost on restart, while the `WHERE status = 'PLACED' AND created_at < ...` query is not.
+6. **SLA auto-reject.** `ExpireUnaccepted` runs on a ticker and moves every order still PLACED after the SLA to REJECTED as the `SYSTEM` actor, using the same transition path, so the refund row comes for free.
+
+   A restaurant accept and the expiry race under one lock (or the SQL status guard): whichever commits first wins and the other gets `ErrInvalidTransition`.
+
+   A sweeper beats one `time.AfterFunc` per order because timers are lost on restart, while the `WHERE status = 'PLACED' AND created_at < ...` query is not.
 
 ```go
 package food
@@ -1291,13 +1361,24 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 | Scale to many cities | Shard orders by city; publish status events through the outbox to Kafka; the SQL guard replaces the mutex |
 | Order history and audit | `order_events(order_id, from, to, actor, at)` written in the status transaction |
 
-Choices made: a process mutex for the interview, `UNIQUE` plus a guarded `UPDATE` in production; prepaid at checkout (stops fake orders, costs refunds; authorize-then-capture is the alternative); a transition table over state classes; an outbox for refunds instead of a best-effort call; a sweeper for the SLA instead of per-order timers; waiters on the same key get the real result and respect `ctx`.
+Choices made:
+
+- A process mutex for the interview, `UNIQUE` plus a guarded `UPDATE` in production
+- Prepaid at checkout (stops fake orders, costs refunds; authorize-then-capture is the alternative)
+- A transition table over state classes
+- An outbox for refunds instead of a best-effort call
+- A sweeper for the SLA instead of per-order timers
+- Waiters on the same key get the real result and respect `ctx`
 
 ## Drawing
 
 ![[Food Ordering System LLD Drawing.excalidraw]]
 
-The drawing shows the entities (Restaurant owns MenuItem, Cart pinned to one restaurant, Order owns OrderLine snapshots), the service facade with its three ports, the PlaceOrder flow with red branches (closed restaurant, unavailable item, payment failure), the state machine labeled by actor, and the `orders` table with `UNIQUE (user_id, idempotency_key)`. The drawing predates two changes in the code: its "take cart (delete)" box is now "freeze cart", and it has neither SYSTEM as a second actor on PLACED → REJECTED nor the refund outbox. Redraw from memory with those included: the 8 states and 8 edges with their actors, the PlaceOrder steps and which one runs without the lock (Charge), MenuItem versus OrderLine, the three ports and the pattern each one is, and the two database guards plus the refund outbox row.
+The drawing shows the entities (Restaurant owns MenuItem, Cart pinned to one restaurant, Order owns OrderLine snapshots), the service facade with its three ports, the PlaceOrder flow with red branches (closed restaurant, unavailable item, payment failure), the state machine labeled by actor, and the `orders` table with `UNIQUE (user_id, idempotency_key)`.
+
+The drawing predates two changes in the code: its "take cart (delete)" box is now "freeze cart", and it has neither SYSTEM as a second actor on PLACED → REJECTED nor the refund outbox.
+
+Redraw from memory with those included: the 8 states and 8 edges with their actors, the PlaceOrder steps and which one runs without the lock (Charge), MenuItem versus OrderLine, the three ports and the pattern each one is, and the two database guards plus the refund outbox row.
 
 ## Interview questions
 
@@ -1340,3 +1421,8 @@ I split the design into a cart, a mutable draft pinned to one restaurant, and an
 - **Before this:** [[State Machines in Go]], [[Cart Checkout with Coupons]], [[Delivery Partner Assignment]]
 - **Next:** [[Pub-Sub Message Queue]], [[Digital Wallet and Ledger]]
 - **Compare with:** [[Case Study - Payment System]] (refunds and webhooks at system level), [[Case Study - Ride Sharing and Proximity]] (rider matching), [[Case Study - Notification System]] (status fan-out)
+
+### Watch on YouTube
+
+- [Low Level Designing (LLD -4) - Food Ordering System / Low Level Design / LLD / Zomato / Swiggy  #lld](https://www.youtube.com/watch?v=Zo_YfDmkZSQ) · InterviewWithBunny · 30 min · 26,771 views
+- [System Design: Food Ordering Platform / Swiggy & Zomato Architecture / Food Ordering Platform Design](https://www.youtube.com/watch?v=_0EtmcREJ1Q) · System Design Decoded · 37 min · 849 views

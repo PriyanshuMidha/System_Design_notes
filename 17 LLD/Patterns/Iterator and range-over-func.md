@@ -10,7 +10,7 @@ sources:
   - "Go 1.24 release notes: strings.Lines, strings.SplitSeq and FieldsSeq, testing.B.Loop"
   - "Go standard library docs: iter (Seq, Seq2, Pull, Pull2), database/sql Rows, bufio.Scanner, io/fs WalkDir and SkipAll, sync.Map.Range"
   - "PostgreSQL 17 docs: LIMIT and OFFSET (skipped rows are still computed)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Iterator and range-over-func
@@ -23,6 +23,49 @@ updated: 2026-11-02
 > - In Go 1.23+ an iterator is a function `func(yield func(V) bool)` that you can `range` over.
 > - The one rule: when `yield` returns `false` (the caller broke out of the loop), stop immediately and clean up.
 > - Classic mistake: a channel fed by a goroutine as an iterator. If the caller stops early, the goroutine blocks forever and leaks.
+
+## Start here: the basics
+
+**The problem in one story.**
+You read a long book one page at a time. You do not photocopy the whole book first.
+When you find the line you wanted, you close the book and put it back on the shelf.
+An iterator gives code the same habit: get the next item only when asked, and clean up the moment you stop.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Iterator | Something that hands out items one at a time | Next order, next order, ... |
+| Lazy | Work happens only when a result is needed | Fetch page 2 only after page 1 is used up |
+| Closure | A function that remembers variables around it | `func() int { count++; return count }` |
+| `yield` | The callback an iterator calls to hand over one item | `yield(order)` returns `false` if the loop stopped |
+| `iter.Seq[V]` | Go 1.23 type for `func(yield func(V) bool)` | `for o := range orders.All() { ... }` |
+| Pagination | Reading a big table in fixed-size chunks | 4 rows per page |
+| Keyset | Remember the last ID and ask for rows after it | `WHERE id > $last` |
+| Goroutine leak | A goroutine stuck forever, never freed | Sender blocked on a channel nobody reads |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    L["for x := range seq"] -->|"asks"| S["Iterator function"]
+    S -->|"yield(item)"| L
+    S --> D["Data source:<br/>slice or DB pages"]
+    L -->|"break -> yield returns false"| C["Iterator stops<br/>and cleans up"]
+```
+
+**Analogy.** A waiter brings dishes one course at a time instead of all at once; when you say "stop, I'm full", the kitchen stops cooking.
+Where it breaks: a real kitchen may already have cooked the next dish; a correct Go iterator must not fetch more after `yield` returns `false`.
+
+**How the rest of this note builds up**
+
+- First, why iterators exist (section 1) and the mental model (section 2).
+- Then the four Go styles, the structure and a paginated iterator step by step (section 3).
+- Then a runnable worked example with tests (section 4) and a variants table (section 5).
+- Finally the SDE-3 depth: trade-offs, production use, the channel-leak deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Hand out one item at a time, and stop the instant `yield` returns `false`.
 
 ## 1. Why it exists
 
@@ -632,9 +675,17 @@ A push iterator is a function call per item. `iter.Pull` switches between two st
 
 ## 8. Deep dive
 
-**Why the channel iterator leaks.** `ChanOrders` starts a goroutine that sends each order on an unbuffered channel. When the consumer breaks out after order 2, nobody will ever receive order 3, so the goroutine blocks on that send forever. It is never collected, and neither is anything it references. A buffered channel only moves the block a few items later. The fix is a `ctx` or a `done` channel that the producer selects on, and a consumer that always cancels. Range-over-func has no second goroutine, so it has nothing to leak.
+**Why the channel iterator leaks.** `ChanOrders` starts a goroutine that sends each order on an unbuffered channel. When the consumer breaks out after order 2, nobody will ever receive order 3, so the goroutine blocks on that send forever.
 
-**What `iter.Pull` costs.** It runs the push iterator on a separate goroutine stack and switches to it on each `next()` call. The runtime hands control over directly with a coroutine switch instead of parking one goroutine on a channel and waking the other through the scheduler, which is why it measured faster than the channel version above but far slower than a plain range. Until `stop()` is called or the sequence ends, that suspended iterator holds whatever it opened.
+It is never collected, and neither is anything it references. A buffered channel only moves the block a few items later. The fix is a `ctx` or a `done` channel that the producer selects on, and a consumer that always cancels.
+
+Range-over-func has no second goroutine, so it has nothing to leak.
+
+**What `iter.Pull` costs.** It runs the push iterator on a separate goroutine stack and switches to it on each `next()` call.
+
+The runtime hands control over directly with a coroutine switch instead of parking one goroutine on a channel and waking the other through the scheduler, which is why it measured faster than the channel version above but far slower than a plain range.
+
+Until `stop()` is called or the sequence ends, that suspended iterator holds whatever it opened.
 
 **Keyset vs offset paging inside an iterator.** With `LIMIT 100 OFFSET 100000`, PostgreSQL still computes and discards the 100,000 skipped rows, so every page gets slower as the scan advances. Keyset paging remembers the last key and seeks to it through the index:
 
@@ -649,7 +700,9 @@ LIMIT $2;
 
 Sorting by a non-unique column needs a tie-breaker in both the `ORDER BY` and the condition: `WHERE (created_at, id) > ($1, $2) ORDER BY created_at, id`.
 
-**A paged scan is not a snapshot.** Each page is a separate query. Rows inserted behind the cursor are skipped, and rows updated between pages can be seen in their newer state. If the export must be consistent, run all pages inside one `REPEATABLE READ` transaction (which keeps one snapshot open for the whole scan) or accept and document the drift.
+**A paged scan is not a snapshot.** Each page is a separate query. Rows inserted behind the cursor are skipped, and rows updated between pages can be seen in their newer state.
+
+If the export must be consistent, run all pages inside one `REPEATABLE READ` transaction (which keeps one snapshot open for the whole scan) or accept and document the drift.
 
 **Single-use and reusable sequences.** `slices.Values(s)` can be ranged many times. A sequence that reads from a network stream can be ranged once. The `iter` package docs ask each API to document which it is. `Store.All` re-runs its queries on every range.
 
@@ -692,3 +745,8 @@ Sorting by a non-unique column needs a tie-breaker in both the `ORDER BY` and th
 - **Next:** [[Repository and Unit of Work]]
 - **Compare with:** [[Composite]] (walking a tree is the classic place for an iterator), [[Rare GoF Patterns in Go]] (Visitor and `fs.WalkDir` callbacks), [[Goroutines and Channels]] (when a channel really is the right tool), [[Pagination, Filtering and Sorting]] (keyset paging at the API level), [[Database Access (database-sql, pgx, sqlc)]] (`Rows` in depth)
 - **Practice:** [[File Search (Unix find)]]
+
+### Watch on YouTube
+
+- [GopherCon 2024: Range Over Function Types - Ian Lance Taylor](https://www.youtube.com/watch?v=i9zwUT9dlVc) · Gopher Academy · 23 min · 4,531 views
+- [Function iterators aren't as bad as I thought...](https://www.youtube.com/watch?v=xEmgcGHs3cA) · Dreams of Code · 4 min · 25,707 views

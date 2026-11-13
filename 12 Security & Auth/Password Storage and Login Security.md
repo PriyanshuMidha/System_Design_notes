@@ -9,7 +9,7 @@ sources:
   - "NIST SP 800-63B, Digital Identity Guidelines (Authentication and Lifecycle Management) — memorized secret requirements, breach-check guidance"
   - "golang.org/x/crypto/argon2 package documentation"
   - "golang.org/x/crypto/bcrypt package documentation (72-byte input limit, ErrPasswordTooLong)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Password Storage and Login Security
@@ -51,13 +51,64 @@ sequenceDiagram
     end
 ```
 
+## Start here: the basics
+
+**The problem in one story.**
+A website's database gets stolen.
+If passwords were stored as plain text, every account is gone instantly, and people reuse passwords elsewhere.
+If they were stored as slow, salted hashes, attackers must guess each password one by one, very slowly.
+This note is how to store passwords and protect the login form.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Hash | A one-way function: easy to compute, can't be reversed | `sha256("cat")` -> fixed 64 hex chars |
+| Salt | Random bytes mixed into each password before hashing | 16 random bytes stored with the hash |
+| Slow hash / KDF | A hash deliberately made expensive to compute | argon2id, bcrypt, scrypt |
+| Brute force | Trying many guesses until one works | Testing billions of passwords offline |
+| Credential stuffing | Trying leaked email/password pairs from other sites | Leaked LinkedIn list tried on your login |
+| Rate limiting | Capping attempts per user or IP | 5 failures then wait |
+| MFA | A second proof beyond the password | A 6-digit code from an app |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Password typed"] --> S["+ random salt"]
+    S --> K["Slow hash<br/>(argon2id)"]
+    K --> DB["Store salt + hash"]
+    L["Login attempt"] --> K2["Same salt + slow hash"]
+    K2 --> C{"Matches stored hash?"}
+    DB --> C
+```
+
+**Analogy.** A paper shredder that always shreds the same page into the same pattern. You keep only the shreds; to check a page you shred it again and compare. Salt is a unique sticker on each page so two identical pages shred differently.
+Where it breaks: real shredding is fast; a password hash is made slow on purpose so an attacker can't try billions of guesses per second.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then how hashing, salting and verification work (section 3) and a full Go login example (section 4).
+- Then argon2id vs bcrypt vs scrypt vs plain SHA (section 5).
+- Finally the SDE-3 deep dive: tuning cost parameters, rate limiting, credential stuffing defense and migration of old hashes (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> Never store passwords; store a salted, deliberately slow hash and compare in constant time.
+
 ## 1. Why it exists
 
-Suppose a database of 10 million user rows leaks, each storing `SHA256(password)` with no salt. SHA-256 is designed to be *fast* — that is exactly the wrong property for password storage. A single consumer GPU computes roughly 10 billion SHA-256 hashes per second. An attacker precomputes a rainbow table once (hash → common password) and instantly recovers every user whose password appears in any common wordlist — because with no salt, two users with the same password produce the same stored hash, and one table attack breaks both.
+Suppose a database of 10 million user rows leaks, each storing `SHA256(password)` with no salt. SHA-256 is designed to be *fast* — that is exactly the wrong property for password storage. A single consumer GPU computes roughly 10 billion SHA-256 hashes per second.
 
-Argon2id with the OWASP-minimum parameters (19 MiB memory, 2 iterations) costs roughly 20–50 ms of CPU time and 19 MiB of RAM *per guess*, on the same hardware. The same GPU that did 10 billion SHA-256 guesses a second manages a few thousand argon2id guesses a second, because the algorithm is deliberately memory-hard: GPUs have thousands of weak cores but comparatively little fast memory per core, so forcing every guess to touch 19 MiB defeats the GPU's main advantage. That difference — SHA-256 at ~10,000,000,000 guesses/sec vs argon2id at a few thousand — is the entire reason password hashing functions exist as a separate category from general-purpose cryptographic hashes.
+An attacker precomputes a rainbow table once (hash → common password) and instantly recovers every user whose password appears in any common wordlist — because with no salt, two users with the same password produce the same stored hash, and one table attack breaks both.
 
-Each password also gets its own random salt. Without a salt, two users who both pick "password123" produce an identical hash, so cracking one row cracks every row sharing that password — and a precomputed table works across the whole database at once. With a unique salt per password, the attacker must redo the expensive computation for every single row, even for repeated passwords.
+Argon2id with the OWASP-minimum parameters (19 MiB memory, 2 iterations) costs roughly 20–50 ms of CPU time and 19 MiB of RAM *per guess*, on the same hardware. The same GPU that did 10 billion SHA-256 guesses a second manages a few thousand argon2id guesses a second, because the algorithm is deliberately memory-hard: GPUs have thousands of weak cores but comparatively little fast memory per core, so forcing every guess to touch 19 MiB defeats the GPU's main advantage.
+
+That difference — SHA-256 at ~10,000,000,000 guesses/sec vs argon2id at a few thousand — is the entire reason password hashing functions exist as a separate category from general-purpose cryptographic hashes.
+
+Each password also gets its own random salt. Without a salt, two users who both pick "password123" produce an identical hash, so cracking one row cracks every row sharing that password — and a precomputed table works across the whole database at once.
+
+With a unique salt per password, the attacker must redo the expensive computation for every single row, even for repeated passwords.
 
 ## 2. Mental model
 
@@ -85,7 +136,9 @@ Memory-hardness is the key property that separates argon2id/scrypt from bcrypt a
 
 The final comparison between a freshly computed hash and the stored one must run in constant time (`subtle.ConstantTimeCompare`, never `==` or `bytes.Equal`), so that an attacker cannot use response-timing differences to learn how many leading bytes of a guess matched.
 
-A second, higher-level timing channel is user enumeration: if `POST /login` returns "fast 401, no such user" for an unknown email but runs the full argon2id computation (slow) for a known email with a wrong password, the response time alone reveals which emails exist. The fix is a **dummy hash**: for an unknown email, run `Verify` against a precomputed, fixed, never-issued hash anyway, so both paths cost the same time and return the same generic error ("invalid email or password").
+A second, higher-level timing channel is user enumeration: if `POST /login` returns "fast 401, no such user" for an unknown email but runs the full argon2id computation (slow) for a known email with a wrong password, the response time alone reveals which emails exist.
+
+The fix is a **dummy hash**: for an unknown email, run `Verify` against a precomputed, fixed, never-issued hash anyway, so both paths cost the same time and return the same generic error ("invalid email or password").
 
 ```mermaid
 flowchart TD
@@ -419,3 +472,8 @@ Pure lockout is itself an attack vector: an attacker who wants to deny a specifi
 - **Before this:** [[Authentication vs Authorization]]
 - **Next:** [[Sessions and Cookies]], [[JWT - Structure, Validation and Pitfalls]]
 - **Compare with:** [[API Abuse and Bot Protection]] (credential stuffing and login-abuse defenses at the edge), [[Authentication and Authorization in Go]] (wiring this hash into a full login handler), [[Rate Limiting - Algorithms and Distributed Design]] (the algorithms behind login throttling)
+
+### Watch on YouTube
+
+- [Password Storage Tier List: encryption, hashing, salting, bcrypt, and beyond](https://www.youtube.com/watch?v=qgpsIBLvrGY) · Studying With Alex · 10 min · 339,130 views
+- [🔐 Password Security for Beginners: Storage & Protection Explained!](https://www.youtube.com/watch?v=hXX91VlfbLw) · CodeLucky · 8 min · 77 views

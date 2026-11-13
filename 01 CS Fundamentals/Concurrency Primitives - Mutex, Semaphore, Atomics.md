@@ -9,7 +9,7 @@ sources:
   - "Coffman, Elphick & Shoshani, System Deadlocks (ACM Computing Surveys, 1971)"
   - "Herlihy & Shavit, The Art of Multiprocessor Programming, ch. 5 (locks) and ch. 10 (CAS)"
 status: reviewed
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Concurrency Primitives - Mutex, Semaphore, Atomics
@@ -25,9 +25,60 @@ updated: 2026-11-09
 > - **Deadlock** needs four conditions at once (Coffman): mutual exclusion, hold-and-wait, no preemption, circular wait. Break any one and it can't happen.
 > - The **Go memory model**'s happens-before relation is what actually tells you whether a value written by one goroutine is guaranteed visible to another — a mutex, channel or atomic op is what establishes that relation; a plain variable write gives you none.
 
+## Start here: the basics
+
+**The problem in one story.**
+Two people share one bank account and both open the banking app at the same moment.
+Each sees 100, each deposits 1, each app saves "101".
+Two deposits happened, but the account shows only one.
+This note is about the tools that make the second person wait their turn.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Thread / goroutine | One line of work the program runs, side by side with others | Two goroutines each handling one web request |
+| Shared memory | A variable more than one thread can read and write | A global `balance int` |
+| Critical section | Code that touches shared data and must not overlap with itself | The line `balance++` |
+| Race condition | The result depends on which thread happens to run first | Two deposits, only one counted |
+| Lock / unlock | Claim the right to enter, then give it back | `mu.Lock()` ... `mu.Unlock()` |
+| Block / wait | A thread pauses until something it needs is free | Goroutine B paused inside `Lock()` |
+| Atomic | Happens as one step that cannot be split or interrupted | `atomic.Int64.Add(1)` |
+| Deadlock | Threads wait on each other forever, so nobody moves | A holds lock 1 and wants 2; B holds 2 and wants 1 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Goroutine A"] --> Q{"Who may touch<br/>shared data now?"}
+    B["Goroutine B"] --> Q
+    Q -- "exactly one" --> M["Mutex"]
+    Q -- "up to N" --> S["Semaphore"]
+    Q -- "one tiny step,<br/>no waiting" --> AT["Atomic"]
+```
+
+**Analogy.** A single-person bathroom with a lock on the door: whoever is inside locks it, everyone else waits in line.
+Where it breaks: a bathroom line is fair and visible; real lock waiters may not be served in arrival order, and nothing stops a buggy program from walking in without locking.
+
+**How the rest of this note builds up**
+
+- First, why races happen (section 1) and a mental model of each tool: door, garage, coin slot (section 2).
+- Then how mutexes, RWMutex, semaphores and compare-and-swap work, plus the ABA problem and deadlock (section 3).
+- Then a traced example and a comparison table (sections 4-5).
+- Finally the SDE-3 deep dive: trade-offs, production failure modes, and the Go memory model's happens-before (sections 6-8).
+
+> [!tip] Remember
+> Shared data plus more than one writer needs a rule for who goes first; mutex, semaphore and atomics are three such rules.
+
 ## 1. Why it exists
 
-Two goroutines both run `balance++` on a shared `int`. That one line of Go is really three separate CPU steps underneath: load `balance` into a register, add one to the register, store the register back to memory. A single CPU core never mixes those three steps up for one goroutine — the problem only appears once a *second* goroutine's three steps can interleave with the first's.
+Two goroutines both run `balance++` on a shared `int`. That one line of Go is really three separate CPU steps underneath:
+
+1. Load `balance` into a register.
+2. Add one to the register.
+3. Store the register back to memory.
+
+A single CPU core never mixes those three steps up for one goroutine — the problem only appears once a *second* goroutine's three steps can interleave with the first's.
 
 Picture the bad interleaving directly, with starting balance 100:
 
@@ -40,9 +91,13 @@ Picture the bad interleaving directly, with starting balance 100:
 | 5 | — | add 1 → register holds 101 | 101 |
 | 6 | — | store 101 to memory | **101** |
 
-Two increments happened. The balance only went up by one, because B's load (step 2) read the value from *before* A's store (step 4) landed. This is a **race condition**: the final result depends on the exact interleaving of instructions across threads, which the scheduler (see [[CPU Scheduling]]) controls and you don't.
+Two increments happened. The balance only went up by one, because B's load (step 2) read the value from *before* A's store (step 4) landed.
 
-This isn't a rare edge case. Run `go test -race` on naive concurrent code and it reliably fires, because the race detector instruments every memory access and flags any pair of concurrent accesses to the same location where at least one is a write and there's no happens-before edge between them — exactly the condition in the table above.
+This is a **race condition**: the final result depends on the exact interleaving of instructions across threads, which the scheduler (see [[CPU Scheduling]]) controls and you don't.
+
+This isn't a rare edge case. Run `go test -race` on naive concurrent code and it reliably fires.
+
+That is because the race detector instruments every memory access and flags any pair of concurrent accesses to the same location where at least one is a write and there's no happens-before edge between them — exactly the condition in the table above.
 
 > [!warning] Common mistake
 > "It worked in every test run, so it's fine" proves nothing. A race condition's outcome depends on scheduler timing, which varies with load, core count, and even which other process the OS happens to run next — passing one hundred quiet local test runs says nothing about behavior under production load. `go test -race` instruments the memory accesses themselves, so it can catch the bug even on a run where the wrong interleaving never actually happened to occur.
@@ -141,7 +196,11 @@ sequenceDiagram
 
 ### Mutex vs RWMutex
 
-`sync.Mutex` excludes everyone, readers included. `sync.RWMutex` lets any number of readers hold `RLock()` concurrently, but a writer's `Lock()` waits for all current readers to finish and blocks new readers until it's done — correct for read-heavy data (a config cache refreshed rarely, read constantly) where exclusive locking would serialize reads that don't actually conflict with each other.
+`sync.Mutex` excludes everyone, readers included.
+
+`sync.RWMutex` lets any number of readers hold `RLock()` concurrently, but a writer's `Lock()` waits for all current readers to finish and blocks new readers until it's done.
+
+That is correct for read-heavy data (a config cache refreshed rarely, read constantly) where exclusive locking would serialize reads that don't actually conflict with each other.
 
 ```mermaid
 flowchart TD
@@ -157,7 +216,11 @@ flowchart TD
 
 ### Semaphores
 
-A semaphore holds a count. `Acquire` decrements it, blocking if it's already zero; `Release` increments it, waking a waiter if any. The simplest correct implementation in Go is a buffered channel: its buffer slot count *is* the semaphore's count, and the blocking behavior of sending to a full channel or receiving from an empty one gives you `Acquire`/`Release` for free. (The standard library also ships `golang.org/x/sync/semaphore` with a weighted, context-cancellable `Acquire` for cases needing more than a fixed-weight count.)
+A semaphore holds a count. `Acquire` decrements it, blocking if it's already zero; `Release` increments it, waking a waiter if any.
+
+The simplest correct implementation in Go is a buffered channel: its buffer slot count *is* the semaphore's count, and the blocking behavior of sending to a full channel or receiving from an empty one gives you `Acquire`/`Release` for free.
+
+(The standard library also ships `golang.org/x/sync/semaphore` with a weighted, context-cancellable `Acquire` for cases needing more than a fixed-weight count.)
 
 ```mermaid
 flowchart LR
@@ -173,7 +236,13 @@ flowchart LR
 
 ### Atomics and compare-and-swap
 
-An atomic operation is a single CPU instruction (on x86-64, backed by the `LOCK` instruction prefix; on ARM64, by load-linked/store-conditional or the newer LSE atomic instructions) that reads, modifies and writes a word with a hardware guarantee that no other core can observe or interleave a partial step. `sync/atomic`'s `Add`, `Load` and `Store` cover the simple cases directly. **Compare-and-swap (CAS)** is the general building block underneath: "if the current value is still what I last read, replace it with this new value; otherwise tell me it changed and don't touch it." Every lock-free data structure is, at its core, a loop around CAS:
+An atomic operation is a single CPU instruction (on x86-64, backed by the `LOCK` instruction prefix; on ARM64, by load-linked/store-conditional or the newer LSE atomic instructions) that reads, modifies and writes a word with a hardware guarantee that no other core can observe or interleave a partial step.
+
+`sync/atomic`'s `Add`, `Load` and `Store` cover the simple cases directly.
+
+**Compare-and-swap (CAS)** is the general building block underneath: "if the current value is still what I last read, replace it with this new value; otherwise tell me it changed and don't touch it."
+
+Every lock-free data structure is, at its core, a loop around CAS:
 
 ```mermaid
 flowchart TD
@@ -185,7 +254,11 @@ flowchart TD
 
 ### The ABA problem: why CAS is harder than it looks
 
-CAS checks "is the value still what I last read?" — but it compares *values*, not *history*. If a value changes away and then changes back to the exact same value between your load and your CAS, your CAS sees no difference and swaps anyway, even though the world moved in between. Walk it through with a lock-free stack whose top pointer starts at node **A**:
+CAS checks "is the value still what I last read?" — but it compares *values*, not *history*.
+
+If a value changes away and then changes back to the exact same value between your load and your CAS, your CAS sees no difference and swaps anyway, even though the world moved in between.
+
+Walk it through with a lock-free stack whose top pointer starts at node **A**:
 
 1. Goroutine 1 reads `top == A` (it plans to pop A, replacing `top` with `A.next`, which is **B**).
 2. Before goroutine 1's CAS runs, goroutine 2 pops **A** (top becomes B), pops **B** (top becomes C), and then pushes a *brand-new* node that happens to be allocated at the same address as the old **A** and pushes it back on top (top becomes A again — same address, different logical node).
@@ -205,7 +278,9 @@ sequenceDiagram
     Note over S: top now points at B, which G2 already removed.<br/>Stack corrupted — CAS was fooled by a value that came back.
 ```
 
-**Why it matters:** this is why production lock-free structures add a version counter or generation tag alongside the pointer (a "tagged pointer" or `atomic.Pointer` plus a separate monotonically increasing stamp), so the CAS compares "value *and* version," not value alone — two states with the same pointer but different versions no longer look identical to the CAS.
+**Why it matters:** this is why production lock-free structures add a version counter or generation tag alongside the pointer (a "tagged pointer" or `atomic.Pointer` plus a separate monotonically increasing stamp).
+
+The CAS then compares "value *and* version," not value alone — two states with the same pointer but different versions no longer look identical to the CAS.
 
 > [!warning] Common mistake
 > Assuming "CAS succeeded" means "nothing happened in between." It only means "the value I'm comparing against looks the same right now" — which the ABA problem shows is not the same guarantee.
@@ -233,7 +308,9 @@ stateDiagram-v2
     Deadlock --> Deadlock: circular wait, no preemption — stuck forever
 ```
 
-The standard fix breaks circular wait: give every lock a fixed global order and always acquire locks in that order, everywhere in the codebase. If every transfer locks the lower-numbered account before the higher-numbered one, A→B and B→A transfers never deadlock, because both always try `muA` before `muB`.
+The standard fix breaks circular wait: give every lock a fixed global order and always acquire locks in that order, everywhere in the codebase.
+
+If every transfer locks the lower-numbered account before the higher-numbered one, A→B and B→A transfers never deadlock, because both always try `muA` before `muB`.
 
 > [!tip] Remember
 > Breaking any single Coffman condition prevents deadlock. In practice, breaking circular wait (a fixed lock order) is almost always the cheapest fix, because the other three conditions are usually inherent to what a lock is for.
@@ -263,7 +340,9 @@ Trace it with two goroutines calling `Inc()` at nearly the same instant, startin
 4. The runtime wakes goroutine B's blocked `Lock()` call; B now holds the mutex.
 5. Goroutine B runs `c.n++` (now `n == 2`) and returns, unlocking in turn.
 
-No interleaving of the two `c.n++` operations is possible, because the mutex guarantees steps 3 and 5 can never overlap. The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the channel-based `Semaphore`, and the deadlock-free `AccountStore` transfer — plus all six tests (including a hammered CAS-loop test, a live-holder-count semaphore test, and a 500-way concurrent-transfer test that would hang on a bad lock order) live in the runnable version: [[Concurrency Primitives - Mutex, Semaphore, Atomics - Go]].
+No interleaving of the two `c.n++` operations is possible, because the mutex guarantees steps 3 and 5 can never overlap.
+
+The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the channel-based `Semaphore`, and the deadlock-free `AccountStore` transfer — plus all five tests (including a hammered CAS-loop test, a live-holder-count semaphore test, and a 500-way concurrent-transfer test that would hang on a bad lock order) live in the runnable version: [[Concurrency Primitives - Mutex, Semaphore, Atomics - Go]].
 
 ## 5. Variants and comparison
 
@@ -300,7 +379,14 @@ No interleaving of the two `c.n++` operations is possible, because the mutex gua
 
 ## 8. Deep dive
 
-- **The Go memory model's happens-before relation**, formalized in `go.dev/ref/mem`, is the actual contract: a goroutine's write `W` is guaranteed visible to a read `R` in another goroutine only if there is a happens-before edge from `W` to `R`. The language guarantees such an edge for: a `Mutex.Unlock()` happens-before the next `Lock()` that acquires it; a send on a channel happens-before the corresponding receive completes; the closing of a channel happens-before a receive that returns because it was closed; and `sync.Once.Do`'s function call happens-before any `Do` call returns. Without one of these (or an atomic operation, which the memory model also defines ordering for), the compiler and CPU are free to reorder or cache the write, and two goroutines can legitimately observe different values — this is exactly what `go test -race` is built to catch, and exactly why "it worked when I tested it without the lock" proves nothing.
+- **The Go memory model's happens-before relation**, formalized in `go.dev/ref/mem`, is the actual contract: a goroutine's write `W` is guaranteed visible to a read `R` in another goroutine only if there is a happens-before edge from `W` to `R`.
+	- The language guarantees such an edge for:
+		- a `Mutex.Unlock()` happens-before the next `Lock()` that acquires it;
+		- a send on a channel happens-before the corresponding receive completes;
+		- the closing of a channel happens-before a receive that returns because it was closed;
+		- `sync.Once.Do`'s function call happens-before any `Do` call returns.
+	- Without one of these (or an atomic operation, which the memory model also defines ordering for), the compiler and CPU are free to reorder or cache the write, and two goroutines can legitimately observe different values.
+	- This is exactly what `go test -race` is built to catch, and exactly why "it worked when I tested it without the lock" proves nothing.
 - **Why CAS, not just lock-free "increment"**: an atomic add is enough for a simple counter, but most lock-free algorithms need "update X to a new value computed from X's old value, but only if nothing else changed X first" — that's the ABA-problem-aware core of CAS (walked through in section 2), and it's what lock-free stacks, queues and `sync.Map`'s fast path are built from.
 - **Spinlocks vs blocking mutexes**: a spinlock busy-waits (loops on CAS) instead of yielding to the scheduler, which is only a win when the expected wait is shorter than a context switch would cost — the Go runtime itself uses brief spinning before parking a goroutine on a contended `sync.Mutex`, a hybrid of both strategies.
 - **This note covers the general, OS/CS-level concurrency primitives.** Go-specific deeper material — `sync.Once`, `sync.Map`, `sync.Pool`, `errgroup`, and the full Go memory model's formal treatment of data races — lives in [[sync Primitives and Atomics]] and [[Memory Model and Data Races]]; goroutine-to-goroutine communication patterns built on channels live in [[Goroutines and Channels]].
@@ -321,7 +407,11 @@ No interleaving of the two `c.n++` operations is possible, because the mutex gua
 > [!trap] This is the single most common wrong answer to "is this lock-free code correct" — each individual operation being atomic says nothing about cross-field consistency.
 
 > [!question]- Your service deadlocks under load but never in local testing. How do you debug it in production without redeploying?
-> Trigger a goroutine dump without killing the process — `kill -QUIT` on the PID (prints all goroutine stacks and exits) is destructive, so prefer wiring up `net/http/pprof`'s `/debug/pprof/goroutine?debug=2` endpoint ahead of time, which dumps every goroutine's stack live. Look for goroutines blocked on `Lock()` or a channel operation and trace which lock each one is waiting for versus holding, to find the cycle.
+> Trigger a goroutine dump without killing the process.
+>
+> `kill -QUIT` on the PID (prints all goroutine stacks and exits) is destructive, so prefer wiring up `net/http/pprof`'s `/debug/pprof/goroutine?debug=2` endpoint ahead of time, which dumps every goroutine's stack live.
+>
+> Look for goroutines blocked on `Lock()` or a channel operation and trace which lock each one is waiting for versus holding, to find the cycle.
 
 > [!question]- What does the Go memory model actually guarantee about a plain (non-atomic, non-mutex-protected) shared variable?
 > Essentially nothing, across goroutines. Without a happens-before edge (from a mutex, channel operation, atomic access, or `sync.Once`), the compiler and CPU may reorder, cache in a register, or otherwise make one goroutine's write invisible or out-of-order to another goroutine's read — this is precisely what `go test -race` flags, independent of whether the bug ever manifests as a visibly wrong value in a given run.
@@ -347,3 +437,7 @@ No interleaving of the two `c.n++` operations is possible, because the mutex gua
 - **Next:** [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]], [[Goroutines and Channels]]
 - **Compare with:** [[sync Primitives and Atomics]] (Go-specific APIs: `sync.Once`, `sync.Map`, `errgroup`), [[Memory Model and Data Races]] (the formal happens-before treatment)
 - **Runnable code:** [[Concurrency Primitives - Mutex, Semaphore, Atomics - Go]]
+
+### Watch on YouTube
+
+- [Mutex vs Semaphore Explained / Concurrency in a Nutshell](https://www.youtube.com/watch?v=iwJt6hqWfTE) · Nutshell · Short, clear comparison of mutex vs semaphore matching the note's core distinction

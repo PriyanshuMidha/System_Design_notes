@@ -8,7 +8,7 @@ sources:
   - "12factor.net, III. Config"
   - "Go 1.24 flag package docs"
   - "Go 1.24 log/slog package docs, LogValuer"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Configuration and Secrets
@@ -22,6 +22,51 @@ updated: 2026-11-07
 > - Collect every validation error with `errors.Join` and fail fast before any dependency is built, so one run reports every missing variable instead of one at a time.
 > - A secret is a special kind of config value: never commit it, never log it, and its storage and rotation are a different concern (link [[Secrets Management]]) from the typed-loading problem this note solves.
 > - Precedence, lowest to highest: built-in defaults → config file → environment variables → command-line flags.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your service runs on your laptop, in staging and in production.
+Each place uses a different database and a different secret key.
+You do not want to edit and rebuild the code for each place.
+So the code reads these values from outside, once, when it starts.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Environment variable | A named text value the OS hands to a program at start | `HTTP_ADDR=:8080` |
+| Config | Every value that changes per environment, not per code change | DB address, timeouts |
+| Secret | A config value that must never be shown or committed | `JWT_SECRET`, DB password |
+| Struct | A Go type that groups named fields | `type Config struct { Addr string }` |
+| Parse | Turn text into a typed value | `"5s"` → `5 * time.Second` |
+| Validate | Check every value is present and sensible | port must be a number |
+| Default | The value used when nothing is set | `:8080` if `HTTP_ADDR` is unset |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D["Defaults"] --> L["Load()<br/>in main"]
+    E["Env vars"] --> L
+    F["Flags"] --> L
+    L -- "any error" --> X["Exit with<br/>all errors listed"]
+    L -- "ok" --> C["Typed Config"]
+    C --> S["Server, DB,<br/>other parts"]
+```
+
+**Analogy.** A shop manager checks one opening-day form, all fields at once, then hands each desk only what it needs.
+Where it breaks: a paper form cannot change later, while a real service may reload some values (feature flags) at runtime through a different system.
+
+**How the rest of this note builds up**
+
+- First, why config lives outside the code (section 1) and the form mental model (section 2).
+- Then how loading works: `LookupEnv` vs `Getenv`, typed parsing, `errors.Join` and precedence (section 3).
+- Then a full `Load` function with a redacting `Secret` type (section 4) and library choices (section 5).
+- Finally the SDE-3 view: production failures, secret rotation and deep-dive trade-offs (sections 6-8).
+
+> [!tip] Remember
+> Read config once in `main`, check everything together, fail fast, and never print a secret.
 
 ### Whiteboard version
 
@@ -44,13 +89,21 @@ The rest of this note turns that one-variable shape into a typed struct that loa
 
 ## 1. Why it exists
 
-InvoiceOps runs the same binary in three environments: a developer's laptop, a staging cluster and production. The database address, the log verbosity and the JWT signing key are different in each one, but the code that uses them must not change. The [12-factor app](https://12factor.net/config) rule for this is strict: config is read from the environment, never baked into the binary and never read from a committed file alongside the code (a config file checked into git is still code, just worse code — it can't differ per environment without a new commit).
+InvoiceOps runs the same binary in three environments: a developer's laptop, a staging cluster and production. The database address, the log verbosity and the JWT signing key are different in each one, but the code that uses them must not change.
 
-Concretely, if `internal/repository` called `os.Getenv("DATABASE_URL")` directly, every package that needs a connection string would duplicate that call, nothing would catch a missing variable until the exact line that reads it executes — possibly minutes into a request — and no test could set a fake value without mutating real process state. A typed `Config`, loaded once in `main` and passed down as a constructor argument, fixes all three: one place reads the environment, `Load` fails before the server starts if anything is missing or malformed, and tests pass in a fake config instead of a real environment.
+The [12-factor app](https://12factor.net/config) rule for this is strict: config is read from the environment, never baked into the binary and never read from a committed file alongside the code (a config file checked into git is still code, just worse code — it can't differ per environment without a new commit).
+
+Concretely, if `internal/repository` called `os.Getenv("DATABASE_URL")` directly, every package that needs a connection string would duplicate that call, nothing would catch a missing variable until the exact line that reads it executes — possibly minutes into a request — and no test could set a fake value without mutating real process state.
+
+A typed `Config`, loaded once in `main` and passed down as a constructor argument, fixes all three: one place reads the environment, `Load` fails before the server starts if anything is missing or malformed, and tests pass in a fake config instead of a real environment.
 
 ## 2. Mental model
 
-Treat configuration like a form someone has to fill out completely before a shop opens for the day. `Load` is the manager reading that form once, at opening time: every required field gets checked, every optional field gets a sensible default if left blank, and if three fields are wrong the manager tells the owner about all three circumstances at once rather than stopping at the first blank box and making them submit the form repeatedly. Only once the form passes does the shop's `main` hand it to the cash register, the stockroom and the delivery desk — not one of which goes and reads the form itself.
+Treat configuration like a form someone has to fill out completely before a shop opens for the day.
+
+`Load` is the manager reading that form once, at opening time: every required field gets checked, every optional field gets a sensible default if left blank, and if three fields are wrong the manager tells the owner about all three circumstances at once rather than stopping at the first blank box and making them submit the form repeatedly.
+
+Only once the form passes does the shop's `main` hand it to the cash register, the stockroom and the delivery desk — not one of which goes and reads the form itself.
 
 A secret is a field on that form that gets covered with a strip of tape before anyone photocopies it. It's still filled in, it still works when the register needs it, but anyone just glancing at the form, or printing it in a report, only ever sees "REDACTED".
 
@@ -69,7 +122,9 @@ Each stage only overrides what the previous stage set; nothing re-reads a variab
 
 ### `LookupEnv` vs `Getenv`, and why it matters
 
-`os.Getenv(key)` returns `""` both when the variable is unset and when it's set to an empty string — the two are indistinguishable. `os.LookupEnv(key)` returns `(value, ok)`, so "not set, use the default" and "set to empty on purpose" are different cases. For a required field like `JWT_SECRET`, that distinction is the difference between "fail loudly because an operator forgot to set it" and "silently sign tokens with an empty-string key", which is a confirmed footgun, not a hypothetical one.
+`os.Getenv(key)` returns `""` both when the variable is unset and when it's set to an empty string — the two are indistinguishable. `os.LookupEnv(key)` returns `(value, ok)`, so "not set, use the default" and "set to empty on purpose" are different cases.
+
+For a required field like `JWT_SECRET`, that distinction is the difference between "fail loudly because an operator forgot to set it" and "silently sign tokens with an empty-string key", which is a confirmed footgun, not a hypothetical one.
 
 ### Typed parsing
 
@@ -119,11 +174,17 @@ if v, ok := os.LookupEnv("DATABASE_URL"); !ok {
 // never reaches the JWT_SECRET check if DATABASE_URL was already missing
 ```
 
-An operator fixes `DATABASE_URL`, redeploys, and immediately hits the next missing variable — one broken deploy per missing field. `errors.Join` (Go 1.20) fixes this: every check appends to a slice of errors regardless of whether earlier checks failed, and `errors.Join(errs...)` folds them into one error whose `Error()` lists every message, separated by newlines, and whose `Unwrap() []error` still lets `errors.Is`/`errors.As` inspect each one individually.
+An operator fixes `DATABASE_URL`, redeploys, and immediately hits the next missing variable — one broken deploy per missing field.
+
+`errors.Join` (Go 1.20) fixes this: every check appends to a slice of errors regardless of whether earlier checks failed, and `errors.Join(errs...)` folds them into one error whose `Error()` lists every message, separated by newlines, and whose `Unwrap() []error` still lets `errors.Is`/`errors.As` inspect each one individually.
 
 ### Precedence and libraries
 
-Flags beat environment variables beat a config file beat defaults. The standard library's `flag` package is enough for a handful of overrides; past a dozen flags, or when documented, typed, prefix-based env binding is wanted, `github.com/caarlos0/env` and `github.com/kelseyhightower/envconfig` do the struct-tag-to-field mapping this note's `Load` does by hand, with no config-file support. `github.com/knadh/koanf` adds layered file + env + flag merging without `viper`'s global, package-level state (`viper.Get` reads a singleton no test can isolate) and without viper's automatic key lowercasing, which silently breaks a key that differs only by case.
+Flags beat environment variables beat a config file beat defaults.
+
+The standard library's `flag` package is enough for a handful of overrides; past a dozen flags, or when documented, typed, prefix-based env binding is wanted, `github.com/caarlos0/env` and `github.com/kelseyhightower/envconfig` do the struct-tag-to-field mapping this note's `Load` does by hand, with no config-file support.
+
+`github.com/knadh/koanf` adds layered file + env + flag merging without `viper`'s global, package-level state (`viper.Get` reads a singleton no test can isolate) and without viper's automatic key lowercasing, which silently breaks a key that differs only by case.
 
 ### Secrets: storage, not just loading
 
@@ -135,7 +196,9 @@ Flags beat environment variables beat a config file beat defaults. The standard 
 
 ### Feature flags are not config
 
-A feature flag (`new-checkout-flow: true`) changes behavior per user, cohort or percentage rollout, and typically flips without a deploy through a dedicated service (LaunchDarkly, Unleash, a database-backed flag table). Startup config is read once and fixed for the process's lifetime. Treating a flag as a `Config` field means every flip needs a restart; treating config as a flag means a value that should never change per-request (`DATABASE_URL`) now has runtime-mutable state nothing guards. (Flag system design is [[Feature Flags]]'s job.)
+A feature flag (`new-checkout-flow: true`) changes behavior per user, cohort or percentage rollout, and typically flips without a deploy through a dedicated service (LaunchDarkly, Unleash, a database-backed flag table). Startup config is read once and fixed for the process's lifetime.
+
+Treating a flag as a `Config` field means every flip needs a restart; treating config as a flag means a value that should never change per-request (`DATABASE_URL`) now has runtime-mutable state nothing guards. (Flag system design is [[Feature Flags]]'s job.)
 
 ## 4. Worked example
 
@@ -528,3 +591,7 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
 - **Before this:** [[Service Project Layout and Wiring]]
 - **Next:** [[HTTP Server Fundamentals (net-http)]]
 - **Compare with:** [[Secrets Management]] (storage, rotation and access control for the secret values this note loads)
+
+### Watch on YouTube
+
+- [27. The Twelve-Factor App](https://www.youtube.com/watch?v=2_fcv3-XfN4) · Sriniously · covers the 12-factor Config principle this note's precedence rules are based on

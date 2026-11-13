@@ -15,7 +15,7 @@ sources:
   - "github.com/hooklift/gowsdl README"
   - "Microsoft 365 Message Center MC676299, Retirement of Exchange Web Services in Exchange Online (blocking of non-Microsoft apps starts 1 October 2026)"
   - "Go 1.24 docs, encoding/xml"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # SOAP and WSDL (Legacy Integrations)
@@ -28,6 +28,50 @@ updated: 2026-11-02
 > - WSDL is the XML contract: operations, message schemas and the endpoint URL; tools generate clients from it.
 > - Rule: wrap the SOAP service in an adapter so the rest of your code only sees domain types and domain errors.
 > - Classic mistake: building XML by string concatenation without escaping, or treating an HTTP 500 Fault as a generic network error.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app needs to ask a bank "how much money is in account ACC-1?".
+The bank built its system 20 years ago and only speaks one strict format.
+You must write the question in their exact form, post it to their address, and read their reply or rejection slip.
+That strict format is SOAP, and the form's rule book is WSDL.
+
+**Words you need first.**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| XML | Text format with opening and closing tags | `<accountId>ACC-1</accountId>` |
+| HTTP `POST` | A web request that sends data to a server | Browser submitting a form |
+| Namespace | A URL-like prefix that says which vocabulary a tag belongs to | `soap:Envelope` vs `bank:Envelope` |
+| XML Schema (XSD) | Rules for which tags and types an XML message may contain | "`amount` must be a decimal" |
+| Envelope / Header / Body | Outer wrapper, metadata part, and the actual request part of a SOAP message | Header holds a token, Body holds `GetBalance` |
+| Fault | The SOAP error message, sent in the Body instead of a reply | `<faultstring>Account not found</faultstring>` |
+| WSDL | XML contract listing operations, message shapes and the endpoint URL | `AccountService.wsdl` |
+| Adapter | Your code that translates between the partner's format and your own types | `BankClient.Balance(ctx, id)` |
+
+**Picture it.**
+
+```mermaid
+flowchart LR
+    A[Your Go service] -->|domain call| B[Adapter]
+    B -->|XML Envelope over HTTP POST| C[Bank SOAP endpoint]
+    C -->|Body reply or Fault| B
+    B -->|domain result or error| A
+    W[WSDL contract] -.->|describes| C
+```
+
+**Analogy.** SOAP is registered post with a strict official form: the envelope, stamps, letter and rejection slip each have a fixed place.
+Where it breaks: a post office reads a messy letter anyway, while a SOAP server rejects a message for one wrong namespace.
+
+**How the rest of this note builds up.**
+- First, why SOAP exists and the registered-post mental model (sections 1-2).
+- Then the envelope, faults, WSDL and SOAP 1.1 vs 1.2 on the wire (section 3).
+- Then a full Go client and adapter you can run (section 4).
+- Finally, comparisons, production rules and the SDE-3 deep dive on WS-Security, MTOM and anti-corruption layers (sections 5-8).
+
+> [!tip] Remember
+> SOAP = an XML Envelope posted over HTTP, described by a WSDL; hide it behind an adapter.
 
 ## 1. Why it exists
 
@@ -623,9 +667,15 @@ A typical WS-Security header with a timestamp and a `UsernameToken`:
 
 - **UsernameToken** sends a username plus a password, either as plain text (only safe inside TLS) or as `PasswordDigest = Base64(SHA-1(nonce + created + password))`. The digest forces the server to store the plain password, so it is weak by today's standards.
 - **Timestamp** limits replay to the `Created`–`Expires` window; servers also remember nonces inside that window.
-- **XML Signature** signs selected elements (Body, Timestamp) after canonicalisation (Exclusive C14N), usually with an X.509 key; **XML Encryption** can encrypt parts. Go's standard library has neither. The usual answers are an XML-signature library such as `github.com/russellhaering/goxmldsig` or a gateway that does WS-Security for you. `goxmldsig` was built for SAML-style enveloped signatures, so check that it covers the signature layout your partner's WS-Security policy requires before you depend on it.
+- **XML Signature** signs selected elements (Body, Timestamp) after canonicalisation (Exclusive C14N), usually with an X.509 key; **XML Encryption** can encrypt parts.
+  - Go's standard library has neither. The usual answers are an XML-signature library such as `github.com/russellhaering/goxmldsig` or a gateway that does WS-Security for you.
+  - `goxmldsig` was built for SAML-style enveloped signatures, so check that it covers the signature layout your partner's WS-Security policy requires before you depend on it.
 
-**MTOM for binary data.** Inside XML, binary must be base64, which adds 33% (4 output bytes per 3 input bytes) plus parsing cost. MTOM (with XOP) sends the envelope as the first part of a `multipart/related` MIME message and moves each binary into its own raw part, referenced from the XML by `<xop:Include href="cid:..."/>`. Scanned documents and PDFs in insurance and banking integrations travel this way.
+**MTOM for binary data.** Inside XML, binary must be base64, which adds 33% (4 output bytes per 3 input bytes) plus parsing cost.
+
+MTOM (with XOP) sends the envelope as the first part of a `multipart/related` MIME message and moves each binary into its own raw part, referenced from the XML by `<xop:Include href="cid:..."/>`.
+
+Scanned documents and PDFs in insurance and banking integrations travel this way.
 
 **Code generation in Go.** `gowsdl` generates Go structs and an operation client from a WSDL. It saves time on large, stable WSDLs, but review the output: unsupported XSD features are skipped or mistyped, and regenerating after a partner change can produce a large diff. For two or three operations, hand-written structs as above are easier to read, test and fix.
 
@@ -633,7 +683,9 @@ A typical WS-Security header with a timestamp and a `UsernameToken`:
 
 **XML parser safety.** Go's `encoding/xml` never fetches external entities, so XML External Entity (XXE) attacks do not apply to it. Parsers in other stacks must have DTD processing disabled when they read partner XML.
 
-**Wrapping the partner (anti-corruption layer).** The adapter in section 4 is the anti-corruption layer from [[Domain-Driven Design - Strategic Design]] and a driven adapter in [[Hexagonal Architecture (Ports and Adapters)]]. It translates names, types (decimal strings to minor units), and faults to domain errors, and it owns the timeouts, retries, circuit breaker and caching. When the bank later ships a REST API, you replace one adapter, and nothing else changes ([[Strangler Fig Pattern and Legacy Migration]]).
+**Wrapping the partner (anti-corruption layer).** The adapter in section 4 is the anti-corruption layer from [[Domain-Driven Design - Strategic Design]] and a driven adapter in [[Hexagonal Architecture (Ports and Adapters)]]. It translates names, types (decimal strings to minor units), and faults to domain errors.
+
+It owns the timeouts, retries, circuit breaker and caching. When the bank later ships a REST API, you replace one adapter, and nothing else changes ([[Strangler Fig Pattern and Legacy Migration]]).
 
 ## 9. Interview questions
 
@@ -673,3 +725,8 @@ A typical WS-Security header with a timestamp and a `UsernameToken`:
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Choosing an API Style]]
 - **Next:** [[Calling External APIs]] (the Go client side), [[Domain-Driven Design - Strategic Design]] (anti-corruption layer), [[Strangler Fig Pattern and Legacy Migration]]
 - **Compare with:** [[REST and HTTP API Design]], [[gRPC]], [[GraphQL]], [[API Contract Design and OpenAPI]] (OpenAPI as the JSON-world counterpart of WSDL)
+
+### Watch on YouTube
+
+- [What is web service ? SOAP vs Rest](https://www.youtube.com/watch?v=DRTp6mT1cTc) · Specialize Automation (Aditya Roy) · basic intro to SOAP envelopes/WSDL versus REST
+- [REST Vs SOAP Web Services / Comparison of SOAP  & RESTful Web Services / SOAP & REST Differences](https://www.youtube.com/watch?v=1SgVa7Jed9I) · Tutorials Pedia · structured comparison table style explainer for interview recall

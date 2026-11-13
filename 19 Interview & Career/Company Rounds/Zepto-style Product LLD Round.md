@@ -8,13 +8,15 @@ sources:
   - "PostgreSQL 17 docs, UPDATE (row count of a conditional update) and Unique Indexes"
   - "Go 1.20 release notes, errors.Join"
   - "Go 1.21 release notes, context.WithoutCancel"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Zepto-style Product LLD Round
 
 > [!summary] TL;DR
-> A "product LLD" round asks you to design one slice of a real product (inventory, cart, order assignment, delivery) as APIs, tables, Go types and one working core method, then defend it against races, retries and failures. It is the format quick-commerce and other product companies tend to use, and this note is a prep plan for it.
+> A "product LLD" round asks you to design one slice of a real product (inventory, cart, order assignment, delivery) as APIs, tables, Go types and one working core method, then defend it against races, retries and failures.
+>
+> It is the format quick-commerce and other product companies tend to use, and this note is a prep plan for it.
 
 > [!abstract] Core idea
 > - The question looks like a product feature, not a puzzle: "a user orders milk and bread from the nearest dark store".
@@ -26,11 +28,58 @@ updated: 2026-11-04
 > [!warning] What this note is based on
 > The round shape below comes from candidate-shared, public interview write-ups and from the owner's own prep notes. It is **anecdotal**: companies change their loops, and nothing here is an official description of any company's process. Read "Zepto-style" as "quick-commerce product LLD", and confirm the format with your recruiter.
 
+## Start here: the basics
+
+**The problem in one story.**
+A small grocery store has one carton of milk left.
+Three people tap "Place order" on their phones at the same moment.
+If the app checks "is there milk?" and then subtracts one in two separate steps, all three can succeed.
+This round tests whether your design stops that, and whether a retry creates a second order.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| LLD (low-level design) | Designing the types, APIs and tables of one feature | Cart, Order, Inventory structs |
+| Dark store | A small warehouse that only serves app orders | The store 2 km from you |
+| Invariant | A rule that must always stay true | Stock never goes below 0 |
+| Race condition | Two requests overlapping and breaking a rule | Two users buy the last carton |
+| Transaction | A group of DB writes that all happen or none do | Reserve stock + insert order |
+| Idempotency key | An ID that makes a retry do nothing new | Same key → same order returned |
+| Compensation | Undoing an earlier step after a later one fails | Release stock if saving the order fails |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User taps<br/>Place order"] --> API["POST /orders<br/>+ idempotency key"]
+    API --> R{"Reserve stock<br/>(atomic UPDATE)"}
+    R -- "0 rows" --> X["Out of stock"]
+    R -- "ok" --> S["Save order"]
+    S -- "fails" --> C["Release stock"]
+    S -- "ok" --> OK["Order placed"]
+```
+
+**Analogy.** A building inspector ignores the paint and checks the load-bearing walls; here the walls are "no overselling" and "one order per retry".
+Where it breaks: an inspector checks a finished building; in this round you must also show the walls hold while people are rushing through at once.
+
+**How the rest of this note builds up**
+
+- First, why product rounds differ from Parking Lot puzzles (section 1) and the "PR review" mental model (section 2).
+- Then round formats, the flow of a round, and why API and schema come first (section 3).
+- Then the worked example: opening script, API, schema, the race, and tested Go code (section 4).
+- Finally the SDE-3 deep dive: partial stock, stale caches, cancellation and a self-review checklist (sections 5-8).
+
+> [!tip] Remember
+> Name the invariant, put it in one atomic database step, and make retries safe.
+
 ## 1. Why it exists
 
 Classic LLD questions (Parking Lot, Vending Machine) test object modelling. A product company's backend work is different: most bugs are not "wrong class hierarchy" but "two requests sold the same last unit" or "the retry created a second order". A product LLD round tests those skills directly in 45–60 minutes.
 
-A concrete scenario: a dark store has 1 carton of milk left and, at 8:00 pm, 3 users tap "Place order" within the same 200 ms. A design that reads `available_qty`, checks it in Go, and then writes `available_qty - 1` can sell 3 cartons it does not have. The interviewer is waiting to see if you notice this before they ask.
+A concrete scenario: a dark store has 1 carton of milk left and, at 8:00 pm, 3 users tap "Place order" within the same 200 ms.
+
+A design that reads `available_qty`, checks it in Go, and then writes `available_qty - 1` can sell 3 cartons it does not have. The interviewer is waiting to see if you notice this before they ask.
 
 ## 2. Mental model
 
@@ -158,7 +207,11 @@ SET    available_qty = available_qty - $3,
 WHERE  store_id = $1 AND product_id = $2 AND available_qty >= $3;
 ```
 
-Run one such statement per item inside one transaction, and roll back if any returns 0 rows. Two concurrent transactions on the same row serialise on the row lock: the second one re-evaluates `available_qty >= $3` after the first commits (PostgreSQL 17, READ COMMITTED), so it sees the new value and affects 0 rows. To avoid deadlocks between two multi-item orders, update items in a fixed order (sort by `product_id`). The full lock discussion is in [[Locking - Optimistic vs Pessimistic]].
+Run one such statement per item inside one transaction, and roll back if any returns 0 rows.
+
+Two concurrent transactions on the same row serialise on the row lock: the second one re-evaluates `available_qty >= $3` after the first commits (PostgreSQL 17, READ COMMITTED), so it sees the new value and affects 0 rows.
+
+To avoid deadlocks between two multi-item orders, update items in a fixed order (sort by `product_id`). The full lock discussion is in [[Locking - Optimistic vs Pessimistic]].
 
 ### The race you must name
 
@@ -182,7 +235,9 @@ sequenceDiagram
 
 ### Go: the core method, tested
 
-The old version of this code reserved stock, then saved the order, and returned on a save error without releasing the stock, so every DB hiccup leaked inventory. It also used a raw `"reserved"` string. The version below fixes both, adds an idempotency key and falls back to the next store when the nearest one loses the race. The in-memory `MemInventory` stands in for the SQL above: its single mutex plays the role of the row lock.
+The old version of this code reserved stock, then saved the order, and returned on a save error without releasing the stock, so every DB hiccup leaked inventory. It also used a raw `"reserved"` string.
+
+The version below fixes both, adds an idempotency key and falls back to the next store when the nearest one loses the race. The in-memory `MemInventory` stands in for the SQL above: its single mutex plays the role of the row lock.
 
 ```go
 package order
@@ -572,3 +627,7 @@ Write this down within an hour of the round:
 - **Before this:** [[LLD Round Playbook]], [[LLD Interview Method]], [[Concurrency for LLD]]
 - **Next:** [[Inventory Order Assignment (Dark Store)]], [[Delivery Partner Assignment]], [[Cart Checkout with Coupons]]
 - **Compare with:** [[Movie Ticket Booking]] (same reserve-then-pay shape with seats), [[System Design Interview Framework]] (the HLD round)
+
+### Watch on YouTube
+
+- [Zepto Hiring GenAI, Analyst, Product Engineer + more  / Job Description + Interview Rounds Explained](https://www.youtube.com/watch?v=zC9KndQNBFM) · Upasana Chaudhuri · 3 min · 636 views

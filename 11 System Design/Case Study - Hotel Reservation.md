@@ -10,13 +10,17 @@ sources:
   - "PostgreSQL 17 documentation, range types (daterange) and exclusion constraints (EXCLUDE USING gist) for non-overlapping reservations of a single unit"
   - "Public airline and hotel industry practice of deliberate overbooking to offset no-shows (general knowledge, rates not stated here)"
   - "Stripe documentation: idempotent requests (Idempotency-Key header)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Hotel Reservation
 
 > [!summary] TL;DR
-> A hotel reservation system (Booking.com, Airbnb, a hotel chain's own site) lets guests search by place and dates, then book a **room type** for a range of nights. The key idea is that inventory is **a count per hotel, room type and date**, not a list of individual rooms, and a booking must reduce every night in the range **atomically** and never go below zero (or above a planned overbooking limit). Search is heavy and can be stale; booking is light and must be exact.
+> A hotel reservation system (Booking.com, Airbnb, a hotel chain's own site) lets guests search by place and dates, then book a **room type** for a range of nights.
+>
+> The key idea is that inventory is **a count per hotel, room type and date**, not a list of individual rooms, and a booking must reduce every night in the range **atomically** and never go below zero (or above a planned overbooking limit).
+>
+> Search is heavy and can be stale; booking is light and must be exact.
 
 > [!abstract] Core idea
 > - Guests book a **room type** ("Deluxe King, 12 to 15 March"), not room 304. The hotel assigns a physical room at check-in.
@@ -25,6 +29,50 @@ updated: 2026-11-09
 > - Concurrency is handled by a conditional update, a row lock, or a version check, with a database **constraint** as the final guard.
 > - Idempotency key = reservation ID, generated before the payment page, so double clicks and retries never double book.
 > - Search is a separate, read-heavy path (cache and search index) that may be slightly stale.
+
+## Start here: the basics
+
+**The problem in one story.**
+You want a Deluxe room in Goa for 12 to 15 March.
+The hotel has 20 Deluxe rooms, and other people are booking the same dates right now.
+The site must show you what is free, take your booking once, and never give away room 21.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Room type | A kind of room, not a specific room number | "Deluxe King" |
+| Inventory | How many rooms of a type exist per night | 20 Deluxe on 12 March |
+| Transaction | Several database changes that succeed or fail together | Update 3 nights or none |
+| Row lock | Making others wait while you change a row | `SELECT ... FOR UPDATE` |
+| Constraint | A rule the database refuses to break | `total_reserved <= limit` |
+| Idempotency key | An ID that makes a retry do nothing new | Double click still makes one booking |
+| Cache | Fast copy of data that may be slightly old | Search results from a minute ago |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    G["Guest"] --> S["Search<br/>(cached, may be stale)"]
+    S --> B["Book 3 nights"]
+    B --> T{"All 3 nights<br/>have a room?"}
+    T -- "yes" --> OK["Reserve all 3<br/>in one transaction"]
+    T -- "no" --> NO["Sorry, sold out"]
+    OK --> P["Pay, then confirmed"]
+```
+
+**Analogy.** A hotel keeps a paper calendar with "rooms left" written under each date, and a booking crosses off one room on every night of your stay at the same time.
+Where it breaks: a paper calendar has one clerk, while the system has thousands of clerks writing at once and needs locks to stay correct.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model of counts per date (section 2).
+- Then the high-level design and booking flow (section 3), plus estimates, API and data model (section 4).
+- Then deep dives: no overselling, overbooking on purpose, holds and payment, search at scale, hot hotels, cancellations (section 5).
+- Finally the SDE-3 view: variants, trade-offs, production, extras and interview questions (sections 6-11).
+
+> [!tip] Remember
+> Inventory is a count per room type per night; a booking changes every night of the stay together or not at all.
 
 ## 1. Why it exists - requirements
 
@@ -53,7 +101,11 @@ It is harder than a cinema seat because a booking spans **several nights**. A gu
 
 ## 2. Mental model
 
-Think of the hotel as a **wall calendar with one row per room type**. Each day cell shows "10 rooms, 6 sold". To book a 3-night stay you put a tally mark in three cells at once; if any cell is already full you put none anywhere. A reservation is a **receipt** pinned to those cells. If the guest does not pay within 10 minutes, the receipt falls off and the marks disappear.
+Think of the hotel as a **wall calendar with one row per room type**. Each day cell shows "10 rooms, 6 sold".
+
+To book a 3-night stay you put a tally mark in three cells at once; if any cell is already full you put none anywhere. A reservation is a **receipt** pinned to those cells.
+
+If the guest does not pay within 10 minutes, the receipt falls off and the marks disappear.
 
 Where the analogy breaks: with thousands of guests using the wall at once, two people may reach for the same cell at the same moment, so something has to make them take turns (a database lock) and the calendar has to survive a power cut (durability).
 
@@ -165,7 +217,9 @@ sequenceDiagram
     R-->>U: confirmation email via event
 ```
 
-Why a separate step to obtain the `reservation_id` first? If the browser double-submits, or the network drops after the server processed the request, the client resends with the **same** ID, and the unique key on `reservation_id` makes the second insert fail harmlessly. Without a pre-issued ID the server cannot tell a retry from a new attempt. See [[Idempotency and Idempotency Keys]].
+Why a separate step to obtain the `reservation_id` first? If the browser double-submits, or the network drops after the server processed the request, the client resends with the **same** ID, and the unique key on `reservation_id` makes the second insert fail harmlessly.
+
+Without a pre-issued ID the server cannot tell a retry from a new attempt. See [[Idempotency and Idempotency Keys]].
 
 ## 4. Worked example - estimates, API and data model
 
@@ -311,7 +365,9 @@ sequenceDiagram
 
 **What if one night passes and another fails?** The multi-row update covers all nights in one statement, but PostgreSQL still counts rows. Fewer than 3 rows means at least one failed, so the transaction rolls back and no night stays reduced.
 
-**What about deadlocks?** Two transactions updating overlapping date ranges in different orders can deadlock. A single multi-row `UPDATE` does not guarantee the order in which rows are locked, so for safety first lock the rows in a fixed order with `SELECT ... WHERE ... ORDER BY date FOR UPDATE`, then run the conditional update. Also retry on SQLSTATE 40P01 (deadlock detected) with backoff ([[Timeouts, Retries and Backoff]]).
+**What about deadlocks?** Two transactions updating overlapping date ranges in different orders can deadlock. A single multi-row `UPDATE` does not guarantee the order in which rows are locked, so for safety first lock the rows in a fixed order with `SELECT ... WHERE ...
+
+ORDER BY date FOR UPDATE`, then run the conditional update. Also retry on SQLSTATE 40P01 (deadlock detected) with backoff ([[Timeouts, Retries and Backoff]]).
 
 ### Deep dive 2: overbooking on purpose
 
@@ -518,3 +574,8 @@ A 45-minute script:
 - **Patterns used:** [[Saga Pattern]], [[Transactional Outbox and CDC]], [[Partitioning and Sharding]], [[Geospatial Indexing]], [[Search Engines and Inverted Indexes]], [[Rate Limiting - Algorithms and Distributed Design]], [[Timeouts, Retries and Backoff]], [[Multi-Region Architecture]]
 - **Class-level twin:** [[Hotel Booking]]
 - **Method:** [[HLD Round - Complete Step-by-Step Guide]]
+
+### Watch on YouTube
+
+- [Hotel Reservation: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=m67Mjbx6DMY) · TechPrep · 13 min · 99,688 views
+- [Design a Hotel Reservation System like Expedia & Kayak / System Design](https://www.youtube.com/watch?v=gGzXvlmbtSI) · Irtiza Hafiz · 31 min · 31,637 views

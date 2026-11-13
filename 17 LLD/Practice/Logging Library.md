@@ -9,19 +9,69 @@ sources:
   - "Go 1.24 standard library docs: log/slog (Logger, Handler, Record, Attr, LevelVar, HandlerOptions, JSONHandler, TextHandler), context, encoding/json, slices.Clip"
   - "Go blog, Structured Logging with slog (2023): the Logger front end and Handler back end"
   - "go.uber.org/zap README: typed fields and the zero-allocation design"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Logging Library
 
 > [!summary] TL;DR
-> A logging library turns `log.Info("payment failed", F("order_id", "o1"))` into one line on one or more outputs. The design splits that call into small swappable steps: a **level filter** drops what nobody wants, a **formatter** turns the entry into text or JSON once, and **appenders** write the bytes to the console, a file or the network. Slow outputs sit behind an async appender that never blocks the request and flushes on shutdown, and a request ID set once in `context.Context` reaches every log line through `InfoCtx`.
+> A logging library turns `log.Info("payment failed", F("order_id", "o1"))` into one line on one or more outputs.
+>
+> The design splits that call into small swappable steps: a **level filter** drops what nobody wants, a **formatter** turns the entry into text or JSON once, and **appenders** write the bytes to the console, a file or the network.
+>
+> Slow outputs sit behind an async appender that never blocks the request and flushes on shutdown, and a request ID set once in `context.Context` reaches every log line through `InfoCtx`.
 
 > [!abstract] Core idea
 > - One log call flows through a pipeline: level filter, then formatter (runs once), then one or more appenders (console, file, network).
 > - The filter runs first and is cheap (one atomic load), so disabled debug logs cost almost nothing.
 > - Slow outputs sit behind an async appender with a bounded buffer: when it is full, drop and count instead of blocking the request; flush on `Close`.
 > - Classic mistakes: building JSON from a `map` (keys come out sorted, not in call order) and letting goroutines write partial lines into one file without a lock.
+
+## Start here: the basics
+
+**The problem in one story.**
+A payment fails in production at 2 a.m. and you need to know why.
+Your service handles thousands of requests a second, so `fmt.Println` everywhere would be slow, messy and impossible to search.
+You want each line to say how serious it is, which request it belongs to, and to go to the screen, a file or a log server.
+A logging library does that without slowing the request down.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Log level | How serious a message is | DEBUG < INFO < WARN < ERROR < FATAL |
+| Structured field | A key-value pair attached to a log line | `order_id=o1` |
+| Formatter | Turns a log entry into text or JSON | `{"level":"INFO","msg":"paid"}` |
+| Appender | Where the bytes go | Console, file, network |
+| Async | Hand work to another goroutine and return at once | Request does not wait for the disk |
+| Bounded buffer | A queue with a fixed size limit | Channel of 1024 entries |
+| `context.Context` | Go value passed down a request carrying deadlines and values | Holds the request ID |
+| Atomic load | Reading a shared number safely without a lock | Checking the current minimum level |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["log.Info(msg, fields)"] --> F{"Level high<br/>enough?"}
+    F -- "no" --> D["Dropped (cheap)"]
+    F -- "yes" --> FM["Formatter<br/>(text or JSON, once)"]
+    FM --> C["Console"]
+    FM --> FI["File"]
+    FM --> Q["Async buffer"] --> N["Network"]
+```
+
+**Analogy.** It is like a post room: the guard turns away junk mail (level filter), a clerk puts each letter in a standard envelope (formatter), and couriers carry copies to different addresses (appenders); a slow courier gets a tray so the clerk never waits.
+Where it breaks: a post room rarely throws letters away, but a full async buffer drops log lines on purpose (and counts them) to protect the request.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and requirements: levels, fields, formats, destinations (Step 1).
+- Then the pipeline design: entities, the `Logger` facade and its two strategy interfaces (Steps 3-5, 7).
+- Then the core code: filter, formatter, appenders, the async appender and context fields (Step 8), its mapping to `log/slog`, and tests.
+- Finally edge cases, trade-offs and the SDE-3 topics: back-pressure, drop counting and flush on shutdown (Steps 9-10 onwards).
+
+> [!tip] Remember
+> Filter first (cheap), format once, write to many appenders, and never let a slow output block the request.
 
 ## Problem statement
 
@@ -963,7 +1013,13 @@ See [[Structured Logging]] for what to log, field naming and log levels in a ser
 
 ![[Logging System LLD Drawing.excalidraw]]
 
-The drawing has three sections: the `Logger` facade with the handler chain, the two strategy interfaces and the `AsyncAppender` wrapping an inner appender; the flow from the app through the filter (below the minimum: dropped) and the formatter to the appenders, with the async path (queued, or dropped when full); and the `AsyncAppender` lifecycle (running, draining, closed). Redraw it from memory, then add the context fields joining at the `Logger`.
+The drawing has three sections:
+
+1. the `Logger` facade with the handler chain, the two strategy interfaces and the `AsyncAppender` wrapping an inner appender;
+2. the flow from the app through the filter (below the minimum: dropped) and the formatter to the appenders, with the async path (queued, or dropped when full);
+3. and the `AsyncAppender` lifecycle (running, draining, closed).
+
+Redraw it from memory, then add the context fields joining at the `Logger`.
 
 - [ ] The chain order: `Logger → LevelFilter → FormatHandler → []Appender`
 - [ ] The two strategy interfaces (`Formatter`, `Appender`), each with two implementations
@@ -1009,3 +1065,7 @@ The drawing has three sections: the `Logger` facade with the handler chain, the 
 - **Before this:** [[Chain of Responsibility and Pipelines]], [[Strategy and Template Method]], [[Decorator and Middleware]], [[Rate Limiter]]
 - **Next:** [[File Search (Unix find)]], [[Concurrency for LLD]], [[Testing LLD Code]]
 - **Compare with:** [[Structured Logging]], [[Notification Service]]
+
+### Watch on YouTube
+
+- [Design Logging library like log4j - LLDcoding.com](https://www.youtube.com/watch?v=FHYEUcDW9UU) · Subhahu Jain · 9 min · 28,514 views

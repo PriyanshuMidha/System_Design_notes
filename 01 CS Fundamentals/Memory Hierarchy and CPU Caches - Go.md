@@ -10,13 +10,22 @@ sources:
   - "AMD Software Optimization Guide for the 'Zen 4' Microarchitecture"
   - "Hennessy & Patterson, Computer Architecture: A Quantitative Approach, 6th ed., ch. 2 (memory hierarchy, coherence)"
   - "Sun/Oracle MOESI/MESI protocol documentation; Culler, Singh & Gupta, Parallel Computer Architecture, ch. 5 (cache coherence)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Memory Hierarchy and CPU Caches - Go
 
 > [!summary] TL;DR
 > A false-sharing experiment in Go: two counter layouts that compute identical results but one pads each counter onto its own 64-byte cache line. The tests prove both are correct; the benchmark measures the performance gap MESI invalidation traffic causes, as described in [[Memory Hierarchy and CPU Caches]].
+
+## Before the code
+
+- **Structs and blank fields**: `_ [7]int64` reserves memory without a usable name; here it is padding.
+- **Slices**: `make([]T, n)` allocates `n` elements back to back in one block of memory.
+- **Goroutines**: `go func(...)` starts a lightweight concurrent function; each counter gets its own.
+- **`sync.WaitGroup`**: `Add`, `Done`, `Wait` let the test block until every goroutine finishes.
+- **`testing` benchmarks**: `func BenchmarkX(b *testing.B)` runs the body `b.N` times and reports time per iteration.
+- **What to run**: `go vet ./... && go test -race -v ./...`, then the benchmark command in Setup.
 
 ## What this code shows
 
@@ -58,7 +67,11 @@ Both types expose the same two methods, `Incr` and `Get`, so the only difference
 
 ### Step 1: the packed layout
 
-**Concept.** This implements the "before" side of [[Memory Hierarchy and CPU Caches#4. Worked example]]: `N` plain `int64` counters packed into one slice. Because a `[]int64` is contiguous memory and each element is 8 bytes, eight consecutive counters fit in one 64-byte cache line. The alternative — one counter per goroutine stored in a local variable — would avoid false sharing entirely, but a shared slice indexed by goroutine ID is a realistic shape for, say, per-worker request counters in a pool.
+**Concept.** This implements the "before" side of [[Memory Hierarchy and CPU Caches#4. Worked example]]: `N` plain `int64` counters packed into one slice.
+
+Because a `[]int64` is contiguous memory and each element is 8 bytes, eight consecutive counters fit in one 64-byte cache line.
+
+The alternative — one counter per goroutine stored in a local variable — would avoid false sharing entirely, but a shared slice indexed by goroutine ID is a realistic shape for, say, per-worker request counters in a pool.
 
 ```go
 package falsesharing
@@ -104,7 +117,14 @@ flowchart LR
 
 ### Step 2: the padded fix
 
-**Concept.** This implements the "after" side of the worked example: each counter is wrapped in a `paddedCounter` struct sized to exactly one 64-byte cache line, so no two counters can ever share a line regardless of how the slice is allocated. The alternative designs are per-goroutine local variables (simplest, but doesn't generalize to a shared counter array an external caller needs to read) or `sync/atomic` counters without padding (fixes correctness under concurrent writes to the *same* index, but does nothing for false sharing between *different* indices) — padding is the one that specifically targets the cache-line problem.
+**Concept.** This implements the "after" side of the worked example: each counter is wrapped in a `paddedCounter` struct sized to exactly one 64-byte cache line, so no two counters can ever share a line regardless of how the slice is allocated.
+
+The alternative designs are:
+
+- Per-goroutine local variables: simplest, but doesn't generalize to a shared counter array an external caller needs to read.
+- `sync/atomic` counters without padding: fixes correctness under concurrent writes to the *same* index, but does nothing for false sharing between *different* indices.
+
+Padding is the one that specifically targets the cache-line problem.
 
 ```go
 // paddedCounter is one int64 padded out to 64 bytes (one typical x86-64 and
@@ -167,7 +187,9 @@ flowchart LR
 
 ### TestCountersAreCorrect
 
-**Property.** Both layouts must independently compute the same final value per counter: `iters` (200,000) after `iters` increments from exactly one goroutine per index. This is the test that distinguishes "a performance bug" from "a correctness bug" — false sharing must never be confused with a race.
+**Property.** Both layouts must independently compute the same final value per counter: `iters` (200,000) after `iters` increments from exactly one goroutine per index.
+
+This is the test that distinguishes "a performance bug" from "a correctness bug" — false sharing must never be confused with a race.
 
 | Input | Expected |
 | --- | --- |
@@ -216,18 +238,36 @@ func TestCountersAreCorrect(t *testing.T) {
 }
 ```
 
+```go
+func TestPaddedCounterIsOneCacheLine(t *testing.T) {
+	// The fix only works if each counter fills exactly one 64-byte line.
+	if got := unsafe.Sizeof(paddedCounter{}); got != 64 {
+		t.Fatalf("sizeof(paddedCounter) = %d, want 64", got)
+	}
+}
+```
+
+`TestPaddedCounterIsOneCacheLine` guards the layout itself: if the padding is edited, the size check fails before any benchmark is misread. The test file imports `sync`, `testing` and `unsafe`.
+
 **How it works.**
 
 1. Each subtest launches `goroutines` (8) goroutines, each incrementing only its own index `i` — this is why `-race` passes: no two goroutines ever write the same memory word, only the same cache line.
 2. `wg.Wait()` ensures every increment has completed before any `Get` call, so the read-after-write ordering is correct.
 3. `go func(i int) { ... }(i)` captures `i` by parameter, not by closing over the loop variable directly — necessary to avoid every goroutine seeing the final value of `i` (a classic Go closure-over-loop-variable bug, fixed here by passing `i` explicitly).
 
-**If it fails.** A failure here (`counter %d = %d, want %d`) would mean an increment was lost or double-counted — a real data race, not false sharing. Since each goroutine only ever touches its own index, this should never happen; if it does, suspect a typo that made two goroutines share an index.
+**If it fails.** A failure here (`counter %d = %d, want %d`) would mean an increment was lost or double-counted — a real data race, not false sharing.
+
+Since each goroutine only ever touches its own index, this should never happen; if it does, suspect a typo that made two goroutines share an index.
 
 ```text
 $ go vet ./falsesharing/...
-$ go test -race ./falsesharing/...
-ok  	cs1scratch/falsesharing	1.934s
+$ go test -race -v ./falsesharing/...
+--- PASS: TestCountersAreCorrect (0.02s)
+    --- PASS: TestCountersAreCorrect/unpadded (0.01s)
+    --- PASS: TestCountersAreCorrect/padded (0.01s)
+--- PASS: TestPaddedCounterIsOneCacheLine (0.00s)
+PASS
+ok  	cs1scratch/falsesharing	1.488s
 ```
 
 ### BenchmarkUnpadded / BenchmarkPadded
@@ -292,7 +332,11 @@ Measured on Go 1.24.4, darwin/arm64, Apple M4, 8 goroutines each doing 200,000 i
 | Unpadded (false sharing) | ~448 us | 1.00x |
 | Padded (one cache line each) | ~411 us | **0.92x** (about 9% faster) |
 
-**Reading the output.** The padded layout was faster in every run, but the gap itself varied widely run to run (roughly 5% to over 25% across repeated identical invocations), with the first iteration in each run consistently the slowest — goroutine and scheduler warm-up, not the cache effect. Apple's performance cores share a large per-cluster L2 with fast core-to-core transfers, which keeps the effect modest here; the same experiment on a multi-socket x86-64 server, where invalidations cross a slower inter-socket interconnect, documents a larger and more consistent gap. Treat the ~9% figure as one representative sample, not a precise constant.
+**Reading the output.** The padded layout was faster in every run, but the gap itself varied widely run to run (roughly 5% to over 25% across repeated identical invocations), with the first iteration in each run consistently the slowest — goroutine and scheduler warm-up, not the cache effect.
+
+Apple's performance cores share a large per-cluster L2 with fast core-to-core transfers, which keeps the effect modest here; the same experiment on a multi-socket x86-64 server, where invalidations cross a slower inter-socket interconnect, documents a larger and more consistent gap.
+
+Treat the ~9% figure as one representative sample, not a precise constant.
 
 ## Pitfalls in the code
 

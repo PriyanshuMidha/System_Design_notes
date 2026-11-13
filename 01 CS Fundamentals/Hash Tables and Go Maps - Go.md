@@ -10,13 +10,22 @@ sources:
   - "Go runtime source, src/internal/runtime/maps (Go 1.24, swisstable.go)"
   - "The Go Programming Language Specification, Map types"
   - "Abseil (Google), Swiss Tables design notes"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Hash Tables and Go Maps - Go
 
 > [!summary] TL;DR
 > A separate-chaining hash table in about 90 lines of Go: `Put`, `Get`, `Delete` and automatic doubling resize, plus a benchmark that measures it against Go's own built-in `map`. Demonstrates the ideas in [[Hash Tables and Go Maps]]: hashing to a bucket, chaining on collision, and amortized O(1) via resizing.
+
+## Before the code
+
+- **Structs and pointers**: `Table` holds a slice of `*entry`; each `entry` points to the `next` one, which forms a linked-list chain per bucket.
+- **Methods with pointer receivers**: `func (t *Table) Put(...)` lets the method change the table in place (resize, size counter).
+- **Multiple return values**: `Get` returns `(int, bool)`, the Go "comma ok" style for "value, and was it found".
+- **`hash/fnv`**: the standard-library FNV-1a hash used to turn a string key into a number.
+- **`testing` package**: `TestXxx` functions check correctness; `BenchmarkXxx` functions measure ns/op against Go's built-in `map`.
+- **What to run**: `go vet ./... && go test -race -v ./...`, then `go test -bench=. -benchmem -run=^$ ./...` for the benchmarks.
 
 ## What this code shows
 
@@ -62,7 +71,11 @@ The type is small on purpose: one slice of bucket heads, one linked-list node ty
 
 ### Whiteboard version
 
-**Concept.** The bare idea in [[Hash Tables and Go Maps#Whiteboard version]]: hash the key, mod by the bucket count, and prepend a new node to whatever list is already there. There's no resize and no update-in-place, so a repeated `put` of the same key creates a duplicate node instead of overwriting — acceptable for a whiteboard sketch, wrong for a real table. The full version below fixes exactly that.
+**Concept.** The bare idea in [[Hash Tables and Go Maps#Whiteboard version]]: hash the key, mod by the bucket count, and prepend a new node to whatever list is already there.
+
+There's no resize and no update-in-place, so a repeated `put` of the same key creates a duplicate node instead of overwriting — acceptable for a whiteboard sketch, wrong for a real table.
+
+The full version below fixes exactly that.
 
 ```go
 package wb
@@ -98,7 +111,11 @@ func (t *tinyTable) put(key, val string) {
 
 ### Step 1: the real type and its hash function
 
-**Concept.** `Table` adds what the whiteboard skips: a `size` counter (so `LoadFactor` and resize decisions are O(1) instead of O(n) scans), and a `hashKey` helper that takes the bucket count as a parameter so the same function works before and after a resize. FNV-1a was picked over a cryptographic hash because the table never faces adversarial input in this exercise; a production table exposed to attacker-controlled keys would also need a random per-instance seed ([[Hash Tables and Go Maps#3.4 Worst case and hash flooding]]), which this teaching version omits for clarity.
+**Concept.** `Table` adds what the whiteboard skips: a `size` counter (so `LoadFactor` and resize decisions are O(1) instead of O(n) scans), and a `hashKey` helper that takes the bucket count as a parameter so the same function works before and after a resize.
+
+FNV-1a was picked over a cryptographic hash because the table never faces adversarial input in this exercise;
+
+a production table exposed to attacker-controlled keys would also need a random per-instance seed ([[Hash Tables and Go Maps#3.4 Worst case and hash flooding]]), which this teaching version omits for clarity.
 
 ```go
 package hashtable
@@ -158,7 +175,9 @@ flowchart LR
 
 ### Step 2: insert, lookup and delete
 
-**Concept.** `Put`, `Get` and `Delete` all share the same first step — hash the key, walk that bucket's chain — which is the chaining strategy from [[Hash Tables and Go Maps#3.2 Collisions chaining vs open addressing]] made concrete. `Put` is the only one that can trigger a resize, and it does so *after* inserting, so the newly-inserted key is included in the rehash rather than needing special-case handling.
+**Concept.** `Put`, `Get` and `Delete` all share the same first step — hash the key, walk that bucket's chain — which is the chaining strategy from [[Hash Tables and Go Maps#3.2 Collisions chaining vs open addressing]] made concrete.
+
+`Put` is the only one that can trigger a resize, and it does so *after* inserting, so the newly-inserted key is included in the rehash rather than needing special-case handling.
 
 ```go
 // Put inserts or updates key. Average O(1); resizes (O(n)) when the load
@@ -237,7 +256,9 @@ func (t *Table) Delete(key string) bool {
 
 ### Step 3: resize
 
-**Concept.** This is the amortized-O(1) argument from [[Hash Tables and Go Maps#3.3 Load factor and resizing]] made runnable: allocate a bigger array, walk every existing entry, recompute its bucket index against the *new* size, and move it over. `resize` reuses the existing `entry` nodes (just changing which bucket's chain they're in) instead of reallocating key/value pairs, which matters more for bigger value types than the `int` used here.
+**Concept.** This is the amortized-O(1) argument from [[Hash Tables and Go Maps#3.3 Load factor and resizing]] made runnable: allocate a bigger array, walk every existing entry, recompute its bucket index against the *new* size, and move it over.
+
+`resize` reuses the existing `entry` nodes (just changing which bucket's chain they're in) instead of reallocating key/value pairs, which matters more for bigger value types than the `int` used here.
 
 ```go
 // resize rehashes every entry into a new, larger bucket array.
@@ -290,7 +311,9 @@ sequenceDiagram
 
 ### TestResizeKeepsAllKeys
 
-**Property.** Inserting 1,000 keys must survive every resize the table performs along the way — no key lost, none duplicated — and the load factor afterward must be back under the `0.75` threshold. This is the core safety property behind the amortized-O(1) claim: if a resize ever lost or duplicated a key, the "same operations, same result" promise of the hash table would be broken.
+**Property.** Inserting 1,000 keys must survive every resize the table performs along the way — no key lost, none duplicated — and the load factor afterward must be back under the `0.75` threshold.
+
+This is the core safety property behind the amortized-O(1) claim: if a resize ever lost or duplicated a key, the "same operations, same result" promise of the hash table would be broken.
 
 | Step | Input | Expected |
 | --- | --- | --- |
@@ -299,6 +322,13 @@ sequenceDiagram
 | Verify | `Get` every one of the 1,000 keys | Each returns its original value, `ok == true` |
 
 ```go
+package hashtable
+
+import (
+	"fmt"
+	"testing"
+)
+
 func TestResizeKeepsAllKeys(t *testing.T) {
 	tbl := New(4)
 	const n = 1000
@@ -438,7 +468,9 @@ BenchmarkGoMapGet-10    	31456329	         7.579 ns/op	       0 B/op	       0 al
 | `BenchmarkGoMapPut ... 12.53 ns/op` | Go's map is *slower* here for repeated updates to a small, already-populated map — its generic, more general-purpose code path costs more than a specialized chaining table with a cheap hash. |
 | `BenchmarkTableGet` / `BenchmarkGoMapGet` | Essentially tied (7.8 vs. 7.6 ns/op): for a small, static key set, neither design has a clear lookup advantage. |
 
-This is a useful, honest result, not a disappointing one: Swiss Tables' real win is at larger scale and under insert/delete churn with varying load factor, where SIMD-scanned metadata avoids touching most keys' memory — a 10,000-key, mostly-update microbenchmark doesn't stress that path. Treat any single benchmark like this as a starting point for your own measurement, not a universal verdict.
+This is a useful, honest result, not a disappointing one: Swiss Tables' real win is at larger scale and under insert/delete churn with varying load factor, where SIMD-scanned metadata avoids touching most keys' memory — a 10,000-key, mostly-update microbenchmark doesn't stress that path.
+
+Treat any single benchmark like this as a starting point for your own measurement, not a universal verdict.
 
 ## Pitfalls in the code
 

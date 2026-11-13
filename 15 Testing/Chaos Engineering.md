@@ -9,7 +9,7 @@ sources:
   - "Chaos Mesh documentation (chaos-mesh.org)"
   - "AWS Fault Injection Service documentation"
   - "Toxiproxy README (Shopify)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Chaos Engineering
@@ -23,9 +23,57 @@ updated: 2026-11-04
 > - Keep the **blast radius** small: one instance, one AZ, a single-digit percentage of traffic, with an automatic abort tied to an SLO.
 > - A chaos experiment validates resilience mechanisms you already believe you have (timeouts, retries, circuit breakers, failover) — it does not replace unit or load testing, and it is not useful without observability and on-call already in place.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your house has a smoke alarm, and you trust it.
+But you have never pressed the test button, so you do not actually know the battery works.
+A real fire is the worst moment to find out.
+Chaos engineering is pressing the test button on purpose, on a quiet day, while everyone is watching.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Dependency | Another service your service calls | Checkout calls the payment provider |
+| Timeout | Give up waiting after a fixed time | Stop waiting for payment after 2 s |
+| Retry | Try a failed call again | Call payment again after 100 ms |
+| Circuit breaker | Stop calling a failing dependency for a while | After 5 failures, fail fast for 30 s |
+| Fallback | A backup answer when the real one fails | Show a cached price |
+| SLO | A target for how well a service must behave | 99.5% of checkouts succeed |
+| Blast radius | How much of the system an experiment can hurt | 1 pod, or 1% of traffic |
+| Steady state | The normal value of a key metric | Checkout success rate near 99.8% |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    H["Guess: checkout stays healthy<br/>if payment fails"] --> I["Break payment<br/>for 1% of traffic"]
+    I --> W{"Metric still normal?"}
+    W -- "yes" --> G["Confidence: grow scope"]
+    W -- "no, auto-abort" --> F["Found a gap: fix it"]
+```
+
+**Analogy.** A fire drill: you pull the alarm on purpose, in a controlled way, to check that people really leave the building the way the plan says.
+Where it breaks: a fire drill uses no real fire, while chaos experiments inject real failures into real (staging or production) systems, so they need automatic abort switches.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the experiment loop as a mental model (section 2).
+- Then how injection works, blast-radius control and the tools (section 3).
+- Then a Go worked example with a fault-injecting wrapper (section 4) and tool comparisons (section 5).
+- Finally the SDE-3 view: trade-offs, production practice, and the deep dive on steady-state metrics and chaos in CI (sections 6-8).
+
+> [!tip] Remember
+> Chaos engineering is a small, controlled, measured experiment that proves your safety nets work, not random breaking.
+
 ## 1. Why it exists
 
-A checkout service has a documented retry-with-backoff policy for calls to its payment provider, a circuit breaker, and a fallback to a cached price. Nobody has ever actually unplugged the payment provider's connection to see what happens. A chaos experiment that injects a 100% failure rate on that one dependency, for five minutes, against 1% of staging traffic, either confirms the fallback works — or reveals that the circuit breaker's threshold is misconfigured and every request hangs for the full client timeout instead, which is exactly the finding you want before a real payment-provider outage happens in production, not during one.
+A checkout service has a documented retry-with-backoff policy for calls to its payment provider, a circuit breaker, and a fallback to a cached price. Nobody has ever actually unplugged the payment provider's connection to see what happens.
+
+A chaos experiment that injects a 100% failure rate on that one dependency, for five minutes, against 1% of staging traffic, either confirms the fallback works, or reveals something worse.
+
+It might show that the circuit breaker's threshold is misconfigured and every request hangs for the full client timeout instead, which is exactly the finding you want before a real payment-provider outage happens in production, not during one.
 
 ## 2. Mental model
 
@@ -85,7 +133,15 @@ sequenceDiagram
 
 ### Blast-radius control
 
-Every experiment should have: a scope (one pod, one AZ, N% of traffic — never "everything" on a first run), an abort condition (an SLO-tied metric breach that halts injection automatically, not just a human watching a dashboard), and a rollback path that's already tested independently of the experiment. Running this first in staging, then at 1% of production traffic, then higher, is the standard progression — "game days" (scheduled, team-wide chaos exercises) are often how the staging-to-small-percentage-of-prod step gets socialized across a team before it becomes routine.
+Every experiment should have:
+
+1. A scope (one pod, one AZ, N% of traffic — never "everything" on a first run).
+2. An abort condition (an SLO-tied metric breach that halts injection automatically, not just a human watching a dashboard).
+3. A rollback path that's already tested independently of the experiment.
+
+Running this first in staging, then at 1% of production traffic, then higher, is the standard progression.
+
+"Game days" (scheduled, team-wide chaos exercises) are often how the staging-to-small-percentage-of-prod step gets socialized across a team before it becomes routine.
 
 ### Tools
 
@@ -272,11 +328,19 @@ Labeled **representative output** because no chaos-tooling cluster is available 
 
 ## 8. Deep dive
 
-**Steady state must be a business-facing metric, not an infrastructure one.** "CPU usage" or "pod count" tell you the system is doing something, not that it's doing its job; "checkout success rate" or "search p99 under 300ms" directly reflect user experience and make the hypothesis falsifiable in a way that matters. A common mistake is choosing a metric that's easy to measure (CPU) instead of one that's meaningful (did the business function keep working).
+**Steady state must be a business-facing metric, not an infrastructure one.** "CPU usage" or "pod count" tell you the system is doing something, not that it's doing its job.
 
-**Chaos in CI, not just scheduled game days.** Toxiproxy's lightweight TCP-proxy model makes it practical to wrap a dependency inside an ordinary integration test — inject latency or a connection reset for one test case, assert the caller's timeout and fallback behavior, and run it on every PR. This turns a subset of chaos engineering into a correctness check rather than an occasional, manually-scheduled exercise, closing the loop faster than a quarterly game day would.
+"Checkout success rate" or "search p99 under 300ms" directly reflect user experience and make the hypothesis falsifiable in a way that matters.
 
-**Turning findings into action, not a one-off report.** An experiment that reveals a gap (a misconfigured breaker, a missing alert) is only valuable if the fix becomes a tracked action item with an owner, the way a postmortem action item would be tracked — otherwise the same gap resurfaces the next time the same dependency actually fails in production, and the experiment's cost (the engineering time, the controlled risk taken) was wasted.
+A common mistake is choosing a metric that's easy to measure (CPU) instead of one that's meaningful (did the business function keep working).
+
+**Chaos in CI, not just scheduled game days.** Toxiproxy's lightweight TCP-proxy model makes it practical to wrap a dependency inside an ordinary integration test — inject latency or a connection reset for one test case, assert the caller's timeout and fallback behavior, and run it on every PR.
+
+This turns a subset of chaos engineering into a correctness check rather than an occasional, manually-scheduled exercise, closing the loop faster than a quarterly game day would.
+
+**Turning findings into action, not a one-off report.** An experiment that reveals a gap (a misconfigured breaker, a missing alert) is only valuable if the fix becomes a tracked action item with an owner, the way a postmortem action item would be tracked.
+
+Otherwise the same gap resurfaces the next time the same dependency actually fails in production, and the experiment's cost (the engineering time, the controlled risk taken) was wasted.
 
 ## 9. Interview questions
 
@@ -312,3 +376,8 @@ Labeled **representative output** because no chaos-tooling cluster is available 
 - **Before this:** [[Load and Performance Testing]], [[Testing Async and Event-Driven Systems]]
 - **Next:** [[Testing in CI-CD, Flaky Tests and Testing in Production]]
 - **Compare with:** [[Testing LLD Code]] (LLD-round test structure, a different scale of testing)
+
+### Watch on YouTube
+
+- [AWS re:Invent 2024 - Chaos engineering: A proactive approach to system resilience (ARC326)](https://www.youtube.com/watch?v=MjPRd_UWCS0) · AWS Events · 58 min · 4,339 views
+- [AWS re:Invent 2022 - The evolution of chaos engineering at Netflix (NFX303)](https://www.youtube.com/watch?v=Xbn65E-BQhA) · AWS Events · 47 min · 21,185 views

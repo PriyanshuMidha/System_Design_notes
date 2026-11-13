@@ -12,13 +12,15 @@ sources:
   - "gRPC documentation, Status codes and their use in gRPC"
   - "Stripe API docs, Errors (error object: type, code, decline_code, message, param, doc_url)"
   - "Go 1.24 standard library docs: errors (Is, As), log/slog, net/http (Request.Pattern since Go 1.23)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # API Error Handling
 
 > [!summary] TL;DR
-> When an API call fails, the response must tell the **client program** what went wrong (a status code and a stable error code it can branch on), tell the **human** how to fix it (a readable message, with every invalid field listed), and tell **you** where to look (a request ID that links to the full error in your logs). The standard body for this over HTTP is **Problem Details** (RFC 9457, `application/problem+json`).
+> When an API call fails, the response must tell the **client program** what went wrong (a status code and a stable error code it can branch on), tell the **human** how to fix it (a readable message, with every invalid field listed), and tell **you** where to look (a request ID that links to the full error in your logs).
+>
+> The standard body for this over HTTP is **Problem Details** (RFC 9457, `application/problem+json`).
 
 > [!abstract] Core idea
 > - Every error response carries three things: a status code, a **stable error code** clients branch on, and a human message.
@@ -26,6 +28,50 @@ updated: 2026-11-02
 > - Convert domain errors to HTTP in **one** mapping layer; the domain never knows about status codes.
 > - Tell clients what is retryable (`429`, `503`) and what is not (`400`, `422`).
 > - Classic mistake: leaking stack traces or SQL errors, or making clients parse the message text.
+
+## Start here: the basics
+
+**The problem in one story.**
+You try to book seat A7 and the app just says "Something went wrong".
+Was the seat taken? Was your card declined? Should you try again?
+A good error answer tells the app what happened, tells you how to fix it,
+and gives the engineers an ID to find the exact failure in their logs.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HTTP status code | A 3-digit number summing up the result | `404` = not found, `500` = server bug |
+| 4xx vs 5xx | 4xx: the caller did something wrong; 5xx: the server failed | `400` bad input vs `503` overloaded |
+| Error code | A fixed string a program can check with `if` | `"seat_taken"` |
+| Validation | Checking input is allowed before using it | `quantity` must be 1-10 |
+| Retry | Sending the same request again after a failure | Try again after 2 s on `503` |
+| Request ID | A unique ID stamped on every request | `req-7f3a` in the response and the logs |
+| Problem Details | The standard JSON body for HTTP errors (RFC 9457) | `{"type":..., "title":..., "status":409}` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request"] --> H["Handler"]
+    H --> SVC["Service returns<br/>domain error"]
+    SVC --> M["One mapping layer"]
+    M --> RESP["Status + error code<br/>+ message + request ID"]
+    M --> LOG["Full details<br/>in logs only"]
+```
+
+**Analogy.** A good error is like a parcel returned with a sticker: "Address incomplete: missing flat number. Ref 7F3A." You know what to fix, and the courier can look up ref 7F3A.
+Where it breaks: a courier sticker is read by a person, while an API error must also be read by code, so the code field must never change wording.
+
+**How the rest of this note builds up**
+
+- First, why error design matters (section 1) and the three audiences: program, human, operator (section 2).
+- Then how it works: Problem Details, stable codes, field-level validation errors, status mapping, retryable vs not, one mapping layer (section 3).
+- Then a full Go middleware example with tests (section 4), variants such as gRPC and GraphQL errors (section 5) and trade-offs (section 6).
+- Finally the SDE-3 deep dive: gateway consistency, the typed-nil trap, layer translation and retryability (sections 7-9).
+
+> [!tip] Remember
+> Every error says what (code), how to fix (message) and where to look (request ID), and never leaks internals.
 
 ## 1. Why it exists
 
@@ -515,7 +561,9 @@ HTTP 500 application/problem+json
 }
 ```
 
-The table name stays in the log line, linked by `request_id`; the client sees only what it can act on. The middleware reuses any incoming `X-Request-Id`; at a public edge, accept it only from your own gateway, or check its length and characters first, because it is copied into logs and responses. While writing this example, the first version of `TestTypedNilBecomesA500` sent the typed-nil error through the full middleware and the test **panicked** inside `(*ValidationError).Error`, called by the log line. That is the trap described in the deep dive.
+The table name stays in the log line, linked by `request_id`; the client sees only what it can act on. The middleware reuses any incoming `X-Request-Id`; at a public edge, accept it only from your own gateway, or check its length and characters first, because it is copied into logs and responses.
+
+While writing this example, the first version of `TestTypedNilBecomesA500` sent the typed-nil error through the full middleware and the test **panicked** inside `(*ValidationError).Error`, called by the log line. That is the trap described in the deep dive.
 
 ## 5. Variants and comparison
 
@@ -577,7 +625,9 @@ sequenceDiagram
 	- **Stripe** returns an error object with `type` (such as `card_error`, `invalid_request_error`, `api_error`), `code`, `decline_code` for card declines, `param` naming the bad field, a `message` and a `doc_url`, and every response carries a `Request-Id` header.
 	- **Google APIs** follow AIP-193: canonical gRPC codes plus `ErrorInfo` with a stable reason, mapped to HTTP for JSON clients.
 	- **Kubernetes** returns a `Status` object with `reason` (`NotFound`, `Conflict`, `AlreadyExists`) and `details`, so `kubectl` can react to the reason instead of the message.
-- **Consistency across the gateway and services.** The gateway produces errors of its own: `401` from token checks, `429` from rate limiting (see [[Rate Limiting - Algorithms and Distributed Design]]), `502` and `504` when a service fails. Out of the box, many proxies and load balancers return HTML error pages for these. Configure the gateway to emit the same `application/problem+json` shape and to pass through service errors untouched, and propagate the request ID in both directions (see [[API Gateway and BFF]]).
+- **Consistency across the gateway and services.** The gateway produces errors of its own: `401` from token checks, `429` from rate limiting (see [[Rate Limiting - Algorithms and Distributed Design]]), `502` and `504` when a service fails.
+
+  Out of the box, many proxies and load balancers return HTML error pages for these. Configure the gateway to emit the same `application/problem+json` shape and to pass through service errors untouched, and propagate the request ID in both directions (see [[API Gateway and BFF]]).
 - **Failure modes → fixes:**
 	- SQL or stack traces in responses → a default branch that returns a generic `500`; a test that asserts internal strings never appear in bodies.
 	- The same error logged five times (repository, service, handler, middleware, gateway) → wrap and return in inner layers, log once at the edge (see [[Structured Logging]]).
@@ -591,12 +641,18 @@ sequenceDiagram
 
 ## 8. Deep dive
 
-- **The typed-nil trap.** An `error` is an interface: a type and a value. Returning a nil `*ValidationError` as `error` yields an interface whose type is set, so `err != nil` is true. The middleware then treats a valid request as failed, `errors.As` matches and hands back a nil pointer, and calling `Error()` on it panics if `Error()` reads a field. The test above checks the first, the `ve != nil` guard handles the second, and the third is what crashed the first version of the test. Fix: return a literal `nil` on success, and guard `ve != nil` after `errors.As`. More Go error mechanics (`errors.Join`, several `%w` in one `fmt.Errorf` since Go 1.20, wrapping rules) are in [[Error Handling]].
+- **The typed-nil trap.** An `error` is an interface: a type and a value. Returning a nil `*ValidationError` as `error` yields an interface whose type is set, so `err != nil` is true.
+
+  The middleware then treats a valid request as failed, `errors.As` matches and hands back a nil pointer, and calling `Error()` on it panics if `Error()` reads a field. The test above checks the first, the `ve != nil` guard handles the second, and the third is what crashed the first version of the test.
+
+  Fix: return a literal `nil` on success, and guard `ve != nil` after `errors.As`. More Go error mechanics (`errors.Join`, several `%w` in one `fmt.Errorf` since Go 1.20, wrapping rules) are in [[Error Handling]].
 - **Translate, do not leak, at layer boundaries.** If the repository returns the raw driver error, every caller must know about PostgreSQL error codes. Translate the ones that have domain meaning (`23505` on the seat index → `ErrSeatTaken`; `40001` serialization failure → retry inside the service) and wrap the rest as opaque internal errors.
 - **`errors.Is` vs `errors.As` vs string matching.** `Is` compares against a sentinel through the whole wrap chain; `As` finds the first error of a type and gives you its data. Matching on `err.Error()` text breaks as soon as someone adds context with `fmt.Errorf`, which is exactly what wrapping is for.
 - **Retryable as a property, not a status.** Inside services, attach retryability to the error (a small interface such as `Retryable() bool`, or a `RetryInfo` detail in gRPC) so retry loops do not re-derive it from status codes. Only the edge turns it into `Retry-After`.
 - **Panics are not errors.** A recover middleware turns a panic into a `500` with the same problem shape and logs the stack trace, so the client sees a consistent error and the process survives (see [[Middleware]]).
-- **`instance` and request IDs.** RFC 9457 lets `instance` be any URI reference. Using the request path is common but not unique per occurrence; `urn:request:req-7f3a` makes it unique. Either way, also return the request ID in a response header such as `X-Request-Id` (some teams return the trace ID taken from the W3C `traceparent` request header instead) so clients can quote it even when the body is lost.
+- **`instance` and request IDs.** RFC 9457 lets `instance` be any URI reference. Using the request path is common but not unique per occurrence; `urn:request:req-7f3a` makes it unique.
+
+  Either way, also return the request ID in a response header such as `X-Request-Id` (some teams return the trace ID taken from the W3C `traceparent` request header instead) so clients can quote it even when the body is lost.
 - **Errors in streaming responses.** Once a `200` and part of an SSE stream or a chunked body have been sent, the status cannot change. Send an error event in the stream's own format; gRPC can do better because its status travels in trailers after the messages.
 
 ## 9. Interview questions
@@ -638,3 +694,8 @@ sequenceDiagram
 - **Before this:** [[REST and HTTP API Design]], [[API Contract Design and OpenAPI]], [[Error Handling]] (Go errors: sentinel, typed, wrapping)
 - **Next:** [[Idempotency and Idempotency Keys]], [[Timeouts, Retries and Backoff]], [[Building REST Endpoints]]
 - **Compare with:** [[gRPC]] (status codes and rich details), [[GraphQL]] (errors beside partial data), [[API Gateway and BFF]] (errors the gateway produces)
+
+### Watch on YouTube
+
+- [Handling HTTP API Errors with Problem Details](https://www.youtube.com/watch?v=uvTT_0hqhyY) · CodeOpinion · Practical explainer on Problem Details (RFC 9457) as the standard error body
+- [RFC 9457 Problem Details for HTTP APIs](https://www.youtube.com/watch?v=5vC-IZFkwkg) · Bruce Hartpence - Learning Networks  · Walks through the RFC itself: type/title/status/detail/instance fields

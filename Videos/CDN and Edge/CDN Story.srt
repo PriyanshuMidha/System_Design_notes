@@ -1,0 +1,316 @@
+1
+00:00:02,399 --> 00:00:11,369
+Narrator: This is Oscar. Oscar runs the only bakery in the world, in Virginia. His website is his shop, and every loaf is a file. A photo, a page, a video.
+
+2
+00:00:11,800 --> 00:00:16,521
+Narrator: And this is Maya. She lives in Mumbai. She taps to open his shop.
+
+3
+00:00:16,952 --> 00:00:19,202
+Maya: One loaf, please!
+
+4
+00:00:19,632 --> 00:00:31,722
+Narrator: Her request has to cross half the planet. Typically one hundred eighty to two hundred fifty milliseconds, each way. Add the handshakes, and the first byte of a cold connection can take four to six hundred milliseconds.
+
+5
+00:00:32,152 --> 00:00:40,786
+Narrator: Now imagine fifty thousand Mayas, every single day. Every one of them held open by Oscar. Every loaf baked and carried by Oscar.
+
+6
+00:00:41,216 --> 00:00:43,969
+Oscar: I cannot keep doing this.
+
+7
+00:00:46,920 --> 00:00:53,009
+Narrator: So Oscar has an idea. He opens a small branch right inside Mumbai, and puts Pia in charge.
+
+8
+00:00:53,439 --> 00:01:03,033
+Narrator: A chain of branches, placed close to the customers. That is a C D N, a content delivery network. And each branch is called a pop, a point of presence.
+
+9
+00:01:03,463 --> 00:01:06,721
+Pia: Welcome! I keep copies of Oscar's loaves on my shelf.
+
+10
+00:01:07,152 --> 00:01:09,209
+Maya: One loaf, please.
+
+11
+00:01:09,640 --> 00:01:11,361
+Pia: Right here!
+
+12
+00:01:11,792 --> 00:01:17,834
+Narrator: That is a cache hit. Milliseconds, not hundreds. And Oscar never even heard about it.
+
+13
+00:01:20,784 --> 00:01:29,465
+Narrator: Next, a customer asks for a loaf Pia has never stocked. That is a cache miss. Pia does not run to Virginia. She phones Sam.
+
+14
+00:01:29,896 --> 00:01:31,617
+Pia: Sam, do you have the rye?
+
+15
+00:01:32,147 --> 00:01:35,022
+Sam: Not today. I will ask Oscar.
+
+16
+00:01:35,451 --> 00:01:45,837
+Narrator: Sam is the origin shield. One regional tier, between the branches and the bakery. Oscar bakes the loaf once. It travels back through Sam to Pia, and Pia keeps a copy.
+
+17
+00:01:46,268 --> 00:01:49,237
+Pia: And the next customer gets it straight from the shelf.
+
+18
+00:01:49,668 --> 00:02:05,310
+Narrator: This is called a pull C D N. The branch fetches a loaf only when someone first asks. The other way is a push C D N. Oscar delivers loaves to every shelf in advance, for example before a big launch. More work to manage, but nobody ever waits for a first miss.
+
+19
+00:02:08,259 --> 00:02:13,078
+Maya: But how do I reach the Mumbai branch, and not the Virginia one?
+
+20
+00:02:13,608 --> 00:02:23,009
+Narrator: Two ways. With anycast, every branch shares one phone number, and the phone network itself rings the nearest one. Cloudflare and Fastly work like this.
+
+21
+00:02:23,439 --> 00:02:31,138
+Narrator: With geo D N S, the directory gives out a different number for each region. Cloud Front works like this, and Akamai mixes both.
+
+22
+00:02:34,087 --> 00:02:36,457
+Narrator: Oscar sticks a label on every loaf.
+
+23
+00:02:36,888 --> 00:02:39,162
+Oscar: Fresh for one hour.
+
+24
+00:02:39,592 --> 00:02:51,825
+Narrator: That is max age, the T T L, how long a copy counts as fresh. A label just for branches is S max age. One that says check with me first is no cache. And one that says never shelve this is no store.
+
+25
+00:02:52,256 --> 00:02:54,385
+Narrator: So what happens when the hour is up?
+
+26
+00:02:54,915 --> 00:02:59,806
+Pia: I do not throw it away. I phone Oscar. Is the sourdough still the same batch?
+
+27
+00:03:00,235 --> 00:03:04,237
+Oscar: Same recipe. Keep it.
+
+28
+00:03:04,668 --> 00:03:10,421
+Narrator: That is a three oh four. No new loaf is sent, only a cheap yes. The copy is fresh again.
+
+29
+00:03:10,852 --> 00:03:20,854
+Narrator: There is a smarter label too, stale while revalidate. Pia hands over the slightly old loaf instantly, and checks with Oscar in the background. The customer never waits.
+
+30
+00:03:23,804 --> 00:03:33,542
+Narrator: Pia needs to know which orders share one loaf. That is the cache key, normally the address of the order. Sourdough sliced is one loaf. Sourdough whole is another.
+
+31
+00:03:33,972 --> 00:03:35,765
+Maya: The ribbon is blue!
+
+32
+00:03:36,195 --> 00:03:39,165
+Pia: A ribbon does not change the bread. Same loaf.
+
+33
+00:03:39,596 --> 00:03:57,277
+Narrator: Those are tracking parameters, like U T M source. A good key ignores them, or the same loaf is stored a thousand times. But the opposite mistake is worse. If the key included a different cookie for every customer, that is Vary on Cookie, no two customers would ever share a loaf, and the shelf would be useless.
+
+34
+00:04:00,228 --> 00:04:08,502
+Narrator: Friday, nine a m. The sourdough's label runs out, and a hundred customers ask within five milliseconds, at branches all over the city.
+
+35
+00:04:08,931 --> 00:04:15,165
+Narrator: If every one of them phoned Oscar, he would be buried. A stampede, and one the shop caused itself.
+
+36
+00:04:15,596 --> 00:04:18,973
+Pia: Everyone wait. I will phone once, for all of you.
+
+37
+00:04:19,403 --> 00:04:23,310
+Narrator: That is request collapsing. Sam does the same, one tier up.
+
+38
+00:04:23,740 --> 00:04:26,829
+Sam: One call to Oscar. Not a hundred.
+
+39
+00:04:27,259 --> 00:04:30,829
+Narrator: A hundred requests. Exactly one for Oscar.
+
+40
+00:04:33,779 --> 00:04:36,942
+Narrator: Then Maya orders a birthday cake, with her own name on it.
+
+41
+00:04:37,372 --> 00:04:40,894
+Pia: This one is private. It never goes on a shared shelf.
+
+42
+00:04:41,324 --> 00:04:52,934
+Narrator: Private and no store exist for exactly this. Never let a response with a Set Cookie sit in a shared cache. A cake with one person's details, shelved publicly, goes home with a stranger.
+
+43
+00:04:53,363 --> 00:05:16,853
+Narrator: Two tricks to know. Cache poisoning. A prankster slips a fake label onto a loaf, the shelf ignores that detail when matching orders, and the fake loaf is handed to everyone. And cache deception. The prankster asks for Maya's private page with a fake ending, like slash nonexistent dot C S S. The shelf thinks it is a plain style file, shelves it, and hands Maya's page to strangers.
+
+44
+00:05:17,283 --> 00:05:27,093
+Narrator: The fix for both. The shelf code must include everything that makes a loaf different, and the bakery must reject strange endings, instead of quietly serving the same page.
+
+45
+00:05:27,524 --> 00:05:38,966
+Narrator: For paid downloads, Oscar uses a signed ticket in the address, a signed U R L, with an expiry time and a signature the branch checks. For a whole video, one signed cookie opens a whole aisle.
+
+46
+00:05:41,915 --> 00:05:46,446
+Narrator: Oscar improves his sourdough. How do the old loaves leave a hundred shelves?
+
+47
+00:05:46,875 --> 00:05:54,189
+Oscar: I do not recall anything. I rename it. Sourdough Two.
+
+48
+00:05:54,620 --> 00:06:00,350
+Narrator: That is a versioned U R L. The old name is simply abandoned, and nothing has to expire.
+
+49
+00:06:00,779 --> 00:06:10,110
+Narrator: Or Oscar can recall only the loaves with one tag. That is a tag purge. Or mark old loaves stale while fresh ones arrive. That is a soft purge.
+
+50
+00:06:10,540 --> 00:06:18,141
+Narrator: But never shout, throw away everything. All the branches phone Oscar in the same second, and a routine change becomes an outage.
+
+51
+00:06:21,091 --> 00:06:33,637
+Narrator: Pia is more than a shelf. At the door she checks tickets, an expiry check on a token. She redirects people, runs taste tests, and turns troublemakers away. That is edge compute, your own code at the branch.
+
+52
+00:06:34,067 --> 00:06:41,045
+Pia: But I never decide what a member may order. Oscar keeps the real member list. My copy is only eventually up to date.
+
+53
+00:06:41,475 --> 00:07:08,805
+Narrator: And custom orders, like checkout, cannot be shelved. Still, Pia helps. The slow handshakes happen with the customer right here in Mumbai, over a short hop. Pia keeps a warm phone line to Oscar always open, and may even use a private road, the provider's own backbone, for the long leg. That is dynamic site acceleration, a product of its own. A newer protocol, H T T P three, even lets Maya's connection survive a switch from wifi to mobile data.
+
+54
+00:07:11,755 --> 00:07:25,189
+Narrator: Videos are loaves too, but huge. So Oscar slices a video into short segments, called H L S or dash. Every slice is cached separately, and Maya's player can switch quality mid stream by asking for a different slice.
+
+55
+00:07:25,620 --> 00:07:35,213
+Pia: I keep score two ways. Hit ratio counts requests. Byte hit ratio counts weight, because one giant video can make the request count look better than it really is.
+
+56
+00:07:35,644 --> 00:07:46,557
+Narrator: A good manager also watches origin offload, the share of requests that never reached Oscar. First byte time in each region. How fast purges finish. And the bandwidth bill, per region.
+
+57
+00:07:49,507 --> 00:08:08,485
+Narrator: Many companies sell this. Cloudflare puts cache, security and code at every branch. Fastly and Akamai are known for fine control and fast purges. Cloud Front fits neatly with Amazon's own services. Or a team can build a few branches themselves, with Varnish or Engine X, but then owns the hardware, the routing, and the pager.
+
+58
+00:08:08,915 --> 00:08:30,413
+Narrator: Branches are not free. Pia may serve a stale loaf. A problem in Brazil means checking a branch Oscar does not own. A branch cannot cure one viral loaf, because every request for it still funnels to one shelf slot. Rarely repeated custom orders gain little from the shelf. And a cafeteria with only local staff does not need branches at all.
+
+59
+00:08:33,364 --> 00:08:48,333
+Narrator: A few deeper points. First, why does S max age exist? Max age came before anyone needed a shared versus private split. S max age lets the operator give the C D N a different freshness window from the browser, without serving two different bodies.
+
+60
+00:08:48,764 --> 00:08:59,173
+Narrator: Next, stale if error. Like stale while revalidate, but it hides origin outages. If Oscar is down, Pia serves the old loaf instead of an error. Both are nearly free wins.
+
+61
+00:08:59,604 --> 00:09:13,182
+Narrator: Anycast has a risk, route flapping. If the routes change in the middle of a session, a connection can suddenly land at a different branch, and a long lived stream or web socket can break. So providers keep their announcements very stable.
+
+62
+00:09:13,611 --> 00:09:32,518
+Narrator: Cost has a shape too. Egress is priced per gigabyte, and the price swings a lot by region. A high hit ratio also cuts the origin's own bandwidth bill. And edge key value stores are fast to read everywhere, but slow to write, seconds to tens of seconds to spread. Fine for a feature flag. Wrong for a counter.
+
+63
+00:09:32,947 --> 00:09:46,861
+Narrator: Last, collapsing has a limit. It only helps while a fetch is in flight. A key that is cold everywhere, asked at different moments, is just normal traffic. There the shield's only job is to be the tier that holds the warm copy everyone else asks.
+
+64
+00:09:49,812 --> 00:10:07,854
+Narrator: Let us read real headers. The note measured this with curl, against the Cloudflare marketing page. The answer carried cache control, no store. On purpose. That page is personalised and full of experiments, so the origin opts out of every shared cache, rather than show one visitor's version to everyone.
+
+65
+00:10:08,283 --> 00:10:24,046
+Narrator: Compare a public static file. Its header says cache control public, max age three thousand six hundred, plus an age field and a cache status field. You can literally watch a real cache holding it for an hour. Reading these few headers tells you what any response will do.
+
+66
+00:10:26,995 --> 00:10:37,166
+Narrator: Now the code. In Go, a tiny origin shield, in under forty lines. It holds one map, from a cache key to a call that is already in flight, guarded by a mutex.
+
+67
+00:10:37,596 --> 00:10:45,966
+Narrator: Get takes the lock, and checks the map. If a fetch for this key is already running, it counts itself as one more waiter, drops the lock, and waits on a channel.
+
+68
+00:10:46,395 --> 00:10:58,365
+Narrator: If not, it registers a new call first, and only then drops the lock and calls the origin. Registering before unlocking is the whole point. Anyone arriving in that window sees the entry, not a second fetch.
+
+69
+00:10:58,796 --> 00:11:13,190
+Narrator: When the origin answers, the call is removed, and the channel is closed. Closing wakes every waiter at once, and the result is safe to read. The test fires one hundred concurrent misses, and proves exactly one origin call, with the race detector on.
+
+70
+00:11:16,139 --> 00:11:19,374
+Narrator: Interview round. Five questions you will really get.
+
+71
+00:11:19,803 --> 00:11:37,101
+Narrator: One. Max age versus S max age? Max age applies to every cache, browsers included. S max age overrides it, but only for shared caches like a C D N. Browsers ignore it. Set both to hold a response longer, or shorter, in the C D N than in the browser.
+
+72
+00:11:37,532 --> 00:11:53,485
+Narrator: Two. The hit ratio falls to nearly zero after someone adds Vary on Cookie. Why? Almost every request now has a different cookie, so almost every request becomes its own cache key. Nothing is shared. Strip the cookie before the lookup, or stop varying on it.
+
+73
+00:11:53,916 --> 00:12:09,629
+Narrator: Three. True or false: a C D N cannot help a logged in dashboard. False. Even uncacheable pages gain from dynamic acceleration. T L S ends at the nearby branch, the origin connection stays warm, and H T T P three helps.
+
+74
+00:12:10,059 --> 00:12:23,494
+Narrator: Four. Poisoning versus deception? Poisoning: the key misses an input the origin varies on, so one bad response is shared with everyone. Deception: the cache is tricked into storing a private page that only looks static.
+
+75
+00:12:23,923 --> 00:12:49,022
+Narrator: Five. What runs at the edge, and what stays at the origin? The edge can check a token's signature and expiry, for a fast reject. The real permission decision stays at the origin, because the edge's view can be stale. And geo D N S versus anycast? Anycast fails over almost instantly and ignores resolver location, but needs routing. Geo D N S is simpler, but coarse, and bounded by the T T L.
+
+76
+00:12:51,971 --> 00:13:08,190
+Narrator: So, in short. Copies sit close to the customers. Labels say how long they stay fresh. The key says what is shared. Collapsing protects Oscar. Rename instead of recall. Private stays private. Quick checks at the edge, real decisions at the origin.
+
+77
+00:13:08,620 --> 00:13:22,173
+Narrator: To go deeper, open the note called C D N and Edge, and its Go note, in your vault. Before it, read H T T P fundamentals, and D N S. After it, forward and reverse proxies, and what happens when you type a U R L.
+
+78
+00:13:22,604 --> 00:13:24,566
+Maya: Thank you, Pia!
+
+79
+00:13:24,995 --> 00:13:26,717
+Pia: Next!
+

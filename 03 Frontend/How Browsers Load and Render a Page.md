@@ -8,7 +8,7 @@ sources:
   - "web.dev, Core Web Vitals"
   - "WHATWG HTML Standard, script processing model"
 status: reviewed
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # How Browsers Load and Render a Page
@@ -25,7 +25,9 @@ updated: 2026-11-09
 
 ### Whiteboard version
 
-A backend engineer who has never opened dev tools only needs this picture: the browser cannot draw a single pixel until it has read *all* of the HTML it has so far and *all* of the CSS, because any later CSS rule could still change how an earlier element looks. Pixels only ever come out of the far end of this pipeline:
+A backend engineer who has never opened dev tools only needs this picture: the browser cannot draw a single pixel until it has read *all* of the HTML it has so far and *all* of the CSS, because any later CSS rule could still change how an earlier element looks.
+
+Pixels only ever come out of the far end of this pipeline:
 
 ```mermaid
 flowchart LR
@@ -40,11 +42,61 @@ flowchart LR
 
 Everything below is what delays entry into, or progress through, this pipeline.
 
+## Start here: the basics
+
+**The problem in one story.**
+You type a URL and press Enter. A blank white screen sits there for a moment, then the page appears.
+In that moment the browser downloaded text files, turned them into structures, worked out sizes and positions, and painted pixels.
+If one slow script is in the way, the whole page waits. Knowing the steps tells you what to remove from the way.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HTML / CSS / JS | Structure / looks / behaviour of a page | `<h1>`, `color: red`, `onclick` |
+| Parse | Read text and turn it into a structure the program can use | HTML text → tree of elements |
+| DOM | The tree built from HTML | `<body>` with child `<div>`s |
+| CSSOM | The tree of style rules built from CSS | "all `h1` are 32px" |
+| Layout | Working out each box's size and position | Header is 1200×80 at the top |
+| Paint | Filling in pixels: text, colours, images | Drawing the blue button |
+| Render-blocking | Something the browser must finish before showing anything | A CSS file in `<head>` |
+| `async` / `defer` | Script attributes that stop a script from pausing the HTML parser | `<script defer src="app.js">` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    H["HTML"] --> D["DOM"]
+    C["CSS"] --> O["CSSOM"]
+    D --> R["Render tree"]
+    O --> R
+    R --> L["Layout"]
+    L --> P["Paint"]
+    P --> X["Composite<br/>(pixels on screen)"]
+```
+
+**Analogy.** Building a page is like building flat-pack furniture: read the parts list (HTML), read the style guide (CSS), plan where every piece goes (layout), then paint and assemble (paint, composite).
+Where it breaks: a carpenter can't start before the whole manual arrives; a browser parses HTML as it streams in and can show parts early.
+
+**How the rest of this note builds up**
+
+- First, why the pipeline exists and a mental model of it (sections 1-2).
+- Then each stage: DOM, CSSOM, render tree, layout, paint, composite, script loading and `DOMContentLoaded` vs `load` (section 3).
+- Then a worked page load, the critical rendering path, Core Web Vitals and the backend side (section 4).
+- Finally variants, trade-offs, production practice and the deep dive, then interview questions (sections 5-9).
+
+> [!tip] Remember
+> HTML → DOM, CSS → CSSOM, then layout, paint, composite; anything that blocks those steps delays the first paint.
+
 ## 1. Why it exists
 
 Say a page's HTML references a 40 KB stylesheet and ends with a `<script src="analytics.js">` tag with no attributes, on a connection with 100 ms round-trip latency.
 
-Without any of the mechanisms below, the browser does this, strictly in order: download and parse enough HTML to discover the stylesheet → download the stylesheet (one round trip) → parse HTML up to the script tag → **stop parsing HTML entirely** → download the script (another round trip, since it is a separate request) → execute it → resume parsing the rest of the HTML. Two sequential round trips plus a parser stall, before the user sees anything past that script tag. For a 50 KB analytics script that has nothing to do with the page's content, that stall is pure waste: it exists only because the HTML parser, by the HTML specification's default behavior, must treat a script tag as "fetch and run it right now, synchronously, in document order."
+Without any of the mechanisms below, the browser does this, strictly in order: download and parse enough HTML to discover the stylesheet → download the stylesheet (one round trip) → parse HTML up to the script tag → **stop parsing HTML entirely** → download the script (another round trip, since it is a separate request) → execute it → resume parsing the rest of the HTML.
+
+Two sequential round trips plus a parser stall, before the user sees anything past that script tag.
+
+For a 50 KB analytics script that has nothing to do with the page's content, that stall is pure waste: it exists only because the HTML parser, by the HTML specification's default behavior, must treat a script tag as "fetch and run it right now, synchronously, in document order."
 
 This is why `<script>` has `async` and `defer` attributes, and why the critical rendering path is something you actively manage rather than something that just happens.
 
@@ -53,7 +105,15 @@ This is why `<script>` has `async` and `defer` attributes, and why the critical 
 
 ## 2. Mental model
 
-Think of the browser as reading a recipe (HTML) out loud while a second person checks a binder of substitutions (CSS) at the same time. The reader can't say whether "add the red sauce" really means red until the substitutions binder is fully checked, because a later page in the binder might override it. So before any step of the recipe can be *performed* (laid out and shown), the binder has to be completely read. A plain `<script>` tag is a recipe instruction that says "stop reading, go fetch and follow a side-note before continuing" — the side-note might rewrite the next few lines, so the reader can't skip ahead. `defer` changes that instruction to "collect this side-note now, but follow it only after I finish the whole recipe, in the order I collected them." `async` changes it to "follow this side-note the instant it arrives, even if I'm mid-sentence."
+Think of the browser as reading a recipe (HTML) out loud while a second person checks a binder of substitutions (CSS) at the same time.
+
+The reader can't say whether "add the red sauce" really means red until the substitutions binder is fully checked, because a later page in the binder might override it.
+
+So before any step of the recipe can be *performed* (laid out and shown), the binder has to be completely read.
+
+A plain `<script>` tag is a recipe instruction that says "stop reading, go fetch and follow a side-note before continuing" — the side-note might rewrite the next few lines, so the reader can't skip ahead.
+
+`defer` changes that instruction to "collect this side-note now, but follow it only after I finish the whole recipe, in the order I collected them." `async` changes it to "follow this side-note the instant it arrives, even if I'm mid-sentence."
 
 This analogy breaks down in one place: a real recipe reader can glance ahead in the binder whenever they like, but the browser genuinely cannot show anything — not even the parts it has already read — until the binder (CSS) is fully checked. The withholding is total, not partial.
 
@@ -80,7 +140,13 @@ flowchart LR
 
 ### Building the CSSOM
 
-Before naming it, here's the problem: the browser needs to know the final, computed style of an element — its color, size, visibility — before it can draw even one pixel of it. But CSS rules can come from several places (an external file, a `<style>` block, inline `style=""`), and a rule near the *end* of the last stylesheet can still override something that looked settled near the top. The browser has no way to know it has seen the "final word" on an element's style until every stylesheet has been read in full. This completed tree of parsed, cascaded rules is the **CSSOM** (CSS Object Model) — see [[CSS Fundamentals - Cascade, Selectors, Box Model]] for how a winning declaration is chosen among competing rules.
+Before naming it, here's the problem: the browser needs to know the final, computed style of an element — its color, size, visibility — before it can draw even one pixel of it.
+
+But CSS rules can come from several places (an external file, a `<style>` block, inline `style=""`), and a rule near the *end* of the last stylesheet can still override something that looked settled near the top.
+
+The browser has no way to know it has seen the "final word" on an element's style until every stylesheet has been read in full.
+
+This completed tree of parsed, cascaded rules is the **CSSOM** (CSS Object Model) — see [[CSS Fundamentals - Cascade, Selectors, Box Model]] for how a winning declaration is chosen among competing rules.
 
 That is what makes CSS **render-blocking**: first paint never happens before the CSSOM is complete, no matter how far along the DOM is.
 
@@ -107,7 +173,9 @@ flowchart TD
     G -- no, only transform/opacity --> CO3[Composite only]
 ```
 
-**Example:** changing an element's `width` re-runs all three steps (layout, paint, composite) on every frame; changing only its `transform: translateX(...)` skips straight to composite. On a typical laptop, a layout+paint+composite frame for a moderately complex page can take several milliseconds, while a composite-only frame takes a fraction of a millisecond — the difference between a smooth 60 fps animation and a janky one.
+**Example:** changing an element's `width` re-runs all three steps (layout, paint, composite) on every frame; changing only its `transform: translateX(...)` skips straight to composite.
+
+On a typical laptop, a layout+paint+composite frame for a moderately complex page can take several milliseconds, while a composite-only frame takes a fraction of a millisecond — the difference between a smooth 60 fps animation and a janky one.
 
 **Why it matters:** this is the entire reason "animate `transform`/`opacity`, not `width`/`top`" is standard advice — it is a direct consequence of which of the three steps a property change actually requires.
 
@@ -151,7 +219,11 @@ Reading the gantt chart: all three download in parallel with parsing, so the dow
 
 **Example:** a script tag at byte offset 2,000 that takes 3 seconds to download — plain `<script>` stalls the parser for the full 3 seconds; `async` lets parsing continue for those 3 seconds and only pauses for however long the script itself takes to run (often a few milliseconds); `defer` behaves the same as `async` for the download, but waits to execute until the parser has nothing left to parse.
 
-**Why it matters:** "`async` blocks rendering less" is the wrong mental model — both `async` and `defer` get parallel downloads and don't block parsing *while downloading*. The real trade a `defer` script makes for its guarantee (document order, runs after a complete DOM) is that it must wait for every other defer script and for parsing to fully finish. The trade an `async` script makes for running the instant it's ready is giving up both ordering and the guarantee that parsing has finished — it can interrupt the parser mid-document, which is why async scripts must never assume elements below them in the HTML already exist.
+**Why it matters:** "`async` blocks rendering less" is the wrong mental model — both `async` and `defer` get parallel downloads and don't block parsing *while downloading*.
+
+The real trade a `defer` script makes for its guarantee (document order, runs after a complete DOM) is that it must wait for every other defer script and for parsing to fully finish.
+
+The trade an `async` script makes for running the instant it's ready is giving up both ordering and the guarantee that parsing has finished — it can interrupt the parser mid-document, which is why async scripts must never assume elements below them in the HTML already exist.
 
 Inline scripts (no `src`) ignore both `async` and `defer`: they always run immediately, in place, because there's nothing to "download" to defer.
 
@@ -202,7 +274,9 @@ Trace a real page load: `index.html` (critical, 8 KB), `styles.css` (critical, 3
 | 5 | Fetch `analytics.js` (80 ms RTT), execute it | `app.js` runs (in order, after parsing) → `DOMContentLoaded` |
 | 6 | Parser resumes, finishes, fires `DOMContentLoaded` | `analytics.js` runs whenever its download lands, independently |
 
-The unoptimized path pays two serialized 80 ms round trips (160 ms) purely for parser stalls, on top of the CSS fetch; the optimized path overlaps all three downloads with parsing, so the extra cost of the two scripts is close to zero on the critical path. This is the actual mechanism behind "defer/async make pages faster" — it's a story about overlapping network time with parsing time, not about the scripts becoming lighter.
+The unoptimized path pays two serialized 80 ms round trips (160 ms) purely for parser stalls, on top of the CSS fetch; the optimized path overlaps all three downloads with parsing, so the extra cost of the two scripts is close to zero on the critical path.
+
+This is the actual mechanism behind "defer/async make pages faster" — it's a story about overlapping network time with parsing time, not about the scripts becoming lighter.
 
 > [!tip] Remember
 > The win from `defer`/`async` is never "the script got smaller" — it's "the download stopped sharing the critical path with parsing."
@@ -244,7 +318,9 @@ This feeds directly into **Core Web Vitals**: **LCP** (Largest Contentful Paint 
 
 ### What's on the backend side
 
-Nothing above starts until the first HTML bytes exist: TTFB (time to first byte) from the server, response compression, and `Cache-Control`/`ETag` headers for static assets all shift when this whole pipeline gets to begin. HTTP/2 server push was an attempt to start sending CSS/JS before the browser asked for it; Chrome disabled it by default in 2022 (Chrome 106) and other Chromium browsers followed, because it over-pushed resources the browser already had cached more often than it helped — `preload` headers achieve the same goal with the browser still in control of what it actually needs.
+Nothing above starts until the first HTML bytes exist: TTFB (time to first byte) from the server, response compression, and `Cache-Control`/`ETag` headers for static assets all shift when this whole pipeline gets to begin.
+
+HTTP/2 server push was an attempt to start sending CSS/JS before the browser asked for it; Chrome disabled it by default in 2022 (Chrome 106) and other Chromium browsers followed, because it over-pushed resources the browser already had cached more often than it helped — `preload` headers achieve the same goal with the browser still in control of what it actually needs.
 
 ## 5. Variants and comparison
 
@@ -295,13 +371,17 @@ Nothing above starts until the first HTML bytes exist: TTFB (time to first byte)
 > Both download in parallel with parsing. `async` executes the moment the download finishes, which can interrupt parsing mid-document and gives no ordering guarantee between scripts. `defer` always executes after parsing completes and always in document order. The difference is in execution timing and ordering, not in whether the network fetch blocks.
 
 > [!question]- Trap: "Using `async` on every script tag is strictly faster, since it never blocks rendering." True or false?
-> False. `async` scripts still pause the parser for the duration of their execution, exactly when they happen to finish — which can be mid-parse, at an unpredictable point, and in an unpredictable order relative to other scripts. It only removes the parser stall during *download*, which `defer` also removes. Using `async` on a script another script depends on also breaks correctness, not just timing.
+> False. `async` scripts still pause the parser for the duration of their execution, exactly when they happen to finish — which can be mid-parse, at an unpredictable point, and in an unpredictable order relative to other scripts.
+>
+> It only removes the parser stall during *download*, which `defer` also removes. Using `async` on a script another script depends on also breaks correctness, not just timing.
 
 > [!question]- Does `DOMContentLoaded` wait for images to load?
 > No. It fires once the DOM is built and deferred/module scripts have run. Images, stylesheets already being applied, and iframes can still be loading; `load` is the event that waits for all of those.
 
 > [!question]- Why is CSS render-blocking but images aren't?
-> The browser cannot know an element's final computed style — and therefore cannot safely paint it — until every applicable CSS rule has been seen, since a later rule could override an earlier one. Images don't change layout semantics the same way once their box is sized (unless no width/height was reserved, which is a separate CLS problem), so the browser can paint around a missing image and fill it in when it arrives.
+> The browser cannot know an element's final computed style — and therefore cannot safely paint it — until every applicable CSS rule has been seen, since a later rule could override an earlier one.
+>
+> Images don't change layout semantics the same way once their box is sized (unless no width/height was reserved, which is a separate CLS problem), so the browser can paint around a missing image and fill it in when it arrives.
 
 > [!question]- What causes layout (reflow) versus only paint versus only composite?
 > Anything that changes an element's geometry (width, display, font-size, adding/removing nodes) triggers layout, then paint, then composite. Anything that changes only painted appearance (background-color, box-shadow) skips layout but repaints. Changing only `transform` or `opacity` can be handled entirely on the compositor thread, skipping both layout and paint — the reason those two properties are preferred for animation.
@@ -328,3 +408,8 @@ Nothing above starts until the first HTML bytes exist: TTFB (time to first byte)
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Next:** [[CSS Fundamentals - Cascade, Selectors, Box Model]]
 - **Compare with:** [[JavaScript Async - Event Loop, Promises, async-await]]
+
+### Watch on YouTube
+
+- [How Browsers Render HTML — The Full Rendering Pipeline (Zero to Pro)](https://www.youtube.com/watch?v=fwVcbzFSnEw) · Code with Pushpa · full DOM/CSSOM/render-tree/layout/paint pipeline walkthrough
+- [How Browsers Render Web Pages Explained / Critical Rendering Path Tutorial](https://www.youtube.com/watch?v=De7Go0qErrY) · freeplacementcourse  · interview-oriented recap of the critical rendering path

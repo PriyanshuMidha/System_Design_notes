@@ -10,13 +10,15 @@ sources:
   - "Protocol Buffers documentation: Updating a message type; reserved fields"
   - "Buf documentation: buf breaking"
   - "Apicurio Registry documentation; AWS Glue Schema Registry documentation"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Event Schemas and Schema Registry
 
 > [!summary] TL;DR
-> An **event schema** is the agreed shape of a message: its field names, types and defaults. A **schema registry** is a small service that stores every version of each schema, gives each one an ID, and refuses a new version that would break existing readers. Producers put the schema ID in front of each message so consumers know exactly how to decode it.
+> An **event schema** is the agreed shape of a message: its field names, types and defaults. A **schema registry** is a small service that stores every version of each schema, gives each one an ID, and refuses a new version that would break existing readers.
+>
+> Producers put the schema ID in front of each message so consumers know exactly how to decode it.
 
 > [!abstract] Core idea
 > - Producers and consumers deploy at different times, so for a while old and new code read each other's messages. Schemas must evolve without breaking either side.
@@ -24,6 +26,51 @@ updated: 2026-11-04
 > - Safe changes: add a field with a default, remove a field that had one. Unsafe: rename, change a type, add a required field, reuse a Protobuf field number.
 > - The registry is **not** in the message path: each message carries a 5-byte header (magic byte + 4-byte ID), and clients cache schemas by ID.
 > - Classic mistake: thinking BACKWARD means "producers can upgrade first". It means the *new schema can read old data*, so consumers upgrade first.
+
+## Start here: the basics
+
+**The problem in one story.**
+Team A sends "order placed" messages; team B reads them.
+One day team A renames `price` to `amount` and ships it.
+Team B's code still looks for `price`, finds nothing, and breaks in production.
+A schema registry is a gatekeeper that rejects that change before it ships.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Schema | The agreed shape of a message: fields and types | `{id: string, amount: int}` |
+| Serialize | Turn data into bytes to send | Struct to Avro bytes |
+| Deserialize | Turn bytes back into data | Avro bytes to struct |
+| Avro / Protobuf | Compact binary formats that use a schema | `.avsc`, `.proto` files |
+| Default value | Value used when a field is missing | `currency` defaults to `"INR"` |
+| Version | One saved edition of a schema | `orders-value` v3 |
+| Compatibility | Whether old and new code can read each other's data | BACKWARD, FORWARD, FULL |
+| Subject | The name a schema's versions are stored under | `orders-value` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Producer"] -- "register schema" --> R["Schema registry"]
+    R -- "ok: id 7<br/>or reject" --> P
+    P -- "bytes: id 7 + data" --> K["Kafka topic"]
+    K --> C["Consumer"]
+    C -- "get schema 7<br/>(cached)" --> R
+```
+
+**Analogy.** A shared form template at a government office: you may add an optional box, but you cannot rename a box that clerks already read.
+Where it breaks: a paper form does not have version numbers in every copy; each message carries its schema id so readers know which version wrote it.
+
+**How the rest of this note builds up**
+
+- First, why independent deploys need schemas (section 1) and the contract mental model (section 2).
+- Then the wire format, compatibility modes, and safe vs unsafe changes in Avro, Protobuf and JSON Schema (section 3).
+- Then a Go compatibility checker with tests (section 4), and registries compared (section 5).
+- Finally the SDE-3 deep dive: data contracts, why Avro needs the writer schema, global IDs and multi-step migrations (sections 6-8).
+
+> [!tip] Remember
+> Evolve schemas only by adding fields with defaults, and let the registry block every breaking change.
 
 ## 1. Why it exists
 
@@ -33,7 +80,9 @@ The order service publishes `OrderPlaced` as JSON to Kafka. Twelve services cons
 - Kafka keeps the new messages for 7 days, so even after a rollback the bad records sit in the log and every replaying consumer hits them again.
 - Nobody saw it coming, because the "contract" lived only in twelve codebases.
 
-With a registry, the producer's CI (or its first `serialize` call) asks: "is this new schema compatible with the last one under subject `orders-value`?" A rename is a delete of `amount` plus an add of `amount_paise` with no default. The new schema cannot fill `amount_paise` from old messages, so the change fails the BACKWARD check and never ships.
+With a registry, the producer's CI (or its first `serialize` call) asks: "is this new schema compatible with the last one under subject `orders-value`?" A rename is a delete of `amount` plus an add of `amount_paise` with no default.
+
+The new schema cannot fill `amount_paise` from old messages, so the change fails the BACKWARD check and never ships.
 
 ## 2. Mental model
 
@@ -143,7 +192,9 @@ consumer: id 2 in cache? no -> GET /schemas/ids/2 -> cache -> decode
 
 ### Go: a registry with compatibility checks and the wire format
 
-The model below uses flat record schemas and Avro's resolution rule: a reader can read a writer's data if every reader field exists in the writer with the same type, or has a default. Real Avro also handles nesting, unions, aliases and type promotions (such as `int` to `long`); this code treats any type change as breaking, which is stricter.
+The model below uses flat record schemas and Avro's resolution rule: a reader can read a writer's data if every reader field exists in the writer with the same type, or has a default.
+
+Real Avro also handles nesting, unions, aliases and type promotions (such as `int` to `long`); this code treats any type change as breaking, which is stricter.
 
 ```go
 // Package schema models a tiny schema registry: the Confluent wire format and
@@ -405,7 +456,9 @@ func TestWireFormat(t *testing.T) {
 }
 ```
 
-`go vet` is clean and `go test -race` passes (Go 1.24). Note what `TestTransitiveCatchesOlderVersions` shows: version `c` passes the plain BACKWARD check (it only looks at `b`, which has no `note` field) but fails the transitive check, because a consumer on `c` replaying from the start would meet version `a`'s string `note` where it expects a long.
+`go vet` is clean and `go test -race` passes (Go 1.24).
+
+Note what `TestTransitiveCatchesOlderVersions` shows: version `c` passes the plain BACKWARD check (it only looks at `b`, which has no `note` field) but fails the transitive check, because a consumer on `c` replaying from the start would meet version `a`'s string `note` where it expects a long.
 
 ### The same checks against a real registry
 
@@ -513,3 +566,8 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 - **Before this:** [[Kafka and Event Streaming]], [[Protocol Buffers and Schema Evolution]], [[Event-Driven Architecture Basics]]
 - **Next:** [[Stream Processing Basics]], [[Transactional Outbox and CDC]] (where event payloads are written)
 - **Compare with:** [[API Versioning and Backward Compatibility]] (the same problem for HTTP APIs), [[Zero-Downtime Schema Migrations]] (expand and contract for tables), [[Event Sourcing]] (upcasters)
+
+### Watch on YouTube
+
+- [How to Evolve your Microservice Schemas / Designing Event-Driven Microservices](https://www.youtube.com/watch?v=XG-EVX6PEFo) · Confluent, an IBM Company · 6 min · 7,510 views
+- [Apache Kafka 101: Schema Registry (2023)](https://www.youtube.com/watch?v=_x9RacHDQY0) · Confluent, an IBM Company · 6 min · 106,045 views

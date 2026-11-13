@@ -12,7 +12,7 @@ sources:
   - "Elhemali et al., Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022)"
   - "Bailis & Kingsbury, The Network is Reliable (ACM Queue, 2014)"
   - "Apache Cassandra docs, consistency levels; Amazon DynamoDB docs, read consistency and global tables; MongoDB docs, read and write concern"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # CAP and PACELC
@@ -26,6 +26,46 @@ updated: 2026-11-04
 > - "C" in CAP means linearizability (every read sees the latest write), not the "C" in ACID.
 > - PACELC: if Partition, choose A or C; Else, choose Latency or Consistency. The "else" branch is what you pay every day.
 > - Classic mistake: "pick 2 of 3". A "CA" system is just a single node, or a system that has not met a partition yet.
+
+## Start here: the basics
+
+**The problem in one story.** A shop has two branches that share one stock list by phone. The phone line goes dead. A customer at each branch wants the last item. Each branch must choose: refuse to sell until the line is back (stay correct), or sell anyway and maybe sell the same item twice (stay open).
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Node | One machine in the system | A database server in Mumbai |
+| Replica | A copy of the same data on another node | The seat count stored on 3 servers |
+| Partition | Nodes are running but cannot talk to each other | The Mumbai–Chennai link drops |
+| Consistency (CAP) | Every read sees the latest write | Nobody ever sees a stale seat count |
+| Availability (CAP) | Every working node still answers requests | Chennai keeps selling during the outage |
+| Latency | Time to answer one request | 2 ms local vs 30 ms cross-city |
+| Majority (quorum) | More than half of the replicas | 2 of 3 nodes |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+  P{Network partition?} -->|Yes| PC{Choose}
+  PC --> CP[C: refuse requests without a majority]
+  PC --> AP[A: answer locally, fix conflicts later]
+  P -->|No, Else| EC{Choose}
+  EC --> L[L: answer fast from nearby copy]
+  EC --> C2[C: wait for replicas to agree]
+```
+
+**Analogy.** Two bank tellers sharing a ledger over a phone line. If the line drops, a careful teller stops paying out; a friendly teller keeps paying and reconciles at day end. Where it breaks: real systems choose per operation, not once per company, and a "partition" can be just a slow link.
+
+**How the rest of this note builds up**
+
+- First, *Why it exists* walks through the ticketing example with a 90-second split.
+- Then *Mental model* and *How it works* define C, A and P precisely, and add the PACELC "else" branch.
+- The *Worked example* simulates CP and AP behaviour in code.
+- Finally, *Variants*, *In production* and the *Deep dive* map real databases to these choices for SDE-3 interviews.
+
+> [!tip] Remember
+> During a partition you choose correct or available; the rest of the time you choose fast or consistent.
 
 ## 1. Why it exists
 
@@ -360,7 +400,11 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 
 ## 8. Deep dive
 
-- **Where single-leader databases sit.** PostgreSQL with one primary and async replicas fits no CAP label cleanly. Reads from replicas are not linearizable even with no partition, so they are not "C". If the primary is cut off, writes stop until failover, so writes are not "A". After a failover, writes acknowledged by the old primary but not yet replicated are lost. CAP was never meant to classify every configuration; describe the actual guarantees instead (see [[Replication]]).
+- **Where single-leader databases sit.** PostgreSQL with one primary and async replicas fits no CAP label cleanly.
+
+  Reads from replicas are not linearizable even with no partition, so they are not "C". If the primary is cut off, writes stop until failover, so writes are not "A". After a failover, writes acknowledged by the old primary but not yet replicated are lost.
+
+  CAP was never meant to classify every configuration; describe the actual guarantees instead (see [[Replication]]).
 - **"Available" in CAP is weaker than "available" in an SLO.** CAP-availability has no latency bound and only applies to non-failed nodes. An SLO counts slow responses as failures and counts every user request. A CP system can have a higher SLO availability than an AP system if its partitions are rare and short.
 - **Partition detection is a timeout.** A node cannot tell "the other side crashed" from "the other side is slow". Every CP system therefore picks a timeout, and while it waits it is neither consistent-and-answering nor refusing: it is just slow. That is PACELC's latency cost showing up again.
 - **Partition recovery** (Brewer 2012): track which operations ran on each side, then merge, compensate (refund the double-booked seat), or apologise. Designing this recovery path is most of the real work of an AP system.
@@ -378,7 +422,9 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 > Because you cannot choose to have no partitions on a network. "CA" only describes a single node, or a cluster that has not yet met a partition. When one happens, it must still behave as either C or A.
 
 > [!question]- Is DynamoDB AP? Is it Dynamo-style leaderless? (trap)
-> DynamoDB is not leaderless. Each partition has a leader elected with Multi-Paxos among 3 replicas in different AZs. Default reads are eventually consistent (they may go to any replica); `ConsistentRead=true` reads are served by the leader. Global tables in their default multi-Region eventual consistency mode replicate asynchronously between Regions with last-writer-wins; the newer multi-Region strong consistency mode (GA 2025) instead acknowledges a write only after it reaches a second Region, which is PC/EC.
+> DynamoDB is not leaderless. Each partition has a leader elected with Multi-Paxos among 3 replicas in different AZs. Default reads are eventually consistent (they may go to any replica); `ConsistentRead=true` reads are served by the leader.
+>
+> Global tables in their default multi-Region eventual consistency mode replicate asynchronously between Regions with last-writer-wins; the newer multi-Region strong consistency mode (GA 2025) instead acknowledges a write only after it reaches a second Region, which is PC/EC.
 
 > [!question]- What does PACELC add?
 > The "else" case. Even with no partition, a strongly consistent system waits for a leader or majority on each write (and on linearizable reads), which adds latency. Cassandra is PA/EL, Spanner and etcd are PC/EC, MongoDB was classed PA/EC in 2012, though its current majority defaults are closer to PC/EC.
@@ -405,3 +451,8 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 - **Before this:** [[Distributed Systems Fundamentals]], [[Replication]]
 - **Next:** [[Consistency Models]], [[Quorums and Leaderless Replication]], [[Consensus - Raft and Paxos]]
 - **Compare with:** [[Distributed SQL]] (PC/EC in practice), [[Wide-Column Stores and Cassandra]] (PA/EL with tunable levels), [[High Availability and Failover]] (availability as uptime, not CAP-availability)
+
+### Watch on YouTube
+
+- [System Design Interview Course • PACELC Theorem(enhanced CAP)](https://www.youtube.com/watch?v=X5izO4vZBhU) · Anubhav Sethi · 9 min · 2,925 views
+- [CAP & PACELC theorems explained](https://www.youtube.com/watch?v=dWjiUqikRx0) · ThatNotesGuy · 6 min · 2,269 views

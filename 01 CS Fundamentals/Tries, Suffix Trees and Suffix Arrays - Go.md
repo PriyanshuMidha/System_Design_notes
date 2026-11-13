@@ -7,13 +7,22 @@ prereqs: ["[[Trees, BSTs and Balanced Trees]]", "[[Arrays and Dynamic Arrays (Go
 related: ["[[Tries, Suffix Trees and Suffix Arrays]]"]
 sources:
   - "Go standard library docs, package index/suffixarray"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Tries, Suffix Trees and Suffix Arrays - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Tries, Suffix Trees and Suffix Arrays]]: a lowercase-ASCII trie with insert, search and autocomplete, plus Go's standard-library suffix array (`index/suffixarray`) confirmed against the text `"banana"`.
+
+## Before the code
+
+- **Structs and pointers** (`*node`): each trie node is a struct; children are pointers, and `nil` means "no child here".
+- **Fixed-size arrays** (`[26]*node`): one slot per lowercase letter, indexed by `byte - 'a'`.
+- **Methods on a pointer receiver** (`func (t *Trie) Insert`): functions attached to the `Trie` type.
+- **Closures** (`var dfs func(...)`): a function stored in a variable that can call itself and append to `out`.
+- **Standard library `index/suffixarray`**: a ready-made suffix array; `New` builds it, `Lookup` finds offsets.
+- **What to run**: `go vet ./... && go test -race -v ./...` in the module folder.
 
 ## What this code shows
 
@@ -39,7 +48,11 @@ flowchart LR
 
 ### Step 1: the node shape
 
-**Concept.** The theory note's whiteboard sketch uses a `map[byte]*node` per node for clarity ([[Tries, Suffix Trees and Suffix Arrays#4. Worked example]]). That's simple but slow: a map lookup costs more than an array index, and allocates on every new node. The alternative kept here is a fixed `[26]*node` array, which trades a little memory (26 pointer slots per node, mostly `nil`, instead of exactly as many map buckets as children) for noticeably faster, allocation-free child lookups — the right trade for a lowercase-only dictionary.
+**Concept.** The theory note's whiteboard sketch uses a `map[byte]*node` per node for clarity ([[Tries, Suffix Trees and Suffix Arrays#4. Worked example]]).
+
+That's simple but slow: a map lookup costs more than an array index, and allocates on every new node.
+
+The alternative kept here is a fixed `[26]*node` array, which trades a little memory (26 pointer slots per node, mostly `nil`, instead of exactly as many map buckets as children) for noticeably faster, allocation-free child lookups — the right trade for a lowercase-only dictionary.
 
 ```go
 // Package trie implements a basic trie (prefix tree) over lowercase
@@ -111,7 +124,12 @@ func (t *Trie) walk(s string) *node {
 
 ### Step 3: search, prefix check and autocomplete
 
-**Concept.** `Search` and `StartsWith` both call `walk` and then look at a different thing: `Search` also requires `end == true` (an exact stored word), `StartsWith` only requires that the walk didn't fall off the tree (any word with that prefix). `Autocomplete` extends the same idea: walk to the prefix's node, then explore every path below it.
+**Concept.** `Search` and `StartsWith` both call `walk` and then look at a different thing:
+
+- `Search` also requires `end == true` (an exact stored word).
+- `StartsWith` only requires that the walk didn't fall off the tree (any word with that prefix).
+
+`Autocomplete` extends the same idea: walk to the prefix's node, then explore every path below it.
 
 ```go
 // Search reports whether word was inserted exactly.
@@ -212,7 +230,9 @@ func TestInsertSearch(t *testing.T) {
 
 **How it works.** The three assertions deliberately probe all three relevant cases on the same small trie: an exact word, a string that is a path in the tree but not a complete word, and the same string checked for prefix membership instead.
 
-**If it fails.** `Search("go")` returning `false` means `end` was never set, or `walk` doesn't stop at the right node. `Search("gop")` returning `true` means a node's `end` flag was set when it shouldn't have been — check that `Insert` only sets `end = true` once, after the full loop.
+**If it fails.** `Search("go")` returning `false` means `end` was never set, or `walk` doesn't stop at the right node.
+
+`Search("gop")` returning `true` means a node's `end` flag was set when it shouldn't have been — check that `Insert` only sets `end = true` once, after the full loop.
 
 ### Test 2: autocomplete
 
@@ -238,7 +258,9 @@ func TestAutocomplete(t *testing.T) {
 
 **How it works.** The test only checks the count, not the exact order, because `Autocomplete`'s doc comment is explicit that order is pre-order-deterministic, not alphabetically sorted — a stricter test would be testing an implementation detail, not the documented contract.
 
-**If it fails.** Fewer than 3 results means the DFS stopped early, likely because `n.end` wasn't checked before recursing into children (a word like `"go"` that is also a prefix of `"gopher"`/`"golang"` would be missed). More than 3 would mean a word was counted twice, usually from a bug in the slice-aliasing of `path` across sibling branches.
+**If it fails.** Fewer than 3 results means the DFS stopped early, likely because `n.end` wasn't checked before recursing into children (a word like `"go"` that is also a prefix of `"gopher"`/`"golang"` would be missed).
+
+More than 3 would mean a word was counted twice, usually from a bug in the slice-aliasing of `path` across sibling branches.
 
 ### Test 3: the standard-library suffix array
 
@@ -270,14 +292,21 @@ func TestSuffixArrayLookup(t *testing.T) {
 }
 ```
 
-**How it works.** The test checks a *count*, not the exact offset order, matching the standard library's own documented guarantee (`Lookup` returns an unsorted list). Running the equivalent of this snippet directly (Go 1.24.4, darwin/arm64, 2026-11-06) confirms the unsorted order is `[3 1]` — the same two positions the manual suffix-array walkthrough in the theory note computes, just not emitted in that table's sorted order.
+**How it works.** The test checks a *count*, not the exact offset order, matching the standard library's own documented guarantee (`Lookup` returns an unsorted list).
 
-**If it fails.** Getting a different count than 2 would mean either the standard library's behavior changed (check the Go release notes) or the test text/pattern was mistyped. `FindAllIndex(re, n)` is the sibling method to reach for if a test ever needs a sorted, non-overlapping list instead.
+Running the equivalent of this snippet directly (Go 1.24.4, darwin/arm64, 2026-11-06) confirms the unsorted order is `[3 1]` — the same two positions the manual suffix-array walkthrough in the theory note computes, just not emitted in that table's sorted order.
+
+**If it fails.** Getting a different count than 2 would mean either the standard library's behavior changed (check the Go release notes) or the test text/pattern was mistyped.
+
+`FindAllIndex(re, n)` is the sibling method to reach for if a test ever needs a sorted, non-overlapping list instead.
 
 ## Pitfalls in the code
 
-- **`word[i] - 'a'` assumes lowercase ASCII input.** A byte outside `'a'..'z'` (uppercase, digits, punctuation, any non-ASCII rune) underflows or overflows the `0..25` range and indexes `children` out of bounds, which panics. This implementation deliberately does not validate input — callers must pre-normalize (lowercase, strip non-letters) before calling `Insert` or `Search`.
-- **`append(path, 'a'+c)` inside `dfs`'s recursion** can alias the same backing array across sibling recursive calls if `path`'s capacity happens to exceed its length at that point, since `append` only reallocates when capacity is exhausted. It is correct here because each call immediately appends and recurses before any sibling call reuses `path`, but changing this loop to recurse into multiple children *after* saving a shared slice reference would be a real bug — always allocate a copy before fanning out to more than one goroutine or storing a sliced reference past the current call.
+- **`word[i] - 'a'` assumes lowercase ASCII input.** A byte outside `'a'..'z'` (uppercase, digits, punctuation, any non-ASCII rune) underflows or overflows the `0..25` range and indexes `children` out of bounds, which panics.
+  This implementation deliberately does not validate input — callers must pre-normalize (lowercase, strip non-letters) before calling `Insert` or `Search`.
+- **`append(path, 'a'+c)` inside `dfs`'s recursion** can alias the same backing array across sibling recursive calls if `path`'s capacity happens to exceed its length at that point, since `append` only reallocates when capacity is exhausted.
+  It is correct here because each call immediately appends and recurses before any sibling call reuses `path`, but changing this loop to recurse into multiple children *after* saving a shared slice reference would be a real bug.
+  Always allocate a copy before fanning out to more than one goroutine or storing a sliced reference past the current call.
 - **`index/suffixarray.Lookup`'s result is unsorted by design**, per its own doc comment — a caller that assumes the returned offsets come back in text order will get intermittently "wrong" answers whenever the suffix sort order and the physical text order disagree, which is most of the time.
 
 ## Exercises

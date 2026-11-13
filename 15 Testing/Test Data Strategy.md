@@ -7,7 +7,7 @@ sources:
   - "gofakeit (go-faker/gofakeit) README"
   - "PostgreSQL 17 docs, CREATE DATABASE ... TEMPLATE"
 status: reviewed
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Test Data Strategy
@@ -21,6 +21,51 @@ updated: 2026-11-04
 > - Make data deterministic: fixed clocks, seeded randomness, sequential IDs — never `time.Now()` or a random UUID a test then has to re-derive.
 > - Never put raw production PII in a lower environment; mask or synthesize instead.
 > - "Passes locally, fails in CI" is almost always test data leaking between tests or two tests racing on shared rows.
+
+## Start here: the basics
+
+**The problem in one story.**
+Test A creates a customer called "alice@example.com" and never deletes her.
+Test B also creates "alice@example.com" and fails with "email already exists".
+On your laptop the tests run in a different order, so everything passes.
+In CI they run in parallel, and the build fails at random.
+Test data strategy is the set of habits that stops tests from tripping over each other's rows.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Fixture | Pre-made test data loaded before tests | A `users.sql` file with 50 rows |
+| Builder / factory | Code that creates a test row with sensible defaults | `NewInvoice(WithAmount(500))` |
+| Isolation | One test cannot see or change another's data | Each test gets its own database |
+| Transaction rollback | Undo every change made inside a transaction | `tx.Rollback()` after the test |
+| Template database | A ready-made database Postgres can copy fast | `CREATE DATABASE t1 TEMPLATE base` |
+| Deterministic | Same input gives the same result every run | A fixed clock instead of `time.Now()` |
+| PII | Personal data that identifies a real person | Real names, emails, phone numbers |
+| Flaky test | Passes sometimes, fails sometimes, same code | Fails only when run in parallel |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    T["Test starts"] --> I["Get an isolated DB<br/>(clone or transaction)"]
+    I --> B["Builder creates only<br/>the rows this test needs"]
+    B --> R["Run the code and assert"]
+    R --> C["Clean up: drop clone<br/>or roll back"]
+```
+
+**Analogy.** Each test gets its own fresh, clean kitchen, sets out only the ingredients its recipe needs, and the kitchen is thrown away afterwards.
+Where it breaks: real kitchens are expensive to copy, but a Postgres template clone takes milliseconds; and some code (commit triggers, `pg_notify`) only behaves for real once data is truly committed.
+
+**How the rest of this note builds up**
+
+- First, why shared fixtures rot and leak state (section 1) and the build-isolate-clean mental model (section 2).
+- Then how it works: builders, rollback vs truncation vs template cloning, and deterministic data (section 3).
+- Then a Go worked example with functional-option builders and per-test databases (section 4), and a comparison of approaches (section 5).
+- Finally the SDE-3 view: PII masking, parallel tests in CI and the rollback blind spot (sections 6-8).
+
+> [!tip] Remember
+> Every test creates exactly the data it needs, in its own isolated space, and leaves nothing behind.
 
 ## 1. Why it exists
 
@@ -280,7 +325,9 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 ## 8. Deep dive
 
 - **Why `TEMPLATE` cloning is fast in Postgres:** `CREATE DATABASE ... TEMPLATE tmpl` uses the filesystem-level file copy Postgres already does for template databases, not a logical replay of DDL; it is close to a file copy, not a migration re-run, so timing scales with data size, not schema complexity.
-- **Transaction rollback's blind spot:** code that relies on `pg_notify`, `AFTER COMMIT` triggers, or `SERIALIZABLE` retry logic only runs its real path after a commit. A test wrapped in an outer transaction that's always rolled back never actually commits, so that code path goes untested — this is why integration tests for exactly that logic need template cloning or truncation instead.
+- **Transaction rollback's blind spot:** code that relies on `pg_notify`, `AFTER COMMIT` triggers, or `SERIALIZABLE` retry logic only runs its real path after a commit.
+  A test wrapped in an outer transaction that's always rolled back never actually commits, so that code path goes untested.
+  This is why integration tests for exactly that logic need template cloning or truncation instead.
 - **Why sequential test IDs, not UUIDs:** a UUID per test run makes `t.Fatalf` output ("expected customer 8f2a19e3-...") useless to compare across runs; a sequential counter reset per test makes failure output diffable and makes golden files for regression tests stable.
 - **Masking and referential integrity:** naive per-column masking (independently randomizing each name column) breaks joins — the same customer must mask to the same fake name in every table. Deterministic masking (`fake_name = hash(real_id) -> lookup table`) keeps foreign keys meaningful while still removing the real PII.
 
@@ -320,3 +367,8 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Unit, Integration and E2E Tests]]
 - **Next:** [[Contract Testing]], [[Load and Performance Testing]]
 - **Compare with:** [[Fuzz and Property-Based Testing]] (generating many inputs instead of many fixture rows)
+
+### Watch on YouTube
+
+- [Develop your Data Strategy](https://www.youtube.com/watch?v=ktnQb5yX93E) · IBM Technology · 7 min · 50,241 views
+- [The Six Pillars of a Data Strategy / Data and Analytics Guide](https://www.youtube.com/watch?v=AZMBtRgmRJA) · Cynozure · 3 min · 56,831 views

@@ -8,7 +8,7 @@ sources:
   - "RFC 6265bis (HTTP State Management Mechanism, cookie attributes and prefixes draft)"
   - "OWASP Session Management Cheat Sheet"
   - "MDN Web Docs, Set-Cookie header and SameSite attribute"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Sessions and Cookies
@@ -46,17 +46,67 @@ sequenceDiagram
     S-->>B: Set-Cookie session cleared, Max-Age=0
 ```
 
+## Start here: the basics
+
+**The problem in one story.**
+You log into a shop, then click to another page.
+HTTP forgets everything between requests, so how does the shop still know it's you?
+The server gives your browser a random ticket (session ID) in a cookie.
+The browser shows that ticket on every request, and the server looks it up.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HTTP | The request/response protocol browsers use | `GET /profile` |
+| Stateless | Each request carries no memory of earlier ones | Server forgets you after each response |
+| Cookie | A small named value the browser stores and sends back | `session=abc123` |
+| Session ID | A random, meaningless key to server-side data | 32 random bytes, base64 |
+| Session store | Where the server keeps session data | Redis key `session:abc123` |
+| Cookie attributes | Flags limiting how a cookie is sent and read | `HttpOnly; Secure; SameSite=Lax` |
+| Session fixation | Attacker plants a known ID before you log in | Server keeps that ID after login |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Browser"] -- "login" --> S["Server"]
+    S -- "store user under<br/>random ID" --> R["Session store"]
+    S -- "Set-Cookie: session=ID" --> B
+    B -- "Cookie: session=ID" --> S
+    S -- "look up ID" --> R
+```
+
+**Analogy.** A coat check. You hand over your coat and get a numbered ticket; the ticket means nothing alone, the coat stays behind the counter.
+Where it breaks: a coat ticket is hard to copy; a cookie can be stolen and replayed, which is why the attributes and ID rotation matter.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then the request flow and cookie attributes (section 3) and a full Go session implementation (section 4).
+- Then sessions vs JWTs (section 5).
+- Finally the SDE-3 deep dive: session fixation, logout and revocation, scaling the store (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> The cookie holds only a random ticket; the real login state lives on the server and can be deleted instantly.
+
 ## 1. Why it exists
 
-HTTP has no memory: every request arrives as if the server had never seen that browser before. A shopping cart, a "logged in as Priya" banner, and an authorization decision on the next request all need *some* state to persist across requests from the same browser. Two options exist: put the state in the client (a signed/encrypted cookie, or a JWT) or put the state on the server and hand the client only a lookup key.
+HTTP has no memory: every request arrives as if the server had never seen that browser before. A shopping cart, a "logged in as Priya" banner, and an authorization decision on the next request all need *some* state to persist across requests from the same browser.
 
-A session is the second option. The server generates a random, opaque ID — say 128 bits of entropy, about `qF3x9K2m...` — that carries no meaning of its own. It stores `{sessionID: {userID: "u9", createdAt: ..., lastSeen: ...}}` in a fast store (Redis is the common choice) and gives the browser only the ID, inside a cookie, which the browser automatically resends on every request to that origin. The server's lookup on each request (`GET session:<id>` from Redis, typically sub-millisecond) is what turns "an anonymous HTTP request with a cookie attached" back into "a request from user u9".
+Two options exist: put the state in the client (a signed/encrypted cookie, or a JWT) or put the state on the server and hand the client only a lookup key.
+
+A session is the second option. The server generates a random, opaque ID — say 128 bits of entropy, about `qF3x9K2m...` — that carries no meaning of its own. It stores `{sessionID: {userID: "u9", createdAt: ..., lastSeen: ...}}` in a fast store (Redis is the common choice) and gives the browser only the ID, inside a cookie, which the browser automatically resends on every request to that origin.
+
+The server's lookup on each request (`GET session:<id>` from Redis, typically sub-millisecond) is what turns "an anonymous HTTP request with a cookie attached" back into "a request from user u9".
 
 The alternative — a JWT the client holds and the server never stores — trades that lookup away for statelessness, at the cost of harder revocation (see [[JWT - Structure, Validation and Pitfalls]] and the comparison table below). Sessions and JWTs solve the same problem with opposite trade-offs; neither is simply "the modern one".
 
 ## 2. Mental model
 
-A cookie is a coat-check ticket. The ticket itself (the session ID) means nothing — it's just a random number. The coat (your actual identity and permissions) stays at the coat check (the server's session store). Anyone holding the ticket gets the coat, which is exactly why the ticket must be unguessable (random, high entropy) and must never be readable by a stranger glancing at your pocket (`HttpOnly` keeps it out of reach of page JavaScript, including injected XSS scripts) or usable from across the street (`SameSite` and `Secure` limit which sites and which connections can present it).
+A cookie is a coat-check ticket. The ticket itself (the session ID) means nothing — it's just a random number. The coat (your actual identity and permissions) stays at the coat check (the server's session store).
+
+Anyone holding the ticket gets the coat, which is exactly why the ticket must be unguessable (random, high entropy) and must never be readable by a stranger glancing at your pocket (`HttpOnly` keeps it out of reach of page JavaScript, including injected XSS scripts) or usable from across the street (`SameSite` and `Secure` limit which sites and which connections can present it).
 
 ## 3. How it works
 
@@ -88,11 +138,15 @@ stateDiagram-v2
     LoggedOut --> [*]
 ```
 
-Two separate timers matter: an **idle timeout** (say 30 minutes of no activity) protects an unattended, still-logged-in browser tab; an **absolute timeout** (say 12 hours) caps a session's total lifetime even if the user is continuously active, so a stolen cookie doesn't stay valid forever. Logout must delete the server-side record — not merely tell the browser to drop the cookie — because an attacker who already copied the cookie value keeps a session that only the server can kill.
+Two separate timers matter: an **idle timeout** (say 30 minutes of no activity) protects an unattended, still-logged-in browser tab; an **absolute timeout** (say 12 hours) caps a session's total lifetime even if the user is continuously active, so a stolen cookie doesn't stay valid forever.
+
+Logout must delete the server-side record — not merely tell the browser to drop the cookie — because an attacker who already copied the cookie value keeps a session that only the server can kill.
 
 ### Session fixation and ID rotation
 
-Session fixation is an attack where the attacker *sets* a victim's session ID before they log in (for example, by sending a link containing a pre-chosen session ID, if the server accepts a client-supplied ID at all, or by planting it via a subdomain that shares the cookie's `Domain`). If the server keeps using that same ID after the victim authenticates, the attacker — who already knows the ID — is now authenticated as the victim too.
+Session fixation is an attack where the attacker *sets* a victim's session ID before they log in (for example, by sending a link containing a pre-chosen session ID, if the server accepts a client-supplied ID at all, or by planting it via a subdomain that shares the cookie's `Domain`).
+
+If the server keeps using that same ID after the victim authenticates, the attacker — who already knows the ID — is now authenticated as the victim too.
 
 ```mermaid
 flowchart LR
@@ -493,3 +547,8 @@ func TestClearCookie(t *testing.T) {
 - **Before this:** [[Authentication vs Authorization]], [[Password Storage and Login Security]]
 - **Next:** [[JWT - Structure, Validation and Pitfalls]], [[Access and Refresh Tokens]]
 - **Compare with:** [[CORS and Same-Origin Policy]] (why a cross-site request can or can't read the response), [[CSRF, XSS and Security Headers]] (the full defense against cookie-riding forged requests), [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]] (cookie basics)
+
+### Watch on YouTube
+
+- [Web App Pentesting - HTTP Cookies & Sessions](https://www.youtube.com/watch?v=zHBpJA5XfDk) · HackerSploit · 34 min · 71,398 views
+- [Cookies and Sessions / Differences / WT / Web Technology / Lec-43 / Bhanu Priya](https://www.youtube.com/watch?v=Ae3WBXMMlXA) · Education 4u · 5 min · 194,522 views

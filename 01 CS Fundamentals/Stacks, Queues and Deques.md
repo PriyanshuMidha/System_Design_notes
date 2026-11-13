@@ -6,7 +6,7 @@ prereqs: ["[[Data Structures Overview and Big-O Cheat Sheet]]", "[[Arrays and Dy
 related: ["[[Linked Lists]]", "[[Graphs and Graph Algorithms]]", "[[Redis as a Queue - Lists, Streams and Pub-Sub]]", "[[Kafka and Event Streaming]]"]
 sources:
   - "Go std lib docs, package container/ring (go.dev/pkg/container/ring)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Stacks, Queues and Deques
@@ -20,11 +20,62 @@ updated: 2026-11-09
 > - A plain slice is a *bad* queue: `s = s[1:]` never frees the dropped prefix's memory. A ring buffer (circular array) or a buffered channel fixes this.
 > - A monotonic stack or deque keeps its elements in sorted order as a side effect of its push/pop rule, turning an `O(n²)` brute force into `O(n)`.
 
+## Start here: the basics
+
+**The problem in one story.**
+You are writing a text editor and the user presses Ctrl+Z.
+You must undo the *most recent* change first, then the one before it.
+Meanwhile, your print server must print documents in the order they *arrived*.
+The first needs a stack (last in, first out); the second needs a queue (first in, first out).
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| LIFO | Last In, First Out | A stack of plates: take the top one |
+| FIFO | First In, First Out | A line at a ticket counter |
+| Push / Pop | Add to / remove from a stack | Push "typed A", pop it on undo |
+| Enqueue / Dequeue | Add to the back / remove from the front of a queue | Join the line / get served |
+| Slice | Go's growable list backed by an array | `s := []int{1, 2, 3}` |
+| Ring buffer | A fixed array used in a circle, wrapping around | A 10-slot log that overwrites the oldest |
+| Deque | Double-ended queue: add/remove at both ends | A sliding window of recent prices |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    subgraph Stack["Stack (LIFO)"]
+      direction TB
+      T["top: C (out first)"] --- M["B"] --- Bo["A"]
+    end
+    subgraph Queue["Queue (FIFO)"]
+      direction LR
+      F["front: A (out first)"] --> Q2["B"] --> Ba["back: C"]
+    end
+```
+
+**Analogy.** A stack is a pile of plates; a queue is a line at a bank.
+Where it breaks: nobody in a bank line gets dropped for memory reasons, but a Go slice used as a queue keeps old, removed items' memory alive unless you use a ring buffer.
+
+**How the rest of this note builds up**
+
+- First, why these structures exist (section 1) and the LIFO vs FIFO mental model (section 2).
+- Then how they work in Go: slice stacks, ring-buffer queues, deques and channels (section 3), with a worked example (section 4).
+- Then variants like monotonic stacks and deques, and their trade-offs (sections 5-6).
+- Finally the SDE-3 view: queues in production systems and the deep dive (sections 7-8).
+
+> [!tip] Remember
+> Stack = most recent first; queue = oldest first; in Go, a slice is a fine stack but a ring buffer is the right queue.
+
 ## 1. Why it exists
 
-Say you're parsing a document for balanced brackets, `{[()]}`. You need to know, at the moment you see a closing bracket, "what was the most recent unmatched opening bracket?" — not the first one, not all of them, just the *last* one still open. That's exactly LIFO: the thing most recently added is the thing you need next. A stack answers this in `O(1)` per character.
+Say you're parsing a document for balanced brackets, `{[()]}`. You need to know, at the moment you see a closing bracket, "what was the most recent unmatched opening bracket?" — not the first one, not all of them, just the *last* one still open.
 
-Now say you're building a job queue where workers must process jobs in the order they arrived, with producers adding jobs faster than workers can finish them at peak. You need "what's the oldest job still waiting?" — FIFO — and you need the queue to hold a bursty backlog without leaking memory or blocking producers forever. A ring buffer or a buffered channel answers this in `O(1)` per enqueue/dequeue, bounded memory.
+That's exactly LIFO: the thing most recently added is the thing you need next. A stack answers this in `O(1)` per character.
+
+Now say you're building a job queue where workers must process jobs in the order they arrived, with producers adding jobs faster than workers can finish them at peak.
+
+You need "what's the oldest job still waiting?" — FIFO — and you need the queue to hold a bursty backlog without leaking memory or blocking producers forever. A ring buffer or a buffered channel answers this in `O(1)` per enqueue/dequeue, bounded memory.
 
 Both are the same underlying idea — a linear sequence with disciplined access at the ends — but the discipline (which end you remove from) is the entire difference between them, and it changes which real-world problems each one solves.
 
@@ -264,3 +315,8 @@ Runnable Go version: [[Stacks, Queues and Deques - Go]]
 - **Next:** [[Graphs and Graph Algorithms]] (stacks and queues drive DFS and BFS)
 - **Compare with:** [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Kafka and Event Streaming]] (durable queues, once in-memory isn't enough)
 - **Runnable code:** [[Stacks, Queues and Deques - Go]]
+
+### Watch on YouTube
+
+- [Monotonic Stack Explained: Solve Tricky Coding Problems Easily!](https://www.youtube.com/watch?v=15OuNilu0r0) · CodeLucky · clear intro to the monotonic stack pattern (next-greater/smaller) that the note calls out
+- [Monotonic stack - Trapping rain water explained with animation](https://www.youtube.com/watch?v=UMFKP9cTDtI) · InvolveInInnovation · animated walkthrough of the classic monotonic-stack interview problem

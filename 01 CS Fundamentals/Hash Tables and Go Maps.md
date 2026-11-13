@@ -9,7 +9,7 @@ sources:
   - "Go runtime source, src/internal/runtime/maps (Go 1.24, swisstable.go)"
   - "The Go Programming Language Specification, Map types"
   - "Abseil (Google), Swiss Tables design notes"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Hash Tables and Go Maps
@@ -22,6 +22,51 @@ updated: 2026-11-09
 > - Two keys can hash to the same slot (a **collision**); chaining or open addressing decides what happens next.
 > - As the table fills up, it **resizes** (grows and rehashes everything) to keep lookups fast.
 > - Go's `map` is this idea, built into the language, with randomized iteration and no concurrency safety.
+
+## Start here: the basics
+
+**The problem in one story.**
+You run a library with a million books.
+A visitor asks for "The Hobbit".
+Walking every shelf would take all day.
+Instead, a rule tells you "titles starting with H live on shelf 8", so you walk straight there.
+A hash table is that rule, done by a computer in nanoseconds.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Key | The thing you look up by | `"alice"` in `ages["alice"]` |
+| Value | The data stored for that key | `31` |
+| Array / slot | A numbered row of boxes; each box is a slot | `slots[0..7]` |
+| Hash function | A recipe that turns any key into a number | `hash("alice") = 9137` |
+| Index (via mod) | The slot number: hash remainder after dividing by slot count | `9137 mod 8 = 1` |
+| Collision | Two keys landing on the same slot | `"alice"` and `"bob"` both → slot 1 |
+| Load factor | How full the table is: entries ÷ slots | 6 entries / 8 slots = 0.75 |
+| Big-O `O(1)` | Cost stays the same no matter how big the data gets | one lookup in 10 or 10M keys |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    K["key: alice"] --> H["hash function"]
+    H --> N["9137"]
+    N --> M["mod 8 = slot 1"]
+    M --> S["slots[1] holds alice = 31"]
+```
+
+**Analogy.** A coat check: your ticket number tells the attendant exactly which hook to check, so nobody searches every hook.
+Where it breaks: hooks never move, but a hash table sometimes rebuilds itself bigger and moves every entry (a resize).
+
+**How the rest of this note builds up**
+
+- First, why searching is too slow and the one-line idea behind hashing (sections 1-2).
+- Then the mechanics: hash functions, collisions, load factor and resizing (section 3), traced by hand in section 4.
+- Then variants, trade-offs and production use (sections 5-7).
+- Finally the SDE-3 deep dive on Go's map internals (old buckets vs. Swiss Tables), `sync.Map`, and interview questions (sections 8-10).
+
+> [!tip] Remember
+> Hash the key, take it mod the slot count, go straight to that slot: average O(1), as long as collisions stay rare.
 
 ## 1. Why it exists
 
@@ -50,7 +95,13 @@ flowchart LR
 
 ## 2. Mental model
 
-**The restaurant-coat-check analogy:** imagine a coat check with 100 numbered hooks. Instead of searching every hook for your coat, the attendant uses a rule — say, "your ticket number mod 100" — to know exactly which hook to check first. If that hook already has a coat on it from someone else's ticket, there's a plan for sharing the hook (a second coat hangs behind the first, or the attendant tries the next hook over). That sharing plan is what turns "a wall of hooks" into "a hash table with chaining" or "a hash table with open addressing."
+**The restaurant-coat-check analogy:** imagine a coat check with 100 numbered hooks.
+
+Instead of searching every hook for your coat, the attendant uses a rule — say, "your ticket number mod 100" — to know exactly which hook to check first.
+
+If that hook already has a coat on it from someone else's ticket, there's a plan for sharing the hook (a second coat hangs behind the first, or the attendant tries the next hook over).
+
+That sharing plan is what turns "a wall of hooks" into "a hash table with chaining" or "a hash table with open addressing."
 
 **Where the analogy breaks down:** a real coat check hook can hold several coats without a formal rule; a hash table bucket needs an explicit collision strategy (below), and — unlike hooks, which stay fixed — the whole hook wall sometimes has to be torn down and rebuilt bigger (a **resize**) as more coats arrive.
 
@@ -126,7 +177,10 @@ flowchart TB
     end
 ```
 
-**Example:** inserting Alice then Bob, both hashing to slot 2 of 5: chaining puts both in slot 2's list (O(1) insert, slot 2 now holds 2 entries); linear probing puts Alice in slot 2 and Bob in slot 3 (still O(1) here, but now a lookup for *anyone* hashing to slot 3 has to check slot 3, notice it's Bob not them, and keep scanning).
+**Example:** inserting Alice then Bob, both hashing to slot 2 of 5:
+
+- Chaining puts both in slot 2's list (O(1) insert, slot 2 now holds 2 entries).
+- Linear probing puts Alice in slot 2 and Bob in slot 3 (still O(1) here, but now a lookup for *anyone* hashing to slot 3 has to check slot 3, notice it's Bob not them, and keep scanning).
 
 **Why it matters:** chaining degrades gracefully (a long list is still just a slow list); open addressing degrades by cascading — one cluster of collisions makes every nearby slot slower to probe, including keys that never collided in the first place.
 
@@ -150,7 +204,9 @@ stateDiagram-v2
     Filling --> [*]
 ```
 
-That single resize is `O(n)` — touching every key — but it happens rarely enough (geometrically less often as the table grows, because the threshold is a fraction of a doubling table) that the *amortized* cost per insert stays `O(1)`. This is the identical argument used for slice growth in [[Arrays and Dynamic Arrays (Go Slices)]]: most inserts are cheap, a rare insert is expensive, and averaged over many inserts the expensive ones vanish into the cost.
+That single resize is `O(n)` — touching every key — but it happens rarely enough (geometrically less often as the table grows, because the threshold is a fraction of a doubling table) that the *amortized* cost per insert stays `O(1)`.
+
+This is the identical argument used for slice growth in [[Arrays and Dynamic Arrays (Go Slices)]]: most inserts are cheap, a rare insert is expensive, and averaged over many inserts the expensive ones vanish into the cost.
 
 > [!warning] Common mistake
 > Treating every single insert as O(1), full stop. One specific insert call — the one that triggers the resize — really does cost O(n). What's O(1) is the *average over many inserts*, not every individual one. If your system has a hard per-request latency budget, that one unlucky insert can blow through it.
@@ -244,7 +300,11 @@ delete(m, "alice")
 
 Same contract, average `O(1)` operations, but compiler- and runtime-supported instead of hand-written, and tuned far beyond the toy version above — with its own resize strategy, its own collision handling (Swiss Tables, below), and a random per-map hash seed baked in automatically.
 
-**Measured, hand-rolled table vs. Go's `map`** (Go 1.24.4, Apple M4, `go test -bench=. -benchmem`, keys pre-generated outside the timed loop, 10,000 string keys): `Put` on the hand-rolled chaining table ran at 8.6 ns/op versus 12.5 ns/op for Go's map; `Get` was close either way, 7.8 ns/op versus 7.6 ns/op. At this scale (10,000 keys, update-heavy workload) the simple chaining table is not slower — Swiss Tables' real advantage shows up at larger scale and higher load factor, where its SIMD-scanned metadata bytes avoid touching most keys' memory at all (see the deep dive), not necessarily on a small, mostly-updates microbenchmark like this one.
+**Measured, hand-rolled table vs. Go's `map`** (Go 1.24.4, Apple M4, `go test -bench=. -benchmem`, keys pre-generated outside the timed loop, 10,000 string keys): `Put` on the hand-rolled chaining table ran at 8.6 ns/op versus 12.5 ns/op for Go's map;
+
+`Get` was close either way, 7.8 ns/op versus 7.6 ns/op.
+
+At this scale (10,000 keys, update-heavy workload) the simple chaining table is not slower — Swiss Tables' real advantage shows up at larger scale and higher load factor, where its SIMD-scanned metadata bytes avoid touching most keys' memory at all (see the deep dive), not necessarily on a small, mostly-updates microbenchmark like this one.
 
 Runnable Go version: [[Hash Tables and Go Maps - Go]]
 
@@ -299,11 +359,19 @@ flowchart TD
 
 ### Go maps before 1.24: buckets with tophash bytes
 
-Up through Go 1.23, the runtime map was a chained-bucket design: each bucket held up to 8 key-value slots plus an array of 8 **tophash** bytes (the high byte of each slot's hash), used to skip most slots without a full key comparison. When a bucket's 8 slots filled, the runtime chained an **overflow bucket** onto it rather than growing the whole table immediately. Growth happened incrementally: a resize allocated double the buckets, but old entries were migrated lazily, a few per subsequent map operation, to avoid a single large pause. The resize trigger was a load factor of about 6.5 (yes, greater than 1 — because of the 8-slot buckets and overflow chaining, a load factor above 1 was still efficient).
+Up through Go 1.23, the runtime map was a chained-bucket design: each bucket held up to 8 key-value slots plus an array of 8 **tophash** bytes (the high byte of each slot's hash), used to skip most slots without a full key comparison.
+
+When a bucket's 8 slots filled, the runtime chained an **overflow bucket** onto it rather than growing the whole table immediately.
+
+Growth happened incrementally: a resize allocated double the buckets, but old entries were migrated lazily, a few per subsequent map operation, to avoid a single large pause.
+
+The resize trigger was a load factor of about 6.5 (yes, greater than 1 — because of the 8-slot buckets and overflow chaining, a load factor above 1 was still efficient).
 
 ### Go 1.24+: Swiss Tables
 
-Starting in Go 1.24, the runtime map implementation switched to a **Swiss Table** design (the same family as Abseil's `flat_hash_map`), documented in the Go 1.24 release notes. Instead of 8-slot buckets with overflow chains, a Swiss Table is open addressing over groups of slots, each group guarded by one metadata byte per slot (empty, deleted, or the top 7 bits of that slot's hash).
+Starting in Go 1.24, the runtime map implementation switched to a **Swiss Table** design (the same family as Abseil's `flat_hash_map`), documented in the Go 1.24 release notes.
+
+Instead of 8-slot buckets with overflow chains, a Swiss Table is open addressing over groups of slots, each group guarded by one metadata byte per slot (empty, deleted, or the top 7 bits of that slot's hash).
 
 ```mermaid
 flowchart LR
@@ -315,7 +383,9 @@ flowchart LR
     meta --> R["Only slot 2 matches:\ncompare the full key there"]
 ```
 
-A lookup scans a group's metadata bytes with a single SIMD-style comparison, checking many slots' tophash at once instead of one at a time, before touching the actual keys. This is both faster (fewer cache misses, more work per CPU instruction) and more memory-compact than the old bucket-and-overflow layout, while keeping the same external contract: same average-case `O(1)`, same `map[K]V` syntax.
+A lookup scans a group's metadata bytes with a single SIMD-style comparison, checking many slots' tophash at once instead of one at a time, before touching the actual keys.
+
+This is both faster (fewer cache misses, more work per CPU instruction) and more memory-compact than the old bucket-and-overflow layout, while keeping the same external contract: same average-case `O(1)`, same `map[K]V` syntax.
 
 ### Rules every Go engineer should know
 
@@ -331,11 +401,19 @@ A lookup scans a group's metadata bytes with a single SIMD-style comparison, che
 
 ### `sync.Map`
 
-`sync.Map` is a specialized concurrent map for two patterns the standard library docs call out explicitly: (1) a key written once and read many times by many goroutines (a cache that's populated once, read forever), or (2) disjoint sets of keys accessed by disjoint sets of goroutines. It is **not** a general drop-in replacement for `map` + mutex — under heavy concurrent writes to overlapping keys, a plain `map` guarded by a `sync.RWMutex` or sharded into several locked maps often performs better, because `sync.Map` optimizes specifically for the read-mostly case.
+`sync.Map` is a specialized concurrent map for two patterns the standard library docs call out explicitly: (1) a key written once and read many times by many goroutines (a cache that's populated once, read forever), or (2) disjoint sets of keys accessed by disjoint sets of goroutines.
+
+It is **not** a general drop-in replacement for `map` + mutex — under heavy concurrent writes to overlapping keys, a plain `map` guarded by a `sync.RWMutex` or sharded into several locked maps often performs better, because `sync.Map` optimizes specifically for the read-mostly case.
 
 ### Classic practice problems
 
-These are the hash-table patterns that show up most often in interviews: **two-sum** (hash set of values seen so far, check `target - v` before inserting, O(n)); **group anagrams** (hash map keyed by each string's sorted letters); **subarray sum equals k** (hash map of prefix-sum → count, so a subarray summing to k is found in O(n) instead of O(n²)); **longest consecutive sequence** (hash set of all values, then only start counting a run from a value whose predecessor isn't in the set, giving O(n) instead of the O(n log n) a sort would cost); **LRU cache** (hash map of key → list node, paired with a doubly linked list for O(1) move-to-front and evict-the-tail — see `08 Caching & Redis` for the full LRU note).
+These are the hash-table patterns that show up most often in interviews:
+
+- **two-sum** (hash set of values seen so far, check `target - v` before inserting, O(n)),
+- **group anagrams** (hash map keyed by each string's sorted letters),
+- **subarray sum equals k** (hash map of prefix-sum → count, so a subarray summing to k is found in O(n) instead of O(n²)),
+- **longest consecutive sequence** (hash set of all values, then only start counting a run from a value whose predecessor isn't in the set, giving O(n) instead of the O(n log n) a sort would cost),
+- **LRU cache** (hash map of key → list node, paired with a doubly linked list for O(1) move-to-front and evict-the-tail — see `08 Caching & Redis` for the full LRU note).
 
 ## 9. Interview questions
 
@@ -377,3 +455,7 @@ These are the hash-table patterns that show up most often in interviews: **two-s
 - **Before this:** [[Arrays and Dynamic Arrays (Go Slices)]], [[Complexity Analysis - Big-O and Amortized Cost]]
 - **Next:** [[Consistent Hashing]], [[Bloom Filters and Probabilistic Data Structures]]
 - **Compare with:** [[Trees, BSTs and Balanced Trees]] (ordered operations a hash table can't do), [[Tries, Suffix Trees and Suffix Arrays]] (prefix-structured keys)
+
+### Watch on YouTube
+
+- [Hash Tables, Visualized (How O(1) Lookups Work)](https://www.youtube.com/watch?v=eUbSeqLMyHg) · Generalist Programmer · Visual walkthrough of hashing, buckets, collisions and resizing

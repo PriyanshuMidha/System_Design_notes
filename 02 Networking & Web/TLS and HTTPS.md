@@ -12,7 +12,7 @@ sources:
   - "RFC 6962, Certificate Transparency"
   - "Go crypto/tls package documentation (Go 1.24)"
 status: reviewed
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # TLS and HTTPS
@@ -38,9 +38,59 @@ A client visiting `https://api.example.com`:
 
 That's the whole deal: identity (certificate) plus a secret only the two endpoints can derive (ECDHE) equals HTTPS.
 
+## Start here: the basics
+
+**The problem in one story.**
+You log in to your bank on café Wi-Fi.
+Your password travels through the café router, the ISP and many other machines.
+Without protection, any of them could read it or change the page you get back.
+HTTPS wraps the conversation so only you and the real bank can read it, and you can check it really is the bank.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Encryption | Scrambling data so only key holders can read it | `hello` becomes `x9#Qp...` |
+| Key | The secret number used to scramble and unscramble | A 256-bit random value |
+| Public / private key | A pair: anyone can use the public one, only the owner has the private one | Server publishes a public key, keeps the private one |
+| Signature | Proof made with a private key that anyone can check with the public key | A CA signing a certificate |
+| Certificate | A signed card saying "this public key belongs to this domain" | Cert for `api.example.com` |
+| CA (Certificate Authority) | A trusted organisation that signs certificates | Let's Encrypt |
+| Handshake | The first few messages where both sides agree how to talk | `ClientHello`, `ServerHello` |
+| Round trip (RTT) | One message there and its reply back | ~50 ms across a country |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Browser"] -- "1. Hello + key share" --> S["Server"]
+    S -- "2. Certificate + key share" --> C
+    C --> V{"Cert signed by<br/>a trusted CA?"}
+    V -- "yes" --> K["Both compute the<br/>same secret key"]
+    V -- "no" --> X["Warning page,<br/>stop"]
+    K --> E["Encrypted HTTP"]
+```
+
+**Analogy.** Two people agree on a secret code word by each mixing paint colours in public, and one of them shows a government ID before they start talking.
+Where it breaks: the ID only proves the name is real; it says nothing about whether that person is honest.
+
+**How the rest of this note builds up**
+
+- First, why plain HTTP is unsafe (section 1) and the two jobs: key exchange and certificates (section 2).
+- Then the TLS 1.2 and 1.3 handshakes, 0-RTT, SNI/ALPN, certificate details and termination patterns (section 3).
+- Then a Go worked example, variants and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive: production failure modes, forward secrecy, HSTS and post-quantum key exchange (sections 7-8).
+
+> [!tip] Remember
+> A certificate proves *who* you are talking to; the key exchange makes sure *nobody else* can read it.
+
 ## 1. Why it exists
 
-Plain HTTP sends everything, including passwords, cookies and page content, as readable bytes on the wire. Anyone on the network path (a shared Wi-Fi hotspot, a compromised router, an ISP) can read it, and anyone who can inject packets can modify it in transit or impersonate the server entirely (serve fake content, steal a login form's submitted password). TLS exists to remove both of those: confidentiality (nobody else can read it) and authentication (you know which server you're actually talking to) plus integrity (nobody can tamper with it undetected).
+Plain HTTP sends everything, including passwords, cookies and page content, as readable bytes on the wire.
+
+Anyone on the network path (a shared Wi-Fi hotspot, a compromised router, an ISP) can read it. Anyone who can inject packets can modify it in transit or impersonate the server entirely (serve fake content, steal a login form's submitted password).
+
+TLS exists to remove both of those: confidentiality (nobody else can read it) and authentication (you know which server you're actually talking to) plus integrity (nobody can tamper with it undetected).
 
 The practical trigger for "HTTPS everywhere" was the free, automated Let's Encrypt CA (2015) and browsers marking plain HTTP as "Not Secure" starting around 2018 — before that, a certificate cost money and required a manual yearly renewal, so a large fraction of the web stayed on HTTP by default.
 
@@ -48,8 +98,12 @@ The practical trigger for "HTTPS everywhere" was the free, automated Let's Encry
 
 Two parts, and it helps to keep them separate:
 
-- **Key exchange (ECDHE):** both sides contribute a random number and a well-known elliptic curve, and each can compute the same shared secret from their own number and the other side's public value — but an eavesdropper who only sees the public values cannot compute the secret. This is **forward secrecy**: even if the server's long-term private key leaks later, past sessions can't be decrypted, because the session key was never derived from that long-term key alone.
-- **Certificates (identity):** a certificate says "the holder of this private key is `api.example.com`", signed by a Certificate Authority (CA). The client doesn't trust the certificate because it says so — it trusts it because the CA's own certificate is signed by another CA, and so on, up to a **root CA** the client's operating system or browser ships with a built-in, hard-coded trust in. That sequence is the **chain of trust**.
+- **Key exchange (ECDHE):** both sides contribute a random number and a well-known elliptic curve, and each can compute the same shared secret from their own number and the other side's public value — but an eavesdropper who only sees the public values cannot compute the secret.
+
+  This is **forward secrecy**: even if the server's long-term private key leaks later, past sessions can't be decrypted, because the session key was never derived from that long-term key alone.
+- **Certificates (identity):** a certificate says "the holder of this private key is `api.example.com`", signed by a Certificate Authority (CA).
+
+  The client doesn't trust the certificate because it says so — it trusts it because the CA's own certificate is signed by another CA, and so on, up to a **root CA** the client's operating system or browser ships with a built-in, hard-coded trust in. That sequence is the **chain of trust**.
 
 ```mermaid
 flowchart LR
@@ -83,7 +137,9 @@ sequenceDiagram
 
 ### TLS 1.3: one round trip, plus a 0-RTT option
 
-TLS 1.3's key idea: the client guesses which key-exchange group the server supports and sends its key share **in the first message**, instead of waiting for the server to pick a cipher suite first. If the guess is right (it almost always is, since there are very few groups in practice), the server can derive the shared secret and reply with its certificate and `Finished` in one message.
+TLS 1.3's key idea: the client guesses which key-exchange group the server supports and sends its key share **in the first message**, instead of waiting for the server to pick a cipher suite first.
+
+If the guess is right (it almost always is, since there are very few groups in practice), the server can derive the shared secret and reply with its certificate and `Finished` in one message.
 
 ```mermaid
 sequenceDiagram
@@ -154,7 +210,9 @@ flowchart TB
 
 - **Edge-terminated:** the load balancer or CDN holds the certificate and decrypts; the hop to the app server is plaintext, acceptable only inside a network you trust (a VPC, not the public internet).
 - **Re-encrypt:** the proxy terminates the client's TLS, then opens a *second*, independent TLS connection to the app server — used when internal traffic must also be encrypted (zero-trust networks, compliance requirements).
-- **Passthrough with mTLS:** the proxy routes on SNI alone without ever decrypting (so it needs no certificate itself), and the app server terminates TLS directly from the client, optionally requiring a client certificate (**mTLS**: `tls.RequireAndVerifyClientCert` in Go). This is the mechanism identity systems like SPIFFE/service meshes build on; see [[Service-to-Service Auth - API Keys, HMAC, mTLS]] for how that identity is actually used for authorization, which is out of scope here.
+- **Passthrough with mTLS:** the proxy routes on SNI alone without ever decrypting (so it needs no certificate itself), and the app server terminates TLS directly from the client, optionally requiring a client certificate (**mTLS**: `tls.RequireAndVerifyClientCert` in Go).
+
+  This is the mechanism identity systems like SPIFFE/service meshes build on; see [[Service-to-Service Auth - API Keys, HMAC, mTLS]] for how that identity is actually used for authorization, which is out of scope here.
 
 ## 4. Worked example
 
@@ -427,7 +485,10 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 
 ## 7. In production
 
-- **Real systems:** nearly all public HTTPS traffic today is TLS 1.3 (TLS 1.2 kept around for legacy client compatibility); Let's Encrypt/ACM/ZeroSSL automate DV certificate issuance at scale; CDNs typically terminate TLS at the edge and re-encrypt or pass through to origin depending on the provider's architecture; Go's `crypto/tls` since Go 1.22 sets the server's default minimum to TLS 1.2, and since Go 1.24 can negotiate a hybrid post-quantum key exchange (`X25519MLKEM768`) by default alongside classical ECDHE.
+- **Real systems:** nearly all public HTTPS traffic today is TLS 1.3 (TLS 1.2 kept around for legacy client compatibility).
+  - Let's Encrypt/ACM/ZeroSSL automate DV certificate issuance at scale.
+  - CDNs typically terminate TLS at the edge and re-encrypt or pass through to origin depending on the provider's architecture.
+  - Go's `crypto/tls` since Go 1.22 sets the server's default minimum to TLS 1.2, and since Go 1.24 can negotiate a hybrid post-quantum key exchange (`X25519MLKEM768`) by default alongside classical ECDHE.
 - **Failure modes → fixes:**
   - **Expired certificate** → the single most common HTTPS outage; automate renewal (ACME) well before the expiry window, and alert on days-to-expiry, not just failure.
   - **Missing intermediate certificate** → some clients (especially older ones, or ones with a stale trust store) can't build the chain even though the leaf cert is valid; always serve the full chain, not just the leaf.
@@ -438,9 +499,15 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 
 ## 8. Deep dive
 
-- **Why ECDHE gives forward secrecy and RSA key exchange doesn't.** In RSA key exchange, the client encrypts the secret directly with the server's long-term public key; if that private key is ever compromised, every past session recorded by an eavesdropper can be decrypted retroactively. In ECDHE, both sides generate a fresh, ephemeral key pair per handshake; the shared secret depends on both ephemeral values, so a later leak of the server's long-term (signing) private key doesn't expose past sessions, because that key was only used to *sign*, never to derive the secret.
+- **Why ECDHE gives forward secrecy and RSA key exchange doesn't.** In RSA key exchange, the client encrypts the secret directly with the server's long-term public key; if that private key is ever compromised, every past session recorded by an eavesdropper can be decrypted retroactively.
+
+  In ECDHE, both sides generate a fresh, ephemeral key pair per handshake; the shared secret depends on both ephemeral values, so a later leak of the server's long-term (signing) private key doesn't expose past sessions, because that key was only used to *sign*, never to derive the secret.
 - **TLS 1.3 removed renegotiation, static RSA key exchange, compression, and most legacy cipher suites outright** rather than making them optional, specifically because each had caused real CVEs (renegotiation enabled MITM injection attacks; compression enabled CRIME). A smaller, mandatory-strong set of options is easier to audit than a large negotiable one.
-- **HSTS (`Strict-Transport-Security` header)** tells the browser to never attempt plain HTTP for this origin again for the given duration, closing the window where a first visit over HTTP could be intercepted and silently kept on HTTP by an attacker (SSL-stripping). The `preload` directive lets a site ship this guarantee baked into the browser itself, before the user ever visits. HSTS only protects *repeat* visits, because the browser has to see the header at least once first; a server still needs a `301`/`308` redirect from `http://` to `https://` on every plain-HTTP request to cover the very first visit, and HSTS is what prevents that first redirect's response from being the thing an attacker tampers with on every subsequent visit.
+- **HSTS (`Strict-Transport-Security` header)** tells the browser to never attempt plain HTTP for this origin again for the given duration, closing the window where a first visit over HTTP could be intercepted and silently kept on HTTP by an attacker (SSL-stripping).
+
+  The `preload` directive lets a site ship this guarantee baked into the browser itself, before the user ever visits.
+
+  HSTS only protects *repeat* visits, because the browser has to see the header at least once first; a server still needs a `301`/`308` redirect from `http://` to `https://` on every plain-HTTP request to cover the very first visit, and HSTS is what prevents that first redirect's response from being the thing an attacker tampers with on every subsequent visit.
 - **Post-quantum readiness:** Go 1.24's `crypto/tls` enables a hybrid key exchange (`X25519MLKEM768`, combining the classical X25519 ECDH with a post-quantum lattice-based KEM) by default on both client and server. It's hybrid specifically so that today's connections stay secure even if the post-quantum half turns out to have an undiscovered weakness — the classical half alone still protects it.
 - **DNS cutover mechanics** (A/AAAA/CNAME changes, lowering TTL before a migration) are a DNS concern, not a TLS one; see [[DNS - Resolution, Records and Caching]] for that half of what the old "Domain, DNS, HTTPS, SSL/TLS" material covered together.
 
@@ -484,3 +551,7 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 - **Next:** [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[Forward and Reverse Proxies - L4 vs L7]]
 - **Compare with:** [[DNS - Resolution, Records and Caching]] (the DNS half of what domain setup involves), [[Service-to-Service Auth - API Keys, HMAC, mTLS]] (using a client certificate's identity for authorization, not the handshake mechanics covered here), [[TLS, HTTPS and HTTP2 in Go Servers]] (the fuller Go server configuration: autocert, hot cert reload, h2c)
 - **Code:** [[TLS and HTTPS - Go]]
+
+### Watch on YouTube
+
+- [TLS 1.3 Handshake Explained In Details (with Math)](https://www.youtube.com/watch?v=IE0QLCcOr0I) · Hussein Nasser · deep dive on the key-exchange math and 1-RTT handshake the note describes

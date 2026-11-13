@@ -15,7 +15,7 @@ sources:
   - "Corbett et al., Spanner (OSDI 2012): 2PC across Paxos groups"
   - "Peng & Dabek, Large-scale Incremental Processing Using Distributed Transactions and Notifications (OSDI 2010): Percolator"
   - "Kafka KIP-98, Exactly Once Delivery and Transactional Messaging"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Two-Phase Commit
@@ -30,6 +30,55 @@ updated: 2026-11-04
 > - A participant that voted yes is **in doubt** and cannot decide alone: 2PC is a **blocking** protocol.
 > - Classic mistake: thinking 2PC is a consensus algorithm. It needs *every* participant, not a majority, and stalls when the coordinator is down.
 
+## Start here: the basics
+
+**The problem in one story.** You move 100 rupees from your account in Bank A to your account in Bank B.
+Bank A must take the money out and Bank B must put it in.
+If A finishes and B's computer crashes, the money vanishes. If B finishes and A crashes, money appears from nowhere.
+Both banks must do their part, or neither must.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Transaction | A group of changes that succeed or fail together | Debit 17 and log the transfer |
+| Commit / abort | Make the changes permanent / throw them away | `COMMIT;` / `ROLLBACK;` |
+| Shard / node | One of several machines that each hold part of the data | Shard A holds accounts 1-50 |
+| Coordinator | The one machine that runs the protocol and decides | The order service |
+| Participant | A database taking part in the transaction | Shard A and shard B |
+| Durable log | A record written to disk that survives a crash | Write-ahead log entry "COMMIT tx42" |
+| Lock | A mark that stops others changing a row until you finish | Row of account 17 locked |
+| In doubt | Voted yes, but does not yet know the final decision | Shard B waiting for the coordinator |
+
+**Picture it**
+
+```mermaid
+sequenceDiagram
+  participant C as Coordinator
+  participant A as Shard A
+  participant B as Shard B
+  C->>A: prepare?
+  C->>B: prepare?
+  A-->>C: yes
+  B-->>C: yes
+  Note over C: log COMMIT (commit point)
+  C->>A: commit
+  C->>B: commit
+```
+
+**Analogy.** A group dinner booking: the organiser asks everyone "can you come?", and only books the table if everyone says yes.
+Where it breaks: guests can change their minds, but a participant that voted yes in 2PC is bound and must wait for the organiser.
+
+**How the rest of this note builds up**
+
+- First, *Why it exists* and *Mental model* explain atomic commit with a simple story.
+- Then *How it works* covers the two phases, the participant states and the recovery rules.
+- The *Worked example* runs a Go simulation and the same protocol with PostgreSQL `PREPARE TRANSACTION`.
+- Finally, the SDE-3 deep dive covers 2PC vs consensus, why 3PC does not help, and how Spanner and Percolator use it.
+
+> [!tip] Remember
+> 2PC is "everyone votes yes, then commit"; one no aborts all, and a crashed coordinator leaves yes-voters stuck holding locks.
+
 ## 1. Why it exists
 
 An order moves money between two shards: debit account 17 on shard A, credit account 92 on shard B. Each shard has its own local transactions. Commit A first and crash before B, and money disappears; commit B first and crash before A, and money is created. Local transactions cannot fix this because no single database sees both writes.
@@ -38,7 +87,11 @@ An order moves money between two shards: debit account 17 on shard A, credit acc
 
 ## 2. Mental model
 
-**A wedding ceremony.** The officiant (coordinator) asks each partner "do you?" (prepare). Each may say no. Once both have said "I do", neither can walk away alone; only the officiant's pronouncement (the decision, recorded in the register) makes it final. If the officiant faints right after both said yes, the couple is in limbo: neither knows whether they are married until the officiant wakes up and reads the register.
+**A wedding ceremony.** The officiant (coordinator) asks each partner "do you?" (prepare). Each may say no.
+
+Once both have said "I do", neither can walk away alone; only the officiant's pronouncement (the decision, recorded in the register) makes it final.
+
+If the officiant faints right after both said yes, the couple is in limbo: neither knows whether they are married until the officiant wakes up and reads the register.
 
 **Terms:**
 
@@ -90,7 +143,11 @@ stateDiagram-v2
     Aborted --> [*]
 ```
 
-The self-loop on `Prepared` is the whole problem with 2PC. A participant that voted yes cannot abort on its own, because the coordinator may already have logged COMMIT and told another participant, which committed. It cannot commit on its own either, because another participant may have voted no. It can only wait, or ask other participants whether any of them has learned the outcome.
+The self-loop on `Prepared` is the whole problem with 2PC.
+
+A participant that voted yes cannot abort on its own, because the coordinator may already have logged COMMIT and told another participant, which committed.
+
+It cannot commit on its own either, because another participant may have voted no. It can only wait, or ask other participants whether any of them has learned the outcome.
 
 ### Recovery rules
 
@@ -414,7 +471,11 @@ Representative output (PostgreSQL 17):
 (1 row)
 ```
 
-Any `UPDATE` on account 17 now waits on that row lock until someone runs `COMMIT PREPARED` or `ROLLBACK PREPARED`. A forgotten prepared transaction also holds back the xmin horizon, so `VACUUM` cannot remove dead rows newer than it in that database or in the shared catalogs, and cannot advance freezing toward wraparound protection (see [[Isolation Levels and MVCC]]). Alert on any row in `pg_prepared_xacts` older than a few minutes.
+Any `UPDATE` on account 17 now waits on that row lock until someone runs `COMMIT PREPARED` or `ROLLBACK PREPARED`.
+
+A forgotten prepared transaction also holds back the xmin horizon, so `VACUUM` cannot remove dead rows newer than it in that database or in the shared catalogs, and cannot advance freezing toward wraparound protection (see [[Isolation Levels and MVCC]]).
+
+Alert on any row in `pg_prepared_xacts` older than a few minutes.
 
 ## 5. Variants and comparison
 
@@ -453,8 +514,12 @@ Any `UPDATE` on account 17 now waits on that row lock until someone runs `COMMIT
 
 ## 8. Deep dive
 
-- **2PC vs consensus.** Consensus needs a majority and tolerates minority failures; it agrees on *some* proposed value. Atomic commit needs *every* participant to vote yes and must abort if any says no; one unreachable participant stops it. The fix in modern systems is to make every participant and the coordinator a consensus group, so "unreachable forever" no longer happens (Gray and Lamport's Paxos Commit, Spanner).
-- **Why 3PC does not save you.** 3PC inserts a "pre-commit" state so that, if the coordinator dies, participants can decide among themselves: if anyone is in pre-commit, nobody had voted no. That reasoning assumes a participant that does not answer has crashed. Under a network partition, one side can commit while the other aborts. Real networks are asynchronous, so 3PC is mostly a textbook answer.
+- **2PC vs consensus.** Consensus needs a majority and tolerates minority failures; it agrees on *some* proposed value.
+  - Atomic commit needs *every* participant to vote yes and must abort if any says no; one unreachable participant stops it.
+  - The fix in modern systems is to make every participant and the coordinator a consensus group, so "unreachable forever" no longer happens (Gray and Lamport's Paxos Commit, Spanner).
+- **Why 3PC does not save you.** 3PC inserts a "pre-commit" state so that, if the coordinator dies, participants can decide among themselves: if anyone is in pre-commit, nobody had voted no.
+  - That reasoning assumes a participant that does not answer has crashed.
+  - Under a network partition, one side can commit while the other aborts. Real networks are asynchronous, so 3PC is mostly a textbook answer.
 - **Cooperative termination.** A participant in doubt can ask the other participants. If any has committed or aborted, or never voted (and can therefore abort), the outcome is known. Only if all live participants are prepared must they wait for the coordinator.
 - **Isolation still matters.** 2PC gives atomicity across nodes; isolation comes from each participant's locks or MVCC. Distributed SQL engines also need a global timestamp order (TrueTime or hybrid logical clocks; see [[Clocks and Ordering]]) so cross-shard reads see a consistent snapshot.
 - **Read-only participants** can vote "read-only" and drop out of phase 2, a common optimization.
@@ -498,3 +563,8 @@ Any `UPDATE` on account 17 now waits on that row lock until someone runs `COMMIT
 - **Before this:** [[Transactions and ACID]], [[Consensus - Raft and Paxos]]
 - **Next:** [[Saga Pattern]], [[Distributed SQL]]
 - **Compare with:** [[Transactional Outbox and CDC]] (atomic "write and publish" without 2PC), [[Delivery Semantics and Exactly-Once]] (Kafka transactions)
+
+### Watch on YouTube
+
+- [Distributed Transactions are Hard (How Two-Phase Commit works)](https://www.youtube.com/watch?v=eltn4x788UM) · Hussein Nasser · 16 min · 40,219 views
+- [Distributed Systems 7.1: Two-phase commit](https://www.youtube.com/watch?v=-_rdWB9hN1c) · Martin Kleppmann · 18 min · 87,979 views

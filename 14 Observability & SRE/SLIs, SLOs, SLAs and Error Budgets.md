@@ -8,13 +8,15 @@ sources:
   - "Google, The Site Reliability Workbook (2018), ch. 2 \"Implementing SLOs\" and ch. 5 \"Alerting on SLOs\""
   - "OpenSLO specification (openslo.com)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # SLIs, SLOs, SLAs and Error Budgets
 
 > [!summary] TL;DR
-> An **SLI** is a measurement ("what fraction of requests succeeded"), an **SLO** is the internal target for that measurement ("99.9% over 30 days"), and an **SLA** is the external, contractual promise with a penalty attached, usually looser than the SLO. The gap between 100% and the SLO is the **error budget**: the amount of unreliability you're allowed to spend before you must stop and fix reliability instead of shipping features.
+> An **SLI** is a measurement ("what fraction of requests succeeded"), an **SLO** is the internal target for that measurement ("99.9% over 30 days"), and an **SLA** is the external, contractual promise with a penalty attached, usually looser than the SLO.
+>
+> The gap between 100% and the SLO is the **error budget**: the amount of unreliability you're allowed to spend before you must stop and fix reliability instead of shipping features.
 
 > [!abstract] Core idea
 > - SLI = good events ÷ valid events, measured continuously.
@@ -22,6 +24,49 @@ updated: 2026-11-07
 > - SLA = the customer-facing promise, with a penalty, set looser than the SLO so breaches are rare.
 > - Error budget = `1 − SLO`; spend it on risky launches, and freeze them when it runs out.
 > - Burn rate turns the slow, 30-day budget into a number you can alert on in minutes (covered fully in [[Alerting and On-Call]]).
+
+## Start here: the basics
+
+**The problem in one story.**
+You run a food-delivery app. Some orders fail now and then.
+Is that fine or a disaster? Without a number, the product team says "never fail" and engineers say "it's mostly fine".
+SLIs and SLOs turn that argument into a shared number, and the error budget says how much failure you can still afford this month.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Request / event | One thing a user asked the system to do | One `POST /orders` call |
+| Good event | An event that met the bar | Returned 2xx in under 300 ms |
+| Percentage (nines) | Reliability written as a percent | 99.9% = "three nines" |
+| Time window | The period the number is measured over | Last 30 days |
+| SLI | The measured ratio of good to valid events | 999,000 good of 1,000,000 = 99.9% |
+| SLO | Your internal target for the SLI | "99.9% over 30 days" |
+| SLA | A contract promise to customers, with a penalty | "99.5% or we refund 10%" |
+| Burn rate | How fast you are using up the allowed failures | 2x = budget gone in half the window |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    E["Every request"] --> SLI["SLI:<br/>good / valid"]
+    SLI --> SLO{"Above SLO<br/>target?"}
+    SLO -- "yes" --> B["Budget left:<br/>ship features"]
+    SLO -- "no" --> FZ["Budget spent:<br/>freeze risky launches"]
+```
+
+**Analogy.** The error budget is a monthly phone data plan: 99.9% means you get about 43 minutes of "downtime data" per 30 days; spend it on risky launches, and when it runs out you slow down.
+Where it breaks: unused data does not roll over, and a real outage can spend the whole budget in one go, which a data plan rarely does.
+
+**How the rest of this note builds up**
+
+- First, why SLOs exist (section 1) and the SLI → SLO → SLA ladder (section 2).
+- Then how to pick SLIs, set targets and compute the budget (section 3), with a worked example (section 4).
+- Then variants, trade-offs and real-world use (sections 5-7).
+- Finally the SDE-3 deep dive on burn-rate alerting and budget policy, plus interview questions (sections 8-9).
+
+> [!tip] Remember
+> Measure good ÷ valid (SLI), aim for a target (SLO), promise less to customers (SLA), and spend the gap (error budget) wisely.
 
 ### Whiteboard version
 
@@ -37,13 +82,17 @@ The SLI is what you measure every minute. The SLO is the line you manage against
 
 ## 1. Why it exists
 
-A team ships a checkout API with no explicit target. One engineer thinks "it should basically never be down." Another thinks "a few minutes a week is fine, we're not a bank." A product manager wants to ship a risky caching change Friday afternoon; an SRE wants to block it. Nobody can settle the argument because there's no number to check it against.
+A team ships a checkout API with no explicit target. One engineer thinks "it should basically never be down." Another thinks "a few minutes a week is fine, we're not a bank." A product manager wants to ship a risky caching change Friday afternoon; an SRE wants to block it.
+
+Nobody can settle the argument because there's no number to check it against.
 
 With an SLO, the question becomes mechanical: **99.9% availability over 30 days means 1,000,000 requests can tolerate 1,000 failures.** If the team has only used 200 of that budget this month, the Friday deploy is fine. If they've used 950, it waits. The SLO converts a reliability argument into arithmetic.
 
 ## 2. Mental model
 
-Think of the error budget as a bank account funded monthly with a fixed amount of "allowed failure." Every bad request withdraws from it. Shipping features, taking risks, doing maintenance — all of that spends budget, same as an outage does. The account resets each window (commonly a rolling 28 or 30 days). When the balance goes negative, the team's job shifts from "ship features" to "pay down reliability debt," because the budget — not someone's opinion — says reliability is the bottleneck right now.
+Think of the error budget as a bank account funded monthly with a fixed amount of "allowed failure." Every bad request withdraws from it. Shipping features, taking risks, doing maintenance — all of that spends budget, same as an outage does.
+
+The account resets each window (commonly a rolling 28 or 30 days). When the balance goes negative, the team's job shifts from "ship features" to "pay down reliability debt," because the budget — not someone's opinion — says reliability is the bottleneck right now.
 
 ## 3. How it works
 
@@ -70,7 +119,11 @@ flowchart LR
     SVC -->|"server-side app metrics:<br/>misses anything that never<br/>reached the service"| SVC
 ```
 
-Measuring at the **server** is cheapest and most common but is blind to anything that failed before the request arrived (DNS, TLS handshake failures, client timeouts). Measuring at the **load balancer** is usually the best default: it sees everything that reached your infrastructure, including upstream 5xxs the app itself never logged. Measuring at the **client** (real-user monitoring or synthetic probes) is the most honest but the most expensive and noisiest, and is reserved for the SLIs that matter most (checkout, login).
+Measuring at the **server** is cheapest and most common but is blind to anything that failed before the request arrived (DNS, TLS handshake failures, client timeouts).
+
+Measuring at the **load balancer** is usually the best default: it sees everything that reached your infrastructure, including upstream 5xxs the app itself never logged.
+
+Measuring at the **client** (real-user monitoring or synthetic probes) is the most honest but the most expensive and noisiest, and is reserved for the SLIs that matter most (checkout, login).
 
 ### SLO target and window
 
@@ -90,7 +143,9 @@ For a **30-day window** (`30 × 24 × 60 = 43,200` minutes):
 | 99.95% | 21m 36s | 500 |
 | 99.99% | 4m 19s | 100 |
 
-**Worked example:** a service targets 99.9% over 30 days and serves 1,000,000 requests in that window. The allowed bad-event fraction is `1 − 0.999 = 0.001`, so the budget is `1,000,000 × 0.001 = 1,000` failed requests. If 500 requests have failed so far this window, **50% of the budget is spent** — `BudgetConsumedFraction` in the code below returns exactly that.
+**Worked example:** a service targets 99.9% over 30 days and serves 1,000,000 requests in that window. The allowed bad-event fraction is `1 − 0.999 = 0.001`, so the budget is `1,000,000 × 0.001 = 1,000` failed requests.
+
+If 500 requests have failed so far this window, **50% of the budget is spent** — `BudgetConsumedFraction` in the code below returns exactly that.
 
 ### Dependency math
 
@@ -212,7 +267,11 @@ xychart-beta
     line [100, 100, 100, 55, 55, 10, 10]
 ```
 
-A flat line means no errors are being recorded; the steep drop from day 14 to day 18 is an incident consuming budget fast. The plateau that follows (day 18 to day 21, holding at 55%) means the service recovered and stopped spending further budget — until a second drop (day 21 to day 25) takes it down to 10%, where it plateaus again for the rest of the window. This shape, not a single "are we up" boolean, is what an error-budget policy reacts to.
+A flat line means no errors are being recorded; the steep drop from day 14 to day 18 is an incident consuming budget fast.
+
+The plateau that follows (day 18 to day 21, holding at 55%) means the service recovered and stopped spending further budget — until a second drop (day 21 to day 25) takes it down to 10%, where it plateaus again for the rest of the window.
+
+This shape, not a single "are we up" boolean, is what an error-budget policy reacts to.
 
 ## 5. Variants and comparison
 
@@ -241,9 +300,15 @@ A flat line means no errors are being recorded; the steep drop from day 14 to da
 
 ## 8. Deep dive
 
-- **Request-based vs window-based SLIs.** A request-based SLI (`good/valid` over all requests in the window) weights every request equally. A window-based SLI (e.g. "percentage of 1-minute windows where availability stayed above X") instead asks whether the service was ever "bad" for a sustained period — used more for latency/aggregate health checks than per-request correctness, and less precise for budget math, so most production SLOs use request-based SLIs.
+- **Request-based vs window-based SLIs.** A request-based SLI (`good/valid` over all requests in the window) weights every request equally. A window-based SLI (e.g.
+
+  "percentage of 1-minute windows where availability stayed above X") instead asks whether the service was ever "bad" for a sustained period — used more for latency/aggregate health checks than per-request correctness, and less precise for budget math, so most production SLOs use request-based SLIs.
 - **Recording rules.** Computing `good/valid` live, per minute, directly from raw events is expensive at scale; Prometheus recording rules pre-aggregate `sli:good_events:rate5m` and `sli:valid_events:rate5m` so the SLO and burn-rate alert queries (next note) just divide two cheap series instead of scanning raw request metrics.
-- **Why the SLA is looser than the SLO.** The SLO is what engineering manages against operationally — tight enough to catch problems before customers notice. The SLA is what's promised externally, with margin, so that normal operational variance (a 10-minute blip well within the SLO's error budget) never triggers a contractual penalty. If SLA == SLO, every SLO miss becomes a legal event, which pressures teams to hide or dispute misses instead of using the budget as intended.
+- **Why the SLA is looser than the SLO.** The SLO is what engineering manages against operationally — tight enough to catch problems before customers notice.
+
+  The SLA is what's promised externally, with margin, so that normal operational variance (a 10-minute blip well within the SLO's error budget) never triggers a contractual penalty.
+
+  If SLA == SLO, every SLO miss becomes a legal event, which pressures teams to hide or dispute misses instead of using the budget as intended.
 - **SLOs and chaos engineering.** A chaos experiment's abort condition should be tied to the error budget, not a vague "stop if it looks bad" — see [[Chaos Engineering]] for blast-radius control that uses exactly this number.
 
 ## 9. Interview questions
@@ -264,7 +329,9 @@ A flat line means no errors are being recorded; the steep drop from day 14 to da
 > Request-based divides good events by valid events across every individual request in the window — precise, and the natural input to error-budget arithmetic. Window-based asks what fraction of short time-windows were acceptable overall, which is coarser and more common for availability-style "was the service up" checks than for budget math.
 
 > [!question]- Trap: if the SLA says 99.5% and you're at 99.6%, are you safe?
-> Not necessarily on the number that matters day to day: the internal SLO (commonly tighter, e.g. 99.9%) is what your error-budget policy manages against, and you could already be over budget against the SLO — and about to do real engineering damage-control — while still comfortably inside the looser, contractual SLA. Interviewers use this to check you understand the SLO/SLA gap is deliberate, not interchangeable.
+> Not necessarily on the number that matters day to day: the internal SLO (commonly tighter, e.g. 99.9%) is what your error-budget policy manages against, and you could already be over budget against the SLO — and about to do real engineering damage-control — while still comfortably inside the looser, contractual SLA.
+>
+> Interviewers use this to check you understand the SLO/SLA gap is deliberate, not interchangeable.
 
 ## 10. Cheat sheet
 
@@ -282,3 +349,8 @@ A flat line means no errors are being recorded; the steep drop from day 14 to da
 - **Before this:** [[Observability Fundamentals]], [[Metrics and Prometheus]]
 - **Next:** [[Alerting and On-Call]], [[Incident Response]]
 - **Compare with:** [[Chaos Engineering]] (validates whether the system actually survives within its error budget), [[Postmortems and Root Cause Analysis]] (the process a budget-exhausting incident feeds into)
+
+### Watch on YouTube
+
+- [SRE Fundamentals - Understanding SLIs, SLOs, SLAs & Error Budgets](https://www.youtube.com/watch?v=nsqHxEbNVcY) · MattOps / DevOps & SRE · 35 min · 565 views
+- [SLOs, SLIs & Error Budgets Explained: The Framework Senior Engineers Actually Use](https://www.youtube.com/watch?v=2GVNfWcljkk) · Shubham Sahoo · 18 min · 171 views

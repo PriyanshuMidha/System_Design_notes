@@ -9,7 +9,7 @@ sources:
   - "OpenTelemetry specification, Observability Primer (signals.md)"
   - "Prometheus docs, Metric and Label Naming"
   - "Brendan Gregg, the USE method (brendangregg.com/usemethod.html)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Observability Fundamentals
@@ -37,6 +37,53 @@ requestsTotal.WithLabelValues("/invoices", "POST", "2xx").Inc()
 ```
 
 A log line names one event with full detail. A counter does not know this invoice's ID — only that one more POST to `/invoices` succeeded. Neither replaces the other; see [[Observability in Go Services]] for the full Go wiring.
+
+## Start here: the basics
+
+**The problem in one story.**
+A customer says "the app was broken at 2 pm".
+You can't attach a debugger to production, and the bug is gone now.
+All you have is what the system wrote down while it ran.
+Observability means writing down the right things so you can answer questions you didn't plan for.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Telemetry | Data a running system emits about itself | Logs, metrics, traces |
+| Log | A timestamped record of one event | `invoice created id=482` |
+| Metric | A number tracked over time, usually counts or averages | Requests per second |
+| Trace | The path of one request through every service, with timings | API → billing → DB, 340 ms total |
+| Span | One step inside a trace | The `db.query` step took 300 ms |
+| Label / field | A key-value tag attached to data | `route="/invoices"` |
+| Cardinality | How many distinct values a label can take | `status` has ~5; `user_id` has millions |
+| Correlation | Linking signals with a shared ID | Same `trace_id` in the trace and the log line |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Running service"] --> L["Logs:<br/>what happened"]
+    S --> M["Metrics:<br/>how much, over time"]
+    S --> T["Traces:<br/>where time went"]
+    L --> C["Correlate with<br/>trace_id"]
+    M --> C
+    T --> C
+    C --> A["Answer a new question"]
+```
+
+**Analogy.** A flight recorder on a plane: investigators don't know in advance what will go wrong, so the recorder captures enough to reconstruct any accident.
+Where it breaks: a flight recorder records everything for a short time; software telemetry costs money per byte and per label, so you must choose what to record.
+
+**How the rest of this note builds up**
+
+- First, why monitoring alone is not enough (section 1) and a mental model of the three signals (section 2).
+- Then how it works: following a spike from metric to trace to log, push vs. pull, and sampling (section 3).
+- Then a worked example (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production practice, cardinality and cost, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Metrics tell you something is wrong, traces tell you where, logs tell you exactly what; a shared trace_id ties them together.
 
 ## 1. Why it exists
 
@@ -218,3 +265,8 @@ RED and USE are the same four golden signals split by what they're measuring: RE
 - **Before this:** none — start here.
 - **Next:** [[Structured Logging]], [[Metrics and Prometheus]], [[Distributed Tracing with OpenTelemetry]]
 - **Compare with:** [[Observability in Go Services]] (the Go implementation of these three signals), [[Latency Numbers Every Engineer Should Know]] (the raw numbers behind "why did this take so long")
+
+### Watch on YouTube
+
+- [Day-1 / Fundamentals of Observability / Observability Zero to Hero Course](https://www.youtube.com/watch?v=otY2_M_pTmU) · Abhishek.Veeramalla · 35 min · 179,945 views
+- [Datadog Fundamentals in 1 Hour  Complete Observability Tutorial 2026](https://www.youtube.com/watch?v=0rSftRQEkGQ) · AiOps School · 104 min · 496 views

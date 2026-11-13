@@ -9,13 +9,22 @@ sources:
   - "IEEE 754-2019, Standard for Floating-Point Arithmetic"
   - "The Unicode Standard, Version 15.0 (UTF-8 encoding, Ch. 3)"
   - "The Go Programming Language Specification (string, rune, byte types)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Number Representation and Text Encoding - Go
 
 > [!summary] TL;DR
 > Five small functions and their tests demonstrate, by running real code, the sharp edges described in [[Number Representation and Text Encoding]]: silent `int8` overflow, float rounding that breaks `0.1 + 0.2 == 0.3`, exact integer-cent money math, endianness, and the byte-vs-rune gap in Go strings.
+
+## Before the code
+
+- **Fixed-width integer types** (`int8`, `int64`, `uint32`): each has a set size and range; arithmetic wraps when it leaves the range.
+- **`float64`**: Go's IEEE 754 double; `==` compares exact bits.
+- **`encoding/binary`**: standard package whose `ByteOrder` interface values (`LittleEndian`, `BigEndian`) write numbers as bytes in a fixed order.
+- **Arrays vs slices**: `[4]byte` is a fixed array comparable with `==`; `buf[:]` makes a slice view over it.
+- **`for range` on a string**: decodes UTF-8 and steps one rune (code point) at a time.
+- **What to run**: `go vet ./... && go test -race -v ./...` in the `numrep` module.
 
 ## What this code shows
 
@@ -48,7 +57,9 @@ Each function is a minimal, pure, standalone demonstration of exactly one repres
 
 ### Step 1: silent integer overflow and exact money math
 
-**Concept.** `AddInt8Wrapping` implements [[Number Representation and Text Encoding#Two's complement and silent overflow]] directly: it is Go's own `+` operator on `int8`, wrapped in a named function purely so a test can call it and assert on the wraparound. `MoneyCents` implements the "why money uses integers" idea by using plain `int64` addition — the alternative of a `float64` parameter was deliberately rejected, since the whole point is that integer cents never need rounding.
+**Concept.** `AddInt8Wrapping` implements [[Number Representation and Text Encoding#Two's complement and silent overflow]] directly: it is Go's own `+` operator on `int8`, wrapped in a named function purely so a test can call it and assert on the wraparound.
+
+`MoneyCents` implements the "why money uses integers" idea by using plain `int64` addition — the alternative of a `float64` parameter was deliberately rejected, since the whole point is that integer cents never need rounding.
 
 ```go
 package numrep
@@ -80,7 +91,9 @@ func MoneyCents(centsA, centsB int64) int64 {
 
 ### Step 2: float approximation
 
-**Concept.** `FloatsAreApproximate` implements [[Number Representation and Text Encoding#IEEE 754 floating point]]: it takes three `float64` arguments and reports whether `a + b == c` holds *exactly*, at the bit level. The function is generic over its three arguments rather than hardcoded to `0.1, 0.2, 0.3` so the same function can also prove the positive case (integral floats compare equal exactly), which is important: the point isn't "floats are always wrong," it's "floats are exact only for specific values."
+**Concept.** `FloatsAreApproximate` implements [[Number Representation and Text Encoding#IEEE 754 floating point]]: it takes three `float64` arguments and reports whether `a + b == c` holds *exactly*, at the bit level.
+
+The function is generic over its three arguments rather than hardcoded to `0.1, 0.2, 0.3` so the same function can also prove the positive case (integral floats compare equal exactly), which is important: the point isn't "floats are always wrong," it's "floats are exact only for specific values."
 
 ```go
 // FloatsAreApproximate reports whether a + b equals c exactly in IEEE 754
@@ -110,7 +123,9 @@ flowchart LR
 
 ### Step 3: endianness
 
-**Concept.** `BytesLE` and `BytesBE` implement [[Number Representation and Text Encoding#Endianness]] using the standard library's `encoding/binary` package rather than manual bit-shifting, which is both less error-prone and the idiomatic Go approach for any code that needs a specific wire format. The alternative — relying on the host's native byte order via `unsafe` pointer casts — was rejected because it would make the function's output depend on which machine it runs on, defeating the entire purpose of fixing a byte order explicitly.
+**Concept.** `BytesLE` and `BytesBE` implement [[Number Representation and Text Encoding#Endianness]] using the standard library's `encoding/binary` package rather than manual bit-shifting, which is both less error-prone and the idiomatic Go approach for any code that needs a specific wire format.
+
+The alternative — relying on the host's native byte order via `unsafe` pointer casts — was rejected because it would make the function's output depend on which machine it runs on, defeating the entire purpose of fixing a byte order explicitly.
 
 ```go
 // BytesLE encodes v as 4 bytes in little-endian order (least-significant
@@ -138,7 +153,9 @@ func BytesBE(v uint32) [4]byte {
 
 ### Step 4: bytes vs. runes
 
-**Concept.** `StringLens` implements [[Number Representation and Text Encoding#Go's string, []byte, and rune]]: it returns both the byte length (`len(s)`) and the rune count (via `for range`) so a caller — or a test — can see directly how far apart they are for a given string. The alternative of using `utf8.RuneCountInString` was avoided here specifically so the function demonstrates the *mechanism* (decoding one rune per iteration) rather than calling a library function that hides it.
+**Concept.** `StringLens` implements [[Number Representation and Text Encoding#Go's string, []byte, and rune]]: it returns both the byte length (`len(s)`) and the rune count (via `for range`) so a caller — or a test — can see directly how far apart they are for a given string.
+
+The alternative of using `utf8.RuneCountInString` was avoided here specifically so the function demonstrates the *mechanism* (decoding one rune per iteration) rather than calling a library function that hides it.
 
 ```go
 // StringLens returns the byte length (len(s), what Go's len() always means
@@ -337,7 +354,9 @@ PASS
 ok  	roll4scratch/numrep	1.516s
 ```
 
-**Reading the output.** Every test passes in under a millisecond individually — none of this code does I/O or allocation-heavy work, so the entire suite's wall-clock time is dominated by Go's test-harness startup, not the assertions themselves. `AddInt8Wrapping(127, 1) = -128`, `FloatsAreApproximate(0.1, 0.2, 0.3) = false`, and `StringLens("café") = (5, 4)` are the three headline results the theory note cites as measured, not merely claimed, behavior.
+**Reading the output.** Every test passes in under a millisecond individually — none of this code does I/O or allocation-heavy work, so the entire suite's wall-clock time is dominated by Go's test-harness startup, not the assertions themselves.
+
+`AddInt8Wrapping(127, 1) = -128`, `FloatsAreApproximate(0.1, 0.2, 0.3) = false`, and `StringLens("café") = (5, 4)` are the three headline results the theory note cites as measured, not merely claimed, behavior.
 
 ## Pitfalls in the code
 

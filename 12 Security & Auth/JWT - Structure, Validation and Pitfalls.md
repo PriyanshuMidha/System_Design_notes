@@ -10,7 +10,7 @@ sources:
   - "RFC 7517, JSON Web Key (JWK)"
   - "OWASP API Security Top 10 2023, API2 Broken Authentication"
   - "github.com/golang-jwt/jwt/v5 documentation"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # JWT - Structure, Validation and Pitfalls
@@ -25,15 +25,63 @@ updated: 2026-11-07
 > - A full validation checklist has six checks: signature, allowed algorithm, `iss`, `aud`, `exp`/`nbf` with leeway, and (if you issue them) `jti` against a denylist.
 > - Revoking a single JWT early is the hard problem JWTs do not solve for free; short expiry plus a refresh token is the usual answer (see [[Access and Refresh Tokens]]).
 
+## Start here: the basics
+
+**The problem in one story.**
+Your API runs on 20 servers behind a load balancer.
+Each request may land on any server, and each server must know who is calling.
+Asking a shared database on every request is slow and fragile.
+A JWT is a signed note the client carries: "this is user 42, valid until 09:00", which any server can check by itself.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Claim | One fact inside a token | `"sub": "42"` |
+| Base64url | A way to write bytes as URL-safe text (not encryption) | `eyJhbGciOiJIUzI1NiJ9` |
+| Signature | Cryptographic proof the content was not changed | HMAC or RSA over header + payload |
+| Secret / private key | The key only the issuer holds to sign | HS256 secret, RS256 private key |
+| Public key | Key anyone can use to verify, but not to sign | Published in a JWKS URL |
+| Stateless | The server stores nothing per user to check a request | Any pod can verify locally |
+| Expiry (`exp`) | Time after which the token is rejected | `exp: 1700000000` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    I["Issuer signs<br/>header.payload"] --> T["JWT:<br/>header.payload.signature"]
+    T --> C["Client sends<br/>Bearer token"]
+    C --> V{"Server checks signature,<br/>alg, iss, aud, exp"}
+    V -- "ok" --> A["Trust the claims"]
+    V -- "fail" --> R["401"]
+```
+
+**Analogy.** A tamper-proof wristband at a festival: staff can check the seal at any gate without phoning the ticket office.
+Where it breaks: anyone can read the wristband print (JWTs are signed, not encrypted), and you cannot easily cancel one wristband before it expires.
+
+**How the rest of this note builds up**
+
+- First, why stateless tokens exist (section 1) and the signed-note mental model (section 2).
+- Then the structure, HS256 vs RS256/EdDSA and JWKS, the validation checklist and the attacks it prevents (section 3).
+- Then a Go validator with tests (section 4) and a comparison with other token types (section 5).
+- Finally the SDE-3 deep dive: trade-offs, revocation, key rotation and production failures (sections 6-8).
+
+> [!tip] Remember
+> A JWT is signed, not secret: pin the algorithm, check `iss`, `aud` and `exp`, and keep it short-lived.
+
 ## 1. Why it exists
 
 An API running behind a load balancer on 20 stateless pods needs to know who is calling on every request. A server-side session keyed by a session ID means every pod either shares one session store (a network hop and a single point of failure on every request) or sticks a client to one pod (breaks autoscaling and rolling deploys).
 
-A JWT moves the session data into the request itself: the client sends `Authorization: Bearer <token>`, and any pod can verify the signature locally — against a shared secret (HS256) or a public key it already cached (RS256/EdDSA) — with no network call. The cost is that the token now carries its own expiry and claims, and the server can no longer just "delete the session row" to log someone out early; see [[Access and Refresh Tokens]] for how real systems close that gap.
+A JWT moves the session data into the request itself: the client sends `Authorization: Bearer <token>`, and any pod can verify the signature locally — against a shared secret (HS256) or a public key it already cached (RS256/EdDSA) — with no network call.
+
+The cost is that the token now carries its own expiry and claims, and the server can no longer just "delete the session row" to log someone out early; see [[Access and Refresh Tokens]] for how real systems close that gap.
 
 ## 2. Mental model
 
-A JWT is a **boarding pass**, not a sealed envelope. The airline (the issuer) prints your name, flight, seat and a tamper-evident mark (the signature) on it. Anyone can read a boarding pass — the gate agent, you, a stranger glancing at your phone — but only someone holding the airline's stamp could have produced a valid one. If you scribble "first class" onto economy seat 32B, the stamp no longer matches and the gate agent (the verifier) rejects it.
+A JWT is a **boarding pass**, not a sealed envelope. The airline (the issuer) prints your name, flight, seat and a tamper-evident mark (the signature) on it. Anyone can read a boarding pass — the gate agent, you, a stranger glancing at your phone — but only someone holding the airline's stamp could have produced a valid one.
+
+If you scribble "first class" onto economy seat 32B, the stamp no longer matches and the gate agent (the verifier) rejects it.
 
 That is the one fact every JWT bug traces back to: **encoded, not encrypted**. Never put a password, a secret, or anything you would not want visible in a browser extension's network tab into a JWT payload.
 
@@ -52,7 +100,9 @@ flowchart LR
     S -. "verify re-computes this over H.P and compares" .-> H
 ```
 
-The header names the algorithm and, for asymmetric signing, a key id (`kid`) telling the verifier which public key to use. The payload is a flat JSON object of **claims**: registered ones (`iss` issuer, `sub` subject, `aud` audience, `exp` expiry, `nbf` not-before, `iat` issued-at, `jti` a unique token id) plus whatever the application adds, such as `role`. Keep the payload small and free of secrets — it is fully readable by anyone holding the token.
+The header names the algorithm and, for asymmetric signing, a key id (`kid`) telling the verifier which public key to use. The payload is a flat JSON object of **claims**: registered ones (`iss` issuer, `sub` subject, `aud` audience, `exp` expiry, `nbf` not-before, `iat` issued-at, `jti` a unique token id) plus whatever the application adds, such as `role`.
+
+Keep the payload small and free of secrets — it is fully readable by anyone holding the token.
 
 ### HS256 vs RS256/EdDSA, and JWKS
 
@@ -121,7 +171,9 @@ sequenceDiagram
     end
 ```
 
-A third live risk is **`kid`/`jku` injection**: a malicious `kid` like `../../dev/null` or a `jku` pointing at an attacker-controlled JWKS URL, if the verifier blindly fetches whatever URL or file path the token names. The fix is the same shape as the others — never let the token tell the verifier where to find the key; the verifier's own configuration names the trusted JWKS URL, and `kid` only selects among keys that URL already returned.
+A third live risk is **`kid`/`jku` injection**: a malicious `kid` like `../../dev/null` or a `jku` pointing at an attacker-controlled JWKS URL, if the verifier blindly fetches whatever URL or file path the token names.
+
+The fix is the same shape as the others — never let the token tell the verifier where to find the key; the verifier's own configuration names the trusted JWKS URL, and `kid` only selects among keys that URL already returned.
 
 ## 4. Worked example
 
@@ -352,3 +404,7 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 - **Before this:** [[Authentication vs Authorization]], [[Sessions and Cookies]]
 - **Next:** [[Access and Refresh Tokens]], [[OAuth 2.0 and OpenID Connect]]
 - **Compare with:** [[Secrets Management]] (where the signing keys themselves live), [[Authentication and Authorization in Go]] (wiring this into Go middleware)
+
+### Watch on YouTube
+
+- [JWT Explained Simply 🔐 / JSON Web Token Architecture, Flow & Security Pitfalls](https://www.youtube.com/watch?v=etJ5IgtPY_Y) · EasyDev · 9 min · 6 views

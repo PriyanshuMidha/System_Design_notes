@@ -14,13 +14,15 @@ sources:
   - "Firecracker paper, Agache et al., NSDI 2020: microVMs for AWS Lambda and Fargate"
   - "Amazon SQS Developer Guide: visibility timeout, dead-letter queues"
   - "Codeforces and ICPC public rules: ICPC-style scoring (solved count, then penalty time)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Online Judge
 
 > [!summary] TL;DR
-> Design a site like LeetCode or Codeforces: users submit code, the system compiles and runs it against hidden test cases, and returns a verdict (Accepted, Wrong Answer, Time Limit Exceeded) within seconds. The hard part is not storing submissions. It is running **untrusted code safely and fairly** at contest-spike scale. Answer: accept the submission fast, queue it, let a pool of sandboxed workers pull jobs, and push the verdict back to the user.
+> Design a site like LeetCode or Codeforces: users submit code, the system compiles and runs it against hidden test cases, and returns a verdict (Accepted, Wrong Answer, Time Limit Exceeded) within seconds. The hard part is not storing submissions.
+>
+> It is running **untrusted code safely and fairly** at contest-spike scale. Answer: accept the submission fast, queue it, let a pool of sandboxed workers pull jobs, and push the verdict back to the user.
 
 > [!abstract] Core idea
 > - Treat every submission as hostile: it may fork-bomb, read other people's files, open sockets, or try to escape. Isolate it with namespaces, cgroups, seccomp and no network.
@@ -29,11 +31,63 @@ updated: 2026-11-09
 > - Run a worker's jobs on a **quiet, pinned CPU** with measured limits, so time limits are fair and repeatable.
 > - Verdicts are written once, idempotently, and shown through polling or push.
 
+## Start here: the basics
+
+**The problem in one story.**
+You submit a solution on LeetCode during a contest, along with 20,000 other people.
+Your code must be compiled, run against hidden tests, and judged in seconds.
+Some of those submissions are deliberately evil: they try to crash the machine or read the answers.
+An online judge runs strangers' code safely, fairly and fast, even at contest peaks.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Submission | One piece of code a user sends to be judged | `solution.cpp` for problem 42 |
+| Test case | One hidden input with its expected output | Input `3 4`, expected `7` |
+| Verdict | The final result of judging | Accepted, Wrong Answer, TLE |
+| Untrusted code | Code written by someone you cannot trust | A fork bomb `while(1) fork();` |
+| Sandbox | A locked box where code runs with limited powers | No network, no other files |
+| Queue | A waiting line of jobs that workers take from | Pending submissions |
+| Worker | A machine process that does the slow job | Compiles and runs one submission |
+| cgroup / namespace | Linux tools to limit and hide resources | Max 256 MB RAM, own process list |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User submits code"] --> W["Web tier:<br/>save, return id"]
+    W --> Q["Queue"]
+    Q --> J["Judge workers"]
+    J --> SB["Sandbox:<br/>compile + run tests"]
+    SB --> V["Verdict saved"]
+    V --> U
+```
+
+**Analogy.** An exam hall: papers go into a tray, examiners grade them one by one in a sealed room where students cannot tamper with the answer key.
+Where it breaks: exam papers do not try to set the room on fire; submitted code might, so the "room" must be a real sandbox.
+
+**How the rest of this note builds up**
+
+- First, requirements, the mental model and one submission step by step (sections 1-3).
+- Then the worked example: estimates, API, data model and the verdict state machine (section 4).
+- Then the deep dives: the sandbox, isolation choices, fair timing, the queue and contest mode (section 5).
+- Finally the SDE-3 view: bottlenecks and scaling, failure handling and trade-offs (sections 6-8).
+
+> [!tip] Remember
+> Accept fast, queue, judge slowly in a sandbox, and treat every submission as hostile.
+
 ## 1. Why it exists - requirements
 
-A coding-practice site has one unusual job: it runs code written by strangers on your own servers. If you did this naively (`exec.Command("python", "user.py")` on the web server) a single user could delete your disk, mine crypto, scan your internal network, or just write `while True: pass` a thousand times and freeze the site. An **online judge** exists to make "run strangers' code" safe, fair and fast.
+A coding-practice site has one unusual job: it runs code written by strangers on your own servers.
 
-Real-life picture: think of a chemistry exam lab. Students (submissions) each get a fume cupboard (sandbox) with a fixed amount of chemicals (memory), a fixed time on the stopwatch (CPU time) and no door to the corridor (no network). The examiner (judge) does not trust anyone, compares the result with the answer sheet (expected output) and writes a grade (verdict). When 500 students arrive at once, they queue outside the lab. Nobody is allowed to skip the queue by shouting.
+If you did this naively (`exec.Command("python", "user.py")` on the web server) a single user could delete your disk, mine crypto, scan your internal network, or just write `while True: pass` a thousand times and freeze the site.
+
+An **online judge** exists to make "run strangers' code" safe, fair and fast.
+
+Real-life picture: think of a chemistry exam lab. Students (submissions) each get a fume cupboard (sandbox) with a fixed amount of chemicals (memory), a fixed time on the stopwatch (CPU time) and no door to the corridor (no network).
+
+The examiner (judge) does not trust anyone, compares the result with the answer sheet (expected output) and writes a grade (verdict). When 500 students arrive at once, they queue outside the lab. Nobody is allowed to skip the queue by shouting.
 
 **Functional requirements**
 - Browse problems (statement, examples, limits) and pick a language (C++, Java, Python, Go and so on).
@@ -53,14 +107,18 @@ Real-life picture: think of a chemistry exam lab. Students (submissions) each ge
 
 **Out of scope (say it in the interview):** plagiarism detection, a full web IDE, problem authoring tools.
 
-**Glossary.** A **submission** is one code upload. A **verdict** is the outcome: **AC** accepted, **WA** wrong answer, **TLE** time limit exceeded, **MLE** memory limit exceeded, **RE** runtime error, **CE** compile error, **OLE** output limit exceeded. A **sandbox** is an isolated environment for one run. A **checker** is a program that decides whether the output is right (needed when many answers are valid). A **special judge** is a custom checker.
+**Glossary.** A **submission** is one code upload. A **verdict** is the outcome: **AC** accepted, **WA** wrong answer, **TLE** time limit exceeded, **MLE** memory limit exceeded, **RE** runtime error, **CE** compile error, **OLE** output limit exceeded. A **sandbox** is an isolated environment for one run.
+
+A **checker** is a program that decides whether the output is right (needed when many answers are valid). A **special judge** is a custom checker.
 
 > [!tip] Remember
 > Fast acknowledge, slow judge, strong sandbox. Everything else in this design supports those three ideas.
 
 ## 2. Mental model
 
-Picture a **restaurant with a kitchen behind a window**. The front desk (web tier) takes your order slip and gives you a ticket number in a second. The slip goes onto a rail (queue). Cooks (judge workers) each pick one slip, cook inside a closed station (sandbox) with a timer and a fixed amount of ingredients, then put the plate and a score on the counter (verdict store). You check the board (poll or push) for your number.
+Picture a **restaurant with a kitchen behind a window**. The front desk (web tier) takes your order slip and gives you a ticket number in a second. The slip goes onto a rail (queue).
+
+Cooks (judge workers) each pick one slip, cook inside a closed station (sandbox) with a timer and a fixed amount of ingredients, then put the plate and a score on the counter (verdict store). You check the board (poll or push) for your number.
 
 Where the analogy breaks: a real cook is trusted. Your cooks are not trusted at all, because the "recipe" is written by the customer and may try to burn the kitchen. The station has to be built like a jail cell, not like a bench.
 
@@ -220,7 +278,9 @@ erDiagram
     }
 ```
 
-- **Submissions:** relational (Postgres or MySQL). Key access: by `submission_id`, by `(user_id, created_at)` for history and by `(contest_id, problem_id)` for standings. Sharded by `user_id` only when one primary can no longer handle writes. At ~100 writes/s one primary is plenty. Why not a NoSQL store: you need joins for standings and strong consistency on the verdict write. See [[Choosing a Database - Decision Guide]].
+- **Submissions:** relational (Postgres or MySQL). Key access: by `submission_id`, by `(user_id, created_at)` for history and by `(contest_id, problem_id)` for standings. Sharded by `user_id` only when one primary can no longer handle writes. At ~100 writes/s one primary is plenty.
+
+  Why not a NoSQL store: you need joins for standings and strong consistency on the verdict write. See [[Choosing a Database - Decision Guide]].
 - **Test data:** object storage (large, immutable, versioned). Workers keep a local LRU cache keyed by `(problem_id, tests_version)`. See [[Choosing Storage for Files, Search and Analytics - Decision Guide]].
 - **Leaderboard:** Redis sorted set per contest, rebuilt from the database if lost (see [[Case Study - Leaderboard and Top-K]]).
 
@@ -246,7 +306,9 @@ stateDiagram-v2
 ### 5.1 The sandbox: how to run hostile code safely
 
 #### In plain words
-A sandbox is a box around the program. The program sees a tiny private world: its own filesystem, its own process list, no network, a hard memory ceiling and a stopwatch. If it tries to leave the box, the kernel stops it. You do not rely on one lock. You stack several, so one mistake does not become a breach (defence in depth).
+A sandbox is a box around the program. The program sees a tiny private world: its own filesystem, its own process list, no network, a hard memory ceiling and a stopwatch. If it tries to leave the box, the kernel stops it.
+
+You do not rely on one lock. You stack several, so one mistake does not become a breach (defence in depth).
 
 #### Picture it
 
@@ -293,10 +355,14 @@ Example attacks and the layer that stops each:
 | Compile bomb | deeply recursive template, giant `#include` | compile-stage limits (CPU, memory, output) | CE |
 
 > [!warning] Common mistake
-> "Docker is a sandbox, so I am done." A plain container shares the host kernel. A kernel bug can let code escape. Docker adds namespaces and cgroups and a default seccomp profile, but for hostile code you tighten it (custom seccomp, no network, read-only, no capabilities) and often add a stronger boundary, below. See [[Docker 09 - Container Security and Hardening]].
+> "Docker is a sandbox, so I am done." A plain container shares the host kernel. A kernel bug can let code escape.
+>
+> Docker adds namespaces and cgroups and a default seccomp profile, but for hostile code you tighten it (custom seccomp, no network, read-only, no capabilities) and often add a stronger boundary, below. See [[Docker 09 - Container Security and Hardening]].
 
 #### Example
-A user submits `fork()` in a loop. The worker starts the run inside a cgroup with `pids.max = 64`. After 64 processes `fork` returns an error. The program spins, burns CPU, hits `RLIMIT_CPU` at 2 s and gets SIGXCPU. The supervisor reads the exit status, sees the cgroup `pids` limit event, and reports RE (or TLE). The worker host never slows, because `cpu.max` also capped the cgroup to one core.
+A user submits `fork()` in a loop. The worker starts the run inside a cgroup with `pids.max = 64`. After 64 processes `fork` returns an error. The program spins, burns CPU, hits `RLIMIT_CPU` at 2 s and gets SIGXCPU.
+
+The supervisor reads the exit status, sees the cgroup `pids` limit event, and reports RE (or TLE). The worker host never slows, because `cpu.max` also capped the cgroup to one core.
 
 #### Why it matters
 One escape equals a breach of the host, which holds worker credentials and, in a bad design, other people's code and the hidden tests.
@@ -311,7 +377,11 @@ One escape equals a breach of the host, which holds worker credentials and, in a
 | gVisor (user-space kernel) | Stronger (syscalls hit a Go-written kernel) | ~100 ms | 10-50 percent on syscall-heavy code (estimate) | Good middle ground. |
 | Firecracker microVM | Strongest (separate kernel via KVM) | ~125 ms (published) | memory per VM | Used for AWS Lambda. Costly for 600 cores of short jobs but right for high-risk code. |
 
-**Choice:** namespaces + cgroups + seccomp as the base, running inside a worker that itself lives in a locked-down VM or node group with **no credentials and no network path to internal services**. Add gVisor or microVMs when you accept arbitrary languages and arbitrary system access (for example an online IDE or a "run any code" product). **Why:** judging needs tens of thousands of very short runs. Heavy VMs per run waste CPU, while the base set blocks all common attacks. The remaining kernel-escape risk is contained by making the host worthless to an attacker (nothing to steal, nothing to reach). See [[Choosing Compute, Scaling and Deployment - Decision Guide]].
+**Choice:** namespaces + cgroups + seccomp as the base, running inside a worker that itself lives in a locked-down VM or node group with **no credentials and no network path to internal services**.
+
+Add gVisor or microVMs when you accept arbitrary languages and arbitrary system access (for example an online IDE or a "run any code" product). **Why:** judging needs tens of thousands of very short runs.
+
+Heavy VMs per run waste CPU, while the base set blocks all common attacks. The remaining kernel-escape risk is contained by making the host worthless to an attacker (nothing to steal, nothing to reach). See [[Choosing Compute, Scaling and Deployment - Decision Guide]].
 
 ```mermaid
 flowchart TD
@@ -495,7 +565,9 @@ flowchart TD
 ## 10. Interview questions
 
 > [!question]- How do you run untrusted code safely?
-> Layer defences: separate namespaces (PID, mount, empty net, user), cgroup limits (memory, pids, cpu), a seccomp allow list, rlimits, a read-only filesystem with a tiny tmpfs, unprivileged user with no capabilities, an output cap and an outside wall-clock timer. Then assume one layer fails: workers sit on hosts with no secrets and no internal network access. For very high risk, use gVisor or Firecracker.
+> Layer defences: separate namespaces (PID, mount, empty net, user), cgroup limits (memory, pids, cpu), a seccomp allow list, rlimits, a read-only filesystem with a tiny tmpfs, unprivileged user with no capabilities, an output cap and an outside wall-clock timer.
+>
+> Then assume one layer fails: workers sit on hosts with no secrets and no internal network access. For very high risk, use gVisor or Firecracker.
 
 > [!question]- Why a queue instead of judging inside the request?
 > Judging takes seconds and arrives in bursts. A queue lets the API reply in milliseconds, absorbs spikes, lets you prioritise contests, and retries jobs when a worker dies. The user sees a ticket number and a status that updates.
@@ -504,7 +576,9 @@ flowchart TD
 > Measure CPU time, one sandbox per pinned core, quiet hosts, language multipliers, and re-run borderline TLE results once on another worker. Mention that you give up some density to get fairness.
 
 > [!question]- A worker dies halfway through a submission. What happens?
-> The queue message was not acked, so it reappears after the visibility timeout. A second worker takes it with `attempt+1`. The verdict write is conditional on the attempt number, so a late write from the dead or slow worker is rejected. After 3 attempts the job goes to a DLQ and the submission shows a system error, not a user error.
+> The queue message was not acked, so it reappears after the visibility timeout. A second worker takes it with `attempt+1`. The verdict write is conditional on the attempt number, so a late write from the dead or slow worker is rejected.
+>
+> After 3 attempts the job goes to a DLQ and the submission shows a system error, not a user error.
 
 > [!question]- The contest leaderboard gets 5,000 reads per second. How do you serve it?
 > Compute scores on verdict events into a Redis sorted set, serve the standings from a 1-2 s cache or the edge, and rebuild from the submissions table if Redis is lost.
@@ -535,3 +609,10 @@ flowchart TD
 - Concepts: [[Background Jobs and Worker Pools]], [[Docker 09 - Container Security and Hardening]], [[Dead Letter Queues and Poison Messages]], [[Backpressure and Flow Control]], [[Autoscaling]], [[Idempotency and Idempotency Keys]]
 - Related case studies: [[Case Study - Distributed Job Scheduler]], [[Case Study - Leaderboard and Top-K]]
 - Framework: [[System Design Interview Framework]], [[HLD Round - Complete Step-by-Step Guide]]
+
+## Links
+
+### Watch on YouTube
+
+- [System Design Interview: Design LeetCode (Online Judge) w/ a Ex-Meta Staff Engineer](https://www.youtube.com/watch?v=1xHADtekTNg) · Hello Interview · 63 min · 172,759 views
+- [System Design: Online Judge for coding contests](https://www.youtube.com/watch?v=eg0nlYcbLpo) · Gaurav Sen · 8 min · 80,967 views

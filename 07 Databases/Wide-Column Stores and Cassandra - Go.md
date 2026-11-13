@@ -13,13 +13,22 @@ sources:
   - "Lakshman and Malik, Cassandra: A Decentralized Structured Storage System (2010)"
   - "Chang et al., Bigtable: A Distributed Storage System for Structured Data (OSDI 2006)"
   - "Discord blog, How Discord Stores Billions of Messages (2017) and How Discord Stores Trillions of Messages (2023)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Wide-Column Stores and Cassandra - Go
 
 > [!summary] TL;DR
 > This note holds the code behind [[Wide-Column Stores and Cassandra]]: the CQL schema for the InvoiceOps audit events, and a Go model of last-write-wins reconciliation, tombstones, `gc_grace_seconds` and repair, with tests that show a deleted row coming back and the repair that prevents it.
+
+## Before the code
+
+- **Structs** (`Cell`): one column value with its write timestamp and a tombstone flag.
+- **Maps as a named type** (`type Replica map[string]Cell`): each replica is a key-to-cell map with methods `Apply` and `Compact`.
+- **Methods on a map type**: `r.Apply(key, c)` changes the map in place, because maps are reference-like in Go.
+- **Variadic parameters** (`replicas ...Replica`): `Read` and `Repair` take any number of replicas, like a coordinator asking several nodes.
+- **`switch` with no value**: `Reconcile` uses `switch { case ...: }` as a clean if/else chain for the last-write-wins rules.
+- **What to run**: `go vet ./... && go test -race ./...` (standard library only; the CQL is reference only).
 
 ## What this code shows
 
@@ -63,7 +72,9 @@ The note has two parts. Steps 1 and 2 are CQL: they show how the primary key is 
 
 ### Step 1: the whiteboard table
 
-**Concept.** [[Wide-Column Stores and Cassandra#Designing InvoiceOps audit events query-first]] starts from the query, not from the entity. The primary key `((workspace_id, bucket_day), created_at, event_id)` has two parts: the inner parentheses are the partition key (which node stores the rows) and the rest are clustering columns (the order of rows inside the partition). The alternative, a table keyed by event id alone, could not answer "newest events of this workspace today" without scanning every node.
+**Concept.** [[Wide-Column Stores and Cassandra#Designing InvoiceOps audit events query-first]] starts from the query, not from the entity. The primary key `((workspace_id, bucket_day), created_at, event_id)` has two parts: the inner parentheses are the partition key (which node stores the rows) and the rest are clustering columns (the order of rows inside the partition).
+
+The alternative, a table keyed by event id alone, could not answer "newest events of this workspace today" without scanning every node.
 
 ```sql
 -- Query: newest events of one workspace on one day
@@ -99,7 +110,9 @@ flowchart LR
 
 ### Step 2: the production schema
 
-**Concept.** The production table adds the choices from [[Wide-Column Stores and Cassandra#5. Variants and comparison]] and the replica placement from [[Wide-Column Stores and Cassandra#3.1 Placement: tokens and replicas]]. `NetworkTopologyStrategy` puts 3 replicas in each data centre. Time-window compaction groups data written on the same day into the same SSTable files, so when the 365-day TTL expires, a whole file can be dropped instead of rewriting it. Size-tiered or leveled compaction would mix old and new rows and keep rewriting them.
+**Concept.** The production table adds the choices from [[Wide-Column Stores and Cassandra#5. Variants and comparison]] and the replica placement from [[Wide-Column Stores and Cassandra#3.1 Placement: tokens and replicas]]. `NetworkTopologyStrategy` puts 3 replicas in each data centre. Time-window compaction groups data written on the same day into the same SSTable files, so when the 365-day TTL expires, a whole file can be dropped instead of rewriting it.
+
+Size-tiered or leveled compaction would mix old and new rows and keep rewriting them.
 
 ```sql
 -- CQL (Cassandra 5.0)
@@ -143,7 +156,9 @@ SELECT * FROM invoiceops.audit_events_by_workspace_day
 WHERE actor_id = 'u-19' ALLOW FILTERING;
 ```
 
-**How it works.** Q1 supplies both partition-key columns, so the coordinator asks one replica set and reads one partition. The anti-pattern filters on `actor_id`, which is not in the key; `ALLOW FILTERING` forces every node to scan every partition, which works on a small table and collapses on a large one. If "events by actor" is a real query, it needs its own table with `actor_id` in the partition key.
+**How it works.** Q1 supplies both partition-key columns, so the coordinator asks one replica set and reads one partition. The anti-pattern filters on `actor_id`, which is not in the key; `ALLOW FILTERING` forces every node to scan every partition, which works on a small table and collapses on a large one.
+
+If "events by actor" is a real query, it needs its own table with `actor_id` in the partition key.
 
 | Query | Partition key given | Cost |
 | --- | --- | --- |
@@ -152,7 +167,9 @@ WHERE actor_id = 'u-19' ALLOW FILTERING;
 
 ### Step 3: the cell and the reconcile rule
 
-**Concept.** [[Wide-Column Stores and Cassandra#3.5 Repair, hints and tombstones]] explains that each cell carries a write timestamp and that replicas settle disagreements by taking the higher timestamp (last write wins). A delete is not an erase; it is a write of a marker called a tombstone, so it can be replicated and reconciled like any value. `Reconcile` encodes the tie rules: on equal timestamps a tombstone beats a live value, and between two live values the larger value wins. The tie rule has to be deterministic so that every replica picks the same winner regardless of the order it saw the writes.
+**Concept.** [[Wide-Column Stores and Cassandra#3.5 Repair, hints and tombstones]] explains that each cell carries a write timestamp and that replicas settle disagreements by taking the higher timestamp (last write wins). A delete is not an erase; it is a write of a marker called a tombstone, so it can be replicated and reconciled like any value.
+
+`Reconcile` encodes the tie rules: on equal timestamps a tombstone beats a live value, and between two live values the larger value wins. The tie rule has to be deterministic so that every replica picks the same winner regardless of the order it saw the writes.
 
 ```go
 // Package lww models how Cassandra reconciles replicas: last write wins per
@@ -223,7 +240,9 @@ flowchart TD
 
 ### Step 4: the replica, Apply and Compact
 
-**Concept.** A `Replica` is a map from key to its one winning cell, as if compaction had already merged all versions. `Apply` is what a replica does with an incoming write: reconcile it with what it already has. `Compact` models purging: once a tombstone is older than `gc_grace_seconds` (default 10 days), the replica forgets the delete entirely. That is safe only if every other replica has seen the tombstone, which is why [[Wide-Column Stores and Cassandra#How deleted rows come back]] ties repair to the grace period.
+**Concept.** A `Replica` is a map from key to its one winning cell, as if compaction had already merged all versions. `Apply` is what a replica does with an incoming write: reconcile it with what it already has. `Compact` models purging: once a tombstone is older than `gc_grace_seconds` (default 10 days), the replica forgets the delete entirely.
+
+That is safe only if every other replica has seen the tombstone, which is why [[Wide-Column Stores and Cassandra#How deleted rows come back]] ties repair to the grace period.
 
 ```go
 // Replica keeps the winning cell per key (as if fully compacted).
@@ -265,7 +284,9 @@ stateDiagram-v2
 
 ### Step 5: Read, Repair and merge
 
-**Concept.** A coordinator that reads from several replicas must merge their answers, and anti-entropy repair is the same merge followed by writing the winner back to every replica ([[Wide-Column Stores and Cassandra#3.5 Repair, hints and tombstones]]). Both use the private `merge` helper, so the rule for "what is the truth" lives in one place. The alternative of reading only one replica would be faster but would return stale data whenever that replica missed a write.
+**Concept.** A coordinator that reads from several replicas must merge their answers, and anti-entropy repair is the same merge followed by writing the winner back to every replica ([[Wide-Column Stores and Cassandra#3.5 Repair, hints and tombstones]]). Both use the private `merge` helper, so the rule for "what is the truth" lives in one place.
+
+The alternative of reading only one replica would be faster but would return stale data whenever that replica missed a write.
 
 ```go
 // Read merges the replicas' answers the way a coordinator does.

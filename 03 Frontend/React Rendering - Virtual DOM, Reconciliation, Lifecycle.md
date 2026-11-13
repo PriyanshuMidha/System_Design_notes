@@ -9,7 +9,7 @@ sources:
   - "react.dev, Preserving and Resetting State"
   - "react.dev, Responding to Events / State as a Snapshot"
   - "React 18 release notes (automatic batching, startTransition)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # React Rendering - Virtual DOM, Reconciliation, Lifecycle
@@ -22,6 +22,49 @@ updated: 2026-11-04
 > - Reconciliation walks the new and old trees together and uses heuristics (same type → update in place, different type → remount, `key` → identity inside a list) to decide what changed.
 > - A component's life has three phases: **mount**, **update**, **unmount**. Hooks (`useEffect`, cleanup functions) are how function components hook into those phases; class lifecycle methods did the same job before hooks existed.
 > - Since React 18, state updates are **batched** everywhere (not just inside event handlers), and rendering itself can be interrupted and resumed (**concurrent rendering**) so a big update doesn't freeze the page.
+
+## Start here: the basics
+
+**The problem in one story.**
+You click a "Like" button and the count goes from 10 to 11.
+Rebuilding the whole page for that would be slow and would lose things like scroll position and typed text.
+React instead compares "what the page should look like now" with "what it looked like before".
+It then changes only the one piece of text that differs.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| DOM | The browser's live tree of page elements | the real `<button>` on screen |
+| Element (React) | A plain JS object describing one piece of UI | `{ type: 'button', props: {...} }` |
+| Virtual DOM | React's in-memory tree of those objects | the "draft" of the page |
+| Diff | Finding what changed between two versions | `0` became `1` |
+| Mount / unmount | A component first appearing / being removed | opening / closing a modal |
+| Key | A stable ID React uses to match list items | `<li key={user.id}>` |
+| Batching | Grouping several state updates into one re-render | two `setX` calls, one render |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["State changes"] --> N["Build new<br/>element tree"]
+    O["Previous<br/>element tree"] --> D{"Diff the trees"}
+    N --> D
+    D --> P["Patch only changed<br/>real DOM nodes"]
+```
+
+**Analogy.** It is like "track changes" in a document: compare the new draft with the old one and edit only the marked spots.
+Where it breaks: track changes compares every word, while React uses cheap shortcuts (element type, `key`) and can miss moves unless you give keys.
+
+**How the rest of this note builds up**
+
+- First, why a virtual DOM exists (section 1) and the "three trees" mental model (section 2).
+- Then the diffing rules, why lists need `key`, and lifecycle phases (section 3).
+- Then a full worked trace including React 18 batching and concurrent rendering (section 4).
+- Finally the SDE-3 deep dive: alternatives, trade-offs, production performance and Fiber internals (sections 5-8).
+
+> [!tip] Remember
+> React re-runs your component, diffs the new tree against the old one, and touches the real DOM only where they differ.
 
 ### Whiteboard version
 
@@ -48,7 +91,9 @@ React's answer: let you write the UI as a **pure function of state** (`UI = f(st
 
 Concretely: re-rendering a 5,000-row table from scratch (destroy and recreate every `<tr>`) forces the browser to redo **layout** (a "reflow" — recomputing every element's size and position) and **paint** for all 5,000 rows. If only one row's data changed, reconciliation produces a diff with one DOM write, and only that row's box triggers reflow and repaint.
 
-A component re-renders (its function runs again) for three reasons: its own state changed (`useState`/`useReducer` setter called), its parent re-rendered (children re-render by default, even with unchanged props, unless wrapped in `React.memo`), or it reads a context whose Provider got a new `value`. Only the first two necessarily touch the DOM; reconciliation is what decides whether a re-render actually produces a DOM write.
+A component re-renders (its function runs again) for three reasons: its own state changed (`useState`/`useReducer` setter called), its parent re-rendered (children re-render by default, even with unchanged props, unless wrapped in `React.memo`), or it reads a context whose Provider got a new `value`.
+
+Only the first two necessarily touch the DOM; reconciliation is what decides whether a re-render actually produces a DOM write.
 
 ## 2. Mental model
 
@@ -78,9 +123,15 @@ flowchart TB
     F -. "fiber node owns a pointer<br/>to its DOM node" .-> D1
 ```
 
-**Example:** Click the counter button once. React calls `Counter()` and gets a brand-new element object (thrown away as soon as it's compared). It diffs that element against the **existing** fiber for this button, finds the text child changed, patches that one fiber's `memoizedProps`, and schedules exactly one DOM text-node update. The element object from this render never touches the DOM directly — the fiber tree is the thing the DOM mutation gets computed from.
+**Example:** Click the counter button once. React calls `Counter()` and gets a brand-new element object (thrown away as soon as it's compared).
 
-**Why it matters:** When people say "React re-renders the whole tree," they mean step one (new element tree, cheap, all JS). The expensive step — touching the real DOM — only happens where the fiber-tree diff found an actual difference. Confusing "re-render" (function call) with "DOM write" (fiber committed a change) is why "my component re-renders constantly" and "my page is slow" are two different bugs with two different fixes.
+It diffs that element against the **existing** fiber for this button, finds the text child changed, patches that one fiber's `memoizedProps`, and schedules exactly one DOM text-node update.
+
+The element object from this render never touches the DOM directly — the fiber tree is the thing the DOM mutation gets computed from.
+
+**Why it matters:** When people say "React re-renders the whole tree," they mean step one (new element tree, cheap, all JS). The expensive step — touching the real DOM — only happens where the fiber-tree diff found an actual difference.
+
+Confusing "re-render" (function call) with "DOM write" (fiber committed a change) is why "my component re-renders constantly" and "my page is slow" are two different bugs with two different fixes.
 
 > [!tip] Remember
 > Every render makes a new element tree (cheap); React diffs it against the **fiber tree** (persistent) to find the minimal set of real DOM writes.
@@ -97,7 +148,9 @@ flowchart LR
     R -. "can be paused,<br/>restarted or thrown away<br/>(concurrent rendering)" .-> R
 ```
 
-The **render phase** is pure: React calls your component functions, computes what should change, and must not touch the DOM or run side effects — which is why it is safe for React to pause, abandon, or redo this phase (that is what lets concurrent features exist at all). The **commit phase** is where DOM writes and effects happen, and it always runs to completion once started.
+The **render phase** is pure: React calls your component functions, computes what should change, and must not touch the DOM or run side effects — which is why it is safe for React to pause, abandon, or redo this phase (that is what lets concurrent features exist at all).
+
+The **commit phase** is where DOM writes and effects happen, and it always runs to completion once started.
 
 ### Diffing heuristics
 
@@ -126,9 +179,17 @@ flowchart TD
 
 ### Why list items need `key`
 
-**In plain words:** Think of a classroom seating chart. If the teacher only tracks "whoever is in seat 3," and a new student is seated in seat 1, everyone from seat 1 onward gets relabeled with the wrong name — the chart didn't track *people*, it tracked *seats*. Matching list children by index has the same bug: it tracks position, not identity.
+**In plain words:** Think of a classroom seating chart.
 
-Without keys, React matches old and new children **by index**. Insert a new first item into `[A, B, C]` and, index-by-index, React sees "position 0 changed from A to NEW, position 1 changed from B to A, position 2 changed from C to B, position 3 is new (C)" — every existing DOM node gets patched with another item's data, and any per-item state (an open `<details>`, an uncontrolled `<input>`'s cursor) ends up attached to the wrong row.
+If the teacher only tracks "whoever is in seat 3," and a new student is seated in seat 1, everyone from seat 1 onward gets relabeled with the wrong name — the chart didn't track *people*, it tracked *seats*.
+
+Matching list children by index has the same bug: it tracks position, not identity.
+
+Without keys, React matches old and new children **by index**.
+
+Insert a new first item into `[A, B, C]` and, index-by-index, React sees "position 0 changed from A to NEW, position 1 changed from B to A, position 2 changed from C to B, position 3 is new (C)".
+
+Every existing DOM node gets patched with another item's data, and any per-item state (an open `<details>`, an uncontrolled `<input>`'s cursor) ends up attached to the wrong row.
 
 **Picture it:**
 
@@ -330,3 +391,8 @@ function onChange(e) {
 - **Before this:** [[React Fundamentals - Components, JSX, Props, State]], [[React Hooks]]
 - **Next:** [[React State Management - Props, Context, Redux]]
 - **Compare with:** [[React Routing and Rendering Strategies - CSR, SSR, SSG]] (how rendering strategy changes where this reconciliation happens)
+
+### Watch on YouTube
+
+- [Virtual DOM, Reconciliation and Diffing Algorithm in React / The Complete React Course / Ep.53](https://www.youtube.com/watch?v=jiziEC8dPSE) · Anurag Singh ProCodrr · full walkthrough of virtual DOM + diffing algorithm
+- [Reconciliation Explained: React Interview Questions](https://www.youtube.com/watch?v=xC8mmhiZ2P8) · Konstantyn's coding · short interview-style recap of reconciliation

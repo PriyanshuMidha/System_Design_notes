@@ -6,13 +6,55 @@ type: reference
 prereqs: ["[[LLD Interview Method]]", "[[Design Patterns Overview and Chooser]]", "[[Concurrency for LLD]]"]
 related: ["[[Testing LLD Code]]", "[[17 LLD MOC]]"]
 sources: ["The 26 practice notes in 17 LLD/Practice"]
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # LLD Problem Cheat Sheet
 
 > [!summary] TL;DR
 > One table for all 26 practice problems in this folder: the core entities, the patterns each one uses, the part that trips people up, the race you must name, and what to actually code in a 60-minute round. Use it the night before an interview, then open the linked note for the full design, code and tests.
+
+## Start here: the basics
+
+**The problem in one story.**
+Tomorrow you have an LLD interview and 26 practice problems in this folder.
+You cannot reread every note tonight.
+This page puts one row per problem: what the main objects are, which patterns fit, and where the bug hides.
+Read the table, then open only the notes you feel shaky on.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Entity | A main noun in the problem with its own data | `Spot`, `Ticket` in a parking lot |
+| Pattern | A named, reusable design shape | Strategy for swappable pricing |
+| Strategy | Pass the changing rule in as a value or interface | A `FeeRule` function |
+| State machine | An object whose allowed actions depend on its current state | Vending machine: idle → has coin → dispensing |
+| Concurrency hazard | A bug that appears when two requests run at once | Two gates giving away the same spot |
+| Compare-and-set | "Change it only if it still has the value I saw" | `available → busy` only if still `available` |
+| Race test | A test run with `go test -race` to catch unsafe sharing | Many goroutines calling `Park` together |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Problem"] --> E["Core entities"]
+    E --> V["What varies?<br/>(patterns)"]
+    V --> H["What do two callers<br/>fight over? (hazard)"]
+    H --> C["What to code<br/>in 60 minutes"]
+```
+
+**Analogy.** A revision card before an exam: one line per topic to jog memory.
+Where it breaks: a card cannot teach the topic; if a row makes no sense, open the full linked note.
+
+**How the rest of this note builds up**
+
+- First, the table: one row per practice problem with entities, patterns, tricky part, hazard and what to code.
+- Then "How to pick your first 5 minutes": a five-step opening routine for any problem.
+- Finally the links to the method, pattern and concurrency notes for depth.
+
+> [!tip] Remember
+> For every problem: name the nouns, what varies, what two callers fight over, and the one method you will code.
 
 ## The table
 
@@ -58,3 +100,8 @@ updated: 2026-11-02
 - **Before this:** [[Digital Wallet and Ledger]], [[LLD Interview Method]]
 - **Next:** [[17 LLD MOC]], [[LLD Round Playbook]]
 - **Compare with:** [[Design Patterns Overview and Chooser]]
+
+### Watch on YouTube
+
+- [Watch This Before Your Next LLD Interview (Concurrency Cheatsheet)](https://www.youtube.com/watch?v=Qa6ePZYmTEU) · bhavika pawani · 21 min · 2,193 views
+- [Low Level Design 102 /What is LLD(Low Level Design)? Simplified steps to learn and break LLD problem](https://www.youtube.com/watch?v=5Tz9EUMHOGI) · sudoCODE · 7 min · 105,776 views

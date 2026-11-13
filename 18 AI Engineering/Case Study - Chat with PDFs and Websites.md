@@ -7,7 +7,7 @@ sources:
   - "OWASP, Server-Side Request Forgery Prevention Cheat Sheet"
   - "Anthropic docs, Messages API streaming (anthropic.com/docs, 2026)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Case Study - Chat with PDFs and Websites
@@ -22,18 +22,72 @@ updated: 2026-11-07
 > - Every chunk is tagged with the uploading user's (or tenant's) ID, and every retrieval at chat time is filtered by that same ID — not checked after the LLM has already read the content.
 > - Chat answers stream (SSE) and cite the source document and page, the same production-quality bar as any other RAG system, built on the ingestion-specific pieces above.
 
+## Start here: the basics
+
+**The problem in one story.**
+A user uploads a 200-page PDF and asks "What is the warranty period?"
+Reading and indexing that PDF takes a minute, so the app cannot make the user wait on one request.
+Another user pastes a URL that secretly points inside your own network.
+This case study builds the chat app while handling slow work and untrusted input.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| RAG | Search your documents, then let the LLM answer from them | Bot quoting page 12 of the PDF |
+| Ingestion | Turning a file into searchable chunks | Parse, split, embed, store |
+| Background job | Slow work done later by a worker, not in the request | Upload returns job ID `j-123` |
+| Queue | A waiting line of jobs for workers | Redis or SQS list of jobs |
+| Magic bytes | The first bytes that reveal a file's real type | PDFs start with `%PDF` |
+| SSRF | Tricking your server into fetching an internal URL | `http://169.254.169.254/` |
+| Tenant | One customer whose data must stay separate | User 42 sees only their PDFs |
+| SSE | Server sends the reply in pieces as it is made | Answer appears word by word |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Upload PDF / URL"] --> V["Validate input"]
+    V --> J["Queue job,<br/>return job ID"]
+    J --> W["Worker: parse,<br/>chunk, embed"]
+    W --> DB["Vector store<br/>(tagged by user)"]
+    C["Chat question"] --> DB
+    DB --> A["Cited answer"]
+```
+
+**Analogy.** The system is a mail room in front of a library. Packages are checked before anything goes on the shelves, and each person may read only their own shelf.
+Where it breaks: a mail room checks the outside of a box; here you must check the actual contents (magic bytes), not the label.
+
+**How the rest of this note builds up**
+
+- First, why this product shape is different (section 1) and the mail-room mental model (section 2).
+- Then upload validation, async ingestion, safe URL fetching and tenant-filtered chat (section 3).
+- Then a Go worked example (section 4) with variants and trade-offs (sections 5-6).
+- Finally production concerns, the SDE-3 deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Accept fast, ingest in the background, distrust every file and URL, and filter every search by owner.
+
 ## 1. Why it exists
 
-A generic internal-knowledge RAG system (see [[RAG Pipeline]]) ingests a corpus the team controls and curates ahead of time. "Chat with your PDFs and websites" is a different product shape: any user can upload any PDF, or paste any URL, at any time, and expects to start asking questions about it within seconds to minutes. That shape creates two problems a curated internal corpus doesn't:
+A generic internal-knowledge RAG system (see [[RAG Pipeline]]) ingests a corpus the team controls and curates ahead of time. "Chat with your PDFs and websites" is a different product shape: any user can upload any PDF, or paste any URL, at any time, and expects to start asking questions about it within seconds to minutes.
+
+That shape creates two problems a curated internal corpus doesn't:
 
 - **Ingestion is slow and must not block the request.** Parsing a 200-page PDF (text extraction, OCR fallback for scanned pages, chunking, embedding every chunk) can take tens of seconds to minutes. A user hitting "upload" and staring at a spinner for two minutes, on a request that can also time out at a load balancer or API gateway, is a bad product and a fragile backend.
 - **The inputs are untrusted, by definition.** An internal corpus was written and reviewed by your own team. A user-uploaded "PDF" could be a renamed executable; a user-submitted "website URL" could point at `http://169.254.169.254/` (a cloud metadata endpoint) or `http://localhost:6379/` (your own Redis instance) instead of a real public website — and if your ingestion worker blindly fetches whatever URL it's given, it becomes an attacker's proxy into your own network.
 
-Concretely: a user uploads a 40 MB file named `report.pdf` that is actually a shell script, and a second user submits the URL `http://169.254.169.254/latest/meta-data/iam/security-credentials/` hoping the ingestion worker's response leaks cloud credentials back to them. Both of these are the backend problems this case study exists to solve — the RAG pipeline that answers questions about the *legitimate* uploads is otherwise the same system already covered in [[RAG Pipeline]].
+Concretely: a user uploads a 40 MB file named `report.pdf` that is actually a shell script, and a second user submits the URL `http://169.254.169.254/latest/meta-data/iam/security-credentials/` hoping the ingestion worker's response leaks cloud credentials back to them.
+
+Both of these are the backend problems this case study exists to solve — the RAG pipeline that answers questions about the *legitimate* uploads is otherwise the same system already covered in [[RAG Pipeline]].
 
 ## 2. Mental model
 
-Think of this system as a mail room attached to an ordinary RAG pipeline. Anyone can drop off a package (upload a PDF) or hand over an address to go fetch something from (submit a URL) — the mail room's whole job is to inspect what comes in, reject anything suspicious, and only then hand a verified, safe document into the same indexing pipeline every other RAG system uses. The chat step, once a document is verified and indexed, is ordinary RAG: embed the question, retrieve the user's own chunks, generate a cited answer.
+Think of this system as a mail room attached to an ordinary RAG pipeline.
+
+Anyone can drop off a package (upload a PDF) or hand over an address to go fetch something from (submit a URL) — the mail room's whole job is to inspect what comes in, reject anything suspicious, and only then hand a verified, safe document into the same indexing pipeline every other RAG system uses.
+
+The chat step, once a document is verified and indexed, is ordinary RAG: embed the question, retrieve the user's own chunks, generate a cited answer.
 
 ## 3. How it works
 
@@ -85,7 +139,13 @@ flowchart TD
     Store --> Job["Create queued ingestion job"]
 ```
 
-For large files, the upload itself typically goes through an **S3 presigned URL** rather than proxying the whole file through the API server (see [[File Upload Architecture]]): the API issues a short-lived, scoped-to-one-object presigned PUT URL, the client uploads directly to object storage, and only then calls the API with the resulting object key to register the ingestion job — the API server never buffers the whole file in memory.
+For large files, the upload itself typically goes through an **S3 presigned URL** rather than proxying the whole file through the API server (see [[File Upload Architecture]]):
+
+1. The API issues a short-lived, scoped-to-one-object presigned PUT URL.
+2. The client uploads directly to object storage.
+3. Only then does it call the API with the resulting object key to register the ingestion job.
+
+The API server never buffers the whole file in memory.
 
 ### SSRF defense for URL ingestion
 
@@ -107,19 +167,37 @@ flowchart TD
 
 ### Crawling
 
-A submitted URL may be a single page or a whole site. The crawler respects `robots.txt` and any sitemap, applies a per-domain rate limit (politeness — hammering a third-party site is both rude and a good way to get the ingestion worker's IP blocked), renders JavaScript-heavy pages when a plain HTML fetch returns an empty shell, deduplicates pages by content hash, and caps total pages per job so one submitted URL can't trigger an unbounded crawl.
+A submitted URL may be a single page or a whole site.
+
+The crawler:
+
+- respects `robots.txt` and any sitemap,
+- applies a per-domain rate limit (politeness — hammering a third-party site is both rude and a good way to get the ingestion worker's IP blocked),
+- renders JavaScript-heavy pages when a plain HTML fetch returns an empty shell,
+- deduplicates pages by content hash,
+- and caps total pages per job so one submitted URL can't trigger an unbounded crawl.
 
 ### Parsing and OCR fallback
 
-A digital PDF's text layer extracts directly; a **scanned** PDF (an image of a page, no text layer) needs OCR before chunking has anything to work with. The parsing step should detect this case (a page that extracts to near-empty text despite having visible content) and fall back to OCR automatically rather than silently indexing an empty chunk. Tables deserve explicit handling too — naive text extraction often flattens a table into unreadable run-on text; a layout-aware parser or a documented table-extraction step (see [[Document Ingestion and Chunking]]) preserves enough structure for the LLM to actually answer questions about it.
+A digital PDF's text layer extracts directly; a **scanned** PDF (an image of a page, no text layer) needs OCR before chunking has anything to work with.
+
+The parsing step should detect this case (a page that extracts to near-empty text despite having visible content) and fall back to OCR automatically rather than silently indexing an empty chunk.
+
+Tables deserve explicit handling too — naive text extraction often flattens a table into unreadable run-on text; a layout-aware parser or a documented table-extraction step (see [[Document Ingestion and Chunking]]) preserves enough structure for the LLM to actually answer questions about it.
 
 ### Tenant isolation
 
-Every chunk stored from a user's document is tagged with that user's (or tenant's) ID at ingestion time. Every retrieval at chat time filters by that same ID as a query-time parameter on the vector search itself — not as a check applied to results afterward, which would already have let the wrong user's content reach the LLM's context. This is the same principle [[RAG Pipeline]] covers for permission filtering generally, applied here to "which user uploaded this document" as the permission boundary.
+Every chunk stored from a user's document is tagged with that user's (or tenant's) ID at ingestion time.
+
+Every retrieval at chat time filters by that same ID as a query-time parameter on the vector search itself — not as a check applied to results afterward, which would already have let the wrong user's content reach the LLM's context.
+
+This is the same principle [[RAG Pipeline]] covers for permission filtering generally, applied here to "which user uploaded this document" as the permission boundary.
 
 ### Chat: streamed answers with citations
 
-A chat request runs the ordinary RAG query pipeline — condense, retrieve (filtered to the caller's documents), assemble, generate — streamed back over Server-Sent Events so the user sees the answer appear incrementally instead of waiting for the full response, and labeled with the source document and page for every claim, exactly as [[RAG Pipeline]] already specifies for a good answer.
+A chat request runs the ordinary RAG query pipeline — condense, retrieve (filtered to the caller's documents), assemble, generate.
+
+It is streamed back over Server-Sent Events so the user sees the answer appear incrementally instead of waiting for the full response, and labeled with the source document and page for every claim, exactly as [[RAG Pipeline]] already specifies for a good answer.
 
 ## 4. Worked example
 
@@ -142,7 +220,9 @@ func isSafeToFetch(resolvedIPs []net.IP) bool {
 }
 ```
 
-The full version below implements upload validation (size and magic bytes), an SSRF-safe URL check with dependency-injected DNS resolution (so it's testable without real network access), and a minimal job-tracking store with the two HTTP handlers (`upload`, `status`) wired to it. It compiles and passes `go vet` and `go test -race` on Go 1.24, tested entirely with `httptest` and fakes — no live upload, crawl, or model call was made.
+The full version below implements upload validation (size and magic bytes), an SSRF-safe URL check with dependency-injected DNS resolution (so it's testable without real network access), and a minimal job-tracking store with the two HTTP handlers (`upload`, `status`) wired to it.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24, tested entirely with `httptest` and fakes — no live upload, crawl, or model call was made.
 
 ```go
 // Package chatpdf implements the two riskiest pieces of a "chat with your

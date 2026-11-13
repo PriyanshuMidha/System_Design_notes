@@ -14,13 +14,15 @@ sources:
   - "Redis docs, Persistence and stop-writes-on-bgsave-error"
   - "Apache Kafka docs, Topic configs: retention.ms, retention.bytes, segment.bytes"
   - "Google, Site Reliability Engineering (2016), ch. 12 'Effective Troubleshooting'"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Disk Full and Log Floods
 
 > [!summary] TL;DR
-> A full disk does not degrade a service slowly. It makes writes fail all at once: databases stop, logs vanish, new files cannot be created, and sometimes even SSH login breaks. The playbook is: confirm which resource is full (space or inodes), free a safe amount of space in seconds, find the fast grower, fix the source, and add alerts that predict "full in 4 hours" instead of reporting "full now".
+> A full disk does not degrade a service slowly. It makes writes fail all at once: databases stop, logs vanish, new files cannot be created, and sometimes even SSH login breaks.
+>
+> The playbook is: confirm which resource is full (space or inodes), free a safe amount of space in seconds, find the fast grower, fix the source, and add alerts that predict "full in 4 hours" instead of reporting "full now".
 
 > [!abstract] Core idea
 > - **Disks fail as a cliff, not a slope.** 79% full is fine, 100% is an outage. So alert on the trend, not only the level.
@@ -44,6 +46,56 @@ flowchart TD
     E -- "containers" --> J["Prune, set log limits,<br/>ephemeral-storage limits"]
 ```
 
+## Start here: the basics
+
+**The problem in one story**
+
+A server keeps writing logs to its disk.
+A bug starts logging the same error thousands of times a second.
+In an hour the disk is full.
+Now the database cannot save orders, and the app crashes on every write.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Disk / volume | Storage where files live, with a fixed size | A 50 GB volume mounted at `/var` |
+| Inode | A file-system entry for one file; there is a limited number | Millions of tiny files can run out of inodes |
+| Log rotation | Closing a log file and starting a new one, deleting old ones | logrotate keeps 7 daily files |
+| Log flood | A sudden huge burst of log lines | One error logged per request at 10k rps |
+| Deleted but open file | A file removed from the folder but still held by a process, so space is not freed | `lsof +L1` lists them |
+| WAL | Write-ahead log: a database's journal of changes written before data files | PostgreSQL `pg_wal` directory |
+| Sampling / rate limiting logs | Keeping only some log lines | Log 1 in 100 identical errors |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["App"] -->|"writes logs"| L["Log files"]
+    L --> D["Disk"]
+    DB["Database"] -->|"writes data"| D
+    D --> F{"Disk full?"}
+    F -->|"yes"| X["Writes fail, crashes"]
+    F -->|"no"| OK["Normal"]
+```
+
+**Analogy**
+
+A warehouse with one loading dock: if boxes arrive faster than they are shipped out, the floor fills and nothing new fits, not even urgent deliveries.
+
+Where it breaks: a warehouse fills visibly and slowly; a disk can go from fine to full in minutes and gives no warning unless you alert on it.
+
+**How the rest of this note builds up**
+
+- First, **Why it exists** and **Mental model** show why a full disk fails hard, not slowly.
+- Then **How it works** covers finding what filled the disk and freeing space safely.
+- Next, the **Worked example** walks through a real-style log flood.
+- Then **Variants and comparison**, **Trade-offs** and **In production** cover rotation, quotas and alerts.
+- Finally, the SDE-3 **Deep dive** covers deleted-but-open files, inodes and WAL growth.
+
+> [!tip] Remember
+> Free space safely first, then stop whatever is filling the disk, then alert before it happens again.
+
 ## 1. Why it exists
 
 Disk is the quietest resource. CPU and memory problems show up as slowness. A disk problem often shows nothing until the last minute, then everything breaks together.
@@ -57,14 +109,18 @@ Disk is the quietest resource. CPU and memory problems show up as slowness. A di
 - Deploys fail: images cannot be pulled, new files cannot be created.
 - No new logs appear in your tooling, so you are blind exactly when you need them.
 
-**User impact (illustrative numbers).** A single-node Postgres has a 500 GB volume. Normal growth is 2 GB/day. A bug logs a 4 KB stack trace on every failed request. At 300 requests/second that is 300 x 4 KB = 1.2 MB/s, or about 100 GB per day. The 120 GB of free space is gone in roughly 29 hours, with no alert, because the alert threshold was "above 95%". Then the database stops, and the whole product is down until space is freed.
+**User impact (illustrative numbers).** A single-node Postgres has a 500 GB volume. Normal growth is 2 GB/day. A bug logs a 4 KB stack trace on every failed request. At 300 requests/second that is 300 x 4 KB = 1.2 MB/s, or about 100 GB per day.
+
+The 120 GB of free space is gone in roughly 29 hours, with no alert, because the alert threshold was "above 95%". Then the database stops, and the whole product is down until space is freed.
 
 > [!tip] Remember
 > The failure is sudden, but the cause is slow. A trend alert such as "full in 4 hours" turns an outage into a ticket.
 
 ## 2. Mental model
 
-**Analogy: a warehouse with a loading dock.** Boxes arrive faster than they leave. For weeks the warehouse looks fine. Then it is full, the dock is blocked, and trucks cannot unload even the urgent box (a database commit). The analogy breaks down in one place: in a warehouse, you can see what is taking space. On a server, space can be hidden inside deleted-but-open files or in a different mount.
+**Analogy: a warehouse with a loading dock.** Boxes arrive faster than they leave. For weeks the warehouse looks fine. Then it is full, the dock is blocked, and trucks cannot unload even the urgent box (a database commit).
+
+The analogy breaks down in one place: in a warehouse, you can see what is taking space. On a server, space can be hidden inside deleted-but-open files or in a different mount.
 
 Four questions cover almost every case:
 
@@ -573,3 +629,7 @@ Log bytes per second per service is a good anomaly signal. A sudden 10x jump usu
 5. Add alerts: trend, inodes, log rate, WAL or slot lag.
 6. Separate volumes if data and logs share one.
 7. Blameless review: [[Postmortems and Root Cause Analysis]].
+
+### Watch on YouTube
+
+- [Linux Disk Full After Deleting Files? lsof +L1 Simply Explained](https://www.youtube.com/watch?v=xnfOynjv3SM) · DevOps Made Simple · 10 min · 33 views

@@ -1,0 +1,84 @@
+# Internet story, voice script. id | SPEAKER | tone | text. Source: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]
+# Cast: ANA = the app/laptop. PIP = a packet (silent). TED = transport clerk (port). IVY = IP clerk. ELI = Ethernet clerk. RORY = a router. GUS and GWEN = ISPs gossiping BGP. SAM = the server.
+== s1 One second, and no straight road
+l1 | N | hook | This is Ana. She types a web address, and a page appears in under a second. The server might be in another country, owned by a company she never heard of. And no wire runs straight from her laptop to it. So how do her bytes get there?
+l2 | N | normal | Old phone calls solved this with a circuit. A fixed slice of wire, reserved for the whole call, and sitting idle during every silent pause. The internet's designers said no. Instead, every message is cut into small packets, each at most about fifteen hundred bytes.
+l3 | N | normal | Each packet is labelled with where it came from and where it is going. Each router forwards each packet by whatever path looks best right now. And if a link dies mid conversation, the next packet simply takes another road. Meet Pip, one packet, carrying a piece of Ana's request.
+l4 | N | normal | Why is this better? A circuit wastes capacity during silence. Packet switching shares one link among many flows, trading guaranteed bandwidth for better average use. That was the core bet of the early ARPANET, and the internet inherited it.
+== s2 Level 1: the words
+l5 | N | normal | Level one. The words. A host is any machine on a network, like Ana's laptop, or a cloud server. A packet is a small chunk of data with an address label. A header is the label bytes stuck on the front.
+l6 | N | normal | An I P address is a number that names a host, like ninety three dot one eighty four dot two sixteen dot thirty four. A port is a number that names a program on that host, like four forty three for H T T P S. A router passes packets toward their destination. A protocol is an agreed set of rules, like T C P, U D P, or H T T P. An I S P connects you to the internet.
+l7 | N | punch | Remember it like this. The I P address finds the machine. The port finds the program. And routers pass each packet one hop at a time.
+== s3 Level 1: nested envelopes
+l8 | N | normal | Now, how does Pip get labelled? Picture nested envelopes. Ana's app writes a note. Get slash. Then three clerks each put it inside a bigger envelope, and write their own to and from on the outside.
+l9 | TED | normal | I am Ted, the transport clerk. I add a port number, four forty three, and a sequence number. So the destination knows which program should open this.
+l10 | IVY | normal | I am Ivy. I add the I P address, from Ana, to the server. My envelope survives the whole trip, every hop.
+l11 | ELI | normal | And I am Eli. I add the Ethernet envelope, with the M A C address of the very next device. Her home router. Not the server.
+l12 | N | normal | This is encapsulation. Going out, every layer adds a header. Coming in, the receiver strips them in exact reverse order, like unstacking nesting dolls. And every header names what comes next. The Ethernet frame has an ether type, saying I P version four, or six, or A R P. The I P header has a protocol field, six for T C P, seventeen for U D P, one for I C M P.
+l13 | RORY | normal | I am Rory, a router. I open only the Ivy envelope. I never open Ted's, so I never see a port, and I never see the H T T P request or the U R L inside.
+l14 | N | warn | That is a common mistake. People say a router reads the request. It does not. Only the two endpoints, and anything that terminates T L S, ever see the request text. A switch opens only Eli's envelope, and nothing deeper.
+l15 | N | normal | And Eli's envelope is thrown away at every hop, and replaced with a new one for the next hop. Ivy's survives the entire trip.
+== s4 Level 2: hop by hop
+l16 | N | normal | Level two. How does Rory decide where to send a packet he has never seen? He has a forwarding table. For a destination address, it says which outgoing link, and which next router. He picks the best matching prefix, the longest match, and forwards. No router knows the whole path. Each only needs the next hop.
+l17 | N | normal | The price of this flexibility? Packets can arrive out of order, arrive twice, or not arrive at all. Those are exactly the problems the layers above, mainly T C P, exist to repair.
+== s5 Level 2: seven layers or four?
+l18 | N | normal | You will hear about the seven layers of O S I. That is a teaching reference from the nineteen eighties. No mainstream network stack runs seven separate protocols. What ships inside every operating system is the four layer T C P I P model. Link, Internet, Transport, Application.
+l19 | N | normal | Here is how they line up. O S I layer seven, application, six, presentation, and five, session, all collapse into one application layer. Four is transport. Three is network, which is the internet layer. Two and one, data link and physical, become the link layer.
+l20 | N | normal | So why learn the numbers? Because people use them as shorthand. An L four load balancer sees only I P and port. An L seven proxy actually parses H T T P. Use the four layer model to describe how things really work, and the O S I numbers only as vocabulary. Never invent a session layer protocol in a real diagram.
+== s6 Level 2: gossip between kingdoms, B G P
+l21 | N | normal | How do routers learn routes? Inside one organization, an autonomous system, such as one I S P, routers share routes using interior protocols like O S P F or I S I S. Between different organizations, they speak B G P, the border gateway protocol.
+l22 | N | normal | Think of B G P as word of mouth. Gus, the server's I S P, announces, I can reach this block of addresses. Path, three. A transit provider adds its own name, and repeats it. Path, two, three.
+l23 | GUS | normal | I can reach ninety three dot one eighty four dot two sixteen dot slash twenty four. Path, three.
+l24 | GWEN | normal | Heard. I will repeat it, adding myself. Path, two, three.
+l25 | N | normal | Ana's own I S P hears several routes, and picks one, by shortest path, plus its own policy rules, and installs it in its forwarding table. From then on it forwards that block toward the transit provider, one hop at a time.
+l26 | N | normal | This is why losing one undersea cable reroutes traffic, rather than cutting the internet in half. Neighbours simply stop hearing a route, and switch to the next best.
+l27 | N | warn | The catch. B G P trusts announcements by default. A network that falsely claims someone else's block can hijack their traffic. There is no central authority checking who may announce what. The bolt on fix is called R P K I, route origin validation.
+== s7 Level 2: the envelope has a size limit
+l28 | N | normal | Ethernet frames carry at most fifteen hundred bytes. That is the M T U, the maximum transmission unit. A packet bigger than any link's M T U must be split, fragmented, or better, never made that big.
+l29 | N | normal | T C P avoids it. At connection setup, it agrees a maximum segment size, so each segment plus its headers fits inside one frame. U D P and I C M P have no such agreement, so they can be fragmented, and if any one fragment is lost, the entire original packet must be resent.
+l30 | N | normal | Path M T U discovery helps. It sends packets marked, do not fragment, and shrinks its guess whenever a router replies, too big.
+l31 | N | warn | And here is the classic outage. A V P N or tunnel adds a header, pushing a normal packet over fifteen hundred bytes. Everything works, except big responses. A confusing symptom, and it traces back to one header field.
+== s8 Level 2: building and apartments
+l32 | N | normal | An I P address names a host. A port, a number from zero to sixty five thousand five hundred thirty five, names a program on it. It lives in the T C P or U D P header, not the I P header, which is exactly why a router never sees it. Ports below one thousand twenty four are well known. Eighty is H T T P, four forty three is H T T P S, fifty three is D N S, and on Linux they need root to bind.
+l33 | SAM | normal | I am Sam, the server. I listen on port four forty three. But do not think I can serve only one visitor. The port only says where new connections arrive.
+l34 | N | normal | A socket is the operating system's handle for one end of a connection. And one connection is identified by its five tuple. Protocol, source I P, source port, destination I P, destination port.
+l35 | N | normal | Open two browser tabs to the same site. Same destination address, same destination port, four hundred forty three. What differs is the source port. The operating system picks a different free ephemeral port for each connection, typically thirty two thousand seven hundred sixty eight to sixty thousand nine hundred ninety nine on Linux.
+l36 | N | normal | So tab one uses source port fifty one thousand one, and tab two, fifty one thousand two. Only one field differs, but that is enough. The kernel keys its lookup on the full five tuple, so it can hand each connection's data to the right thread.
+l37 | N | warn | The mistake to avoid. A listening port does not identify a connection. The full five tuple does. That is how one port serves thousands of clients at once.
+== s9 Level 3: loose ends that matter
+l38 | N | normal | Level three. T C P versus U D P. T C P retransmits lost segments, keeps order, and costs a handshake and acknowledgements. Use it when correctness matters more than latency, like H T T P or S S H. U D P guarantees nothing, and has only an eight byte header. Use it when latency matters more than occasional loss, like D N S, video, and the basis of Quick.
+l39 | N | normal | T T L, time to live, is a hop counter in the I P header. Every router subtracts one. At zero the packet is dropped, and an I C M P time exceeded message goes back. It stops routing loops. And traceroute abuses it, sending packets with T T L one, two, three, and recording who replies at each hop.
+l40 | N | normal | Why the five tuple and not just the port? Because millions of clients can reach port four forty three at once. The operating system demultiplexes each incoming segment to the right in memory socket using the full five tuple as the lookup key.
+l41 | N | normal | And anycast is not a special protocol. The same address is announced through B G P from many places, and ordinary shortest path routing sends each client to the nearest. That is how D N S root servers and C D Ns serve one address from dozens of data centres.
+== s10 In Go: seeing the five tuple
+g1 | N | normal | Now the code, in Go. The simplest socket program already shows the five tuple. One side listens, one connects, and each end sees a different pairing.
+g2 | N | normal | Listen on one twenty seven dot zero dot zero dot one, port zero, and the operating system picks any free port. Dial that address. The client side gets an ephemeral source port, and nothing in the code chose it.
+g3 | N | normal | A small function, five tuple, formats exactly what the kernel keys on. The protocol, then the local address, an arrow, then the remote address. And an echo server accepts one connection, reports that tuple on a channel, then copies back everything it reads.
+g4 | N | normal | The test opens two connections to the same listener. Same destination, different source ports. So the two tuples differ, exactly as the model says, and the test passes with the race detector on.
+== s11 When it breaks, and what to watch
+l42 | N | warn | Three failures to know. An M T U black hole. Large packets vanish silently, because a middle box drops them instead of sending back too big. Lower the interface M T U, or clamp the segment size on the path.
+l43 | N | warn | A B G P leak or hijack. Traffic for a block suddenly goes somewhere wrong. Use route origin validation, and monitoring that alerts on unexpected path changes for your own blocks.
+l44 | N | warn | And port exhaustion. A host that opens huge numbers of outbound connections to one destination runs out of ephemeral ports, about twenty eight thousand by default on Linux. Reuse connections with pooling, or widen the port range.
+l45 | N | normal | What to monitor. Interface M T U mismatches, seen as path M T U discovery failures. B G P session flaps, and path changes for your own blocks. And ephemeral port usage on hosts with many connections.
+l46 | N | normal | Also two deeper points. Packet switching's flexibility costs ordering and reliability, so something above I P must restore them, if the app needs it. And if a hand written raw socket gets an ether type or protocol field wrong, the receiving stack silently drops the packet.
+== s12 Interview round
+q0 | N | hook | Interview round. Six questions you will really get.
+q1 | N | normal | One. I P address versus port? An I P address names a host. A port, in the T C P or U D P header, names a program on it. Routers route on I P only. The destination kernel uses the port to hand data to the right process.
+q2 | N | normal | Two. A trap. Explain the O S I model as how the internet actually works. It is a trap, because O S I is a teaching reference. The internet runs the four layer T C P I P model, and layers five to seven all collapse into application. Say that explicitly.
+q3 | N | normal | Three. Why do two tabs to the same site not interfere? Different ephemeral source ports, so the five tuple differs, even though the destination is identical. The kernel demultiplexes on the whole tuple.
+q4 | N | normal | Four. What happens to a packet bigger than the M T U? Without the do not fragment bit, a router fragments it, which is expensive, since losing one fragment loses the whole packet. T C P avoids this by agreeing a segment size at setup.
+q5 | N | normal | Five. How does a router handle a packet it has never seen? It looks up the destination in its forwarding table, built from interior protocols and B G P, picks the longest matching prefix, and forwards it out the matching link.
+q6 | N | normal | Six. What does T T L do, and how does traceroute use it? T T L is a hop counter, decremented by each router, which stops loops. Traceroute sends T T L one, two, three, and records each time exceeded reply to reconstruct the path.
+== s13 Summary
+l47 | N | calm | Let us put it all together, from easy to advanced.
+l47a | N | normal | One. Packets, not circuits. Each packet is routed independently, hop by hop, and no router knows the whole path. That flexibility costs order and reliability, which T C P restores.
+l47b | N | normal | Two. The I P address finds the host. The port finds the program. The five tuple is a connection's true identity.
+l47c | N | normal | Three. Encapsulation adds a header per layer going out, and strips them in reverse coming in. Routers open only the I P header. Switches open only Ethernet.
+l47d | N | normal | Four. O S I is vocabulary. T C P I P's four layers are what runs.
+l47e | N | normal | Five. B G P is organisations announcing reachability by word of mouth. Shortest path and policy win, and nobody checks who is telling the truth, unless R P K I does.
+l47f | N | normal | Six. M T U is about fifteen hundred bytes. T C P agrees a segment size. U D P and I C M P can fragment. T T L stops loops, and traceroute uses it.
+l47g | N | calm | And the one line to keep. The I P address finds the machine, the port finds the program, and routers pass each packet one hop at a time.
+== s14 Where to go next
+rn1 | N | calm | To go deeper, open the note called how the internet works, and its Go note, in your vault. Nothing comes before it. After it, read I P addressing, subnets, N A T and V P C basics, then T C P, and then D N S. Compare it with forward and reverse proxies, where L four and L seven really matter, and with I O models.
+l48 | ANA | hook | Thank you, Pip! The page loaded.
+l49 | SAM | punch | Next!

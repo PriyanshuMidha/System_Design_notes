@@ -13,7 +13,7 @@ sources:
   - "Google email sender guidelines (2024): bulk senders need SPF, DKIM, DMARC and a low spam-complaint rate"
   - "Gmail labels instead of folders and conversation view: public Gmail product behaviour"
   - "All sizes, counts and rates in this note are labelled estimates, not published figures"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Email Service
@@ -28,9 +28,56 @@ updated: 2026-11-09
 > - Outbound mail is a **queue with retries, per-domain rate limits and a bounce handler**; reputation is a resource you can burn.
 > - Each user has a **private search index**, updated asynchronously after delivery.
 
+## Start here: the basics
+
+**The problem in one story.**
+You click send on an email to a friend at another company.
+Seconds later it is in their inbox and their phone buzzes.
+A year later they can still search for it.
+All of that happens across servers that do not trust each other, while spammers try to sneak in.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| SMTP | The protocol servers use to send mail to each other | Your server talks to `mx.gmail.com` on port 25 |
+| MX record | A DNS entry naming a domain's mail server | `example.com MX mail.example.com` |
+| IMAP / JMAP | Protocols a mail app uses to read a mailbox | Phone app listing your inbox |
+| SPF / DKIM / DMARC | Checks that a sender is allowed to use a domain | A signature proving mail really came from `bank.com` |
+| Spam filter | Code that scores how likely a message is junk | Score 9/10 -> Junk folder |
+| Mailbox storage | Where each user's messages are kept | Messages for `ana@` on a shard |
+| Push | Telling a device right away that mail arrived | Phone notification |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Sender's server"] -- "SMTP" --> IN["Inbound gateway"]
+    IN --> CHK["SPF / DKIM<br/>+ spam filter"]
+    CHK --> MB[("Mailbox storage")]
+    MB --> IDX["Search index"]
+    MB --> PU["Push to device"]
+    APP["Mail app"] -- "IMAP / API" --> MB
+```
+
+**Analogy.** A very paranoid post office: a guard checks the stamp, a sorter throws out junk, and good letters go into a private cabinet with a bell.
+Where it breaks: a post office delivers one physical letter, while email copies messages freely, so storage dedup, retries and duplicate delivery are real design problems.
+
+**How the rest of this note builds up**
+
+- First, what an email service must do (section 1) and the post office model (section 2).
+- Then the high-level design: inbound and outbound paths, storage and search (section 3), with estimates, API and data model (section 4).
+- Then variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production practice, deliverability, spam, storage, then scaling and failure handling (sections 7-9).
+
+> [!tip] Remember
+> Email is untrusted SMTP in, authentication and spam checks in the middle, durable mailboxes plus search and push out.
+
 ## 1. Why it exists - requirements
 
-You write to a friend on another provider. Click send, and a few seconds later it shows up in their inbox, their phone buzzes, and a year later they can still find it by typing a word from the body. Behind that: millions of servers that do not trust each other, a protocol from the 1980s, and an industry of spammers trying to abuse every step.
+You write to a friend on another provider. Click send, and a few seconds later it shows up in their inbox, their phone buzzes, and a year later they can still find it by typing a word from the body.
+
+Behind that: millions of servers that do not trust each other, a protocol from the 1980s, and an industry of spammers trying to abuse every step.
 
 **Functional requirements**
 - Send and receive mail with any other provider on the internet (SMTP interoperability).
@@ -61,7 +108,11 @@ You write to a friend on another provider. Click send, and a few seconds later i
 
 ## 2. Mental model
 
-Think of the postal system with a very paranoid post office. Letters arrive from strangers at the front desk (inbound SMTP). A guard checks the return address against the sender's registered stamp (SPF, DKIM), and a sorter throws out obvious junk (spam filter). Good letters are copied into the right person's private cabinet (mailbox storage) and a bell rings at their desk (push).
+Think of the postal system with a very paranoid post office:
+
+1. Letters arrive from strangers at the front desk (inbound SMTP).
+2. A guard checks the return address against the sender's registered stamp (SPF, DKIM), and a sorter throws out obvious junk (spam filter).
+3. Good letters are copied into the right person's private cabinet (mailbox storage) and a bell rings at their desk (push).
 
 Going out, you hand a letter to a courier (outbound queue). The courier looks up the destination post office (MX lookup), tries to deliver, and if the destination says "come back later" the courier tries again with longer gaps. After a few days of failure the courier returns the letter with a note (bounce).
 
@@ -502,3 +553,8 @@ flowchart LR
 - **Building blocks:** [[Search Engines and Inverted Indexes]], [[File Uploads and Object Storage]], [[Partitioning and Sharding]], [[Caching Patterns]], [[Timeouts, Retries and Backoff]], [[Dead Letter Queues and Poison Messages]], [[Idempotency and Idempotency Keys]], [[Load Shedding and Graceful Degradation]], [[Multi-Region Architecture]], [[Unique ID Generation]], [[Storage Engines - B-tree vs LSM and WAL]], [[Hot Keys and Hot Partitions]]
 - **Decision guides:** [[Choosing a Database - Decision Guide]], [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing a Caching Strategy - Decision Guide]]
 - **Compare with:** [[Case Study - Notification System]] (outbound fan-out), [[Case Study - File Storage and Sync]] (blobs and sync), [[Case Study - Chat System]] (per-user inbox and push)
+
+### Watch on YouTube
+
+- [System Design Interviews - Distributed Email Service](https://www.youtube.com/watch?v=PTfIiDZZ_5k) · baozi8 包子吧 · 10 min · 114 views
+- [Notification Service System Design(Email, SMS, Push) #systemdesigninterview #highleveldesign #hld](https://www.youtube.com/watch?v=vMx9-ZQW2m8) · TechDecoded · 7 min · 662 views

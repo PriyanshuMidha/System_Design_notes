@@ -8,13 +8,15 @@ sources:
   - "PostgreSQL 17 documentation, 13.2.1 Read Committed Isolation Level (re-evaluation of WHERE on the updated row version)"
   - "PostgreSQL 17 documentation, 13.3.4 Deadlocks; Appendix A error codes 40001 and 40P01"
   - "Redis documentation: SET with NX and EX options, EVAL (Lua scripts run atomically)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Ticket Booking
 
 > [!summary] TL;DR
-> A ticket booking system (cinemas, concerts, trains) lets many people pick specific seats and pay for them, without ever selling one seat twice. The design centres on a short **hold** (a reservation that expires after about 10 minutes unless paid), a database rule that makes double booking impossible, and a **virtual waiting room** that admits buyers at a safe rate when a big sale opens.
+> A ticket booking system (cinemas, concerts, trains) lets many people pick specific seats and pay for them, without ever selling one seat twice.
+>
+> The design centres on a short **hold** (a reservation that expires after about 10 minutes unless paid), a database rule that makes double booking impossible, and a **virtual waiting room** that admits buyers at a safe rate when a big sale opens.
 
 > [!abstract] Core idea
 > - Seat state moves `AVAILABLE → HELD → BOOKED`; a hold carries an expiry time, so an abandoned hold frees itself without any cleanup job.
@@ -22,6 +24,51 @@ updated: 2026-11-04
 > - Holding several seats is **all-or-nothing**: if any seat is gone, nothing is held.
 > - Payment confirmation is **idempotent**, and a payment that arrives after the hold expired is refunded, not forced through.
 > - On-sales are protected by a waiting room that admits buyers at the rate the booking path can serve.
+
+## Start here: the basics
+
+**The problem in one story.**
+A popular concert goes on sale at 10 am.
+Thousands of fans click on seat F7 in the same second.
+Only one may get it, and the others must be told quickly.
+If someone picks a seat and then walks away, it must become free again.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Hold | A short reservation that expires if not paid | F7 held for 10 minutes |
+| Transaction | A group of database changes that succeed or fail together | Hold 3 seats at once |
+| Row lock | The database letting only one writer change a row at a time | Second buyer waits on F7 |
+| Conditional update | "Change this row only if it still matches a rule" | `UPDATE ... WHERE status='AVAILABLE'` |
+| Race condition | Two actions overlap and give a wrong result | Two people both see F7 as free |
+| Idempotency key | An id that makes a retried request safe to repeat | Same payment not charged twice |
+| Waiting room | A queue that lets buyers in at a safe rate | "You are number 4,512 in line" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Buyer"] --> W["Waiting room"]
+    W --> P["Pick seats"]
+    P --> H["Hold seats<br/>(expires in 10 min)"]
+    H --> PAY["Pay"]
+    PAY --> B["Seats BOOKED"]
+    H -- "timer runs out" --> A["Seats AVAILABLE again"]
+```
+
+**Analogy.** A cloakroom hook with a timer tag: your coat claims the hook, but if you do not pay in time, the hook counts as empty.
+Where it breaks: a real attendant cannot judge thousands of hooks in the same millisecond; the database row lock does that job.
+
+**How the rest of this note builds up**
+
+- First, requirements and the double-booking race (section 1), then the cloakroom mental model (section 2).
+- Then the high-level design with holds, payments and the waiting room (section 3).
+- Then estimates, API, the data model with SQL, and the same rules in Go (section 4).
+- Finally the SDE-3 material: variants, trade-offs, production issues and the deep dive (sections 5-8).
+
+> [!tip] Remember
+> Take seats with one conditional update and let holds expire by time, so a seat is never sold twice.
 
 ## 1. Why it exists - requirements
 
@@ -32,7 +79,9 @@ SELECT status FROM show_seats WHERE show_id = 501 AND seat_id = 'F7';  -- both s
 UPDATE show_seats SET status = 'BOOKED', user_id = $me WHERE show_id = 501 AND seat_id = 'F7';
 ```
 
-Both transactions pass the check and both write; the second write silently overwrites the first, and two people arrive at the cinema with tickets for F7. Wrapping this in a transaction does **not** fix it at PostgreSQL's default isolation level, READ COMMITTED: both transactions still read "AVAILABLE" before either writes. The fix is to make the check and the write one atomic statement, or to lock the row before reading, as shown below. (See [[Isolation Levels and MVCC]] for why.)
+Both transactions pass the check and both write; the second write silently overwrites the first, and two people arrive at the cinema with tickets for F7. Wrapping this in a transaction does **not** fix it at PostgreSQL's default isolation level, READ COMMITTED: both transactions still read "AVAILABLE" before either writes.
+
+The fix is to make the check and the write one atomic statement, or to lock the row before reading, as shown below. (See [[Isolation Levels and MVCC]] for why.)
 
 A second problem appears when a popular concert opens: 1 million people arrive in the first minute for 50,000 seats. Without admission control, the seat map service, the database and the payment provider are all overwhelmed at once.
 
@@ -53,7 +102,9 @@ A second problem appears when a popular concert opens: 1 million people arrive i
 
 ## 2. Mental model
 
-Think of a **cloakroom with numbered hooks**. To claim a hook you hang your coat on it; if someone's coat is already there, you cannot. A hold is a coat with a **timer tag**: if you do not come back with payment in 10 minutes, the attendant treats the hook as empty, even if the coat is still hanging there. Paying swaps the timer tag for a permanent ticket.
+Think of a **cloakroom with numbered hooks**. To claim a hook you hang your coat on it; if someone's coat is already there, you cannot.
+
+A hold is a coat with a **timer tag**: if you do not come back with payment in 10 minutes, the attendant treats the hook as empty, even if the coat is still hanging there. Paying swaps the timer tag for a permanent ticket.
 
 Terms:
 - **Inventory:** the set of sellable seats for one show (`show_seats` rows).
@@ -295,7 +346,9 @@ RETURNING seat_id;
 COMMIT;
 ```
 
-Why this is safe under READ COMMITTED: if two transactions target F7, the second one blocks on the first one's row lock. When the first commits, PostgreSQL re-checks the `WHERE` clause against the new row version (`status = 'HELD'`, not expired), the condition fails, and the second transaction updates 0 rows for F7. No `SELECT ... FOR UPDATE` is needed. Expired holds are taken over by the same statement, which is why no sweeper job is required for correctness.
+Why this is safe under READ COMMITTED: if two transactions target F7, the second one blocks on the first one's row lock. When the first commits, PostgreSQL re-checks the `WHERE` clause against the new row version (`status = 'HELD'`, not expired), the condition fails, and the second transaction updates 0 rows for F7.
+
+No `SELECT ... FOR UPDATE` is needed. Expired holds are taken over by the same statement, which is why no sweeper job is required for correctness.
 
 **Confirm: only a live hold can become a booking.**
 
@@ -609,3 +662,8 @@ A 45-minute script:
 - **Before this:** [[Transactions and ACID]], [[Locking - Optimistic vs Pessimistic]], [[Isolation Levels and MVCC]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[Case Study - Payment System]], [[Case Study - Leaderboard and Top-K]]
 - **Compare with:** [[Movie Ticket Booking]] and [[Hotel Booking]] (class-level twins: date-range holds instead of seats), [[Saga Pattern]], [[Distributed Locks and Fencing Tokens]]
+
+### Watch on YouTube
+
+- [System Design of a Ticket Booking System: BookMyShow](https://www.youtube.com/watch?v=ohdu6TUoE5s) · Gaurav Sen · 77 min · 46,761 views
+- [✅ System Design 2: Design Ticket Booking System like BookMyShow, District / HLD / LLD](https://www.youtube.com/watch?v=uamf0wRMx5o) · InterviewWithBunny · 46 min · 88,225 views

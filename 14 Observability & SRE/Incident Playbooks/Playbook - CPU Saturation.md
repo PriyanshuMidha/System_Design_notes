@@ -11,7 +11,7 @@ sources:
   - "Go 1.25 release notes, container-aware GOMAXPROCS"
   - "Kubernetes docs, 'Resource Management for Pods and Containers' (CPU requests, limits, throttling)"
   - "cAdvisor metrics (container_cpu_usage_seconds_total, container_cpu_cfs_throttled_periods_total)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - CPU Saturation
@@ -25,6 +25,51 @@ updated: 2026-11-09
 > - Four different causes look alike: real work growth, a hot code path (bug or bad input), throttling, and noisy neighbours (steal time).
 > - A CPU profile (`pprof`) answers "which function" in 30 seconds; `top -H` and `pidstat` answer "which thread or process".
 > - Mitigate by adding capacity or removing load first; fix the code after.
+
+## Start here: the basics
+
+**The problem in one story.**
+A shop has one cashier who serves 10 customers a minute.
+On a sale day 12 customers a minute arrive.
+The line grows, and everyone waits longer, not only the extra two.
+A server with saturated CPU is that cashier: requests queue and the site slows down.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| CPU core | One unit that runs one thread at a time | A 4-core machine runs 4 at once |
+| Utilisation | Share of time the CPU is busy | 85% busy |
+| Saturation | More work is waiting than the CPU can run | Run queue keeps growing |
+| Latency | How long one request takes | p99 = 800 ms |
+| Container CPU limit | A cap on how much CPU a pod may use | `limits.cpu: 2` |
+| Throttling | The kernel pausing a container that hit its limit | Pod slow at 50% CPU |
+| Profile (pprof) | A sample of which functions use the CPU | `json.Marshal` = 40% |
+| Thread / goroutine | A unit of work the scheduler runs | Go runs goroutines on threads |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    I["Requests arrive"] --> Q["Run queue"]
+    Q --> C["CPU cores"]
+    C --> O["Responses"]
+    L["Container limit"] -. "throttles" .-> C
+    Q -. "grows when<br/>arrivals > capacity" .-> S["Latency climbs"]
+```
+
+**Analogy.** The cashier queue above: add cashiers (scale out), send some customers away (shed load), or make each checkout faster (fix hot code).
+Where it breaks: a container limit is like a manager forcing the cashier to take a break each minute, even with an empty line elsewhere in the store.
+
+**How the rest of this note builds up**
+
+- First, why queues form (section 1) and the four look-alike situations (section 2).
+- Then what CPU numbers mean, how container limits throttle, `GOMAXPROCS`, and load average (section 3).
+- Then the first 5 minutes and a real-style incident (section 4), plus diagnosis flowchart, PromQL and profile reading (section 5).
+- Finally fixes and trade-offs (section 6) and the SDE-3 deep dive: alerts, always-on profiling, CFS throttling, steal time and single-thread bottlenecks (sections 7-8).
+
+> [!tip] Remember
+> Check throttling and what changed first; add capacity or shed load before you fix the code.
 
 ## 1. Why it exists
 
@@ -101,7 +146,9 @@ flowchart TD
 
 ### How container CPU limits throttle you
 
-**In plain words:** A CPU **limit** in Kubernetes is enforced by the kernel's CFS (Completely Fair Scheduler) **bandwidth control**. Time is cut into periods of 100 ms by default. A limit of 500m CPU gives the container 50 ms of CPU time per period across all its threads. When the budget is used up, every thread in the container is paused until the next period.
+**In plain words:** A CPU **limit** in Kubernetes is enforced by the kernel's CFS (Completely Fair Scheduler) **bandwidth control**. Time is cut into periods of 100 ms by default. A limit of 500m CPU gives the container 50 ms of CPU time per period across all its threads.
+
+When the budget is used up, every thread in the container is paused until the next period.
 
 ```mermaid
 sequenceDiagram
@@ -122,11 +169,15 @@ sequenceDiagram
 
 ### Go and GOMAXPROCS
 
-Go starts as many running threads as `GOMAXPROCS`. Before Go 1.25 it defaulted to the number of CPUs on the node, not the container limit. A pod limited to 2 CPUs on a 64-core node would run 64 scheduler threads and get throttled constantly. Since Go 1.25 the runtime reads the cgroup CPU limit and sets `GOMAXPROCS` accordingly. On older versions use `go.uber.org/automaxprocs` or set `GOMAXPROCS` by hand. See [[Runtime - Goroutine Scheduler (GMP)]].
+Go starts as many running threads as `GOMAXPROCS`. Before Go 1.25 it defaulted to the number of CPUs on the node, not the container limit. A pod limited to 2 CPUs on a 64-core node would run 64 scheduler threads and get throttled constantly.
+
+Since Go 1.25 the runtime reads the cgroup CPU limit and sets `GOMAXPROCS` accordingly. On older versions use `go.uber.org/automaxprocs` or set `GOMAXPROCS` by hand. See [[Runtime - Goroutine Scheduler (GMP)]].
 
 ### Load average versus utilisation
 
-**Load average** counts tasks that are running or waiting (on Linux it also includes uninterruptible I/O waits). A load of 8 on an 8-core machine means fully busy; 16 means a queue of 8. It lags the real situation because it is an exponential average over 1, 5 and 15 minutes. **PSI** (Pressure Stall Information) is more direct: `/proc/pressure/cpu` reports the share of time tasks were stalled waiting for CPU.
+**Load average** counts tasks that are running or waiting (on Linux it also includes uninterruptible I/O waits). A load of 8 on an 8-core machine means fully busy; 16 means a queue of 8. It lags the real situation because it is an exponential average over 1, 5 and 15 minutes.
+
+**PSI** (Pressure Stall Information) is more direct: `/proc/pressure/cpu` reports the share of time tasks were stalled waiting for CPU.
 
 > [!tip] Remember
 > Look at throttling and run-queue wait. A pod can be starved while the average CPU looks fine.
@@ -361,7 +412,9 @@ This needs `import _ "net/http/pprof"`. Binding to `127.0.0.1` keeps it off the 
 
 ### Why latency curves bend near 100 percent
 
-In queueing theory, mean wait grows roughly as `rho / (1 - rho)` for a single server, where `rho` is utilisation. At 50 percent the wait factor is 1; at 90 percent it is 9; at 95 percent it is 19. This is why capacity planners aim for 60 to 70 percent peak CPU and why an autoscaler target of 50 to 70 percent is common. These are rule-of-thumb figures from queueing models, not measured values for your system.
+In queueing theory, mean wait grows roughly as `rho / (1 - rho)` for a single server, where `rho` is utilisation. At 50 percent the wait factor is 1; at 90 percent it is 9; at 95 percent it is 19.
+
+This is why capacity planners aim for 60 to 70 percent peak CPU and why an autoscaler target of 50 to 70 percent is common. These are rule-of-thumb figures from queueing models, not measured values for your system.
 
 ```mermaid
 flowchart LR
@@ -383,7 +436,9 @@ In a VM, `st` is time the hypervisor ran another guest on your vCPU. On burstabl
 
 ### Single-thread bottleneck
 
-A service that is slow while total CPU is low (for example 12 percent on 8 cores) may have one thread at 100 percent: a global lock, a single-threaded event loop, or a single goroutine consuming a channel. `top -H` shows it. Scaling out pods may not help if the bottleneck is per-process serialisation; shard the work or remove the lock.
+A service that is slow while total CPU is low (for example 12 percent on 8 cores) may have one thread at 100 percent: a global lock, a single-threaded event loop, or a single goroutine consuming a channel.
+
+`top -H` shows it. Scaling out pods may not help if the bottleneck is per-process serialisation; shard the work or remove the lock.
 
 ### Spinning versus blocking
 
@@ -440,3 +495,7 @@ CPU may be high because something else is slow: a slow database makes requests p
 - **Platform:** [[Autoscaling]], [[Kubernetes Fundamentals]], [[Metrics and Prometheus]], [[Alerting and On-Call]]
 - **Compare with:** [[Playbook - Memory Leak and OOMKilled]], [[Latency, Percentiles and Bottleneck Analysis]]
 - **After:** [[Postmortems and Root Cause Analysis]]
+
+### Watch on YouTube
+
+- [USE: CPU Saturation](https://www.youtube.com/watch?v=_HEiug2msx4) · Ostsee-Pinguin · 33 min · 211 views

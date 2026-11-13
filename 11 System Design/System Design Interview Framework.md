@@ -7,13 +7,15 @@ related: ["[[Scaling Basics]]", "[[Load Balancing]]", "[[Case Study - URL Shorte
 sources:
   - "Owner's original framework notes (10-step flow, problem table, mistakes, practice method), rewritten"
   - "Alex Xu, System Design Interview - An Insider's Guide, vol. 1 (2020), ch. 3 (4-step framework)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # System Design Interview Framework
 
 > [!summary] TL;DR
-> A system design interview gives you 45-60 minutes to design a large system out loud. This note is a repeatable plan for that hour: clarify requirements, estimate only what matters, define entities and APIs, draw a high-level design that works, then spend most of the time on one or two deep dives driven by the non-functional requirements, stating every trade-off as "X over Y because ...".
+> A system design interview gives you 45-60 minutes to design a large system out loud.
+>
+> This note is a repeatable plan for that hour: clarify requirements, estimate only what matters, define entities and APIs, draw a high-level design that works, then spend most of the time on one or two deep dives driven by the non-functional requirements, stating every trade-off as "X over Y because ...".
 
 > [!abstract] Core idea
 > - Requirements before boxes: functional, non-functional with numbers, and what is explicitly out of scope.
@@ -21,6 +23,50 @@ updated: 2026-11-04
 > - Spend the most time on the riskiest component, and offer options before choosing.
 > - Say trade-offs out loud, with numbers; name failure modes and what you would monitor.
 > - At SDE-3 level the interviewer scores whether you drive the conversation, quantify, and keep the design simple and operable, not how many technologies you name.
+
+## Start here: the basics
+
+**The problem in one story.**
+You get 45 minutes to plan a city's bus network out loud.
+If you start by picking bus colours, you run out of time before routes exist.
+If you first ask how many riders, where they go and how fast, every later choice has a reason.
+A system design interview works the same way.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Requirements | What the system must do and how well | "Shorten URLs; redirect under 50 ms" |
+| Back-of-envelope estimate | Quick rough maths | 100 M links/day ≈ 1,160 writes/s |
+| API | The calls clients make | `POST /urls`, `GET /{code}` |
+| High-level design | Boxes and arrows of the main parts | App, cache, database |
+| Deep dive | Zooming into one risky part | How short codes avoid collisions |
+| Trade-off | Getting X by giving up Y | Speed over strong consistency |
+| Bottleneck | The part that breaks first under load | The database on the read path |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Requirements"] --> E["Estimates"]
+    E --> A["Entities + API"]
+    A --> H["High-level design"]
+    H --> D["Deep dives"]
+    D --> W["Wrap-up:<br/>failures, monitoring"]
+```
+
+**Analogy.** A doctor's visit: symptoms first, then tests, then diagnosis, then treatment.
+Where it breaks: a doctor can order more tests later; in an interview the clock forces you to choose which part to examine closely.
+
+**How the rest of this note builds up**
+
+- First, why a plan beats raw knowledge (section 1) and the mental model (section 2).
+- Then the time budget, the steps, how the conversation flows and choosing the deep dive (section 3).
+- Then a full URL shortener in 45 minutes and a self-review rubric (section 4).
+- Finally the SDE-3 view: variants, traps, what interviewers score and deep dive (sections 5-8).
+
+> [!tip] Remember
+> Requirements, numbers, simple design, then deep dives, and say every trade-off out loud.
 
 ## 1. Why it exists
 
@@ -33,7 +79,9 @@ The difference is not knowledge; it is a plan. Interviews are short, open-ended 
 
 ## 2. Mental model
 
-Think of an architect meeting a client. The architect does not start with the roof material. They ask how many people will live there and what the budget is (requirements), sketch the floor plan (high-level design), then go deep on the hard part (the cantilevered balcony), while telling the client what each choice costs. The interviewer is the client and a colleague at the same time: they want to see how you decide, not just the final drawing.
+Think of an architect meeting a client. The architect does not start with the roof material. They ask how many people will live there and what the budget is (requirements), sketch the floor plan (high-level design), then go deep on the hard part (the cantilevered balcony), while telling the client what each choice costs.
+
+The interviewer is the client and a colleague at the same time: they want to see how you decide, not just the final drawing.
 
 ## 3. How it works
 
@@ -136,8 +184,16 @@ WRAP  302 vs 301 trade-off, failure of cache, metrics: hit rate, p99, 404 rate
 
 **Minutes 24-41, deep dives.**
 
-1. *Code generation.* Options: (a) hash the URL and take 7 characters, which collides and needs a check-and-retry; (b) random 7 characters with insert-if-absent, simple with a tiny collision rate at this fill level; (c) a counter encoded in base 62, which never collides but is guessable and needs a distributed ID source (ranges handed out in blocks; see [[Unique ID Generation]]). Choice: (c) with block allocation for no collisions, shuffled or encrypted if guessability matters, "because it removes the read-before-write on the hot path."
-2. *Read path at 231k/s.* Cache-aside in Redis with the 10 GB hot set; [[Caching Patterns]] owns the details. Hot viral links: replicate hot keys or add a small in-process cache with a short TTL ([[Hot Keys and Hot Partitions]]). 302 instead of 301, "because 301 is cached by browsers and we would lose the ability to change or expire links and to count clicks."
+1. *Code generation.* Options: (a) hash the URL and take 7 characters, which collides and needs a check-and-retry.
+
+   (b) random 7 characters with insert-if-absent, simple with a tiny collision rate at this fill level.
+
+   (c) a counter encoded in base 62, which never collides but is guessable and needs a distributed ID source (ranges handed out in blocks; see [[Unique ID Generation]]).
+
+   Choice: (c) with block allocation for no collisions, shuffled or encrypted if guessability matters, "because it removes the read-before-write on the hot path."
+2. *Read path at 231k/s.* Cache-aside in Redis with the 10 GB hot set; [[Caching Patterns]] owns the details.
+
+   Hot viral links: replicate hot keys or add a small in-process cache with a short TTL ([[Hot Keys and Hot Partitions]]). 302 instead of 301, "because 301 is cached by browsers and we would lose the ability to change or expire links and to count clicks."
 
 **Minutes 41-45, wrap-up.** Failure modes: Redis down → reads fall through to the store, protected by rate limiting and a circuit breaker; a store partition down → replicas take over. Monitor cache hit rate, redirect p99, 404 rate and code-allocator lag. Evolution: analytics via an async click stream to [[Kafka and Event Streaming]], custom aliases with a uniqueness check.
 
@@ -265,3 +321,8 @@ The interview is a compressed version of real design work, and the same habits s
 - **Before this:** [[System Design Fundamentals]], [[Back-of-the-Envelope Estimation]], [[Scaling Basics]], [[Load Balancing]]
 - **Next:** [[Case Study - URL Shortener]], then the other case studies in [[11 System Design MOC]]
 - **Compare with:** [[LLD Interview Method]] and [[LLD Round Playbook]] (the class-design round), [[SDE-3 Readiness Checklist]] (where this framework fits in overall preparation)
+
+### Watch on YouTube
+
+- [How to Answer Any System Design Interview (The Delivery Framework)](https://www.youtube.com/watch?v=FkLAEAcQXcc) · Hello Interview · 14 min · 15,978 views
+- [System Design Interview: A Step-By-Step Guide](https://www.youtube.com/watch?v=i7twT3x5yv8) · ByteByteGo · 9 min · 1,133,256 views

@@ -7,13 +7,15 @@ related: ["[[SDE-3 Readiness Checklist]]"]
 sources:
   - "Go 1.22 release notes, per-iteration loop variables"
   - "The Go Programming Language Specification (channel types, method sets)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Go Interview Questions and Traps
 
 > [!summary] TL;DR
-> Nine classic Go gotchas an interviewer expects you to have been bitten by at least once: a nil pointer hiding inside a non-nil interface, loop variables before and after Go 1.22, slices that secretly alias each other, map iteration order, defer argument timing, goroutine leaks, channel nil/closed semantics, interface satisfaction by method sets, and unguarded concurrent map access. Each has a runnable snippet, tested and `go vet`-clean, that reproduces the trap and its fix.
+> Nine classic Go gotchas an interviewer expects you to have been bitten by at least once: a nil pointer hiding inside a non-nil interface, loop variables before and after Go 1.22, slices that secretly alias each other, map iteration order, defer argument timing, goroutine leaks, channel nil/closed semantics, interface satisfaction by method sets, and unguarded concurrent map access.
+>
+> Each has a runnable snippet, tested and `go vet`-clean, that reproduces the trap and its fix.
 
 > [!abstract] Core idea
 > - Every trap here compiles and runs correctly; the "bug" is a semantic surprise, not a build error, which is exactly why it reaches production before it's caught.
@@ -21,13 +23,72 @@ updated: 2026-11-04
 > - Go 1.22 (2024) fixed the loop-variable trap by default; the rest are still live in Go 1.24.
 > - Deep technical coverage of each underlying mechanism (interfaces, slices, goroutines, channels) lives in [[04 Go Language MOC]] once written — this note is the interview-facing trap list, not the tutorial.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your Go code compiles, passes a quick test, and looks correct.
+In production, an error check says "error" when there is none, or a test fails 1 run in 20.
+Nothing was broken in the syntax; you assumed a Go rule worked the "obvious" way and it does not.
+This note lists nine such traps and shows each one with code.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Interface value | A pair: (concrete type, value inside) | `var err error = (*MyErr)(nil)` is not `nil` |
+| Pointer | A value holding the address of another value | `p := &x` |
+| Slice | A window (pointer, length, capacity) onto an array | `s := arr[1:3]` |
+| Map | A key-value table with no fixed order | `m := map[string]int{}` |
+| Goroutine | A lightweight function running concurrently | `go work()` |
+| Channel | A pipe goroutines use to pass values | `ch := make(chan int)` |
+| `defer` | Run this call when the function returns | `defer f.Close()` |
+| Method set | Which methods count for a type when matching an interface | `*T` has pointer-receiver methods, `T` does not |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    F["Go feature"] --> R["Precise rule<br/>(in the spec)"]
+    F --> G["Intuitive guess"]
+    G -- "differs from rule" --> T["Trap: runs,<br/>but wrong result"]
+    R --> OK["Correct code"]
+```
+
+**Analogy.** A "push" door that looks like a "pull" door: it works fine, but your instinct makes you walk into it.
+Where it breaks: you learn a door after one bump; some Go traps (like map order) hide for months because they fail only sometimes.
+
+**How the rest of this note builds up**
+
+- First, why interviewers ask about traps (section 1) and the "rule vs. guess" mental model (section 2).
+- Then the nine traps in order, each with a runnable snippet and its fix: nil interfaces, loop variables, slice aliasing, map order, defer timing, goroutine leaks, channels, method sets, concurrent maps (sections 3-4).
+- Finally the SDE-3 view: how the traps connect, production habits and the precise Go 1.22 rules (sections 5-8).
+
+> [!tip] Remember
+> Every trap is a precise Go rule mistaken for the simpler thing it looks like.
+
 ## 1. Why it exists
 
-Go's design favours few, orthogonal features, which also means a handful of corners get hit by almost everyone exactly once — usually in a code review or a production incident, not in a tutorial. Interviewers lean on these traps because they distinguish "has used Go" from "has been burned by Go," which correlates with production experience far better than syntax questions do. This note is the concentrated version of that experience: nine traps, each demonstrated with code you can run.
+Go's design favours few, orthogonal features, which also means a handful of corners get hit by almost everyone exactly once — usually in a code review or a production incident, not in a tutorial.
+
+Interviewers lean on these traps because they distinguish "has used Go" from "has been burned by Go," which correlates with production experience far better than syntax questions do.
+
+This note is the concentrated version of that experience: nine traps, each demonstrated with code you can run.
 
 ## 2. Mental model
 
-Every trap on this list follows the same shape: Go gives you a feature with a precise, documented rule (interfaces are a `(type, value)` pair; a range loop variable is a variable; a slice header has a length and a capacity; a map has no ordering guarantee; `defer` evaluates its arguments immediately; an unbuffered channel send blocks until received; a nil channel blocks forever; a method set depends on the receiver type; a plain map has no built-in concurrency safety). The trap is always mistaking the rule for the simpler, more intuitive thing it resembles but isn't.
+Every trap on this list follows the same shape: Go gives you a feature with a precise, documented rule:
+
+- interfaces are a `(type, value)` pair;
+- a range loop variable is a variable;
+- a slice header has a length and a capacity;
+- a map has no ordering guarantee;
+- `defer` evaluates its arguments immediately;
+- an unbuffered channel send blocks until received;
+- a nil channel blocks forever;
+- a method set depends on the receiver type;
+- a plain map has no built-in concurrency safety.
+
+The trap is always mistaking the rule for the simpler, more intuitive thing it resembles but isn't.
 
 ## 3. How it works
 
@@ -100,7 +161,9 @@ func fixedDoWork(fail bool) error {
 
 ### Trap 2 — loop variable capture, pre- and post-Go 1.22
 
-Before Go 1.22, a `for i := range ...` loop declared **one** `i` shared by every iteration; a closure created inside the loop captured that single variable, so all closures saw its final value once the loop ended. Go 1.22 (verified in the release notes) changed the default: the loop variable is now a **new variable per iteration**, so closures see the value from their own iteration — this module's `go.mod` says `go 1.24`, so this is the behaviour below.
+Before Go 1.22, a `for i := range ...` loop declared **one** `i` shared by every iteration; a closure created inside the loop captured that single variable, so all closures saw its final value once the loop ended.
+
+Go 1.22 (verified in the release notes) changed the default: the loop variable is now a **new variable per iteration**, so closures see the value from their own iteration — this module's `go.mod` says `go 1.24`, so this is the behaviour below.
 
 ```go
 func TestLoopVariableGo122(t *testing.T) {
@@ -118,7 +181,9 @@ func TestLoopVariableGo122(t *testing.T) {
 }
 ```
 
-**The gotcha that remains even on Go 1.24:** `v` in `for _, v := range items` is still a *copy* of the element, per-iteration variable or not. Taking `&v` gives a pointer to that iteration's copy, which is safe since 1.22, but mutating through it never touches the original slice element — use `&items[i]` when you need to mutate in place.
+**The gotcha that remains even on Go 1.24:** `v` in `for _, v := range items` is still a *copy* of the element, per-iteration variable or not.
+
+Taking `&v` gives a pointer to that iteration's copy, which is safe since 1.22, but mutating through it never touches the original slice element — use `&items[i]` when you need to mutate in place.
 
 ```go
 func TestLoopPointerAliasing(t *testing.T) {
@@ -344,7 +409,9 @@ func TestNilChannelBlocksForever(t *testing.T) {
 
 ### Trap 8 — interface satisfaction and method sets
 
-A method defined with a pointer receiver (`func (l *Logger) Read() string`) is only in the method set of `*Logger`, never of `Logger`. A `Logger` value does **not** satisfy an interface requiring `Read()`, even though `*Logger` does — this is a compile-time trap, not a runtime one, but it surprises anyone who expects "it has the method" to be enough regardless of receiver type.
+A method defined with a pointer receiver (`func (l *Logger) Read() string`) is only in the method set of `*Logger`, never of `Logger`.
+
+A `Logger` value does **not** satisfy an interface requiring `Read()`, even though `*Logger` does — this is a compile-time trap, not a runtime one, but it surprises anyone who expects "it has the method" to be enough regardless of receiver type.
 
 ```go
 type Reader interface{ Read() string }
@@ -429,7 +496,11 @@ func TestMutexGuardedMapIsRaceFree(t *testing.T) {
 }
 ```
 
-**Why this is distinct from trap 4:** map iteration order (trap 4) is about a single goroutine getting a randomized but safe read; this trap is about two goroutines touching the map at the same time at all, which the runtime refuses to allow silently — it crashes loudly instead of corrupting data quietly, which is actually the kinder failure mode of the two.
+**Why this is distinct from trap 4:** map iteration order (trap 4) is about a single goroutine getting a randomized but safe read.
+
+This trap is about two goroutines touching the map at the same time at all, which the runtime refuses to allow silently.
+
+It crashes loudly instead of corrupting data quietly, which is actually the kinder failure mode of the two.
 
 ## 5. Variants and comparison
 
@@ -458,11 +529,23 @@ func TestMutexGuardedMapIsRaceFree(t *testing.T) {
 
 ## 8. Deep dive
 
-The nil-interface trap (trap 1) and the method-set trap (trap 8) are two faces of the same underlying fact: an interface value is a `(type, value)` pair, not a bare pointer. Trap 1 happens because `(*MyError, nil)` is a non-nil pair; trap 8 happens because the compiler decides, at compile time, whether a concrete type's method set — which depends on whether a method uses a pointer or value receiver — is enough to satisfy an interface. Both traps disappear once you stop picturing an interface variable as "basically a pointer" and start picturing it as the two-word pair it actually is.
+The nil-interface trap (trap 1) and the method-set trap (trap 8) are two faces of the same underlying fact: an interface value is a `(type, value)` pair, not a bare pointer.
 
-The loop-variable trap (trap 2) and the goroutine-leak trap (trap 6) are also related: both involve a closure or goroutine capturing scope that outlives the intent of the code that created it. Go 1.22 fixed one instance of this (the loop variable) at the language level; the other (an unbounded goroutine holding a channel send) has no language-level fix — it requires the caller to design for cancellation, typically with a buffered channel or a `ctx.Done()` case in a `select`, which is exactly the pattern [[09 Messaging & Async MOC]]'s worker-pool notes cover in depth.
+Trap 1 happens because `(*MyError, nil)` is a non-nil pair; trap 8 happens because the compiler decides, at compile time, whether a concrete type's method set — which depends on whether a method uses a pointer or value receiver — is enough to satisfy an interface.
 
-A subtlety worth stating precisely for an interview: Go 1.22's fix is per `go.mod`'s `go` directive, not per Go toolchain version alone — a module that still declares `go 1.21` or lower keeps the pre-1.22 shared-variable semantics even when compiled with a newer `go` tool, because the language version is pinned by the module, not just by the compiler installed on the machine.
+Both traps disappear once you stop picturing an interface variable as "basically a pointer" and start picturing it as the two-word pair it actually is.
+
+The loop-variable trap (trap 2) and the goroutine-leak trap (trap 6) are also related: both involve a closure or goroutine capturing scope that outlives the intent of the code that created it.
+
+Go 1.22 fixed one instance of this (the loop variable) at the language level.
+
+The other (an unbounded goroutine holding a channel send) has no language-level fix. It requires the caller to design for cancellation, typically with a buffered channel or a `ctx.Done()` case in a `select`.
+
+That is exactly the pattern [[09 Messaging & Async MOC]]'s worker-pool notes cover in depth.
+
+A subtlety worth stating precisely for an interview: Go 1.22's fix is per `go.mod`'s `go` directive, not per Go toolchain version alone.
+
+A module that still declares `go 1.21` or lower keeps the pre-1.22 shared-variable semantics even when compiled with a newer `go` tool, because the language version is pinned by the module, not just by the compiler installed on the machine.
 
 ## 9. Interview questions
 
@@ -470,7 +553,9 @@ A subtlety worth stating precisely for an interview: Go 1.22's fix is per `go.mo
 > Because the function returned a concrete nil pointer type (e.g. `*MyError(nil)`) through an `error`-typed result. The interface value becomes `(*MyError, nil)`, which is non-nil as an interface even though the underlying pointer is nil. The fix: only ever `return nil` literally for an interface-typed result.
 
 > [!question]- Trap: "I upgraded to Go 1.22+, so closures over loop variables are always safe now, right?"
-> Only for the per-iteration *variable* identity — closures created in different iterations now see different variables. The remaining gotcha: `v` in `for _, v := range items` is still a copy of the element on every iteration, 1.22 or not, so mutating `*(&v)` never mutates the original slice; you still need `&items[i]` to mutate in place.
+> Only for the per-iteration *variable* identity — closures created in different iterations now see different variables.
+>
+> The remaining gotcha: `v` in `for _, v := range items` is still a copy of the element on every iteration, 1.22 or not, so mutating `*(&v)` never mutates the original slice; you still need `&items[i]` to mutate in place.
 
 > [!question]- You see `base[1:3]` passed to a function that appends to it. When can that append corrupt data the caller still reads from `base`?
 > Whenever the sub-slice still has spare capacity from `base`'s backing array — append reuses that array instead of allocating, so writes land inside `base`'s memory. It stops being a risk only once an append grows past the shared capacity and a new array is allocated.
@@ -485,13 +570,19 @@ A subtlety worth stating precisely for an interview: Go 1.22's fix is per `go.mo
 > Whether any goroutine sends on an unbuffered (or finite-buffer) channel whose receiver can give up — a timeout path, a cancelled request, a closed consumer — without the sender also selecting on a cancellation signal. The fix is either a buffer sized for "fire and forget," or a `select` with `ctx.Done()` alongside the send.
 
 > [!question]- What's the difference between closing a channel and sending `nil` on a channel variable?
-> Closing a channel is a signal to every receiver that no more values are coming; receives after a close drain any buffered values then return `(zero, false)` immediately. Setting a channel *variable* to `nil` disables it as a `select` case (it blocks forever, so it's never chosen) — a completely different mechanism, often used together: close to signal "done," nil the local variable afterward so a `select` loop stops selecting that case at all.
+> Closing a channel is a signal to every receiver that no more values are coming; receives after a close drain any buffered values then return `(zero, false)` immediately.
+>
+> Setting a channel *variable* to `nil` disables it as a `select` case (it blocks forever, so it's never chosen) — a completely different mechanism, often used together: close to signal "done," nil the local variable afterward so a `select` loop stops selecting that case at all.
 
 > [!question]- Trap: a type has a method with a pointer receiver, and a reviewer says "but the value type clearly has that method, I can see it in the struct's method list." Why does `var _ Interface = MyValue{}` still fail to compile?
 > A pointer-receiver method is only in the method set of the pointer type (`*T`), never of the value type (`T`) — Go's spec draws this line precisely so that a value which can't safely be mutated through that method isn't silently treated as if it could. Passing `&MyValue{}` instead of `MyValue{}` is the fix.
 
 > [!question]- Two goroutines write to the same plain `map[string]int` with no synchronization. What happens, and why can't you `recover()` from it?
-> The Go runtime detects the concurrent write and crashes the whole process with `fatal error: concurrent map writes`. This is a fatal throw, not a panic, specifically so that silent map corruption can never be mistaken for a "successful" write — `recover()` only catches panics, so the process always goes down. Fix: guard every access with a `sync.Mutex`/`sync.RWMutex`, or switch to `sync.Map` for write-heavy concurrent use.
+> The Go runtime detects the concurrent write and crashes the whole process with `fatal error: concurrent map writes`.
+>
+> This is a fatal throw, not a panic, specifically so that silent map corruption can never be mistaken for a "successful" write — `recover()` only catches panics, so the process always goes down.
+>
+> Fix: guard every access with a `sync.Mutex`/`sync.RWMutex`, or switch to `sync.Map` for write-heavy concurrent use.
 
 ## 10. Cheat sheet
 
@@ -510,3 +601,8 @@ A subtlety worth stating precisely for an interview: Go 1.22's fix is per `go.mo
 - **Before this:** [[SDE-3 Readiness Checklist]]
 - **Next:** none — this is the last note in the learning order for 19.
 - **Compare with:** [[Backend Roadmap and Tech Landscape]]
+
+### Watch on YouTube
+
+- [Top 30 Go Interview Questions And Answers / Best Golang Interview Questions (Updated 2025)](https://www.youtube.com/watch?v=7CXE1MODF1Q) · MindMajix · 20 min · 52,527 views
+- [Go Programming Interview Questions - Complete Guide](https://www.youtube.com/watch?v=CfCeJPEPpm8) · Learn To Code · 11 min · 19,542 views

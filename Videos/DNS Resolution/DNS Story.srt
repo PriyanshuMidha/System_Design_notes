@@ -1,0 +1,348 @@
+1
+00:00:02,399 --> 00:00:16,722
+Narrator: This is Rita. She wants to visit her friend's house, and all she knows is its name. Example dot com. But in this town, houses are found by number, not by name. Computers route on numbers, I P addresses. People remember names.
+
+2
+00:00:17,152 --> 00:00:22,425
+Rita: I cannot remember a number. And what if my friend moves house?
+
+3
+00:00:22,955 --> 00:00:36,869
+Narrator: The number would change, but the name should not. That is the job of D N S, the domain name system. Every name has an owner, who can change the number behind it at any time. And a worldwide system of remembering, so the change reaches everyone.
+
+4
+00:00:37,299 --> 00:00:49,390
+Narrator: Think of a phone book that nobody holds whole. The root book says which book covers dot com. The dot com book says which book covers example dot com. And only example dot com's own book holds the real entry.
+
+5
+00:00:52,340 --> 00:01:08,846
+Narrator: Read a name from right to left. At the very end, usually hidden, is a dot. That is the root. Then dot com, the top level domain, or T L D. Then example, the registered domain. Then any subdomains the owner creates, like www, or A P I.
+
+6
+00:01:09,275 --> 00:01:20,549
+Narrator: Meet the librarians. Roz keeps the root. Tom keeps the dot com book. And Ava owns example dot com, so she keeps the real entry. A server like Ava is called authoritative.
+
+7
+00:01:20,980 --> 00:01:24,670
+Roz: I only know who runs each top level domain.
+
+8
+00:01:25,099 --> 00:01:27,829
+Tom: I only know who runs each name under dot com.
+
+9
+00:01:28,260 --> 00:01:31,829
+Ava: And I know the real address. I am the authority.
+
+10
+00:01:34,780 --> 00:01:52,774
+Narrator: Rita's laptop is a stub resolver. It cannot walk the books itself. So it asks a recursive resolver, Rex, the librarian. Rex could belong to her internet provider, or be a public one, like eight dot eight dot eight dot eight from Google, or one dot one dot one dot one from Cloudflare, or the cloud network's own built in one.
+
+11
+00:01:53,203 --> 00:01:59,390
+Rita: Rex, where is example dot com? Just give me the answer, please.
+
+12
+00:01:59,819 --> 00:02:05,957
+Narrator: That request is recursive. Give me the final answer, or an error. Do not make me do the walk.
+
+13
+00:02:06,388 --> 00:02:10,677
+Rex: Not in my memory. I will walk the books.
+
+14
+00:02:11,108 --> 00:02:17,798
+Narrator: Rex's own questions are iterative. Give me your best answer, or a referral to someone else. First, Roz.
+
+15
+00:02:18,228 --> 00:02:21,413
+Rex: Roz, where is example dot com?
+
+16
+00:02:21,943 --> 00:02:26,641
+Roz: Not me. Ask Tom, he runs dot com.
+
+17
+00:02:27,072 --> 00:02:30,810
+Narrator: That is a referral. Not the answer, just who to ask next.
+
+18
+00:02:31,240 --> 00:02:34,401
+Rex: Tom, where is example dot com?
+
+19
+00:02:34,931 --> 00:02:37,205
+Tom: Ask Ava. Her book covers it.
+
+20
+00:02:37,635 --> 00:02:40,798
+Rex: Ava, where is example dot com?
+
+21
+00:02:41,328 --> 00:02:48,954
+Ava: One seven two, sixty six, one forty seven, two forty three. Remember it for two hundred thirty seconds.
+
+22
+00:02:49,383 --> 00:02:55,282
+Narrator: Root, then T L D, then authoritative. Three questions, and the answer is cached on the way back.
+
+23
+00:02:55,711 --> 00:02:58,009
+Rex: Here you go, Rita.
+
+24
+00:03:00,960 --> 00:03:21,641
+Narrator: A minute later, Rita asks again, and nobody walks. The answer sits in several places. First, her browser's own notepad. Capped at about sixty seconds in Chrome, even if the T T L is longer. Second, the operating system, which honors the T T L. And a hosts file entry bypasses D N S completely, and never expires.
+
+25
+00:03:22,072 --> 00:03:34,234
+Narrator: Third, Rex's memory. It is shared by every customer he serves, so in the real world this layer matters most. And fourth, any cache inside your own program. Go's standard library caches nothing by itself.
+
+26
+00:03:34,663 --> 00:03:43,945
+Narrator: T T L means time to live, in seconds. It is a countdown, and it starts fresh at each layer, from the moment that layer first saw the answer. Not one shared clock.
+
+27
+00:03:44,376 --> 00:04:02,201
+Narrator: A low T T L, seconds to minutes, means changes show up almost everywhere quickly, but Ava is asked far more often. A high T T L, hours or a day, means fewer questions, but a slow rollout. So before a planned move, lower the T T L a full T T L period ahead, and raise it again afterwards.
+
+28
+00:04:02,632 --> 00:04:12,705
+Narrator: And a myth. D N S propagation is not a wave across the internet. Ava's new answer exists at once. What takes time is every cache waiting out the old one.
+
+29
+00:04:15,656 --> 00:04:17,906
+Rita: What if I misspell the name?
+
+30
+00:04:18,435 --> 00:04:23,470
+Rex: Then Ava says, no such name. N X domain.
+
+31
+00:04:23,899 --> 00:04:42,038
+Narrator: And Rex remembers that too. It is called negative caching. For how long? The S O A record, the zone's header, has a minimum field. In the measured example it was eighteen hundred seconds. So even after you create the missing record, anyone who cached the no keeps hearing no until that clock runs out.
+
+32
+00:04:44,987 --> 00:04:58,613
+Narrator: How does Roz know Tom, and Tom know Ava? Delegation. A zone is the part of the tree one set of nameservers is responsible for. The parent holds an N S record that points at the child's nameservers. A pointer, not the answer.
+
+33
+00:04:59,043 --> 00:05:04,221
+Tom: Example dot com's nameserver is called N S one, dot example dot com.
+
+34
+00:05:04,651 --> 00:05:13,262
+Rex: But to find N S one's number, I must ask example dot com's nameserver. Which I cannot reach without its number!
+
+35
+00:05:13,791 --> 00:05:22,017
+Narrator: A circle. The fix is a glue record. Tom hands out N S one's number directly, glued onto the delegation, in the same breath.
+
+36
+00:05:22,447 --> 00:05:29,161
+Tom: Here. N S one lives at two oh three, dot zero, dot one thirteen, dot five.
+
+37
+00:05:29,591 --> 00:05:36,305
+Narrator: Forget the glue, and the whole zone breaks. Not slowly. Completely, the moment the cached copies expire.
+
+38
+00:05:39,255 --> 00:05:58,713
+Narrator: Roz is busy. There are only thirteen root names, A through M, a limit from the original five hundred twelve byte message size. But a name is not one machine. The same address is announced from hundreds of places by anycast, and the network sends each question to the nearest. Thirteen identities, not thirteen machines.
+
+39
+00:05:59,144 --> 00:06:19,826
+Narrator: Questions mostly travel over U D P, port fifty three. Fast, no handshake. If an answer is too big, say many records or signatures, Rex retries over T C P. And an extension called E D N S zero lets a resolver announce a bigger buffer, commonly twelve thirty two or four thousand ninety six bytes, so most answers still fit.
+
+40
+00:06:22,776 --> 00:06:31,026
+Narrator: Ava's book holds records. An A record maps a name to an I P version four address. A quad A record does the same for version six.
+
+41
+00:06:31,456 --> 00:06:56,002
+Narrator: A C name is an alias. Www points to the main name, and Rex asks again for the target. But a C name cannot sit beside any other record at the same name. And the bare domain, the zone apex, must carry the S O A and N S records. So it can never be a C name. That is why providers sell an alias record, a flattened C name, which behaves like one but sits legally at the apex.
+
+42
+00:06:56,432 --> 00:07:16,562
+Narrator: M X says which mail servers take the mail, with a priority. T X T holds free text, like ownership proofs and the mail guards. S P F lists who may send as you. D K I M publishes a key to check signatures. D M A R C says what to do when those fail. N S delegates, and S O A is the zone's header, one per zone.
+
+43
+00:07:16,992 --> 00:07:27,449
+Narrator: P T R goes backwards, from number to name. S R V names the host and port of a service. And C A A lists which certificate authorities may issue certificates for your domain.
+
+44
+00:07:30,399 --> 00:07:44,577
+Narrator: Because Ava can answer differently to different questions, D N S becomes a crude traffic director. Round robin. She lists several numbers and the client picks one. Simple, but a dead house keeps getting visitors until the caches expire.
+
+45
+00:07:45,007 --> 00:08:03,146
+Narrator: Geo D N S. Ava looks at where the question came from, and hands out the nearest branch. A visitor in Mumbai gets Mumbai. A visitor in Dublin gets Dublin. But she judges by where Rex is, not where Rita is, so someone on a V P N, or using a far away public resolver, gets the wrong branch.
+
+46
+00:08:03,576 --> 00:08:11,922
+Narrator: Health checked failover. Ava keeps probing each house, and stops handing out any that fail. But even this is bounded by the T T L.
+
+47
+00:08:12,351 --> 00:08:24,946
+Narrator: Remember the ceiling. All of this happens before any connection exists. D N S chooses which number, coarsely. It never looks at the request itself, so it is no replacement for a per request load balancer.
+
+48
+00:08:27,896 --> 00:08:47,857
+Narrator: Inside a Kubernetes cluster, an internal server called Core D N S answers names like my service, dot my namespace, dot S V C, dot cluster dot local. Every pod carries a rule, n dots five. A name with fewer than five dots first tries each suffix on a search list. A name with five or more dots skips the list.
+
+49
+00:08:48,288 --> 00:08:59,009
+Narrator: That is why external names can feel slow in a pod. Every suffix is tried, and fails, before the real lookup. A trailing dot on external names forces an absolute query immediately.
+
+50
+00:09:01,960 --> 00:09:21,322
+Narrator: Plain D N S trusts everyone. An attacker can race a forged answer to Rex, or leave a poisoned one in his memory. The defence is D N S sec. Zones sign their records, and publish keys. Each parent vouches for its child with a D S record, all the way up to the root, whose key is built into a validating resolver.
+
+51
+00:09:21,751 --> 00:09:24,121
+Roz: I vouch for dot com.
+
+52
+00:09:24,552 --> 00:09:26,346
+Tom: I vouch for example dot com.
+
+53
+00:09:26,775 --> 00:09:28,857
+Ava: And I sign my answer.
+
+54
+00:09:29,288 --> 00:09:54,793
+Narrator: But the protection only exists if Rex actually checks. And D N S sec does not hide the question. Anyone on the path can still see which names Rita looks up. That is what D O H and D O T are for, D N S over H T T P S, and D N S over T L S. They encrypt the talk between Rita and Rex, at the cost of needing T L S, and of network middle boxes losing their ability to filter plain questions.
+
+55
+00:09:57,744 --> 00:10:13,577
+Narrator: When something breaks, ask with a tool called dig. Its columns are the name, the T T L remaining, the class, the type, and the data. And with plus trace, dig repeats Rex's own walk, showing each referral, root, then dot com, then the authority, so you are not trusting a possibly stale cache.
+
+56
+00:10:16,528 --> 00:10:39,442
+Narrator: The classic traps. Forgot to lower the T T L before a move, so the old address keeps getting visitors, up to the old T T L, everywhere. A C name placed at the apex, use an alias record. A no cached just before you created the record. Pods slow on n dots. And split horizon D N S, different answers inside and outside, useful, but you must keep two books in sync.
+
+57
+00:10:39,871 --> 00:10:54,649
+Narrator: And watch these. Query volume, and errors like server fail and N X domain at your authoritative servers. D N S sec validation failures. Health check status on any geo or failover rule. And response time from each client region.
+
+58
+00:10:57,600 --> 00:11:15,450
+Narrator: A few deeper points. First, trust. A stub resolver trusts its recursive resolver completely. It cannot verify the walk itself. That is exactly the boundary D N S sec validation, and D O H and D O T, work on. A compromised Rex could lie to every client behind him.
+
+59
+00:11:15,879 --> 00:11:32,601
+Narrator: Second, large U D P answers avoid the T C P round trip, but they are also the classic tool for D N S amplification attacks. A spoofed source address sends a tiny question that returns a huge answer, and the flood lands on the victim. So operators limit who may ask.
+
+60
+00:11:33,032 --> 00:11:48,481
+Narrator: Third, anycast and T C P. Anycast is clean for U D P, since each packet can go to the nearest copy. But a T C P connection must stay on one instance for its life. If the routes flap in the middle, the connection breaks, even though the address never changed.
+
+61
+00:11:48,912 --> 00:12:01,409
+Narrator: Fourth, why Go does not cache. Caching is a policy choice, how long, how to rotate, how to handle failures. So the standard library leaves it to your application, or to the operating system resolver it already delegates to.
+
+62
+00:12:01,840 --> 00:12:13,258
+Narrator: And last, D N S sec proves that a name does not exist in an awkward way, with N S E C records showing there is nothing between two names. And a large share of resolvers still do not validate at all.
+
+63
+00:12:16,207 --> 00:12:25,081
+Narrator: Now the code. In Go, a small caching resolver, because Go's resolver caches nothing. Every call to look up host makes a fresh network query.
+
+64
+00:12:25,511 --> 00:12:39,953
+Narrator: The cache is a map from host name to an entry, holding the addresses, and the time they expire. A mutex guards it. The resolver is hidden behind a tiny interface, so tests can fake it, and the clock is replaceable, so tests never have to sleep.
+
+65
+00:12:40,384 --> 00:12:49,066
+Narrator: Lookup takes the lock, and checks the map. If the entry exists, and now is before its expiry, that is a cache hit, and it returns without touching the network.
+
+66
+00:12:49,495 --> 00:13:04,250
+Narrator: Otherwise it is a miss. It calls the upstream resolver, and stores the answer with an expiry of now plus the T T L. The next call inside that window is a hit. A real cache would read each record's own T T L, instead of one fixed value.
+
+67
+00:13:04,679 --> 00:13:16,193
+Narrator: The tests prove two things. A lookup inside the T T L makes zero extra upstream calls. And a lookup after the T T L expires triggers a fresh one. Both pass with the race detector on.
+
+68
+00:13:19,144 --> 00:13:22,426
+Narrator: Interview round. Seven questions you will really get.
+
+69
+00:13:22,855 --> 00:13:36,337
+Narrator: One. Recursive versus authoritative? A recursive resolver does the whole walk for a client, and caches. It owns no data. An authoritative server holds the real records for its zones, and never walks for anyone else.
+
+70
+00:13:36,768 --> 00:13:49,841
+Narrator: Two. A trap. D N S propagation takes up to forty eight hours. False. The new answer is live at once. Caches holding the old one wait out their T T L. Lower the T T L before a change.
+
+71
+00:13:50,272 --> 00:14:01,042
+Narrator: Three. Why no C name at the apex? It cannot sit beside other records, and the apex must carry S O A and N S. So use an alias, or flattened C name, record.
+
+72
+00:14:01,471 --> 00:14:11,282
+Narrator: Four. How does negative caching work? A no, N X domain or no data, is cached for the S O A minimum, so a typo is not re asked on every lookup.
+
+73
+00:14:11,711 --> 00:14:25,673
+Narrator: Five. D N S load balancing versus a load balancer? D N S picks which address a client gets, cached up to the T T L, before any connection exists. A load balancer routes each request or connection in real time.
+
+74
+00:14:26,104 --> 00:14:34,114
+Narrator: Six. Does Go's resolver cache? No. Every call is a fresh query. Wrap it yourself if you want T T L aware reuse.
+
+75
+00:14:34,543 --> 00:14:48,433
+Narrator: Seven. What do D O H and D O T solve that D N S sec does not? D N S sec proves an answer was not tampered with. D O H and D O T hide the question from the network. Different problems, often both wanted.
+
+76
+00:14:51,384 --> 00:14:57,234
+Narrator: Let us put it all together. Rita typed a name. Here is what happened, and what to remember.
+
+77
+00:14:57,663 --> 00:15:10,570
+Narrator: One. D N S turns names into numbers, and gives every name an owner who can change the number at any time. Nobody holds the whole book. It is delegated: root, then T L D, then the authoritative server.
+
+78
+00:15:11,000 --> 00:15:21,193
+Narrator: Two. Rita's laptop is a stub. It asks a recursive resolver, who does the walk with iterative questions, collecting referrals, and hands back one final answer.
+
+79
+00:15:21,624 --> 00:15:40,337
+Narrator: Three. Answers are cached at every layer, the browser, the operating system, the resolver, and your own program. T T L is a countdown that starts fresh at each one. Lower it before a migration, and remember that propagation is just old caches expiring. Even no is cached, for the S O A minimum.
+
+80
+00:15:40,768 --> 00:15:55,833
+Narrator: Four. Zones are linked by N S records, and glue records break the circle when a nameserver lives inside its own zone. The root has thirteen names, but hundreds of machines behind them through anycast. Questions go over U D P, and fall back to T C P.
+
+81
+00:15:56,264 --> 00:16:10,826
+Narrator: Five. Records say what a name means. A and quad A for addresses. C name for aliases, never at the apex. M X and T X T for mail. N S, S O A, P T R, S R V and C A A for the rest.
+
+82
+00:16:11,255 --> 00:16:24,809
+Narrator: Six. D N S can steer traffic, round robin, by location, or by health. But it chooses before any connection, coarsely, and always bounded by the T T L. It is not a per request load balancer.
+
+83
+00:16:25,240 --> 00:16:38,625
+Narrator: Seven. Sign it with D N S sec so answers can be trusted, and encrypt it with D O H or D O T so nobody watches the questions. In a cluster, mind n dots five. When it breaks, use dig with plus trace.
+
+84
+00:16:39,056 --> 00:16:48,649
+Narrator: And the one line to keep: D N S is a delegated, cached phone book. Every surprise you will ever see in it is really a cache, a T T L, or a delegation.
+
+85
+00:16:49,080 --> 00:17:05,874
+Narrator: To go deeper, open the D N S note and its Go note in your vault. Before it, read how the internet works, and I P addressing. After it, T L S and H T T P S, and C D N and edge. Compare it with load balancing, and with forward and reverse proxies.
+
+86
+00:17:06,304 --> 00:17:10,786
+Rita: Thank you, Rex! I found my friend's house.
+
+87
+00:17:11,215 --> 00:17:12,938
+Rex: Next!
+

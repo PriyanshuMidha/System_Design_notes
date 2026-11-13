@@ -9,7 +9,7 @@ sources:
   - "Kubernetes documentation: CronJob (concurrencyPolicy, startingDeadlineSeconds)"
   - "Varghese & Lauck, Hashed and Hierarchical Timing Wheels (SOSP 1987)"
   - "Amazon SQS Developer Guide: visibility timeout, delay queues (max 15 minutes)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Distributed Job Scheduler
@@ -24,9 +24,57 @@ updated: 2026-11-04
 > - Execution is therefore **at least once**. The job's effect must be idempotent.
 > - Recurring (cron) schedules create one run per fire time, deduplicated by a unique key `(schedule_id, fire_time)`.
 
+## Start here: the basics
+
+**The problem in one story.**
+You want an app to send 10 million reminders a day, each at its own time.
+One server with cron can do it, until it reboots at 02:00 and the jobs never run.
+Add a second server and now every job runs twice.
+A distributed scheduler runs each job on time, once, even when machines fail.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Job | A piece of work to run at a given time | "Email user 42 at 09:00" |
+| Cron | A schedule format for repeating jobs | `0 2 * * *` = every day at 02:00 |
+| Worker | A process that actually runs the job | A pod calling the email API |
+| Poller | A loop that looks for jobs that are due | Every second: find jobs with `run_at <= now` |
+| Lease | A time-limited claim on a job | Worker A owns job 9 for 30 s |
+| Heartbeat | A periodic "I am still alive" signal | Renew the lease every 10 s |
+| Idempotent | Running twice has the same effect as once | Sending reminder #9 checks it was not sent |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    API["Create job API"] --> DB[("Durable job store<br/>sorted by run time")]
+    P["Pollers"] --> DB
+    P --> W["Workers run job"]
+    W -- "heartbeat" --> DB
+    W -- "done" --> DB
+```
+
+**Analogy.** A hotel wake-up-call desk: cards sorted by time, clerks hand due cards to callers, and a caller who stops checking in loses the card to someone else.
+Where it breaks: a human caller who wakes up late knows not to call again, but a paused worker does not, so the store must reject its stale attempt number.
+
+**How the rest of this note builds up**
+
+- First, why single-server cron fails (section 1) and the wake-up desk model (section 2).
+- Then the high-level design: store, pollers, leases and workers (section 3), with estimates, API and data model (section 4).
+- Then variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production systems, timing wheels, bursts, fencing and exactly-once effects (sections 7-8).
+
+> [!tip] Remember
+> Store jobs durably, claim them with expiring leases, and make every job safe to run twice.
+
 ## 1. Why it exists - requirements
 
-A single-server cron runs jobs until the server reboots during the 02:00 run, or until you add a second replica and every job runs twice. A product team now wants 10 million user reminders a day, each at its own time, plus thousands of hourly and nightly reports. The scheduler must be a service of its own. The single-service mechanics (cron syntax, Kubernetes CronJob, `SKIP LOCKED` polling) are in [[Scheduled Jobs - Cron to Durable Schedulers]]; this note designs the distributed, multi-tenant version.
+A single-server cron runs jobs until the server reboots during the 02:00 run, or until you add a second replica and every job runs twice.
+
+A product team now wants 10 million user reminders a day, each at its own time, plus thousands of hourly and nightly reports. The scheduler must be a service of its own.
+
+The single-service mechanics (cron syntax, Kubernetes CronJob, `SKIP LOCKED` polling) are in [[Scheduled Jobs - Cron to Durable Schedulers]]; this note designs the distributed, multi-tenant version.
 
 **Functional requirements**
 - Submit a one-off job with a `run_at` time and a payload (HTTP callback, queue message or registered handler).
@@ -46,7 +94,13 @@ A single-server cron runs jobs until the server reboots during the 02:00 run, or
 
 ## 2. Mental model
 
-Picture a hotel wake-up-call desk. Every request is written on a card and filed in a box sorted by time (the durable store). A few clerks (pollers) keep pulling cards that are due and hand them to callers (workers). A caller signs the card with the time they took it and must re-sign every 10 seconds while still on the phone. If a card has not been re-signed for 30 seconds, the desk assumes the caller fainted and gives the card, with a new attempt number, to someone else. When the first caller wakes up and tries to stamp "done" with the old number, the desk refuses.
+Picture a hotel wake-up-call desk:
+
+1. Every request is written on a card and filed in a box sorted by time (the durable store).
+2. A few clerks (pollers) keep pulling cards that are due and hand them to callers (workers).
+3. A caller signs the card with the time they took it and must re-sign every 10 seconds while still on the phone.
+4. If a card has not been re-signed for 30 seconds, the desk assumes the caller fainted and gives the card, with a new attempt number, to someone else.
+5. When the first caller wakes up and tries to stamp "done" with the old number, the desk refuses.
 
 ## 3. How it works - high-level design
 
@@ -129,7 +183,10 @@ All inputs are estimates.
 | Run history | 200 B per attempt row | 50 M × 200 B = 10 GB/day; × 30 days | ~300 GB, partitioned by day, old partitions dropped |
 | Lease writes | each run: claim + 1 heartbeat + complete ≈ 3 writes | 579/s × 3 | ~1,700 writes/s average, ~42,000/s in the burst second |
 
-The burst, not the average, sizes the system. Two fixes: spread the burst (the API can add up to a few seconds of jitter to cron jobs whose owners opt in), and claim **ahead**: pollers lease jobs due in the next few seconds into an in-memory timing wheel on the worker side, which fires them on time (see the deep dive).
+The burst, not the average, sizes the system. Two fixes:
+
+1. Spread the burst: the API can add up to a few seconds of jitter to cron jobs whose owners opt in.
+2. Claim **ahead**: pollers lease jobs due in the next few seconds into an in-memory timing wheel on the worker side, which fires them on time (see the deep dive).
 
 ### API
 
@@ -687,3 +744,8 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 - **Building blocks:** [[Partitioning and Sharding]], [[Replication]], [[Distributed Locks and Fencing Tokens]], [[Leader Election]], [[Timeouts, Retries and Backoff]], [[Dead Letter Queues and Poison Messages]], [[Transactional Outbox and CDC]], [[Kafka and Event Streaming]], [[Unique ID Generation]]
 - **Next:** [[Case Study - Metrics and Logging Platform]] (how you would watch this scheduler), [[Workflow Engines and Durable Execution]]
 - **Compare with:** [[Task Scheduler (delayed and recurring jobs)]] (class-level LLD twin), [[Case Study - Ride Sharing and Proximity]] (same lease-with-expiry idea for driver offers), [[Saga Pattern]]
+
+### Watch on YouTube
+
+- [20: Distributed Job Scheduler / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=pzDwYHRzEnk) · Jordan has no life · 30 min · 78,748 views
+- [Distributed Job Scheduler Design Deep Dive with Google SWE! / Systems Design Interview Question 25](https://www.youtube.com/watch?v=WTxG5880EH8) · Jordan has no life · 19 min · 37,014 views

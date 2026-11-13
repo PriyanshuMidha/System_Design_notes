@@ -7,7 +7,7 @@ prereqs: ["[[Data Structures Overview and Big-O Cheat Sheet]]", "[[Arrays and Dy
 related: ["[[Stacks, Queues and Deques]]", "[[Graphs and Graph Algorithms]]"]
 sources:
   - "Go std lib docs, package container/ring (go.dev/pkg/container/ring)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Stacks, Queues and Deques - Go
@@ -15,9 +15,20 @@ updated: 2026-11-09
 > [!summary] TL;DR
 > A generic slice-backed `Stack[T]`, a generic `RingBuffer[T]` queue, the monotonic-stack and monotonic-deque patterns, multi-source BFS, and a buffered channel used as a bounded concurrent pipeline — one tested implementation per idea in [[Stacks, Queues and Deques]].
 
+## Before the code
+
+- **Generics** (`Stack[T any]`, `RingBuffer[T any]`): one stack or queue type that works for any element type, checked at compile time.
+- **Slices** (`append`, `s[:len(s)-1]`): push and pop for a stack; a fixed slice used in a circle for the ring buffer.
+- **Sentinel errors** (`var ErrEmpty = errors.New(...)`): one shared error value callers can compare against with `errors.Is`.
+- **Goroutines and channels** (`go func`, `chan int`): `RunPipeline` uses a buffered channel as a bounded FIFO queue between a producer and a consumer.
+- **`sync.WaitGroup` and `sync.Mutex`**: wait for goroutines to finish, and protect shared data from two goroutines writing at once.
+- **What to run:** `go vet ./sqd/... && go test -race ./sqd/...` inside the module; `-race` matters for `RunPipeline`.
+
 ## What this code shows
 
-This file moves from the simplest structure (a stack, no concurrency at all) to the most involved (a channel-based pipeline with two goroutines and a mutex), in the same order the theory note introduces the ideas. Reading top to bottom therefore also walks from "no concurrency concerns" to "concurrency is the entire point," which is deliberate: each step's Go-specific detail builds on the one before it.
+This file moves from the simplest structure (a stack, no concurrency at all) to the most involved (a channel-based pipeline with two goroutines and a mutex), in the same order the theory note introduces the ideas.
+
+Reading top to bottom therefore also walks from "no concurrency concerns" to "concurrency is the entire point," which is deliberate: each step's Go-specific detail builds on the one before it.
 
 | Code piece | Theory concept it demonstrates |
 |---|---|
@@ -58,13 +69,21 @@ Four Go-specific ideas recur across the steps below, worth naming once up front 
 
 ### How the pieces in this file relate to each other
 
-`Stack[T]` and `RingBuffer[T]` are fully independent generic types; `ValidParentheses` and `DailyTemperatures` both build on `Stack[T]` but use it for opposite reasons (matching nested structure versus finding a nearest dominating value). `SlidingWindowMax` needs a plain slice rather than `Stack[T]` specifically because it needs both-end access, which a single-ended stack doesn't provide. `RottingOranges` and `RunPipeline` are the two pieces that reach for genuine queue behavior (FIFO order, and respectively multi-source graph traversal or cross-goroutine communication) rather than a stack's LIFO order.
+`Stack[T]` and `RingBuffer[T]` are fully independent generic types; `ValidParentheses` and `DailyTemperatures` both build on `Stack[T]` but use it for opposite reasons (matching nested structure versus finding a nearest dominating value).
+
+`SlidingWindowMax` needs a plain slice rather than `Stack[T]` specifically because it needs both-end access, which a single-ended stack doesn't provide.
+
+`RottingOranges` and `RunPipeline` are the two pieces that reach for genuine queue behavior (FIFO order, and respectively multi-source graph traversal or cross-goroutine communication) rather than a stack's LIFO order.
 
 None of these seven pieces depends on any other, so — as with the sorting and searching companion note — they can be read in any order without losing anything, though reading them in the order presented follows the same simple-to-involved progression the theory note itself uses.
 
-That independence also means each exercise below can be attempted on its own function without needing to touch, or risk breaking, any of the others — a useful property when studying one structure at a time rather than the whole file at once. It's also why the tests are organized one-per-structure rather than as a single end-to-end test: a failure immediately points at exactly one piece of code, never a tangle of several.
+That independence also means each exercise below can be attempted on its own function without needing to touch, or risk breaking, any of the others — a useful property when studying one structure at a time rather than the whole file at once.
 
-This mirrors how these structures tend to compose in a real program: a service might use a `Stack[T]` for one unrelated concern (parsing, say) and a `RingBuffer[T]` for another (buffering outgoing requests) without those two structures ever needing to know about each other. The independence in this file is a direct reflection of that — each structure is complete and useful entirely on its own, never requiring any of the others to function correctly.
+It's also why the tests are organized one-per-structure rather than as a single end-to-end test: a failure immediately points at exactly one piece of code, never a tangle of several.
+
+This mirrors how these structures tend to compose in a real program: a service might use a `Stack[T]` for one unrelated concern (parsing, say) and a `RingBuffer[T]` for another (buffering outgoing requests) without those two structures ever needing to know about each other.
+
+The independence in this file is a direct reflection of that — each structure is complete and useful entirely on its own, never requiring any of the others to function correctly.
 
 Keeping that in mind while reading the Code section below is worth one more sentence: nothing stops you from copying out just `RingBuffer[T]` (say) into a different project without the rest of this file, and it would compile and work exactly as shown here, with no hidden dependency on anything else in this note.
 
@@ -424,7 +443,9 @@ The consumer goroutine drains the channel and writes results, guarded by a mutex
 
 ## Tests
 
-Four tests, one per structure that has nontrivial state to get wrong (`Stack[T]` is simple enough that its correctness follows directly from a plain slice's, so it has no dedicated test of its own here). Each test below states the property it's actually checking before showing the code, because the property — not the specific numbers — is what should be internalized and re-checked whenever this code changes.
+Four tests, one per structure that has nontrivial state to get wrong (`Stack[T]` is simple enough that its correctness follows directly from a plain slice's, so it has no dedicated test of its own here).
+
+Each test below states the property it's actually checking before showing the code, because the property — not the specific numbers — is what should be internalized and re-checked whenever this code changes.
 
 ### `TestRingBuffer`
 
@@ -454,7 +475,9 @@ func TestRingBuffer(t *testing.T) {
 }
 ```
 
-A failure here would mean `grow` lost an element or scrambled the order — the most likely cause being a copy that used raw array order instead of logical (`head`-relative) order. Tracing this test by hand: after the two initial pushes the buffer holds `[1,2]` with `head=0`; the third push triggers `grow`, which must read `buf[(0+0)%2]=1` then `buf[(0+1)%2]=2` into the new array's slots `0` and `1`, reset `head` to `0`, and only then write `3` into slot `2` — any deviation from that exact order is what the three `Pop` assertions at the end would catch.
+A failure here would mean `grow` lost an element or scrambled the order — the most likely cause being a copy that used raw array order instead of logical (`head`-relative) order.
+
+Tracing this test by hand: after the two initial pushes the buffer holds `[1,2]` with `head=0`; the third push triggers `grow`, which must read `buf[(0+0)%2]=1` then `buf[(0+1)%2]=2` into the new array's slots `0` and `1`, reset `head` to `0`, and only then write `3` into slot `2` — any deviation from that exact order is what the three `Pop` assertions at the end would catch.
 
 ### `TestSlidingWindowMax`
 
@@ -524,7 +547,9 @@ func TestRunPipeline(t *testing.T) {
 }
 ```
 
-A failure here under `-race` specifically (rather than a plain `go test`) would mean the mutex around `out`/`idx` is missing or misplaced — the values could still happen to come out right on a given run while the memory access itself is unsafe. This is the one test in this note where "the assertion passed" and "the code is correct" are genuinely different claims: the assertion only checks the final `out` slice, while `-race` is what checks that getting there never involved two goroutines touching the same memory location at the same time without synchronization.
+A failure here under `-race` specifically (rather than a plain `go test`) would mean the mutex around `out`/`idx` is missing or misplaced — the values could still happen to come out right on a given run while the memory access itself is unsafe.
+
+This is the one test in this note where "the assertion passed" and "the code is correct" are genuinely different claims: the assertion only checks the final `out` slice, while `-race` is what checks that getting there never involved two goroutines touching the same memory location at the same time without synchronization.
 
 **Measured output** (Go 1.24.4, darwin/arm64, scratch module, 2026-11-09):
 
@@ -536,7 +561,9 @@ ok  	cs1scratch/sqd	0.187s
 
 ## Pitfalls in the code
 
-None of the pitfalls below show up as a compile error or a panic on first run — that's precisely what makes them pitfalls rather than bugs you'd catch immediately. Each one either produces a plausible-looking wrong answer, a slow memory leak that only matters over a long process lifetime, or a race that only shows up under the race detector or under real concurrent load.
+None of the pitfalls below show up as a compile error or a panic on first run — that's precisely what makes them pitfalls rather than bugs you'd catch immediately.
+
+Each one either produces a plausible-looking wrong answer, a slow memory leak that only matters over a long process lifetime, or a race that only shows up under the race detector or under real concurrent load.
 
 - **Copying a ring buffer in raw array order during `grow`.** It must copy in *logical* order (`(head+i) % len(buf)`), or wrapped-around data gets scrambled the moment a grow happens right after the buffer has wrapped past index 0. This is the single easiest mistake to make when porting a textbook ring-buffer description straight into code: the textbook diagram shows the *logical* sequence, but the backing array's physical layout after several wraps rarely matches it.
 - **Forgetting to zero a popped slot.** Both `Stack.Pop` and `RingBuffer.Pop` explicitly zero the vacated slot before shrinking/advancing — skipping this is harmless for `int` but silently keeps large or pointer-holding values reachable to the GC indefinitely, the generic-code equivalent of the slice-leak problem the theory note opens with.
@@ -553,7 +580,11 @@ None of the pitfalls below show up as a compile error or a panic on first run �
 | `SlidingWindowMax` uses a plain `[]int` deque rather than `RingBuffer[T]` | Reuse `RingBuffer[T]` for the deque | A plain slice needs both-end access (`deque[0]` and `deque[len-1]`) which `RingBuffer[T]` doesn't expose; introducing a second generic type just for this one function would add indirection without adding clarity |
 | `RottingOranges` uses `[][2]int` for coordinates rather than a named `struct{ r, c int }` | A named coordinate struct | The anonymous array pair keeps the function self-contained with no extra type declaration; a named struct would read better if coordinates were used across multiple functions in the same package |
 
-None of these choices is the only reasonable one — they're the choices that keep each function's teaching point in focus. A production codebase with many functions sharing grid coordinates would likely promote `[2]int` to a named type the moment a second function needed it; a production pipeline handling many concurrent consumers would likely promote the mutex to a dedicated results channel. Neither promotion changes the underlying pattern being taught, which is why this note keeps the simpler form.
+None of these choices is the only reasonable one — they're the choices that keep each function's teaching point in focus.
+
+A production codebase with many functions sharing grid coordinates would likely promote `[2]int` to a named type the moment a second function needed it; a production pipeline handling many concurrent consumers would likely promote the mutex to a dedicated results channel.
+
+Neither promotion changes the underlying pattern being taught, which is why this note keeps the simpler form.
 
 ## Running it
 
@@ -586,7 +617,11 @@ It's worth seeing all seven pieces of code in this note next to each other on co
 
 ### Where context would matter, and where it deliberately doesn't
 
-`RunPipeline` has no `context.Context` parameter, which is worth noting explicitly rather than leaving implicit: a production version of this pipeline would almost certainly take one, so a caller could cancel an in-flight pipeline (for a request timeout, for instance) instead of waiting for every item to finish unconditionally. It's omitted here because adding cancellation correctly means also deciding what a canceled consumer does with a half-filled `out` slice and a producer still trying to send — real design decisions that would dilute this note's actual teaching point, which is the queue/backpressure mechanics, not cancellation semantics. The exercises below point at exactly this gap.
+`RunPipeline` has no `context.Context` parameter, which is worth noting explicitly rather than leaving implicit: a production version of this pipeline would almost certainly take one, so a caller could cancel an in-flight pipeline (for a request timeout, for instance) instead of waiting for every item to finish unconditionally.
+
+It's omitted here because adding cancellation correctly means also deciding what a canceled consumer does with a half-filled `out` slice and a producer still trying to send — real design decisions that would dilute this note's actual teaching point, which is the queue/backpressure mechanics, not cancellation semantics.
+
+The exercises below point at exactly this gap.
 
 ## Exercises
 
@@ -612,6 +647,10 @@ Keeping that purpose in view while changing the code is what separates "the test
 
 ### A closing note on reading this file top to bottom
 
-If you read only one takeaway from this note, make it this: every structure above traded a small amount of extra bookkeeping (an error return, a head/size pair, a mutex) for a correctness or memory guarantee a naive version doesn't have. That trade is almost always worth it, and recognizing which guarantee each piece of bookkeeping buys you is the actual transferable skill — not memorizing these seven functions by name.
+If you read only one takeaway from this note, make it this: every structure above traded a small amount of extra bookkeeping (an error return, a head/size pair, a mutex) for a correctness or memory guarantee a naive version doesn't have.
 
-Concretely: `Stack[T]`'s error return buys "no panic on empty"; `RingBuffer[T]`'s head/size pair buys "no leaked backing array"; the monotonic stack/deque's pop-before-push rule buys `O(n)` instead of `O(n²)`; `RottingOranges`'s per-level queue buys a correct minute count instead of an approximate one; and `RunPipeline`'s mutex buys a program that is actually safe under concurrent access, not merely one that happens to produce the right numbers on a given run. Each of these is a small, local price for a guarantee that would otherwise fail silently, often far from where the missing guarantee was actually needed.
+That trade is almost always worth it, and recognizing which guarantee each piece of bookkeeping buys you is the actual transferable skill — not memorizing these seven functions by name.
+
+Concretely: `Stack[T]`'s error return buys "no panic on empty"; `RingBuffer[T]`'s head/size pair buys "no leaked backing array"; the monotonic stack/deque's pop-before-push rule buys `O(n)` instead of `O(n²)`; `RottingOranges`'s per-level queue buys a correct minute count instead of an approximate one; and `RunPipeline`'s mutex buys a program that is actually safe under concurrent access, not merely one that happens to produce the right numbers on a given run.
+
+Each of these is a small, local price for a guarantee that would otherwise fail silently, often far from where the missing guarantee was actually needed.

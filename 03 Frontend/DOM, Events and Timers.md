@@ -8,13 +8,15 @@ sources:
   - "HTML Standard: timers (setTimeout/setInterval), the event loop"
   - "MDN Web Docs: Event bubbling and capturing, IntersectionObserver, MutationObserver"
 status: reviewed
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # DOM, Events and Timers
 
 > [!summary] TL;DR
-> The **DOM** is a live tree of JavaScript objects the browser builds from HTML text — it's a data structure in memory, not the HTML file itself. Events travel down the tree (capture), hit their target, then bubble back up, which is what makes event delegation possible. `setTimeout` runs once after at least a given delay; `setInterval` keeps running every interval until you explicitly stop it.
+> The **DOM** is a live tree of JavaScript objects the browser builds from HTML text — it's a data structure in memory, not the HTML file itself.
+>
+> Events travel down the tree (capture), hit their target, then bubble back up, which is what makes event delegation possible. `setTimeout` runs once after at least a given delay; `setInterval` keeps running every interval until you explicitly stop it.
 
 > [!abstract] Core idea
 > - The DOM tree is built once from HTML text, then JavaScript can keep mutating it; the original HTML string is never consulted again.
@@ -22,15 +24,67 @@ updated: 2026-11-09
 > - One listener on a parent, checking `event.target`, replaces listeners on every child — that's event delegation.
 > - `setInterval(fn, 1000)` fires repeatedly every ~1000ms until `clearInterval` is called; it does not run once. Both timers' delays are a minimum, not a guarantee.
 
+## Start here: the basics
+
+**The problem in one story.**
+You click a "Like" button and the heart turns red without reloading the page.
+Something had to notice the click, find the heart on the page and change it.
+That "something" is JavaScript talking to the DOM, the browser's live model of the page.
+Timers let the same code act later, like hiding a toast after 3 seconds.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| DOM | A tree of objects, one per tag, that JS can read and change | `document.body` |
+| Node / element | One item in that tree | The `<button>` object |
+| Event | A message that something happened | `"click"`, `"keydown"` |
+| Listener (handler) | A function run when an event fires | `btn.addEventListener("click", fn)` |
+| Callback | A function you pass in to be called later | `setTimeout(fn, 500)` |
+| Bubbling | An event travelling up from the clicked element to its parents | Click on `<li>` also reaches `<ul>` |
+| Event loop | The browser's loop that runs queued callbacks one at a time | Runs your timer callback when the stack is free |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User clicks"] --> E["Browser creates<br/>click event"]
+    E --> C["Capture: root down<br/>to target"]
+    C --> T["Target's listeners run"]
+    T --> B["Bubble: target up<br/>to root"]
+    B --> D["Your code updates<br/>the DOM"]
+```
+
+**Analogy.** The DOM is a family tree of the page; an event is a shout that travels down to the person who was poked and then back up through their parents, and anyone listening along the way can react.
+Where it breaks: real family members can't cancel a shout; `stopPropagation` can stop an event from travelling further.
+
+**How the rest of this note builds up**
+
+- First, why the DOM exists and a mental model of it (sections 1-2).
+- Then selecting and updating nodes, event flow and delegation, cleanup with `AbortController`, and timers (section 3).
+- Then a whiteboard version, a one-shot vs repeating timer trace and a Go comparison (section 4).
+- Finally variants, trade-offs, production practice and the deep dive, then interview questions (sections 5-9).
+
+> [!tip] Remember
+> JS changes the page through the DOM tree; events flow down then up; timer delays are a minimum, not a promise.
+
 ## 1. Why it exists
 
-HTML describes a page's initial structure, but a page has to react after that: a click, a typed character, data arriving from the network. The browser needs (a) an in-memory structure it can inspect and change at runtime, since the original HTML text is long gone by the time a user clicks something, and (b) a way to run code later — after a delay, or every N milliseconds, since not all work can happen the instant the page loads.
+HTML describes a page's initial structure, but a page has to react after that: a click, a typed character, data arriving from the network.
 
-Concretely: a task-list app deletes an item when its "x" button is clicked. There is no HTML for "delete the 4th item" — the delete has to find that specific DOM node (the one the event happened on) and remove it, then the browser re-paints the screen to match the new in-memory structure. That round trip — structure in memory, events telling you what changed, timers letting you defer work — is what this note covers.
+The browser needs (a) an in-memory structure it can inspect and change at runtime, since the original HTML text is long gone by the time a user clicks something, and (b) a way to run code later — after a delay, or every N milliseconds, since not all work can happen the instant the page loads.
+
+Concretely: a task-list app deletes an item when its "x" button is clicked.
+
+There is no HTML for "delete the 4th item" — the delete has to find that specific DOM node (the one the event happened on) and remove it, then the browser re-paints the screen to match the new in-memory structure.
+
+That round trip — structure in memory, events telling you what changed, timers letting you defer work — is what this note covers.
 
 ## 2. Mental model
 
-The **DOM tree is not the HTML file** — HTML is the opening instructions, and the DOM is the building the browser constructs from them and then keeps live and mutable for the rest of the page's life. `document.querySelector(...)` is just "walk this tree and find a room"; `el.remove()` is "tear a room out of the building", and the browser re-paints to match.
+The **DOM tree is not the HTML file** — HTML is the opening instructions, and the DOM is the building the browser constructs from them and then keeps live and mutable for the rest of the page's life.
+
+`document.querySelector(...)` is just "walk this tree and find a room"; `el.remove()` is "tear a room out of the building", and the browser re-paints to match.
 
 An event is a ripple starting at the window, traveling down to the exact element clicked (capture), then traveling back up through every ancestor (bubble) — like dropping a stone into a pond and watching the ripple go out both toward the center and back.
 
@@ -73,7 +127,9 @@ li.textContent = userInput;   // still safe: set as text, not markup
 document.querySelector("ul").append(li); // appendChild(li) also works; append() also takes plain strings
 ```
 
-Writing to the DOM triggers layout recalculation; reading a layout property (`offsetHeight`, `getBoundingClientRect()`) right after a write forces the browser to compute layout immediately instead of batching it, and alternating writes and reads in a loop (**layout thrashing**) can make a loop of 100 elements cost 100 forced layouts instead of one. Fix: read all the values you need first, then do all the writes, or batch writes with `requestAnimationFrame`.
+Writing to the DOM triggers layout recalculation; reading a layout property (`offsetHeight`, `getBoundingClientRect()`) right after a write forces the browser to compute layout immediately instead of batching it, and alternating writes and reads in a loop (**layout thrashing**) can make a loop of 100 elements cost 100 forced layouts instead of one.
+
+Fix: read all the values you need first, then do all the writes, or batch writes with `requestAnimationFrame`.
 
 ### Event flow: capture, target, bubble, and delegation
 
@@ -89,7 +145,9 @@ sequenceDiagram
     D-->>W: bubble phase continues
 ```
 
-A listener registered with `addEventListener("click", fn, { capture: true })` fires on the way down; the default (`capture: false`, the common case) fires on the way up. `event.stopPropagation()` stops the ripple from reaching further ancestors (or descendants, in capture); `event.preventDefault()` stops the browser's own default action (following a link, submitting a form) — they solve different problems and neither implies the other.
+A listener registered with `addEventListener("click", fn, { capture: true })` fires on the way down; the default (`capture: false`, the common case) fires on the way up.
+
+`event.stopPropagation()` stops the ripple from reaching further ancestors (or descendants, in capture); `event.preventDefault()` stops the browser's own default action (following a link, submitting a form) — they solve different problems and neither implies the other.
 
 **Event delegation** uses bubbling to put one listener on a stable ancestor instead of one per (possibly changing) child:
 
@@ -101,10 +159,14 @@ document.querySelector("#images").addEventListener("click", (e) => {
 });
 ```
 
-This single listener keeps working even if images are added to `#images` later — a per-image listener would need re-attaching every time. For a listener that only reads the event and never calls `preventDefault`, mark it `{ passive: true }` so the browser doesn't have to wait for your handler before scrolling — this matters most for `touchstart`/`wheel` listeners that can otherwise visibly delay scroll.
+This single listener keeps working even if images are added to `#images` later — a per-image listener would need re-attaching every time.
+
+For a listener that only reads the event and never calls `preventDefault`, mark it `{ passive: true }` so the browser doesn't have to wait for your handler before scrolling — this matters most for `touchstart`/`wheel` listeners that can otherwise visibly delay scroll.
 
 > [!warning] Common mistake
-> Attaching a listener and forgetting to remove it. `removeEventListener` needs the exact same function reference you passed to `addEventListener` — an inline arrow function can never be removed, because a new function value is created every time you write it. A listener left on an element you then remove from the DOM keeps that element (and anything it closes over) pinned in memory until the page unloads.
+> Attaching a listener and forgetting to remove it. `removeEventListener` needs the exact same function reference you passed to `addEventListener` — an inline arrow function can never be removed, because a new function value is created every time you write it.
+>
+> A listener left on an element you then remove from the DOM keeps that element (and anything it closes over) pinned in memory until the page unloads.
 
 ### Cleaning up listeners in bulk with AbortController
 
@@ -310,3 +372,8 @@ flowchart TD
 - **Next:** [[JavaScript Async - Event Loop, Promises, async-await]], [[React Fundamentals - Components, JSX, Props, State]]
 - **Compare with:** [[How Browsers Load and Render a Page]] (where the initial DOM tree comes from before any of this runs)
 - **Runnable code:** [[DOM, Events and Timers - Go]]
+
+### Watch on YouTube
+
+- [Web Development with JavaScript #4 - Event Bubbling, Capturing & Delegation](https://www.youtube.com/watch?v=1DXDizP7COQ) · A Coder's Journey · covers capture/bubble phases and delegation together with examples
+- [Event Delegation in JavaScript, Simplified](https://www.youtube.com/watch?v=aZ3JWv0ofuA) · Deeecode · short, simplified reinforcement of the delegation pattern

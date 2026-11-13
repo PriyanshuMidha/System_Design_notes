@@ -16,7 +16,7 @@ sources:
   - "Cahill, Röhm, Fekete, Serializable Isolation for Snapshot Databases (SIGMOD 2008)"
   - "Ports and Grittner, Serializable Snapshot Isolation in PostgreSQL (VLDB 2012)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 7"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Isolation Levels and MVCC
@@ -30,6 +30,52 @@ updated: 2026-11-07
 > - A version is visible if the transaction that created it committed before your snapshot and the one that deleted it did not.
 > - Classic mistake: assuming REPEATABLE READ stops every anomaly. Write skew still gets through; only SERIALIZABLE (with retries) or explicit locks stop it.
 > - Old versions stay until VACUUM; one long-open transaction blocks that cleanup everywhere.
+
+## Start here: the basics
+
+**The problem in one story.**
+Two cashiers check the same customer's credit limit at the same moment.
+Each sees "room for one more invoice" and each adds one.
+Both checks were correct on their own, yet together they break the limit.
+The database must decide how much each cashier sees of the other's unfinished work.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Transaction | A group of reads and writes that succeed or fail together | `BEGIN; UPDATE ...; COMMIT;` |
+| Commit | Make a transaction's changes permanent and visible | `COMMIT` |
+| Concurrent | Running at the same time as something else | Two API requests on one row |
+| Isolation level | The promise about what you see of other running transactions | READ COMMITTED, SERIALIZABLE |
+| Anomaly | A known bug that a weaker level allows | A dirty read, write skew |
+| Snapshot | A frozen view of committed data at one moment | What `SELECT` sees under REPEATABLE READ |
+| Row version | One copy of a row; an update makes a new copy | Old balance 100, new balance 80 |
+| VACUUM | PostgreSQL's cleanup of versions nobody can see any more | Run by autovacuum |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W["Writer: UPDATE row"] --> V1["Old version<br/>(xmax = writer)"]
+    W --> V2["New version<br/>(xmin = writer)"]
+    R1["Reader with older snapshot"] --> V1
+    R2["Reader with newer snapshot"] --> V2
+    V1 --> C["VACUUM removes it<br/>when no snapshot needs it"]
+```
+
+**Analogy.** Each transaction reads from its own printout of the database, while writers keep editing the live copy.
+Where it breaks: a printout cannot tell you that someone else is acting on the same facts, so two transactions can both make a decision that is wrong together (write skew).
+
+**How the rest of this note builds up**
+
+- First, why isolation exists (section 1) and the printout mental model (section 2).
+- Then the six anomalies and what each level prevents (section 3, first half).
+- Then how MVCC really works: heap versions, snapshots, the visibility rule, SSI, VACUUM and InnoDB undo logs (section 3, second half).
+- Then a traced worked example and comparisons (sections 4-6).
+- Finally the SDE-3 view: production failures, long transactions, wraparound and the deep dive (sections 7-8).
+
+> [!tip] Remember
+> MVCC means readers never block writers, but only SERIALIZABLE (with retries) or explicit locks stop write skew.
 
 ## 1. Why it exists
 
@@ -56,7 +102,9 @@ sequenceDiagram
     Note over DB: open balance is 115,000, limit was 100,000
 ```
 
-The open balance is now 115,000. Neither session did anything wrong on its own, and no row was written twice. At PostgreSQL's default level, and even at REPEATABLE READ, both commit. Running transactions one at a time would have rejected B. Isolation levels define how close to "one at a time" the database gets for you, and what you must add yourself.
+The open balance is now 115,000. Neither session did anything wrong on its own, and no row was written twice. At PostgreSQL's default level, and even at REPEATABLE READ, both commit.
+
+Running transactions one at a time would have rejected B. Isolation levels define how close to "one at a time" the database gets for you, and what you must add yourself.
 
 ## 2. Mental model
 
@@ -266,7 +314,11 @@ flowchart LR
 
 ### Snapshots and the commit log
 
-A **snapshot** records which transactions count as finished. `SELECT pg_current_snapshot();` prints it as `xmin:xmax:xip_list`, for example `735:738:736`: every xid below 735 had finished, none at or above 738 had started, and 736 was still running. Whether a finished xid committed or aborted is kept in `pg_xact`, two bits per transaction. The first reader to look a status up caches it in the tuple as **hint bits**, which is why a plain `SELECT` can dirty pages (and, with data checksums or `wal_log_hints` on, write WAL).
+A **snapshot** records which transactions count as finished. `SELECT pg_current_snapshot();` prints it as `xmin:xmax:xip_list`, for example `735:738:736`: every xid below 735 had finished, none at or above 738 had started, and 736 was still running.
+
+Whether a finished xid committed or aborted is kept in `pg_xact`, two bits per transaction.
+
+The first reader to look a status up caches it in the tuple as **hint bits**, which is why a plain `SELECT` can dirty pages (and, with data checksums or `wal_log_hints` on, write WAL).
 
 ```mermaid
 flowchart LR
@@ -321,9 +373,13 @@ sequenceDiagram
 
 ### SERIALIZABLE in PostgreSQL: SSI
 
-Since 9.1, PostgreSQL's SERIALIZABLE runs transactions exactly like REPEATABLE READ and additionally tracks **read-write dependencies**. "T1 →rw T2" means T1 read something that the concurrent T2 then wrote: a row version, or a gap T2 inserted into. Readers record what they read as **SIRead locks** (shown as `SIReadLock` in `pg_locks`). These never block anyone; they only let the database notice conflicts.
+Since 9.1, PostgreSQL's SERIALIZABLE runs transactions exactly like REPEATABLE READ and additionally tracks **read-write dependencies**. "T1 →rw T2" means T1 read something that the concurrent T2 then wrote: a row version, or a gap T2 inserted into.
 
-Every anomaly under snapshot isolation needs a "dangerous structure": two rw-dependencies in a row, T1 →rw T2 →rw T3, where T3 commits first (T1 and T3 may be the same transaction). PostgreSQL watches for that pattern and aborts one participant with 40001. That is cheap, but it also catches some harmless patterns (false positives), so retries are part of using SERIALIZABLE.
+Readers record what they read as **SIRead locks** (shown as `SIReadLock` in `pg_locks`). These never block anyone; they only let the database notice conflicts.
+
+Every anomaly under snapshot isolation needs a "dangerous structure": two rw-dependencies in a row, T1 →rw T2 →rw T3, where T3 commits first (T1 and T3 may be the same transaction).
+
+PostgreSQL watches for that pattern and aborts one participant with 40001. That is cheap, but it also catches some harmless patterns (false positives), so retries are part of using SERIALIZABLE.
 
 ```mermaid
 flowchart LR
@@ -375,7 +431,9 @@ stateDiagram-v2
 
 #### Bloat
 
-Dead tuples, and the index entries pointing at them, take space and slow scans until VACUUM runs. Autovacuum starts when dead tuples exceed `autovacuum_vacuum_threshold` (50) + `autovacuum_vacuum_scale_factor` (0.2) × rows, and since PostgreSQL 13 also after many inserts. Plain VACUUM makes space reusable inside the table but rarely shrinks the file; `VACUUM FULL` rewrites the table under an ACCESS EXCLUSIVE lock.
+Dead tuples, and the index entries pointing at them, take space and slow scans until VACUUM runs. Autovacuum starts when dead tuples exceed `autovacuum_vacuum_threshold` (50) + `autovacuum_vacuum_scale_factor` (0.2) × rows, and since PostgreSQL 13 also after many inserts.
+
+Plain VACUUM makes space reusable inside the table but rarely shrinks the file; `VACUUM FULL` rewrites the table under an ACCESS EXCLUSIVE lock.
 
 Example: a table with 1,000,000 rows triggers autovacuum after 50 + 0.2 × 1,000,000 = 200,050 dead tuples.
 
@@ -395,7 +453,11 @@ flowchart LR
 
 #### XID wraparound
 
-Transaction IDs are 32 bits and compared in a circle: about 2 billion xids are "in the past" and 2 billion "in the future". VACUUM **freezes** old tuples so they count as older than every xid. When a table's oldest unfrozen xid gets older than `autovacuum_freeze_max_age` (200 million), an anti-wraparound autovacuum is forced, even with autovacuum disabled. If that cannot keep up, PostgreSQL warns once only 40 million xids remain, and finally refuses to start transactions that need a new xid until a VACUUM fixes it. That is an outage.
+Transaction IDs are 32 bits and compared in a circle: about 2 billion xids are "in the past" and 2 billion "in the future". VACUUM **freezes** old tuples so they count as older than every xid.
+
+When a table's oldest unfrozen xid gets older than `autovacuum_freeze_max_age` (200 million), an anti-wraparound autovacuum is forced, even with autovacuum disabled.
+
+If that cannot keep up, PostgreSQL warns once only 40 million xids remain, and finally refuses to start transactions that need a new xid until a VACUUM fixes it. That is an outage.
 
 ```mermaid
 flowchart LR
@@ -618,3 +680,8 @@ flowchart LR
 - **Before this:** [[Transactions and ACID]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Next:** [[Locking - Optimistic vs Pessimistic]], [[Replication]], [[Transactions and the Repository Pattern]]
 - **Compare with:** [[Consistency Models]] (linearizability is about single objects in distributed systems; serializability is about transactions), [[Distributed SQL]] (serializable transactions across nodes)
+
+### Watch on YouTube
+
+- [(Backend #9) Understand isolation levels & read phenomena in MySQL & PostgreSQL via examples](https://www.youtube.com/watch?v=4EajrPgJAk0) · TECH SCHOOL · walks through anomalies with concrete query examples
+- [Stop Locking Your Database: How MVCC Solves Concurrency / KaaS-6](https://www.youtube.com/watch?v=8f7cktxHPw8) · Last Mile Developer · focused explanation of MVCC snapshots and versioning

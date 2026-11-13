@@ -7,14 +7,18 @@ sources:
   - "Go database/sql package docs (pkg.go.dev/database/sql), Tx.Rollback semantics"
   - "PostgreSQL 17 docs, chapter 13 (Concurrency Control) and Appendix A (PostgreSQL Error Codes)"
   - "sqlc documentation, WithTx pattern"
-updated: 2026-11-07
+updated: 2026-11-13
 status: reviewed
 ---
 
 # Transactions and the Repository Pattern
 
 > [!summary] TL;DR
-> A database transaction makes a group of writes succeed or fail together. In Go, that means opening one `*sql.Tx` and handing it — not a fresh `*sql.DB` — to every repository call that must share it, then committing once at the end. The repository pattern is how you keep that SQL out of business logic: repositories take an interface both `*sql.DB` and `*sql.Tx` satisfy, so the same repository code runs standalone or inside a shared transaction.
+> A database transaction makes a group of writes succeed or fail together.
+>
+> In Go, that means opening one `*sql.Tx` and handing it — not a fresh `*sql.DB` — to every repository call that must share it, then committing once at the end.
+>
+> The repository pattern is how you keep that SQL out of business logic: repositories take an interface both `*sql.DB` and `*sql.Tx` satisfy, so the same repository code runs standalone or inside a shared transaction.
 
 > [!abstract] Core idea
 > - `defer tx.Rollback()` right after `BeginTx` is always safe: it is a no-op once `Commit` has already succeeded.
@@ -23,17 +27,72 @@ status: reviewed
 > - Never make a network call — a queue publish, an HTTP request — while a transaction is open. Write an outbox row instead, and publish it after commit.
 > - Optimistic locking (a version column) and row locks (`SELECT ... FOR UPDATE`) solve the same problem — a concurrent writer — at different costs.
 
+## Start here: the basics
+
+**The problem in one story.**
+A customer pays an invoice. Your code must mark the invoice paid AND record the payment.
+If the server crashes between the two writes, the books disagree.
+A transaction makes both writes happen together, or neither.
+The repository pattern keeps that SQL tidy behind small Go types.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Transaction | A group of database writes that succeed or fail as one | Mark paid + insert payment |
+| Commit | "Make all my writes permanent now" | `tx.Commit()` |
+| Rollback | "Throw away all my writes" | `tx.Rollback()` |
+| Connection | One open line between your app and the database | One slot in a `*sql.DB` pool |
+| Repository | A Go type that hides SQL behind methods | `InvoiceRepo.MarkPaid(ctx, id)` |
+| Interface | A list of methods any type can satisfy | `DBTX` fits both `*sql.DB` and `*sql.Tx` |
+| Lock | A rule that stops two writers changing the same row at once | `SELECT ... FOR UPDATE` |
+| Outbox | A table of "messages to send later", written in the same transaction | Row: "invoice 42 paid" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Service:<br/>PayInvoice"] --> B["Begin transaction"]
+    B --> I["InvoiceRepo<br/>mark paid"]
+    B --> P["PaymentRepo<br/>insert payment"]
+    I --> C{"All OK?"}
+    P --> C
+    C -- "yes" --> CM["Commit"]
+    C -- "no" --> RB["Rollback"]
+```
+
+**Analogy.** A shopping cart at a checkout: items only become yours when you pay for the whole cart, and walking away puts every item back.
+Where it breaks: a real shop lets other shoppers grab items while you browse; a database transaction can hold locks that make other writers wait.
+
+**How the rest of this note builds up**
+
+- First, why partial writes hurt (section 1) and the mental model of one transaction shared by many repositories (section 2).
+- Then the lifecycle, `DBTX` and the `WithTx` helper, row locks vs optimistic locking (section 3).
+- Then the outbox pattern, retrying serialization failures, and the full worked example (sections 3-4).
+- Finally the SDE-3 deep dive: trade-offs, production failure modes and connection pinning (sections 5-8).
+
+> [!tip] Remember
+> One transaction, one connection, passed to every repository; commit once at the end, and never call the network while it is open.
+
 ## 1. Why it exists
 
-InvoiceOps processes a payment webhook: record the webhook event, apply the payment amount to the invoice, insert a payment row, and queue a notification — four writes that must all happen or none of them should. If the invoice update succeeds but the payment row insert fails and nobody rolls back the invoice update, the invoice now shows paid with no record of why.
+InvoiceOps processes a payment webhook: record the webhook event, apply the payment amount to the invoice, insert a payment row, and queue a notification — four writes that must all happen or none of them should.
 
-A transaction is Postgres's mechanism for this: `BEGIN`, a sequence of statements, then `COMMIT` or `ROLLBACK`. In Go, `*sql.Tx` represents that open transaction, and because it wraps one borrowed connection from the pool, every statement in it has to go through that same `*sql.Tx` value — not back through `*sql.DB`, which would run on a different, unrelated connection and see none of the uncommitted work.
+If the invoice update succeeds but the payment row insert fails and nobody rolls back the invoice update, the invoice now shows paid with no record of why.
 
-The repository pattern solves a separate but related problem: without it, the webhook handler ends up full of raw SQL, and that SQL gets copy-pasted into the next handler that also needs an invoice. A repository hides the SQL behind `repo.ApplyPayment(ctx, id, amount)`; the question this note answers is how several repositories agree to share one transaction instead of each opening its own.
+A transaction is Postgres's mechanism for this: `BEGIN`, a sequence of statements, then `COMMIT` or `ROLLBACK`.
+
+In Go, `*sql.Tx` represents that open transaction, and because it wraps one borrowed connection from the pool, every statement in it has to go through that same `*sql.Tx` value — not back through `*sql.DB`, which would run on a different, unrelated connection and see none of the uncommitted work.
+
+The repository pattern solves a separate but related problem: without it, the webhook handler ends up full of raw SQL, and that SQL gets copy-pasted into the next handler that also needs an invoice.
+
+A repository hides the SQL behind `repo.ApplyPayment(ctx, id, amount)`; the question this note answers is how several repositories agree to share one transaction instead of each opening its own.
 
 ## 2. Mental model
 
-A transaction is a **tab you open at a bar**: everything ordered against that tab is provisional until you either `COMMIT` (pay and keep it) or `ROLLBACK` (walk away, nothing happened). `*sql.Tx` is that tab, and it is tied to one specific seat at the bar — one connection. You cannot hand half the tab to someone at another seat and expect it to apply to your order.
+A transaction is a **tab you open at a bar**: everything ordered against that tab is provisional until you either `COMMIT` (pay and keep it) or `ROLLBACK` (walk away, nothing happened).
+
+`*sql.Tx` is that tab, and it is tied to one specific seat at the bar — one connection. You cannot hand half the tab to someone at another seat and expect it to apply to your order.
 
 The repository pattern is a **job ticket that doesn't care which tab it's billed to**. A repository method takes a `DBTX` — "something that can run a query" — and the caller decides whether that's the bar's shared register (`*sql.DB`, no transaction) or one specific open tab (`*sql.Tx`, inside `WithTx`). The repository's code never changes either way.
 
@@ -160,7 +219,9 @@ func WithTx(ctx context.Context, db *sql.DB, opts *sql.TxOptions, fn func(tx *sq
 
 A `Store` groups every repository a use case needs and is built from one `DBTX`, so `NewStore(db)` (no transaction) and `NewStore(tx)` (inside `WithTx`) are the same call with a different argument — this is the "unit of work": one object that represents everything a single business operation touches, committed or rolled back as one.
 
-`DBTX` is declared next to the repositories here for brevity, but the idiomatic Go placement is on the consumer side: the package that *calls* a repository defines the narrow interface it actually needs (here, three methods), and the repository's constructor simply accepts that interface — it never imports `*sql.DB` or `*sql.Tx` to declare it. SQL stays inside repositories; the business rule of *which* repositories a use case needs, and whether they share a transaction, stays in the service layer. See [[Interfaces]] for why small, consumer-defined interfaces beat one shared "repository interface" package.
+`DBTX` is declared next to the repositories here for brevity, but the idiomatic Go placement is on the consumer side: the package that *calls* a repository defines the narrow interface it actually needs (here, three methods), and the repository's constructor simply accepts that interface — it never imports `*sql.DB` or `*sql.Tx` to declare it.
+
+SQL stays inside repositories; the business rule of *which* repositories a use case needs, and whether they share a transaction, stays in the service layer. See [[Interfaces]] for why small, consumer-defined interfaces beat one shared "repository interface" package.
 
 `BeginTx`'s second argument, `*sql.TxOptions`, sets the isolation level (`sql.LevelDefault`, `sql.LevelRepeatableRead`, `sql.LevelSerializable`, ...) and `ReadOnly: true`. A read-only transaction lets Postgres apply some internal optimizations and documents intent, but `database/sql` does not enforce it client-side — a write statement inside a `ReadOnly: true` transaction fails at the server, not at the Go call site.
 
@@ -184,17 +245,28 @@ flowchart TD
 - **`SELECT ... FOR UPDATE`** locks the selected rows until the transaction ends, so any other transaction's `UPDATE` or `FOR UPDATE` on the same rows blocks until this one commits or rolls back.
 - **`FOR UPDATE SKIP LOCKED`** is the shape behind a Postgres-backed work queue: several workers each run `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1`, and a row already locked by another worker is silently skipped instead of blocking.
 - **`FOR UPDATE NOWAIT`** fails immediately with an error instead of blocking, when blocking at all is unacceptable.
-- **Optimistic locking** (used in the worked example below) never takes a row lock. It reads a `version` column, then writes with `WHERE id = ? AND version = ?`; if another transaction committed a change in between, `RowsAffected()` comes back `0` and the caller knows to re-read and retry — see [[Locking - Optimistic vs Pessimistic]] for the general trade-off.
+- **Optimistic locking** (used in the worked example below) never takes a row lock.
+  - It reads a `version` column, then writes with `WHERE id = ? AND version = ?`; if another transaction committed a change in between, `RowsAffected()` comes back `0` and the caller knows to re-read and retry — see [[Locking - Optimistic vs Pessimistic]] for the general trade-off.
 
 ### The outbox pattern, and why step 5 cannot be "publish to the queue"
 
-The old note's webhook steps put "enqueue follow-up job or outbox event" inside the transaction, as if a queue publish and an outbox insert were interchangeable. They are not: publishing to Kafka, SQS, or Redis from inside a database transaction is a **dual write** — the message can go out and then the transaction rolls back, or the transaction can commit and the publish call can fail or the process can crash before it runs. Either way, the queue and the database disagree about what happened, and no retry of "just the publish" fixes a case where the whole process died.
+The old note's webhook steps put "enqueue follow-up job or outbox event" inside the transaction, as if a queue publish and an outbox insert were interchangeable.
 
-The fix is to never call the queue from inside the transaction at all: insert a plain row into an `outbox_events` table, in the same transaction and therefore the same commit, as the business data. A separate relay — a poller, or Postgres logical replication reading the WAL (CDC) — reads unpublished rows after commit and publishes them, marking each row published only once the publish call itself succeeds.
+They are not: publishing to Kafka, SQS, or Redis from inside a database transaction is a **dual write** — the message can go out and then the transaction rolls back, or the transaction can commit and the publish call can fail or the process can crash before it runs.
+
+Either way, the queue and the database disagree about what happened, and no retry of "just the publish" fixes a case where the whole process died.
+
+The fix is to never call the queue from inside the transaction at all: insert a plain row into an `outbox_events` table, in the same transaction and therefore the same commit, as the business data.
+
+A separate relay — a poller, or Postgres logical replication reading the WAL (CDC) — reads unpublished rows after commit and publishes them, marking each row published only once the publish call itself succeeds.
 
 ### Retrying on serialization failure
 
-Under `SERIALIZABLE` or `REPEATABLE READ` isolation, Postgres can abort a transaction at commit time with SQLSTATE `40001` (serialization failure) purely because of a conflict with a concurrent transaction — not because anything was wrong with the SQL. `40P01` (deadlock detected) is the analogous case for two transactions waiting on each other's locks. Both are meant to be retried: wrap the whole transaction body in a retry loop with a short backoff, and only retry these two codes — a unique-constraint violation or a syntax error retried in a loop just repeats the same failure forever.
+Under `SERIALIZABLE` or `REPEATABLE READ` isolation, Postgres can abort a transaction at commit time with SQLSTATE `40001` (serialization failure) purely because of a conflict with a concurrent transaction — not because anything was wrong with the SQL.
+
+`40P01` (deadlock detected) is the analogous case for two transactions waiting on each other's locks.
+
+Both are meant to be retried: wrap the whole transaction body in a retry loop with a short backoff, and only retry these two codes — a unique-constraint violation or a syntax error retried in a loop just repeats the same failure forever.
 
 ## 4. Worked example
 
@@ -214,7 +286,9 @@ err := WithTx(ctx, db, nil, func(tx *sql.Tx) error {
 The full version below is the tested InvoiceOps payment webhook: idempotent via a unique `(provider, event_id)` constraint, applies payment with optimistic locking, and enqueues an outbox row instead of publishing directly.
 
 > [!info] Why these tests run on SQLite
-> Postgres cannot run in this writing environment, so the tests run against an in-memory SQLite database (`modernc.org/sqlite`). The SQL is written to also be valid PostgreSQL 17 aside from placeholder style (`?` here vs `$1, $2, ...`); the retry example's error classifier checks SQLite's "database is locked" text, where production code against Postgres checks SQLSTATE `40001`/`40P01` instead (shown as a comment).
+> Postgres cannot run in this writing environment, so the tests run against an in-memory SQLite database (`modernc.org/sqlite`).
+>
+> The SQL is written to also be valid PostgreSQL 17 aside from placeholder style (`?` here vs `$1, $2, ...`); the retry example's error classifier checks SQLite's "database is locked" text, where production code against Postgres checks SQLSTATE `40001`/`40P01` instead (shown as a comment).
 
 ```go
 package txrepo
@@ -502,7 +576,8 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 
 - A transaction that spans an entire request, including slow calls to other services, holds one pooled connection — and often row locks — for the whole time. Keep transactions short: only the database writes that must be atomic, nothing else.
 - Optimistic locking pushes the retry burden to the caller. For a hot row with constant contention, the version check fails so often that `SELECT ... FOR UPDATE` (serializing writers but succeeding on the first try) can be the simpler, faster choice in practice — measure instead of assuming optimistic is always cheaper.
-- The outbox pattern adds a table, a relay process, and eventual consistency between "committed" and "published." For a system that can tolerate an at-least-once publish with no ordering guarantee and doesn't need the commit and the publish to be atomic, publishing directly after commit (accepting the small window where the publish can fail and nothing retries it) is sometimes an acceptable, simpler trade.
+- The outbox pattern adds a table, a relay process, and eventual consistency between "committed" and "published."
+  - For a system that can tolerate an at-least-once publish with no ordering guarantee and doesn't need the commit and the publish to be atomic, publishing directly after commit (accepting the small window where the publish can fail and nothing retries it) is sometimes an acceptable, simpler trade.
 - A single-statement write never needs a transaction at all — `*sql.DB` already runs one statement atomically. Wrapping it in `BeginTx`/`Commit` only adds overhead.
 
 ## 7. In production
@@ -518,10 +593,13 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 ## 8. Deep dive
 
 - **Why `defer tx.Rollback()` is always safe.** `database/sql`'s `Tx.Rollback` is documented to return `sql.ErrTxDone` if the transaction has already been committed or rolled back, rather than erroring or re-rolling-back. The deferred call's return value is simply discarded (hence the `//nolint:errcheck`), which is correct here specifically because that one error value is defined to be harmless.
-- **Isolation levels change what "version conflict" even means.** Under Postgres's default `READ COMMITTED`, an `UPDATE ... WHERE version = ?` can still race correctly because each statement sees a fresh snapshot — this is why the optimistic check above works without raising the isolation level. Under `SERIALIZABLE`, Postgres instead detects a much broader class of conflicts automatically and aborts the whole transaction with `40001`, which is why serializable code needs the retry loop even without a manual version column. See [[Isolation Levels and MVCC]] for what each level actually guarantees.
+- **Isolation levels change what "version conflict" even means.** Under Postgres's default `READ COMMITTED`, an `UPDATE ... WHERE version = ?` can still race correctly because each statement sees a fresh snapshot — this is why the optimistic check above works without raising the isolation level.
+  - Under `SERIALIZABLE`, Postgres instead detects a much broader class of conflicts automatically and aborts the whole transaction with `40001`, which is why serializable code needs the retry loop even without a manual version column.
+  - See [[Isolation Levels and MVCC]] for what each level actually guarantees.
 - **`SKIP LOCKED` as a job queue is a distinct technique from both locks shown above.** It does not wait for a lock and does not detect conflict after the fact; it simply excludes already-locked rows from the result set, which is precisely the shape multiple worker processes need to each grab a different pending job without coordinating out-of-band.
 - **The unit-of-work pattern versus "just pass `*sql.Tx` everywhere."** `Store` exists so a use-case function writes `store.Invoices.ApplyPayment(...)` instead of threading a raw `*sql.Tx` through every call, and so the exact same function signature works whether or not a transaction is active — a repository method never has an `if tx != nil` branch; it always just has a `DBTX`.
-- **Savepoints** (`SAVEPOINT`, `ROLLBACK TO SAVEPOINT`) give a transaction a partial rollback point for isolated recoverable sub-steps — useful when one step in a larger transaction (for example, an optional enrichment call that itself hits the database) is allowed to fail without discarding everything already done. `database/sql` has no direct savepoint API; it requires running the `SAVEPOINT ...` SQL text through the same `*sql.Tx`.
+- **Savepoints** (`SAVEPOINT`, `ROLLBACK TO SAVEPOINT`) give a transaction a partial rollback point for isolated recoverable sub-steps — useful when one step in a larger transaction (for example, an optional enrichment call that itself hits the database) is allowed to fail without discarding everything already done.
+  - `database/sql` has no direct savepoint API; it requires running the `SAVEPOINT ...` SQL text through the same `*sql.Tx`.
 
 ## 9. Interview questions
 
@@ -529,22 +607,36 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 > So it covers every exit path — an early `return err`, a panic, or reaching `Commit()` successfully — with one line. It is safe after a successful commit because `Tx.Rollback` is documented to return `sql.ErrTxDone` (a no-op signal) once the transaction is already finished, rather than erroring or undoing the commit.
 
 > [!question]- Why can't two repositories each open their own transaction and expect to see each other's uncommitted writes?
-> A transaction is tied to one specific borrowed connection, and Postgres's default isolation (`READ COMMITTED`) only lets a transaction see *committed* data from other transactions. Two separate `BeginTx` calls are two separate transactions on two separate connections; neither sees the other's writes until one of them commits — which defeats the point of doing them together. They must share the same `*sql.Tx`.
+> A transaction is tied to one specific borrowed connection, and Postgres's default isolation (`READ COMMITTED`) only lets a transaction see *committed* data from other transactions.
+>
+> Two separate `BeginTx` calls are two separate transactions on two separate connections; neither sees the other's writes until one of them commits — which defeats the point of doing them together. They must share the same `*sql.Tx`.
 
 > [!question]- Trap: a webhook handler inserts a payment row, updates the invoice, and publishes a "payment applied" event to Kafka — all inside one `BeginTx`/`Commit` block. What's wrong?
-> The Kafka publish is a network call made while a database transaction is open: a dual write. If the publish succeeds and the transaction then rolls back, a message went out for something that never happened. If the transaction commits and the process crashes before the publish runs, the event is lost with no way to know it was missed. The fix is the outbox pattern: insert an outbox row in the same transaction, and publish it afterward from a separate relay.
+> The Kafka publish is a network call made while a database transaction is open: a dual write. If the publish succeeds and the transaction then rolls back, a message went out for something that never happened.
+>
+> If the transaction commits and the process crashes before the publish runs, the event is lost with no way to know it was missed.
+>
+> The fix is the outbox pattern: insert an outbox row in the same transaction, and publish it afterward from a separate relay.
 
 > [!question]- What's the difference between optimistic locking and `SELECT ... FOR UPDATE`, and when would you pick one over the other?
-> Optimistic locking (a version column, `UPDATE ... WHERE id=? AND version=?`) takes no lock; a conflicting concurrent write is detected after the fact via `RowsAffected() == 0`, and the loser retries. `SELECT ... FOR UPDATE` takes a real row lock for the transaction's duration, so a conflicting writer simply blocks until the first one commits. Optimistic locking is cheaper under low contention; row locks are simpler to reason about and avoid wasted retries under high contention on the same row.
+> Optimistic locking (a version column, `UPDATE ... WHERE id=? AND version=?`) takes no lock; a conflicting concurrent write is detected after the fact via `RowsAffected() == 0`, and the loser retries.
+>
+> `SELECT ... FOR UPDATE` takes a real row lock for the transaction's duration, so a conflicting writer simply blocks until the first one commits.
+>
+> Optimistic locking is cheaper under low contention; row locks are simpler to reason about and avoid wasted retries under high contention on the same row.
 
 > [!question]- What does SQLSTATE `40001` mean, and what should a Go service do when it sees it?
-> It is Postgres's "serialization failure" code: under `SERIALIZABLE` (or sometimes `REPEATABLE READ`) isolation, the database itself detected that this transaction's view of the data conflicted with a concurrently committed transaction, and aborted it — not because of a bug in the SQL. The service should retry the entire transaction from the start, typically with a short backoff, the same way it would retry `40P01` (deadlock detected).
+> It is Postgres's "serialization failure" code: under `SERIALIZABLE` (or sometimes `REPEATABLE READ`) isolation, the database itself detected that this transaction's view of the data conflicted with a concurrently committed transaction, and aborted it — not because of a bug in the SQL.
+>
+> The service should retry the entire transaction from the start, typically with a short backoff, the same way it would retry `40P01` (deadlock detected).
 
 > [!question]- Why does a repository take a `DBTX` interface instead of a concrete `*sql.DB`?
 > Because `*sql.Tx` has the same `ExecContext`/`QueryContext`/`QueryRowContext` method set as `*sql.DB` but is not the same type, and a repository needs to run identically whether it's operating standalone or inside someone else's shared transaction. Defining a small interface both types satisfy lets the caller decide which one to pass without the repository code changing at all.
 
 > [!question]- Trap: your retry loop around a transaction retries on *any* error it gets back. What goes wrong, and how do you fix it?
-> A non-transient error — a unique constraint violation, a foreign key violation, a syntax error, this note's own `ErrVersionConflict` business conflict — will fail identically on every retry, so the loop just burns attempts and delays the real response. Classify errors first: only retry Postgres SQLSTATE `40001`/`40P01` (or, in this note's SQLite test environment, "database is locked"/"database is busy"), and return everything else immediately.
+> A non-transient error — a unique constraint violation, a foreign key violation, a syntax error, this note's own `ErrVersionConflict` business conflict — will fail identically on every retry, so the loop just burns attempts and delays the real response.
+>
+> Classify errors first: only retry Postgres SQLSTATE `40001`/`40P01` (or, in this note's SQLite test environment, "database is locked"/"database is busy"), and return everything else immediately.
 
 ## 10. Cheat sheet
 
@@ -562,3 +654,8 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 - **Before this:** [[Database Access (database-sql, pgx, sqlc)]], [[Transactions and ACID]]
 - **Next:** [[Schema Migrations in Go Services]], [[Testing Go Services]]
 - **Compare with:** [[Isolation Levels and MVCC]] (what READ COMMITTED vs SERIALIZABLE actually guarantee), [[Locking - Optimistic vs Pessimistic]] (the general trade-off), [[Interfaces]] (consumer-side interfaces like `DBTX`)
+
+### Watch on YouTube
+
+- [Learning Golang: Relational Databases - Transactions with PostgreSQL](https://www.youtube.com/watch?v=BLr2V6zB5k4) · Mario Carrion · deep dive on database/sql transactions with Postgres
+- [Repository Pattern in Golang: Step-by-Step Tutorial (Demystified!)](https://www.youtube.com/watch?v=MOEgAq_RXog) · AM Channel · step-by-step repository pattern implementation

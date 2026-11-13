@@ -11,13 +11,15 @@ sources:
   - "PCI Security Standards Council, PCI DSS v4.0 and SAQ A eligibility (all cardholder data functions outsourced)"
   - "Brandur Leach, Implementing Stripe-like Idempotency Keys in Postgres (2017)"
   - "Airbnb Engineering, Avoiding Double Payments in a Distributed Payments System (2019)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Payment System
 
 > [!summary] TL;DR
-> A payment system takes money from a customer through a **payment service provider** (PSP, such as Stripe, Adyen or Razorpay: the company that actually talks to card networks and banks) and records every rupee in an **append-only ledger**. The load is small; the hard part is never charging twice and never losing track of a charge, even when the network times out halfway through.
+> A payment system takes money from a customer through a **payment service provider** (PSP, such as Stripe, Adyen or Razorpay: the company that actually talks to card networks and banks) and records every rupee in an **append-only ledger**.
+>
+> The load is small; the hard part is never charging twice and never losing track of a charge, even when the network times out halfway through.
 
 > [!abstract] Core idea
 > - Save the payment intent and its idempotency key in your database **before** you call the PSP, and send the **same key** to the PSP.
@@ -26,9 +28,60 @@ updated: 2026-11-04
 > - Webhooks are verified, deduplicated by event id and applied through a state machine that ignores out-of-order events.
 > - A daily reconciliation against the PSP's settlement file is the final safety net.
 
+## Start here: the basics
+
+**The problem in one story.**
+You tap "Pay ₹500" for a movie ticket and the screen spins, then shows an error.
+Did the money leave your account or not? If you tap again, will you pay twice?
+A payment system must answer that question correctly every time, even when networks fail halfway.
+It also keeps a permanent, balanced record of where every rupee went.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| PSP | Payment service provider: the company that talks to banks | Stripe, Razorpay |
+| Idempotency key | A unique ID so a repeated request has no extra effect | `pay_order_42` |
+| Timeout | No answer came back in time; the result is unknown | PSP did not reply in 10 s |
+| Webhook | The PSP calling your server later to report a result | `payment.succeeded` event |
+| Ledger | A book of money movements that is never edited | Rows only appended |
+| Double-entry | Every movement is a debit in one account and a credit in another | Customer -500, Merchant +500 |
+| Reconciliation | Comparing your records with the PSP's records | Daily settlement file check |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Customer pays"] --> API["Payment service"]
+    API --> DB["Save intent + key<br/>(before calling)"]
+    DB --> PSP["PSP charges card"]
+    PSP --> WH["Webhook: result"]
+    WH --> L["Ledger entries"]
+    PSP --> R["Daily settlement file"]
+    R --> REC["Reconciliation"]
+    L --> REC
+```
+
+**Analogy.** A shop's cash book: every sale is written in ink, in two columns that must always match, and each evening the book is checked against the bank statement.
+Where it breaks: a shopkeeper sees the cash in hand; with a PSP a timeout leaves you genuinely not knowing whether money moved.
+
+**How the rest of this note builds up**
+
+- First, requirements and the mental model (sections 1-2).
+- Then the high-level design and the worked example: estimates, API, data model, Go code for the core rule, and the timeout trace (sections 3-4).
+- Then variants, trade-offs and production lessons (sections 5-7).
+- Finally the SDE-3 deep dive: reconciliation, double-entry, hot ledger accounts, idempotency key details, refunds and multi-region (section 8).
+
+> [!tip] Remember
+> Save the key before calling the PSP, treat a timeout as unknown, and never edit the ledger.
+
 ## 1. Why it exists - requirements
 
-A ticketing site sells a ₹499 ticket. The client calls `POST /pay`, your server calls the PSP, the PSP charges the card, and then the response is lost because your 10-second timeout fires. The client sees an error and taps **Pay** again. If the second attempt creates a new charge, the customer pays ₹998. If your service crashed before writing anything, you have a charge on the customer's statement and no record of it at all. Both bugs come from the same root: the system did not write down what it was about to do before doing it.
+A ticketing site sells a ₹499 ticket. The client calls `POST /pay`, your server calls the PSP, the PSP charges the card, and then the response is lost because your 10-second timeout fires. The client sees an error and taps **Pay** again.
+
+If the second attempt creates a new charge, the customer pays ₹998. If your service crashed before writing anything, you have a charge on the customer's statement and no record of it at all.
+
+Both bugs come from the same root: the system did not write down what it was about to do before doing it.
 
 **Functional requirements**
 - Pay-in: charge a card, UPI or wallet through a PSP for an order (`order_id`), including 3-D Secure or UPI approval steps where the customer must act.
@@ -47,7 +100,9 @@ A ticketing site sells a ₹499 ticket. The client calls `POST /pay`, your serve
 
 ## 2. Mental model
 
-Think of a careful bank clerk with a paper logbook. Before phoning another bank to move money, the clerk writes "about to send ₹499 for order 42, reference K1" in the logbook. If the phone line drops, the clerk does not dial again with a new reference. The clerk calls back and asks "did reference K1 go through?". At the end of the day the clerk compares the logbook with the other bank's statement, line by line.
+Think of a careful bank clerk with a paper logbook. Before phoning another bank to move money, the clerk writes "about to send ₹499 for order 42, reference K1" in the logbook.
+
+If the phone line drops, the clerk does not dial again with a new reference. The clerk calls back and asks "did reference K1 go through?". At the end of the day the clerk compares the logbook with the other bank's statement, line by line.
 
 Mapped to the system:
 - **Logbook line before the call** = the `payments` row plus the idempotency key, committed before the PSP call.
@@ -601,7 +656,11 @@ func TestConcurrentDuplicatesCallPSPOnce(t *testing.T) {
 
 Verified with Go 1.24: `go vet ./...` is clean and `go test -race ./...` passes all five tests.
 
-One simplification to be honest about: `Reconcile` marks a payment `failed` when the PSP has no charge for the key. In production you only do that after the PSP's own idempotency window has safely passed or after the PSP confirms the attempt is dead, because a slow request might still land. The key's TTL at the PSP (Stripe prunes keys that are at least 24 hours old) is therefore also your deadline for resolving unknowns.
+One simplification to be honest about: `Reconcile` marks a payment `failed` when the PSP has no charge for the key.
+
+In production you only do that after the PSP's own idempotency window has safely passed or after the PSP confirms the attempt is dead, because a slow request might still land.
+
+The key's TTL at the PSP (Stripe prunes keys that are at least 24 hours old) is therefore also your deadline for resolving unknowns.
 
 ### The timeout trace
 
@@ -728,7 +787,11 @@ A single `merchant_payable` account for a large merchant receives every sale. If
 
 ### Refunds and chargebacks
 
-A refund is its own idempotent resource with its own key and its own state machine (`pending → succeeded | failed`). The rule `sum(refunds) ≤ captured amount` is checked under a row lock on the payment (`SELECT … FOR UPDATE`), because two concurrent partial refunds could otherwise both pass the check (see [[Locking - Optimistic vs Pessimistic]]). A chargeback arrives only by webhook; it freezes the disputed amount with ledger entries, collects evidence, and finishes as won (reverse the hold) or lost (money leaves for good, plus a dispute fee).
+A refund is its own idempotent resource with its own key and its own state machine (`pending → succeeded | failed`).
+
+The rule `sum(refunds) ≤ captured amount` is checked under a row lock on the payment (`SELECT … FOR UPDATE`), because two concurrent partial refunds could otherwise both pass the check (see [[Locking - Optimistic vs Pessimistic]]).
+
+A chargeback arrives only by webhook; it freezes the disputed amount with ledger entries, collects evidence, and finishes as won (reverse the hold) or lost (money leaves for good, plus a dispute fee).
 
 ### Multi-region
 
@@ -737,10 +800,14 @@ Payments need one writer per payment. A common pattern is to home each merchant 
 ## 9. Interview questions
 
 > [!question]- Your API calls the PSP and the call times out. What do you do?
-> Treat it as "unknown", not "failed". The intent is already in the database as `processing` with key K. Return 202 to the client, then resolve by PSP webhook or by a reconciler that looks up K at the PSP. If you must retry the charge, retry with the same K so the PSP deduplicates. Never retry with a new key.
+> Treat it as "unknown", not "failed". The intent is already in the database as `processing` with key K. Return 202 to the client, then resolve by PSP webhook or by a reconciler that looks up K at the PSP.
+>
+> If you must retry the charge, retry with the same K so the PSP deduplicates. Never retry with a new key.
 
 > [!question]- (Trap) Why not record the payment in the ledger after the PSP returns success? That is when money has moved.
-> The ledger entry is written after success, but the **intent** must be written before the call. If you write nothing until the PSP answers, a crash or timeout after the charge leaves money taken with no trace in your system. Persist intent and key first, send the same key to the PSP, and post the ledger entries when the outcome is known.
+> The ledger entry is written after success, but the **intent** must be written before the call. If you write nothing until the PSP answers, a crash or timeout after the charge leaves money taken with no trace in your system.
+>
+> Persist intent and key first, send the same key to the PSP, and post the ledger entries when the outcome is known.
 
 > [!question]- How do two concurrent retries with the same key end up charging only once?
 > The key is claimed by one atomic statement, `INSERT … ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`. Exactly one request gets a row back and calls the PSP; the other sees the existing row in `processing` and returns 202 or 409. A "SELECT then INSERT" check has a race window and is wrong.
@@ -776,3 +843,8 @@ Payments need one writer per payment. A common pattern is to home each merchant 
 - **Before this:** [[Idempotency and Idempotency Keys]], [[Transactions and ACID]], [[Webhooks - Sending and Receiving]], [[Transactional Outbox and CDC]], [[System Design Interview Framework]]
 - **Next:** [[Case Study - File Storage and Sync]], [[Saga Pattern]], [[Case Study - Ticket Booking]]
 - **Compare with:** [[Digital Wallet and Ledger]] (class-level ledger in Go), [[Movie Ticket Booking]] (LLD checkout flow), [[Event Sourcing]]
+
+### Watch on YouTube
+
+- [29: Amazon Payment Gateway / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=rT4sS4l51PY) · Jordan has no life · 26 min · 63,756 views
+- [Design a Payment System - System Design Interview](https://www.youtube.com/watch?v=olfaBgJrUBI) · Code with Lucian · 31 min · 744,849 views

@@ -9,13 +9,15 @@ sources:
   - "Go blog, Range over function types (go.dev/blog/range-functions)"
   - "Go 1.24 release notes, Generic type aliases"
   - "go.dev/wiki/TypeParameters"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Generics and Iterators
 
 > [!summary] TL;DR
-> Generics (Go 1.18) let a function or type work over many concrete types while the compiler still checks every operation at compile time, using **type parameters** written in square brackets and **constraints** that say which operations are allowed. Iterators (Go 1.23) are an ordinary function shape, `func(yield func(V) bool)`, that a plain `for range` loop can drive directly, which is how `slices`, `maps` and your own types expose lazy, early-exitable sequences without allocating a slice first.
+> Generics (Go 1.18) let a function or type work over many concrete types while the compiler still checks every operation at compile time, using **type parameters** written in square brackets and **constraints** that say which operations are allowed.
+>
+> Iterators (Go 1.23) are an ordinary function shape, `func(yield func(V) bool)`, that a plain `for range` loop can drive directly, which is how `slices`, `maps` and your own types expose lazy, early-exitable sequences without allocating a slice first.
 
 > [!abstract] Core idea
 > - A type parameter is a placeholder type, `func Max[T cmp.Ordered](a, b T) T`; the compiler fills it in at each call site and checks the body against the constraint, not against `any`.
@@ -23,13 +25,61 @@ updated: 2026-11-07
 > - An iterator is a function that takes a `yield` callback and calls it once per element; `range` over that function calls it for you and turns `break` into `yield` returning `false`.
 > - `iter.Seq[V]` and `iter.Seq2[K, V]` are just names for those function shapes, so your own iterator and the standard library's compose for free.
 
+## Start here: the basics
+
+**The problem in one story.**
+You write `MaxInt`, then need `MaxFloat`, then `MaxString`: three copies of the same code.
+Generics let you write `Max` once with a placeholder type that Go fills in for each call.
+Iterators solve a second problem: walking through a big or endless sequence one item at a time, and stopping whenever you like, with a plain `for range` loop.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Type | The kind of a value | `int`, `string`, `[]User` |
+| Type parameter | A placeholder type filled in at the call | `func Max[T cmp.Ordered](a, b T) T` |
+| Interface | A set of rules a type must meet | `comparable`, `fmt.Stringer` |
+| Constraint | The interface that limits what `T` can be | `cmp.Ordered` allows `<` |
+| Instantiation | The compiler making a concrete version for one type | `Max[int]` |
+| Callback | A function you hand over to be called later | `yield(v)` |
+| Lazy | Producing values only when asked | Read lines one by one, not all at once |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    G["Max[T cmp.Ordered]"] --> I1["Max[int]"]
+    G --> I2["Max[float64]"]
+    G --> I3["Max[string]"]
+    S["iter.Seq[V]"] -- "range calls yield" --> L["for v := range seq { ... }"]
+    L -- "break → yield returns false" --> S
+```
+
+**Analogy.** A generic function is a cookie cutter: one shape, any dough that fits the rules.
+An iterator is a waiter bringing dishes one at a time until you say "enough".
+Where it breaks: a cutter only works on dough the constraint allows; Go will not compile `Max` on a type without `<`.
+
+**How the rest of this note builds up**
+
+- First, why generics (1.18) and iterators (1.23) were added (section 1) and their mental models (section 2).
+- Then type parameters, constraints, unions with `~`, `iter.Seq` and `range` over functions (section 3).
+- Then a worked example combining both, with tests (section 4), and comparisons (sections 5-6).
+- Finally the SDE-3 deep dive: stenciling vs dictionaries, generic type aliases, and production use (sections 7-8).
+
+> [!tip] Remember
+> Generics = one function for many types under a constraint; iterators = a function that calls `yield` per item until you stop.
+
 ## 1. Why it exists
 
 Before Go 1.18, a container that worked for any type either gave up type safety (`[]interface{}`, with a type assertion and a possible panic on every read) or was copy-pasted per type (`IntSet`, `StringSet`, `UserSet`, …). A cache keyed by `string` could not be reused for a cache keyed by `int64` without copying the whole file.
 
 Generics close that gap: one `LRU[K comparable, V any]` type serves every key and value type, and the compiler rejects `cache.Put(42, "x")` on an `LRU[string, int]` at compile time, not with a runtime panic.
 
-Iterators close a different gap. Before Go 1.23, "give me a lazy, early-exitable sequence of my own type" meant either materializing a `[]T` (memory for every element, even if the caller only wants the first three) or hand-writing a `Next() (T, bool)` cursor type and asking every caller to drive it in a `for cursor.Next() { ... }` loop instead of plain `range`. Range-over-func lets your own types plug into the same `for range` syntax as a slice or a channel.
+Iterators close a different gap.
+
+Before Go 1.23, "give me a lazy, early-exitable sequence of my own type" meant either materializing a `[]T` (memory for every element, even if the caller only wants the first three) or hand-writing a `Next() (T, bool)` cursor type and asking every caller to drive it in a `for cursor.Next() { ... }` loop instead of plain `range`.
+
+Range-over-func lets your own types plug into the same `for range` syntax as a slice or a channel.
 
 ## 2. Mental model
 
@@ -37,7 +87,9 @@ A generic function is a **template that the compiler fills in and type-checks pe
 
 A constraint is a **list of what you're allowed to do with T**, expressed as an interface. `any` means "nothing but assignment and passing around." `comparable` means "`==` and `!=` work, so T can be a map key." `cmp.Ordered` means "`<`, `<=`, `>`, `>=` work."
 
-An iterator is a **function that calls your loop body for you**. `for v := range seq` where `seq` has type `func(func(V) bool)` desugars, roughly, to `seq(func(v V) bool { <loop body>; return true })`, with `break` turning the generated callback's return into `false`. `iter.Seq[V]` is the standard library's name for exactly that function type — it exists so iterator-returning functions have one documented signature to agree on, not a new language mechanism.
+An iterator is a **function that calls your loop body for you**. `for v := range seq` where `seq` has type `func(func(V) bool)` desugars, roughly, to `seq(func(v V) bool { <loop body>; return true })`, with `break` turning the generated callback's return into `false`.
+
+`iter.Seq[V]` is the standard library's name for exactly that function type — it exists so iterator-returning functions have one documented signature to agree on, not a new language mechanism.
 
 ## 3. How it works
 
@@ -96,7 +148,9 @@ flowchart TB
 
 - **Type inference** fills in `T` from the argument types so most calls need no explicit `Sum[int](xs)`; explicit instantiation is only needed when the compiler has nothing to infer from, such as `zeroValue[int]()` with no arguments.
 - **Type-checking** happens once against the constraint's method/operator set, so the compiler catches `Sum([]bool{...})` before anything runs.
-- **Instantiation** is the compiler's choice of implementation strategy: stencil out a fully specialized copy of the function per concrete type (fast, more binary size) or build one generic implementation plus a runtime "dictionary" of the type's operations (smaller binary, a little slower). Go's compiler mixes both (GC-shape stenciling): types that share a GC shape, such as all one-word pointer types, can share a stencil.
+- **Instantiation** is the compiler's choice of implementation strategy: stencil out a fully specialized copy of the function per concrete type (fast, more binary size) or build one generic implementation plus a runtime "dictionary" of the type's operations (smaller binary, a little slower).
+
+  Go's compiler mixes both (GC-shape stenciling): types that share a GC shape, such as all one-word pointer types, can share a stencil.
 
 ### Range-over-func, step by step
 
@@ -301,7 +355,11 @@ The full `LRU` (`Get`/`Put`/eviction) and its test `TestLRU` are in the scratch 
 
 **Why `Max[T cmp.Ordered]` and not a hand-rolled constraint?** `cmp.Ordered` (package `cmp`, Go 1.21) is a union of every built-in ordered type (`int`, `int64`, `float64`, `string`, …), maintained by the standard library so your code does not drift from it as new numeric types are added.
 
-**Stenciling vs dictionaries.** The Go compiler specializes (stencils) a generic function per set of type arguments that share a "GC shape" — roughly, the same size and the same pointer/non-pointer layout. `Sum[int]` and `Sum[int64]` share one stencil (both are 8-byte, non-pointer words); `Sum[MyBoxedFloat]`, if it had a different layout, would not. Within one GC shape, the compiler passes a runtime **dictionary** — a small table of the type's size, alignment and method/operator implementations — instead of generating a full copy per concrete type, trading a little runtime indirection for a smaller binary.
+**Stenciling vs dictionaries.** The Go compiler specializes (stencils) a generic function per set of type arguments that share a "GC shape" — roughly, the same size and the same pointer/non-pointer layout.
+
+`Sum[int]` and `Sum[int64]` share one stencil (both are 8-byte, non-pointer words); `Sum[MyBoxedFloat]`, if it had a different layout, would not.
+
+Within one GC shape, the compiler passes a runtime **dictionary** — a small table of the type's size, alignment and method/operator implementations — instead of generating a full copy per concrete type, trading a little runtime indirection for a smaller binary.
 
 **Methods cannot add type parameters.** `func (s *Set[K]) Transform[V any]() *Set[V]` is illegal — only free functions and the type declaration itself can introduce new type parameters; a method is stuck with the type parameters its receiver already has. The usual workaround is a free function, `func Transform[K, V comparable](s *Set[K], f func(K) V) *Set[V]`.
 
@@ -331,7 +389,9 @@ flowchart TD
 > `iter.Seq[V]` is `func(func(V) bool)` — a function that takes a `yield` callback and calls it once per element, stopping if `yield` returns `false`. Since Go 1.23, `for v := range f` is legal when `f` has exactly that shape; the compiler generates the `yield` callback from your loop body and wires `break` to returning `false`.
 
 > [!question]- Why does Go 1.24 add generic type aliases, and what breaks without them?
-> Before 1.24, `type A = B[T]` with its own type parameter `T` was illegal, so you could not give a short, interchangeable name to one instantiation of a generic type, or write a generic alias for a struct literal shape. Without it, every caller had to spell out the full instantiation (`Set[string]`) everywhere, with no way to swap the underlying generic type later without touching every call site.
+> Before 1.24, `type A = B[T]` with its own type parameter `T` was illegal, so you could not give a short, interchangeable name to one instantiation of a generic type, or write a generic alias for a struct literal shape.
+>
+> Without it, every caller had to spell out the full instantiation (`Set[string]`) everywhere, with no way to swap the underlying generic type later without touching every call site.
 
 > [!question]- When should you prefer `iter.Pull` over a plain `for range` on an `iter.Seq`?
 > Only when you cannot structure the consumer as a simple loop body — merging two sorted sequences step by step, or driving an iterator from inside a `select`. It costs a background goroutine and a channel handoff per element, so it is slower than `range` and `defer stop()` is mandatory to avoid leaking that goroutine.
@@ -356,3 +416,7 @@ flowchart TD
 - **Before this:** [[Functions, Closures, Defer, Panic and Recover]], [[Interfaces]], [[Hash Tables and Go Maps]]
 - **Next:** [[Reflection and unsafe]], [[Modern Go Feature Timeline (1.18-1.25)]]
 - **Compare with:** [[Arrays, Slices and Maps (with internals)]] (the concrete, non-generic container types these abstract over)
+
+### Watch on YouTube
+
+- [Go Generics Complete Tutorial Master Type Parameters Constraints in Go 1.18+](https://www.youtube.com/watch?v=EBE8Z2pxH7g) · CodeLucky · full tutorial on type parameters and constraints

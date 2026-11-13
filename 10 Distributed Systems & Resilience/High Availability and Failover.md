@@ -12,7 +12,7 @@ sources:
   - "Patroni documentation, YAML configuration (ttl, loop_wait, retry_timeout)"
   - "Apache Cassandra docs, phi_convict_threshold"
   - "Google SRE Book (2016), chapter 3 Embracing Risk"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # High Availability and Failover
@@ -26,6 +26,52 @@ updated: 2026-11-04
 > - Failover time = detect + decide + promote + reroute. Detection timeouts trade false alarms against slow recovery.
 > - Stateful failover is the hard part: async replicas lose recent writes, and two primaries (split brain) corrupt data unless the old one is fenced.
 > - Classic mistake: adding a standby and never testing the failover. An untested failover path usually fails when it is needed.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your shop's website runs on one computer.
+At 2 a.m. that computer's power supply dies.
+Nobody can buy anything until someone wakes up and fixes it.
+High availability means keeping a second copy ready, so traffic moves to it on its own within seconds.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Server / node | One machine (or VM) running your program | One EC2 instance running your Go API |
+| Replica / standby | An extra copy kept ready to take over | A second PostgreSQL that copies the first |
+| Primary | The copy that currently accepts writes | The database your app writes orders to |
+| Load balancer | A box that spreads requests across healthy servers | AWS ALB in front of 3 app servers |
+| Health check | A small regular "are you alive?" request | `GET /healthz` every 10 s |
+| Availability Zone (AZ) | A separate data centre inside one cloud region | `ap-south-1a` vs `ap-south-1b` |
+| Downtime budget | How long you may be down per month for a target | 99.9% allows about 43 min/month |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Users"] --> LB["Load balancer"]
+    LB --> A["App server A"]
+    LB --> B["App server B"]
+    A --> P["Primary DB"]
+    B --> P
+    P -- "copies data" --> S["Standby DB"]
+    S -. "promoted if primary dies" .-> P
+```
+
+**Analogy.** A shop with two cashiers: if one faints, customers walk to the other till.
+Where it breaks: cashiers share nothing, but a database standby must already hold the same data, and a few of the newest sales may not have reached it yet.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the vocabulary: availability, SPOF, RTO, RPO (section 2).
+- Then how it works: availability math, failure detection and the steps of a failover (section 3), with a worked Go example (section 4).
+- Then the variants (active-passive, active-active) and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: split brain, fencing, real failover times and testing in production (sections 7-8).
+
+> [!tip] Remember
+> Remove every single point of failure, then actually test that traffic moves to the spare when one dies.
 
 ## 1. Why it exists
 
@@ -396,3 +442,8 @@ With a 3 s timeout, 3 confirmations and a 1 s check interval, the peer is declar
 - **Before this:** [[Distributed Systems Fundamentals]], [[Replication]], [[Load Balancing]]
 - **Next:** [[Leader Election]], [[Failure Detection, Gossip and Membership]], [[Multi-Region Architecture]]
 - **Compare with:** [[CAP and PACELC]] (CAP-availability vs uptime), [[Backup, PITR and Disaster Recovery]] (cold recovery), [[SLIs, SLOs, SLAs and Error Budgets]] (how availability is measured and budgeted)
+
+### Watch on YouTube
+
+- [Fail-over and High-Availability (Explained by Example)](https://www.youtube.com/watch?v=Zgy1miPsTNs) · Hussein Nasser · 19 min · 67,906 views
+- [Design Patterns for High Availability: What gets you 99.999% uptime?](https://www.youtube.com/watch?v=LdvduBxZRLs) · Gaurav Sen · 13 min · 35,846 views

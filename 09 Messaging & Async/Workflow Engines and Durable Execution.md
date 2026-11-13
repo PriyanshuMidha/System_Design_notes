@@ -9,7 +9,7 @@ sources:
   - "Temporal Go SDK v1.38.0 (go.temporal.io/sdk) API reference and testsuite package: workflow.ExecuteActivity, workflow.Sleep, workflow.GetVersion"
   - "AWS Step Functions Developer Guide: Standard vs Express workflows, Amazon States Language"
   - "Uber Engineering, Cadence open-source announcement"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Workflow Engines and Durable Execution
@@ -24,9 +24,62 @@ updated: 2026-11-04
 > - Activities still run **at least once**, so they must be idempotent.
 > - Classic mistake: calling `time.Now()`, `rand`, or a network API directly in workflow code. Replay then takes a different path and the engine reports a nondeterminism error.
 
+## Start here: the basics
+
+**The problem in one story**
+You order a phone. The shop reserves it, charges your card, then waits two days for a courier.
+Halfway through, the shop's server restarts.
+Did it charge you? Should it charge again? Who remembers to book the courier?
+A workflow engine remembers every finished step, so the process picks up exactly where it stopped.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Workflow | A multi-step business process written as one function | Reserve, charge, ship, refund on failure |
+| Activity | One step that touches the outside world | `ChargeCard(order-7, 499)` |
+| Side effect | Something a step changes outside the program | Money moved, email sent |
+| Event history | A saved log of every finished step and its result | "charge done, txn-42" |
+| Replay | Re-running the function and reusing saved results | Skips the charge, returns txn-42 |
+| Deterministic | Same input always gives the same path through the code | No `time.Now()` or random numbers |
+| Idempotent | Doing it twice has the same effect as once | Charge with key `order-7` only once |
+| Retry with backoff | Try again after waiting longer each time | Wait 1 s, 2 s, 4 s ... |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W["workflow code"] -->|"run step"| A["activity"]
+    A -->|"result"| H[("event history")]
+    X["worker crashes"] --> N["new worker"]
+    N -->|"replay"| H
+    H -->|"saved results,<br/>skip done steps"| W
+```
+
+**Analogy**
+A cook follows a recipe and writes each finished step in a notebook; a replacement cook reads the notebook and skips what is done.
+Where it breaks: a real cook can improvise, but workflow code must take the same path on every replay.
+
+**How the rest of this note builds up**
+
+- First, the hand-built mess of status columns and cron jobs (section 1) and the recipe-and-notebook model (section 2).
+- Then the mechanics: workers, task queues, event history, retries and timers (section 3).
+- Then a worked example: a teaching replay engine in Go and the same flow in the Temporal Go SDK (section 4), plus alternatives like Step Functions (section 5).
+- Finally the SDE-3 depth: history limits, versioning, replay mechanics and why activities run at least once (sections 6-8).
+
+> [!tip] Remember
+> Workflow code decides, activities act; the engine saves every result so a crash never repeats a finished step.
+
 ## 1. Why it exists
 
-Take an order flow: reserve stock (inventory service), charge ₹499 (payment provider), book a courier (logistics API), and if courier booking fails three times, refund and release stock. Booking can take up to 2 days because the courier confirms by webhook.
+Take an order flow:
+
+1. Reserve stock (inventory service).
+2. Charge ₹499 (payment provider).
+3. Book a courier (logistics API).
+4. If courier booking fails three times, refund and release stock.
+
+Booking can take up to 2 days because the courier confirms by webhook.
 
 Built by hand, this becomes:
 - a `status` column with 9 states and a `next_retry_at` column,
@@ -41,7 +94,9 @@ A workflow engine lets you write the flow as one function and makes the engine r
 
 ## 2. Mental model
 
-The workflow function is a **recipe** and the event history is a **cook's notebook**. Every time the cook finishes a step ("eggs whisked, result: bowl A"), they write it down. If the cook faints, a new cook starts reading the recipe from the top. For each step, they check the notebook first: "eggs whisked? Yes, bowl A" and move on without whisking again. When they reach the first step not in the notebook, they actually do it.
+The workflow function is a **recipe** and the event history is a **cook's notebook**. Every time the cook finishes a step ("eggs whisked, result: bowl A"), they write it down.
+
+If the cook faints, a new cook starts reading the recipe from the top. For each step, they check the notebook first: "eggs whisked? Yes, bowl A" and move on without whisking again. When they reach the first step not in the notebook, they actually do it.
 
 This only works if the recipe gives the same instructions every time it is read. If the recipe says "add salt if it is raining" and the weather changed, the new cook goes a different way than the notebook records. That is why workflow code must be **deterministic**.
 
@@ -117,7 +172,14 @@ Workflow code runs many times over the life of one execution. Anything that coul
 
 ### Retries and timeouts
 
-Activities get retry policies declared once, not hand-written loops. Temporal's default activity retry policy: first retry after 1 s, backoff coefficient 2.0, maximum interval 100 × the initial interval, and unlimited attempts. Only `ScheduleToClose` (or a `MaximumAttempts` you set) ends the retries; `StartToClose` bounds a single attempt:
+Activities get retry policies declared once, not hand-written loops. Temporal's default activity retry policy:
+
+- first retry after 1 s,
+- backoff coefficient 2.0,
+- maximum interval 100 × the initial interval,
+- unlimited attempts.
+
+Only `ScheduleToClose` (or a `MaximumAttempts` you set) ends the retries; `StartToClose` bounds a single attempt:
 - **StartToClose:** maximum time for one attempt. Always set it.
 - **ScheduleToClose:** maximum time for all attempts together.
 - **ScheduleToStart:** maximum time waiting in the queue for a worker.
@@ -498,7 +560,11 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 | Hand-built state machine | Status column + queues + cron + webhook handlers | Two or three steps, short-lived | Recovery and retries are your code and your bugs |
 | Choreography with events | Each service reacts to the previous one's event | Loosely coupled flows with no central owner | Hard to see the whole flow or change it; see [[Saga Pattern]] |
 
-**Step Functions types:** Standard workflows run up to 1 year with exactly-once execution of each workflow step and full history; Express workflows run up to 5 minutes, priced per request and duration, for high-volume short flows; asynchronous Express runs are at-least-once and synchronous Express runs are at-most-once.
+**Step Functions types:**
+
+- Standard workflows run up to 1 year with exactly-once execution of each workflow step and full history.
+- Express workflows run up to 5 minutes, priced per request and duration, for high-volume short flows.
+- Asynchronous Express runs are at-least-once and synchronous Express runs are at-most-once.
 
 ## 6. Trade-offs and when not to use
 
@@ -525,7 +591,8 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 
 ## 8. Deep dive
 
-- **Replay mechanics.** A worker usually keeps a running workflow cached in memory ("sticky execution") and only feeds it new events. Full replay happens on cache eviction, worker restart or a different worker taking over. Replay compares each command the code produces with the next command recorded in history; a mismatch is a nondeterminism error and the workflow task fails (and is retried) until fixed code is deployed.
+- **Replay mechanics.** A worker usually keeps a running workflow cached in memory ("sticky execution") and only feeds it new events. Full replay happens on cache eviction, worker restart or a different worker taking over.
+	- Replay compares each command the code produces with the next command recorded in history; a mismatch is a nondeterminism error and the workflow task fails (and is retried) until fixed code is deployed.
 - **Why activities are at-least-once.** The engine records `ActivityTaskCompleted` only after the worker reports. If the worker dies after the side effect but before reporting, the engine sees a timeout and schedules another attempt. No engine can avoid this window, which is the same dual-write problem as in [[Transactional Outbox and CDC]].
 - **Workflow code is exactly-once in effect.** Workflow code may execute many times, but its *decisions* are recorded once, because the history is the source of truth. That is why it may not have side effects of its own.
 - **Signals, queries and updates.** Signals append an event and wake the workflow (fire and forget). Queries read the workflow's state without changing history. Updates (newer in Temporal) are a request/response: a validated change whose result the caller waits for.
@@ -572,3 +639,8 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 - **Before this:** [[Saga Pattern]], [[Background Jobs and Worker Pools]], [[Timeouts, Retries and Backoff]]
 - **Next:** [[Stream Processing Basics]], [[Scheduled Jobs - Cron to Durable Schedulers]]
 - **Compare with:** [[Event Sourcing]] (replaying domain events), [[Transactional Outbox and CDC]] (the same crash window, solved for one event), [[AWS SQS, SNS and EventBridge]]
+
+### Watch on YouTube
+
+- [Durable Execution (Temporal/Inngest) / Distributed Systems Deep Dives With Ex-Google SWE](https://www.youtube.com/watch?v=GT9k8OSjzX8) · Jordan has no life · 18 min · 38,177 views
+- [What is Temporal? Durable Execution Explained](https://www.youtube.com/watch?v=PCZghg9ySrY) · The Data and AI Guy · 14 min · 14,990 views

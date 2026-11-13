@@ -11,7 +11,7 @@ sources:
   - "RFC 9204, QPACK"
   - "RFC 9000, QUIC"
 status: reviewed
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HTTP-1.1 vs HTTP-2 vs HTTP-3
@@ -36,9 +36,58 @@ Six requests, each taking 50ms to answer, fired at the same server:
 
 That gap is the entire reason HTTP/2 exists: one connection, many requests in flight at once, instead of one request at a time or one connection per request.
 
+## Start here: the basics
+
+**The problem in one story.**
+You open a news site. The page needs the HTML, a stylesheet, scripts, twenty images and a font.
+Your browser has to ask the server for each one.
+If it can only ask one thing at a time, the page crawls in piece by piece.
+HTTP/1.1, HTTP/2 and HTTP/3 are three answers to "how do we ask for many things at once, quickly, even when the network drops data?"
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Request / response | A question the browser sends and the server's answer | `GET /logo.png` → the image bytes |
+| Connection | An open line between browser and server that messages travel on | One TCP connection to `example.com:443` |
+| TCP | The transport that delivers bytes reliably and in order | A lost byte is resent before later bytes are handed over |
+| UDP | A transport that sends packets with no ordering or retry promises | Video calls, DNS, and QUIC run on it |
+| Packet loss | The network silently drops some data on the way | Wi-Fi glitch drops one packet out of a thousand |
+| Round trip (RTT) | Time for a message to go to the server and back | 40ms from Mumbai to Singapore |
+| Multiplexing | Mixing many conversations on one line, each tagged so they can be separated | Six downloads interleaved on one connection |
+| Head-of-line blocking | One stuck item at the front makes everything behind it wait | A slow customer at the only checkout counter |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Browser needs<br/>6 files"] --> H1["HTTP/1.1:<br/>one at a time<br/>(or 6 connections)"]
+    B --> H2["HTTP/2:<br/>all 6 on one TCP<br/>connection"]
+    B --> H3["HTTP/3:<br/>all 6 on one QUIC<br/>connection over UDP"]
+    H2 -- "1 lost packet" --> S2["every stream waits"]
+    H3 -- "1 lost packet" --> S3["only that stream waits"]
+```
+
+**Analogy.** HTTP/1.1 is a single-lane road where cars go one after another. HTTP/2 is one lane carrying cars from many families, interleaved; if one car breaks down, the whole lane stops. HTTP/3 gives each family its own lane on the same highway, so a breakdown only stops that lane.
+Where it breaks: real lanes do not share one congestion budget or one encryption setup, but QUIC streams share both at the connection level.
+
+**How the rest of this note builds up**
+
+- First, why HTTP/1.1's one-at-a-time model forced browsers into 6 connections (section 1) and a mental model of the three versions (section 2).
+- Then, how each version frames messages: HTTP/1.1 text, HTTP/2 binary frames and HPACK, HTTP/3 on QUIC with QPACK (section 3).
+- Then, the Go test that measures the HTTP/1.1 vs HTTP/2 gap on one machine (section 4).
+- Finally, the SDE-3 deep dive on TCP head-of-line blocking, 0-RTT replay, priority, and compression side channels, plus interview questions.
+
+> [!tip] Remember
+> Each version fixes the previous one's bottleneck: HTTP/2 shares one connection, HTTP/3 stops one lost packet from stalling every stream.
+
 ## 1. Why it exists
 
-Browsers load a page that references dozens of resources: HTML, CSS, several JS bundles, a dozen images, a font. Under HTTP/1.1 a single TCP connection serves requests strictly one at a time — RFC 9112 allows pipelining several requests back to back, but responses must still come back in the same order, so one slow response blocks every response queued behind it. No major browser ever enabled pipelining because a single slow or buggy response (or an intermediary that mishandled it) stalled the whole queue; that history is why pipelining is widely considered a failed feature today.
+Browsers load a page that references dozens of resources: HTML, CSS, several JS bundles, a dozen images, a font.
+
+Under HTTP/1.1 a single TCP connection serves requests strictly one at a time. RFC 9112 allows pipelining several requests back to back, but responses must still come back in the same order, so one slow response blocks every response queued behind it.
+
+No major browser ever enabled pipelining because a single slow or buggy response (or an intermediary that mishandled it) stalled the whole queue. That history is why pipelining is widely considered a failed feature today.
 
 The workaround browsers actually shipped was to open 6 TCP connections per host and spread requests across them. That buys parallelism but at a cost: 6x the TCP and TLS handshakes, 6x the congestion-control state starting from scratch, and 6 connections all fighting the same bottleneck link.
 
@@ -112,11 +161,24 @@ sequenceDiagram
 - A **dynamic table** per connection: headers seen before (like `cookie` or a long `user-agent`) get added once and referenced by index afterward.
 - Huffman coding compresses literal values that aren't in either table.
 
-**Stream priority** let a client hint which streams matter more (so, for example, render-blocking CSS could jump ahead of a background image) via a dependency tree and weights. In practice priority signals were inconsistently implemented and often ignored by servers; HTTP/2's extensible priority scheme was later replaced by RFC 9218 ("Extensible Prioritization Scheme for HTTP"), which both HTTP/2 and HTTP/3 can use.
+**Stream priority** let a client hint which streams matter more (so, for example, render-blocking CSS could jump ahead of a background image) via a dependency tree and weights.
 
-**Server push** (`PUSH_PROMISE` frames, letting a server proactively send `app.js` before the client asks) is part of RFC 9113 but is deprecated in practice: Chrome removed support in 2022 because measured cache-hit rates showed browsers already had the asset cached most of the time, making push waste bandwidth, and because push made HTTP caching semantics harder to reason about. Treat server push as a historical feature, not something to design around; use `<link rel="preload">` or `103 Early Hints` instead.
+In practice priority signals were inconsistently implemented and often ignored by servers. HTTP/2's extensible priority scheme was later replaced by RFC 9218 ("Extensible Prioritization Scheme for HTTP"), which both HTTP/2 and HTTP/3 can use.
 
-**TCP head-of-line blocking still exists.** All of HTTP/2's streams share one TCP byte stream. TCP guarantees **in-order delivery**, so if segment #42 is lost, the kernel withholds segments #43, #44, ... from the application — even though those bytes may belong to a completely different, otherwise-ready HTTP/2 stream — until #42 is retransmitted and arrives. One lost packet stalls every stream on the connection. This is the specific problem HTTP/3 was built to remove.
+**Server push** (`PUSH_PROMISE` frames, letting a server proactively send `app.js` before the client asks) is part of RFC 9113 but is deprecated in practice.
+
+Chrome removed support in 2022 for two reasons:
+
+1. Measured cache-hit rates showed browsers already had the asset cached most of the time, making push waste bandwidth.
+2. Push made HTTP caching semantics harder to reason about.
+
+Treat server push as a historical feature, not something to design around; use `<link rel="preload">` or `103 Early Hints` instead.
+
+**TCP head-of-line blocking still exists.** All of HTTP/2's streams share one TCP byte stream.
+
+TCP guarantees **in-order delivery**, so if segment #42 is lost, the kernel withholds segments #43, #44, ... from the application until #42 is retransmitted and arrives — even though those bytes may belong to a completely different, otherwise-ready HTTP/2 stream.
+
+One lost packet stalls every stream on the connection. This is the specific problem HTTP/3 was built to remove.
 
 ```mermaid
 flowchart TB
@@ -175,7 +237,11 @@ sequenceDiagram
 > [!tip] Remember
 > Fewer round trips before the first request is not a minor optimization — on a high-latency mobile link, the handshake can be a larger fraction of page-load time than the actual data transfer.
 
-Because QUIC has no TCP-style header compression state to rebuild per connection, HTTP/3 uses **QPACK (RFC 9204)** instead of HPACK. QPACK's dynamic table updates travel on a dedicated, unidirectional stream rather than inline with the headers, specifically so that a lost packet updating the table doesn't block headers on unrelated streams from being decoded — HPACK's inline, strictly-ordered table updates would have reintroduced head-of-line blocking at the compression layer.
+Because QUIC has no TCP-style header compression state to rebuild per connection, HTTP/3 uses **QPACK (RFC 9204)** instead of HPACK.
+
+QPACK's dynamic table updates travel on a dedicated, unidirectional stream rather than inline with the headers. That way a lost packet updating the table doesn't block headers on unrelated streams from being decoded.
+
+HPACK's inline, strictly-ordered table updates would have reintroduced head-of-line blocking at the compression layer.
 
 ### Spotting TCP-level head-of-line blocking in production
 
@@ -190,7 +256,11 @@ flowchart TD
     check -- "no retransmits,\nhandlers were just slow" --> apphandler["Application-layer slowness,\nnot a transport problem"]
 ```
 
-**Example:** `ss -ti` (Linux) on a live connection prints a `retrans:a/b` field per socket — `a` retransmits in the current loss recovery episode, `b` total since the socket opened — alongside `rtt` and `unacked`. If a handful of HTTP/2 streams on the *same* TCP connection all show their response latency jump at the same moment while `ss -ti` shows a nonzero `retrans` count on exactly that connection, that correlation is the signature of TCP-level HOL blocking. Go's `net.Conn` exposes the same underlying socket via `(*net.TCPConn).SyscallConn()` and a raw `getsockopt(TCP_INFO)` call if you need this from inside an application rather than from the command line.
+**Example:** `ss -ti` (Linux) on a live connection prints a `retrans:a/b` field per socket — `a` retransmits in the current loss recovery episode, `b` total since the socket opened — alongside `rtt` and `unacked`.
+
+If a handful of HTTP/2 streams on the *same* TCP connection all show their response latency jump at the same moment while `ss -ti` shows a nonzero `retrans` count on exactly that connection, that correlation is the signature of TCP-level HOL blocking.
+
+Go's `net.Conn` exposes the same underlying socket via `(*net.TCPConn).SyscallConn()` and a raw `getsockopt(TCP_INFO)` call if you need this from inside an application rather than from the command line.
 
 > [!warning] Common mistake
 > Watching only HTTP-level metrics (request latency, error rate) and concluding "HTTP/2 multiplexing isn't working" when the real cause is a TCP retransmission storm underneath it. The fix in that case is not a code change to the HTTP layer at all — it's either accepting the trade-off or moving to HTTP/3, which removes the shared TCP byte stream entirely.
@@ -256,11 +326,19 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
 
 ## 8. Deep dive
 
-- **Why pipelining really failed.** RFC 9112 still permits HTTP/1.1 pipelining, but responses must return in request order, so one response that never returns, or an intermediary that buffers and reorders incorrectly, wedges the whole connection. No major browser shipped it enabled by default; HTTP/2's multiplexing solves the same goal (many requests, one connection) without the ordering hazard, because each stream is independently framed and identified.
+- **Why pipelining really failed.** RFC 9112 still permits HTTP/1.1 pipelining, but responses must return in request order, so one response that never returns, or an intermediary that buffers and reorders incorrectly, wedges the whole connection.
+  - No major browser shipped it enabled by default.
+  - HTTP/2's multiplexing solves the same goal (many requests, one connection) without the ordering hazard, because each stream is independently framed and identified.
 - **Flow control is per-stream and per-connection.** HTTP/2 (and HTTP/3) give each stream its own flow-control window (`WINDOW_UPDATE` frames) on top of a connection-wide window, so one greedy stream can't starve others of buffer space; this is separate from, and layered above, TCP's own byte-level flow control.
-- **QUIC's 0-RTT has a replay caveat.** Resuming a QUIC connection can send the first request with zero round trips, but 0-RTT data can be replayed by an attacker who captures and resends the packet — the same caveat TLS 1.3's 0-RTT has (see [[TLS and HTTPS]]). Servers must only accept 0-RTT for requests that are safe to execute twice (idempotent GETs), never for anything that mutates state.
-- **Compression-based side channels.** HPACK and QPACK, like any compression over attacker-influenced plaintext, can in principle leak information through compressed size (the family of attacks that includes CRIME/BREACH against earlier compression schemes). Modern implementations mitigate this by not compressing sensitive headers together with attacker-controlled ones across security boundaries; this is primarily a concern for proxies and gateways that mix trust levels.
-- **Stream priority's uncertain future.** HTTP/2's original dependency-tree priority (RFC 9113 §5.3, since obsoleted for this purpose) saw inconsistent server support. RFC 9218's simpler "Extensible Priority" scheme (one urgency 0–7 plus an incremental flag) is what browsers moved to for both HTTP/2 and HTTP/3; a server that ignores priority signals is still spec-conformant, it just can't offer any scheduling benefit from them.
+- **QUIC's 0-RTT has a replay caveat.** Resuming a QUIC connection can send the first request with zero round trips, but 0-RTT data can be replayed by an attacker who captures and resends the packet.
+  - This is the same caveat TLS 1.3's 0-RTT has (see [[TLS and HTTPS]]).
+  - Servers must only accept 0-RTT for requests that are safe to execute twice (idempotent GETs), never for anything that mutates state.
+- **Compression-based side channels.** HPACK and QPACK, like any compression over attacker-influenced plaintext, can in principle leak information through compressed size (the family of attacks that includes CRIME/BREACH against earlier compression schemes).
+  - Modern implementations mitigate this by not compressing sensitive headers together with attacker-controlled ones across security boundaries.
+  - This is primarily a concern for proxies and gateways that mix trust levels.
+- **Stream priority's uncertain future.** HTTP/2's original dependency-tree priority (RFC 9113 §5.3, since obsoleted for this purpose) saw inconsistent server support.
+  - RFC 9218's simpler "Extensible Priority" scheme (one urgency 0–7 plus an incremental flag) is what browsers moved to for both HTTP/2 and HTTP/3.
+  - A server that ignores priority signals is still spec-conformant; it just can't offer any scheduling benefit from them.
 
 ## 9. Interview questions
 
@@ -271,10 +349,14 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
 > Pipelined responses must still arrive in request order, so one slow or hung response blocks every response queued behind it, and some intermediaries mishandled pipelined streams outright. Opening parallel connections was a more reliable workaround, which is exactly the inefficiency HTTP/2's multiplexing was built to remove.
 
 > [!question]- What does HPACK actually compress, and why not just gzip the headers?
-> HPACK replaces repeated header/value pairs with small integer references into a static table of common headers and a per-connection dynamic table of headers seen before, plus Huffman coding for literals. Generic compression (gzip) over headers that mix attacker-controlled and secret values enabled the CRIME/BREACH class of attacks by leaking information through compressed size; HPACK (and QPACK) were designed with that history in mind.
+> HPACK replaces repeated header/value pairs with small integer references into a static table of common headers and a per-connection dynamic table of headers seen before, plus Huffman coding for literals.
+>
+> Generic compression (gzip) over headers that mix attacker-controlled and secret values enabled the CRIME/BREACH class of attacks by leaking information through compressed size; HPACK (and QPACK) were designed with that history in mind.
 
 > [!question]- Trap: is HTTP/3 "HTTP over UDP with no reliability"?
-> No. QUIC (RFC 9000), which carries HTTP/3, is built on UDP but adds its own reliable, ordered delivery, congestion control and encryption per stream — it's a full transport protocol, not raw UDP. The point of using UDP is to avoid the kernel's fixed TCP semantics (in particular strict in-order delivery across the whole connection) and move loss recovery into QUIC where it can be done per stream.
+> No. QUIC (RFC 9000), which carries HTTP/3, is built on UDP but adds its own reliable, ordered delivery, congestion control and encryption per stream — it's a full transport protocol, not raw UDP.
+>
+> The point of using UDP is to avoid the kernel's fixed TCP semantics (in particular strict in-order delivery across the whole connection) and move loss recovery into QUIC where it can be done per stream.
 
 > [!question]- Why is server push deprecated if it sounds useful?
 > In practice browsers found that the assets a server pushed were usually already in the client's cache, so push wasted bandwidth and made cache invalidation harder to reason about correctly. Chrome removed support in 2022. `<link rel="preload">` and the `103 Early Hints` status let a server hint at resources without forcing them onto the wire.
@@ -301,3 +383,8 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
 - **Next:** [[TLS and HTTPS]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]]
 - **Compare with:** [[gRPC]] (built on HTTP/2 framing for multiplexed RPC streams), [[Network Debugging Toolkit - dig, curl, ss, tcpdump]] (inspecting which protocol a real connection negotiated)
 - **Runnable code:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3 - Go]]
+
+### Watch on YouTube
+
+- [Limitation Of HTTP/2 That Led To HTTP/3: Explained with Example](https://www.youtube.com/watch?v=AIDkSTiknLg) · CodingX · clear example-based explanation of the HTTP/2 head-of-line blocking problem HTTP/3 solves
+- [System design: HTTP/2 Multiplexing fixes sequential lag](https://www.youtube.com/watch?v=q6hc6qBJzTc) · programmerCave · focused explainer on HTTP/2 multiplexing vs HTTP/1.1 sequential requests

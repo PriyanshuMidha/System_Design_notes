@@ -14,13 +14,15 @@ sources:
   - "HAProxy PROXY protocol specification (v1 text, v2 binary)"
   - "RFC 5798, Virtual Router Redundancy Protocol (VRRP) v3"
   - "Kubernetes docs, Configure Liveness, Readiness and Startup Probes"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Load Balancing
 
 > [!summary] TL;DR
-> A load balancer (LB) sits in front of several identical servers (**backends**), gives clients one address, and spreads requests across the backends that are healthy. It is what makes horizontal scaling and surviving a dead server possible; the interesting choices are at which network layer it works, which algorithm picks the backend, and how it detects and drains unhealthy ones.
+> A load balancer (LB) sits in front of several identical servers (**backends**), gives clients one address, and spreads requests across the backends that are healthy.
+>
+> It is what makes horizontal scaling and surviving a dead server possible; the interesting choices are at which network layer it works, which algorithm picks the backend, and how it detects and drains unhealthy ones.
 
 > [!abstract] Core idea
 > - An L4 balancer routes TCP/UDP connections by IP and port; an L7 balancer understands HTTP and routes each request by path, header or cookie.
@@ -28,6 +30,51 @@ updated: 2026-11-04
 > - Health checks remove dead backends; connection draining lets a backend finish in-flight work before it leaves.
 > - The balancer itself must be redundant (a pair, anycast, or a managed service).
 > - Trap: an L4 balancer cannot spread gRPC or HTTP/2 traffic well, because many requests share one long-lived connection.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app becomes popular and one server can no longer keep up.
+You buy two more servers, but every user's phone still knows only the first server's address.
+You need one front door that all users hit, which then passes each visitor to whichever server is free and working.
+That front door is a load balancer.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Server / backend | A machine (or pod) running your app code | `pod-1` running the invoice API |
+| Request | One message from a client asking for something | `GET /api/invoices/42` |
+| RPS | Requests per second, a measure of load | 2,000 RPS at peak |
+| IP address and port | The network address of a program | `10.0.0.5:8080` |
+| TCP connection | A long-lived pipe between client and server; many requests can travel on it | One browser tab keeping a connection open |
+| HTTP | The text protocol web requests use, with path and headers | `POST /login` with a `Cookie` header |
+| Health check | A small "are you OK?" call to a server | `GET /healthz` returns `200` |
+| Horizontal scaling | Adding more identical servers instead of a bigger one | Going from 3 pods to 4 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C1[Client] --> LB["Load balancer<br/>(one address)"]
+    C2[Client] --> LB
+    LB --> S1["Server 1"]
+    LB --> S2["Server 2"]
+    LB -. "skipped: failed health check" .-> S3["Server 3 (down)"]
+```
+
+**Analogy.** A host at a busy restaurant seats each guest at a free waiter's table, so no single waiter drowns.
+Where it breaks: a host sees every table, but many real balancers each see only part of the load and their view is a little out of date.
+
+**How the rest of this note builds up**
+
+- First, why a balancer exists (section 1) and the restaurant-host mental model (section 2).
+- Then where balancers sit, L4 vs L7, the picking algorithms, and health checks with draining (section 3).
+- Then a worked example with Go code for weighted round robin and power of two choices, plus a deploy trace (section 4).
+- Finally the SDE-3 material: variants, trade-offs, production failure modes, and the deep dive on P2C, EWMA and connection reuse (sections 5-8).
+
+> [!tip] Remember
+> A load balancer is one front door that sends each request to a healthy server, so you can add, lose or replace servers without clients noticing.
 
 ## 1. Why it exists
 
@@ -122,7 +169,11 @@ sequenceDiagram
 
 ### Sticky sessions vs external state
 
-Sticky sessions (a cookie such as AWS's `AWSALB`, or an IP hash) send a user back to the same backend. They hide in-memory session state but break when that backend dies, unbalance load when a few users are heavy, and fight autoscaling. The cleaner design keeps the app tier stateless and stores sessions in Redis or a signed token ([[Scaling Basics]], [[Sessions and Cookies]]). Stickiness remains useful as an optimisation, for example to keep a user's local cache warm.
+Sticky sessions (a cookie such as AWS's `AWSALB`, or an IP hash) send a user back to the same backend.
+
+They hide in-memory session state but break when that backend dies, unbalance load when a few users are heavy, and fight autoscaling.
+
+The cleaner design keeps the app tier stateless and stores sessions in Redis or a signed token ([[Scaling Basics]], [[Sessions and Cookies]]). Stickiness remains useful as an optimisation, for example to keep a user's local cache warm.
 
 ## 4. Worked example
 
@@ -362,7 +413,9 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 
 - **Why P2C works with stale information.** Many independent balancers each with a slightly stale view of backend load all herd onto the "least loaded" backend if they pick the global minimum. Sampling two at random keeps the choice spread out while still avoiding the worst backends, which is why Envoy uses it for `LEAST_REQUEST`.
 - **EWMA and the fast-failure trap.** A latency-aware balancer prefers the fastest backend; a backend that returns errors in 1 ms looks fastest of all. Combine latency scoring with error-rate ejection.
-- **Consistent hashing in LBs.** Ring hash and Maglev keep a key on the same backend when the backend set changes, which keeps caches warm. Maglev builds a lookup table so each lookup is `O(1)`, at the cost of moving slightly more keys on change; details in [[Consistent Hashing]]. Bounded-load variants cap any backend at `(1 + ε) ×` average to tame hot keys.
+- **Consistent hashing in LBs.** Ring hash and Maglev keep a key on the same backend when the backend set changes, which keeps caches warm.
+
+  Maglev builds a lookup table so each lookup is `O(1)`, at the cost of moving slightly more keys on change; details in [[Consistent Hashing]]. Bounded-load variants cap any backend at `(1 + ε) ×` average to tame hot keys.
 - **Connection reuse hides imbalance.** Keep-alive and HTTP/2 mean a client may send all its traffic through one connection chosen minutes ago. Balancing per request at L7, capping connection age, or client-side balancing restores spread.
 - **Global vs regional.** Global balancing chooses a region (DNS latency or geo routing, anycast) and must handle region failover and data residency; regional balancing spreads load across zones and instances. Cross-zone balancing evens load but can add inter-zone data transfer cost on some clouds.
 - **The LB as a protection layer.** L7 proxies are a natural place for rate limits, request size limits and load shedding; see [[Rate Limiting - Algorithms and Distributed Design]] and [[Load Shedding and Graceful Degradation]].
@@ -406,3 +459,8 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 - **Before this:** [[Scaling Basics]], [[Forward and Reverse Proxies - L4 vs L7]]
 - **Next:** [[Service Discovery]], [[Scaling WebSockets]], [[Rate Limiting - Algorithms and Distributed Design]]
 - **Compare with:** [[Consistent Hashing]] (hash-based routing in depth), [[Nginx]] (configuring upstreams), [[AWS 06 - Load Balancing (ALB vs NLB)]] (the managed products), [[API Gateway and BFF]] (an L7 proxy with API concerns on top)
+
+### Watch on YouTube
+
+- [What is LOAD BALANCING? ⚖️](https://www.youtube.com/watch?v=K0Ta65OqQkY) · Gaurav Sen · 13 min · 1,323,191 views
+- [Top 6 Load Balancing Algorithms Every Developer Should Know](https://www.youtube.com/watch?v=dBmxNsS3BGE) · ByteByteGo · 5 min · 177,398 views

@@ -8,7 +8,7 @@ sources:
   - "Martin Fowler, StranglerFigApplication (martinfowler.com, 2004, updated 2024)"
   - "Martin Fowler, MonolithFirst (martinfowler.com, 2015)"
   - "Debezium documentation, Change Data Capture"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Strangler Fig Pattern and Legacy Migration
@@ -36,19 +36,71 @@ flowchart LR
 
 Everything in this note is this one diagram made precise: what the rule can look at, how it changes over weeks instead of flipping once, and what happens to the data underneath while the arrow moves.
 
+## Start here: the basics
+
+**The problem in one story.**
+A company has an old app that still earns money every day.
+Rewriting it all and switching over in one night is very risky.
+Instead, you put a "traffic director" in front, and move one small feature at a time to the new app.
+If something breaks, you send that feature's traffic back to the old app in seconds.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Legacy system | An old system still in use that is hard to change | A 5-year-old invoicing monolith |
+| Reverse proxy / facade | A front door that forwards each request to a backend | Nginx or an API gateway |
+| Routing rule | The check that picks which backend answers | "tenant in cohort A → new service" |
+| Slice | A small, separately movable piece of traffic | One route, one tenant group, 5% of requests |
+| Cutover | Switching traffic from old to new | Rule flips for `/invoices` |
+| Rollback | Switching back if the new side misbehaves | Flip the rule back |
+| Shadow traffic | Sending a copy of requests to the new system, ignoring its answer | Compare old vs new responses |
+| CDC (change data capture) | Streaming every DB change to another store | Debezium copying rows to the new DB |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Users"] --> F{"Facade<br/>routing rule"}
+    F -->|"not migrated yet"| O["Old system"]
+    F -->|"migrated slice"| N["New service"]
+    O -. "data sync (CDC)" .-> N
+```
+
+**Analogy.** Renovating a house room by room while the family keeps living in it, instead of demolishing it and camping outside for a year.
+Where it breaks: rooms in a house are separate, but old and new systems often share data, so the data move needs its own careful plan.
+
+**How the rest of this note builds up**
+
+- First, why big-bang rewrites fail (section 1) and the facade mental model (section 2).
+- Then how routing, slices, shadow traffic and data migration work (section 3), with a Go worked example (section 4).
+- Then variants (branch by abstraction, parallel run) and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production practice, retiring the old system, interview questions (sections 7-9).
+
+> [!tip] Remember
+> Move one small, reversible slice at a time until the old system has no traffic left, then delete it.
+
 ## 1. Why it exists
 
-A five-year-old monolith has one module — say, invoicing — that a team wants to extract into its own service, written in Go with a cleaner schema. The tempting plan is a **big-bang rewrite**: freeze the old invoicing code, write the new service over two months, cut every client over on release day. Fowler's *MonolithFirst* (2015) and the original *StranglerFigApplication* post (2004) both argue this plan fails in a specific, recurring way: the rewrite takes longer than planned (the old system kept shipping bug fixes and new invoice edge cases the whole time, which the rewrite has to catch up on, forever one release behind), and the cutover is a single all-or-nothing event with no partial-failure recovery — if the new system has one serious bug, the only rollback is reverting the whole deployment and losing two months of parallel changes in the old system.
+A five-year-old monolith has one module — say, invoicing — that a team wants to extract into its own service, written in Go with a cleaner schema. The tempting plan is a **big-bang rewrite**: freeze the old invoicing code, write the new service over two months, cut every client over on release day.
 
-**For example, out of 100,000 requests through the routing facade below, migrating one tenant cohort at a time:** moving 30% of tenants to a new backend changes the request path for roughly 30,000 of them and leaves the other 70,000 completely untouched by the migration — each slice is independently revertible, because "revert" means flipping that slice's rule back, not redeploying anything. A big-bang cutover has no equivalent partial state: every request is on the new system, or none are.
+Fowler's *MonolithFirst* (2015) and the original *StranglerFigApplication* post (2004) both argue this plan fails in a specific, recurring way: the rewrite takes longer than planned (the old system kept shipping bug fixes and new invoice edge cases the whole time, which the rewrite has to catch up on, forever one release behind), and the cutover is a single all-or-nothing event with no partial-failure recovery — if the new system has one serious bug, the only rollback is reverting the whole deployment and losing two months of parallel changes in the old system.
+
+**For example, out of 100,000 requests through the routing facade below, migrating one tenant cohort at a time:** moving 30% of tenants to a new backend changes the request path for roughly 30,000 of them and leaves the other 70,000 completely untouched by the migration — each slice is independently revertible, because "revert" means flipping that slice's rule back, not redeploying anything.
+
+A big-bang cutover has no equivalent partial state: every request is on the new system, or none are.
 
 The strangler fig pattern replaces the single cutover with a long sequence of small, reversible ones, so a bad slice costs a percentage of traffic for an hour, not all of it for a weekend.
 
 ## 2. Mental model
 
-A strangler fig seed germinates in the branches of a host tree and sends roots down around the trunk. Over years the fig's roots thicken into a lattice, the host tree below dies and rots away, and the fig stands on its own, in the exact shape the old tree used to occupy — but the fig was never "installed" in one move; it grew around the tree while the tree kept standing.
+A strangler fig seed germinates in the branches of a host tree and sends roots down around the trunk.
 
-The **facade is the fig's growing lattice**: it occupies the position every client already calls (the old system's URL, the old system's internal API), and it decides, request by request, whether the old trunk or the new growth answers. The host tree (the old system) never had to be demolished for the fig to take root — it keeps serving requests the facade hasn't routed away yet, right up until the facade routes nothing to it and it can be switched off.
+Over years the fig's roots thicken into a lattice, the host tree below dies and rots away, and the fig stands on its own, in the exact shape the old tree used to occupy — but the fig was never "installed" in one move; it grew around the tree while the tree kept standing.
+
+The **facade is the fig's growing lattice**: it occupies the position every client already calls (the old system's URL, the old system's internal API), and it decides, request by request, whether the old trunk or the new growth answers.
+
+The host tree (the old system) never had to be demolished for the fig to take root — it keeps serving requests the facade hasn't routed away yet, right up until the facade routes nothing to it and it can be switched off.
 
 ## 3. How it works
 
@@ -74,11 +126,17 @@ flowchart TB
     P1 --> P2 --> P3
 ```
 
-Phase 1 is the starting point, not a step to build: the facade exists (it might already be a reverse proxy or API gateway doing something else) and every request still reaches the old system. Phase 2 is where the pattern lives — it can last months, with the migrated slice growing from one route to most of them. Phase 3 is the only truly final step: the old system is decommissioned, and the facade's "old" branch is deleted from the code, not just left unused, or the pattern never finishes and the facade becomes permanent dead weight.
+Phase 1 is the starting point, not a step to build: the facade exists (it might already be a reverse proxy or API gateway doing something else) and every request still reaches the old system.
+
+Phase 2 is where the pattern lives — it can last months, with the migrated slice growing from one route to most of them.
+
+Phase 3 is the only truly final step: the old system is decommissioned, and the facade's "old" branch is deleted from the code, not just left unused, or the pattern never finishes and the facade becomes permanent dead weight.
 
 ### 3.2 Finding seams and routing by slice
 
-A **seam** is a boundary in the old system where a request can be intercepted without understanding the whole monolith: a URL prefix (`/invoices/*`), a tenant ID, a message type on a queue, or a function call behind an interface the old code already has. The facade routes by whichever seam the old system exposes most cleanly — usually the URL path, because most monoliths already have a URL-routing layer to hook into.
+A **seam** is a boundary in the old system where a request can be intercepted without understanding the whole monolith: a URL prefix (`/invoices/*`), a tenant ID, a message type on a queue, or a function call behind an interface the old code already has.
+
+The facade routes by whichever seam the old system exposes most cleanly — usually the URL path, because most monoliths already have a URL-routing layer to hook into.
 
 Three concrete routing rules, each real and each used at a different point in the migration:
 
@@ -109,11 +167,15 @@ sequenceDiagram
     end
 ```
 
-The client only ever sees the old system's answer; the new system's call happens in parallel and its result only feeds a diff log. A migration should see a long run of `match? = true` on representative traffic before a routing rule is allowed to let the new system answer for real. This is the same idea as a **dark launch** (running new code in production without exposing it) applied specifically to the strangler seam, and it is the piece the old 92%-template version of this note was missing entirely.
+The client only ever sees the old system's answer; the new system's call happens in parallel and its result only feeds a diff log. A migration should see a long run of `match? = true` on representative traffic before a routing rule is allowed to let the new system answer for real.
+
+This is the same idea as a **dark launch** (running new code in production without exposing it) applied specifically to the strangler seam, and it is the piece the old 92%-template version of this note was missing entirely.
 
 ### 3.4 Branch by abstraction: the in-process sibling
 
-When the seam is inside one codebase rather than between two deployed services — the invoicing *module* needs replacing but will stay in the same binary for now — **branch by abstraction** is the strangler fig's in-code twin: introduce an interface the old implementation already satisfies, write the new implementation behind the same interface, flip a flag per call site (or per tenant, same as 3.2) to choose which implementation runs, and delete the old implementation once every call site has flipped. It avoids a long-lived feature branch that drifts from `main`; both implementations ship on every commit, selected at runtime instead of at merge time.
+When the seam is inside one codebase rather than between two deployed services — the invoicing *module* needs replacing but will stay in the same binary for now — **branch by abstraction** is the strangler fig's in-code twin: introduce an interface the old implementation already satisfies, write the new implementation behind the same interface, flip a flag per call site (or per tenant, same as 3.2) to choose which implementation runs, and delete the old implementation once every call site has flipped.
+
+It avoids a long-lived feature branch that drifts from `main`; both implementations ship on every commit, selected at runtime instead of at merge time.
 
 ### 3.5 Data migration, the part that outlasts the code
 
@@ -126,7 +188,11 @@ Code can be migrated route by route; data cannot be migrated row by row without 
 
 ### 3.6 Anti-corruption layer
 
-While the old and new systems coexist, they often disagree on what a word means — the old monolith's `Invoice` row might represent what the new system splits into `Invoice` and `CreditNote`. An **anticorruption layer** (a DDD term; see [[Domain-Driven Design - Strategic Design]]) is a translation adapter at the seam that maps the old model to the new one and back, so neither side's domain model has to compromise to understand the other. Without it, the new service's domain model slowly absorbs the old system's historical quirks just to stay compatible, and the whole point of rewriting is lost.
+While the old and new systems coexist, they often disagree on what a word means — the old monolith's `Invoice` row might represent what the new system splits into `Invoice` and `CreditNote`.
+
+An **anticorruption layer** (a DDD term; see [[Domain-Driven Design - Strategic Design]]) is a translation adapter at the seam that maps the old model to the new one and back, so neither side's domain model has to compromise to understand the other.
+
+Without it, the new service's domain model slowly absorbs the old system's historical quirks just to stay compatible, and the whole point of rewriting is lost.
 
 ## 4. Worked example
 
@@ -170,7 +236,9 @@ flowchart TB
     metrics["adapter: metrics recorder"] -->|implements| DiffRecorder
 ```
 
-`facade` imports nothing from either adapter: it declares `Backend`, `RoutingRule` and `DiffRecorder` as interfaces and depends only on those. Both the old-monolith adapter and the new-service adapter import `facade` to implement `Backend`, never the reverse — the same inward-pointing dependency direction [[Hexagonal Architecture (Ports and Adapters)]] and [[Clean Architecture]] both require, applied here to a migration seam instead of a layered application.
+`facade` imports nothing from either adapter: it declares `Backend`, `RoutingRule` and `DiffRecorder` as interfaces and depends only on those.
+
+Both the old-monolith adapter and the new-service adapter import `facade` to implement `Backend`, never the reverse — the same inward-pointing dependency direction [[Hexagonal Architecture (Ports and Adapters)]] and [[Clean Architecture]] both require, applied here to a migration seam instead of a layered application.
 
 ```go
 // Package facade is the routing facade a strangler-fig migration puts in
@@ -554,3 +622,8 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 - **Before this:** [[Monolith vs Microservices]], [[Hexagonal Architecture (Ports and Adapters)]]
 - **Next:** [[Documenting Architecture - C4 Diagrams and Fitness Functions]]
 - **Compare with:** [[Architecture Decision Records]] (record the retirement criteria as an ADR), [[API Gateway and BFF]] (the usual place the routing facade lives), [[Service Project Layout and Wiring]] (where the new service's own package boundaries come from)
+
+### Watch on YouTube
+
+- [Microservice Design Patterns / Strangler Fig in Action and Real Migration Story](https://www.youtube.com/watch?v=0nKCfZgUhNA) · Krish Dinesh · 46 min · 2,602 views
+- [Strangling the dragon: modernizing legacy systems with the Strangler Fig pattern   by Daniel Ranela](https://www.youtube.com/watch?v=AmL_OCs5F4E) · Devoxx · 35 min · 1,656 views

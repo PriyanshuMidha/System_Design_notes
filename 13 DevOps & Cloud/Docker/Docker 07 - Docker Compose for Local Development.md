@@ -7,7 +7,7 @@ sources:
   - "Docker Compose file reference (Compose Specification), docs.docker.com"
   - "Docker Compose v2 CLI reference, docs.docker.com"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 07 - Docker Compose for Local Development
@@ -21,6 +21,54 @@ updated: 2026-11-07
 > - Named volumes hold state (databases); bind mounts hold live source code; both outlive `down`, only `down -v` removes named volumes.
 > - Classic mistake: treating `depends_on` as a readiness gate, so the API starts before Postgres accepts connections and crashes on its first query.
 
+## Start here: the basics
+
+**The problem in one story**
+
+A new teammate joins and wants to run the app on their laptop.
+The app needs a Go API, Postgres, Redis and a background worker.
+Without a shared file they copy four long `docker run` commands from a wiki and get one flag wrong.
+Compose writes the whole stack down once, so `docker compose up` starts everything the same way for everyone.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Service | One kind of container in your app | `api`, `postgres`, `redis` |
+| YAML | A plain-text config format using indentation | `ports:` then `- "3000:3000"` |
+| Image vs build | Use a ready image, or build one from your Dockerfile | `image: redis:7` / `build: .` |
+| Environment variable | A named setting passed to a program at start | `DATABASE_URL=postgres://...` |
+| Healthcheck | A command Docker runs to ask "is this ready?" | `pg_isready -U postgres` |
+| Named volume | Docker-managed storage that outlives containers | `pgdata` |
+| Port publishing | Making a container port reachable from the host | `"3000:3000"` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    File["compose.yaml"] -->|"docker compose up"| Net["Project network"]
+    Net --> API["api"]
+    Net --> PG[("postgres")]
+    Net --> R["redis"]
+    API -->|"by service name"| PG
+    API --> R
+```
+
+**Analogy**
+
+A Compose file is a recipe card: list every ingredient and step once, and anyone can cook the same dish.
+Where it breaks: a recipe does not keep the kitchen running if the stove fails; Compose also has no failover or multi-host scheduling.
+
+**How the rest of this note builds up**
+
+- First, why hand-written `docker run` scripts break down and the "parts list" mental model.
+- Then how Compose networks services and the difference between start order and readiness.
+- Then a full Go API + Postgres + Redis + worker example, with a Go readiness endpoint and test.
+- Finally the SDE-3 deep dive: project names, override files, profiles and why Compose is not production orchestration.
+
+> [!tip] Remember
+> `depends_on` orders start; only a healthcheck with `condition: service_healthy` waits for ready.
+
 ## 1. Why it exists
 
 Running an API, a Postgres database, a Redis cache, and a background worker by hand means four `docker run` commands, a hand-built network so they can find each other, and remembering the right flags every time:
@@ -33,7 +81,9 @@ docker run -d --name api --network devnet -p 3000:3000 -e DATABASE_URL=postgres:
 docker run -d --name worker --network devnet -e DATABASE_URL=postgres://postgres:dev@postgres:5432/app myapp:worker
 ```
 
-That is four commands to remember, four to tear down in the right order, and no single place that says what the application actually consists of. Compose replaces all four `docker run` invocations with one declarative file and two commands: `docker compose up -d` and `docker compose down`.
+That is four commands to remember, four to tear down in the right order, and no single place that says what the application actually consists of.
+
+Compose replaces all four `docker run` invocations with one declarative file and two commands: `docker compose up -d` and `docker compose down`.
 
 ## 2. Mental model
 
@@ -43,7 +93,14 @@ Compose derives a **project name** from the folder (or `name:` in the file, or `
 
 ## 3. How it works
 
-A Compose file has four kinds of top-level things: `services` (the containers), `volumes` (named, persistent storage), `networks` (how services reach each other), and `configs`/`secrets` (files mounted in, since Compose v2). Compose v2 (the `docker compose` plugin, not the old standalone `docker-compose`) needs no `version:` key — the Compose Specification is versionless, and the plugin now ships alongside Docker Engine in current installs (bundled with Docker Desktop, and installed as `docker-compose-plugin` next to `docker-ce` on Linux).
+A Compose file has four kinds of top-level things:
+
+- `services` (the containers)
+- `volumes` (named, persistent storage)
+- `networks` (how services reach each other)
+- `configs`/`secrets` (files mounted in, since Compose v2)
+
+Compose v2 (the `docker compose` plugin, not the old standalone `docker-compose`) needs no `version:` key — the Compose Specification is versionless, and the plugin now ships alongside Docker Engine in current installs (bundled with Docker Desktop, and installed as `docker-compose-plugin` next to `docker-ce` on Linux).
 
 ```mermaid
 flowchart TB
@@ -62,7 +119,9 @@ flowchart TB
 
 Only `api` publishes a port to the host; `postgres`, `redis` and `worker` are reachable only from inside `devnet`, by service name, through Compose's embedded DNS (the same `127.0.0.11` resolver as a user-defined network — see [[Docker 05 - Networking and Port Publishing]]).
 
-**Startup ordering vs readiness.** `depends_on: [postgres]` only guarantees Docker *starts* the `postgres` container before `api`'s container is created — the Postgres process inside might still be running its first-time initialization for several seconds. `condition: service_healthy` makes Compose wait for the dependency's `healthcheck` to report `healthy` before starting the dependent:
+**Startup ordering vs readiness.** `depends_on: [postgres]` only guarantees Docker *starts* the `postgres` container before `api`'s container is created — the Postgres process inside might still be running its first-time initialization for several seconds.
+
+`condition: service_healthy` makes Compose wait for the dependency's `healthcheck` to report `healthy` before starting the dependent:
 
 ```mermaid
 sequenceDiagram
@@ -197,7 +256,9 @@ Points worth noticing:
 - `develop.watch` (Compose v2.22+) syncs `./cmd/api` into the running container on save, for a dev inner loop without a full rebuild — `docker compose watch` runs this instead of `up`.
 - The root `.env` file only feeds `${VAR}` interpolation *inside* `compose.yaml` (file paths, image tags, the password above). A service that needs a whole list of variables injected as its own environment uses `env_file: - .env.api` instead of (or alongside) an inline `environment:` map — same effect as `environment:`, but the values live in a separate file instead of being typed into the service block.
 
-**Readiness endpoint the healthcheck is really testing for.** `pg_isready` proves Postgres is accepting connections, but the API itself should expose its own readiness once it has completed its own startup (DB ping, cache ping). Go 1.24:
+**Readiness endpoint the healthcheck is really testing for.** `pg_isready` proves Postgres is accepting connections.
+
+But the API itself should expose its own readiness once it has completed its own startup (DB ping, cache ping). Go 1.24:
 
 ```go
 // Package main is a scratch program for the "Docker Compose for Local
@@ -364,3 +425,8 @@ docker compose down -v            # also delete named volumes (pgdata is gone)
 - **Before this:** [[Docker 05 - Networking and Port Publishing]], [[Docker 06 - Volumes and Bind Mounts]]
 - **Next:** [[Docker 08 - How Docker Works Under the Hood]], [[Kubernetes Fundamentals]]
 - **Compare with:** [[Docker 04 - Writing a Production Dockerfile for Go]] (the image Compose builds from), [[CI-CD Pipelines (GitHub Actions for Go)]] (Compose used to stand up integration-test dependencies)
+
+### Watch on YouTube
+
+- [How To Use Docker To Make Local Development A Breeze](https://www.youtube.com/watch?v=zkMRWDQV4Tg) · ArjanCodes · 21 min · 376,345 views
+- [Docker Up and Running 13: Docker Compose for Local Development](https://www.youtube.com/watch?v=4mCye01GE54) · Syndri Training · 5 min · 588 views

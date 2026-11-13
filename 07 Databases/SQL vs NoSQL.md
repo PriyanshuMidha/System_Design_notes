@@ -19,13 +19,17 @@ sources:
   - "Bronson et al., TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC 2013)"
   - "Corbett et al., Spanner: Google's Globally-Distributed Database (OSDI 2012)"
   - "AWS What's New, Amazon Aurora PostgreSQL Limitless Database is generally available (2024-10-31)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # SQL vs NoSQL
 
 > [!summary] TL;DR
-> **SQL** (relational) databases store tables with a declared schema and let you join them, query them any way you like, and change many rows in one transaction. **NoSQL** is an umbrella for stores built on other data models (documents, key-value pairs, wide rows, graphs) that usually give up ad-hoc joins in exchange for a data layout matched to a few known queries at large scale. Choose by access patterns, relationships, consistency and scale, not by the label: NoSQL stores now have transactions, and SQL databases now scale out.
+> **SQL** (relational) databases store tables with a declared schema and let you join them, query them any way you like, and change many rows in one transaction.
+>
+> **NoSQL** is an umbrella for stores built on other data models (documents, key-value pairs, wide rows, graphs) that usually give up ad-hoc joins in exchange for a data layout matched to a few known queries at large scale.
+>
+> Choose by access patterns, relationships, consistency and scale, not by the label: NoSQL stores now have transactions, and SQL databases now scale out.
 
 > [!abstract] Core idea
 > - Pick a store from its access patterns (which queries, how often, how big), not from the SQL or NoSQL label.
@@ -33,9 +37,58 @@ updated: 2026-11-07
 > - Document or key-value: data laid out to match a few known queries, scaled by partition key; new questions need new copies of the data.
 > - Classic mistake: writing two stores from one request (a dual write). Keep one source of truth and copy changes out with an outbox or CDC.
 
+## Start here: the basics
+
+**The problem in one story.**
+You can keep your kitchen in labelled jars on shelves, or pack a ready-made lunchbox for each day.
+Jars let you cook any recipe, but you have to gather ingredients each time.
+Lunchboxes are instant to grab, but only for the meals you planned.
+Relational (SQL) and NoSQL databases make this same trade.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Relational database | Data in tables with a fixed schema, queried with SQL | PostgreSQL, MySQL |
+| NoSQL | Umbrella name for non-relational stores | DynamoDB, MongoDB, Redis, Cassandra |
+| Schema | The declared shape of the data | `invoices(id, client_id, amount)` |
+| Access pattern | A query the app runs, with how often and how big | "Get a client's last 20 invoices" |
+| Join | Combining rows from tables at read time | invoices + clients |
+| Denormalize | Copy data so one read gets everything | Client name stored inside each invoice document |
+| Partition key | The value that decides which server holds a record | `client_id` |
+| Transaction | Several changes that succeed or fail together | Debit and credit in one step |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+  Q[What are the access patterns?] --> A{Known, few and huge scale?}
+  A -- yes --> N[Key-value or document store]
+  A -- no / changing --> R[Relational database]
+  R --> X[Copy out to other stores via outbox or CDC]
+```
+
+**Analogy.**
+SQL is the jars-on-shelves kitchen; a document or key-value store is the pre-packed lunchbox.
+Where it breaks: real systems often use both, with one store as the source of truth feeding the other.
+
+**How the rest of this note builds up**
+
+- First, why so many kinds of database exist and a simple mental model.
+- Then the families, schema-on-write versus schema-on-read, joins versus aggregates, ACID versus BASE, and scaling.
+- Then a worked example choosing a store for InvoiceOps.
+- Finally, dual writes versus the outbox, production practice and the SDE-3 deep dive.
+
+> [!tip] Remember
+> Choose a store from your access patterns, not from the SQL or NoSQL label.
+
 ## 1. Why it exists
 
-Relational databases were built for one server, strong consistency and flexible queries. In the 2000s, web companies outgrew single machines. Google's Bigtable (2006) and Amazon's Dynamo (2007) gave up joins and multi-row transactions so that data could be spread over many machines by key and stay available when some failed. Document stores such as MongoDB (first released in 2009) added a JSON-shaped model that maps directly onto application objects.
+Relational databases were built for one server, strong consistency and flexible queries. In the 2000s, web companies outgrew single machines.
+
+Google's Bigtable (2006) and Amazon's Dynamo (2007) gave up joins and multi-row transactions so that data could be spread over many machines by key and stay available when some failed.
+
+Document stores such as MongoDB (first released in 2009) added a JSON-shaped model that maps directly onto application objects.
 
 InvoiceOps shows why the choice is per access pattern, not per company:
 - **Recording a payment** must insert the payment, raise the invoice's paid amount and write an audit row together. Finance also asks new questions every month ("revenue by client country, by quarter"). That is relational work.
@@ -227,7 +280,9 @@ flowchart LR
     P4["4 Session by token, 2,000/s, TTL"] --> RD[("Redis")]
 ```
 
-**Back-of-envelope (estimate):** 10,000 workspaces × 100 invoices a month = 1M invoices a month, about 0.4 inserts per second on average. Even a 100× peak is 40 per second. Storage is about 1M × (1 KB invoice + 5 items × 200 B) ≈ 2 GB a month. One Postgres primary with a replica handles this with large headroom, so the core stays relational.
+**Back-of-envelope (estimate):** 10,000 workspaces × 100 invoices a month = 1M invoices a month, about 0.4 inserts per second on average. Even a 100× peak is 40 per second.
+
+Storage is about 1M × (1 KB invoice + 5 items × 200 B) ≈ 2 GB a month. One Postgres primary with a replica handles this with large headroom, so the core stays relational.
 
 **Pattern 6 without a second database.** The custom fields live in one `jsonb` column; a GIN index serves containment queries on it.
 
@@ -315,7 +370,9 @@ sequenceDiagram
     end
 ```
 
-**Polyglot persistence costs.** Every extra store adds backups, upgrades, monitoring, security review and on-call knowledge. Data copied between stores needs one writer and a pipeline: writing to Postgres and Elasticsearch from the same request is a *dual write* that silently diverges when one side fails. Use an outbox (a table written in the same transaction as the change, which a relay then publishes) or CDC (change data capture: streaming changes out of the database log), and run a reconciliation job.
+**Polyglot persistence costs.** Every extra store adds backups, upgrades, monitoring, security review and on-call knowledge. Data copied between stores needs one writer and a pipeline: writing to Postgres and Elasticsearch from the same request is a *dual write* that silently diverges when one side fails.
+
+Use an outbox (a table written in the same transaction as the change, which a relay then publishes) or CDC (change data capture: streaming changes out of the database log), and run a reconciliation job.
 
 ## 7. In production
 
@@ -404,3 +461,8 @@ flowchart LR
 - **Before this:** [[SQL Essentials]]
 - **Next:** [[Relational Schema Design]], [[NoSQL Data Modeling]], [[Partitioning and Sharding]]
 - **Compare with:** [[Distributed SQL]] (SQL with built-in scale-out), [[CAP and PACELC]] (the consistency trade-off behind the defaults), [[Wide-Column Stores and Cassandra]] (the Discord-style message store)
+
+### Watch on YouTube
+
+- [SQL vs NoSQL Explained: Why Your Bank and Your Feed Differ](https://www.youtube.com/watch?v=auBGsfDdQyE) · 𝗦𝘁𝗮𝗿𝗖𝗼𝗱𝗲 𝗞𝗵 · covers ACID vs NoSQL families and CAP tradeoffs, matching note's framing
+- [SQL Vs NoSQL — Choosing The Right Database](https://www.youtube.com/watch?v=2nPT2mv93pk) · Destination Engineer (Formally Destination FAANG) · interview-style walkthrough of choosing by access patterns and scale

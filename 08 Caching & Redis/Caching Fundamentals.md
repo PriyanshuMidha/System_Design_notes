@@ -10,7 +10,7 @@ sources:
   - "Redis docs, MEMORY USAGE and INFO commands"
   - "PostgreSQL 17 docs, Resource Consumption (shared_buffers)"
   - "Nishtala et al., Scaling Memcache at Facebook (NSDI 2013)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Caching Fundamentals
@@ -24,6 +24,51 @@ updated: 2026-11-04
 > - Caches exist at every layer: browser, CDN, proxy, inside your process, a shared store like Redis, and inside the database itself.
 > - The cache is a copy. The database stays the source of truth, and the system must stay correct when the cache is empty, stale or down.
 > - Every cache needs four decisions: what to cache, the key, how long it stays fresh, and what happens when it fails.
+
+## Start here: the basics
+
+**The problem in one story.**
+A shop page shows a product's name, price and stock.
+Every visitor makes the server ask the database for the same row again.
+The database gets slow when thousands of people ask at once.
+So the server keeps a quick copy of the answer nearby and reuses it for the next visitor.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Database | The main, permanent store of your data | PostgreSQL holding the `products` table |
+| Source of truth | The place whose value counts if copies disagree | The DB row, not the cached copy |
+| Latency | How long one request takes | 20 ms for a DB query vs 0.06 ms for a Redis `GET` |
+| Key / value | A name you look up, and the data stored under it | `product:42` → `{"price": 499}` |
+| Hit / miss | Found in the cache / not found, must go to the DB | Second visitor = hit, first = miss |
+| Hit ratio | Share of reads the cache answers | 95 of 100 reads hit = 95% |
+| Stale | A copy that no longer matches the source | Cache says ₹499, DB now says ₹549 |
+| Redis | A fast in-memory key-value server many apps share | `SET`, `GET`, `EXPIRE` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["App needs data"] --> C{"In cache?"}
+    C -- "hit" --> R["Return fast"]
+    C -- "miss" --> DB["Read database (slow)"]
+    DB --> F["Store copy in cache"]
+    F --> R
+```
+
+**Analogy.** A sticky note on your monitor holds an answer whose full version is in a filing cabinet down the hall.
+Where it breaks: a real sticky note never vanishes on its own, but cache entries expire or get evicted on purpose.
+
+**How the rest of this note builds up**
+
+- First, why caches exist (section 1) and the sticky-note mental model (section 2).
+- Then how a cache works across layers: browser, CDN, in-process, Redis, database (section 3).
+- Then a worked Go example and the variants and trade-offs (sections 4-6).
+- Finally the SDE-3 view: production sizing and monitoring, the deep dive, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> A cache is a fast copy; the database stays the truth, and the system must work when the copy is gone.
 
 ## 1. Why it exists
 
@@ -103,7 +148,11 @@ flowchart LR
 | Distributed (L2) | Sessions, rendered fragments, query results, counters | Your code | Every instance of every service that uses it |
 | Database internals | Hot pages and index blocks (PostgreSQL `shared_buffers`), precomputed results (materialized views) | The database engine | All queries |
 
-Details of the HTTP layers belong to [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] and [[CDN and Edge]]. One point from the CDN worth keeping here: the **first** request for an object at an edge is a miss that goes to the origin; only the **second and later** requests from that region are hits. Cold caches are normal after deploys, purges and new regions.
+Details of the HTTP layers belong to [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] and [[CDN and Edge]].
+
+One point from the CDN worth keeping here: the **first** request for an object at an edge is a miss that goes to the origin; only the **second and later** requests from that region are hits.
+
+Cold caches are normal after deploys, purges and new regions.
 
 > [!warning] Not every fast store is a cache
 > Kafka keeps messages for a retention period, but it is a **durable log**, the source of truth for those events, not a cache. Elasticsearch is a **derived index** that you rebuild from the source, close in spirit to a cache but queried for search, not used to skip a lookup. A cache is defined by being **safe to lose**: if you wipe it, the system is slower but still correct.
@@ -410,3 +459,8 @@ clients:ws_123:list:v1:9f2c1a        <- hash of status=active&page=1&sort=name
 - **Before this:** [[Latency Numbers Every Engineer Should Know]], [[Memory Hierarchy and CPU Caches]]
 - **Next:** [[Caching Patterns]], [[Cache Invalidation, TTL and Consistency]], [[Cache Eviction Policies - LRU, LFU, TTL]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]
 - **Compare with:** [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[CDN and Edge]], [[Materialized Views and Denormalization]], [[Redis Fundamentals]]
+
+### Watch on YouTube
+
+- [How does Caching on the Backend work? (System Design Fundamentals)](https://www.youtube.com/watch?v=bP4BeUjNkXc) · Software Developer Diaries · clear visual intro to why caching exists and the hit/miss/hit-ratio basics
+- [🧠 System Design Fundamentals 11 ✅  Caching & CDN in System Design / Cache Strategies, TTL & Eviction](https://www.youtube.com/watch?v=mTHT3LmsNbw) · InterviewWithBunny · broader system-design framing covering cache layers, TTL and eviction together

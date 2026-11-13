@@ -9,7 +9,7 @@ sources:
   - "Google SRE Book, ch. 3 'Embracing Risk' and ch. 6 'Monitoring Distributed Systems' (four golden signals)"
   - "Jeff Dean, 'Numbers Everyone Should Know' (latency table, widely reproduced; values are order-of-magnitude)"
   - "Owner's interview preparation notes, rewritten"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HLD Round - Complete Step-by-Step Guide
@@ -23,6 +23,53 @@ updated: 2026-11-09
 > - Spend 40 percent of the time on one or two deep dives chosen from the riskiest non-functional requirement.
 > - Say every decision as "I pick X over Y because Z, and the cost is W".
 > - A working simple design first; complexity only when a number demands it.
+
+## Start here: the basics
+
+**The problem in one story**
+
+An interviewer says "Design a food delivery app" and gives you 45 minutes.
+If you start drawing boxes at once, you will miss what matters and run out of time.
+If you follow a fixed set of steps, you ask the right questions, size the system, and spend your time on the hardest part.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| HLD | High-level design: the big boxes and how they talk | Clients, gateway, services, DBs, queues |
+| Functional requirement | What the system must do | "User can place an order" |
+| Non-functional requirement | How well it must do it | "p99 under 200 ms, 99.9% uptime" |
+| QPS | Queries (requests) per second | 1,750 orders per second at peak |
+| Back-of-envelope estimate | Quick rough math to size the system | 10M orders/day ÷ 86,400 s ≈ 116/s |
+| Deep dive | Zooming into the riskiest part in detail | How to assign riders without double booking |
+| Trade-off | What you give up to get something | Faster reads, but data can be seconds stale |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A[Requirements] --> B[Estimates]
+    B --> C[API and data model]
+    C --> D[Simple design]
+    D --> E[Deep dives]
+    E --> F[Scale, reliability, security]
+    F --> G[Wrap-up]
+```
+
+**Analogy**
+
+The round is like a doctor's visit: ask about symptoms, take measurements, give a first diagnosis, then run detailed tests on the worrying part.
+Where it breaks: a doctor has a lab, but you only have estimates, so you must say which numbers are guesses.
+
+**How the rest of this note builds up**
+
+- First, why the round exists and the mental model of what is judged (sections 1-2).
+- Then the nine steps in detail (section 3) and a worked food delivery example (section 4).
+- Next, variants of the round, trade-offs and what real teams care about (sections 5-7).
+- Finally, the SDE-3 deep dive: phrasing bank, choosing the deep dive by problem type, and consistency, then interview questions and the cheat sheet (sections 8-10).
+
+> [!tip] Remember
+> Every box traces back to a requirement or a number; say "X over Y because Z, cost W".
 
 ## 1. Why it exists
 
@@ -341,7 +388,11 @@ flowchart TD
     E --> F["Prove it: load test,<br/>watch saturation metrics"]
 ```
 
-Worked numbers from the food delivery example: orders go from 175 to 1,750 peak per second. Say: "One Postgres primary on good hardware commonly handles thousands of simple writes per second, 1,750 per second of multi-row order transactions leaves thin headroom on one node (this is an estimate, hardware dependent), so I would plan to partition orders by customer id into N shards, and I would validate that with a load test first." The honest note on measured limits shows judgement.
+Worked numbers from the food delivery example: orders go from 175 to 1,750 peak per second.
+
+Say: "One Postgres primary on good hardware commonly handles thousands of simple writes per second, 1,750 per second of multi-row order transactions leaves thin headroom on one node (this is an estimate, hardware dependent), so I would plan to partition orders by customer id into N shards, and I would validate that with a load test first."
+
+The honest note on measured limits shows judgement.
 
 Answer structure: re-estimate, find the first bottleneck, fix, check side effects (hot keys, connection counts, cost), prove with a load test.
 
@@ -478,3 +529,8 @@ See [[Consistency Models]] and [[CAP and PACELC]] for the theory behind each bra
 - **Theory behind decisions:** [[Queues vs Streams and Broker Comparison]], [[Caching Patterns]], [[Partitioning and Sharding]], [[Consistency Models]], [[CAP and PACELC]], [[Choosing an API Style]]
 - **Case studies:** [[Case Study - URL Shortener]], [[Case Study - News Feed]], [[Case Study - Payment System]], [[Case Study - Ride Sharing and Proximity]]
 - **Compare with:** [[LLD Round Playbook]], [[SDE-3 Readiness Checklist]]
+
+### Watch on YouTube
+
+- [Complete System Design Roadmap 2026 / HLD & LLD by Shradha Ma'am](https://www.youtube.com/watch?v=CuQmQpvw04I) · Apna College · 20 min · 795,135 views
+- [How to crack HLD ( High Level Design) round in an interview? / System Design Interviews](https://www.youtube.com/watch?v=EB4XAkcz2Zw) · Recro · 3 min · 765 views

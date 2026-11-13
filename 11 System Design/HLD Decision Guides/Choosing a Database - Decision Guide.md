@@ -25,7 +25,7 @@ sources:
   - "Uber Engineering, Fast and Reliable Log Analytics with ClickHouse (2021)"
   - "Stripe Engineering, How Stripe's document databases supported 99.999% uptime with zero-downtime data migrations (2024): DocDB on MongoDB"
   - "Netflix Tech Blog, Cassandra at Netflix (multi-region, 2011 and later posts)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Choosing a Database - Decision Guide
@@ -38,6 +38,53 @@ updated: 2026-11-09
 > - Ask five questions in order: shape of data, query pattern, consistency need, scale, and who operates it.
 > - Most systems use **polyglot persistence**: one source of truth (usually relational) plus derived stores (cache, search index, warehouse) fed from it.
 > - In an interview the winning move is to state the access pattern first, then the choice, then the cost you accept.
+
+## Start here: the basics
+
+**The problem in one story**
+
+You are storing orders for a shop. Orders must never be lost or double-charged.
+You also store a stream of clicks, millions per hour, where losing a few is fine.
+One kind of database is great at the first job, another at the second. Choosing a database means matching the tool to the job.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Relational (SQL) | Data in tables with rows, columns and joins | `orders` joined to `customers` |
+| NoSQL | Non-table stores: key-value, document, wide-column, graph | DynamoDB, MongoDB, Cassandra |
+| Transaction | Several changes that all happen or none happen | Debit A and credit B together |
+| ACID | Guarantees of a transaction: atomic, consistent, isolated, durable | A crash never leaves half a transfer |
+| Access pattern | The exact queries the app runs, and how often | "get orders by customer, newest first" |
+| Index | An extra structure that makes a lookup fast | Index on `email` |
+| Sharding | Splitting data across machines by a key | Users A-M on node 1, N-Z on node 2 |
+| Replica | A copy of the data on another machine | Read replica for reports |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    Q[What does the data look like and how is it read?] --> R{Need joins and transactions?}
+    R -->|yes| SQL[(Relational: Postgres, MySQL)]
+    R -->|no| K{Simple key lookups at huge scale?}
+    K -->|yes| KV[(Key-value / wide-column)]
+    K -->|no| DOC[(Document store)]
+```
+
+**Analogy**
+
+Choosing a database is like choosing a vehicle: a truck carries heavy loads safely, a bike is fast in traffic, and nobody does both well.
+Where it breaks: you can run several databases side by side and copy data between them, which you cannot do with one trip.
+
+**How the rest of this note builds up**
+
+- First, why many kinds of database exist and the five-question mental model (sections 1-2).
+- Then how each family works and a worked example (sections 3-4).
+- Next, variant comparisons, trade-offs and production lessons (sections 5-7).
+- Finally, the SDE-3 deep dive on storage engines, consistency, scale thresholds and migration safety, then drills and interview questions (sections 8-12).
+
+> [!tip] Remember
+> State the access pattern first, then the database, then the cost you accept.
 
 ## 1. Why it exists
 
@@ -126,7 +173,9 @@ flowchart TD
 | Relational | Tables, foreign keys, SQL | PostgreSQL, MySQL | Transactions, joins, ad hoc queries |
 | Document | JSON documents | MongoDB, Couchbase | Nested aggregates read as a unit |
 | Key-value | Key to opaque value | Redis, DynamoDB, Riak | Lookup by key at low latency |
-| Wide-column | Partition key plus sorted clustering columns | Cassandra, ScyllaDB, HBase | Huge write volume, time-ordered reads per partition |
+| Wide-column | Partition key plus sorted clustering columns |
+
+Cassandra, ScyllaDB, HBase | Huge write volume, time-ordered reads per partition |
 | Graph | Nodes and edges | Neo4j, Neptune | Multi-hop relationship queries |
 | Time-series | Timestamp plus tags plus value | TimescaleDB, InfluxDB, Prometheus | Append-only metrics with retention |
 | Search | Inverted index | Elasticsearch, OpenSearch, Solr | Relevance ranked text search |
@@ -292,7 +341,9 @@ quadrantChart
 
 ### Why the engine type follows the storage engine
 
-Relational engines such as Postgres and InnoDB use **B-trees**: reads are fast, in-place updates cost random IO. Cassandra, ScyllaDB, RocksDB and many others use **LSM trees**: writes go to a memory table and an append-only log, so writes are fast, and reads may check several files. This is why Cassandra absorbs write firehoses and why it needs compaction. See [[Storage Engines - B-tree vs LSM and WAL]].
+Relational engines such as Postgres and InnoDB use **B-trees**: reads are fast, in-place updates cost random IO. Cassandra, ScyllaDB, RocksDB and many others use **LSM trees**: writes go to a memory table and an append-only log, so writes are fast, and reads may check several files.
+
+This is why Cassandra absorbs write firehoses and why it needs compaction. See [[Storage Engines - B-tree vs LSM and WAL]].
 
 ```mermaid
 flowchart LR
@@ -437,3 +488,10 @@ Avoid:
 - Theory: [[CAP and PACELC]], [[Consistency Models]], [[Quorums and Leaderless Replication]], [[Multi-Region Architecture]]
 - Case studies: [[Case Study - Key-Value Store]], [[Case Study - Chat System]], [[Case Study - Payment System]], [[Case Study - Leaderboard and Top-K]]
 - Next: [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]]
+
+## Links
+
+### Watch on YouTube
+
+- [Choosing a Database for Systems Design: All you need to know in one video](https://www.youtube.com/watch?v=6GebEqt6Ynk) · Jordan has no life · 23 min · 85,343 views
+- [Database Design Tips / Choosing the Best Database in a System Design Interview](https://www.youtube.com/watch?v=cODCpXtPHbQ) · codeKarle · 23 min · 616,842 views

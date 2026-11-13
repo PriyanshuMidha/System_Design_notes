@@ -10,7 +10,7 @@ sources:
   - "Marc Brooker, Exponential Backoff And Jitter, AWS Architecture Blog (2015): full jitter"
   - "RFC 6585, section 4: 429 Too Many Requests; RFC 9110, section 15.5.9: 408 Request Timeout"
   - "Meta WhatsApp Business Platform docs: the 24-hour customer service window and template messages"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Notification Service
@@ -23,6 +23,48 @@ updated: 2026-11-02
 > - Each provider sits behind one `Sender` interface (Adapter); failover and rate limiting wrap a `Sender` without changing the service (Decorator).
 > - The one rule: retry only retryable failures (network errors, 408, 429, 5xx) with capped, jittered backoff; any other 4xx is permanent.
 > - Classic mistakes: retrying an invalid phone number, rendering SMS with `html/template` (users see `&amp;`), and dropping queued messages on deploy.
+
+## Start here: the basics
+
+**The problem in one story.** You order food. The app should send you an email, an SMS and a push message saying "order placed". The order page must not wait for the SMS company. If the SMS company is down, the message should be retried later, and it must never arrive twice.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Channel | A way to reach the user | Email, SMS, push, WhatsApp |
+| Provider | The outside company that actually sends | An SMS gateway |
+| Queue | A waiting line of work for workers | 1,000 messages waiting to send |
+| Worker | A goroutine that takes jobs off the queue | Sends one message at a time |
+| Idempotency key | A unique ID so a repeat is skipped | `order-42:sms` sent once |
+| Retryable error | A failure that may work next time | 503, timeout, 429 |
+| Backoff with jitter | Wait longer after each failure, plus randomness | 1 s, 2 s, 4 s ± random |
+| DLQ (dead-letter queue) | Where messages go after giving up | Invalid number after 5 tries |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  E[Order placed event] --> Q[Queue]
+  Q --> W[Worker]
+  W --> K{Key already claimed?}
+  K -->|yes| S[Skip]
+  K -->|no| P[Check preferences + render]
+  P --> SD[Sender: email / SMS / push]
+  SD -->|retryable fail| Q
+```
+
+**Analogy.** A post room in an office: people drop letters in a tray and go back to work, clerks pick them up, stamp each one with a tracking number so none is sent twice, and resend if the courier did not show. Where it breaks: real clerks do not get rate-limited by the courier; providers do, so the service must throttle itself.
+
+**How the rest of this note builds up**
+
+- First the problem, requirements and actors (Steps 1-2), then entities and the `Sender` interface (Steps 3-5).
+- Then storage: the `notifications` table as outbox and idempotency claim (Step 6), and patterns (Adapter, Decorator, Factory).
+- Then the Go code and tests (Step 8): workers, retries, rate limits, graceful drain.
+- Finally the SDE-3 depth: edge cases, trade-offs (priority lanes, failover) and interview questions.
+
+> [!tip] Remember
+> Send asynchronously, claim a key once, retry only retryable errors with jittered backoff.
 
 ## Problem statement
 
@@ -238,9 +280,13 @@ CREATE TABLE provider_limits (
 );
 ```
 
-The claim in production is `INSERT INTO notifications (...) ON CONFLICT (idempotency_key) DO NOTHING` (0 rows means duplicate) or Redis `SET key 1 NX EX 86400`. With many worker pods, the provider bucket moves to Redis (a token bucket in a Lua script, keyed by provider), as in [[Rate Limiter]]. The `notifications` table doubles as the outbox when the order service writes it in its own transaction ([[Transactional Outbox and CDC]]), and that is what makes a drain deadline safe: anything not sent is still `queued` in the table.
+The claim in production is `INSERT INTO notifications (...) ON CONFLICT (idempotency_key) DO NOTHING` (0 rows means duplicate) or Redis `SET key 1 NX EX 86400`. With many worker pods, the provider bucket moves to Redis (a token bucket in a Lua script, keyed by provider), as in [[Rate Limiter]].
 
-In production a `NotificationRepository` replaces `IdemStore`: `Claim` is the `INSERT ... ON CONFLICT DO NOTHING` above, `MarkSent` stores the provider message ID, and `MarkFailed` records the attempt, the status code and whether it was retryable, which decides between a new `next_attempt_at` and the DLQ. The ports, compiled with the package below (`PrefStore` is already part of it):
+The `notifications` table doubles as the outbox when the order service writes it in its own transaction ([[Transactional Outbox and CDC]]), and that is what makes a drain deadline safe: anything not sent is still `queued` in the table.
+
+In production a `NotificationRepository` replaces `IdemStore`: `Claim` is the `INSERT ... ON CONFLICT DO NOTHING` above, `MarkSent` stores the provider message ID, and `MarkFailed` records the attempt, the status code and whether it was retryable, which decides between a new `next_attempt_at` and the DLQ.
+
+The ports, compiled with the package below (`PrefStore` is already part of it):
 
 ```go
 type NotificationRepository interface {
@@ -1192,7 +1238,17 @@ Tradeoffs chosen:
 - **Release the key on failure:** allows a replay from the DLQ; a crash between send and store can still double-send (at-least-once).
 - **In-process queue and bucket:** exact for one process; production moves both to Kafka and Redis.
 
-Common mistakes: sending synchronously inside the order request; no idempotency key; retrying permanent errors; retrying in a tight loop, or with `time.Sleep` that ignores cancellation; blocking forever on a full channel; a `switch channel` in the service instead of a factory; ignoring opt-out or sending WhatsApp without opt-in; no provider rate limit; publishing the event outside the database transaction (the outbox fixes it).
+Common mistakes:
+
+- sending synchronously inside the order request
+- no idempotency key
+- retrying permanent errors
+- retrying in a tight loop, or with `time.Sleep` that ignores cancellation
+- blocking forever on a full channel
+- a `switch channel` in the service instead of a factory
+- ignoring opt-out or sending WhatsApp without opt-in
+- no provider rate limit
+- publishing the event outside the database transaction (the outbox fixes it)
 
 See [[Case Study - Notification System]] for the system-level design (fan-out to millions, provider routing, analytics).
 
@@ -1200,7 +1256,9 @@ See [[Case Study - Notification System]] for the system-level design (fan-out to
 
 ![[Notification System LLD Drawing.excalidraw]]
 
-The drawing shows the `Sender` interface with its adapters and the rate-limit decorator, the worker pipeline (claim, preferences, render, factory, rate limit, send, backoff), the notification statuses, and the `notifications` table with `UNIQUE (idempotency_key)`. Redraw it from memory, then add what it predates: the high and low lanes, the failover chain, and the retryable or permanent split after each send.
+The drawing shows the `Sender` interface with its adapters and the rate-limit decorator, the worker pipeline (claim, preferences, render, factory, rate limit, send, backoff), the notification statuses, and the `notifications` table with `UNIQUE (idempotency_key)`.
+
+Redraw it from memory, then add what it predates: the high and low lanes, the failover chain, and the retryable or permanent split after each send.
 
 - [ ] The `Sender` interface with its implementers, and which ones wrap another
 - [ ] The worker pipeline in order: claim, preferences, render, factory, rate limit, send, classify, backoff
@@ -1246,3 +1304,8 @@ The drawing shows the `Sender` interface with its adapters and the rate-limit de
 - **Before this:** [[Factory and Abstract Factory]], [[Adapter]], [[Decorator and Middleware]], [[Delivery Partner Assignment]]
 - **Next:** [[Rate Limiter]], [[Circuit Breaker]]
 - **Compare with:** [[Case Study - Notification System]], [[Timeouts, Retries and Backoff]], [[Idempotency and Idempotency Keys]], [[Graceful Shutdown and Health Checks]]
+
+### Watch on YouTube
+
+- [Designing Notifications Service for Instagram](https://www.youtube.com/watch?v=kIP8L-CSl2Y) · Arpit Bhayani · 37 min · 112,344 views
+- [19: Notification Service / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=J-5JozlYIqI) · Jordan has no life · 21 min · 65,691 views

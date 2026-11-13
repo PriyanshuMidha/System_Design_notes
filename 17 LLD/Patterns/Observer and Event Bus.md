@@ -8,7 +8,7 @@ sources:
   - "Gamma, Helm, Johnson, Vlissides, Design Patterns (1994), Observer"
   - "Go standard library docs: os/signal Notify and Stop, context.AfterFunc (Go 1.21), sync.OnceFunc (Go 1.21), errors.Join (Go 1.20), slices.DeleteFunc"
   - "PostgreSQL 17 docs: SELECT ... FOR UPDATE SKIP LOCKED"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Observer and Event Bus
@@ -22,9 +22,54 @@ updated: 2026-11-03
 > - One failing or panicking handler must not stop the others.
 > - Classic mistake: publishing an event inside a database transaction that later rolls back. Publish after commit, through the **transactional outbox** (an event row saved in the same transaction and sent later by a relay; see [[Transactional Outbox and CDC]]).
 
+## Start here: the basics
+
+**The problem in one story.**
+A shop gets a new order. Email, SMS, analytics and the cache all need to know.
+If the order code calls each one by hand, it grows with every new listener and fails when one of them is down.
+Instead, the order code shouts "order created!" once, and whoever cares is listening.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Event | A message saying something happened | `order.created` with order ID 42 |
+| Topic | The name listeners subscribe to | `"order.created"` |
+| Publisher | Code that announces events | `CreateOrder` |
+| Subscriber / handler | A function called when an event arrives | `sendEmail(evt)` |
+| Mutex | A lock so only one goroutine changes data at a time | `mu.Lock()` around the handler map |
+| Synchronous / async | Wait for handlers vs let them run later | Async: handlers run in other goroutines |
+| Transaction / commit | A DB change that becomes final only at commit | Rollback means the order never existed |
+| Outbox | A table row saved with the order and sent later | Relay reads `outbox` and publishes |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["CreateOrder"] -->|"publish order.created"| B["Event bus"]
+    B --> E["Email handler"]
+    B --> S["SMS handler"]
+    B --> A["Analytics handler"]
+```
+
+**Analogy.** A YouTube channel: the creator uploads once, and every subscriber gets notified; the creator does not know who they are.
+Where it breaks: YouTube retries and stores notifications for you; an in-process bus loses events on crash unless you add an outbox.
+
+**How the rest of this note builds up**
+
+- First, why an event bus beats inline calls, and three bugs in the naive version (section 1), then the mental model (section 2).
+- Then how a safe bus works: lock, copy, call outside the lock, isolate failures (section 3).
+- Then a runnable worked example with tests and the outbox rows in PostgreSQL (section 4), plus variants (section 5).
+- Finally the SDE-3 depth: trade-offs, production practice, the deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> Publish once, let subscribers react on their own, and only publish after the commit.
+
 ## 1. Why it exists
 
-`CreateOrder` saves an order and then must send an email, send an SMS, update analytics and warm a cache. Written inline, `CreateOrder` imports four packages, takes about 4 × 50 ms = 200 ms longer (an estimate: 50 ms per remote call), and fails the whole order when the SMS gateway is down. Every new reaction means editing the order code again.
+`CreateOrder` saves an order and then must send an email, send an SMS, update analytics and warm a cache.
+
+Written inline, `CreateOrder` imports four packages, takes about 4 × 50 ms = 200 ms longer (an estimate: 50 ms per remote call), and fails the whole order when the SMS gateway is down. Every new reaction means editing the order code again.
 
 With an event bus, `CreateOrder` publishes one `order.created` event. Email, SMS and analytics subscribe on their own, and the order code never changes when a fourth reaction is added.
 
@@ -89,7 +134,11 @@ classDiagram
 
 **Subscribing:** `Subscribe` appends a new `*subscription` under the write lock and returns an `unsubscribe` function wrapped in `sync.OnceFunc`, so calling it twice is harmless. Each subscription is a distinct pointer, which matters because a `HandlerFunc` value cannot be compared with `==`.
 
-**Asynchronous delivery:** wrap a slow handler in an `AsyncSubscriber`. It is itself a `Handler`, so it plugs into the same bus. `Handle` only puts the event on a buffered channel; one goroutine per subscriber drains it in order. When the buffer is full, the policy decides: **Block** (the publisher waits: back-pressure) or **DropNewest** (the event is dropped and counted). A blocked publisher waits **without holding any lock**, so `Close` can always stop intake: it wakes every blocked sender with `ErrClosed`, drains what was already accepted, and returns once the handler has finished those events.
+**Asynchronous delivery:** wrap a slow handler in an `AsyncSubscriber`. It is itself a `Handler`, so it plugs into the same bus. `Handle` only puts the event on a buffered channel; one goroutine per subscriber drains it in order.
+
+When the buffer is full, the policy decides: **Block** (the publisher waits: back-pressure) or **DropNewest** (the event is dropped and counted).
+
+A blocked publisher waits **without holding any lock**, so `Close` can always stop intake: it wakes every blocked sender with `ErrClosed`, drains what was already accepted, and returns once the handler has finished those events.
 
 **Publish after commit.** An in-process bus forgets everything when the process dies, and publishing inside a database transaction announces orders that may roll back. The fix is the transactional outbox: write the event row in the **same transaction** as the order, and let a relay publish committed rows.
 
@@ -607,7 +656,11 @@ func TestCloseReturnsWhileASendIsBlocked(t *testing.T) {
 }
 ```
 
-`go test -race -count=3` passes all eight tests on every run. The last test is a regression test: an earlier version held the read lock while blocked on `a.ch <- e`, so with a stuck handler and a context that never ends, `Close` (which needs the write lock) waited forever, and the waiting writer also blocked every new `Handle`. Against that version the test fails with "Close did not release the blocked sender".
+`go test -race -count=3` passes all eight tests on every run.
+
+The last test is a regression test: an earlier version held the read lock while blocked on `a.ch <- e`, so with a stuck handler and a context that never ends, `Close` (which needs the write lock) waited forever, and the waiting writer also blocked every new `Handle`.
+
+Against that version the test fails with "Close did not release the blocked sender".
 
 ### The outbox rows (PostgreSQL 17)
 
@@ -738,3 +791,8 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - **Before this:** [[Interfaces]], [[Goroutines and Channels]], [[sync Primitives and Atomics]]
 - **Next:** [[State Machines in Go]] (emit an event on every transition), [[Transactional Outbox and CDC]], [[Pub-Sub Message Queue]]
 - **Compare with:** [[Facade (vs Mediator)]] (a mediator owns routing rules), [[Case Study - Notification System]] (fan-out at system scale), [[Event-Driven Architecture Basics]], [[Kafka and Event Streaming]]
+
+### Watch on YouTube
+
+- [Observer Pattern Tutorial: I NEVER Knew Events Were THIS Powerful 🚀](https://www.youtube.com/watch?v=oNalXg67XEE) · ArjanCodes · 15 min · 221,063 views
+- [EventBus and Observer Pattern - Android App Development](https://www.youtube.com/watch?v=WnzSkRinnuc) · Electronic Armory · 15 min · 22,324 views

@@ -8,7 +8,7 @@ sources:
   - "Google SRE Workbook — no dedicated capacity-planning chapter; closest treatment is Ch. 11 (Managing Load) and Ch. 17 (Identifying and Recovering from Overload)"
   - "Little's Law (Little, 1961; applied form widely used in queueing theory texts)"
   - "Brendan Gregg, Systems Performance: Enterprise and the Cloud, 2nd ed."
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Performance Engineering and Capacity Planning
@@ -35,17 +35,69 @@ with 30% headroom (one pod can die)      = 4 x 1.3      = 5.2  -> 6 pods
 
 That arithmetic — Little's Law plus a headroom multiplier — is the whole idea. Everything below is making it rigorous: how to get the inputs right, how to find the real bottleneck instead of guessing, and how to validate the plan with a load test before the sale starts.
 
+## Start here: the basics
+
+**The problem in one story.**
+A ticket site expects ten times the usual crowd for a big concert sale.
+If it has too few servers, the site falls over at the worst moment.
+If it guesses where it is slow, it may speed up the wrong part.
+This note is about measuring first, then working out how many servers you really need.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| RPS | Requests per second arriving at a service | 2,000 RPS at peak |
+| Latency | Time one request takes | 150 ms per checkout |
+| Concurrency | Requests being worked on at the same moment | 300 in flight |
+| Bottleneck | The slowest stage that limits everything else | The payment gateway call |
+| Pod / instance | One running copy of the service | 6 pods behind a load balancer |
+| Headroom | Spare capacity kept on purpose | Run at 70% so one pod can die |
+| Load test | Sending fake traffic to see where it breaks | Ramp to 3,000 RPS in staging |
+| Little's Law | Concurrency = arrival rate × time each request takes | 2,000 × 0.15 s = 300 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    F["Traffic forecast<br/>(peak RPS)"] --> L["Little's Law<br/>concurrency"]
+    L --> P["Divide by<br/>per-pod capacity"]
+    P --> H["Add headroom"]
+    H --> T["Load test<br/>to validate"]
+    T -- "breaks early" --> B["Find & fix<br/>bottleneck"]
+    B --> T
+```
+
+**Analogy.** Planning a wedding dinner: guests per hour × minutes each guest sits = tables needed, plus a few spare tables in case more people turn up.
+Where it breaks: tables don't get slower when the room is full, but servers do; latency rises near full load, which changes the math.
+
+**How the rest of this note builds up**
+
+- First, why guessing fails (section 1) and a mental model of one bottleneck at a time (section 2).
+- Then how it works: the bottleneck-finding loop and the capacity-planning pipeline (section 3).
+- Then a worked example with real numbers (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production capacity practice, queueing effects, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Measure to find the one bottleneck, then size with Little's Law plus headroom, and prove it with a load test.
+
 ## 1. Why it exists
 
 A team ships a service that handles today's traffic fine. Six months later, the same code falls over during a marketing push, and nobody saw it coming because nobody asked "how much more can this take, and what breaks first?"
 
-Concretely: a feed service runs comfortably at 200 requests/second (RPS) with p99 latency of 180ms. Marketing announces a sale expected to 10x traffic to 2,000 RPS. Without capacity planning, the team finds out whether the service survives by watching it happen live. With it, they compute in advance that the database connection pool (configured for 50 connections) looks fine at 450 RPS using idle-time query latency — concurrency = 450 x 0.025s = 11.25 connections in flight — but p99 query time itself degrades under load because of lock contention on a hot row, pushing effective query time to 120ms per query at 450 RPS: concurrency = 450 x 0.12s = 54 connections in flight, past the pool's 50-connection limit. That failure mode (a resource that gets slower as load rises, not just full) is exactly what capacity planning before a load test catches and a server-count spreadsheet alone misses.
+Concretely: a feed service runs comfortably at 200 requests/second (RPS) with p99 latency of 180ms. Marketing announces a sale expected to 10x traffic to 2,000 RPS. Without capacity planning, the team finds out whether the service survives by watching it happen live.
+
+With it, they compute in advance that the database connection pool (configured for 50 connections) looks fine at 450 RPS using idle-time query latency — concurrency = 450 x 0.025s = 11.25 connections in flight — but p99 query time itself degrades under load because of lock contention on a hot row, pushing effective query time to 120ms per query at 450 RPS: concurrency = 450 x 0.12s = 54 connections in flight, past the pool's 50-connection limit.
+
+That failure mode (a resource that gets slower as load rises, not just full) is exactly what capacity planning before a load test catches and a server-count spreadsheet alone misses.
 
 Performance engineering is the process that finds this kind of answer: measure, find the one true bottleneck, fix it, measure again. Capacity planning is performance engineering pointed at the future instead of at today's incident.
 
 ## 2. Mental model
 
-Picture the request path as a chain of stages: load balancer, API handler, cache, database, external payment API, response serialization. Under any fixed load, exactly one stage is the slowest — the **bottleneck** — and the whole request's latency is dominated by it. Speeding up a stage that is not the bottleneck does nothing to overall latency; it just means that stage now waits more.
+Picture the request path as a chain of stages: load balancer, API handler, cache, database, external payment API, response serialization. Under any fixed load, exactly one stage is the slowest — the **bottleneck** — and the whole request's latency is dominated by it.
+
+Speeding up a stage that is not the bottleneck does nothing to overall latency; it just means that stage now waits more.
 
 This is why "optimize everything a little" is weaker than "find the bottleneck, fix it, repeat." Each fix typically exposes a new bottleneck one stage over, the same way widening one lane of a three-lane highway just moves the jam to the next bottleneck downstream.
 
@@ -71,7 +123,9 @@ flowchart TD
     C -- no --> D["Done: ship it, then set<br/>an alert so you notice the next regression"]
 ```
 
-The loop only works if step 2 uses real signals instead of intuition. A trace that breaks a 420ms p99 request down into "12ms API handler, 8ms serialization, 35ms cache lookup, 365ms database query" tells you the database is the bottleneck; guessing "it's probably the network" wastes a sprint. See [[Latency, Percentiles and Bottleneck Analysis]] for how to build that breakdown from traces and percentiles, and [[Debugging Database Performance]] for the database-specific version of step 3.
+The loop only works if step 2 uses real signals instead of intuition. A trace that breaks a 420ms p99 request down into "12ms API handler, 8ms serialization, 35ms cache lookup, 365ms database query" tells you the database is the bottleneck; guessing "it's probably the network" wastes a sprint.
+
+See [[Latency, Percentiles and Bottleneck Analysis]] for how to build that breakdown from traces and percentiles, and [[Debugging Database Performance]] for the database-specific version of step 3.
 
 ### The capacity-planning pipeline
 
@@ -260,3 +314,8 @@ The same shape applies to every other resource, not just compute:
 - **Before this:** [[Latency, Percentiles and Bottleneck Analysis]], [[Back-of-the-Envelope Estimation]]
 - **Next:** [[Production Readiness Review]], [[Autoscaling]]
 - **Compare with:** [[Load and Performance Testing]] (empirical validation of a capacity plan), [[SLIs, SLOs, SLAs and Error Budgets]] (the target a capacity plan is sized against)
+
+### Watch on YouTube
+
+- [Back-Of-The-Envelope Estimation / Capacity Planning](https://www.youtube.com/watch?v=UC5xf8FbdJc) · ByteByteGo · 8 min · 136,493 views
+- [Capacity Modeling  The next milestone in Performance Engineering](https://www.youtube.com/watch?v=V7VR1a8p7Bk) · TechGig · 61 min · 2,953 views

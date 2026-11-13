@@ -8,7 +8,7 @@ sources:
   - "Cormen, Leiserson, Rivest, Stein, Introduction to Algorithms (3rd ed.), ch. 12–13, 18"
   - "PostgreSQL 17 docs, Index Types (B-tree)"
   - "Linux kernel documentation, rbtree.rst"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Trees, BSTs and Balanced Trees
@@ -22,13 +22,64 @@ updated: 2026-11-09
 > - Self-balancing trees (AVL, red-black) do extra work on insert/delete to keep height at O(log n) always.
 > - B-trees and B+trees are a different balancing strategy, shaped around disk/page reads rather than in-memory pointer chasing.
 
+## Start here: the basics
+
+**The problem in one story.**
+You keep a phone book of 1 million contacts that changes all day.
+A sorted array finds a name fast, but inserting "Aaron" means shifting a million entries.
+A linked list inserts fast but finds slowly.
+A balanced search tree does both in about 20 steps, because each step throws away half of what's left.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Node | One box holding a value and links to children | `{key: 8, left, right}` |
+| Root / leaf | Top node / a node with no children | 8 is the root; 1 is a leaf |
+| Height | Number of levels from root to deepest leaf | A 3-level tree has height 3 |
+| BST | Binary Search Tree: left side smaller, right side larger | 3 left of 8, 10 right of 8 |
+| Balanced | All branches about the same height | Height ≈ log₂(n) |
+| `O(log n)` | Work grows with the number of halvings | 1M items → ~20 steps |
+| Rotation | Re-hanging a few nodes to fix balance | AVL and red-black trees use it |
+| B-tree | A wide tree with many keys per node, made for disk pages | Database indexes |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    R["8"] --> A["3"]
+    R --> B["10"]
+    A --> C["1"]
+    A --> D["6"]
+    B --> E["14"]
+```
+
+**Analogy.** A BST is the "guess my number" game: each answer ("higher" or "lower") rules out half the remaining numbers.
+Where it breaks: the game assumes you always guess the middle; a BST built from sorted input keeps guessing at the edge and becomes a slow linked list.
+
+**How the rest of this note builds up**
+
+- First, why trees exist (section 1) and the mental model of halving at every node (section 2).
+- Then how BST search, insert, delete and traversals work (section 3), with a worked example (section 4).
+- Then the balanced variants (AVL, red-black, B-tree, B+tree) and trade-offs (sections 5-6).
+- Finally the SDE-3 view: trees in production, a whiteboard version and the deep dive (sections 7-9).
+
+> [!tip] Remember
+> A BST halves the search at every node only while it stays balanced; balanced trees and B-trees exist to guarantee that.
+
 ## 1. Why it exists
 
 Picture a service that stores a million user records and repeatedly has to answer three kinds of question: "is user ID 482913 present?", "give me the next ID after 482913", and "insert ID 619000." Each existing structure you might reach for falls short in its own way.
 
-A plain sorted array answers the first two questions in `O(log n)` with binary search — fast. But an insert in the middle shifts up to half a million elements, costing `O(n)` — the array has to make room by physically moving everything after the insertion point. A linked list inserts in `O(1)` once you already have a pointer to the right spot, but *finding* that spot takes `O(n)`, because you cannot jump to a linked list's middle the way you can jump to an array's middle index.
+A plain sorted array answers the first two questions in `O(log n)` with binary search — fast.
 
-A **binary search tree** is the structure that gives you both: `O(log n)` search *and* `O(log n)` insert/delete — as long as its height stays close to `log n`. That "as long as" is the whole story of this note: a BST's worst case is as bad as the linked list's, and most of what makes balanced trees worth learning is how they prevent that worst case from happening.
+But an insert in the middle shifts up to half a million elements, costing `O(n)` — the array has to make room by physically moving everything after the insertion point.
+
+A linked list inserts in `O(1)` once you already have a pointer to the right spot, but *finding* that spot takes `O(n)`, because you cannot jump to a linked list's middle the way you can jump to an array's middle index.
+
+A **binary search tree** is the structure that gives you both: `O(log n)` search *and* `O(log n)` insert/delete — as long as its height stays close to `log n`.
+
+That "as long as" is the whole story of this note: a BST's worst case is as bad as the linked list's, and most of what makes balanced trees worth learning is how they prevent that worst case from happening.
 
 > [!tip] Remember
 > A BST is the structure that tries to give you binary search's speed and a linked list's cheap inserts at the same time — but only while its shape stays balanced.
@@ -56,7 +107,11 @@ flowchart TD
 **Why it matters:** The "array" here is a chain of pointers instead of contiguous memory, so you can insert and delete by just relinking pointers instead of shifting elements — that's the entire reason a BST exists instead of just always using a sorted array.
 
 > [!warning] Common mistake
-> Assuming any binary tree with numbers in it is a BST. The BST property is strict: *every* node in a left subtree must be smaller than the node above it, and *every* node in a right subtree must be larger — not just the immediate children. A tree can look locally sorted at every parent-child pair and still violate this globally (see the "validate BST" problem in the Deep dive).
+> Assuming any binary tree with numbers in it is a BST.
+>
+> The BST property is strict: *every* node in a left subtree must be smaller than the node above it, and *every* node in a right subtree must be larger — not just the immediate children.
+>
+> A tree can look locally sorted at every parent-child pair and still violate this globally (see the "validate BST" problem in the Deep dive).
 
 ## 3. How it works
 
@@ -267,15 +322,25 @@ flowchart TD
 
 AVL enforces a strict **balance factor**: for every node, `|height(left) − height(right)| ≤ 1`. This keeps AVL trees closer to perfectly balanced than red-black trees, so lookups are slightly faster, but inserting or deleting a single key can trigger a cascade of rotations back up toward the root to restore the invariant.
 
-Red-black trees use a looser, color-based invariant (every path from a node to its descendant leaves has the same number of black nodes; a red node's children must be black) that bounds the longest root-to-leaf path to at most twice the shortest, rather than within 1. This looser bound means red-black trees need fewer rotations on average per insert/delete — typically a constant number, versus AVL's potential `O(log n)` cascade — which is why red-black trees are the more common choice for general-purpose libraries that mix reads and writes.
+Red-black trees use a looser, color-based invariant (every path from a node to its descendant leaves has the same number of black nodes; a red node's children must be black) that bounds the longest root-to-leaf path to at most twice the shortest, rather than within 1.
+
+This looser bound means red-black trees need fewer rotations on average per insert/delete — typically a constant number, versus AVL's potential `O(log n)` cascade — which is why red-black trees are the more common choice for general-purpose libraries that mix reads and writes.
 
 ### B-trees and B+trees: balancing around disk, not memory
 
-A binary tree's branching factor is 2: height grows as `log₂ n`. For a billion keys, that's about 30 levels — 30 pointer-chases, each potentially a disk seek if the tree doesn't fit in memory. A B-tree instead gives each node hundreds of keys (sized to fill one disk page, typically 4–16 KB), so height grows as `log_b n` with `b` in the hundreds: the same billion keys fit in 3–4 levels. A B+tree additionally keeps all actual data in the leaves (internal nodes hold only routing keys) and links the leaves together in a chain, so a range scan after finding the start key is a straight walk forward through leaves rather than repeated tree descents. This is the shape behind every mainstream relational database index; the write-path trade-offs against LSM-trees are covered fully in [[Storage Engines - B-tree vs LSM and WAL]] — this note only establishes why the tree is wide and shallow rather than binary and tall.
+A binary tree's branching factor is 2: height grows as `log₂ n`. For a billion keys, that's about 30 levels — 30 pointer-chases, each potentially a disk seek if the tree doesn't fit in memory.
+
+A B-tree instead gives each node hundreds of keys (sized to fill one disk page, typically 4–16 KB), so height grows as `log_b n` with `b` in the hundreds: the same billion keys fit in 3–4 levels.
+
+A B+tree additionally keeps all actual data in the leaves (internal nodes hold only routing keys) and links the leaves together in a chain, so a range scan after finding the start key is a straight walk forward through leaves rather than repeated tree descents.
+
+This is the shape behind every mainstream relational database index; the write-path trade-offs against LSM-trees are covered fully in [[Storage Engines - B-tree vs LSM and WAL]] — this note only establishes why the tree is wide and shallow rather than binary and tall.
 
 ### Why Go's standard library has no balanced tree
 
-Go's designers chose to ship `map` (a hash table) rather than an ordered tree in the standard library, pushing sorted/ordered use cases toward `slices.Sort` + `slices.BinarySearch` on a slice, or third-party packages like `github.com/google/btree` for a true in-memory B-tree. This is a deliberate minimalism choice, not an oversight — it is one of the few gaps interview prep should know is a gap.
+Go's designers chose to ship `map` (a hash table) rather than an ordered tree in the standard library, pushing sorted/ordered use cases toward `slices.Sort` + `slices.BinarySearch` on a slice, or third-party packages like `github.com/google/btree` for a true in-memory B-tree.
+
+This is a deliberate minimalism choice, not an oversight — it is one of the few gaps interview prep should know is a gap.
 
 ### Classic practice problems
 
@@ -325,3 +390,8 @@ Go's designers chose to ship `map` (a hash table) rather than an ordered tree in
 - **Next:** [[Heaps and Priority Queues]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Compare with:** [[Hash Tables and Go Maps]] (O(1) but unordered), [[Tries, Suffix Trees and Suffix Arrays]] (branch by prefix, not comparison)
 - **Runnable Go version:** [[Trees, BSTs and Balanced Trees - Go]]
+
+### Watch on YouTube
+
+- [Balanced BSTs Explained: AVL & Red-Black Trees for Beginners!](https://www.youtube.com/watch?v=Hazb9VMDrdk) · CodeLucky · beginner-friendly comparison of AVL vs red-black balancing
+- [Red-Black Trees: Self-Balancing Strategies & Insertion Explained / Data Structures Tutorial](https://www.youtube.com/watch?v=sp7m4uWDi-M) · Amitabha Dey · deep dive on red-black tree rotation/insertion rules

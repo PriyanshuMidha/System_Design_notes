@@ -12,7 +12,7 @@ sources:
   - "Dropbox API docs, Content hash (4 MiB blocks, SHA-256) and files/list_folder/longpoll"
   - "Xia et al., FastCDC: a Fast and Efficient Content-Defined Chunking Approach for Data Deduplication (USENIX ATC 2016)"
   - "Tridgell and Mackerras, The rsync algorithm (1996)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - File Storage and Sync
@@ -27,9 +27,59 @@ updated: 2026-11-04
 > - Sync is a per-namespace change journal plus a cursor per device; a long-poll or WebSocket tells devices when to pull.
 > - Concurrent edits are detected with a base-version check at commit; the loser becomes a "conflicted copy" instead of silently overwriting.
 
+## Start here: the basics
+
+**The problem in one story.**
+You edit a big file on your laptop, changing a tiny part.
+You want your phone to show the new version soon.
+Sending the whole file again every time is slow and expensive.
+A sync service sends only the changed pieces and tells every device what changed.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Chunk | A small piece of a file | A 200 MiB file split into 4 MiB pieces |
+| Hash | A short fingerprint of some bytes | SHA-256 of a chunk |
+| Dedup | Storing identical data only once | Two users upload the same PDF, one copy kept |
+| Metadata | Facts about a file, not its contents | Name, size, chunk list, version |
+| Object storage | Cheap storage for blobs by key | Amazon S3 |
+| Journal / cursor | A numbered list of changes and a device's place in it | "I have seen up to change 98231" |
+| Egress | Data sent out of a cloud, billed per GB | Downloading files to phones |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D1["Laptop client"] -- "upload new chunks" --> OS[("Object storage<br/>chunks by hash")]
+    D1 -- "commit file version" --> MD[("Metadata DB<br/>+ change journal")]
+    MD -- "notify" --> D2["Phone client"]
+    D2 -- "fetch missing chunks" --> OS
+```
+
+**Analogy.** A library storing books as loose pages filed by fingerprint; a new edition reuses every unchanged page.
+Where it breaks: library pages never get edited at the same time by two authors offline, but devices do, so the service needs conflict rules.
+
+**How the rest of this note builds up**
+
+- First, why naive full-file upload fails (section 1) and the loose-pages model (section 2).
+- Then the high-level design: chunk upload, metadata commit, change journal and notification (section 3), with estimates, API, schema and chunking code (section 4).
+- Then variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production practice, journal ordering, tiering, GC and conflict handling (sections 7-8).
+
+> [!tip] Remember
+> Split files into hashed chunks, upload only new ones, and sync devices through an ordered change journal.
+
 ## 1. Why it exists - requirements
 
-A user edits a 200 MiB video project on a laptop, changing a few kilobytes in the middle. A naive design re-uploads all 200 MiB to one server, which writes it to local disk, and the user's phone downloads the whole thing again. At a few million active users this design fails on every axis: upload bandwidth, disk capacity on single servers, a lost upload at 99% that must restart from zero, and egress (outbound data transfer, billed by cloud providers per GB) for every device.
+A user edits a 200 MiB video project on a laptop, changing a few kilobytes in the middle. A naive design re-uploads all 200 MiB to one server, which writes it to local disk, and the user's phone downloads the whole thing again.
+
+At a few million active users this design fails on every axis:
+
+- upload bandwidth,
+- disk capacity on single servers,
+- a lost upload at 99% that must restart from zero,
+- and egress (outbound data transfer, billed by cloud providers per GB) for every device.
 
 **Functional requirements**
 - Upload and download files from a few bytes to many GiB; uploads resume after a network drop.
@@ -47,7 +97,12 @@ A user edits a 200 MiB video project on a laptop, changing a few kilobytes in th
 
 ## 2. Mental model
 
-Think of a library that stores every book as numbered loose pages in a giant warehouse, where each page is filed under a fingerprint of its text. The catalogue card for a book lists the fingerprints of its pages in order. When an author fixes a typo on page 37, the library files one new page and writes a new catalogue card that reuses every other page. Two authors who quote the same page share one physical copy. Readers keep a bookmark in the "new cards" log and only fetch the pages they do not already hold.
+Think of a library that stores every book as numbered loose pages in a giant warehouse, where each page is filed under a fingerprint of its text.
+
+- The catalogue card for a book lists the fingerprints of its pages in order.
+- When an author fixes a typo on page 37, the library files one new page and writes a new catalogue card that reuses every other page.
+- Two authors who quote the same page share one physical copy.
+- Readers keep a bookmark in the "new cards" log and only fetch the pages they do not already hold.
 
 Mapped to the system:
 - **Pages in the warehouse** = chunks in object storage, keyed by SHA-256.
@@ -192,7 +247,9 @@ GET  /v1/changes/longpoll?namespace=9001&cursor=98231&timeout=60
 POST /v1/shares {"file_or_folder_id": 77, "grantee": "user:42", "role": "editor"}
 ```
 
-Dropbox's public API has the same shape: `files/list_folder/continue` takes a cursor and `files/list_folder/longpoll` blocks until something changes. For a single huge object without dedup (for example a backup archive), use S3 multipart upload instead: parts of 5 MiB to 5 GiB (the last part may be smaller), at most 10,000 parts, then `CompleteMultipartUpload`. The browser-side details live in [[File Upload Architecture]].
+Dropbox's public API has the same shape: `files/list_folder/continue` takes a cursor and `files/list_folder/longpoll` blocks until something changes.
+
+For a single huge object without dedup (for example a backup archive), use S3 multipart upload instead: parts of 5 MiB to 5 GiB (the last part may be smaller), at most 10,000 parts, then `CompleteMultipartUpload`. The browser-side details live in [[File Upload Architecture]].
 
 ### Data model
 
@@ -278,13 +335,17 @@ INSERT INTO outbox (topic, key, payload) VALUES ('ns-changes', $5::text, $6);
 COMMIT;
 ```
 
-The journal `seq` comes from a counter row on `namespaces`, not from a PostgreSQL sequence. A sequence is non-transactional: two concurrent commits could take 98231 and 98232, the second could commit first, and a device that synced up to 98232 would never see 98231. The counter row is locked until commit, so sequence numbers become visible in order and without gaps.
+The journal `seq` comes from a counter row on `namespaces`, not from a PostgreSQL sequence.
+
+A sequence is non-transactional: two concurrent commits could take 98231 and 98232, the second could commit first, and a device that synced up to 98232 would never see 98231. The counter row is locked until commit, so sequence numbers become visible in order and without gaps.
 
 The `refcount` increments on the global `chunks` table live on other shards, so they happen asynchronously (from the outbox) and garbage collection tolerates the lag; see the deep dive.
 
 ### Go: fixed-size vs content-defined chunking, measured
 
-Fixed-size chunks are simple, but inserting one byte at the front shifts every boundary and every chunk hash changes. **Content-defined chunking** (CDC) picks boundaries where a rolling hash of the last few dozen bytes matches a pattern, so boundaries move with the content. The code below implements both (the CDC loop is a simplified FastCDC-style gear hash) and measures the bytes a client must re-upload after a one-byte insert.
+Fixed-size chunks are simple, but inserting one byte at the front shifts every boundary and every chunk hash changes. **Content-defined chunking** (CDC) picks boundaries where a rolling hash of the last few dozen bytes matches a pattern, so boundaries move with the content.
+
+The code below implements both (the CDC loop is a simplified FastCDC-style gear hash) and measures the bytes a client must re-upload after a one-byte insert.
 
 ```go
 // Package chunk splits files into chunks addressed by SHA-256, with fixed-size
@@ -447,7 +508,10 @@ func TestIdenticalFilesDedupe(t *testing.T) {
 re-upload after 1-byte insert: fixed=1048577 bytes, cdc=2963 bytes
 ```
 
-With fixed 8 KiB chunks the client re-uploads the whole 1 MiB file plus the inserted byte (every boundary shifted). With CDC it re-uploads one chunk of 2,963 bytes, because the boundaries after the edit realign with the content. In production the same parameters are scaled up (for example 1 MiB minimum, 4 MiB average, 16 MiB maximum, as an estimate of typical settings); the effect is the same.
+- With fixed 8 KiB chunks the client re-uploads the whole 1 MiB file plus the inserted byte (every boundary shifted).
+- With CDC it re-uploads one chunk of 2,963 bytes, because the boundaries after the edit realign with the content.
+
+In production the same parameters are scaled up (for example 1 MiB minimum, 4 MiB average, 16 MiB maximum, as an estimate of typical settings); the effect is the same.
 
 ## 5. Variants and comparison
 
@@ -510,15 +574,27 @@ Production systems typically combine them: refcounts for fast reclamation, plus 
 
 ### Storage tiering and cost
 
-Most files are rarely read after a few weeks. A tiering job moves chunks that have not been read for a while to colder classes. In S3, Standard-IA has a 30-day minimum storage duration, and Glacier Flexible Retrieval has a 90-day minimum with retrieval delays from minutes to hours. Chunks shared by many versions or users should stay warm. Old versions beyond the retention policy are purged, which feeds GC. Egress is often the largest line item; serving shared files through a CDN and syncing only deltas are the main levers.
+Most files are rarely read after a few weeks. A tiering job moves chunks that have not been read for a while to colder classes.
+
+- In S3, Standard-IA has a 30-day minimum storage duration, and Glacier Flexible Retrieval has a 90-day minimum with retrieval delays from minutes to hours.
+- Chunks shared by many versions or users should stay warm.
+- Old versions beyond the retention policy are purged, which feeds GC.
+
+Egress is often the largest line item; serving shared files through a CDN and syncing only deltas are the main levers.
 
 ### Why commits are per-namespace serial
 
-The journal sequence is per namespace. A device's cursor is a single integer, so "what changed since cursor c" is an index range scan on `(namespace_id, seq)`. Allocating `seq` from the locked `namespaces.next_seq` row inside the commit transaction serializes commits within one namespace. That costs nothing for a personal folder; for a giant team folder it becomes the throughput limit. The usual fix is to split very large shared folders into sub-namespaces, not to give up the total order that makes cursors simple.
+The journal sequence is per namespace. A device's cursor is a single integer, so "what changed since cursor c" is an index range scan on `(namespace_id, seq)`.
+
+Allocating `seq` from the locked `namespaces.next_seq` row inside the commit transaction serializes commits within one namespace. That costs nothing for a personal folder; for a giant team folder it becomes the throughput limit.
+
+The usual fix is to split very large shared folders into sub-namespaces, not to give up the total order that makes cursors simple.
 
 ### Moves, renames and deletes
 
-A rename should not re-upload anything: it is a metadata-only journal entry (`op = 'move'`) on the same `file_id`. A delete is a tombstone in `files` plus a journal entry, so offline devices learn about it when they sync. A device that edited a file offline while another device deleted it sees a conflict on commit: the usual policy is to restore the file with the edit, because losing an edit is worse than resurrecting a file.
+- A rename should not re-upload anything: it is a metadata-only journal entry (`op = 'move'`) on the same `file_id`.
+- A delete is a tombstone in `files` plus a journal entry, so offline devices learn about it when they sync.
+- A device that edited a file offline while another device deleted it sees a conflict on commit: the usual policy is to restore the file with the edit, because losing an edit is worse than resurrecting a file.
 
 ### Download path and large files
 
@@ -562,3 +638,7 @@ The client downloads chunks in parallel (for example 4 to 8 at a time) via presi
 - **Before this:** [[File Upload Architecture]], [[Partitioning and Sharding]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Case Study - Payment System]]
 - **Next:** [[Case Study - Web Crawler]], [[Case Study - Video Streaming]], [[AWS 07 - S3]]
 - **Compare with:** [[CRDTs and Conflict Resolution]] (merging instead of conflicted copies), [[File Uploads and Object Storage]] (Go upload handlers), [[CDN and Edge]]
+
+### Watch on YouTube
+
+- [System Design: Dropbox File Storage & Sync Explained Visually](https://www.youtube.com/watch?v=LSeOMkd8R5o) · SeeItFlow · 19 min · 19 views

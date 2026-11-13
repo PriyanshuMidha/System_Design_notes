@@ -14,7 +14,7 @@ sources:
   - "Apache Cassandra docs: gossip (runs every second, exchanges state with up to three other nodes), phi_convict_threshold (default 8), Merkle-tree repair"
   - "DeCandia et al., Dynamo (SOSP 2007): gossip membership, hinted handoff, Merkle anti-entropy"
   - "Consul docs, Gossip Protocol (Serf, LAN and WAN pools)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Failure Detection, Gossip and Membership
@@ -29,9 +29,59 @@ updated: 2026-11-04
 > - **Gossip** (epidemic) dissemination spreads updates in `O(log N)` rounds with constant load per node; **Merkle-tree anti-entropy** repairs data that gossip missed.
 > - Classic mistake: having every node heartbeat every other node. That is `N²` messages per interval: 1,000 nodes means about a million messages every heartbeat interval.
 
+## Start here: the basics
+
+**The problem in one story.**
+A friend in a group chat stops replying.
+Are they asleep, out of signal, or did their phone die? You cannot tell from silence.
+Still, the group must decide quickly whether to stop waiting for them.
+And everyone in the group should reach the same decision without one person being in charge.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cluster | A group of machines working as one system | 300 Cassandra nodes |
+| Heartbeat | A small "I'm alive" message sent regularly | Every 1 s |
+| Timeout | How long silence lasts before you suspect a node | 5 s without a heartbeat |
+| False positive | Declaring a healthy node dead | A slow node marked down |
+| Failure detector | The component that guesses which nodes are dead | Phi accrual in Cassandra |
+| Gossip | Telling a few random peers what you know, repeatedly | Each node talks to 3 others per second |
+| Membership list | Each node's view of who is in the cluster and their state | `node47: suspect` |
+| Single point of failure | One part whose loss stops everything | A central health-check server |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Node A"] -- "ping" --> B["Node B"]
+    B -. "no reply" .-> A
+    A --> S["Mark B suspect"]
+    S -- "gossip" --> C["Node C"]
+    S -- "gossip" --> D["Node D"]
+    C -- "gossip" --> E["Node E"]
+```
+
+**Analogy.** Office rumours: each person tells two or three colleagues, and soon the whole floor knows, with nobody sending a company-wide email.
+Where it breaks: office rumours are rarely corrected, but SWIM lets a suspected node refute the rumour with a newer message.
+
+**How the rest of this note builds up**
+
+- First, the three jobs: detect, disseminate, agree on membership (section 1), and the slow-vs-dead mental model (section 2).
+- Then heartbeats and timeouts, phi accrual, SWIM, member states and gossip (section 3).
+- Then a Go phi accrual detector and SWIM merge rules (section 4), and how real systems compare (section 5).
+- Finally the SDE-3 deep dive: false positives in production, Lifeguard, Merkle-tree anti-entropy and tuning trade-offs (sections 6-8).
+
+> [!tip] Remember
+> Slow and dead look the same; detectors only suspect, and gossip spreads the news in about log N rounds.
+
 ## 1. Why it exists
 
-A 300-node Cassandra cluster loses a node to a kernel panic. Coordinators keep sending it reads and writes; each one waits for a timeout, latency climbs, and the client retries make it worse. The cluster needs to learn, within seconds, "node 47 is down: stop routing to it, store hints for it, and replace it if it does not come back". Every node needs the same answer, without a central server that would itself be a single point of failure.
+A 300-node Cassandra cluster loses a node to a kernel panic. Coordinators keep sending it reads and writes; each one waits for a timeout, latency climbs, and the client retries make it worse.
+
+The cluster needs to learn, within seconds, "node 47 is down: stop routing to it, store hints for it, and replace it if it does not come back".
+
+Every node needs the same answer, without a central server that would itself be a single point of failure.
 
 Three separate jobs hide in that sentence:
 
@@ -62,7 +112,11 @@ Instead of answering "dead or alive", the phi accrual detector (Hayashibara et a
 
 `phi = -log10( P(the next heartbeat arrives later than now) )`
 
-It learns the distribution of recent heartbeat gaps from a sliding window. If heartbeats usually arrive every 1 s and it has been 1 s, phi is low; after 18 s, phi is high. The application picks a threshold: Cassandra convicts a node when phi exceeds `phi_convict_threshold`, default 8. Because the model adapts to each node's normal rhythm, a node on a jittery link is not convicted for jitter it always has.
+It learns the distribution of recent heartbeat gaps from a sliding window. If heartbeats usually arrive every 1 s and it has been 1 s, phi is low; after 18 s, phi is high.
+
+The application picks a threshold: Cassandra convicts a node when phi exceeds `phi_convict_threshold`, default 8.
+
+Because the model adapts to each node's normal rhythm, a node on a jittery link is not convicted for jitter it always has.
 
 With exponentially distributed gaps (Cassandra's approximation), `phi = elapsed / (mean × ln 10)`. For a 1 s mean gap:
 
@@ -419,3 +473,8 @@ func TestRefute(t *testing.T) {
 - **Before this:** [[Distributed Systems Fundamentals]], [[Timeouts, Retries and Backoff]], [[Quorums and Leaderless Replication]]
 - **Next:** [[Leader Election]], [[CRDTs and Conflict Resolution]]
 - **Compare with:** [[Consensus - Raft and Paxos]] (strongly consistent membership for a few voters), [[Wide-Column Stores and Cassandra]] (gossip and repair in a real database)
+
+### Watch on YouTube
+
+- [Jinal Parikh – Are you Dead or Alive? Using Gossip for Failure Detection / Øredev 2022](https://www.youtube.com/watch?v=wJPRtGfbPLE) · Øredev Conference · 42 min · 370 views
+- [System Design / Design Key Value Store /  Pt8 / Failure Detection / Gossip Protocol](https://www.youtube.com/watch?v=4oLHS4eBo_M) · Software Interviews Prep · 11 min · 433 views

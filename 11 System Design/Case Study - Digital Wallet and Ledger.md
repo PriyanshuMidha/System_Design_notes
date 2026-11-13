@@ -12,13 +12,15 @@ sources:
   - "Hector Garcia-Molina and Kenneth Salem, Sagas (ACM SIGMOD 1987)"
   - "PostgreSQL 17 documentation, 13.3 Explicit Locking (SELECT FOR UPDATE) and 13.2 Transaction Isolation"
   - "Reserve Bank of India, Master Directions on Prepaid Payment Instruments (wallet limits and KYC tiers; reviewed as context only)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Digital Wallet and Ledger
 
 > [!summary] TL;DR
-> A digital wallet (Paytm, PhonePe, PayPal balance, Cash App) lets people hold money inside the system and move it instantly between users and merchants. The design is a **double-entry ledger** of immutable entries, a derived **balance** per wallet, **idempotent transfers**, and a plan for moving money between wallets that live on different database shards without ever creating or destroying a rupee.
+> A digital wallet (Paytm, PhonePe, PayPal balance, Cash App) lets people hold money inside the system and move it instantly between users and merchants.
+>
+> The design is a **double-entry ledger** of immutable entries, a derived **balance** per wallet, **idempotent transfers**, and a plan for moving money between wallets that live on different database shards without ever creating or destroying a rupee.
 
 > [!abstract] Core idea
 > - Money is never "updated". Every movement is a **transaction** made of balanced ledger entries (total debits equal total credits), written once and never changed.
@@ -27,9 +29,60 @@ updated: 2026-11-09
 > - Same-shard transfers use one local ACID transaction. Cross-shard transfers use a **saga with holds** (reserve, then commit or release), not distributed locks.
 > - A **reconciliation** job continuously proves that the sum of all balances equals the sum of the ledger, and that the wallet matches the bank.
 
+## Start here: the basics
+
+**The problem in one story.**
+You have ₹1,000 in a wallet app and send ₹300 to a friend.
+The network drops and you tap "Send" again. You must still pay only ₹300.
+If the server crashes halfway, the money must not vanish from you without reaching your friend.
+A wallet's job is to make "pay twice" and "money disappears" impossible, even with retries and crashes.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Ledger | An append-only record of every money movement | "₹300 from Asha to Ravi, txn 91" |
+| Double entry | Every movement is written as a debit and an equal credit | −300 Asha, +300 Ravi |
+| Balance | The current total in a wallet, derived from the ledger | Asha: ₹700 |
+| Transaction (DB) | A group of writes that all succeed or all fail | Debit and credit saved together |
+| Idempotency key | A unique ID per request so a retry is recognised | `key = "pay-abc123"` sent twice, applied once |
+| Shard | One slice of the data on its own database | Wallets A-M on shard 1 |
+| Saga | A multi-step operation with an undo for each step | Hold money, credit, then capture or release |
+| Reconciliation | Checking two records agree, and flagging if not | Sum of balances = sum of ledger |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Send ₹300<br/>+ idempotency key"] --> API["Wallet API"]
+    API --> K{"Key seen before?"}
+    K -- "yes" --> OLD["Return first result"]
+    K -- "no" --> TX["One DB transaction:<br/>ledger entries + balances"]
+    TX --> REC["Reconciliation job<br/>checks totals"]
+```
+
+**Analogy.** A shopkeeper's ink cash book: every movement is a "from" line and a "to" line, never erased; mistakes get a new correcting line (section 2 expands this).
+Where it breaks: one cash book sits in one shop; a large wallet splits its book across many shards, so one transfer can touch two books.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the high-level design and estimation (section 3), and the API, data model and one transfer step by step (section 4).
+- Then variants and trade-offs (sections 5-6) and production notes (section 7).
+- Finally the SDE-3 deep dive: idempotency, cross-shard sagas with holds, hot wallets, reconciliation, scaling and failure handling (section 8).
+
+> [!tip] Remember
+> Never update money in place: write balanced, immutable ledger entries with an idempotency key, in one transaction with the balance.
+
 ## 1. Why it exists - requirements
 
-You hold ₹1,000 in a wallet app. You send ₹300 to a friend. Your phone shows a spinner, the network drops, and you tap "Send" again. If the system simply does `balance = balance - 300` on every request, you just paid ₹600. Or the server subtracts from you, crashes, and never adds to your friend: ₹300 vanished. A wallet exists to make these two failures impossible: **no double spend and no lost money**.
+You hold ₹1,000 in a wallet app.
+
+You send ₹300 to a friend. Your phone shows a spinner, the network drops, and you tap "Send" again.
+
+If the system simply does `balance = balance - 300` on every request, you just paid ₹600. Or the server subtracts from you, crashes, and never adds to your friend: ₹300 vanished.
+
+A wallet exists to make these two failures impossible: **no double spend and no lost money**.
 
 **Functional requirements**
 - Create a wallet for a user or merchant, with a currency.
@@ -55,7 +108,13 @@ You hold ₹1,000 in a wallet app. You send ₹300 to a friend. Your phone shows
 
 ## 2. Mental model
 
-Think of the paper cash book at a small shop. Every time money moves, the owner writes one line in the "from" column and one in the "to" column, in ink, never erasing. The total in the left column always equals the total in the right column. If a mistake happens, the owner does not scratch it out; they write a new correcting line. The balance on the shelf (the "wallet balance") is a handy running total that the owner updates at the same moment as writing the line.
+Think of the paper cash book at a small shop.
+
+Every time money moves, the owner writes one line in the "from" column and one in the "to" column, in ink, never erasing. The total in the left column always equals the total in the right column.
+
+If a mistake happens, the owner does not scratch it out; they write a new correcting line.
+
+The balance on the shelf (the "wallet balance") is a handy running total that the owner updates at the same moment as writing the line.
 
 Mapped to the system:
 - **Ink, never erase** = append-only ledger entries; corrections are reversing entries.
@@ -277,7 +336,9 @@ Wallet W1 has ₹1,000, W2 has ₹200. Transfer ₹300 from W1 to W2 on one shar
 
 1. Insert idempotency key K (first time, so proceed).
 2. `BEGIN`.
-3. Lock both wallet rows in ascending id order (at the default Read Committed level in PostgreSQL this is enough, because the balance is re-read after the lock is granted; do not check the balance before locking) with `SELECT ... FOR UPDATE`. Ordered locking prevents two opposite transfers (W1 to W2 and W2 to W1) deadlocking (see [[Locking - Optimistic vs Pessimistic]]).
+3. Lock both wallet rows in ascending id order (at the default Read Committed level in PostgreSQL this is enough, because the balance is re-read after the lock is granted; do not check the balance before locking) with `SELECT ... FOR UPDATE`.
+
+   Ordered locking prevents two opposite transfers (W1 to W2 and W2 to W1) deadlocking (see [[Locking - Optimistic vs Pessimistic]]).
 4. Check `W1.balance - W1.held >= 300`. Yes (1,000).
 5. `UPDATE wallets SET balance_minor = balance_minor - 30000 WHERE id = W1`, and `+ 30000` on W2.
 6. Insert entries: debit W1 30000, credit W2 30000, same `txn_id`.
@@ -299,7 +360,11 @@ Failure examples:
 | Withdrawal ₹100 to bank | `wallet:W1` 100 | `psp_clearing` 100 |
 | Refund of the merchant payment | `wallet:M1` 196 and `platform_fees` 4 | `wallet:W1` 200 |
 
-Note the convention: here a wallet's balance is a liability to the user, so crediting a user wallet increases what the system owes them. For a wallet, balance = credits minus debits; for the asset account `psp_clearing` (bank money we hold a claim on) a debit increases it. Whichever convention you pick, state it once and keep every row consistent. The key invariant never changes: per `txn_id`, debits equal credits.
+Note the convention: here a wallet's balance is a liability to the user, so crediting a user wallet increases what the system owes them.
+
+For a wallet, balance = credits minus debits; for the asset account `psp_clearing` (bank money we hold a claim on) a debit increases it.
+
+Whichever convention you pick, state it once and keep every row consistent. The key invariant never changes: per `txn_id`, debits equal credits.
 
 ```mermaid
 flowchart LR
@@ -431,7 +496,11 @@ Compare with the alternatives:
 | TC/C (try-confirm-cancel) | reserve on both, then confirm or cancel | no long locks, parallel | needs explicit try, confirm and cancel APIs per resource |
 | Saga with holds | local steps plus compensation, held money | available, scales | intermediate states visible; compensations must be idempotent |
 
-**Watch out.** Between the credit (step 3) and the capture (step 4) the same money is visible on both shards, so the global invariant check and the per-`txn_id` debits-equal-credits check must either skip transfers still `PENDING` or treat the hold as the debit side. The hold must not expire while the transfer is `PENDING` (set `expires_at` well past the saga timeout), otherwise the capture can fail after the destination already spent the credit. Because one `txn_id` now spans two shards, the per-transaction check runs as a cross-shard reconciliation job, not a single SQL query.
+**Watch out.** Between the credit (step 3) and the capture (step 4) the same money is visible on both shards, so the global invariant check and the per-`txn_id` debits-equal-credits check must either skip transfers still `PENDING` or treat the hold as the debit side.
+
+The hold must not expire while the transfer is `PENDING` (set `expires_at` well past the saga timeout), otherwise the capture can fail after the destination already spent the credit.
+
+Because one `txn_id` now spans two shards, the per-transaction check runs as a cross-shard reconciliation job, not a single SQL query.
 
 **Why it matters.** The hold turns "debit then credit" (where a crash loses money) into "reserve, credit, capture", where every crash point has a defined recovery. See [[Saga Pattern]] and [[Two-Phase Commit]].
 
@@ -568,3 +637,8 @@ flowchart TD
 - **Next:** [[Case Study - Stock Exchange]], [[Event Sourcing]], [[Two-Phase Commit]]
 - **Compare with:** [[Digital Wallet and Ledger]] (class-level ledger in Go), [[Case Study - Ticket Booking]], [[Case Study - Flash Sale and E-commerce Checkout]]
 - **Decision guides:** [[Choosing a Database - Decision Guide]], [[Choosing Consistency, Replication and Partitioning - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing a Caching Strategy - Decision Guide]]
+
+### Watch on YouTube
+
+- [Digital Wallet Ledger Architecture  Building Scalable, Consistent, and Fraud Resistant Payment Syste](https://www.youtube.com/watch?v=37tEgwLcUrQ) · SystemDesignPrep · 7 min · 785 views
+- [Digital Wallet System Design / Distributed transactions / SAGA pattern](https://www.youtube.com/watch?v=8ByEyCd-MEM) · System Design Pal · 13 min · 5,302 views

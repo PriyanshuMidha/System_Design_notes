@@ -10,13 +10,17 @@ sources:
   - "Go docs, net/http/pprof, runtime/debug.SetMemoryLimit (GOMEMLIMIT, Go 1.19)"
   - "kube-state-metrics docs, pod metrics (kube_pod_container_status_last_terminated_reason)"
   - "cAdvisor metrics (container_memory_working_set_bytes, container_memory_rss)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Memory Leak and OOMKilled
 
 > [!summary] TL;DR
-> Pods restart with `OOMKilled` (exit code 137), or memory climbs on a graph until something dies. In the first five minutes, confirm which container is dying, check what changed, and mitigate by rolling back, raising the limit temporarily, or adding replicas. Then find the cause with a heap profile diff. This playbook is the checklist to run while the pager is ringing; [[Debugging Memory Leaks and OOMs in Go]] is the theory behind it.
+> Pods restart with `OOMKilled` (exit code 137), or memory climbs on a graph until something dies.
+>
+> In the first five minutes, confirm which container is dying, check what changed, and mitigate by rolling back, raising the limit temporarily, or adding replicas. Then find the cause with a heap profile diff.
+>
+> This playbook is the checklist to run while the pager is ringing; [[Debugging Memory Leaks and OOMs in Go]] is the theory behind it.
 
 > [!abstract] Core idea
 > - Separate three different problems that look the same: a real leak (memory grows with time), a load-driven spike (memory grows with traffic), and a limit that was set too low (steady memory above the limit).
@@ -24,6 +28,51 @@ updated: 2026-11-09
 > - The kernel kills the container when the cgroup is over its memory limit and cannot reclaim enough. Kubernetes only reports it afterwards.
 > - Two heap profiles taken minutes apart and diffed answer "what grew" better than reading code.
 > - Prevention is a memory limit with headroom, `GOMEMLIMIT` below that limit, bounded caches and queues, and an alert that fires on the trend, not only on the kill.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your order service runs fine all morning.
+Slowly, its memory use creeps up, a few MB every minute.
+At lunch peak it hits its allowed maximum, and the system kills it instantly.
+It restarts, creeps up again, and dies again, while customers see errors.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Pod / container | One running copy of your service, packaged with its own limits | `orders-7d9f-abc` |
+| Memory limit | The most RAM a container is allowed to use | `limits.memory: 512Mi` |
+| Heap | Memory your program allocates while running | A map that holds cached users |
+| Memory leak | Memory that is never freed, so usage keeps growing | A cache map that only adds, never deletes |
+| OOM killer | The Linux kernel part that kills a process when memory runs out | Sends SIGKILL to your app |
+| OOMKilled / exit 137 | How Kubernetes reports that kill afterwards | `Reason: OOMKilled  Exit Code: 137` |
+| Heap profile | A snapshot of which code holds which memory | `go tool pprof heap.out` |
+| Rollback | Going back to the previous working version | Redeploy yesterday's image |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["App allocates memory"] --> B{"Under the<br/>memory limit?"}
+    B -- "yes" --> A
+    B -- "no" --> C["Kernel OOM killer<br/>sends SIGKILL"]
+    C --> D["Kubernetes shows<br/>OOMKilled, restarts pod"]
+    D --> A
+```
+
+**Analogy.** A pod is a hotel room with a maximum number of guests. A leak is guests who never check out; eventually security throws someone out.
+Where it breaks: you can see hotel guests, but you can only see heap memory through a profile, and the "guard" picks a victim by score, not guilt.
+
+**How the rest of this note builds up**
+
+- First, why memory incidents happen and what users feel (section 1), and the leak vs spike vs too-low-limit model (section 2).
+- Then how an OOM kill actually happens in the kernel and the signals to read (section 3).
+- Then the hands-on run: first 5 minutes, commands and heap diffs (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 depth: production alerts, kernel scoring, RSS vs heap, memory pprof cannot see, and Go leak patterns (sections 7-8).
+
+> [!tip] Remember
+> Memory that only grows is a leak; mitigate first (rollback, more room, more pods), then diff two heap profiles to find it.
 
 ## 1. Why it exists
 
@@ -55,7 +104,11 @@ flowchart LR
 
 ## 2. Mental model
 
-Think of a pod as a hotel room with a fixed number of guests allowed (the memory limit). A **leak** is guests who check in but never check out. A **spike** is a convention arriving for one night. A **too-low limit** is a room that was always too small. The security guard (the kernel OOM killer) does not negotiate: when the room is over capacity, someone is thrown out, and it is often the process that happened to be allocating.
+Think of a pod as a hotel room with a fixed number of guests allowed (the memory limit). A **leak** is guests who check in but never check out. A **spike** is a convention arriving for one night.
+
+A **too-low limit** is a room that was always too small.
+
+The security guard (the kernel OOM killer) does not negotiate: when the room is over capacity, someone is thrown out, and it is often the process that happened to be allocating.
 
 Where the analogy breaks down: guests in a hotel are visible, but heap memory is only visible through a profile. And the guard picks a victim by a score, not by who is guilty.
 
@@ -74,7 +127,11 @@ Where the analogy breaks down: guests in a hotel are visible, but heap memory is
 
 ### How an OOM kill actually happens
 
-**In plain words:** Every container lives in a **cgroup**, a kernel group that tracks and caps its resources. When the container's memory reaches the cap and the kernel cannot free enough (page cache that can be dropped is freed first), the kernel's **OOM killer** picks a process in that cgroup and sends it SIGKILL. SIGKILL cannot be caught, so the process gets no chance to log or flush.
+**In plain words:** Every container lives in a **cgroup**, a kernel group that tracks and caps its resources.
+
+When the container's memory reaches the cap and the kernel cannot free enough (page cache that can be dropped is freed first), the kernel's **OOM killer** picks a process in that cgroup and sends it SIGKILL.
+
+SIGKILL cannot be caught, so the process gets no chance to log or flush.
 
 ```mermaid
 sequenceDiagram
@@ -366,7 +423,11 @@ See [[Alerting and On-Call]] for how to keep these actionable.
 
 ### Why the kernel kills the "wrong" process
 
-The kernel scores processes by memory use and an adjustable score (`oom_score_adj`). Kubernetes sets higher scores for BestEffort and Burstable pods so they die first on node pressure. Inside a single container, the largest process dies, which for a one-process container is your app. In a multi-process container (an app plus a sidecar script), a small helper process can be killed instead and the container stays "running" in a broken state.
+The kernel scores processes by memory use and an adjustable score (`oom_score_adj`). Kubernetes sets higher scores for BestEffort and Burstable pods so they die first on node pressure.
+
+Inside a single container, the largest process dies, which for a one-process container is your app.
+
+In a multi-process container (an app plus a sidecar script), a small helper process can be killed instead and the container stays "running" in a broken state.
 
 ### Why RSS stays high after the heap shrinks
 
@@ -436,3 +497,8 @@ If 6 pods each handle 1/6 of traffic and one dies, the other 5 take 20 percent m
 - **Platform:** [[Kubernetes Fundamentals]], [[Autoscaling]], [[Rollback and Safe Migrations]], [[Metrics and Prometheus]], [[Alerting and On-Call]]
 - **Compare with:** [[Playbook - CPU Saturation]] (the other resource-exhaustion playbook)
 - **After:** [[Postmortems and Root Cause Analysis]]
+
+### Watch on YouTube
+
+- [Fixing OOMKilled Pods in Kubernetes / Troubleshooting Memory Leaks Like a Pro 🚀](https://www.youtube.com/watch?v=Yh6tjHktLKU) · Platform Engineering hacks · 5 min · 556 views
+- [What is memory leak?](https://www.youtube.com/watch?v=eu_kTGv61WQ) · codebasics · 3 min · 110,597 views

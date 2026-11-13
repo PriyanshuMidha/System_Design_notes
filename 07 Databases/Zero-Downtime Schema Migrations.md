@@ -12,19 +12,64 @@ sources:
   - "PostgreSQL 11 release notes (ADD COLUMN with a default without a rewrite); PostgreSQL 12 release notes (SET NOT NULL can skip the scan)"
   - "pgx v5.8 docs, QueryExecModeCacheStatement (cached statements fail after column changes)"
   - "golang-migrate v4.18.3 source (schema_migrations dirty flag, pg_advisory_lock); goose v3.24 (-- +goose NO TRANSACTION)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Zero-Downtime Schema Migrations
 
 > [!summary] TL;DR
-> A schema migration changes tables while the app keeps serving traffic. Two things cause outages: DDL that takes a strong lock and makes every query on the table wait, and schema changes that break the app version still running. The fix is **expand → migrate → contract**: add the new shape, move code and data to it over several deploys, and remove the old shape last. Use DDL that only holds its lock for a moment.
+> A schema migration changes tables while the app keeps serving traffic. Two things cause outages: DDL that takes a strong lock and makes every query on the table wait, and schema changes that break the app version still running.
+>
+> The fix is **expand → migrate → contract**: add the new shape, move code and data to it over several deploys, and remove the old shape last. Use DDL that only holds its lock for a moment.
 
 > [!abstract] Core idea
 > - Two things cause outages: a lock that queues every query on the table, and a schema the still-running old app version cannot handle.
 > - The rule: expand, migrate, contract. Add the new shape, move code and data over several deploys, remove the old shape last.
 > - Every DDL statement runs with a short `lock_timeout`, so it gives up instead of blocking traffic.
 > - Classic mistake: renaming or dropping a column in one deploy while old app pods still read it.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app is live and you need to rename a column from `name` to `full_name`.
+You run the change and deploy new code, but for a few minutes the old code is still running and asks for `name`.
+Those requests fail.
+Worse, the change itself may lock the table and make every query wait. Zero-downtime migrations avoid both.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Schema | The shape of the tables: columns, types, indexes | `invoices(id, total, status)` |
+| Migration | A script that changes the schema | `ALTER TABLE invoices ADD COLUMN note text` |
+| DDL | SQL statements that change structure, not data | `CREATE INDEX`, `ALTER TABLE` |
+| Lock | A marker that makes other queries wait for the table | `ACCESS EXCLUSIVE` blocks even reads |
+| Rolling deploy | Replacing app servers a few at a time | Old and new versions run together for minutes |
+| Backfill | Filling a new column for existing rows | Copy `name` into `full_name` in batches |
+| `lock_timeout` | Max time a statement waits for a lock before giving up | `SET lock_timeout = '2s'` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    E["Expand:<br/>add new column"] --> D1["Deploy: write both"]
+    D1 --> B["Backfill old rows<br/>in batches"]
+    B --> D2["Deploy: read new"]
+    D2 --> K["Contract:<br/>drop old column"]
+```
+
+**Analogy.** Replacing a bridge while traffic flows: build the new lanes beside the old, move cars over, then knock down the old lanes.
+Where it breaks: a real bridge has no lock queue; in a database, even a quick change waiting for a lock can stall all traffic behind it.
+
+**How the rest of this note builds up**
+
+- First, why migrations cause outages (section 1) and the expand → migrate → contract model (section 2).
+- Then which DDL is safe, lock timeouts and backfills (section 3).
+- Then a step-by-step worked example (section 4) and variants and trade-offs (sections 5-6).
+- Finally production tooling, the SDE-3 deep dive on locks and rollbacks, and interview traps.
+
+> [!tip] Remember
+> Every schema change must work with both the old and the new app version, and every DDL gets a short `lock_timeout`.
 
 ## 1. Why it exists
 
@@ -216,7 +261,9 @@ flowchart TD
     B --> P["sleep Pause"] --> N["next += batch"] --> C
 ```
 
-Rows inserted after `MaxID` was read come from v2 pods, which already write `total_minor`. Interrupting the job and resuming it from the returned id writes every row exactly once, because the `UPDATE` skips rows that are already filled. Time budget: 20 million rows at 5,000 per batch is 4,000 batches. At roughly 150 ms per batch plus a 50 ms pause, that is about 13 minutes (an estimate; measure on a production-size copy).
+Rows inserted after `MaxID` was read come from v2 pods, which already write `total_minor`. Interrupting the job and resuming it from the returned id writes every row exactly once, because the `UPDATE` skips rows that are already filled.
+
+Time budget: 20 million rows at 5,000 per batch is 4,000 batches. At roughly 150 ms per batch plus a 50 ms pause, that is about 13 minutes (an estimate; measure on a production-size copy).
 
 Runnable Go version: [[Zero-Downtime Schema Migrations - Go]]
 
@@ -356,3 +403,8 @@ The API queries are blocked by the **ALTER** (41388), not by the analytics query
 - **Before this:** [[Relational Schema Design]], [[Transactions and ACID]], [[Locking - Optimistic vs Pessimistic]]
 - **Next:** [[Schema Migrations in Go Services]] (tool setup, embedding, CI), [[Rollback and Safe Migrations]] (deploy-side rollback), [[Index Types and Index Design]]
 - **Compare with:** [[API Versioning and Backward Compatibility]] (expand/contract for APIs), [[Event Schemas and Schema Registry]] (evolving event schemas), [[Deployment Strategies - Rolling, Blue-Green, Canary]]
+
+### Watch on YouTube
+
+- [Every engineer should know this.. (Expand-Contract Pattern)](https://www.youtube.com/watch?v=ONSCQWLD9d0) · Software Developer Diaries · short visual explainer of the expand-migrate-contract pattern used in the note
+- [The safe way to run zero-downtime database migrations](https://www.youtube.com/watch?v=l_jjjgwNRI0) · programmerCave · practical walkthrough of safe migration steps and lock-timeout concerns

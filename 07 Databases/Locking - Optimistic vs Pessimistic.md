@@ -14,7 +14,7 @@ sources:
   - "RFC 9110, HTTP Semantics: If-Match and 412 Precondition Failed; RFC 6585: 428 Precondition Required"
   - "AWS DynamoDB Developer Guide, Condition expressions; Redis docs, Transactions (WATCH)"
   - "pkg.go.dev, github.com/jackc/pgx/v5 (BeginFunc, pgconn.PgError)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Locking - Optimistic vs Pessimistic
@@ -28,6 +28,51 @@ updated: 2026-11-07
 > - Optimistic: `UPDATE … WHERE id = $1 AND version = $2`; zero rows affected means "someone beat you, re-read and retry".
 > - Pick by contention: rare conflicts favour optimistic, hot rows and expensive retries favour pessimistic.
 > - Whenever a transaction locks more than one row, lock in a fixed order (for example by id) to avoid deadlocks.
+
+## Start here: the basics
+
+**The problem in one story.**
+An invoice has 10,000 paid. Two payments of 2,000 arrive at the same instant.
+Each request reads "paid = 10,000", adds 2,000 in code, and writes back 12,000.
+The result should be 14,000. One payment silently vanished.
+Locking is how you stop the second writer from wiping out the first.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Row | One record in a table | Invoice 42 |
+| Transaction | Reads and writes that succeed or fail together | `BEGIN ... COMMIT` |
+| Lost update | One write overwrites another that happened in between | 12,000 instead of 14,000 |
+| Lock | A marker that says "this row is mine until I commit" | `SELECT ... FOR UPDATE` |
+| Version column | A number bumped on every write, used to detect changes | `version = 7` |
+| Contention | How often requests fight over the same row | A hot product's stock row |
+| Deadlock | Two transactions each wait for a lock the other holds | A locks 1 then 2, B locks 2 then 1 |
+| Retry | Run the whole read-compute-write again after a conflict | Re-read the invoice and try again |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    S["Read-modify-write on a shared row"] --> Q{"Conflicts common?"}
+    Q -- "yes: hot row" --> P["Pessimistic: lock first<br/>SELECT ... FOR UPDATE"]
+    Q -- "no: rare" --> O["Optimistic: write only if<br/>version unchanged"]
+    P --> PW["Others wait"]
+    O --> OR["0 rows updated:<br/>re-read and retry"]
+```
+
+**Analogy.** Pessimistic locking is booking a meeting room before using it; optimistic locking is walking in and leaving if someone is already there.
+Where it breaks: rooms are visibly occupied, but a database writer only finds out about a conflict at write time, after doing the work.
+
+**How the rest of this note builds up**
+
+- First, why lost updates happen and the cheapest fix of letting the database do the arithmetic (section 1), then the mental model (section 2).
+- Then pessimistic row locks, the optimistic version column, deadlocks and lock ordering (sections 3.1-3.3).
+- Then advisory locks and optimistic concurrency outside SQL (sections 3.4-3.5), a traced worked example and comparisons (sections 4-6).
+- Finally the SDE-3 view: `SKIP LOCKED` job queues, where PostgreSQL stores row locks, lock queues and InnoDB differences (sections 7-8).
+
+> [!tip] Remember
+> Rare conflicts: optimistic with a version check. Hot rows: lock first. Many rows: always lock in a fixed order.
 
 ## 1. Why it exists
 
@@ -50,7 +95,9 @@ sequenceDiagram
     Note over DB: paid_minor = 50000<br/>A's 30,000 is gone
 ```
 
-The customer paid 80,000 and the invoice says 50,000. No error was raised, no constraint failed, and the default isolation level (READ COMMITTED in PostgreSQL, see [[Isolation Levels and MVCC]]) allows it. This is the **lost update** anomaly. A **read-modify-write** cycle (read a value, change it in the application, write it back) is exposed to it whenever two copies of the cycle overlap.
+The customer paid 80,000 and the invoice says 50,000. No error was raised, no constraint failed, and the default isolation level (READ COMMITTED in PostgreSQL, see [[Isolation Levels and MVCC]]) allows it. This is the **lost update** anomaly.
+
+A **read-modify-write** cycle (read a value, change it in the application, write it back) is exposed to it whenever two copies of the cycle overlap.
 
 ### The cheapest fix: let the database do the arithmetic
 
@@ -261,7 +308,9 @@ sequenceDiagram
     DB-->>B: lock 501 granted
 ```
 
-PostgreSQL does not check for deadlocks on every wait. A waiting backend checks only after `deadlock_timeout` (default 1 s), then aborts one transaction in the cycle with SQLSTATE `40P01`. In practice the victim is usually the backend that ran the check, which is the one that started waiting first; do not rely on which side loses. So a deadlock costs about a second of latency and one failed transaction.
+PostgreSQL does not check for deadlocks on every wait. A waiting backend checks only after `deadlock_timeout` (default 1 s), then aborts one transaction in the cycle with SQLSTATE `40P01`.
+
+In practice the victim is usually the backend that ran the check, which is the one that started waiting first; do not rely on which side loses. So a deadlock costs about a second of latency and one failed transaction.
 
 ```mermaid
 flowchart LR
@@ -337,7 +386,9 @@ Optimistic concurrency outside SQL uses the same idea, called **compare-and-set*
 | Redis | `WATCH key`, read, `MULTI` … `EXEC` | `EXEC` returns nil when the watched key changed |
 | JPA / Hibernate, Rails | `@Version` field, `lock_version` column | `OptimisticLockException`, `StaleObjectError` |
 
-The HTTP form is how InvoiceOps protects a user editing an invoice in a browser for five minutes: the version travels to the client as the ETag and comes back in `If-Match` ([[HTTP Caching - Cache-Control, ETag, Conditional Requests]] owns the header details). Holding a database lock for five minutes of human thinking is never acceptable, so long-lived edits are always optimistic.
+The HTTP form is how InvoiceOps protects a user editing an invoice in a browser for five minutes: the version travels to the client as the ETag and comes back in `If-Match` ([[HTTP Caching - Cache-Control, ETag, Conditional Requests]] owns the header details).
+
+Holding a database lock for five minutes of human thinking is never acceptable, so long-lived edits are always optimistic.
 
 ```mermaid
 sequenceDiagram
@@ -390,7 +441,9 @@ Invoice 1 has `total_minor = 100,000`. Fifty goroutines each pay 2,000 using the
 | … | … | … | … |
 | 50 | 1 | 100,000, status `paid`, version 50 | 0 |
 
-The worst case is 50 + 49 + … + 1 = 1,275 attempts; in practice goroutines do not all collide every round, and one measured run needed only a handful of retries. The final state is always the same: `paid_minor = 100,000`, `version = 50`. The business rule is also checked on every attempt: if a 51st payment of 2,000 arrived, it would return "payment exceeds amount due" and never retry.
+The worst case is 50 + 49 + … + 1 = 1,275 attempts; in practice goroutines do not all collide every round, and one measured run needed only a handful of retries.
+
+The final state is always the same: `paid_minor = 100,000`, `version = 50`. The business rule is also checked on every attempt: if a 51st payment of 2,000 arrived, it would return "payment exceeds amount due" and never retry.
 
 ```mermaid
 flowchart TD
@@ -509,7 +562,9 @@ sequenceDiagram
     Note over W1,T: crash before COMMIT: rollback, rows 1..10 claimable again
 ```
 
-Worker 1 locks the first 10 due rows; worker 2, running the same query a millisecond later, skips those 10 and gets the next 10. If a worker crashes while this statement's transaction is still open, the transaction rolls back and the rows become claimable again. Once the claim has committed, the rows stay `running`, so a reaper must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling belong to [[Background Workers and Job Queues]].
+Worker 1 locks the first 10 due rows; worker 2, running the same query a millisecond later, skips those 10 and gets the next 10. If a worker crashes while this statement's transaction is still open, the transaction rolls back and the rows become claimable again.
+
+Once the claim has committed, the rows stay `running`, so a reaper must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling belong to [[Background Workers and Job Queues]].
 
 ## Whiteboard version
 
@@ -526,7 +581,11 @@ lost update = read -> compute in app -> write, overlapping another writer
 
 ### Where PostgreSQL stores row locks
 
-A row lock is not an entry in the shared lock table. It is written into the row's header: the locker's transaction id goes into `xmax` with flag bits saying "locked, not deleted" (see [[Storage Engines - B-tree vs LSM and WAL]] for page layout). That is why locking a million rows does not exhaust lock memory, and also why `SELECT … FOR UPDATE` dirties pages and writes WAL. When several transactions hold `FOR SHARE` on the same row, `xmax` points to a **MultiXact**, a separate record listing all lockers. Heavy shared locking (including foreign-key checks on a popular parent row) grows the MultiXact area, which needs its own wraparound protection by VACUUM.
+A row lock is not an entry in the shared lock table. It is written into the row's header: the locker's transaction id goes into `xmax` with flag bits saying "locked, not deleted" (see [[Storage Engines - B-tree vs LSM and WAL]] for page layout).
+
+That is why locking a million rows does not exhaust lock memory, and also why `SELECT … FOR UPDATE` dirties pages and writes WAL. When several transactions hold `FOR SHARE` on the same row, `xmax` points to a **MultiXact**, a separate record listing all lockers.
+
+Heavy shared locking (including foreign-key checks on a popular parent row) grows the MultiXact area, which needs its own wraparound protection by VACUUM.
 
 ```mermaid
 flowchart LR
@@ -540,7 +599,9 @@ flowchart LR
 
 ### How waiting works
 
-A transaction that finds a conflicting row lock waits on the holder's transaction id in the regular lock manager. When the holder ends, the waiter wakes, and at READ COMMITTED re-checks the updated row against its `WHERE` clause (PostgreSQL calls this EvalPlanQual). A surprising consequence: `UPDATE … WHERE status = 'sent'` may wait, re-check, find the row is now `'paid'`, and update zero rows. That is correct, but the app must handle "0 rows" even in the pessimistic path.
+A transaction that finds a conflicting row lock waits on the holder's transaction id in the regular lock manager. When the holder ends, the waiter wakes, and at READ COMMITTED re-checks the updated row against its `WHERE` clause (PostgreSQL calls this EvalPlanQual).
+
+A surprising consequence: `UPDATE … WHERE status = 'sent'` may wait, re-check, find the row is now `'paid'`, and update zero rows. That is correct, but the app must handle "0 rows" even in the pessimistic path.
 
 ### Lock queues
 
@@ -562,7 +623,13 @@ sequenceDiagram
 
 ### InnoDB differs
 
-MySQL InnoDB at its default REPEATABLE READ locks index ranges, not just rows. A locking read takes **next-key locks**: a lock on the index record plus the **gap** before it, so no one can insert into that gap. The classic surprise: two sessions run `SELECT … FOR UPDATE WHERE id = 900` for an id that does not exist yet. Both get the gap lock (gap locks do not conflict with each other), then both `INSERT id = 900`, each insert waits on the other's gap lock, and InnoDB reports a deadlock. PostgreSQL has no gap locks; locking a non-existent row locks nothing, so the "check then insert" pattern there needs a unique constraint plus `INSERT … ON CONFLICT`. InnoDB has supported `NOWAIT`, `SKIP LOCKED` and `FOR SHARE` since MySQL 8.0.
+MySQL InnoDB at its default REPEATABLE READ locks index ranges, not just rows. A locking read takes **next-key locks**: a lock on the index record plus the **gap** before it, so no one can insert into that gap.
+
+The classic surprise: two sessions run `SELECT … FOR UPDATE WHERE id = 900` for an id that does not exist yet.
+
+Both get the gap lock (gap locks do not conflict with each other), then both `INSERT id = 900`, each insert waits on the other's gap lock, and InnoDB reports a deadlock.
+
+PostgreSQL has no gap locks; locking a non-existent row locks nothing, so the "check then insert" pattern there needs a unique constraint plus `INSERT … ON CONFLICT`. InnoDB has supported `NOWAIT`, `SKIP LOCKED` and `FOR SHARE` since MySQL 8.0.
 
 ```mermaid
 sequenceDiagram
@@ -582,7 +649,11 @@ The version check works at READ COMMITTED because the `UPDATE` re-reads the late
 
 ### Behaviour at scale
 
-One row can absorb only so many locked writes per second, because they serialize on its lock and each one waits for the previous commit's WAL flush. If a commit takes about 1 ms, one row tops out around 1,000 writes per second, regardless of how many CPUs the server has (an estimate from commit latency, not a benchmark). Beyond that, change the data shape: per-shard counters summed on read, append-only ledger rows instead of a mutable balance, or batching.
+One row can absorb only so many locked writes per second, because they serialize on its lock and each one waits for the previous commit's WAL flush.
+
+If a commit takes about 1 ms, one row tops out around 1,000 writes per second, regardless of how many CPUs the server has (an estimate from commit latency, not a benchmark).
+
+Beyond that, change the data shape: per-shard counters summed on read, append-only ledger rows instead of a mutable balance, or batching.
 
 ```mermaid
 flowchart LR
@@ -639,3 +710,7 @@ flowchart LR
 - **Before this:** [[Transactions and ACID]], [[Isolation Levels and MVCC]]
 - **Next:** [[Query Plans and EXPLAIN]], [[Background Workers and Job Queues]], [[Distributed Locks and Fencing Tokens]]
 - **Compare with:** [[HTTP Caching - Cache-Control, ETag, Conditional Requests]], [[Transactions and the Repository Pattern]], [[Timeouts, Retries and Backoff]]
+
+### Watch on YouTube
+
+- [Optimistic Locking clearly explained / Java / SQL / System Design](https://www.youtube.com/watch?v=d41JuPT_Wls) · ByteMonk · clear explanation of version-column optimistic locking vs locking reads

@@ -11,13 +11,17 @@ sources:
   - "AWS ACM User Guide, Validating domain ownership"
   - "AWS ACM User Guide, Managed renewal"
   - "AWS Certificate Manager FAQs, CloudFront certificate region requirement"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 09 - Route 53 and ACM
 
 > [!summary] TL;DR
-> Route 53 is AWS's DNS service: it answers "what IP/name does this domain point to right now", and can answer differently per client with routing policies like weighted or latency-based. ACM issues and auto-renews free TLS certificates for AWS-fronting services (ALB, CloudFront, API Gateway) as long as you let AWS prove you own the domain once. Together they're the "how do requests find us, and how is that connection encrypted" layer in front of an AWS architecture — the TLS handshake itself and general DNS theory live in [[TLS and HTTPS]] and [[DNS - Resolution, Records and Caching]]; this note is the AWS-specific plumbing.
+> Route 53 is AWS's DNS service: it answers "what IP/name does this domain point to right now", and can answer differently per client with routing policies like weighted or latency-based.
+>
+> ACM issues and auto-renews free TLS certificates for AWS-fronting services (ALB, CloudFront, API Gateway) as long as you let AWS prove you own the domain once.
+>
+> Together they're the "how do requests find us, and how is that connection encrypted" layer in front of an AWS architecture — the TLS handshake itself and general DNS theory live in [[TLS and HTTPS]] and [[DNS - Resolution, Records and Caching]]; this note is the AWS-specific plumbing.
 
 > [!abstract] Core idea
 > - A **hosted zone** is a container of DNS records for a domain; Route 53 is authoritative for it once you point the domain's registrar at Route 53's name servers.
@@ -26,11 +30,59 @@ updated: 2026-11-07
 > - ACM certificates are **free but can't leave AWS** — you can't export the private key to install it on your own nginx box; they only attach to AWS resources (ALB, CloudFront, API Gateway, etc.).
 > - A CloudFront certificate must be requested in **us-east-1** regardless of where your users or origin are; an ALB certificate must be in the **same region as the ALB**. Mixing these up is the most common ACM mistake.
 
+## Start here: the basics
+
+**The problem in one story.**
+You type `api.myshop.com` in a browser, but computers only talk to numeric IP addresses.
+Something must turn the name into an address, and the browser also needs proof the site is really yours.
+Route 53 is the phone book that turns names into addresses.
+ACM gives you the free certificate that proves your identity and turns on HTTPS.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| DNS | The internet's name-to-address lookup system | `myshop.com` → `13.234.10.5` |
+| Domain | A name you own on the internet | `myshop.com` |
+| DNS record | One line in the phone book | `A api → 13.234.10.5` |
+| TTL | How long others may cache an answer | 300 seconds |
+| Zone apex | The bare domain with nothing in front | `myshop.com` (not `www.`) |
+| TLS certificate | A signed file proving a site's identity | Enables the padlock in the browser |
+| Load balancer (ALB) | A front door that spreads traffic to servers | Sends requests to 3 app tasks |
+| Region | A geographic AWS location | `us-east-1`, `ap-south-1` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Browser"] -- "where is api.myshop.com?" --> R53["Route 53"]
+    R53 -- "alias: this ALB" --> U
+    U -- "HTTPS" --> ALB["ALB with ACM cert"]
+    ALB --> App["App servers"]
+```
+
+**Analogy.** Route 53 is a phone book, and ACM is the ID card a shopkeeper shows so you trust the shop.
+Where it breaks: a phone book gives the same number to everyone, but Route 53 routing policies can give different answers to different users (by latency, weight, location, or health).
+
+**How the rest of this note builds up**
+
+- First, why DNS and certificates matter and a mental model of zones and records (sections 1-2).
+- Then how it works: hosted zones, alias records, routing policies, health checks, ACM validation and regions (section 3).
+- Then a worked example and comparisons with other DNS and certificate options (sections 4-6).
+- Finally the SDE-3 deep dive: production traps like caching, TTLs and the us-east-1 rule (sections 7-9).
+
+> [!tip] Remember
+> Route 53 answers "where is this name?"; ACM answers "is this really you?"
+
 ## 1. Why it exists
 
-A production service needs a name (`api.example.com`) that resolves to the right infrastructure, can be changed without every client needing to know a new IP, and can route different clients to different targets — a canary release at 10%, the nearest regional endpoint, or a healthy target when another has failed. Running your own authoritative name servers means operating highly available, globally distributed DNS infrastructure yourself; Route 53 does that for you and layers routing policies and health checks on top, which is the part a self-hosted BIND setup would need the most custom work to replicate.
+A production service needs a name (`api.example.com`) that resolves to the right infrastructure, can be changed without every client needing to know a new IP, and can route different clients to different targets — a canary release at 10%, the nearest regional endpoint, or a healthy target when another has failed.
 
-On top of a working name, that connection needs TLS, and a certificate that's installed on the wrong AWS resource, in the wrong region, or that silently expired is one of the most common ways a perfectly good deployment stops serving traffic. ACM exists to make certificate issuance and renewal a non-event: request once, validate ownership once, and AWS renews it automatically for as long as the validation record still resolves — no cron job, no forgotten expiry.
+Running your own authoritative name servers means operating highly available, globally distributed DNS infrastructure yourself; Route 53 does that for you and layers routing policies and health checks on top, which is the part a self-hosted BIND setup would need the most custom work to replicate.
+
+On top of a working name, that connection needs TLS, and a certificate that's installed on the wrong AWS resource, in the wrong region, or that silently expired is one of the most common ways a perfectly good deployment stops serving traffic.
+
+ACM exists to make certificate issuance and renewal a non-event: request once, validate ownership once, and AWS renews it automatically for as long as the validation record still resolves — no cron job, no forgotten expiry.
 
 **Concrete numbers (documented, AWS pricing as of late 2026 — confirm current rates):**
 - Hosted zone: ~$0.50/month per zone; standard queries: ~$0.40 per million; alias record queries to AWS resources (ALB, CloudFront, S3 website endpoints) in the same account: **free**.
@@ -89,7 +141,9 @@ An alias record pointing at an ALB automatically tracks the ALB's IPs as AWS rot
 
 ### DNS cutover practice
 
-Migrating a record to point somewhere new (a new load balancer, a new region) is a two-step operation if you want to avoid a visible outage: **lower the TTL well before the cutover** (e.g. from 3600s to 60s, at least one old-TTL period ahead of time, so caches holding the old long TTL expire naturally), then flip the record, then raise the TTL back once you've confirmed the new target is healthy. Skipping the TTL-lowering step means some fraction of clients keep hitting the old target for up to the old TTL's duration after cutover — which matters if the old target is being decommissioned on a tight schedule.
+Migrating a record to point somewhere new (a new load balancer, a new region) is a two-step operation if you want to avoid a visible outage: **lower the TTL well before the cutover** (e.g. from 3600s to 60s, at least one old-TTL period ahead of time, so caches holding the old long TTL expire naturally), then flip the record, then raise the TTL back once you've confirmed the new target is healthy.
+
+Skipping the TTL-lowering step means some fraction of clients keep hitting the old target for up to the old TTL's duration after cutover — which matters if the old target is being decommissioned on a tight schedule.
 
 ### ACM: issuance, validation, and renewal
 
@@ -254,7 +308,9 @@ func TestResolveDropsUnhealthyTargets(t *testing.T) {
 }
 ```
 
-**Measured:** 100,000 simulated clients against a 90/10 weighted split (Go 1.24, `go test -race`, 2026-11-07) resolved to **89,895 (89.9%)** on the 90-weight target and **10,105 (10.1%)** on the 10-weight target — within half a percentage point of the ideal 90/10, which is the statistical noise you'd expect from a hash-based split at this sample size, not a bug. The unhealthy-target test (1,000 queries against a 50/50 split where one target is marked unhealthy) sent **100%** of traffic to the remaining healthy target, confirming the pool-removal behavior rather than mere deprioritization.
+**Measured:** 100,000 simulated clients against a 90/10 weighted split (Go 1.24, `go test -race`, 2026-11-07) resolved to **89,895 (89.9%)** on the 90-weight target and **10,105 (10.1%)** on the 10-weight target — within half a percentage point of the ideal 90/10, which is the statistical noise you'd expect from a hash-based split at this sample size, not a bug.
+
+The unhealthy-target test (1,000 queries against a 50/50 split where one target is marked unhealthy) sent **100%** of traffic to the remaining healthy target, confirming the pool-removal behavior rather than mere deprioritization.
 
 ## 5. Variants and comparison
 
@@ -291,7 +347,9 @@ func TestResolveDropsUnhealthyTargets(t *testing.T) {
 
 ## 8. Deep dive
 
-- **Why alias records exist at all.** The DNS spec requires a few record types (`NS`, `SOA`) to coexist at a zone's apex, and the spec forbids a `CNAME` from coexisting with any other record type at the same name — so a plain CNAME can never point the bare domain (`example.com`) anywhere; only a subdomain (`www.example.com`) could use one. Route 53's alias record is a proprietary extension that behaves like a CNAME from the outside but is resolved internally by Route 53 at query time, sidestepping that restriction and letting the apex domain point at an ALB, CloudFront distribution, or another AWS resource whose IPs can change.
+- **Why alias records exist at all.** The DNS spec requires a few record types (`NS`, `SOA`) to coexist at a zone's apex, and the spec forbids a `CNAME` from coexisting with any other record type at the same name — so a plain CNAME can never point the bare domain (`example.com`) anywhere; only a subdomain (`www.example.com`) could use one.
+
+  Route 53's alias record is a proprietary extension that behaves like a CNAME from the outside but is resolved internally by Route 53 at query time, sidestepping that restriction and letting the apex domain point at an ALB, CloudFront distribution, or another AWS resource whose IPs can change.
 - **Health check evaluation is itself distributed.** Route 53 runs each health check from multiple AWS regions' health checkers and requires a configurable minimum number of them to agree a target is unhealthy before acting — this avoids one region's transient network blip single-handedly failing a target out of the pool for everyone.
 - **ACM's renewal check is the same validation record, not a fresh challenge.** Unlike some certificate authorities, renewing an ACM certificate does not ask you to redo validation from scratch each time — it periodically re-checks the *same* DNS validation record is still present and still resolves, and only fails renewal if that record is gone or the resource using the certificate was deleted, which is why "someone deleted an old-looking CNAME during cleanup" is the single most common cause of an unexpectedly expired ACM certificate.
 
@@ -310,7 +368,9 @@ func TestResolveDropsUnhealthyTargets(t *testing.T) {
 > ACM auto-renewal re-checks that the original DNS validation CNAME is still present and resolves. If that record was deleted (often by someone cleaning up "unused-looking" DNS records) or the underlying resource was removed, renewal fails silently until you notice the expiry approaching.
 
 > [!question]- What's the practical difference between a CNAME and a Route 53 alias record for an ALB?
-> A CNAME is a real extra DNS lookup each time, can't be used at the zone apex, and is billed as a normal query. An alias record is resolved by Route 53 internally (no extra lookup), works at the apex, automatically tracks the ALB's changing IPs, and is free — there's essentially no reason to use a CNAME instead when aliasing an AWS resource.
+> A CNAME is a real extra DNS lookup each time, can't be used at the zone apex, and is billed as a normal query.
+>
+> An alias record is resolved by Route 53 internally (no extra lookup), works at the apex, automatically tracks the ALB's changing IPs, and is free — there's essentially no reason to use a CNAME instead when aliasing an AWS resource.
 
 > [!question]- You need instant, fine-grained control over a canary's traffic split. Should you use Route 53 weighted routing?
 > Not for sub-second control — DNS answers get cached by resolvers for the record's TTL, so shifting a DNS weighted split takes time to fully propagate as caches expire. An ALB weighted target group rebalances the split immediately at the request-routing layer, which is the better tool when canary speed matters.
@@ -331,3 +391,8 @@ func TestResolveDropsUnhealthyTargets(t *testing.T) {
 - **Before this:** [[DNS - Resolution, Records and Caching]], [[TLS and HTTPS]]
 - **Next:** [[AWS 10 - CloudWatch]], [[Deploying a Go API on AWS (Reference Architecture)]]
 - **Compare with:** [[AWS 06 - Load Balancing (ALB vs NLB)]] and [[Load Balancing]] (traffic shifting at the load-balancer layer instead of DNS), [[Forward and Reverse Proxies - L4 vs L7]] (where TLS termination sits relative to a proxy)
+
+### Watch on YouTube
+
+- [(ACM) AWS Certificate Manager Course / Route 53 / Load Balancer - Part 16](https://www.youtube.com/watch?v=_bEPuvrjB5Y) · Rahul Wagh · 39 min · 71,139 views
+- [AWS Route53 - Domain and SSL Certificate using Hosted Zones and ACM](https://www.youtube.com/watch?v=ookzXuMr8eY) · Endre Synnes · 7 min · 51,314 views

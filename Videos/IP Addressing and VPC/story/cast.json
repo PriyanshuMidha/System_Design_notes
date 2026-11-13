@@ -1,0 +1,8 @@
+{
+  "N":    {"voice": "en-US-EmmaMultilingualNeural", "rate": 4,  "pitch": 0,  "volume": 0},
+  "DEV":  {"voice": "en-US-ChristopherNeural",      "rate": 4,  "pitch": 2,  "volume": 0},
+  "CID":  {"voice": "en-GB-RyanNeural",             "rate": -2, "pitch": -2, "volume": 0},
+  "NORA": {"voice": "en-US-AriaNeural",             "rate": 2,  "pitch": 1,  "volume": 0},
+  "VIC":  {"voice": "en-US-GuyNeural",              "rate": -4, "pitch": -4, "volume": 0},
+  "RAE":  {"voice": "en-AU-NatashaNeural",          "rate": 2,  "pitch": 2,  "volume": 0}
+}

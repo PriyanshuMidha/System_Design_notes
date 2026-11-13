@@ -7,13 +7,21 @@ prereqs: []
 related: ["[[Data Structures Overview and Big-O Cheat Sheet]]"]
 sources:
   - "Go source, runtime/slice.go and runtime/map.go (growth and layout behaviour referenced in the theory note)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Data Structures Overview and Big-O Cheat Sheet - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Data Structures Overview and Big-O Cheat Sheet]]: a small `Choose` function that turns the theory note's decision flowchart into testable Go code, so "which structure for this need" is something a test checks instead of only a diagram.
+
+## Before the code
+
+- **Structs**: `Need` groups several `bool` fields into one value; unset fields default to `false`.
+- **Bodyless `switch`**: `switch { case cond: ... }` checks each condition top to bottom and takes the first true one.
+- **Table-driven tests**: a slice of anonymous structs (`name`, `need`, `want`) looped over in one test function.
+- **`%+v` / `%q` verbs**: print a struct with field names, and a string in quotes, in failure messages.
+- **What to run**: `go vet ./... && go test -race -v ./...` inside a module named `datastructures`.
 
 ## What this code shows
 
@@ -40,7 +48,11 @@ flowchart LR
 
 ### Step 1: `Need`, the seven questions the flowchart asks
 
-**Concept.** Each field mirrors one branch of [[Data Structures Overview and Big-O Cheat Sheet#Choosing a structure]]'s decision flowchart. The alternative — a single `enum`-style string field naming one need — was rejected because real code sometimes needs more than one property at once (the leaderboard example needs both `AlwaysNeedTheMin` and `RandomAccessByKey`); a struct of booleans lets `Choose` pick a priority order explicitly instead of forcing the caller to collapse several needs into one label.
+**Concept.** Each field mirrors one branch of [[Data Structures Overview and Big-O Cheat Sheet#Choosing a structure]]'s decision flowchart.
+
+The alternative — a single `enum`-style string field naming one need — was rejected because real code sometimes needs more than one property at once (the leaderboard example needs both `AlwaysNeedTheMin` and `RandomAccessByKey`).
+
+A struct of booleans lets `Choose` pick a priority order explicitly instead of forcing the caller to collapse several needs into one label.
 
 ```go
 package datastructures
@@ -63,7 +75,11 @@ type Need struct {
 
 ### Step 2: `Choose`, the flowchart as a switch
 
-**Concept.** This function is deliberately a priority-ordered `switch`, not a lookup table, because some needs should win over others when a caller's `Need` sets more than one field — `AlwaysNeedTheMin` is checked first because a heap satisfies "give me the min" far better than any structure further down the list would, even if a lower-priority field is also set. The rejected alternative, a map from `Need` to structure name, can't express that priority at all, since a map key would have to be the whole struct, and there'd be no way to say "if several fields are true, prefer this one."
+**Concept.** This function is deliberately a priority-ordered `switch`, not a lookup table, because some needs should win over others when a caller's `Need` sets more than one field.
+
+`AlwaysNeedTheMin` is checked first because a heap satisfies "give me the min" far better than any structure further down the list would, even if a lower-priority field is also set.
+
+The rejected alternative, a map from `Need` to structure name, can't express that priority at all, since a map key would have to be the whole struct, and there'd be no way to say "if several fields are true, prefer this one."
 
 ```go
 package datastructures
@@ -71,7 +87,7 @@ package datastructures
 // Choose returns the structure this note recommends for the given need.
 // It mirrors section 3's decision flowchart so the choice is testable.
 func Choose(n Need) string {
-	switch {
+	switch { // switch on true: first matching case wins, so order = priority
 	case n.AlwaysNeedTheMin:
 		return "heap"
 	case n.FIFO:
@@ -103,6 +119,8 @@ func Choose(n Need) string {
 
 Proves each of the flowchart's five most distinctive branches (the ones with no overlap in their boolean fields) returns the name the flowchart names for that need.
 
+It also checks one overlapping case, the leaderboard, to pin the priority order: when both `AlwaysNeedTheMin` and `RandomAccessByKey` are set, the heap wins.
+
 | Input (`Need`) | Expected output |
 | --- | --- |
 | `{AlwaysNeedTheMin: true}` | `"heap"` |
@@ -110,6 +128,7 @@ Proves each of the flowchart's five most distinctive branches (the ones with no 
 | `{LIFO: true}` | `"stack (slice)"` |
 | `{RangeQueries: true}` | `"tree (sorted structure)"` |
 | `{RandomAccessByKey: true}` | `"hash table (map)"` |
+| `{AlwaysNeedTheMin: true, RandomAccessByKey: true}` | `"heap"` |
 
 A failure here would mean `Choose`'s `switch` branch order or return strings drifted out of sync with the flowchart in the theory note — exactly the kind of silent documentation/code mismatch this test exists to catch.
 
@@ -129,6 +148,8 @@ func TestChoose(t *testing.T) {
 		{"undo stack", Need{LIFO: true}, "stack (slice)"},
 		{"range scan", Need{RangeQueries: true}, "tree (sorted structure)"},
 		{"cache lookup", Need{RandomAccessByKey: true}, "hash table (map)"},
+		// overlap: the switch order must make the heap win
+		{"leaderboard: min wins over key", Need{AlwaysNeedTheMin: true, RandomAccessByKey: true}, "heap"},
 	}
 	for _, c := range cases {
 		if got := Choose(c.need); got != c.want {
@@ -153,16 +174,16 @@ go vet ./...
 go test -race -v ./...
 ```
 
-Measured (Go 1.24.4, darwin/arm64, 2026-11-09):
+Measured (Go 1.24.4, darwin/arm64, 2026-11-13):
 
 ```text
 === RUN   TestChoose
 --- PASS: TestChoose (0.00s)
 PASS
-ok  	datastructures	1.435s
+ok  	datastructures	1.428s
 ```
 
-Reading it: one test, five subtests via the table, all passing — confirming `Choose`'s priority order matches the flowchart's branch order exactly, with no drift between the diagram and the code.
+Reading it: one test, six table cases (not `t.Run` subtests, so they report as one PASS), all passing — confirming `Choose`'s priority order matches the flowchart's branch order exactly, with no drift between the diagram and the code.
 
 ## Pitfalls in the code
 

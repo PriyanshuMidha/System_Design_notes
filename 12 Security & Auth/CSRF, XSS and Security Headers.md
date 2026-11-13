@@ -9,7 +9,7 @@ sources:
   - "MDN, Content-Security-Policy"
   - "RFC 6797, HTTP Strict Transport Security (HSTS)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # CSRF, XSS and Security Headers
@@ -22,6 +22,49 @@ updated: 2026-11-07
 > - XSS abuses a page that renders attacker-controlled text as HTML or JavaScript instead of as plain text.
 > - The fix for each is structural: CSRF tokens + `SameSite` cookies for the first, output encoding + CSP for the second. Neither fixes the other.
 > - Security headers (CSP, HSTS, `X-Content-Type-Options`, `frame-ancestors`) are a second line of defense: they contain the damage when a specific encoding or validation bug slips through.
+
+## Start here: the basics
+
+**The problem in one story.**
+You are logged into your bank in one tab.
+You open a bad website in another tab, and it secretly submits a "send money" form to your bank; your browser adds your bank cookie for you (CSRF).
+Or a bad comment on a site contains a script that runs in every visitor's browser (XSS).
+This note shows how to block both and how browser security headers limit the damage.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cookie | Small value the browser stores and sends back to a site automatically | `session=abc123` |
+| Session | The server remembering you are logged in | Session ID mapped to user 42 |
+| CSRF | Another site making your browser send a request you did not mean | Hidden form posting to `/transfer` |
+| XSS | Attacker JavaScript running inside your page | `<script>` saved in a comment |
+| Encoding (escaping) | Turning special characters into safe text | `<` becomes `&lt;` |
+| `SameSite` | Cookie flag limiting when cookies go on cross-site requests | `SameSite=Lax` |
+| CSP | A header listing which scripts the page may run | `script-src 'self'` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Attacker"] -- "forged form" --> C["CSRF: victim browser<br/>sends request + cookie"]
+    A -- "malicious text" --> X["XSS: script runs<br/>inside your page"]
+    C --> F1["Fix: CSRF token +<br/>SameSite cookie"]
+    X --> F2["Fix: output encoding<br/>+ CSP header"]
+```
+
+**Analogy.** CSRF is someone slipping a signed cheque into your stack for you to hand over; XSS is someone sneaking into your office and acting from your desk.
+Where it breaks: real cheques need your signature each time; browsers attach cookies automatically, which is exactly why CSRF works.
+
+**How the rest of this note builds up**
+
+- First, the bank-transfer attacks for CSRF and XSS (section 1) and the mental model (section 2).
+- Then CSRF tokens with `SameSite`, the three XSS types, output encoding, and security headers (section 3).
+- Then Go code: a stateless CSRF token and a security-headers middleware (section 4), plus a comparison (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production rollout of CSP, and edge cases (sections 6-8).
+
+> [!tip] Remember
+> CSRF: prove the request came from your page (token + `SameSite`). XSS: encode untrusted output and back it with CSP.
 
 ## 1. Why it exists
 
@@ -84,7 +127,9 @@ The synchronizer-token pattern works because of the **same-origin policy**: `evi
 
 `SameSite` is a second, independent control set on the cookie itself: `Strict` withholds the cookie on every cross-site request, `Lax` sends it only on top-level `GET` navigation, and `None` always sends it (the full attribute table lives in [[Sessions and Cookies]]).
 
-`SameSite=Lax` alone stops the form-POST example, because the cookie is withheld on a cross-site `POST`. It does **not** stop a cross-site `GET` that has a side effect (`GET /transfer?to=mallory&amount=5000`, which is also just bad API design — see [[OWASP API Security Top 10]]), and it does not stop XSS running same-origin. Use CSRF tokens and `SameSite=Lax`/`Strict` together, not one instead of the other, and never put state-changing actions behind `GET`.
+`SameSite=Lax` alone stops the form-POST example, because the cookie is withheld on a cross-site `POST`. It does **not** stop a cross-site `GET` that has a side effect (`GET /transfer?to=mallory&amount=5000`, which is also just bad API design — see [[OWASP API Security Top 10]]), and it does not stop XSS running same-origin.
+
+Use CSRF tokens and `SameSite=Lax`/`Strict` together, not one instead of the other, and never put state-changing actions behind `GET`.
 
 ### XSS: three places the attacker's string lands
 
@@ -433,3 +478,8 @@ In `06 Backend Engineering in Go`, [[Secure Coding for Go Services]] shows where
 - **Before this:** [[Sessions and Cookies]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Next:** [[OWASP API Security Top 10]], [[Secrets Management]]
 - **Compare with:** [[CORS and Same-Origin Policy]] (a different browser control: who may *read* a response, not who may *send* a request), [[TLS and HTTPS]] (what HSTS is protecting), [[Secure Coding for Go Services]] (where this middleware sits in a full Go service)
+
+### Watch on YouTube
+
+- [API Security Explained: Rate Limiting, CORS, SQL Injection, CSRF, XSS & More](https://www.youtube.com/watch?v=FsB_nRGdeLs) · Hayk Simonyan · 8 min · 501,701 views
+- [Why Your Token Storage Could Be Your Biggest Security Risk - XSS and CSRF Attack in Action](https://www.youtube.com/watch?v=vTroMvQy6K0) · LearnThatStack · 5 min · 18,388 views

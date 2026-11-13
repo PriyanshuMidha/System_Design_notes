@@ -7,13 +7,22 @@ prereqs: ["[[Data Structures Overview and Big-O Cheat Sheet]]", "[[Arrays and Dy
 related: ["[[Linked Lists]]", "[[Stacks, Queues and Deques]]", "[[Hash Tables and Go Maps]]", "[[Memory Hierarchy and CPU Caches]]"]
 sources:
   - "Go std lib docs, package container/list (go.dev/pkg/container/list)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Linked Lists - Go
 
 > [!summary] TL;DR
 > The runnable side of [[Linked Lists]]: a typed singly linked list with the five classic traversal patterns (reverse, cycle detection, middle node, merge, remove-nth-from-end), and an LRU cache built from a map plus Go's standard-library doubly linked list.
+
+## Before the code
+
+- **Pointers (`*Node`)**: a variable holding the address of a node; `nil` means "no node", which marks the end of a list.
+- **Structs**: `Node` and `entry` group a value with its links into one record.
+- **Methods on a type**: `func (c *LRU) Get(...)` attaches behaviour to the cache, so only its own methods touch the map and list.
+- **`container/list`**: the standard-library doubly linked list; `Value` is `any`, so reads need a type assertion like `el.Value.(*entry)`.
+- **Maps**: `map[int]*list.Element` gives `O(1)` key lookup straight to a list node.
+- **What to run**: `go vet ./... && go test -race -v ./...` inside the module.
 
 ## What this code shows
 
@@ -211,6 +220,98 @@ flowchart LR
     end
 ```
 
+### Step 5: the FromSlice / ToSlice helpers
+
+**Concept.** The tests build lists from slices and read them back as slices, so each check is one `reflect.DeepEqual` instead of a hand-written pointer walk. Both helpers live in `node.go`.
+
+```go
+// FromSlice builds a singly linked list holding vals in order.
+func FromSlice(vals []int) *Node {
+	dummy := &Node{}
+	tail := dummy
+	for _, v := range vals {
+		tail.Next = &Node{Val: v}
+		tail = tail.Next
+	}
+	return dummy.Next // nil for an empty slice
+}
+
+// ToSlice walks the list from head and collects every value.
+// It must only be called on an acyclic list, or it never returns.
+func ToSlice(head *Node) []int {
+	var out []int
+	for n := head; n != nil; n = n.Next {
+		out = append(out, n.Val)
+	}
+	return out
+}
+```
+
+**How it works.**
+
+1. `FromSlice` reuses the dummy-node trick: `tail` always points at the last node built, so appending never needs a "first node" special case.
+2. An empty input returns `nil`, which every function above already treats as the empty list.
+3. `ToSlice` is a plain forward walk, `O(n)` time; on a cyclic list it would loop forever, so `TestHasCycle` never calls it after creating a cycle.
+
+### Step 6: the LRU cache
+
+**Concept.** The theory note's LRU section pairs a map (key to list element) with a doubly linked list ordered by recency ([[Linked Lists#The LRU cache: map and list working together]]). Front of the list = most recently used; back = next to evict.
+
+```go
+package linkedlist
+
+import "container/list"
+
+type entry struct {
+	key, val int // key is stored so eviction can delete it from the map
+}
+
+// LRU is a fixed-capacity least-recently-used cache.
+type LRU struct {
+	cap   int
+	ll    *list.List            // front = most recent, back = least recent
+	items map[int]*list.Element // key -> its element in ll
+}
+
+func NewLRU(capacity int) *LRU {
+	return &LRU{cap: capacity, ll: list.New(), items: make(map[int]*list.Element)}
+}
+```
+
+```go
+// Get returns the value and marks the key as most recently used.
+func (c *LRU) Get(key int) (int, bool) {
+	el, ok := c.items[key]
+	if !ok {
+		return 0, false
+	}
+	c.ll.MoveToFront(el) // a read counts as "used"
+	return el.Value.(*entry).val, true
+}
+
+// Put inserts or updates a key, evicting the least recent entry when full.
+func (c *LRU) Put(key, val int) {
+	if el, ok := c.items[key]; ok {
+		el.Value.(*entry).val = val
+		c.ll.MoveToFront(el) // an update also refreshes recency
+		return
+	}
+	if c.ll.Len() >= c.cap {
+		oldest := c.ll.Back()
+		c.ll.Remove(oldest)
+		delete(c.items, oldest.Value.(*entry).key)
+	}
+	c.items[key] = c.ll.PushFront(&entry{key: key, val: val})
+}
+```
+
+**How it works.**
+
+1. `Get` is a map lookup (`O(1)`) plus `MoveToFront` (four pointer writes, `O(1)`).
+2. `Put` on an existing key updates in place and refreshes recency.
+3. `Put` on a new key at capacity removes `Back()` from both the list and the map, then pushes the new entry to the front.
+4. The entry stores its own key, because eviction starts from the list element and must find the map key to delete.
+
 ## Design decisions
 
 | Decision | Alternative | Trade-off |
@@ -280,7 +381,9 @@ func TestHasCycle(t *testing.T) {
 
 **How it works.** The test deliberately mutates the list after the first check, so one list proves both the negative and the positive case. Re-linking the tail to `head.Next` (not `head` itself) checks that the cycle is detected even when it does not loop back to the very first node.
 
-**If it fails.** `HasCycle` returning `true` on the acyclic list means the loop guard is wrong (for example, comparing `slow == fast` before either has moved). Returning `false` after the tail is re-linked means the loop exits instead of looping forever — check the `fast != nil && fast.Next != nil` guard still allows the loop to keep running inside the cycle.
+**If it fails.** `HasCycle` returning `true` on the acyclic list means the loop guard is wrong (for example, comparing `slow == fast` before either has moved).
+
+Returning `false` after the tail is re-linked means the loop exits instead of looping forever — check the `fast != nil && fast.Next != nil` guard still allows the loop to keep running inside the cycle.
 
 ### Test 3: middle node, odd and even length
 

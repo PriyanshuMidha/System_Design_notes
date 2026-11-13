@@ -10,13 +10,22 @@ sources:
   - "RFC 9293, Transmission Control Protocol (TCP)"
   - "RFC 8446, The Transport Layer Security (TLS) Protocol Version 1.3"
   - "curl(1) and dig(1) manuals"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # What Happens When You Type a URL - Go
 
 > [!summary] TL;DR
 > This code measures the four phases [[What Happens When You Type a URL]] walks through for a single HTTP request — DNS lookup, TCP connect, TLS handshake, and time to first byte — using `net/http/httptrace`, the same mechanism `curl -w` and a browser's DevTools waterfall panel are built on.
+
+## Before the code
+
+- **`net/http`**: Go's built-in HTTP client and server; `client.Do(req)` sends one request.
+- **`net/http/httptrace`**: lets you attach callbacks that fire at DNS, connect, TLS and first-byte moments.
+- **Closures**: small inline functions that capture local variables (`t`, `dnsStart`) and update them when called.
+- **`context.Context`**: the trace rides on the request's context, so it affects only that one request.
+- **`httptest.NewTLSServer`**: a real local HTTPS server for tests, no network needed.
+- **Run it:** `go vet ./...` and `go test -race ./...` (standard library only).
 
 ## What this code shows
 
@@ -68,7 +77,11 @@ type Timings struct {
 }
 ```
 
-**Concept.** This is the Go shape of the table in [[What Happens When You Type a URL#Where the time actually goes]]: one field per phase the theory note names. The zero value matters as much as a populated one — a zero `TLSHandshake` is the code's way of confirming "this request never paid for TLS," which is exactly the claim the tests below check. An alternative design (one flat `map[string]time.Duration`) was rejected because a struct gives compile-time field names and lets a caller inspect `timings.TTFB` directly instead of a string lookup that could typo silently.
+**Concept.** This is the Go shape of the table in [[What Happens When You Type a URL#Where the time actually goes]]: one field per phase the theory note names.
+
+The zero value matters as much as a populated one — a zero `TLSHandshake` is the code's way of confirming "this request never paid for TLS," which is exactly the claim the tests below check.
+
+An alternative design (one flat `map[string]time.Duration`) was rejected because a struct gives compile-time field names and lets a caller inspect `timings.TTFB` directly instead of a string lookup that could typo silently.
 
 **How it works.**
 1. Every field is a `time.Duration`, Go's standard type for an elapsed time — it prints cleanly (`14.2ms`) and supports normal comparisons (`<`, `<=`) the tests below rely on.
@@ -129,7 +142,9 @@ The second half attaches that trace to the request, runs it, and drains the body
 }
 ```
 
-**Concept.** This implements [[What Happens When You Type a URL#Tracing the same four phases in Go]]: `httptrace.ClientTrace` is Go's hook into the exact moments the standard library's own HTTP transport reaches each phase boundary — the same instrumentation point `curl -w` reads from inside libcurl. The alternative — timing the whole `client.Do(req)` call as one block — was rejected because it only gives `Total`, which hides exactly which phase is slow, the one piece of information this note's entire "where do you look next" interview question depends on.
+**Concept.** This implements [[What Happens When You Type a URL#Tracing the same four phases in Go]]: `httptrace.ClientTrace` is Go's hook into the exact moments the standard library's own HTTP transport reaches each phase boundary — the same instrumentation point `curl -w` reads from inside libcurl.
+
+The alternative — timing the whole `client.Do(req)` call as one block — was rejected because it only gives `Total`, which hides exactly which phase is slow, the one piece of information this note's entire "where do you look next" interview question depends on.
 
 **How it works.**
 1. Each callback (`DNSStart`, `DNSDone`, and so on) fires at an exact point inside the transport's own request lifecycle; the closures record a `time.Now()` at the start of a phase and compute the elapsed duration at its end.

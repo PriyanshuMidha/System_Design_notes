@@ -9,7 +9,7 @@ sources:
   - "Go release notes 1.20, multiple %w verbs and errors.Join"
   - "errors package docs, go.dev/pkg/errors"
   - "Effective Go, Errors"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Error Handling
@@ -23,6 +23,48 @@ updated: 2026-11-07
 > - Three shapes cover almost everything: **sentinel** (`var ErrNotFound = errors.New(...)`), **typed** (`type ValidationError struct{...}`), and **wrapped** (context added on top of either).
 > - `panic` is reserved for programmer bugs the caller cannot be expected to handle (nil map write, index out of range); recoverable business failures are always errors.
 > - Map errors to a transport (HTTP, gRPC) status only at the outermost boundary — the domain and service layers never import `net/http`.
+
+## Start here: the basics
+
+**The problem in one story.**
+You try to book a train seat and something goes wrong.
+"Seat not found", "bad date" and "server down" need very different replies.
+In Go, a function that can fail returns an `error` value next to its result, and the caller decides what to do.
+Good error handling keeps enough detail to tell those cases apart, all the way up to the reply the user sees.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| `error` | Built-in interface: any value with an `Error() string` method | `return nil, err` |
+| Interface | A set of methods; any type having them fits | `error`, `io.Reader` |
+| `nil` | "No error happened" when returned as an error | `if err != nil { ... }` |
+| Sentinel error | A fixed, named error value you compare against | `var ErrNotFound = errors.New("not found")` |
+| Wrapping | Adding context around an error without losing it | `fmt.Errorf("load user: %w", err)` |
+| Panic | A crash-style stop for bugs, not normal failures | Index out of range |
+| Status code | Number a transport sends back to the client | HTTP 404, 500 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    DB["Repo:<br/>ErrNotFound"] -- "%w wrap" --> SVC["Service:<br/>'get order 7: not found'"]
+    SVC -- "returns error" --> H["HTTP handler"]
+    H -- "errors.Is(err, ErrNotFound)" --> R["404 to client"]
+```
+
+**Analogy.** An error is a parcel note passed up a chain of offices; each office adds a label ("from warehouse 3") but keeps the original slip inside.
+Where it breaks: real labels can be read by anyone; in Go, the inner error stays findable only if each layer wraps with `%w`, not `%v`.
+
+**How the rest of this note builds up**
+
+- First, why Go returns errors instead of throwing exceptions (section 1) and the mental model (section 2).
+- Then sentinel, typed and wrapped errors, `errors.Is`, `errors.As`, `errors.Join`, and when to `panic` (section 3).
+- Then a full worked example mapping domain errors to HTTP status at the edge (section 4), plus trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: the typed-nil trap, multi-`%w` trees, boundary rules and production logging (sections 7-8).
+
+> [!tip] Remember
+> Return errors, wrap with `%w`, check with `errors.Is`/`errors.As`, and turn them into status codes only at the edge.
 
 ## 1. Why it exists
 
@@ -42,7 +84,11 @@ if err != nil {
 }
 ```
 
-for every error collapses three very different situations — "the client sent a bad seat ID" (should be 400), "the seat is already taken" (should be 409), and "the database is down" (should be 503) — into the same 500 response and the same flat log line. The client cannot retry correctly, and an on-call engineer reading the log cannot tell a real outage from routine bad input without re-reading the whole call stack. The fix is not more logging; it is giving errors enough structure (sentinel, typed, wrapped) that the boundary can tell them apart without parsing strings.
+for every error collapses three very different situations — "the client sent a bad seat ID" (should be 400), "the seat is already taken" (should be 409), and "the database is down" (should be 503) — into the same 500 response and the same flat log line.
+
+The client cannot retry correctly, and an on-call engineer reading the log cannot tell a real outage from routine bad input without re-reading the whole call stack.
+
+The fix is not more logging; it is giving errors enough structure (sentinel, typed, wrapped) that the boundary can tell them apart without parsing strings.
 
 ## 2. Mental model
 
@@ -54,9 +100,13 @@ type error interface {
 }
 ```
 
-Any type with that one method satisfies it — a plain string wrapper from `errors.New`, a struct with fields, or a wrapped error that points at another one. Because `error` is just an interface, `errors.Is` and `errors.As` are not special compiler magic: they are ordinary functions that call an optional `Unwrap() error` (or `Unwrap() []error`) method in a loop, walking from the outermost wrap down to the original cause — the same way you would walk a singly linked list.
+Any type with that one method satisfies it — a plain string wrapper from `errors.New`, a struct with fields, or a wrapped error that points at another one.
 
-By convention, an error string is lowercase and has no trailing punctuation, because it is almost always printed after other context (`fmt.Errorf("reserve seat: %w", err)` reads badly as `"reserve seat: Seat Unavailable."`). The idiomatic shape for the wrapping operation itself is `"<op>: %w"` — a short, lowercase description of what was being attempted, a colon, and the wrapped cause — which is what every `fmt.Errorf` call in this note follows.
+Because `error` is just an interface, `errors.Is` and `errors.As` are not special compiler magic: they are ordinary functions that call an optional `Unwrap() error` (or `Unwrap() []error`) method in a loop, walking from the outermost wrap down to the original cause — the same way you would walk a singly linked list.
+
+By convention, an error string is lowercase and has no trailing punctuation, because it is almost always printed after other context (`fmt.Errorf("reserve seat: %w", err)` reads badly as `"reserve seat: Seat Unavailable."`).
+
+The idiomatic shape for the wrapping operation itself is `"<op>: %w"` — a short, lowercase description of what was being attempted, a colon, and the wrapped cause — which is what every `fmt.Errorf` call in this note follows.
 
 ## 3. How it works
 
@@ -78,11 +128,15 @@ A sentinel error becomes part of your package's exported API the moment you expo
 err := fmt.Errorf("process order: %w and %w", errA, errB)
 ```
 
-`errors.Is(err, target)` walks the chain (unwrapping one or many at each step) and reports whether `target` appears anywhere in it — by `==` for comparable sentinels, or by a custom `Is(error) bool` method if the error type defines one. `errors.As(err, &target)` walks the same chain looking for the first error whose **type** matches `target`'s type, and if found, assigns it through the pointer. Using `%v` instead of `%w` prints the same text but severs the chain: `errors.Is`/`errors.As` can no longer see the original error.
+`errors.Is(err, target)` walks the chain (unwrapping one or many at each step) and reports whether `target` appears anywhere in it — by `==` for comparable sentinels, or by a custom `Is(error) bool` method if the error type defines one.
+
+`errors.As(err, &target)` walks the same chain looking for the first error whose **type** matches `target`'s type, and if found, assigns it through the pointer. Using `%v` instead of `%w` prints the same text but severs the chain: `errors.Is`/`errors.As` can no longer see the original error.
 
 ### errors.Join
 
-`errors.Join(errs...)` (Go 1.20) combines a slice of errors into one value whose `Error()` prints each on its own line and whose `Unwrap() []error` exposes the originals, so both `errors.Is` and `errors.As` still look inside. It is the right tool when you want to report every problem at once — for example, validating every field of a form instead of stopping at the first bad one — rather than wrapping, which chains a single cause through layers.
+`errors.Join(errs...)` (Go 1.20) combines a slice of errors into one value whose `Error()` prints each on its own line and whose `Unwrap() []error` exposes the originals, so both `errors.Is` and `errors.As` still look inside.
+
+It is the right tool when you want to report every problem at once — for example, validating every field of a form instead of stopping at the first bad one — rather than wrapping, which chains a single cause through layers.
 
 ```mermaid
 flowchart LR
@@ -130,7 +184,9 @@ classDiagram
 
 ### panic, recover, and the typed-nil trap
 
-`panic` stops normal execution and unwinds the call stack, running deferred functions as it goes, until something calls `recover` inside a `defer` or the program crashes. Reserve it for programmer errors: a nil map write, an out-of-bounds index, an invariant your own code violated. Never use it for a seat that is already booked or a field that failed validation — those are errors, because the caller is expected to handle them.
+`panic` stops normal execution and unwinds the call stack, running deferred functions as it goes, until something calls `recover` inside a `defer` or the program crashes. Reserve it for programmer errors: a nil map write, an out-of-bounds index, an invariant your own code violated.
+
+Never use it for a seat that is already booked or a field that failed validation — those are errors, because the caller is expected to handle them.
 
 ```mermaid
 stateDiagram-v2
@@ -144,7 +200,11 @@ stateDiagram-v2
 
 A `recover` at a goroutine or HTTP-handler boundary converts an unexpected panic into an ordinary `error` so one bad request cannot take down the whole process — but it should be a safety net, not a substitute for returning real errors from functions that can fail predictably.
 
-The **typed-nil trap**: a function that returns a concrete pointer type (`*MyError`) through a named result or directly assigned to an `error` variable can produce a non-nil interface even when the pointer itself is `nil`. An interface value is `nil` only when **both** its dynamic type and its dynamic value are nil; `(*MyError)(nil)` stored in an `error` variable has a non-nil type, so `err != nil` is true even though there is "no error" in the pointer sense. The fix is to never return a concrete error-implementing pointer type directly as `error` — return the interface type, or the literal `nil`.
+The **typed-nil trap**: a function that returns a concrete pointer type (`*MyError`) through a named result or directly assigned to an `error` variable can produce a non-nil interface even when the pointer itself is `nil`.
+
+An interface value is `nil` only when **both** its dynamic type and its dynamic value are nil; `(*MyError)(nil)` stored in an `error` variable has a non-nil type, so `err != nil` is true even though there is "no error" in the pointer sense.
+
+The fix is to never return a concrete error-implementing pointer type directly as `error` — return the interface type, or the literal `nil`.
 
 ## 4. Worked example
 
@@ -457,11 +517,21 @@ ok  	scratch/g3/errdemo	3.533s
 
 ## 8. Deep dive
 
-- **Why `errors.Is` and not `==` after wrapping.** `fmt.Errorf("...: %w", err)` returns a new value every time; comparing that new value to `ErrNotFound` with `==` is always false. `errors.Is` instead calls `Unwrap()` in a loop and compares each link, so it sees through any number of wraps. A custom `Is(target error) bool` method lets a type define its own equivalence (for example, treating any `*MyError` with the same code as equal) instead of relying on `==`.
+- **Why `errors.Is` and not `==` after wrapping.** `fmt.Errorf("...: %w", err)` returns a new value every time; comparing that new value to `ErrNotFound` with `==` is always false. `errors.Is` instead calls `Unwrap()` in a loop and compares each link, so it sees through any number of wraps.
+
+  A custom `Is(target error) bool` method lets a type define its own equivalence (for example, treating any `*MyError` with the same code as equal) instead of relying on `==`.
 - **Why `errors.As` needs a pointer to a pointer for pointer-receiver errors.** `var ve *ValidationError; errors.As(err, &ve)` passes `*(*ValidationError)` so `errors.As` can assign through it. Passing `ve` (not `&ve`) compiles only if `ve` is already addressable as an `any`-boxed pointer target — in practice, always pass `&ve`.
-- **Multiple `%w` and the join tree.** Since Go 1.20, `fmt.Errorf` accepts more than one `%w` verb, producing an error whose `Unwrap() []error` returns all wrapped errors; `errors.Join` builds the same shape directly from a slice. Both `errors.Is` and `errors.As` do a depth-first walk over this tree, so a target nested inside one branch of a joined error is still found.
-- **The transport boundary rule, restated precisely.** `HTTPStatus` above takes an `error` and returns an `int`; nothing else in the package imports `net/http`. This keeps the domain testable without an HTTP server and makes the mapping reusable for a gRPC status mapper (`codes.NotFound` instead of `http.StatusNotFound`) without touching the domain code at all. The concrete status-and-body shape (problem+json, error codes) is covered in [[API Error Handling]]; wiring it into a real handler is in [[Building REST Endpoints]].
-- **`recover` only works one level up.** `recover()` only stops a panic if it is called directly inside a deferred function in the **same goroutine** where the panic happened. A `recover` in the function that started a goroutine does not catch a panic inside that goroutine — each goroutine that can panic needs its own recovery, which is why worker pools and `errgroup`-based fan-out usually wrap each unit of work in a small recover-to-error helper like `SafeHandler` above.
+- **Multiple `%w` and the join tree.** Since Go 1.20, `fmt.Errorf` accepts more than one `%w` verb, producing an error whose `Unwrap() []error` returns all wrapped errors; `errors.Join` builds the same shape directly from a slice.
+
+  Both `errors.Is` and `errors.As` do a depth-first walk over this tree, so a target nested inside one branch of a joined error is still found.
+- **The transport boundary rule, restated precisely.** `HTTPStatus` above takes an `error` and returns an `int`; nothing else in the package imports `net/http`.
+
+  This keeps the domain testable without an HTTP server and makes the mapping reusable for a gRPC status mapper (`codes.NotFound` instead of `http.StatusNotFound`) without touching the domain code at all.
+
+  The concrete status-and-body shape (problem+json, error codes) is covered in [[API Error Handling]]; wiring it into a real handler is in [[Building REST Endpoints]].
+- **`recover` only works one level up.** `recover()` only stops a panic if it is called directly inside a deferred function in the **same goroutine** where the panic happened.
+
+  A `recover` in the function that started a goroutine does not catch a panic inside that goroutine — each goroutine that can panic needs its own recovery, which is why worker pools and `errgroup`-based fan-out usually wrap each unit of work in a small recover-to-error helper like `SafeHandler` above.
 
 ## 9. Interview questions
 
@@ -472,7 +542,9 @@ ok  	scratch/g3/errdemo	3.533s
 > `errors.Is(err, target)` walks the wrap chain checking identity — "is this error (or one it wraps) equal to this specific sentinel value?" `errors.As(err, &target)` walks the same chain checking type — "is there an error of this type anywhere in the chain, and if so, give it to me." Use `Is` for sentinels, `As` for typed errors that carry data.
 
 > [!question]- What is the typed-nil trap, and how do you avoid it?
-> A function that returns a concrete pointer type (`*MyError`) assigned to an `error` variable can produce a non-nil interface even when the pointer is `nil`, because an interface is nil only when both its type and value are nil. Avoid it by never returning a concrete error-implementing pointer type directly as `error` — return the interface, or the literal `nil`.
+> A function that returns a concrete pointer type (`*MyError`) assigned to an `error` variable can produce a non-nil interface even when the pointer is `nil`, because an interface is nil only when both its type and value are nil.
+>
+> Avoid it by never returning a concrete error-implementing pointer type directly as `error` — return the interface, or the literal `nil`.
 
 > [!question]- When should you use `panic` instead of returning an error?
 > Only for programmer bugs the caller cannot reasonably be expected to handle — a broken invariant, a nil map write, code that should be unreachable. Any failure a caller might legitimately want to check and react to (not found, invalid input, a conflict) is an error, never a panic.
@@ -501,3 +573,7 @@ ok  	scratch/g3/errdemo	3.533s
 - **Before this:** [[Functions, Closures, Defer, Panic and Recover]], [[Interfaces]]
 - **Next:** [[Packages, Modules and Dependency Management]], [[Building REST Endpoints]]
 - **Compare with:** [[API Error Handling]] (the HTTP status/body contract this note's `HTTPStatus` function feeds), [[Go Interview Questions and Traps]] (the nil-interface trap restated alongside other Go gotchas)
+
+### Watch on YouTube
+
+- [GopherCon 2020: Working with Errors - Jonathan Amsterdam](https://www.youtube.com/watch?v=IKoSsJFdRtI) · Gopher Academy · authoritative deep dive on Go 1.13 error wrapping, errors.Is/As, by the Go error design author

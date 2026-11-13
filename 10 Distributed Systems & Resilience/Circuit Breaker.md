@@ -11,7 +11,7 @@ sources:
   - "Netflix Hystrix wiki, Configuration; Hystrix README (maintenance mode since 2018)"
   - "sony/gobreaker v2.4.0 source and documentation"
   - "Envoy documentation, Outlier detection and Circuit breaking"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Circuit Breaker
@@ -25,6 +25,45 @@ updated: 2026-11-04
 > - Count timeouts, 5xx and connection errors as failures, not 4xx client errors.
 > - Put the timeout inside the breaker, the retry loop outside it, and never retry while it is open.
 > - Classic mistake: a breaker with no fallback just turns slow errors into fast errors; decide what the user sees.
+
+## Start here: the basics
+
+**The problem in one story.** You keep calling a friend who never picks up. Each call you wait a full minute before giving up. After five failed calls, you stop trying for an hour and do something else, then try once more. A circuit breaker does exactly this for code calling a failing service.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Dependency | Another service your code calls | The inventory API |
+| Timeout | Maximum wait before giving up on a call | 300 ms |
+| Failure rate | Share of recent calls that failed | 30 of 100 calls = 30% |
+| Fail fast | Return an error at once without calling | "inventory unavailable" in 1 µs |
+| Fallback | What you return instead of the real answer | Cached stock count |
+| Retry | Trying the same call again after a failure | Retry once after 100 ms |
+| Cascading failure | One service's problem spreads to its callers | Slow inventory makes checkout time out |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+  [*] --> Closed
+  Closed --> Open: failure rate too high
+  Open --> HalfOpen: cool-down passed
+  HalfOpen --> Closed: probes succeed
+  HalfOpen --> Open: a probe fails
+```
+
+**Analogy.** The electrical breaker in your home cuts power when a circuit overloads, protecting the wiring. Where it breaks: a home breaker stays off until a person resets it, while a software breaker tests recovery by itself with probe calls.
+
+**How the rest of this note builds up**
+
+- First, *Why it exists* explains cascading failure from one slow dependency.
+- Then *Mental model* and *How it works* walk through closed, open and half-open, and the sliding window.
+- The *Worked example* builds a breaker in Go with timeouts, retries and a fallback.
+- Finally, *Variants*, *In production* and the *Deep dive* cover tuning, per-host breakers and SDE-3 pitfalls.
+
+> [!tip] Remember
+> Stop calling what is clearly broken, fail fast with a fallback, and probe now and then to see if it is back.
 
 ## 1. Why it exists
 
@@ -118,7 +157,9 @@ sequenceDiagram
 ### Where the breaker goes
 
 - **Per dependency, often per host.** One breaker per downstream (payments, recommendations, search). If the client talks to many replicas, a breaker per host lets healthy hosts keep serving while a bad one is cut off. One breaker for "all outbound calls" would let a single bad dependency block everything.
-- **In the client library or in the mesh.** In-process (gobreaker, failsafe-go, resilience4j) knows business errors and can run fallbacks. In a service mesh, Envoy's **outlier detection** ejects a misbehaving host from the load-balancing pool after, by default, 5 consecutive 5xx errors, for a base of 30 s. Envoy's own setting called "circuit breaking" is different: it caps connections, pending requests and retries per cluster, which is a bulkhead ([[Bulkheads and Concurrency Limits]]).
+- **In the client library or in the mesh.** In-process (gobreaker, failsafe-go, resilience4j) knows business errors and can run fallbacks.
+
+  In a service mesh, Envoy's **outlier detection** ejects a misbehaving host from the load-balancing pool after, by default, 5 consecutive 5xx errors, for a base of 30 s. Envoy's own setting called "circuit breaking" is different: it caps connections, pending requests and retries per cluster, which is a bulkhead ([[Bulkheads and Concurrency Limits]]).
 
 ### How it fits with timeouts and retries
 
@@ -779,3 +820,8 @@ Compare with [[17 LLD/Practice/Circuit Breaker|the Circuit Breaker LLD practice 
 - **Before this:** [[Distributed Systems Fundamentals]], [[Timeouts, Retries and Backoff]]
 - **Next:** [[Bulkheads and Concurrency Limits]], [[Load Shedding and Graceful Degradation]]
 - **Compare with:** [[17 LLD/Practice/Circuit Breaker|Circuit Breaker (LLD practice problem)]] (the class-design angle), [[Rate Limiting - Algorithms and Distributed Design]] (limits your volume instead of reacting to failures), [[Calling External APIs]] (Go client setup)
+
+### Watch on YouTube
+
+- [Circuit Breaker Explained / Working Principle](https://www.youtube.com/watch?v=SNBfppriDjc) · RealPars · 7 min · 184,624 views
+- [Why Circuit Breakers DON'T Protect People (electric shocks)](https://www.youtube.com/watch?v=gqEu9t8HwW0) · The Engineering Mindset · 18 min · 2,972,093 views

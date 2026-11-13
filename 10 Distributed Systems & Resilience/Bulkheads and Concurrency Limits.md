@@ -14,7 +14,7 @@ sources:
   - "JEP 444: Virtual Threads (Java 21)"
   - "Envoy documentation, Circuit breaking (cluster thresholds)"
   - "Netflix concurrency-limits library (GitHub README)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Bulkheads and Concurrency Limits
@@ -28,6 +28,47 @@ updated: 2026-11-04
 > - Cap in-flight calls **per dependency** (semaphore, pool size, `MaxConnsPerHost`), and reject or fall back when the cap is full.
 > - Size the cap from rate × latency with headroom; put timeouts on everything so slots come back.
 > - Classic mistake in Go: "goroutines are cheap, so there is no pool to exhaust". The pools are your connections, your database and your memory.
+
+## Start here: the basics
+
+**The problem in one story.** A restaurant kitchen has 10 cooks. One dish, a slow-roasted special, suddenly takes an hour instead of ten minutes. If every cook can start that dish, soon all 10 are stuck at the oven and nobody makes salads or soup.
+
+The fix: only 2 cooks may ever work on the special. Everyone else keeps the rest of the menu moving.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Dependency | Another service or database your code calls | The payment API your checkout calls |
+| In flight | A request that has started but not finished | 40 calls currently waiting on the payment API |
+| Latency | How long one request takes | 50 ms normally, 2 s when the API is sick |
+| Pool | A fixed set of reusable resources | 20 database connections shared by all handlers |
+| Semaphore | A counter that lets only N holders in at once | `make(chan struct{}, 10)` in Go |
+| Timeout | A deadline after which you give up waiting | Cancel the call after 300 ms |
+| Fallback | What you return when you cannot call the real thing | Cached prices, or "try again later" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  R[Incoming requests] --> S[Your service]
+  S --> A["Bulkhead A: max 10"] --> PA[Payments API]
+  S --> B["Bulkhead B: max 20"] --> DB[(Database)]
+  S --> C["Bulkhead C: max 5"] --> RE[Recommendations]
+  A -. full .-> F[Reject or fallback]
+```
+
+**Analogy.** A ship's hull is split into watertight compartments (bulkheads). One hole floods one compartment, not the whole ship. Where it breaks: a ship's compartments are fixed steel, while software limits must be sized from traffic and latency, and can even adapt at runtime.
+
+**How the rest of this note builds up**
+
+- First, *Why it exists* shows how one slow dependency quietly eats all goroutines and connections.
+- Then *Mental model* and *How it works* introduce Little's Law and how to size a limit from rate × latency.
+- The *Worked example* builds per-dependency limits in Go and measures the difference.
+- Finally, *Variants*, *In production* and the *Deep dive* cover adaptive limits (AIMD, Gradient) and the SDE-3 details.
+
+> [!tip] Remember
+> Give every dependency its own small, capped share of capacity, so one slow call can only drown its own compartment.
 
 ## 1. Why it exists
 
@@ -55,7 +96,9 @@ Go has no request thread pool, so the failure looks different but ends the same 
 
 The name comes from ships. A hull is split into watertight compartments by walls called bulkheads. A hole floods one compartment, and the ship stays afloat.
 
-In a service, the "water" is waiting work. Without bulkheads, all requests draw from one shared pool of resources, so whatever is slowest fills it. With bulkheads, recommendations get 200 slots, payments get 50, search gets 100. When recommendations hang, their 200 slots fill and further recommendation calls are turned away at once (and the page shows a fallback), while payments still have all 50 of their slots.
+In a service, the "water" is waiting work. Without bulkheads, all requests draw from one shared pool of resources, so whatever is slowest fills it. With bulkheads, recommendations get 200 slots, payments get 50, search gets 100.
+
+When recommendations hang, their 200 slots fill and further recommendation calls are turned away at once (and the page shows a fallback), while payments still have all 50 of their slots.
 
 The limit is the size of the compartment. Too small and you reject healthy traffic; too large and the compartment is the whole ship.
 
@@ -647,3 +690,7 @@ func TestExportsWeighted(t *testing.T) {
 - **Before this:** [[Timeouts, Retries and Backoff]], [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]], [[Goroutines and Channels]], [[Concurrency Primitives - Mutex, Semaphore, Atomics]]
 - **Next:** [[Load Shedding and Graceful Degradation]], [[Performance Engineering and Capacity Planning]]
 - **Compare with:** [[Connection Pooling]] (database pools in depth), [[Backpressure and Flow Control]] (limits between producers and consumers), [[Runtime - Goroutine Scheduler (GMP)]] (why goroutines block cheaply), [[Background Jobs and Worker Pools]] (bounded workers for async work)
+
+### Watch on YouTube
+
+- [Jai Desai - Little's Law: Why Service Concurrency Limits Matter - WTF is SRE 2023](https://www.youtube.com/watch?v=4N8-3mb-mzM) · Container Solutions · 17 min · 156 views

@@ -17,13 +17,19 @@ sources:
   - "Instagram engineering blog, Sharding and IDs at Instagram (2012)"
   - "Figma engineering blog, How Figma's Databases Team Lived to Tell the Scale (2024)"
   - "CockroachDB docs: multi-region (REGIONAL BY ROW, survival goals)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Choosing Consistency, Replication and Partitioning - Decision Guide
 
 > [!summary] TL;DR
-> Three questions decide most data-layer designs in an HLD round. How fresh must a read be (consistency)? Who accepts writes and when does a write count as done (replication)? How do you split data once one machine is not enough (partitioning)? This guide gives a flowchart for each, a comparison table, real systems, and the sentences to say in the interview.
+> Three questions decide most data-layer designs in an HLD round.
+>
+> 1. How fresh must a read be (consistency)?
+> 2. Who accepts writes and when does a write count as done (replication)?
+> 3. How do you split data once one machine is not enough (partitioning)?
+>
+> This guide gives a flowchart for each, a comparison table, real systems, and the sentences to say in the interview.
 
 > [!abstract] Core idea
 > - Start from the weakest guarantee the business tolerates, then pay for stronger ones only where money or safety demands it.
@@ -31,6 +37,52 @@ updated: 2026-11-09
 > - Go multi-leader or leaderless only when you must accept writes in several regions or survive partitions without a failover.
 > - Default partitioning: do not shard until a single node (plus replicas and caching) cannot hold the load. When you must, pick a key that spreads writes and keeps your hottest query on one shard.
 > - Name the trade-off aloud: freshness against latency and availability.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your chat app keeps messages in one database. It gets too busy, so you add copies of the database on other machines.
+Now a friend may read a copy that has not yet received your newest message.
+Later even the copies are not enough, so you must split the messages across machines.
+This guide is about three choices: how fresh reads must be, how copies are kept, and how data is split.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Replica | A copy of the data on another machine | 1 leader + 2 followers |
+| Leader / follower | The copy that accepts writes / copies that receive them | Writes to leader, reads from followers |
+| Sync / async replication | Wait for copies before saying "done" / do not wait | Sync: no data loss; async: faster |
+| Consistency | How up to date a read is guaranteed to be | Strong: always the latest write |
+| Replication lag | How far behind a follower is | Follower 200 ms behind |
+| Partition / shard | One slice of the data on its own machine | Users A-M on shard 1 |
+| Shard key | The field that decides which shard a row goes to | `chat_id` |
+| Quorum | A majority of copies that must agree | 2 of 3 replicas |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    W[Write] --> L[(Leader)]
+    L -->|replicate| F1[(Follower 1)]
+    L -->|replicate| F2[(Follower 2)]
+    R[Read] --> F1
+    K[Shard key] --> S1[Shard A]
+    K --> S2[Shard B]
+```
+
+**Analogy.** A shared notebook photocopied for each office: copies let more people read at once, but a copy made this morning misses this afternoon's notes. Splitting the notebook into volumes (A-M, N-Z) is partitioning.
+Where it breaks: photocopies are made by hand once, while replicas update continuously, usually within milliseconds.
+
+**How the rest of this note builds up**
+
+- First, why it exists and the mental model (sections 1-2).
+- Then six decisions (section 3): consistency level, session guarantees, leader topology, sync vs async, partitioning scheme, shard key, and whether to shard at all.
+- Then a worked chat example and comparison tables (sections 4-5).
+- Finally the SDE-3 deep dive (section 8): why `R + W > N` is not linearizable, resharding without downtime, cross-shard operations and geo partitioning.
+
+> [!tip] Remember
+> Pick the weakest consistency the business allows, one leader with async followers by default, and shard only when one node cannot cope.
 
 ## 1. Why it exists
 
@@ -342,7 +394,11 @@ What to monitor:
 
 ### Why `R + W > N` is not linearizable
 
-Overlap guarantees a read set contains at least one replica with the latest acknowledged write. It does not guarantee that concurrent writes or sloppy quorums and clock-based timestamps behave. A read during an in-flight write can return the old or new value, and two readers can see them in opposite orders. For true linearizability you need consensus or a single ordered log. See [[Quorums and Leaderless Replication]].
+Overlap guarantees a read set contains at least one replica with the latest acknowledged write. It does not guarantee that concurrent writes or sloppy quorums and clock-based timestamps behave.
+
+A read during an in-flight write can return the old or new value, and two readers can see them in opposite orders.
+
+For true linearizability you need consensus or a single ordered log. See [[Quorums and Leaderless Replication]].
 
 ### Resharding without downtime
 
@@ -423,3 +479,8 @@ A strongly consistent write across US-East and EU-West needs at least one transa
 - Cloud: [[AWS 08 - RDS and Aurora]]
 - System design: [[System Design Interview Framework]], [[Hot Keys and Hot Partitions]], [[Back-of-the-Envelope Estimation]], [[Case Study - Chat System]], [[Case Study - Key-Value Store]]
 - Sibling guide: [[Choosing Storage for Files, Search and Analytics - Decision Guide]]
+
+### Watch on YouTube
+
+- [Database Replication, Partitioning & Sharding — Explained in 25 Minutes 🚀](https://www.youtube.com/watch?v=FA2kVglR-ZQ) · Souradrita Sarkar · 25 min · 1,052 views
+- [Replication in Distributed Systems: Modes, Consistency, and Architectures Explained](https://www.youtube.com/watch?v=TcxMMxhMJHs) · Byte Sized Tutorials · 5 min · 676 views

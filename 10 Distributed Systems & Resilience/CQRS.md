@@ -10,7 +10,7 @@ sources:
   - "Fowler, CQRS (martinfowler.com bliki, 2011)"
   - "Microsoft Azure Architecture Center: CQRS pattern"
   - "PostgreSQL 17 documentation: REFRESH MATERIALIZED VIEW, logical decoding"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # CQRS
@@ -24,6 +24,45 @@ updated: 2026-11-04
 > - Read models can be updated in the same transaction, through an outbox or CDC, or from an event-sourced stream.
 > - When updates are asynchronous, reads lag writes, so the UI must handle "I just saved it but don't see it yet".
 > - Classic mistake: thinking CQRS requires events, a message broker or event sourcing. It requires none of them.
+
+## Start here: the basics
+
+**The problem in one story.** A library keeps one big ledger of every book borrowed and returned. Librarians write in it all day. Visitors keep asking "which books are popular this month?", and each answer means reading the whole ledger. So the library keeps a separate notice board with the answer already worked out, updated as the ledger changes.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Command | A request that changes data | "Record payment of ₹500" |
+| Query | A request that only reads data | "Show outstanding amount per customer" |
+| Normalized schema | Each fact stored once, in separate tables | `invoices` and `payments` tables |
+| Denormalized | Data copied and pre-joined for fast reads | One row per customer with totals |
+| Read model / projection | A copy of data shaped for one screen or query | The finance dashboard table |
+| Eventual consistency | The copy catches up a little later | Dashboard shows the payment after 1 s |
+| Outbox / CDC | Ways to pass changes from writes to read models reliably | An `outbox` table read by a worker |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  U[User] -->|command| W[Write model]
+  W --> DB[(Normalized DB)]
+  DB -->|changes| PR[Projector]
+  PR --> RM[(Read model)]
+  U -->|query| RM
+```
+
+**Analogy.** A restaurant's order tickets (write side) versus the menu board showing "today's specials" (read side). Where it breaks: a menu board is updated by hand, while a read model must be rebuilt automatically and may lag writes.
+
+**How the rest of this note builds up**
+
+- First, *Why it exists* shows the InvoiceOps dashboard query that is too slow on the write schema.
+- Then *Mental model* and *How it works* split commands from queries and compare ways to update read models.
+- The *Worked example* builds a write model and a projection in Go.
+- Finally, *Variants*, *Trade-offs* and the *Deep dive* cover lag, rebuilds and when CQRS is overkill at SDE-3 level.
+
+> [!tip] Remember
+> CQRS means writes and reads use different models; events and brokers are optional extras.
 
 ## 1. Why it exists
 
@@ -41,7 +80,9 @@ One model is being asked to be good at two opposite jobs. CQRS splits them: the 
 
 Start from **CQS** (Command-Query Separation, Bertrand Meyer): a method either changes state (a command) or returns a value (a query), never both. CQRS applies that rule to the whole data model: separate **models**, not just separate methods.
 
-The analogy is a **restaurant kitchen and its menu board**. Orders (commands) go to the kitchen, which follows strict rules: stock, recipes, order of work. The board in the dining room (a read model) shows "today's specials, 3 left", copied from the kitchen and updated when someone has a moment. Diners read the board; nobody cooks from it. If the board says 3 left and the kitchen has 2, the kitchen wins.
+The analogy is a **restaurant kitchen and its menu board**. Orders (commands) go to the kitchen, which follows strict rules: stock, recipes, order of work. The board in the dining room (a read model) shows "today's specials, 3 left", copied from the kitchen and updated when someone has a moment.
+
+Diners read the board; nobody cooks from it. If the board says 3 left and the kitchen has 2, the kitchen wins.
 
 Terms used below:
 
@@ -136,7 +177,9 @@ Cost: every payment now also locks the customer's dashboard row, so two payments
 
 ### Go: asynchronous projector with version tokens
 
-The write model validates commands and appends events to an outbox under one lock (standing in for one database transaction). The projector applies events strictly in order and skips duplicates, so at-least-once delivery is safe. `Summary` takes the caller's version token and refuses to answer from a stale position. `Rebuild` replays the outbox into a fresh read model. It passes `go vet` and `go test -race` on Go 1.24.
+The write model validates commands and appends events to an outbox under one lock (standing in for one database transaction). The projector applies events strictly in order and skips duplicates, so at-least-once delivery is safe.
+
+`Summary` takes the caller's version token and refuses to answer from a stale position. `Rebuild` replays the outbox into a fresh read model. It passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 package cqrs
@@ -541,7 +584,9 @@ The Go example sidesteps this because its single lock makes allocation and commi
 
 ### Rebuilds at scale
 
-A replay must be faster than real time, or it never catches up. Batch reads (thousands of events per query), batch writes to the read store, and disable read-store indexes until the end where the store allows it. Build into a new table or index and switch an alias, so queries never see a half-built model. Keep the event or outbox history long enough to rebuild from it, or snapshot read models periodically.
+A replay must be faster than real time, or it never catches up. Batch reads (thousands of events per query), batch writes to the read store, and disable read-store indexes until the end where the store allows it.
+
+Build into a new table or index and switch an alias, so queries never see a half-built model. Keep the event or outbox history long enough to rebuild from it, or snapshot read models periodically.
 
 ### Ordering scope
 
@@ -590,3 +635,8 @@ Total order across all events makes a projector simple but single-threaded. Most
 - **Before this:** [[Materialized Views and Denormalization]], [[Transactional Outbox and CDC]], [[Consistency Models]]
 - **Next:** [[Event Sourcing]], [[Saga Pattern]]
 - **Compare with:** [[Replication]] (read replicas keep the same model), [[Caching Patterns]] (a copy, not a new model), [[Materialized Views and Denormalization]] (CQRS inside one database)
+
+### Watch on YouTube
+
+- [CQRS is probably the cause of the Microservices madness](https://www.youtube.com/watch?v=DQ3D_mplIgY) · Hussein Nasser · 6 min · 76,431 views
+- [Mastering CQRS in Just 5 Minutes](https://www.youtube.com/watch?v=SvjdJoNPcHs) · ByteMonk · 5 min · 68,166 views

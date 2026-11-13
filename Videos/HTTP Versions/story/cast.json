@@ -1,0 +1,10 @@
+{
+  "N":     {"voice": "en-US-EmmaMultilingualNeural", "rate": 4,  "pitch": 0,  "volume": 0},
+  "ZARA":  {"voice": "en-US-AriaNeural",             "rate": 4,  "pitch": 0,  "volume": 0},
+  "RAVI":  {"voice": "en-US-ChristopherNeural",      "rate": 6,  "pitch": 3,  "volume": 0},
+  "HAL":   {"voice": "en-GB-RyanNeural",             "rate": -2, "pitch": -2, "volume": 0},
+  "MAYA":  {"voice": "en-US-JennyNeural",            "rate": 4,  "pitch": 2,  "volume": 0},
+  "QUINN": {"voice": "en-AU-NatashaNeural",          "rate": 2,  "pitch": 1,  "volume": 0},
+  "TOM":   {"voice": "en-US-RogerNeural",            "rate": -4, "pitch": -4, "volume": 0},
+  "GUS":   {"voice": "en-US-GuyNeural",              "rate": 0,  "pitch": -4, "volume": 0}
+}

@@ -8,7 +8,7 @@ related: ["[[Sorting, Searching and Interview Patterns]]", "[[Graphs and Graph A
 sources:
   - "Go standard library docs, package sort and package slices"
   - "Go source, cmd/compile and src/sort: pdqsort (pattern-defeating quicksort), introduced in Go 1.19"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Sorting, Searching and Interview Patterns - Go
@@ -16,9 +16,20 @@ updated: 2026-11-09
 > [!summary] TL;DR
 > One tested Go function per interview pattern from [[Sorting, Searching and Interview Patterns]]: two pointers, sliding window, prefix sums, BFS, DFS, backtracking, and bottom-up DP. Each function is the smallest correct version of its pattern, chosen to make the pattern itself legible rather than to handle every edge case a production system would need.
 
+## Before the code
+
+- **Slices** (`[]int`, `[][]byte`): Go's growable lists; every pattern here walks or indexes into them.
+- **Multiple return values** (`(int, int)`): `TwoSumSorted` returns both indices at once instead of a struct.
+- **Maps** (`map[int][]int`): Go's hash table, used as a graph's adjacency list for BFS.
+- **Closures and recursion** (`Subsets`): an inner function calls itself to try "include" and "exclude" for each item (backtracking).
+- **Standard sort helpers** (`slices.Sort`, `sort.Search`): library sorting (pdqsort) and binary search on a condition.
+- **What to run:** `go vet ./patterns/... && go test -race ./patterns/...` inside the module. No goroutines or interfaces are needed here.
+
 ## What this code shows
 
-Each function below is deliberately the smallest version of its pattern that still demonstrates the real idea, rather than a production-hardened implementation — the goal is for the pattern itself to be legible in a single read, with every design choice explained rather than left implicit. None of these functions depends on any other, so they can be read in any order, though the order below follows the same progression as the theory note's "How it works" section.
+Each function below is deliberately the smallest version of its pattern that still demonstrates the real idea, rather than a production-hardened implementation — the goal is for the pattern itself to be legible in a single read, with every design choice explained rather than left implicit.
+
+None of these functions depends on any other, so they can be read in any order, though the order below follows the same progression as the theory note's "How it works" section.
 
 | Function | Theory concept it demonstrates |
 |---|---|
@@ -32,13 +43,17 @@ Each function below is deliberately the smallest version of its pattern that sti
 
 ### How the functions in this file relate to each other
 
-It helps to see the shape of the whole file before reading any one function closely. `TwoSumSorted`, `MaxSubarraySum`, and `PrefixSums` are each fully independent, operating on sorted or fixed arrays respectively. `NumIslands` and `ShortestPathBFS` both traverse a graph-shaped input but differ in traversal order (depth-first vs breadth-first) and in what that difference buys. `Subsets` and `CoinChangeMinCoins` solve the same *kind* of combinatorial problem with opposite strategies: enumerate everything versus cache overlapping answers.
+It helps to see the shape of the whole file before reading any one function closely. `TwoSumSorted`, `MaxSubarraySum`, and `PrefixSums` are each fully independent, operating on sorted or fixed arrays respectively.
+
+`NumIslands` and `ShortestPathBFS` both traverse a graph-shaped input but differ in traversal order (depth-first vs breadth-first) and in what that difference buys. `Subsets` and `CoinChangeMinCoins` solve the same *kind* of combinatorial problem with opposite strategies: enumerate everything versus cache overlapping answers.
 
 None of the seven functions calls any other, so they can be read, tested, or modified in any order without breaking anything else in the file — a deliberate choice that keeps each pattern's teaching point isolated rather than tangled up with another pattern's.
 
 That independence also means the exercises below can be attempted in any order, and a change to one function's internals (for example, switching `CoinChangeMinCoins` to top-down recursion) can never accidentally affect the behavior of any other function in this file, which is a useful property to notice and rely on when studying one pattern at a time rather than the whole file at once.
 
-It is also why the tests are organized one per function rather than as a single combined test: a failure always points at exactly one function, never at an ambiguous interaction between two of them. This mirrors how these patterns tend to show up in practice — each one solving its own narrow problem, composed together only at a higher level by the surrounding program, rather than sharing internal state with each other.
+It is also why the tests are organized one per function rather than as a single combined test: a failure always points at exactly one function, never at an ambiguous interaction between two of them.
+
+This mirrors how these patterns tend to show up in practice — each one solving its own narrow problem, composed together only at a higher level by the surrounding program, rather than sharing internal state with each other.
 
 ```text
 module cs1scratch
@@ -403,6 +418,8 @@ Each of these asks you to change one function and predict the result *before* ru
 
 Each function above pays a small, deliberate cost for a guarantee that a brute-force version wouldn't have: two pointers trade a nested loop for one pass across sorted data; the sliding window trades per-window recomputation for one incremental update; prefix sums trade a one-time `O(n)` pass for `O(1)` queries afterward; BFS trades "a path" for "the *shortest* path"; and bottom-up DP trades exponential recomputation for a table that's filled exactly once per sub-amount.
 
-Recognizing which guarantee each pattern buys — not memorizing the seven functions by name — is the actual interview skill these patterns are testing. In an interview, stating the guarantee out loud before writing any code ("this needs the shortest path specifically, so it has to be BFS, not DFS") is usually worth more to an interviewer than the code itself, since it demonstrates the recognition step this whole note is built around.
+Recognizing which guarantee each pattern buys — not memorizing the seven functions by name — is the actual interview skill these patterns are testing.
+
+In an interview, stating the guarantee out loud before writing any code ("this needs the shortest path specifically, so it has to be BFS, not DFS") is usually worth more to an interviewer than the code itself, since it demonstrates the recognition step this whole note is built around.
 
 None of these seven functions depends on any of the others, so none of them needs to be memorized as a block — each one is small enough to be re-derived from its one-line purpose (stated in the Exercises section above) faster than it can be recalled from memory, which is the more durable way to prepare for a problem that only superficially resembles one of these but isn't identical to it.

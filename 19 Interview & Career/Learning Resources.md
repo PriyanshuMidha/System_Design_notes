@@ -7,19 +7,61 @@ prereqs: []
 related: ["[[LLD Round Playbook]]", "[[SDE-3 Readiness Checklist]]", "[[Backend Roadmap and Tech Landscape]]", "[[19 Interview & Career MOC]]"]
 sources:
   - "Links collected from the owner's legacy notes and 00 Rebuild/Salvaged Links (not re-fetched on 2026-11-04)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Learning Resources
 
 > [!summary] TL;DR
-> A curated list of the outside material behind this vault, grouped by area, with official documentation first, then books, then courses and videos. Each entry says what it is good for and which vault note it backs up, so you read the note first and the source only for the part you need.
+> A curated list of the outside material behind this vault, grouped by area, with official documentation first, then books, then courses and videos.
+>
+> Each entry says what it is good for and which vault note it backs up, so you read the note first and the source only for the part you need.
 
 > [!abstract] Core idea
 > - Official docs are the source of truth; blogs and videos are for intuition.
 > - Read the vault note, then the one section of the source it points to, then code the example yourself.
 > - Courses taught in Java still work for LLD, but translate them to Go and add what they skip (concurrency, DB invariants, idempotency).
 > - Links were collected from older notes and were not re-checked on the date above; if one is dead, search the title on the same site.
+
+## Start here: the basics
+
+**The problem in one story.**
+You want to learn Kafka, so you search and get 40 videos, 10 courses and 3 books.
+You start a 12-hour course and stop after hour two, tired and no wiser.
+This page picks a small set of trusted sources per topic and tells you which part to read.
+You read the vault note first, then only the slice of the source you need.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Official docs | Documentation written by the people who build the tool | go.dev/doc |
+| Spec | The exact formal rules of a language or protocol | The Go language specification |
+| Vault note | One note in this Obsidian vault | [[LLD Round Playbook]] |
+| Scratch module | A throwaway Go project for trying code | `go mod init scratch` |
+| LLD | Low-level design: classes, methods and their rules | Designing a parking lot |
+| MOC | "Map of content", an index note for a folder | [[19 Interview & Career MOC]] |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    N["Read vault note"] --> S["Open one matching<br/>section of a source"]
+    S --> B["Rebuild the example<br/>+ one test"]
+    B --> W["Write your own<br/>interview answer"]
+```
+
+**Analogy.** A good librarian: instead of handing you the whole shelf, they open the right book at the right chapter.
+Where it breaks: a librarian checks the book is still there, but these links were not re-checked, so some may be dead.
+
+**How the rest of this note builds up**
+
+- First, the four-step way to use any resource.
+- Then sources by area: Go, APIs and gRPC, databases and caching, containers and cloud, AI engineering.
+- Finally the deeper material: LLD and design courses and the advanced backend + AI syllabus.
+
+> [!tip] Remember
+> Note first, one section of the source second, your own code third.
 
 ## How to use a resource
 
@@ -170,3 +212,8 @@ The owner's earlier study plan followed a two-part backend course. Its syllabus,
 - **Before this:** [[19 Interview & Career MOC]], [[Backend Roadmap and Tech Landscape]]
 - **Next:** [[SDE-3 Readiness Checklist]], [[LLD Round Playbook]]
 - **Compare with:** each area's MOC, which lists the vault notes in learning order
+
+### Watch on YouTube
+
+- [Learning Resources : Meaning, Types and Function /BEd 3rd Semester Notes/ Teaching of Life Sciences](https://www.youtube.com/watch?v=h4Mnuw0SEns) · The Vani Classes · 12 min · 112,010 views
+- [Meaning, Significance and Types of Learning Resources in EVS](https://www.youtube.com/watch?v=yrE6Tzgx-5E) · NIOS Senior Secondary Courses · 28 min · 17,868 views

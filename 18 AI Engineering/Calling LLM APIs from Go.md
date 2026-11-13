@@ -7,7 +7,7 @@ sources:
   - "Anthropic docs, Messages API and Go SDK (github.com/anthropics/anthropic-sdk-go, 2026)"
   - "Anthropic docs, Rate limits and streaming Messages (anthropic.com/docs, 2026)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Calling LLM APIs from Go
@@ -22,15 +22,69 @@ updated: 2026-11-07
 > - Client-side rate limiting keeps you under your own configured budget, which is cheaper to reason about than reacting to `429`s after the fact.
 > - This note is the mechanics layer: what to put *in* the prompt is [[Prompt Engineering]]; what the provider is doing conceptually is [[LLM Fundamentals]]; Go's general HTTP client patterns (timeouts, context, connection pooling) live in [[Calling External APIs]] and apply here unchanged.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your Go server needs an answer from an LLM to reply to a user.
+That means sending an HTTP request to another company's server and waiting.
+Sometimes it is slow, sometimes it says "too many requests", sometimes it just fails.
+This note is about making that call safely and cheaply.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HTTP POST | Sending data to a server and getting a reply | `POST /v1/messages` with JSON |
+| JSON | A text format for structured data | `{"model":"x","max_tokens":100}` |
+| API key | A secret that proves who is calling | Sent in a request header |
+| Token | A small piece of text the model counts and bills | "hello world" is about 2 tokens |
+| Streaming (SSE) | The reply arrives in small pieces over one connection | Words appear one by one |
+| Status code `429` | "Too many requests, slow down" | You went over your rate limit |
+| Retry with backoff | Try again after waiting longer each time | Wait 1s, then 2s, then 4s |
+| Timeout | Give up after a fixed time | Cancel after 30 seconds |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Go server"] --> L["Rate limiter"]
+    L --> P["POST to LLM API"]
+    P -- "200" --> A["Answer + token usage"]
+    P -- "429 / 5xx" --> B["Wait (backoff)"]
+    B --> P
+    P -- "other 4xx" --> E["Fail: fix request"]
+```
+
+**Analogy.** It is like ordering from a busy restaurant by phone. If the line is busy you call back later, and you do not call a hundred times a minute.
+Where it breaks: a restaurant never tells you the exact cost of each word; the API returns exact token counts you must track.
+
+**How the rest of this note builds up**
+
+- First, why a bare HTTP call is not enough (section 1) and the mental model (section 2).
+- Then request shape, streaming, retries, rate limiting and token accounting (section 3).
+- Then a full Go worked example (section 4) with variants and trade-offs (sections 5-6).
+- Finally production practice, the SDE-3 deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> An LLM call is just HTTP, but wrap it in timeouts, retries for `429`/`5xx`, a rate limiter and token counting.
+
 ## 1. Why it exists
 
-A naive integration is `http.Post` plus `json.Unmarshal`, and it works — right up until your traffic hits the provider's rate limit, a transient `503` arrives during a deploy on their side, or a user asks a question your service answers by streaming to a web client that should not wait 8 seconds staring at a spinner. None of those are exotic: a backend calling a third-party LLM API at any real volume will see `429`s during bursts, will see occasional `5xx`s, and will want streaming for any user-facing chat surface. Handling all three (and counting tokens before you ever make the call, so you can budget) is the job of this note.
+A naive integration is `http.Post` plus `json.Unmarshal`, and it works — right up until your traffic hits the provider's rate limit, a transient `503` arrives during a deploy on their side, or a user asks a question your service answers by streaming to a web client that should not wait 8 seconds staring at a spinner.
+
+None of those are exotic: a backend calling a third-party LLM API at any real volume will see `429`s during bursts, will see occasional `5xx`s, and will want streaming for any user-facing chat surface.
+
+Handling all three (and counting tokens before you ever make the call, so you can budget) is the job of this note.
 
 Concretely: without a retry policy, a transient `429` becomes a user-visible error for no reason; without a client-side rate limiter, your service pushes past its own quota and gets more `429`s than it needs to; without streaming, a 10-second answer feels like a hang instead of a conversation.
 
 ## 2. Mental model
 
-Treat the LLM API exactly like any other rate-limited, occasionally-flaky external HTTP dependency (see [[Calling External APIs]] for the general pattern) — because that is what it is. The LLM-specific parts are: the request/response shape (a `messages` array, not a REST resource), the token-based cost and limits (not request-count based), and the optional SSE streaming mode. Everything else — context deadlines, retries, backoff, connection reuse — is the same discipline you'd apply to a payments API or a shipping-rates API.
+Treat the LLM API exactly like any other rate-limited, occasionally-flaky external HTTP dependency (see [[Calling External APIs]] for the general pattern) — because that is what it is.
+
+The LLM-specific parts are: the request/response shape (a `messages` array, not a REST resource), the token-based cost and limits (not request-count based), and the optional SSE streaming mode.
+
+Everything else — context deadlines, retries, backoff, connection reuse — is the same discipline you'd apply to a payments API or a shipping-rates API.
 
 ## 3. How it works
 
@@ -61,7 +115,11 @@ flowchart TD
     Wait --> Start
 ```
 
-The rule that matters: **retry transport errors, 408, 429 and 5xx; never retry other 4xx.** A `400` (malformed request) or `401` (bad key) will return the exact same error on retry number six as it did on attempt one — retrying it just adds latency and burns your retry budget on a request that was always going to fail. When the server sends a `Retry-After` header (common on `429`), honour it instead of your own backoff schedule; it reflects the provider's actual rate-limit reset time.
+The rule that matters:
+
+**retry transport errors, 408, 429 and 5xx; never retry other 4xx.** A `400` (malformed request) or `401` (bad key) will return the exact same error on retry number six as it did on attempt one — retrying it just adds latency and burns your retry budget on a request that was always going to fail.
+
+When the server sends a `Retry-After` header (common on `429`), honour it instead of your own backoff schedule; it reflects the provider's actual rate-limit reset time.
 
 ### Streaming via Server-Sent Events
 
@@ -86,11 +144,15 @@ sequenceDiagram
     App-->>User: close stream
 ```
 
-Each `data:` line is a separate JSON payload; your Go code reads the body line by line (not with `json.Decode` on the whole body, which would block until the connection closes), accumulates `content_block_delta` text events, and watches for `message_stop` to know the response is complete. A connection that drops mid-stream should be treated like any partial response: log what you have, and either resume (if the provider supports it) or surface a clear "answer cut off" state rather than silently returning a truncated string as if it were complete.
+Each `data:` line is a separate JSON payload; your Go code reads the body line by line (not with `json.Decode` on the whole body, which would block until the connection closes), accumulates `content_block_delta` text events, and watches for `message_stop` to know the response is complete.
+
+A connection that drops mid-stream should be treated like any partial response: log what you have, and either resume (if the provider supports it) or surface a clear "answer cut off" state rather than silently returning a truncated string as if it were complete.
 
 ### Token counting before you call
 
-Before sending a request, you often want to know roughly or exactly how many tokens it will cost — to decide whether to trim history, to budget a per-tenant quota, or to pick a cheaper model for a short task. Providers expose a documented count-tokens endpoint that runs the real tokeniser; a local character-based estimate is faster but is, at best, an estimate (see [[LLM Fundamentals]] on tokenisation).
+Before sending a request, you often want to know roughly or exactly how many tokens it will cost — to decide whether to trim history, to budget a per-tenant quota, or to pick a cheaper model for a short task.
+
+Providers expose a documented count-tokens endpoint that runs the real tokeniser; a local character-based estimate is faster but is, at best, an estimate (see [[LLM Fundamentals]] on tokenisation).
 
 ## 4. Worked example
 
@@ -200,7 +262,9 @@ This has no retries, no rate limiting, and blocks fully on `io.ReadAll` — fine
 
 ### Full version: retries, rate limiting, streaming, token counting
 
-A production-shaped client. It compiles and passes `go vet` and `go test -race` on Go 1.24. Only the retry/rate-limit/streaming logic is shown here in full; the package also has a `RateLimiter` (a token bucket, elided — see the cheat sheet for its one-line job) and a `tokens.go` (token counting, see [[LLM Fundamentals]] on tokenisation) that are not reproduced in this note.
+A production-shaped client. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+
+Only the retry/rate-limit/streaming logic is shown here in full; the package also has a `RateLimiter` (a token bucket, elided — see the cheat sheet for its one-line job) and a `tokens.go` (token counting, see [[LLM Fundamentals]] on tokenisation) that are not reproduced in this note.
 
 ```go
 // Client calls the Messages API over plain net/http.
@@ -675,3 +739,8 @@ func TestNoRetryOn400(t *testing.T) {
 - **Before this:** [[LLM Fundamentals]], [[Calling External APIs]]
 - **Next:** [[Prompt Engineering]], [[Structured Outputs and Tool Calling]]
 - **Compare with:** [[LLM Cost, Latency and Caching]] (what to do with the token counts this note gives you), [[LLM Observability]] (what to log about every call)
+
+### Watch on YouTube
+
+- [AI Tool Calling via Natural Language: LLMs, APIs & Docker in Action](https://www.youtube.com/watch?v=gosZ_vqXkMI) · IBM Technology · 4 min · 17,071 views
+- [What is Tool Calling? Connecting LLMs to Your Data](https://www.youtube.com/watch?v=h8gMhXYAv1k) · IBM Technology · 4 min · 66,153 views

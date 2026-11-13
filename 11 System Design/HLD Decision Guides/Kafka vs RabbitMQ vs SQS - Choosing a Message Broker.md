@@ -20,13 +20,15 @@ sources:
   - "Netflix Tech Blog, Evolution of the Netflix Data Pipeline (Keystone, 2016): Kafka at the core"
   - "Instagram Engineering, What Powers Instagram: Hundreds of Instances, Dozens of Technologies (2011), and Celery documentation: Celery with RabbitMQ as a broker"
   - "Uber Engineering, Introducing uReplicator and related Kafka posts (2016 onward): Kafka as the messaging backbone"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Kafka vs RabbitMQ vs SQS - Choosing a Message Broker
 
 > [!summary] TL;DR
-> A **queue** (SQS, RabbitMQ) hands each message to one worker and forgets it after the worker confirms; a **log** (Kafka, Redis Streams, NATS JetStream, Pub/Sub with retention) keeps messages so many readers can read them, in order, and replay them later. Pick a queue for **tasks** ("send this email"), pick a log for **events and history** ("every order that ever happened").
+> A **queue** (SQS, RabbitMQ) hands each message to one worker and forgets it after the worker confirms; a **log** (Kafka, Redis Streams, NATS JetStream, Pub/Sub with retention) keeps messages so many readers can read them, in order, and replay them later.
+>
+> Pick a queue for **tasks** ("send this email"), pick a log for **events and history** ("every order that ever happened").
 
 > [!abstract] Core idea
 > - The first question is not "which product" but "queue model or log model".
@@ -34,6 +36,51 @@ updated: 2026-11-09
 > - Need per-message routing, priorities, delays, or request/reply: RabbitMQ.
 > - Need zero operations on AWS and simple task distribution: SQS (with SNS for fan-out).
 > - Every durable broker is at-least-once in practice. Design the consumer to be idempotent.
+
+## Start here: the basics
+
+**The problem in one story.**
+A shop's checkout service must tell the email service, the warehouse and the analytics team that an order happened.
+Calling each one directly means checkout fails whenever any of them is slow or down.
+Instead, checkout drops a message into a broker and moves on; the others pick it up when ready.
+The question is which broker, and that depends on whether the message is a task or a fact to keep.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Message | A small piece of data sent from one service to another | `{"order_id": 42, "status": "paid"}` |
+| Producer / consumer | The sender / the reader of messages | Checkout produces, email service consumes |
+| Queue | Each message goes to one worker, then is deleted | SQS queue of "send email" jobs |
+| Log | Messages are kept in order so many readers can read and replay them | Kafka topic of all orders |
+| Partition | One ordered slice of a Kafka topic | Orders for user 7 always go to partition 3 |
+| Ack (acknowledge) | The consumer saying "done, you can forget it" | Worker acks after sending the email |
+| At-least-once | A message may arrive more than once, never zero times | Email sent twice after a retry |
+| Idempotent | Processing the same message twice has the same effect as once | Skip if `order_id` already handled |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Producer"] --> Q["Queue (SQS, RabbitMQ)"]
+    Q --> W["One worker gets it,<br/>then it is deleted"]
+    P --> L["Log (Kafka)"]
+    L --> R1["Reader A"]
+    L --> R2["Reader B (can replay)"]
+```
+
+**Analogy.** A queue is a to-do pile at a desk: each worker takes a card and throws it away when done. A log is a newspaper archive: anyone can read any day's issue, as many times as they want.
+Where it breaks: an archive never loses issues, but a log also deletes old messages after its retention period.
+
+**How the rest of this note builds up**
+
+- First, why brokers exist and the queue vs log mental model (sections 1-2).
+- Then both models step by step, a decision flowchart, and guarantees and ordering in plain words (section 3).
+- Then a worked example, the comparison table, lightweight logs and cloud options (sections 4-5).
+- Finally the SDE-3 material: trade-offs, real failure modes, metrics, and the deep dive on partitions, ordering with retries, exactly-once and schemas (sections 6-8).
+
+> [!tip] Remember
+> Decide queue (tasks) or log (events you keep and replay) first; then pick the product, and always make consumers idempotent.
 
 ## 1. Why it exists
 
@@ -148,7 +195,9 @@ flowchart TD
 
 ### Guarantees and ordering in plain words
 
-**Ordering.** Kafka guarantees order within a partition, so use the entity id (order id, user id) as the key and all events for that entity stay in order. SQS FIFO guarantees order per **message group id**. RabbitMQ keeps order within one queue with one consumer, but order is lost when several consumers or redeliveries are involved. SQS standard gives best-effort order only. See [[Message Ordering and Partition Keys]].
+**Ordering.** Kafka guarantees order within a partition, so use the entity id (order id, user id) as the key and all events for that entity stay in order. SQS FIFO guarantees order per **message group id**.
+
+RabbitMQ keeps order within one queue with one consumer, but order is lost when several consumers or redeliveries are involved. SQS standard gives best-effort order only. See [[Message Ordering and Partition Keys]].
 
 **Delivery semantics.** All durable brokers are at-least-once by default: a crash after processing but before the ack means a redelivery. Kafka can give exactly-once inside Kafka (idempotent producer plus transactions), but not across your database and email service. SQS FIFO deduplicates for 5 minutes by deduplication id. See [[Delivery Semantics and Exactly-Once]] and [[Idempotency and Idempotency Keys]].
 
@@ -440,3 +489,10 @@ Phrases to avoid: "exactly-once, no problem", "Kafka is always faster", "just us
 - Case studies: [[Case Study - Distributed Message Queue]], [[Case Study - Notification System]], [[Case Study - Chat System]], [[Case Study - Ad Click Aggregation]]
 - Compare with: [[Choosing a Database - Decision Guide]]
 - Map: [[09 Messaging & Async MOC]]
+
+## Links
+
+### Watch on YouTube
+
+- [Kafka vs. RabbitMQ vs. Messaging Middleware vs. Pulsar](https://www.youtube.com/watch?v=x4k1XEjNzYQ) · ByteByteGo · 4 min · 215,512 views
+- [Kafka vs RabbitMQ](https://www.youtube.com/watch?v=1HOVtQ-_fcE) · Hello Interview · 10 min · 354,475 views

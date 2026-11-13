@@ -8,7 +8,7 @@ sources:
   - "go.dev/blog/loopvar-preview (Go 1.22 loop variable semantics)"
   - "go.dev/doc/go1.22 (range over int)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Syntax, Types and Control Flow
@@ -22,6 +22,49 @@ updated: 2026-11-07
 > - `for` is the only loop keyword; it covers counted loops, while-style loops, infinite loops, and (since Go 1.22) ranging over a plain integer.
 > - `switch` never falls through by default, the opposite of C and Java.
 > - Every type has a zero value (`0`, `""`, `false`, or `nil`), which is why an unvalidated, unset field silently "works" instead of crashing.
+
+## Start here: the basics
+
+**The problem in one story.**
+You write `total := price * qty` where `price` is a decimal and `qty` is a whole number.
+Some languages quietly convert one of them and sometimes give a surprising answer.
+Go refuses to compile until you say `price * float64(qty)` yourself.
+That strictness, plus a small set of statements (`if`, `for`, `switch`), is the whole flavor of Go syntax.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Variable | A named box that holds a value | `x := 5` |
+| Declaration | The line that creates a variable and fixes its type | `var name string` |
+| Type | What kind of value a variable can hold | `int`, `float64`, `bool` |
+| Conversion | Changing a value to another type, written explicitly | `float64(3)` |
+| Zero value | The value a variable has before you set it | `0`, `""`, `false`, `nil` |
+| Scope | The block where a name is visible | a variable made inside `if {}` is gone after `}` |
+| Loop | Repeating code | `for i := 0; i < 3; i++ {}` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D["Declare<br/>var / :="] --> T["Type fixed<br/>forever"]
+    T --> Z["Starts at<br/>zero value"]
+    Z --> C["Control flow<br/>if / for / switch"]
+    C --> X["Explicit<br/>conversions only"]
+```
+
+**Analogy.** Go variables are labelled jars: a jar marked "sugar" only ever holds sugar, and to pour sugar into the "flour" jar you must relabel it on purpose.
+Where it breaks: real jars start empty; Go jars start with a default zero value already inside.
+
+**How the rest of this note builds up**
+
+- First, why Go keeps syntax small and strict (section 1) and a mental model (section 2).
+- Then how declarations, types, conversions, `for`, `if` and `switch` work (section 3), and a worked example (section 4).
+- Then comparison with other languages, trade-offs and production habits (sections 5-7).
+- Finally the SDE-3 deep dive on untyped constants, the Go 1.22 loop-variable change, why there is no `while`, and modulo sign rules (section 8).
+
+> [!tip] Remember
+> Types are fixed at declaration, conversions are always explicit, `for` is the only loop, and `switch` never falls through.
 
 ## 1. Why it exists
 
@@ -61,7 +104,11 @@ import (
 )
 ```
 
-A blank import (`_ "net/http/pprof"`) runs the package's `init()` functions — here, registering pprof's HTTP handlers on `http.DefaultServeMux` — without giving you any name to call; it exists purely for that side effect. An aliased import renames the package's identifier in this file only, commonly to avoid a clash between two packages that would otherwise both be called `rand`, or to shorten a long default name. An import that is in the file but never referenced is a compile error, the same as an unused local variable — the one exception is an unused package-level `var`, which compiles fine.
+A blank import (`_ "net/http/pprof"`) runs the package's `init()` functions — here, registering pprof's HTTP handlers on `http.DefaultServeMux` — without giving you any name to call; it exists purely for that side effect.
+
+An aliased import renames the package's identifier in this file only, commonly to avoid a clash between two packages that would otherwise both be called `rand`, or to shorten a long default name.
+
+An import that is in the file but never referenced is a compile error, the same as an unused local variable — the one exception is an unused package-level `var`, which compiles fine.
 
 ### `:=` shadowing: a new variable, not an update
 
@@ -262,7 +309,9 @@ Every type has a zero value, and a declared-but-unassigned variable always holds
 | array | every element is its own type's zero value |
 | struct | every field is its own type's zero value |
 
-This matters most for request decoding: a JSON field the client never sent and a field the client explicitly sent as `0` or `""` look identical once decoded into a plain `int` or `string` — both become the type's zero value. Telling "absent" from "zero" needs a pointer field or a separate presence check (covered where request decoding lives, in [[Request Decoding, Validation and DTOs]]).
+This matters most for request decoding: a JSON field the client never sent and a field the client explicitly sent as `0` or `""` look identical once decoded into a plain `int` or `string` — both become the type's zero value.
+
+Telling "absent" from "zero" needs a pointer field or a separate presence check (covered where request decoding lives, in [[Request Decoding, Validation and DTOs]]).
 
 Exported names (capitalized) are visible outside their package; unexported names are not. This is Go's only visibility mechanism — there is no `public`/`private` keyword, just the first letter's case.
 
@@ -274,7 +323,9 @@ A doc comment is a plain `//` comment directly above a declaration, with no blan
 func ParseAmountCents(s string) (cents int32, err error) { ... }
 ```
 
-`go doc` and `pkg.go.dev` both render this exact comment as the symbol's documentation, so the "starts with the name" rule is not a style nitpick — tools rely on it to know where the doc comment for one symbol ends and unrelated code comments begin. Only exported identifiers need one; an unexported helper can skip it unless its behaviour is non-obvious.
+`go doc` and `pkg.go.dev` both render this exact comment as the symbol's documentation, so the "starts with the name" rule is not a style nitpick — tools rely on it to know where the doc comment for one symbol ends and unrelated code comments begin.
+
+Only exported identifiers need one; an unexported helper can skip it unless its behaviour is non-obvious.
 
 ### Built-ins: min, max, clear (Go 1.21)
 
@@ -470,13 +521,17 @@ ok  	syntaxdemo	1.154s
 > No, the opposite of C and Java: each matched case's body runs once and the switch exits. Falling into the next case needs the explicit `fallthrough` keyword, and when used, it runs the next case's body unconditionally — even if that next case's own condition would be false.
 
 > [!question]- What changed about `for` loop variables in Go 1.22, and what does it NOT fix?
-> Before 1.22, all iterations shared one loop variable, so a goroutine or closure that captured it could see a later iteration's value. Since 1.22 each iteration gets its own fresh variable, which fixes that capture bug. It does not change that the loop variable is still a copy of the element — mutating it never mutates the original slice element; you still index to mutate in place.
+> Before 1.22, all iterations shared one loop variable, so a goroutine or closure that captured it could see a later iteration's value. Since 1.22 each iteration gets its own fresh variable, which fixes that capture bug.
+>
+> It does not change that the loop variable is still a copy of the element — mutating it never mutates the original slice element; you still index to mutate in place.
 
 > [!question]- When would you intentionally choose a labelled `break` over restructuring into a function with an early `return`?
 > Rarely as a first choice — extracting the nested loops into a function and using `return` is usually clearer. A labelled break earns its place when extracting a function would need to return several values just to signal "which loop matched, and where," and the labelled form keeps that logic in one place without an extra function signature.
 
 > [!question]- A JSON request omits a field, and the handler proceeds as if it were explicitly set to zero. What Go behaviour causes this, and how do you detect "absent" instead?
-> Every Go type has a zero value, and `encoding/json` leaves a struct field at its zero value when the key is absent — there is no separate "unset" state for a plain `int` or `string` field. To tell absent from explicit-zero, decode into a pointer field (`*int`) and check for `nil`, or check key presence in a `map[string]any` before decoding into the typed struct.
+> Every Go type has a zero value, and `encoding/json` leaves a struct field at its zero value when the key is absent — there is no separate "unset" state for a plain `int` or `string` field.
+>
+> To tell absent from explicit-zero, decode into a pointer field (`*int`) and check for `nil`, or check key presence in a `map[string]any` before decoding into the typed struct.
 
 ## 10. Cheat sheet
 
@@ -495,3 +550,7 @@ ok  	syntaxdemo	1.154s
 - **Before this:** [[Go Toolchain, Tooling and Debugging]]
 - **Next:** [[Arrays, Slices and Maps (with internals)]], [[Functions, Closures, Defer, Panic and Recover]]
 - **Compare with:** [[Structs, Methods and Embedding]] (custom types and struct tags build on the types covered here), [[Go Interview Questions and Traps]]
+
+### Watch on YouTube
+
+- [Go Basics: Syntax, Variables, and Control Structures - Beginner’s Guide](https://www.youtube.com/watch?v=o_Z80ZQ_2g0) · Michael Tyiska · Beginner-friendly tour of Go's var/:=, types, and if/for/switch control flow

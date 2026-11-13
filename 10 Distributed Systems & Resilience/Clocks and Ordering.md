@@ -15,7 +15,7 @@ sources:
   - "CockroachDB docs, clock synchronization and --max-offset (default 500 ms)"
   - "MongoDB docs, Causal Consistency (cluster time)"
   - "Twitter Snowflake (2010) README, 41-bit timestamp + 10-bit worker + 12-bit sequence"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Clocks and Ordering
@@ -29,6 +29,46 @@ updated: 2026-11-04
 > - Lamport clocks give an order that respects cause and effect; vector clocks also detect when two events are concurrent.
 > - Hybrid logical clocks stay close to real time while keeping causality; TrueTime waits out the uncertainty instead.
 > - Classic mistake: last-writer-wins with wall-clock timestamps. It silently drops writes whenever clocks are skewed.
+
+## Start here: the basics
+
+**The problem in one story.** Two people in different cities write in a shared diary and stamp each entry with their own watch. One watch is 5 seconds fast. Later, reading the diary, you see a reply stamped *before* the question it answers. Watches cannot tell you what really happened first.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Wall clock | The time-of-day clock on a machine | `time.Now()` says 10:00:03 |
+| Clock skew / drift | Two clocks disagree, or one slowly runs fast or slow | Server B is 40 ms ahead of A |
+| NTP | A protocol that nudges clocks toward the true time | It can jump a clock back 1 s |
+| Monotonic clock | A clock that only moves forward, for measuring durations | Go's `time.Since(start)` uses it |
+| Happened-before | Event A could have caused event B | Send a message, then it is received |
+| Concurrent events | Neither could have caused the other | Two users edit offline at once |
+| Logical clock | A counter used instead of time to order events | Lamport counter 7, then 8 |
+
+**Picture it**
+
+```mermaid
+sequenceDiagram
+  participant A as Node A (counter)
+  participant B as Node B (counter)
+  A->>A: event, counter=1
+  A->>B: message carries 1
+  B->>B: max(0,1)+1 = 2
+  B->>B: next event = 3
+```
+
+**Analogy.** Numbered tickets at a deli counter: the number, not the wall clock, decides who is served first. Where it breaks: one ticket machine is a single owner; in a distributed system every node has its own counter, so you need rules (Lamport, vector clocks) to combine them.
+
+**How the rest of this note builds up**
+
+- First, *Why it exists* shows how skewed wall clocks lose writes.
+- Then *Mental model* and *How it works* introduce monotonic time, Lamport clocks and vector clocks.
+- The *Worked example* implements these clocks in Go.
+- Finally, *Variants*, *In production* and the *Deep dive* cover hybrid logical clocks and TrueTime at SDE-3 depth.
+
+> [!tip] Remember
+> Use counters, not wall clocks, to decide order across machines; use the monotonic clock to measure time on one.
 
 ## 1. Why it exists
 
@@ -113,11 +153,15 @@ Cost: one entry per process (or per replica that wrote the key). With many clien
 
 ### Hybrid logical clocks (HLC)
 
-An HLC timestamp is `(wall, logical)`: `wall` is the largest physical time this node has seen (its own or in a message), and `logical` counts events while `wall` does not move. It respects happens-before like a Lamport clock, stays within the clock skew of real time, and fits in 64 bits. CockroachDB orders transactions with HLC timestamps, and MongoDB's cluster time (since 3.6) is a hybrid logical clock used for causally consistent sessions.
+An HLC timestamp is `(wall, logical)`: `wall` is the largest physical time this node has seen (its own or in a message), and `logical` counts events while `wall` does not move.
+
+It respects happens-before like a Lamport clock, stays within the clock skew of real time, and fits in 64 bits. CockroachDB orders transactions with HLC timestamps, and MongoDB's cluster time (since 3.6) is a hybrid logical clock used for causally consistent sessions.
 
 ### TrueTime and commit-wait (Spanner)
 
-Spanner's `TT.now()` returns an interval `[earliest, latest]` guaranteed to contain true time, using GPS receivers and atomic clocks in each data centre. The uncertainty ε was typically 1 to 7 ms in the 2012 paper. A transaction picks commit timestamp `s = TT.now().latest` and then **waits** until `TT.now().earliest > s` before making the commit visible. After that wait, any transaction that starts later in real time gets a larger timestamp, which gives external consistency (strict serializability). The cost is about 2ε of latency per read-write commit.
+Spanner's `TT.now()` returns an interval `[earliest, latest]` guaranteed to contain true time, using GPS receivers and atomic clocks in each data centre. The uncertainty ε was typically 1 to 7 ms in the 2012 paper.
+
+A transaction picks commit timestamp `s = TT.now().latest` and then **waits** until `TT.now().earliest > s` before making the commit visible. After that wait, any transaction that starts later in real time gets a larger timestamp, which gives external consistency (strict serializability). The cost is about 2ε of latency per read-write commit.
 
 ### Sequence numbers as ordering
 
@@ -351,7 +395,9 @@ func TestHLCOrdersMessagesDespiteSkew(t *testing.T) {
 }
 ```
 
-What the HLC test shows: B's own clock says 900, but after hearing from A it stamps events `(1000, 1)`, `(1000, 2)`, so its events still sort after A's send. Once B's physical clock passes 1000, the logical part resets to 0 and timestamps track real time again. A plain wall clock would have stamped B's receive at 900, *before* the send.
+What the HLC test shows: B's own clock says 900, but after hearing from A it stamps events `(1000, 1)`, `(1000, 2)`, so its events still sort after A's send.
+
+Once B's physical clock passes 1000, the logical part resets to 0 and timestamps track real time again. A plain wall clock would have stamped B's receive at 900, *before* the send.
 
 ## 5. Variants and comparison
 
@@ -435,3 +481,8 @@ What the HLC test shows: B's own clock says 900, but after hearing from A it sta
 - **Before this:** [[Consistency Models]], [[Quorums and Leaderless Replication]]
 - **Next:** [[Consensus - Raft and Paxos]], [[Distributed Locks and Fencing Tokens]], [[CRDTs and Conflict Resolution]]
 - **Compare with:** [[Unique ID Generation]] (time-based IDs), [[Distributed SQL]] (HLC and TrueTime in practice), [[Kafka and Event Streaming]] (ordering by offset)
+
+### Watch on YouTube
+
+- [Read a paper: Time, clocks, and the ordering of events in a distributed system](https://www.youtube.com/watch?v=ummQWQgkWOA) · Vivek Haldar · 15 min · 5,796 views
+- [Time and Ordering in Distributed Systems: Logical vs. Vector Clocks Explained!](https://www.youtube.com/watch?v=TTv6bEFvIho) · CodeLucky · 5 min · 4,278 views

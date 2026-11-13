@@ -17,13 +17,15 @@ sources:
   - "oapi-codegen v2.8.2 README (OpenAPI 3.0 and 3.1 support, strict server)"
   - "Tool docs: Spectral, oasdiff, Pact, Schemathesis, kin-openapi, ogen, swaggo/swag, openapi-generator"
   - "MDN Web Docs, Number.MAX_SAFE_INTEGER"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # API Contract Design and OpenAPI
 
 > [!summary] TL;DR
-> An **API contract** is the written promise of what an API accepts and returns: URLs, fields, types, limits, errors and headers. **OpenAPI** is the standard file format for writing that promise for HTTP APIs, so machines can lint it, diff it, generate code from it and test against it. Design the contract first, evolve it only by additive changes, and let CI reject anything that would break existing clients.
+> An **API contract** is the written promise of what an API accepts and returns: URLs, fields, types, limits, errors and headers. **OpenAPI** is the standard file format for writing that promise for HTTP APIs, so machines can lint it, diff it, generate code from it and test against it.
+>
+> Design the contract first, evolve it only by additive changes, and let CI reject anything that would break existing clients.
 
 > [!abstract] Core idea
 > - The **contract** is the written promise of what the API accepts and returns; OpenAPI is the machine-readable file for it.
@@ -32,11 +34,59 @@ updated: 2026-11-02
 > - Clients are tolerant readers (ignore unknown fields); servers are strict about requests.
 > - Classic mistake: treating required, optional and nullable as the same thing.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your team builds a movie-booking server; another team builds the phone app.
+They need to know exactly what to send and what comes back, field by field.
+If you quietly rename `price` to `amount`, every installed app breaks overnight.
+A contract is the written promise both sides agree on before anyone writes code.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| API | A way for one program to ask another program for something | App calls `POST /bookings` |
+| Endpoint | One URL plus method the API answers | `GET /shows/42` |
+| Request / response | What the client sends / what the server sends back | JSON body in, JSON body out |
+| Schema | A description of the shape of some data | `price` is an integer, required |
+| JSON | A text format for data with keys and values | `{"seat": "A7"}` |
+| OpenAPI | A standard YAML/JSON file format that describes an HTTP API | `openapi.yaml` listing all endpoints |
+| Breaking change | A change that makes an existing client fail | Removing a field the app reads |
+| Code generation | Tools that write client or server code from the spec | A Go client built from `openapi.yaml` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Contract<br/>(openapi.yaml)"] --> D["Docs"]
+    S --> C["Client code"]
+    S --> V["Server request<br/>validation"]
+    S --> T["Tests and<br/>breaking-change checks"]
+    C --> API["Running API"]
+    V --> API
+```
+
+**Analogy.** A contract is like a restaurant menu: it lists what you can order and what arrives on the plate, before the kitchen cooks anything.
+Where it breaks: a menu can change any day, but an API contract can only safely grow, because old clients keep ordering from the old menu.
+
+**How the rest of this note builds up**
+
+- First, why contracts exist (section 1) and the mental model of a promise between teams (section 2).
+- Then how it works: contract-first vs code-first, OpenAPI anatomy, required vs optional vs nullable, and what counts as breaking (section 3).
+- Then a worked Go example validated against a real spec (section 4), with variants and trade-offs (sections 5-6).
+- Finally the SDE-3 view: production linting and breaking-change CI, OpenAPI 3.0 vs 3.1, and interview traps (sections 7-9).
+
+> [!tip] Remember
+> Write the promise first, generate everything from it, and only ever add to it.
+
 ## 1. Why it exists
 
 A mobile app shows an order's total from `order.total`. A backend developer renames it to `order.total_amount` because it reads better. The change passes code review and every server test.
 
-App store releases are slow and users update late, so suppose 30% of users still run the old app a month later (an estimate; measure your own version spread). For that 30%, the order screen now shows nothing or crashes, and the server logs show only `200 OK`. Nothing told the developer that `total` was a promise to clients they cannot redeploy.
+App store releases are slow and users update late, so suppose 30% of users still run the old app a month later (an estimate; measure your own version spread). For that 30%, the order screen now shows nothing or crashes, and the server logs show only `200 OK`.
+
+Nothing told the developer that `total` was a promise to clients they cannot redeploy.
 
 A contract makes the promise explicit and checkable:
 
@@ -325,7 +375,11 @@ The difference matters most in partial updates. With JSON Merge Patch, an absent
 
 ### What counts as a breaking change
 
-A change is breaking if **any existing, correctly written client** can fail or misbehave. The full classification table lives in [[API Versioning and Backward Compatibility]]. The one contract-specific point to remember is that direction matters: adding a required field or tightening validation breaks requests but not responses, while making a required field optional or adding an enum value breaks responses (clients assume the field is there or switch exhaustively) but not requests.
+A change is breaking if **any existing, correctly written client** can fail or misbehave. The full classification table lives in [[API Versioning and Backward Compatibility]].
+
+The one contract-specific point to remember is that direction matters: adding a required field or tightening validation breaks requests but not responses.
+
+By contrast, making a required field optional or adding an enum value breaks responses (clients assume the field is there or switch exhaustively) but not requests.
 
 The safe path for a rename: add `total_amount`, keep sending `total`, mark `total` as `deprecated: true` in the spec, watch until no client reads it, then remove it in the next major version (see [[API Versioning and Backward Compatibility]]).
 
@@ -533,9 +587,13 @@ func TestMoneyAsMinorUnits(t *testing.T) {
 }
 ```
 
-Result (measured with `go test -race -count=1`, Go 1.24.4, 2026-11-02): all 4 tests pass. The response from the "newer server", with status `ON_HOLD` and an extra `loyalty_points` field, decodes without error. A `*string` field cannot tell `{}` from `{"note": null}`; `Field[string]` can. Ten float64 additions of `0.10` do not equal `1.0`, while ten additions of 10 minor units equal exactly 100.
+Result (measured with `go test -race -count=1`, Go 1.24.4, 2026-11-02): all 4 tests pass. The response from the "newer server", with status `ON_HOLD` and an extra `loyalty_points` field, decodes without error.
 
-**Spec check (measured, 2026-11-02).** The YAML contract above was fed to oapi-codegen v2.8.2 (built from source with `go run`) with models, a strict `net/http` server and a client enabled. Generation succeeded and the generated package passes `go vet` on Go 1.24.4. For the nullable `note` field it generated `Note *string` by default, which has exactly the absent-or-null ambiguity the test shows. Since v2.1.0, the `nullable-type: true` output option generates `nullable.Nullable[string]` instead.
+A `*string` field cannot tell `{}` from `{"note": null}`; `Field[string]` can. Ten float64 additions of `0.10` do not equal `1.0`, while ten additions of 10 minor units equal exactly 100.
+
+**Spec check (measured, 2026-11-02).** The YAML contract above was fed to oapi-codegen v2.8.2 (built from source with `go run`) with models, a strict `net/http` server and a client enabled. Generation succeeded and the generated package passes `go vet` on Go 1.24.4.
+
+For the nullable `note` field it generated `Note *string` by default, which has exactly the absent-or-null ambiguity the test shows. Since v2.1.0, the `nullable-type: true` output option generates `nullable.Nullable[string]` instead.
 
 ## 5. Variants and comparison
 
@@ -594,7 +652,9 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 
 ## 8. Deep dive
 
-- **OpenAPI 3.0 vs 3.1.** 3.1 adopts JSON Schema Draft 2020-12 completely, while 3.0 used a modified subset. In practice: `nullable: true` becomes `type: [T, "null"]`, schema `example` becomes `examples` (a list), `exclusiveMinimum` takes a number instead of a boolean, `$ref` may sit beside `summary` and `description`, `paths` became optional, and `webhooks` is new. Check generator support before moving: oapi-codegen v2.8.2's README states support for 3.0 and 3.1 (3.1 support is recent), and older releases needed a 3.1 spec downgraded to 3.0.
+- **OpenAPI 3.0 vs 3.1.** 3.1 adopts JSON Schema Draft 2020-12 completely, while 3.0 used a modified subset. In practice: `nullable: true` becomes `type: [T, "null"]`, schema `example` becomes `examples` (a list), `exclusiveMinimum` takes a number instead of a boolean, `$ref` may sit beside `summary` and `description`, `paths` became optional, and `webhooks` is new.
+
+  Check generator support before moving: oapi-codegen v2.8.2's README states support for 3.0 and 3.1 (3.1 support is recent), and older releases needed a 3.1 spec downgraded to 3.0.
 - **The `additionalProperties: false` rollout trap.** During a rolling deploy, new and old server instances serve traffic together. A new client that sends a new optional field to an old instance gets a `400`. Options: deploy the server before any client uses the field (usual), or let servers ignore unknown request fields and only lint for typos in client tests.
 - **Large integers.** JSON numbers have no size limit, but JavaScript parses them as doubles, exact only up to 2^53 − 1 (9,007,199,254,740,991). A 64-bit ID such as a Snowflake ID loses its last digits in a browser. Send IDs, and `int64` amounts that might grow that large, as strings.
 - **Polymorphism.** `oneOf` with a `discriminator` (`"type": "card"` vs `"type": "upi"`) models payment methods. Generators handle it unevenly, and adding a new variant is a breaking change for clients that switch exhaustively. Treat the variant list like an open enum.
@@ -640,3 +700,7 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 - **Before this:** [[REST and HTTP API Design]], [[Choosing an API Style]]
 - **Next:** [[API Error Handling]], [[API Versioning and Backward Compatibility]], [[Idempotency and Idempotency Keys]], [[OpenAPI-First Development in Go]]
 - **Compare with:** [[Protocol Buffers and Schema Evolution]] (the same evolution rules for `.proto`), [[GraphQL]] (SDL schema as the contract)
+
+### Watch on YouTube
+
+- [28. OpenAPI: The universal contract between clients and servers](https://www.youtube.com/watch?v=CwKsU84jIWs) · Sriniously · Explains OpenAPI as the machine-readable contract, matching the note's framing

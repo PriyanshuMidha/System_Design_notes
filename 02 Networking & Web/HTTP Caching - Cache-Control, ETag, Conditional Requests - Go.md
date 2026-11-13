@@ -9,13 +9,21 @@ sources:
   - "RFC 9111, HTTP Caching"
   - "RFC 9110, HTTP Semantics (§13 Conditional Requests)"
   - "MDN Web Docs, HTTP Caching"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HTTP Caching - Cache-Control, ETag, Conditional Requests - Go
 
 > [!summary] TL;DR
 > This code demonstrates the full caching contract from [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] in a single `net/http` handler: it sets `Cache-Control`, `ETag`, `Last-Modified` and `Vary`, then answers `304 Not Modified` with no body whenever a client's `If-None-Match` (or, as a fallback, `If-Modified-Since`) proves nothing changed.
+
+## Before the code
+
+- **`net/http` handlers**: a function `func(w http.ResponseWriter, req *http.Request)` that reads request headers and writes a response.
+- **Closures**: `Handler` returns a function that remembers `get` and `maxAge`, so each request sees the current resource.
+- **Struct methods**: `Resource.etag()` is a method on a value type that hashes the body with `crypto/sha256`.
+- **`httptest.NewServer`**: starts a real local HTTP server inside a test, so requests go over a real socket.
+- **What to run**: `go vet ./...` then `go test -race ./...` from the module root.
 
 ## What this code shows
 
@@ -36,7 +44,11 @@ updated: 2026-11-09
 
 ### Step 1: the resource and its fingerprint
 
-**Concept.** The theory note's ETag is "an opaque fingerprint of the response body." Here that fingerprint is a truncated SHA-256 hash of the resource's bytes, computed fresh on every request rather than stored and trusted from write time. Hashing on read, instead of caching a pre-computed tag, guarantees the ETag can never drift out of sync with the actual bytes being served — the alternative design (store the ETag alongside the data and trust it) is cheaper per request but risks the two falling out of sync if the data is ever mutated through a path that forgets to update the stored tag.
+**Concept.** The theory note's ETag is "an opaque fingerprint of the response body." Here that fingerprint is a truncated SHA-256 hash of the resource's bytes, computed fresh on every request rather than stored and trusted from write time.
+
+Hashing on read, instead of caching a pre-computed tag, guarantees the ETag can never drift out of sync with the actual bytes being served.
+
+The alternative design (store the ETag alongside the data and trust it) is cheaper per request but risks the two falling out of sync if the data is ever mutated through a path that forgets to update the stored tag.
 
 ```go
 package cachedemo
@@ -69,7 +81,10 @@ func (r Resource) etag() string {
 
 ### Step 2: the handler
 
-**Concept.** This is [[HTTP Caching - Cache-Control, ETag, Conditional Requests#Cache-Control directives]] and [[HTTP Caching - Cache-Control, ETag, Conditional Requests#ETag and conditional requests]] combined into one request path: set the freshness and validator headers unconditionally, then check validators in priority order before deciding whether to write a body at all. An alternative design would run validation first and only compute headers on the `200` path, but that duplicates the header-setting logic across two branches; setting headers once up front and branching only on the body keeps the 304 and 200 paths from drifting apart over time.
+**Concept.** This is [[HTTP Caching - Cache-Control, ETag, Conditional Requests#Cache-Control directives]] and [[HTTP Caching - Cache-Control, ETag, Conditional Requests#ETag and conditional requests]] combined into one request path: set the freshness and validator headers unconditionally, then check validators in priority order before deciding whether to write a body at all.
+
+An alternative design would run validation first and only compute headers on the `200` path, but that duplicates the header-setting logic across two branches.
+Setting headers once up front and branching only on the body keeps the 304 and 200 paths from drifting apart over time.
 
 ```go
 // Handler serves Resource with Cache-Control, ETag, Last-Modified and
@@ -331,7 +346,9 @@ PASS
 ok      roll10/cachedemo       1.471s
 ```
 
-Reading it line by line: the first test's log line confirms the measurable claim this whole note makes — a `200` cost 14 bytes of body, the matching `304` cost 0. Both `PASS` lines confirm the handler branches correctly on both validator types, and `-race` passing confirms no data race exists even though `Handler` closes over a `get` function that could, in a real server, read from a concurrently-updated store.
+Reading it line by line: the first test's log line confirms the measurable claim this whole note makes — a `200` cost 14 bytes of body, the matching `304` cost 0.
+
+Both `PASS` lines confirm the handler branches correctly on both validator types, and `-race` passing confirms no data race exists even though `Handler` closes over a `get` function that could, in a real server, read from a concurrently-updated store.
 
 ## Pitfalls in the code
 

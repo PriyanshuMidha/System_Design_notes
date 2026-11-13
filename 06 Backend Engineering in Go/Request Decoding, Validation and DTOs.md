@@ -8,7 +8,7 @@ sources:
   - "Go encoding/json package docs (Unmarshal field matching, UseNumber)"
   - "Go 1.24 release notes, omitzero struct tag"
   - "Go blog, JSON and Go (case-insensitive key matching, documented)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Request Decoding, Validation and DTOs
@@ -22,11 +22,66 @@ updated: 2026-11-07
 > - `DisallowUnknownFields` plus `MaxBytesReader` plus a trailing-data check close the three gaps that let a malformed or malicious body reach business logic.
 > - Validation collects every broken field at once; it never stops at the first error.
 
+## Start here: the basics
+
+**The problem in one story.**
+A client sends your server some JSON to create an invoice.
+It sneaks in an extra field, `"status": "paid"`, hoping your code copies it straight in.
+If it does, the client just marked its own invoice paid for free.
+Careful decoding and validation decide exactly which fields a request may set, and reject everything else.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| JSON | A text format for data with keys and values | `{"client_id": "c_1"}` |
+| Decode / unmarshal | Turn JSON bytes into a Go struct | `json.NewDecoder(r.Body).Decode(&dto)` |
+| Struct tag | A note on a Go field saying its JSON name | `` `json:"due_date"` `` |
+| DTO | Data Transfer Object: a struct only for the wire format | `CreateInvoiceRequest` |
+| Domain model | The struct your business logic trusts | `Invoice` with `Status` |
+| Validation | Checking values make sense after decoding | `due_date` must not be in the past |
+| Mass assignment | A client setting fields it should not control | Sending `"status": "paid"` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["Raw JSON body"] --> L["Size limit"]
+    L --> D["Decode into<br/>request DTO (strict)"]
+    D --> V{"Validate all fields"}
+    V -- "errors" --> E["400 with every<br/>broken field"]
+    V -- "ok" --> C["Domain command"]
+    C --> S["Service layer"]
+```
+
+**Analogy.** A paper form at a government office: you can only fill in the boxes printed on it, and the clerk checks every box before stamping it.
+Where it breaks: a clerk notices scribbles in the margin, but Go's decoder silently ignores unknown fields unless you call `DisallowUnknownFields`.
+
+**How the rest of this note builds up**
+
+- First, why decoding needs care: mass assignment and `encoding/json` surprises (section 1), then the three-types mental model (section 2).
+- Then how it works: `readJSON` with size limit, unknown-field and trailing-data checks, plus collecting validation errors (section 3).
+- Then a full worked example with tests (section 4).
+- Finally the SDE-3 view: variants, trade-offs, production failures and the deep dive (sections 5-8).
+
+> [!tip] Remember
+> Decode strictly into a request-only struct, validate every field, then build the domain object yourself.
+
 ## 1. Why it exists
 
-Take `CreateInvoiceRequest{ClientID, DueDate, Items}` decoded straight into a type that also happens to have a `Status` field, because someone reused the domain `Invoice` struct for both the wire format and the database row. A client sends `{"client_id": "c_1", "due_date": "2026-12-01", "items": [...], "status": "paid"}`. With plain `json.Unmarshal`, that body sets `Status` to `"paid"` on a brand-new invoice before any validation runs — a mass-assignment bug that lets a client mark its own invoice paid for free. The fix is not "add more validation" after the fact; it's that `status` should never have been a field the decoder could reach, because the request DTO should never have had it.
+Take `CreateInvoiceRequest{ClientID, DueDate, Items}` decoded straight into a type that also happens to have a `Status` field, because someone reused the domain `Invoice` struct for both the wire format and the database row.
 
-A second, quieter failure: `{"STATUS":"paid"}` sets a field tagged `json:"status"` anyway, because `encoding/json` matches keys case-insensitively when no exact match exists. And `{"status":"draft","status":"paid"}` sets it to `"paid"`, because with duplicate keys the last one silently wins. Neither of these is a bug in your code — they are `encoding/json`'s documented, default behavior, and a handler that doesn't know about them will ship surprises.
+A client sends `{"client_id": "c_1", "due_date": "2026-12-01", "items": [...], "status": "paid"}`.
+
+With plain `json.Unmarshal`, that body sets `Status` to `"paid"` on a brand-new invoice before any validation runs — a mass-assignment bug that lets a client mark its own invoice paid for free.
+
+The fix is not "add more validation" after the fact; it's that `status` should never have been a field the decoder could reach, because the request DTO should never have had it.
+
+A second, quieter failure: `{"STATUS":"paid"}` sets a field tagged `json:"status"` anyway, because `encoding/json` matches keys case-insensitively when no exact match exists.
+
+And `{"status":"draft","status":"paid"}` sets it to `"paid"`, because with duplicate keys the last one silently wins.
+
+Neither of these is a bug in your code — they are `encoding/json`'s documented, default behavior, and a handler that doesn't know about them will ship surprises.
 
 ## 2. Mental model
 
@@ -196,7 +251,9 @@ The three types look similar today. They diverge the moment the database needs a
 
 ### PATCH: telling absent from null
 
-`*string` on a PATCH request distinguishes "the client didn't mention this field" (`nil`) from "the client wants to clear it" (non-nil pointer to `""`). A plain `string` field cannot make that distinction — it would be the zero value either way. The alternative at larger scale is JSON Merge Patch (RFC 7396): the whole body is a partial document and any key present, even with value `null`, means "set this field to null".
+`*string` on a PATCH request distinguishes "the client didn't mention this field" (`nil`) from "the client wants to clear it" (non-nil pointer to `""`). A plain `string` field cannot make that distinction — it would be the zero value either way.
+
+The alternative at larger scale is JSON Merge Patch (RFC 7396): the whole body is a partial document and any key present, even with value `null`, means "set this field to null".
 
 ## 4. Worked example
 
@@ -427,3 +484,8 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
 - **Before this:** [[Building REST Endpoints]]
 - **Next:** [[Middleware]]
 - **Compare with:** [[Error Handling]] (the same classify-then-map pattern, one layer up), [[API Error Handling]] (the design-level error contract these DTOs feed)
+
+### Watch on YouTube
+
+- [Go Programming - JSON Encoding & Decoding in Golang](https://www.youtube.com/watch?v=Vr63uGL7NrU) · BugBytes · covers DisallowUnknownFields and strict JSON decoding into DTOs
+- [JSON in Go: Encoding, Decoding & Struct Tags for Beginners](https://www.youtube.com/watch?v=fdOtbSaHkPs) · CodeLucky · basics of struct tags and encoding/json behavior for request bodies

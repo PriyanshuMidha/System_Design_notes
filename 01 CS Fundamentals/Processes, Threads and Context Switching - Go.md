@@ -9,7 +9,7 @@ sources:
   - "Linux kernel documentation, Scheduling (kernel.org Documentation/scheduler)"
   - "Go runtime source, runtime/proc.go and runtime/runtime2.go (Go 1.24)"
   - "Love, Linux Kernel Development, 3rd ed., ch. 3-4 (processes and scheduling)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Processes, Threads and Context Switching - Go
@@ -17,9 +17,20 @@ updated: 2026-11-09
 > [!summary] TL;DR
 > Runnable code for [[Processes, Threads and Context Switching]]: a minimal process table modelling `fork`, `exec` and per-process threads, plus two context-switch benchmarks measured side by side on the same machine — one that lets the Go scheduler keep both goroutines on one OS thread, and one that pins each goroutine to its own OS thread with `runtime.LockOSThread`, forcing a real kernel context switch on every hand-off.
 
+## Before the code
+
+- **Goroutines (`go f()`)**: a function running concurrently, scheduled by the Go runtime rather than the OS.
+- **Unbuffered channels (`make(chan struct{})`)**: a send blocks until a receiver is ready, so each send is a forced hand-off between goroutines.
+- **`runtime.LockOSThread`**: pins the calling goroutine to one OS thread, so switching to another pinned goroutine needs a real kernel context switch.
+- **`defer`**: runs a call when the function returns (even on panic); used here to always unpin the thread.
+- **Maps and structs (`map[int]*PCB`)**: the in-memory process table is a plain map from PID to a struct pointer.
+- **What to run**: `go vet ./... && go test -race ./...` for correctness, then `go run ./cmd/pingpong` for the timing numbers.
+
 ## What this code shows
 
-Every row below is a two-way link: the theory-note section names the *why*, and the code name is the *how*. Reading them side by side before diving into the Code section is the fastest way to know, for any one block below, what question it is supposed to answer — which matters because the two benchmark functions in particular look almost identical to each other at a glance, and the whole point of this note is in the one difference between them.
+Every row below is a two-way link: the theory-note section names the *why*, and the code name is the *how*.
+
+Reading them side by side before diving into the Code section is the fastest way to know, for any one block below, what question it is supposed to answer — which matters because the two benchmark functions in particular look almost identical to each other at a glance, and the whole point of this note is in the one difference between them.
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -43,9 +54,15 @@ flowchart LR
 
 ## Why measure both sides instead of citing one number
 
-The theory note's claim has two parts, and a single benchmark can only ever support one of them. "A goroutine handoff is cheap" is easy to show: time `PingPongLatency` and the number is small. The harder part is "...*because* it avoids a real kernel context switch, which is itself expensive" — that is a claim about what's being avoided, not just about what's being measured, and a single number can't distinguish "this is cheap because it skips the kernel" from "this is cheap because context switches in general are cheap on modern hardware."
+The theory note's claim has two parts, and a single benchmark can only ever support one of them. "A goroutine handoff is cheap" is easy to show: time `PingPongLatency` and the number is small.
 
-`OSThreadPingPongLatency` exists specifically to rule out the second explanation. By keeping every other variable identical — same unbuffered-channel hand-off shape, same machine, same Go version, same run — and changing only whether the two goroutines *can* share an OS thread, the difference between the two measured numbers isolates the one variable the theory note is actually making a claim about. A 90x gap between two numbers that differ in exactly one respect is much stronger evidence than either number taken alone, and it is also why both benchmarks were written to share as much structure as possible rather than being two unrelated functions that happen to both return a `time.Duration`.
+The harder part is "...*because* it avoids a real kernel context switch, which is itself expensive" — that is a claim about what's being avoided, not just about what's being measured, and a single number can't distinguish "this is cheap because it skips the kernel" from "this is cheap because context switches in general are cheap on modern hardware."
+
+`OSThreadPingPongLatency` exists specifically to rule out the second explanation.
+
+By keeping every other variable identical — same unbuffered-channel hand-off shape, same machine, same Go version, same run — and changing only whether the two goroutines *can* share an OS thread, the difference between the two measured numbers isolates the one variable the theory note is actually making a claim about.
+
+A 90x gap between two numbers that differ in exactly one respect is much stronger evidence than either number taken alone, and it is also why both benchmarks were written to share as much structure as possible rather than being two unrelated functions that happen to both return a `time.Duration`.
 
 This is also why the pinned benchmark uses `runtime.LockOSThread` rather than, say, spawning real OS-level processes and measuring IPC between them: a process-to-process round trip would add syscall and IPC overhead on top of the context switch itself, muddying exactly the comparison this benchmark exists to make cleanly.
 
@@ -58,9 +75,17 @@ This is also why the pinned benchmark uses `runtime.LockOSThread` rather than, s
 
 ## How to read this note
 
-This note has two halves that teach different things. The `ProcessTable` steps (1 and 2) are a **model**: a simplified stand-in for the real kernel data structures described in the theory note, built to be inspected and tested rather than to be a real operating system. The two benchmark steps (3 and 4) are the opposite: they are not a model of a context switch, they **are** one, measured directly on whatever machine runs them. Keeping those two purposes separate matters when reading the code — the process table's job is to make the *vocabulary* (PCB, fork, exec, thread) concrete, while the benchmarks' job is to replace a cited number from someone else's benchmark with a number from this one.
+This note has two halves that teach different things.
 
-Each code step below follows the same shape: a **Concept** paragraph linking the code back to the exact theory-note section it implements and naming the alternative designs that were considered, a block of code kept under about 30 lines, and a **How it works** list walking through the lines that matter. Where a function was naturally longer than that, it is split across two blocks that continue each other, with a sentence marking the split.
+The `ProcessTable` steps (1 and 2) are a **model**: a simplified stand-in for the real kernel data structures described in the theory note, built to be inspected and tested rather than to be a real operating system.
+
+The two benchmark steps (3 and 4) are the opposite: they are not a model of a context switch, they **are** one, measured directly on whatever machine runs them.
+
+Keeping those two purposes separate matters when reading the code — the process table's job is to make the *vocabulary* (PCB, fork, exec, thread) concrete, while the benchmarks' job is to replace a cited number from someone else's benchmark with a number from this one.
+
+Each code step below follows the same shape: a **Concept** paragraph linking the code back to the exact theory-note section it implements and naming the alternative designs that were considered, a block of code kept under about 30 lines, and a **How it works** list walking through the lines that matter.
+
+Where a function was naturally longer than that, it is split across two blocks that continue each other, with a sentence marking the split.
 
 ## Code
 
@@ -339,7 +364,9 @@ The caller pins itself the same way, waits for the signal, then times the hand-o
 
 ## Design decisions
 
-The table below records five choices made while writing this code, each with the alternative that was considered and rejected. Reading a "Design decisions" table like this is itself a useful interview-prep habit: for any piece of unfamiliar code you're reading, asking "what did they choose not to do here, and why" surfaces assumptions the code's author made silently, which is exactly the kind of question a system-design interview tends to probe for.
+The table below records five choices made while writing this code, each with the alternative that was considered and rejected.
+
+Reading a "Design decisions" table like this is itself a useful interview-prep habit: for any piece of unfamiliar code you're reading, asking "what did they choose not to do here, and why" surfaces assumptions the code's author made silently, which is exactly the kind of question a system-design interview tends to probe for.
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -349,11 +376,19 @@ The table below records five choices made while writing this code, each with the
 | A `ready` channel before timing the pinned benchmark | Start the clock immediately | Excludes goroutine/thread startup and `LockOSThread` setup cost from the measured hand-off time |
 | Unbuffered channels for both benchmarks | Buffered channels | Unbuffered channels guarantee a hand-off (block until both sides rendezvous) on every single operation; a buffered channel could let several sends proceed without any scheduler involvement, hiding the effect being measured |
 
-Two of these decisions are worth dwelling on, because they are easy to get subtly wrong. First, pinning with `runtime.LockOSThread` only forces a *real* kernel switch if both communicating goroutines are pinned — pinning just one side still lets the Go scheduler keep the unpinned side wherever it likes, and the measurement would silently fall back to measuring something closer to the unpinned case. Second, the `ready` handshake is not cosmetic: `LockOSThread` itself has a small, one-time setup cost (the Go runtime has to actually allocate or reuse a dedicated OS thread for the calling goroutine), and starting the clock before that cost has been paid on both sides would inflate the first sample disproportionately. Both benchmarks pay that cost entirely before `start := time.Now()` runs.
+Two of these decisions are worth dwelling on, because they are easy to get subtly wrong.
+
+First, pinning with `runtime.LockOSThread` only forces a *real* kernel switch if both communicating goroutines are pinned — pinning just one side still lets the Go scheduler keep the unpinned side wherever it likes, and the measurement would silently fall back to measuring something closer to the unpinned case.
+
+Second, the `ready` handshake is not cosmetic: `LockOSThread` itself has a small, one-time setup cost (the Go runtime has to actually allocate or reuse a dedicated OS thread for the calling goroutine), and starting the clock before that cost has been paid on both sides would inflate the first sample disproportionately.
+
+Both benchmarks pay that cost entirely before `start := time.Now()` runs.
 
 ## Tests
 
-Four tests cover this code: three exercise the `ProcessTable` model's correctness (one per operation that could be confused with another — threading versus forking versus execing), and the fourth is a sanity check on the measurement harness itself rather than a performance assertion, for the reason explained in the recap at the end of this note. None of the four tests assert anything about the pinned benchmark's absolute or relative timing, deliberately, since timing assertions in a unit test tend to be flaky across different machines and load conditions — the timing numbers that matter are read from `go run ./cmd/pingpong`'s printed output instead, in the Running it section below.
+Four tests cover this code: three exercise the `ProcessTable` model's correctness (one per operation that could be confused with another — threading versus forking versus execing), and the fourth is a sanity check on the measurement harness itself rather than a performance assertion, for the reason explained in the recap at the end of this note.
+
+None of the four tests assert anything about the pinned benchmark's absolute or relative timing, deliberately, since timing assertions in a unit test tend to be flaky across different machines and load conditions — the timing numbers that matter are read from `go run ./cmd/pingpong`'s printed output instead, in the Running it section below.
 
 ### Test 1: a thread shares its parent process's PCB
 
@@ -446,7 +481,9 @@ func TestExecReusesThePIDAndResetsState(t *testing.T) {
 
 **If it fails.** A changed PID means `Exec` created a new process instead of reusing the old PCB. A stale `ProgramCtr` or nonzero `Registers[0]` means the reset step was skipped.
 
-Together, Tests 1 through 3 cover the three PCB operations the theory note describes — creating/threading, forking, and execing — each checked for the one property that distinguishes it from the other two: threading grows a list on the *same* PCB, forking produces a *new* PCB with copied state, and execing mutates the *same* PCB's program-specific fields in place. A bug that swapped any two of these behaviours (for instance, if `Fork` accidentally reused the parent's PID) would be caught by exactly one of these three tests, which is why all three are kept rather than merged into one larger test.
+Together, Tests 1 through 3 cover the three PCB operations the theory note describes — creating/threading, forking, and execing — each checked for the one property that distinguishes it from the other two: threading grows a list on the *same* PCB, forking produces a *new* PCB with copied state, and execing mutates the *same* PCB's program-specific fields in place.
+
+A bug that swapped any two of these behaviours (for instance, if `Fork` accidentally reused the parent's PID) would be caught by exactly one of these three tests, which is why all three are kept rather than merged into one larger test.
 
 ### Test 4: the goroutine handoff measurement is small and positive
 
@@ -474,7 +511,9 @@ func TestPingPongLatencyIsSmallAndPositive(t *testing.T) {
 
 This section gives the exact commands, their exact output on this machine, and a line-by-line reading of that output — the same three-part shape used for every measurement in this note.
 
-Two commands cover everything in this note: one verifies correctness, the other produces the actual timing numbers quoted in the theory note's worked example. Running them in this order matters a little — `go vet` and `go test -race` are fast and should be run first on any change, while `go run ./cmd/pingpong` takes a few seconds (it runs ten total samples of 20,000-50,000 rounds each) and is worth running last, once you're confident the code itself is correct.
+Two commands cover everything in this note: one verifies correctness, the other produces the actual timing numbers quoted in the theory note's worked example.
+
+Running them in this order matters a little — `go vet` and `go test -race` are fast and should be run first on any change, while `go run ./cmd/pingpong` takes a few seconds (it runs ten total samples of 20,000-50,000 rounds each) and is worth running last, once you're confident the code itself is correct.
 
 ```bash
 go vet ./... && go test -race ./...
@@ -513,7 +552,9 @@ OS-thread handoff (each side pinned via LockOSThread):
 3. The gap between the two groups is the whole point of the comparison: identical hand-off logic, identical hardware, identical run — the only variable is whether the Go scheduler is allowed to avoid the kernel.
 4. Minor sample-to-sample variation within each group (e.g. 7.04-7.79 µs) reflects ordinary OS scheduling noise (other processes, thermal/frequency scaling) rather than anything about the code itself.
 
-Both groups are also worth comparing against the theory note's lifecycle diagram directly: every single handoff in the unpinned group is a `Running -> Ready` transition for one goroutine paired with a `Ready -> Running` transition for the other, entirely inside the Go scheduler's own bookkeeping. Every handoff in the pinned group is the same pair of transitions, but now enforced by the kernel's scheduler across two OS threads, which is precisely why it pays the page-table and cache costs the theory note's third section describes.
+Both groups are also worth comparing against the theory note's lifecycle diagram directly: every single handoff in the unpinned group is a `Running -> Ready` transition for one goroutine paired with a `Ready -> Running` transition for the other, entirely inside the Go scheduler's own bookkeeping.
+
+Every handoff in the pinned group is the same pair of transitions, but now enforced by the kernel's scheduler across two OS threads, which is precisely why it pays the page-table and cache costs the theory note's third section describes.
 
 ## Pitfalls in the code
 

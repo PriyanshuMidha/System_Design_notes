@@ -9,7 +9,7 @@ sources:
   - "React Router docs (reactrouter.com), createBrowserRouter and data APIs"
   - "react.dev, lazy and Suspense"
   - "Next.js docs, Rendering (SSG, SSR, ISR, App Router)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # React Routing and Rendering Strategies - CSR, SSR, SSG
@@ -22,6 +22,49 @@ updated: 2026-11-04
 > - **CSR** renders in the browser, **SSR** renders HTML per request on the server (then hydrates), **SSG** renders HTML once at build time, **ISR** regenerates static pages periodically without a full rebuild.
 > - `lazy()` + `<Suspense>` split code by route so a user only downloads the JS for the page they're on — but `Suspense` needs something built to integrate with it (a lazy component, a resource with a `.read()`-style API, or the `use()` hook), not a bare `Promise` passed as a prop.
 > - **React Server Components** run only on the server and never ship their code to the browser at all — a stricter, more granular version of "render on the server" than classic SSR.
+
+## Start here: the basics
+
+**The problem in one story.**
+A user opens your shop's home page, then clicks a product.
+Reloading the whole page from the server for every click feels slow.
+But if the browser must download a big JavaScript file before showing anything, the first visit feels slow too.
+Routing decides which screen shows for a URL; rendering strategy decides where and when the HTML is made.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| URL / route | An address, and the screen tied to it | `/users/42` shows a profile |
+| Server | The machine that sends pages and data | a Node server returning HTML |
+| HTML | The page text the browser draws | `<h1>Shop</h1>` |
+| Bundle | The JS files the browser downloads to run the app | `main.js`, 500 KB |
+| SPA | Single-page app: one load, then JS swaps screens | Gmail switching folders |
+| Hydration | JS attaching click handlers to server-made HTML | a static button becomes clickable |
+| Build time | When the app is compiled before deploy | `npm run build` |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    Q{"When is the HTML made?"} --> CSR["In the browser<br/>(CSR)"]
+    Q --> SSR["On the server,<br/>every request (SSR)"]
+    Q --> SSG["Once, at build<br/>(SSG)"]
+    Q --> ISR["At build, then refreshed<br/>periodically (ISR)"]
+```
+
+**Analogy.** Think of a restaurant: SSG is pre-packed sandwiches, SSR is cooking each order when it arrives, CSR is handing the customer ingredients and a recipe.
+Where it breaks: real food cannot become "interactive" later, but SSR and SSG pages still need hydration in the browser to respond to clicks.
+
+**How the rest of this note builds up**
+
+- First, why client routing and multiple strategies exist (section 1) and the mental model (section 2).
+- Then client vs server routing, protected routes, `lazy()`/`Suspense`, CSR/SSR/SSG/ISR and Server Components (section 3).
+- Then picking a strategy for a real app and route-based code splitting end to end (section 4).
+- Finally the SDE-3 deep dive: trade-offs, production, and streaming SSR (sections 5-8).
+
+> [!tip] Remember
+> The router picks which component shows; the rendering strategy picks where and when its HTML is produced.
 
 ### Whiteboard version
 
@@ -40,7 +83,9 @@ Click a `<Link to="/users/42">`, and React Router intercepts the click, calls `h
 
 ## 1. Why it exists
 
-Before client-side routing, every link click meant: browser requests a whole new HTML page, the connection round-trips, the browser throws away the current DOM and builds a new one, and any JS state (an open modal, scroll position, a form half-filled) is gone. For an app with frequent navigation (a dashboard, a chat app), that full reload is wasted work: the header, sidebar and CSS rarely change between pages.
+Before client-side routing, every link click meant: browser requests a whole new HTML page, the connection round-trips, the browser throws away the current DOM and builds a new one, and any JS state (an open modal, scroll position, a form half-filled) is gone.
+
+For an app with frequent navigation (a dashboard, a chat app), that full reload is wasted work: the header, sidebar and CSS rarely change between pages.
 
 Client-side routing keeps the JS app loaded and just swaps the part of the tree the URL maps to, using the browser's History API so the back/forward buttons and the URL bar still work correctly without a server round trip.
 
@@ -72,7 +117,9 @@ flowchart TD
     end
 ```
 
-**History API vs hash routing.** `createBrowserRouter` uses `pushState`/`popstate`, giving clean URLs (`/users/42`) — but the server must be configured to return the SPA's `index.html` for *any* path (a rewrite rule), since a direct request to `/users/42` would otherwise 404 on a static host that doesn't know that route. `createHashRouter` keeps the route after a `#` (`/#/users/42`); the browser never sends the part after `#` to the server, so hash routing works on static hosting with zero server configuration, at the cost of an uglier URL and historically worse SEO.
+**History API vs hash routing.** `createBrowserRouter` uses `pushState`/`popstate`, giving clean URLs (`/users/42`) — but the server must be configured to return the SPA's `index.html` for *any* path (a rewrite rule), since a direct request to `/users/42` would otherwise 404 on a static host that doesn't know that route.
+
+`createHashRouter` keeps the route after a `#` (`/#/users/42`); the browser never sends the part after `#` to the server, so hash routing works on static hosting with zero server configuration, at the cost of an uglier URL and historically worse SEO.
 
 ```jsx
 // React Router v6.4+/v7: route objects, data loaders, nested layouts
@@ -193,7 +240,13 @@ flowchart LR
     SC -. "its own code never ships to the browser" .-> client
 ```
 
-In a framework that supports them (Next.js App Router), components are Server Components **by default**; adding `'use client'` at the top of a file opts a component (and its subtree) into being a Client Component. A Server Component can read a database or the filesystem directly and send only its rendered output (plus any Client Component "holes" it renders) to the browser — its own imports (an ORM, a markdown parser) never appear in the client JS bundle at all, which is a stronger guarantee than "SSR renders this once, but all the code still ships for hydration." The trade-off is a stricter model: Server Components can't use `useState`, `useEffect`, or browser-only APIs, since they never run in the browser.
+In a framework that supports them (Next.js App Router), components are Server Components **by default**; adding `'use client'` at the top of a file opts a component (and its subtree) into being a Client Component.
+
+A Server Component can read a database or the filesystem directly and send only its rendered output (plus any Client Component "holes" it renders) to the browser.
+
+Its own imports (an ORM, a markdown parser) never appear in the client JS bundle at all. That is a stronger guarantee than "SSR renders this once, but all the code still ships for hydration."
+
+The trade-off is a stricter model: Server Components can't use `useState`, `useEffect`, or browser-only APIs, since they never run in the browser.
 
 ## 4. Worked example
 
@@ -274,7 +327,9 @@ A user who only ever visits `/` never downloads `Catalog` or `Account`'s JavaScr
 
 ### Streaming SSR and Suspense on the server
 
-**In plain words:** Classic SSR has to finish rendering the *entire* page on the server before sending any of it — one slow data source (a sidebar widget calling a flaky third-party API) delays the whole response. Streaming SSR instead sends the page in pieces, as each piece becomes ready, like a restaurant bringing out appetizers while the kitchen still works on the main course instead of making the whole table wait for everything at once.
+**In plain words:** Classic SSR has to finish rendering the *entire* page on the server before sending any of it — one slow data source (a sidebar widget calling a flaky third-party API) delays the whole response.
+
+Streaming SSR instead sends the page in pieces, as each piece becomes ready, like a restaurant bringing out appetizers while the kitchen still works on the main course instead of making the whole table wait for everything at once.
 
 **Picture it:**
 
@@ -293,7 +348,9 @@ sequenceDiagram
     Server->>Browser: Chunk 3: closing tags, page complete
 ```
 
-**Example:** A product page's main content (title, price, add-to-cart) is ready in 50ms; its "customers also bought" sidebar depends on a recommendation service that takes 800ms. Streaming SSR sends the main content chunk almost immediately — the browser paints it right away — then streams the sidebar's HTML in a second chunk once the recommendation service responds, with a small inline script that slots it into the already-painted page.
+**Example:** A product page's main content (title, price, add-to-cart) is ready in 50ms; its "customers also bought" sidebar depends on a recommendation service that takes 800ms.
+
+Streaming SSR sends the main content chunk almost immediately — the browser paints it right away — then streams the sidebar's HTML in a second chunk once the recommendation service responds, with a small inline script that slots it into the already-painted page.
 
 **Why it matters:** Without streaming, that one slow sidebar call would delay *time to first byte* for the entire page, even though 95% of the page had nothing to do with it. Streaming isolates the slow part behind its own `<Suspense>` boundary so it can't block anything outside itself.
 
@@ -343,3 +400,8 @@ A framework can start sending HTML for the parts of a page that are ready, wrap 
 - **Before this:** [[React Fundamentals - Components, JSX, Props, State]], [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]], [[React State Management - Props, Context, Redux]]
 - **Next:** this is the last note in the Frontend learning path; from here, see [[07 Databases MOC]] or [[05 APIs MOC]] for the backend side of a full-stack request
 - **Compare with:** [[How Browsers Load and Render a Page]] (the critical rendering path this sits on top of), [[CDN and Edge]] (where SSG/ISR output is typically served from)
+
+### Watch on YouTube
+
+- [NextJS Rendering Methods - Explained (CSR vs SSR vs SSG vs ISR)](https://www.youtube.com/watch?v=XwswPqIXYoI) · basarat · side-by-side comparison of all four rendering strategies
+- [CSR / SSR / SSG / ISR with Next.js – Explained!](https://www.youtube.com/watch?v=eMwTEo6AjDc) · leerob · concise explainer from a Next.js core team member

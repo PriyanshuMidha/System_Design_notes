@@ -9,7 +9,7 @@ sources:
   - "pg_ivm extension README (Incremental View Maintenance; create_immv)"
   - "ClickHouse docs: Materialized views (insert triggers), AggregatingMergeTree, SummingMergeTree"
   - "Materialize and RisingWave docs: incrementally maintained materialized views over streams"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Materialized Views and Denormalization
@@ -23,6 +23,49 @@ updated: 2026-11-03
 > - App-maintained summaries (counters, rollup tables) can be updated in the same transaction (always correct, adds write contention) or asynchronously from events (fast writes, must be idempotent).
 > - Decide the **staleness budget** with the product owner ("the revenue chart may lag 5 minutes"), then pick the refresh strategy that meets it.
 > - Every copy needs a rebuild path and a drift check, because it *will* disagree with the source one day.
+
+## Start here: the basics
+
+**The problem in one story.**
+A dashboard shows "total revenue per workspace this month".
+Computing it means adding up millions of invoice rows on every page load.
+The page gets slow, and the database gets busy.
+So you compute the answer ahead of time, store it, and read the stored answer instead.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Query | A question you ask the database | `SELECT sum(total) FROM invoices` |
+| Aggregation | Combining many rows into one number | `sum`, `count`, `avg` |
+| View | A saved query that runs every time you read it | `CREATE VIEW` |
+| Materialized view | A saved answer stored as a table | `CREATE MATERIALIZED VIEW` |
+| Refresh | Recompute the stored answer | `REFRESH MATERIALIZED VIEW` |
+| Normalized | Each fact is stored in exactly one place | Customer name only in `customers` |
+| Denormalized | A deliberate copy or summary kept for fast reads | `invoice_count` on `workspaces` |
+| Stale | The copy no longer matches the source | Total shows yesterday's number |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    SRC["Source tables<br/>(invoices)"] -- "refresh / event" --> MV["Precomputed copy<br/>(view or rollup)"]
+    APP["Dashboard read"] --> MV
+    SRC -. "drift check" .-> MV
+```
+
+**Analogy.** A shop writes the day's sales total on a whiteboard instead of re-adding every receipt each time someone asks.
+Where it breaks: the whiteboard is only as fresh as the last time someone updated it, and a missed receipt makes it wrong until a full recount.
+
+**How the rest of this note builds up**
+
+- First, why precomputing exists (section 1) and the mental model (section 2).
+- Then views vs materialized views, refresh options, three ways to maintain a copy, and the staleness budget (section 3).
+- Then a full before/after example, the hand-maintained version and an asynchronous Go rollup (section 4).
+- Finally the SDE-3 view: comparisons, trade-offs, production drift, and the deep dive (sections 5-8).
+
+> [!tip] Remember
+> A materialized view or summary trades freshness for fast reads; agree the staleness budget and always keep a rebuild path.
 
 ## 1. Why it exists
 
@@ -40,7 +83,9 @@ WHERE workspace_id = $1
 GROUP BY status;
 ```
 
-For a small workspace with 200 invoices this takes well under a millisecond. For the largest customer, with 400,000 invoices, Postgres has to read 400,000 rows on every page load. Suppose (an estimate for this example) it takes about 380 ms and the dashboard auto-refreshes every 30 seconds for 2,000 open browser tabs: that is about 67 executions per second, each reading hundreds of thousands of rows, all to produce six rows of output that barely change between calls.
+For a small workspace with 200 invoices this takes well under a millisecond. For the largest customer, with 400,000 invoices, Postgres has to read 400,000 rows on every page load.
+
+Suppose (an estimate for this example) it takes about 380 ms and the dashboard auto-refreshes every 30 seconds for 2,000 open browser tabs: that is about 67 executions per second, each reading hundreds of thousands of rows, all to produce six rows of output that barely change between calls.
 
 The answer changes only when an invoice is created, edited or paid. Computing it once and storing it turns a 380 ms aggregation into a lookup of six rows by key.
 
@@ -72,7 +117,9 @@ flowchart LR
     S["summary table at 10:03: 503, current"] -. "updated by each write" .-> C
 ```
 
-**Analogy:** a shop counts its cash drawer. A view is counting every coin each time someone asks the total. A materialized view is a sticky note with the total written at closing time: instant to read, wrong after the next sale. A summary table is a running tally that the cashier updates with every sale: always current if nobody forgets a sale.
+**Analogy:** a shop counts its cash drawer. A view is counting every coin each time someone asks the total. A materialized view is a sticky note with the total written at closing time: instant to read, wrong after the next sale.
+
+A summary table is a running tally that the cashier updates with every sale: always current if nobody forgets a sale.
 
 ## 3. How it works
 
@@ -89,7 +136,9 @@ flowchart LR
 
 ### 3.2 Creating and refreshing a materialized view in PostgreSQL 17
 
-The view groups invoices by `(workspace_id, status)` and stores `invoice_count`, `total_minor` and `outstanding_minor`, created `WITH DATA` so it is readable at once (`WITH NO DATA` leaves it unreadable until the first `REFRESH`). Because there is one row per `(workspace_id, status)`, a `UNIQUE` index on those two columns is possible, and `REFRESH ... CONCURRENTLY` requires it. The full statements are in [[Materialized Views and Denormalization - Go]].
+The view groups invoices by `(workspace_id, status)` and stores `invoice_count`, `total_minor` and `outstanding_minor`, created `WITH DATA` so it is readable at once (`WITH NO DATA` leaves it unreadable until the first `REFRESH`).
+
+Because there is one row per `(workspace_id, status)`, a `UNIQUE` index on those two columns is possible, and `REFRESH ... CONCURRENTLY` requires it. The full statements are in [[Materialized Views and Denormalization - Go]].
 
 ```sql
 CREATE UNIQUE INDEX workspace_dashboard_uidx ON workspace_dashboard (workspace_id, status);
@@ -235,7 +284,9 @@ flowchart LR
 
 ### 4.3 The refresh cost and cadence
 
-The refresh re-runs the `GROUP BY` over all 20 million invoices. Estimate: a parallel sequential scan plus hash aggregate over a table of this size takes in the order of 10–60 seconds, depending on hardware and how much is cached. The concurrent variant then diffs about 300,000 rows. Measure it on your own data with `\timing` in `psql` before choosing the interval.
+The refresh re-runs the `GROUP BY` over all 20 million invoices. Estimate: a parallel sequential scan plus hash aggregate over a table of this size takes in the order of 10–60 seconds, depending on hardware and how much is cached.
+
+The concurrent variant then diffs about 300,000 rows. Measure it on your own data with `\timing` in `psql` before choosing the interval.
 
 With a 5-minute budget, schedule the refresh every 4 minutes, and alert if a refresh takes more than 1 minute (budget minus interval). Run it from one place, for example a `pg_cron` job or one scheduled worker, so two refreshes never queue behind the `EXCLUSIVE` lock.
 
@@ -273,7 +324,9 @@ HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 
 ### 4.5 Asynchronous rollup in Go, with idempotency and a drift check
 
-When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event. Delivery is **at-least-once**: after a consumer crash, the same event can arrive again. Applying it twice is the classic double-counting bug. The fix is to remember which event IDs were applied; in SQL, that is a `processed_events` table written in the same transaction as the rollup update.
+When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event. Delivery is **at-least-once**: after a consumer crash, the same event can arrive again. Applying it twice is the classic double-counting bug.
+
+The fix is to remember which event IDs were applied; in SQL, that is a `processed_events` table written in the same transaction as the rollup update.
 
 ```mermaid
 sequenceDiagram
@@ -293,7 +346,11 @@ sequenceDiagram
     Note over C,T: ignored: total stays 300000, count stays 1
 ```
 
-Trace with numbers: create adds 1 invoice and 250,000; the edit adds the delta 300,000 minus 250,000 = 50,000, giving 1 invoice and 300,000. The redelivered edit is skipped by its ID. Without the ID check the total would read 350,000, which is the double-counting bug. A delete event (new total 0) subtracts 1 from the count. If an event is lost altogether, a drift check recomputes the totals from the source rows and reports the workspaces that disagree: in the test, invoice 2 changed from 500 to 800 but the event was lost, so the rollup shows 500 and the check reports workspace 2 with the correct 1 invoice and 800.
+Trace with numbers: create adds 1 invoice and 250,000; the edit adds the delta 300,000 minus 250,000 = 50,000, giving 1 invoice and 300,000. The redelivered edit is skipped by its ID.
+
+Without the ID check the total would read 350,000, which is the double-counting bug. A delete event (new total 0) subtracts 1 from the count.
+
+If an event is lost altogether, a drift check recomputes the totals from the source rows and reports the workspaces that disagree: in the test, invoice 2 changed from 500 to 800 but the event was lost, so the rollup shows 500 and the check reports workspace 2 with the correct 1 invoice and 800.
 
 The Go rollup (`Rollup.Apply`, `Rollup.Get`, `Rollup.Drift`), its four tests including four concurrent consumers receiving the same 1,000 events, and the idempotent apply as one SQL transaction are in Go. Runnable Go version: [[Materialized Views and Denormalization - Go]]
 
@@ -312,7 +369,9 @@ The Go rollup (`Rollup.Apply`, `Rollup.Get`, `Rollup.Drift`), its four tests inc
 | Streaming database (Materialize, RisingWave) | SQL views kept incrementally up to date from Kafka or Postgres CDC | complex joins that must be fresh within seconds | another system to run; memory for join state |
 | Cache (Redis) | store the query result with a TTL | a hot, small result where a few seconds of staleness is fine | invalidation and stampedes ([[Cache Invalidation, TTL and Consistency]]) |
 
-**Cache or materialized view?** A cache holds results for *keys that are asked for*, expires them, and lives outside the database. A materialized view holds results for *every key*, can be indexed and joined in SQL, and is refreshed as a whole. Use a cache when a small fraction of keys is hot and recomputing one key is cheap. Use a materialized view when computing any single key requires scanning a lot of data, or when other queries want to join and filter the precomputed rows.
+**Cache or materialized view?** A cache holds results for *keys that are asked for*, expires them, and lives outside the database. A materialized view holds results for *every key*, can be indexed and joined in SQL, and is refreshed as a whole.
+
+Use a cache when a small fraction of keys is hot and recomputing one key is cheap. Use a materialized view when computing any single key requires scanning a lot of data, or when other queries want to join and filter the precomputed rows.
 
 ## 6. Trade-offs and when not to use
 
@@ -353,11 +412,17 @@ The Go rollup (`Rollup.Apply`, `Rollup.Get`, `Rollup.Drift`), its four tests inc
 
 ## 8. Deep dive
 
-**What `CONCURRENTLY` actually does.** PostgreSQL computes the new result into a temporary table, then compares it with the current contents using a full outer join on all columns. Rows only in the old result are deleted, rows only in the new result are inserted. A changed row is therefore a delete plus an insert. The unique index is used to match rows efficiently and guarantees the view has no duplicate rows, which the diff needs. This is why a view whose rows change completely each time (for example, a `now()`-relative column) gains nothing from `CONCURRENTLY` and costs more.
+**What `CONCURRENTLY` actually does.** PostgreSQL computes the new result into a temporary table, then compares it with the current contents using a full outer join on all columns. Rows only in the old result are deleted, rows only in the new result are inserted.
+
+A changed row is therefore a delete plus an insert. The unique index is used to match rows efficiently and guarantees the view has no duplicate rows, which the diff needs.
+
+This is why a view whose rows change completely each time (for example, a `now()`-relative column) gains nothing from `CONCURRENTLY` and costs more.
 
 **Statistics on a view.** A materialized view is a table to the planner. Autovacuum analyzes it like any table, but right after creating it, run `ANALYZE workspace_dashboard;` so the planner knows its size.
 
-**Hot rows and counter sharding.** If 200 invoices per second are created in one workspace and each transaction runs `UPDATE workspace_totals SET ... WHERE workspace_id = 42`, every transaction waits for the previous one's row lock until it commits. Throughput is capped at roughly `1 / (commit latency)`; at 5 ms per commit (an estimate), about 200 per second. Splitting the row into slots removes the queue:
+**Hot rows and counter sharding.** If 200 invoices per second are created in one workspace and each transaction runs `UPDATE workspace_totals SET ... WHERE workspace_id = 42`, every transaction waits for the previous one's row lock until it commits.
+
+Throughput is capped at roughly `1 / (commit latency)`; at 5 ms per commit (an estimate), about 200 per second. Splitting the row into slots removes the queue:
 
 ```mermaid
 flowchart LR
@@ -372,7 +437,9 @@ flowchart LR
 
 The table `workspace_totals_slots` has primary key `(workspace_id, slot)` with `slot` from 0 to 15. A write picks `floor(random() * 16)` and upserts that slot row with `ON CONFLICT ... DO UPDATE`; a read runs `sum(invoice_count), sum(total_minor)` over the 16 rows of the workspace. The full DDL and SQL are in [[Materialized Views and Denormalization - Go]].
 
-**Deltas versus recompute.** `sum` and `count` are easy to maintain incrementally: add on insert, subtract on delete. `min`, `max` and `count(DISTINCT ...)` are not: when the current maximum is deleted, the new maximum can only be found by looking at the remaining rows. That is why incremental view engines restrict which aggregates they support, and why ClickHouse stores intermediate *aggregate states* (for example a set for `uniq`) rather than final numbers.
+**Deltas versus recompute.** `sum` and `count` are easy to maintain incrementally: add on insert, subtract on delete. `min`, `max` and `count(DISTINCT ...)` are not: when the current maximum is deleted, the new maximum can only be found by looking at the remaining rows.
+
+That is why incremental view engines restrict which aggregates they support, and why ClickHouse stores intermediate *aggregate states* (for example a set for `uniq`) rather than final numbers.
 
 **Ordering in async rollups.** Deltas commute (`+100` then `+50` equals `+50` then `+100`), so rollups of sums tolerate out-of-order events. "Set the status to X" does not commute. For non-commutative copies, carry a version number with each event and apply only if it is newer than the stored version.
 
@@ -418,3 +485,8 @@ The table `workspace_totals_slots` has primary key `(workspace_id, slot)` with `
 - **Before this:** [[Relational Schema Design]], [[Query Plans and EXPLAIN]], [[Indexing Fundamentals]], [[Transactions and ACID]]
 - **Next:** [[NoSQL Data Modeling]], [[Transactional Outbox and CDC]], [[CQRS]]
 - **Compare with:** [[Caching Fundamentals]], [[Time-Series and Columnar Storage]], [[Index Types and Index Design]]
+
+### Watch on YouTube
+
+- [Materialized views explained](https://www.youtube.com/watch?v=-A3EtQgDn_0) · ClickHouse · official vendor explanation of materialized views as stored query results
+- [Understanding Denormalization in Database Design](https://www.youtube.com/watch?v=NPGEDDr5MUo) · StructuredCS · covers the denormalization trade-off side of the note

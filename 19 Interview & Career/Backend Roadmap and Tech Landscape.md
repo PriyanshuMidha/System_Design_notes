@@ -6,13 +6,15 @@ prereqs: []
 related: ["[[SDE-3 Readiness Checklist]]", "[[Learning Resources]]"]
 sources:
   - "ByteByteGo-style 'Backend Burger' infographic (screenshot in the old vault; exact episode unverified)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Backend Roadmap and Tech Landscape
 
 > [!summary] TL;DR
-> A backend engineer's job splits into about ten tech layers — language, protocols, data stores, messaging, infra, and observability, among others. This note maps each layer to the concrete tools an SDE-3 is expected to know and to the numbered folder in this vault that teaches it, so you always know what to learn next and where.
+> A backend engineer's job splits into about ten tech layers — language, protocols, data stores, messaging, infra, and observability, among others.
+>
+> This note maps each layer to the concrete tools an SDE-3 is expected to know and to the numbered folder in this vault that teaches it, so you always know what to learn next and where.
 
 > [!abstract] Core idea
 > - Backend work is layered: a request moves through a language/framework, an API protocol, business logic, a data store, and a response — with caching, messaging, security, deployment and observability cutting across all of it.
@@ -20,9 +22,57 @@ updated: 2026-11-04
 > - This vault's 19 numbered folders are one path through the layers, roughly in learning order.
 > - This note is a map, not a tutorial: every layer links to the folder that actually teaches it.
 
+## Start here: the basics
+
+**The problem in one story.**
+You can build a small Go service that saves data to Postgres.
+In an interview someone asks, "What happens at 10x traffic, or when the queue backs up?"
+You freeze, not because you lack Go skill, but because you never knew caching, queues or monitoring were separate things to learn.
+This note is the map of those things and where this vault teaches each one.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Backend | The server-side code users never see directly | The service that stores your orders |
+| API | The agreed way clients talk to a server | `POST /orders` over HTTP |
+| Data store | Where data is kept long term | PostgreSQL, Redis, S3 |
+| Cache | A fast copy of data to avoid slow lookups | Redis holding a product page |
+| Message queue | A buffer where work waits to be processed later | Kafka topic of "order placed" events |
+| Infrastructure | The machines and platforms code runs on | Docker, Kubernetes, AWS |
+| Observability | Seeing what a running system is doing | Logs, metrics, traces |
+| Layer | One area of skill in the stack | "Messaging" is one layer |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] --> A["API layer"]
+    A --> B["Business logic"]
+    B --> D["Data layer"]
+    CA["Cache"] -.-> D
+    Q["Messaging"] -.-> B
+    I["Infra + observability<br/>(around everything)"] -.-> A
+```
+
+**Analogy.** A city map: roads (the request path) plus water, power and police that serve every street (caching, messaging, infra, observability).
+Where it breaks: a city map is fixed; the tech in each layer changes every few years, while the layers themselves stay.
+
+**How the rest of this note builds up**
+
+- First, why knowing only "Go + Postgres" stalls you (section 1) and the request-path picture (section 2).
+- Then each layer with its tools and its vault folder, plus a worked trace of one request (sections 3-4).
+- Then variants, trade-offs and how this looks on a real team (sections 5-7).
+- Finally the SDE-3 deep dive on learning order and depth: what to know deeply vs. only recognise (section 8).
+
+> [!tip] Remember
+> Learn the layers first, the tools second; know your language and main data store deeply, recognise the rest.
+
 ## 1. Why it exists
 
-A new backend engineer who only knows "Go + Postgres" can ship a CRUD service but will stall in an SDE-3 interview the moment the conversation turns to "how would this handle 10x traffic" or "what happens when the queue backs up." The gap is not depth in Go — it is not knowing which *other* layers exist at all: caching, messaging, distributed consensus, observability, deployment strategy.
+A new backend engineer who only knows "Go + Postgres" can ship a CRUD service but will stall in an SDE-3 interview the moment the conversation turns to "how would this handle 10x traffic" or "what happens when the queue backs up."
+
+The gap is not depth in Go — it is not knowing which *other* layers exist at all: caching, messaging, distributed consensus, observability, deployment strategy.
 
 Conversely, a candidate who has only read about these layers in the abstract (without ever writing the Go code for a worker pool, or running an `EXPLAIN` on a slow query) also stalls, one level later: they can name the layer but not reason about it under a follow-up question.
 
@@ -70,7 +120,12 @@ The ten layers, each mapped to the Go-specific tools an SDE-3 is expected to rec
 | 9 | Observability | Deeply: the three signals, SLOs, incident response | OpenTelemetry, Prometheus, Grafana | [[14 Observability & SRE MOC]] |
 | 10 | Testing | Deeply: the test pyramid, fakes vs. mocks, race detection | `go test`, table-driven tests, `-race` | [[15 Testing MOC]] |
 
-Layers the old infographic left out entirely, each still worth a "recognise" level of depth for an SDE-3: security and auth ([[12 Security & Auth MOC]]), software architecture patterns ([[16 Software Architecture MOC]]), object-oriented and low-level design ([[17 LLD MOC]]), and AI engineering / LLM-backed features ([[18 AI Engineering MOC]]), which is now common enough in backend roles to show up in interviews.
+Layers the old infographic left out entirely, each still worth a "recognise" level of depth for an SDE-3:
+
+- security and auth ([[12 Security & Auth MOC]]);
+- software architecture patterns ([[16 Software Architecture MOC]]);
+- object-oriented and low-level design ([[17 LLD MOC]]);
+- AI engineering / LLM-backed features ([[18 AI Engineering MOC]]), which is now common enough in backend roles to show up in interviews.
 
 ## 4. Worked example
 
@@ -109,11 +164,19 @@ No single folder "is" this feature; the feature is the whole table acting togeth
 
 ## 8. Deep dive
 
-The original "Backend Burger" framing (client request → routing → business logic → database, as stacked burger layers) is a request-flow diagram, not a tech-landscape map — it describes one request moving through one service, not the set of skills a backend engineer needs. This note deliberately separates the two ideas: section 3's flowchart is the request-flow view (useful, but it's already taught per-layer in [[06 Backend Engineering in Go MOC]]); the table is the landscape view, which is what a roadmap note should be.
+The original "Backend Burger" framing (client request → routing → business logic → database, as stacked burger layers) is a request-flow diagram, not a tech-landscape map — it describes one request moving through one service, not the set of skills a backend engineer needs.
 
-A second trap in the old framing was listing languages, frameworks and data stores as flat, interchangeable options (Java/Python/Go, Flask/Express/Next.js, PostgreSQL/MongoDB/Cassandra) without saying which one this vault — or the reader's job — actually uses. An SDE-3 roadmap needs to pick: this vault picks Go as the primary language and PostgreSQL 17 as the primary relational store, and every "Tools" column above names the Go-specific choice first.
+This note deliberately separates the two ideas: section 3's flowchart is the request-flow view (useful, but it's already taught per-layer in [[06 Backend Engineering in Go MOC]]); the table is the landscape view, which is what a roadmap note should be.
 
-The "learning order" in the diagram below is a dependency order, not a difficulty order: you can learn caching before distributed systems, but you cannot reason about cache invalidation correctness without first understanding what a transaction is (layer 4), which is why data stores sit ahead of caching in the table even though caching is simpler to operate.
+A second trap in the old framing was listing languages, frameworks and data stores as flat, interchangeable options (Java/Python/Go, Flask/Express/Next.js, PostgreSQL/MongoDB/Cassandra) without saying which one this vault — or the reader's job — actually uses.
+
+An SDE-3 roadmap needs to pick: this vault picks Go as the primary language and PostgreSQL 17 as the primary relational store, and every "Tools" column above names the Go-specific choice first.
+
+The "learning order" in the diagram below is a dependency order, not a difficulty order.
+
+You can learn caching before distributed systems, but you cannot reason about cache invalidation correctness without first understanding what a transaction is (layer 4).
+
+That is why data stores sit ahead of caching in the table even though caching is simpler to operate.
 
 ```mermaid
 flowchart TD
@@ -168,3 +231,8 @@ flowchart TD
 - **Before this:** none — this is an entry point.
 - **Next:** [[SDE-3 Readiness Checklist]]
 - **Compare with:** [[Learning Resources]]
+
+### Watch on YouTube
+
+- [Backend SDE Roadmap 2026-27 / Techs, Skills, Tools for Industry / Learn in Order for Interviews](https://www.youtube.com/watch?v=Kx-4Sc57NM0) · Dev. Shivansh Vasu · 43 min · 8,331 views
+- [The Complete Backend Developer Roadmap](https://www.youtube.com/watch?v=OeEHJgzqS1k) · Programming with Mosh · 8 min · 991,104 views

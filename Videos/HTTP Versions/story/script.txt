@@ -1,0 +1,100 @@
+# HTTP versions story: "Ten Minutes to Noon". id | SPEAKER | tone | text. Source: [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] and its Go note
+# Cast: ZARA = performance engineer (hero). RAVI = her rookie. HAL = HTTP one point one, the single window counter. MAYA = HTTP two, the shared lobby receptionist. TOM = T C P, the one road. QUINN = HTTP three on QUIC, the hub with a door per stream. GUS = the corporate firewall.
+== s1 The noon rush
+l1 | N | hook | Showtown, eleven fifty. In ten minutes, tickets for the biggest concert of the year go on sale. And then the alarm rings. On phones, the checkout page crawls. Spinners everywhere. Every second of waiting, a customer leaves. Ten minutes to find out why.
+l2 | ZARA | normal | I am Zara, the performance engineer. Ravi, my rookie, you are with me. The page needs thirty files, and it is slow, even though the server is fast.
+l3 | RAVI | question | Why would a fast server give a slow page, Zara? Is it the files, the road, or the server?
+l4 | ZARA | punch | The server answers in fifty milliseconds. The problem is how we ask. There are three versions of H T T P, three ways to ask for many things at once. Let us meet them, one by one.
+l5 | N | normal | Words first. A request is a question the browser sends, and a response is the answer. A connection is an open line between them. T C P is the transport that delivers bytes reliably and in order. U D P sends packets with no promise of order or retry. Packet loss is the network silently dropping data, like a Wi Fi glitch. A round trip, or R T T, is the time to go to the server and back, forty milliseconds from Mumbai to Singapore. Multiplexing is mixing many conversations on one line, each one tagged. And head of line blocking is when one stuck item at the front makes everything behind it wait, like one slow customer at the only checkout counter.
+l6 | ZARA | normal | Picture a news page. The H T M L, a stylesheet, scripts, twenty images and a font. If you can only ask for one thing at a time, the page crawls in piece by piece. Our question is simple. How do we ask for many things at once, even when the network drops data?
+l7 | N | normal | Here is the whole story on a whiteboard. Six requests, each taking fifty milliseconds. Over one H T T P one point one connection, about three hundred ten milliseconds. Over one H T T P two connection, about sixty two. That gap is the entire reason H T T P two exists. And each version fixes the bottleneck of the one before.
+== s2 Hal and the single window
+h1 | N | normal | Suspect one. Hal, at the single window counter. H T T P one point one sends one request at a time, on each connection. Zara and Ravi walk over.
+h2 | HAL | normal | I am Hal. One customer at a time. Ask me for the style sheet. Done? Next. My requests are plain text, ending with a blank line. G E T, slash style dot C S S, Host, Accept Encoding. Keep alive lets you reuse my window for the next customer, but still, only one at a time.
+h3 | RAVI | question | Can you not take a queue of requests, Hal?
+h4 | HAL | normal | Pipelining. The spec allows it. But the answers must come back in the same order, so one slow answer blocks everyone behind it, and some middlemen mangled it. No major browser ever turned it on. Pipelining is a failed feature.
+h5 | N | normal | So browsers shipped a workaround. Open six T C P connections per host, and spread the requests. Parallelism, at a price. Six times the T C P handshakes. Six times the T L S handshakes over H T T P S. Six congestion control states, each starting from scratch. And six connections fighting over the same link.
+h6 | ZARA | normal | Thirty files over six connections is still five round trips per connection. Each connection serializes its own share. Parallelism tops out at however many sockets the browser is willing to open.
+h7 | N | warn | The classic mistake is thinking more connections are a free lunch. Each one repeats the T C P handshake, one round trip, and over H T T P S, one to two more for T L S, before a single byte of the file arrives.
+h8 | N | calm | Think of a doctor's office. In one point one, one patient is called in and finishes completely, then the next. To see two at once, you need a second office.
+== s3 Maya and the shared lobby
+m1 | N | normal | Suspect two. Maya, the receptionist of the shared lobby. H T T P two, from twenty fifteen, built on Google's SPDY.
+m2 | MAYA | normal | I am Maya. I wrap every request and response in small binary frames. Headers, data, settings, window update, reset stream. Each frame carries a stream I D. Frames from many streams interleave on one connection, and the receiver puts each stream back together.
+m3 | RAVI | question | So nobody waits for anybody?
+m4 | MAYA | normal | Right. Headers for stream one. Headers for stream three. A bit of data for stream one, then stream three. Headers for stream five. Then the rest of stream one. No response waits for another to finish. One connection, with the parallelism of six.
+m5 | N | normal | Maya also compresses headers, with H pack, instead of sending repetitive text on every request. A static table of sixty one common pairs, like method get, referenced by a one byte index. A dynamic table per connection, so a long cookie or user agent is sent once, then referenced by number. And Huffman coding for literal values that are in neither table.
+m6 | MAYA | normal | Priority was meant to let a browser say, render blocking C S S jumps ahead of a background image, using a dependency tree and weights. In practice, servers implemented it unevenly, or ignored it. A simpler scheme, R F C ninety two eighteen, later replaced it.
+m7 | N | normal | Then server push. A push promise frame lets a server send the app script before it is asked. Chrome removed it in twenty twenty two. Browsers already had the file cached most of the time, so push wasted bandwidth, and it made cache rules harder to reason about. Use link rel preload, or one oh three Early Hints, instead.
+m8 | N | calm | In the doctor's office, Maya is one receptionist swapping charts between patients, all progressing in the same room. But the building has a single entrance.
+== s4 Tom and the traffic jam
+t1 | N | warn | Noon. The sale opens, and a commuter train enters a tunnel. Packets start vanishing. Ravi watches every stream freeze at the same instant.
+t2 | RAVI | question | Maya, you said no stream blocks another. Why did everything stop?
+t3 | TOM | normal | I am Tom, the T C P road. I promise in order delivery. Segment forty two was lost. Segments forty three, forty four and more arrived, but I hold them back from the application until forty two is sent again. I do not know, or care, that they belong to different streams.
+t4 | ZARA | punch | One lost packet stalls every stream on the connection. Maya fixed head of line blocking at the H T T P layer only. Underneath, T C P still blocks everything. That is the classic mistake.
+t5 | N | normal | Look at the buffer. Frames from stream one, three and five all pour into one T C P receive buffer, in strict byte order. The segment for stream one is lost, so the kernel withholds every later byte, including ready frames for streams three and five.
+== s5 Quinn and the hub of many doors
+q1 | N | normal | Suspect three, and the fix. Quinn, at the hub with a separate door for every stream. H T T P three, standardized in R F C ninety one fourteen, in twenty twenty two.
+q2 | QUINN | normal | I am Quinn. I keep Maya's request and frame model, but I replace T C P with QUIC, which runs over U D P. Every H T T P stream gets its own QUIC stream, with its own loss detection and retransmission.
+q3 | N | normal | Watch. Stream one gets its first packet. The second packet is lost. Stream three delivers app dot J S in full, unaffected. Only stream one waits for the retransmission.
+q4 | QUINN | normal | And handshakes. T C P and T L S used to be two handshakes stacked. First agree on a byte stream, then agree on keys. I fold T L S one point three into my own handshake.
+q5 | N | normal | On a fifty millisecond round trip, a fresh H T T P two connection pays about a hundred milliseconds, two round trips, before the first request byte leaves. A fresh H T T P three connection pays about fifty. A resumed one, zero R T T, sends the request in the very first packet. On a slow mobile link, the handshake can cost more than the data.
+q6 | QUINN | normal | I also use Q pack, not H pack. Table updates travel on their own one way stream, so a lost update never blocks headers on other streams. H pack's ordered, inline updates would have brought head of line blocking back at the compression layer.
+q7 | QUINN | normal | And I identify a connection by a connection I D, not by the I P and port. When a phone switches from Wi Fi to cellular in the middle of a request, I keep going.
+q8 | N | calm | In the doctor's office, every patient now has their own entrance. Same building, shared encryption and congestion control. Where the picture breaks, real lanes do not share one budget, but QUIC streams do, at the connection level.
+q9 | ZARA | normal | And Ravi, QUIC is not raw U D P with no reliability. It adds its own reliable delivery, congestion control and encryption. U D P is only the carrier.
+== s6 The proof, the comparison and the trace
+p1 | N | normal | Now, prove it. One handler that sleeps fifty milliseconds, called six times at once. The baseline. Serial is six times fifty, three hundred. Parallel is about fifty, plus a little overhead. On the H T T P two path, a test server speaks H T T P two over T L S, A L P N picks h two, and all six requests share one connection. On the H T T P one point one path, a plain server, and a client capped to one connection per host. Measure both.
+p2 | N | normal | The result. H T T P one point one lands near the three hundred serial ideal. H T T P two lands near the fifty parallel ideal. Multiplexing, proven as a passing test. And notice, the handler code is identical. The upgrade is a transport decision, not an application one.
+p3 | ZARA | normal | On the wire, curl dash v with the http two flag prints, server accepted h two, then H T T P slash two two hundred. Against a C D N with the http three flag, it prints, using H T T P slash three. Exact lines vary by curl build.
+p4 | N | normal | The comparison. One point one runs on T C P, with no multiplexing and no header compression, blocking per connection. It suits simple services, legacy clients and some internal A P Is. H T T P two runs on T C P plus T L S, multiplexed, with H pack. Fixed at the H T T P layer, but still blocked at T C P. The default for most web traffic and g R P C. H T T P three runs on QUIC over U D P, with independent loss recovery and Q pack. Fixed at both layers, and used by browsers and C D Ns on lossy or mobile networks.
+p5 | N | normal | How do you spot T C P blocking in production? The H T T P layer only sees slow requests, never why. The symptom, several H T T P two streams spike in latency at the same instant. Run S S dash T I on that very connection. Retransmits at the same moment mean one lost segment stalled every stream. No retransmits means the handlers were simply slow. Inside Go, the socket's T C P info is reachable through syscall conn.
+p6 | ZARA | warn | The trap is watching only request latency, and concluding that multiplexing is broken. The fix is not a code change at the H T T P layer at all. Accept the trade off, or move to H T T P three.
+== s7 In Go: the multiplexing test
+g1 | N | normal | Now the Go code. One test, called test H one single conn versus H two multiplexing. Standard library only, no external dependencies.
+g2 | N | normal | Step one, a helper called measure concurrency. It fires N concurrent gets with a wait group, and returns the wall clock time of the whole batch. The same helper serves both protocols, so the comparison is fair.
+g3 | N | normal | Inside, add one to the wait group, start a goroutine, defer done, get the url, and close the body. Closing matters. An unclosed body keeps the connection out of the pool and quietly distorts the timing.
+g4 | N | normal | Step two. One handler that sleeps fifty milliseconds, and two servers. The H T T P two server is an unstarted test server with enable H T T P two switched on, then start T L S. Its client already trusts the generated certificate. The H T T P one point one server is a plain test server, with a client whose transport sets max conns per host to one.
+g5 | N | normal | Step three. Measure both, and assert. H T T P two must finish under half the serial ideal. H T T P one point one must take at least seventy percent of it. Thresholds, not exact numbers, so the test never flakes.
+g6 | N | normal | Measured on this machine, three hundred thirteen milliseconds against sixty eight. Pitfalls. Forgetting to close the body leaks connections. Calling t fatal f from inside a goroutine. And leaving out max conns per host, so Go quietly opens extra connections. H T T P three is not in the standard library as of Go one point twenty four. Add x net http three, or quic go.
+== s8 Trade-offs, failures and what to watch
+f1 | N | warn | The trade offs. H T T P two and three add real complexity. Frame parsing, flow control windows per stream and per connection, and for three, a full QUIC stack. A tiny internal service gains little. QUIC does loss recovery in user space, costing more C P U per byte than kernel T C P. Pick one point one when you control both ends, need no multiplexing, or are debugging, because it is easy to read on the wire.
+f2 | GUS | normal | I am Gus, the corporate firewall. I only recognize T C P. I block U D P on port four forty three. Fine by me. But your client must fall back. The Alt Svc header advertises H T T P three, so the fallback is explicit, not silent.
+f3 | N | normal | Failure one. Under packet loss, a single slow stream degrades the whole H T T P two connection. The fix, prefer H T T P three on lossy networks, or open a second H T T P two connection for latency sensitive traffic.
+f4 | N | warn | Failure two, the Rapid Reset attack. A flood of cheap reset stream frames drives a server's C P U to exhaustion, creating and tearing down streams. The fix, rate limit resets per connection, and cap concurrent streams with settings max concurrent streams.
+f5 | N | normal | Failure three. U D P blocked by a middlebox silently falls back to T C P. Rely on the client's automatic fallback through Alt Svc, and never assume H T T P three reached the server.
+f6 | N | calm | In production, Go's net http negotiates H T T P two automatically over T L S. g R P C requires H T T P two for streaming. Cloudflare, Fastly, Google and Akamai serve H T T P three at the edge. What to monitor. The negotiated protocol on every response, resp dot Proto in Go. Concurrent streams per connection. Stream reset rate. And QUIC packet loss and retransmission rate at the edge.
+== s9 Deep dive: the details that bite
+d1 | N | normal | Why pipelining really failed. Responses must return in request order, so one response that never returns, or an intermediary that reorders wrongly, wedges the whole connection. H T T P two solves the same goal without that hazard, because each stream is framed and identified on its own.
+d2 | N | normal | Flow control is per stream and per connection. Window update frames give every stream its own window, on top of a connection wide window, so one greedy stream cannot starve the others. This sits above T C P's own byte level flow control.
+d3 | N | warn | QUIC's zero R T T has a replay caveat. An attacker who captures the first packet can send it again. T L S one point three has the same caveat. Servers must accept zero R T T only for requests that are safe to run twice, idempotent gets, never anything that changes state.
+d4 | N | normal | Compression side channels. H pack and Q pack, like any compression over attacker influenced text, can leak through compressed size. That is the family of attacks including CRIME and BREACH. The mitigation, never compress sensitive headers together with attacker controlled ones across a trust boundary. Mostly a concern for proxies that mix trust levels.
+d5 | N | normal | And the uncertain future of priority. The old dependency tree is obsolete. R F C ninety two eighteen's extensible priority is one urgency from zero to seven, plus an incremental flag, used for both H T T P two and three. A server that ignores it is still conformant. It just offers no scheduling benefit.
+== s10 Interview round
+q0 | N | hook | Interview round. Ravi asks, Zara answers. Seven questions.
+iq1 | RAVI | question | Did H T T P two solve head of line blocking?
+ia1 | ZARA | normal | Only at the H T T P layer. Streams still share one T C P byte stream, so one lost segment stalls them all. H T T P three fixes it with loss recovery per stream.
+iq2 | RAVI | question | Why did browsers never use pipelining?
+ia2 | ZARA | normal | Responses must return in order, so one slow one blocks the rest, and some middlemen mishandled it. Parallel connections were safer, and that is the waste H T T P two removed.
+iq3 | RAVI | question | What does H pack compress, and why not just gzip the headers?
+ia3 | ZARA | normal | Table indexes plus Huffman coding. Gzip over headers that mix secrets and attacker text leaked through size, the CRIME and BREACH attacks. H pack and Q pack were designed with that history in mind.
+iq4 | RAVI | question | The trap. Is H T T P three just H T T P over U D P with no reliability?
+ia4 | ZARA | normal | No. QUIC adds reliable delivery, congestion control and encryption per stream. U D P is used to escape T C P's connection wide ordering.
+iq5 | RAVI | question | Why is server push deprecated, if it sounds so useful?
+ia5 | ZARA | normal | Pushed files were usually already cached, so it wasted bandwidth and confused invalidation. Chrome removed it in twenty twenty two. Use preload and Early Hints.
+iq6 | RAVI | question | What changes in a Go server for H T T P two, versus three?
+ia6 | ZARA | normal | Nothing for two. Net http negotiates h two over T L S with A L P N. Three needs a QUIC module, because it is a different transport.
+iq7 | RAVI | question | A client on flaky Wi Fi keeps stalling mid download. Which change helps most?
+ia7 | ZARA | normal | Move to H T T P three. Loss is isolated per stream, and the connection I D survives the switch from Wi Fi to cellular.
+== s11 Case closed: the summary
+s0 | N | calm | Eleven fifty nine. Zara turns on H T T P three at the edge, with H T T P two as the fallback. Noon. The sale opens, the train rolls through the tunnel, and the page still loads. Let us put it all together.
+s1a | N | normal | One. H T T P one point one asks for one thing at a time per connection, so browsers opened six, and pipelining failed.
+s1b | N | normal | Two. H T T P two multiplexes many streams over one T C P connection, with binary frames and H pack.
+s1c | N | normal | Three. That fixes blocking only at the H T T P layer. One lost T C P segment still stalls every stream.
+s1d | N | normal | Four. H T T P three runs the same model over QUIC on U D P, so loss recovery is per stream, with Q pack for headers.
+s1e | N | normal | Five. QUIC needs one round trip for a new connection, zero on resume with a replay caveat, and migrates by connection I D.
+s1f | N | normal | Six. Server push is dead. Use preload or Early Hints, and always keep a fallback through Alt Svc.
+s1g | N | calm | And the one line to keep. Each version fixes the previous one's bottleneck. Two shares one connection, three stops one lost packet from stalling every stream.
+== s12 Where to go next
+rn1 | N | calm | To go deeper, open the note, H T T P one point one versus two versus three, and its Go note, in your vault. Before it, read T C P, H T T P Fundamentals, and U D P and QUIC. After it, T L S and H T T P S, and H T T P Caching. And compare it with g R P C, and the Network Debugging Toolkit.
+e1 | RAVI | hook | Zara, that was ten minutes I will never forget.
+e2 | ZARA | punch | Next case, Ravi. Bring a coffee.

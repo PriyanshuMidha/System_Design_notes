@@ -9,13 +9,22 @@ sources:
   - "System V Application Binary Interface, AMD64 Architecture Processor Supplement (ELF)"
   - "Go documentation, cmd/link and cmd/cgo"
   - "Patterson & Hennessy, Computer Organization and Design, RISC-V Edition, ch. 4"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # How a Computer Runs a Program - Go
 
 > [!summary] TL;DR
 > A minimal register machine in about 60 lines of Go — five instructions, eight registers, one program counter — that makes [[How a Computer Runs a Program]]'s fetch-decode-execute loop runnable and steppable instead of only diagrammed.
+
+## Before the code
+
+- **Custom types (`type Opcode int`)**: give a plain `int` its own name so opcodes cannot be mixed up with other numbers.
+- **`iota` constants**: Go numbers each constant in the block automatically (0, 1, 2, ...), like an instruction set assigning opcode numbers.
+- **Structs and fixed arrays (`[8]int`)**: `CPU` and `Instr` group fields; an array has a size fixed at compile time, like a real register file.
+- **`for {}` with `switch`**: an endless loop that exits only via `return`; the `switch` picks the code path per opcode.
+- **`testing` package**: functions named `TestXxx` in `_test.go` files run with `go test`.
+- **What to run**: `go vet ./... && go test -race -v ./...` inside the module.
 
 ## What this code shows
 
@@ -53,7 +62,9 @@ classDiagram
     Run ..> Instr : fetches from a []Instr program
 ```
 
-The whole package is one function, `Run`, plus the two small types it operates on. There is no assembler, no linker, no loader here — only the fetch-decode-execute loop itself, which is the one piece of the pipeline a few dozen lines of Go can make fully concrete.
+The whole package is one function, `Run`, plus the two small types it operates on.
+
+There is no assembler, no linker, no loader here — only the fetch-decode-execute loop itself, which is the one piece of the pipeline a few dozen lines of Go can make fully concrete.
 
 ## Setup
 
@@ -65,7 +76,11 @@ The whole package is one function, `Run`, plus the two small types it operates o
 
 ### Step 1: instructions and CPU state
 
-**Concept.** This is [[How a Computer Runs a Program#2. Mental model]]'s "eight sticky notes and a pointer finger" made literal as Go types. `CPU` holds exactly the state that survives between instructions — registers and the program counter — matching the note's claim that registers are the CPU's only directly-addressable storage. `Instr` is a fixed-shape value (an opcode plus up to three integer operands) rather than, say, a string to parse, because a real CPU's instructions are fixed-width binary, not text — parsing text at execution time would misrepresent the mechanism being taught.
+**Concept.** This is [[How a Computer Runs a Program#2. Mental model]]'s "eight sticky notes and a pointer finger" made literal as Go types.
+
+`CPU` holds exactly the state that survives between instructions — registers and the program counter — matching the note's claim that registers are the CPU's only directly-addressable storage.
+
+`Instr` is a fixed-shape value (an opcode plus up to three integer operands) rather than, say, a string to parse, because a real CPU's instructions are fixed-width binary, not text — parsing text at execution time would misrepresent the mechanism being taught.
 
 ```go
 // Package fde is a minimal fetch-decode-execute loop: a tiny register machine
@@ -116,7 +131,9 @@ type CPU struct {
 
 ### Step 2: the loop itself
 
-**Concept.** `Run` *is* [[How a Computer Runs a Program#3.1 The fetch-decode-execute cycle]]: the `for` loop's body does fetch (`program[c.PC]`), decode (the `switch` on `instr.Op`), and execute (each `case`'s body) on every single iteration, exactly mirroring the note's three-stage diagram. There is no separate "decode" step producing control signals the way real hardware does — the Go `switch` statement collapses decode and execute into one dispatch, which is the one simplification this teaching version takes versus real silicon.
+**Concept.** `Run` *is* [[How a Computer Runs a Program#3.1 The fetch-decode-execute cycle]]: the `for` loop's body does fetch (`program[c.PC]`), decode (the `switch` on `instr.Op`), and execute (each `case`'s body) on every single iteration, exactly mirroring the note's three-stage diagram.
+
+There is no separate "decode" step producing control signals the way real hardware does — the Go `switch` statement collapses decode and execute into one dispatch, which is the one simplification this teaching version takes versus real silicon.
 
 ```go
 // Run executes program starting at PC=0 until OpHalt, and returns the final
@@ -200,7 +217,9 @@ sequenceDiagram
 
 ### TestCountdownSumsFiveToOne
 
-**Property.** A small loop program — set a counter to 5, then repeatedly add the counter to an accumulator and decrement it until it hits zero — must produce the correct sum (`5+4+3+2+1 = 15`) and must actually execute at least one fetch-decode-execute cycle to get there. This directly exercises every opcode except nothing is skipped: `OpLoadConst` (three times, for the initial values), `OpJumpIfZero` (both as the loop test and as the unconditional jump back), `OpAdd`, `OpSub`, and `OpHalt`.
+**Property.** A small loop program — set a counter to 5, then repeatedly add the counter to an accumulator and decrement it until it hits zero — must produce the correct sum (`5+4+3+2+1 = 15`) and must actually execute at least one fetch-decode-execute cycle to get there.
+
+This directly exercises every opcode except nothing is skipped: `OpLoadConst` (three times, for the initial values), `OpJumpIfZero` (both as the loop test and as the unconditional jump back), `OpAdd`, `OpSub`, and `OpHalt`.
 
 | Register | Role | Starting value |
 | --- | --- | --- |
@@ -248,7 +267,9 @@ func TestCountdownSumsFiveToOne(t *testing.T) {
 5. `cpu.Reg[1]` after the loop fully unwinds holds `5+4+3+2+1 = 15`, checked directly against the hand-computed expected sum.
 6. `cpu.Cycles == 0` would only be possible if `Run` returned without executing a single instruction — asserting it's nonzero is a basic sanity check that the loop body actually ran.
 
-**If it fails.** A wrong accumulator value with `Cycles > 0` points at an opcode's execute logic (most likely `OpAdd`, `OpSub`, or the jump-target math). A test that never returns (hangs) points at `OpJumpIfZero`'s branch condition or target, most likely the "unconditional jump back" at instruction 6 looping forever instead of being gated correctly by instruction 3's exit check.
+**If it fails.** A wrong accumulator value with `Cycles > 0` points at an opcode's execute logic (most likely `OpAdd`, `OpSub`, or the jump-target math).
+
+A test that never returns (hangs) points at `OpJumpIfZero`'s branch condition or target, most likely the "unconditional jump back" at instruction 6 looping forever instead of being gated correctly by instruction 3's exit check.
 
 **Measured** (Go 1.24.4, `go vet` and `go test -race`):
 

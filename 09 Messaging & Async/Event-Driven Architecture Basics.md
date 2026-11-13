@@ -9,7 +9,7 @@ sources:
   - "CloudEvents specification v1.0.2 (CNCF): required attributes id, source, specversion, type"
   - "Gregor Hohpe and Bobby Woolf, Enterprise Integration Patterns (2003): Command Message, Event Message, Document Message"
   - "Chris Richardson, Microservices Patterns (2018): choreography- and orchestration-based sagas"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Event-Driven Architecture Basics
@@ -24,11 +24,63 @@ updated: 2026-11-04
 > - Events arrive late, twice or out of order. Consumers must cope, and publishers must publish reliably (outbox).
 > - Classic mistake: an "event" that is really a command in disguise (`SendWelcomeEmail`), which couples the publisher to one consumer.
 
+## Start here: the basics
+
+**The problem in one story.**
+You buy shoes online. The shop must charge your card, email a receipt, add loyalty points and update stock.
+If the checkout code phones each of those teams one by one, any one of them being down breaks your purchase.
+Instead, checkout just shouts "order placed!" and each team listens and does its own job.
+That shout is an event, and building systems around such shouts is event-driven architecture.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Service | A separately deployed program that owns one job | The payments service |
+| Synchronous call | Caller waits for the answer before moving on | HTTP `POST /charge` and wait |
+| Asynchronous | Send now, the work happens later without waiting | Drop a letter in a postbox |
+| Message broker / event bus | A server that holds messages between senders and receivers | Kafka, RabbitMQ, SNS |
+| Publish / subscribe | Sender posts a message; anyone interested receives a copy | Email and loyalty both get `order.placed` |
+| Coupling | How much one service must know or change because of another | Orders must redeploy when email changes |
+| Eventually consistent | All copies agree, but only after a short delay | Points show up 2 seconds after checkout |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    O["Orders service"] -->|"order.placed"| B{{"Event bus"}}
+    B --> P["Payments"]
+    B --> E["Email"]
+    B --> L["Loyalty"]
+    B --> A["Analytics"]
+```
+
+**Analogy.** A town notice board: the bakery pins a notice, and whoever cares reads it and acts. The bakery does not phone anyone.
+Where it breaks: a paper notice is read once and in order; real events can arrive twice, late or out of order.
+
+**How the rest of this note builds up**
+
+- First, why events exist (section 1) and the event vs command vs query vocabulary (section 2).
+- Then how it works: notification vs state transfer, choreography vs orchestration (section 3), with a worked Go example (section 4).
+- Then variants, trade-offs and when not to use events (sections 5-6).
+- Finally the SDE-3 deep dive: production issues (section 7), fat vs thin events and versioning (section 8), then interview questions and a cheat sheet (sections 9-10).
+
+> [!tip] Remember
+> An event says "this happened" to anyone listening; a command says "do this" to one receiver.
+
 ## 1. Why it exists
 
-An orders service in a monolith-turned-microservices system calls, on every checkout: payments, inventory, email, loyalty, analytics and fraud. That is 6 synchronous calls. If each is 99.9% available, the chain is about 0.999^6 ≈ 99.4% available, so roughly 6 in 1,000 checkouts hit some failure (an estimate that assumes independent failures). Each new team that wants to "know about orders" needs a code change and a deploy of the orders service.
+An orders service in a monolith-turned-microservices system calls, on every checkout: payments, inventory, email, loyalty, analytics and fraud. That is 6 synchronous calls.
 
-With events, the orders service commits the order and publishes `order.placed`. Payments, email, loyalty, analytics and fraud subscribe. The orders service no longer changes when the 7th consumer arrives, and an email outage does not fail checkouts. The cost: the business process "place order" now lives in six codebases, and its state is **eventually consistent** (the loyalty balance is updated a few hundred milliseconds or minutes later, not inside the checkout transaction).
+If each is 99.9% available, the chain is about 0.999^6 ≈ 99.4% available, so roughly 6 in 1,000 checkouts hit some failure (an estimate that assumes independent failures).
+
+Each new team that wants to "know about orders" needs a code change and a deploy of the orders service.
+
+With events, the orders service commits the order and publishes `order.placed`. Payments, email, loyalty, analytics and fraud subscribe.
+
+The orders service no longer changes when the 7th consumer arrives, and an email outage does not fail checkouts.
+
+The cost: the business process "place order" now lives in six codebases, and its state is **eventually consistent** (the loyalty balance is updated a few hundred milliseconds or minutes later, not inside the checkout transaction).
 
 ## 2. Mental model
 
@@ -363,7 +415,11 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 
 **Where to draw event boundaries.** Events are most stable when they cross a bounded context boundary ([[Domain-Driven Design - Strategic Design]]). Inside one context, use domain events in-process; at the edge, publish **integration events** with a deliberately smaller, stable schema. Publishing internal domain events directly leaks your model and freezes it.
 
-**Fat vs thin is a spectrum, and "delta" events are a trap.** An event like `order.updated {changed: {status: "paid"}}` forces every consumer to have seen all earlier deltas in order. Prefer either a thin notification or a full snapshot of the fields consumers need. Snapshots make reordering harmless if each carries a version: the consumer applies an event only if `event.version > stored.version`.
+**Fat vs thin is a spectrum, and "delta" events are a trap.**
+
+An event like `order.updated {changed: {status: "paid"}}` forces every consumer to have seen all earlier deltas in order.
+
+Prefer either a thin notification or a full snapshot of the fields consumers need. Snapshots make reordering harmless if each carries a version: the consumer applies an event only if `event.version > stored.version`.
 
 **Ordering scope.** A broker orders events per partition, per message group, or per queue. Put all events for one aggregate (one order) under the same key so they stay ordered relative to each other. Across aggregates there is no order, and you should not need one.
 
@@ -408,3 +464,8 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 - **Before this:** [[Queues vs Streams and Broker Comparison]], [[Monolith vs Microservices]]
 - **Next:** [[Background Jobs and Worker Pools]], [[Transactional Outbox and CDC]], [[Event Schemas and Schema Registry]]
 - **Compare with:** [[Saga Pattern]], [[Event Sourcing]], [[CQRS]], [[Workflow Engines and Durable Execution]]
+
+### Watch on YouTube
+
+- [Event-Driven Architecture(EDA) vs. Request/Response (RR): System Design Explained](https://www.youtube.com/watch?v=7fkS-18KBlw) · Confluent, an IBM Company · 12 min · 311,560 views
+- [What's an Event Driven System?](https://www.youtube.com/watch?v=rJHTK2TfZ1I) · Gaurav Sen · 14 min · 434,302 views

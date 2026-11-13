@@ -6,7 +6,7 @@ related: ["[[CSRF, XSS and Security Headers]]", "[[API Abuse and Bot Protection]
 sources:
   - "OWASP API Security Top 10 2023"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # OWASP API Security Top 10
@@ -20,6 +20,52 @@ updated: 2026-11-07
 > - API1 (BOLA) and API5 (BFLA) are the two most common and most expensive to get wrong — they are an authorization bug one query away from a direct fix.
 > - This note owns the security *concepts*; the Go implementation of authz middleware lives in [[Authentication and Authorization in Go]], and request-shape hardening lives in [[Secure Coding for Go Services]].
 
+## Start here: the basics
+
+**The problem in one story.**
+A shopping app shows your order at `/orders/1001`.
+You change the URL to `/orders/1002` and see a stranger's address.
+The login worked fine; the API just never checked the order was yours.
+The OWASP API Top 10 is a list of the ten most common mistakes like this.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| API | A URL other programs call to read or change data | `GET /orders/1001` |
+| Authentication | Checking who the caller is | Validating a login token |
+| Authorization | Checking what that caller may do | Only the owner can read an order |
+| Object ID | The identifier of one record in a URL or body | `1001` in `/orders/1001` |
+| BOLA | Broken Object Level Authorization: no ownership check per record | Reading order 1002 that isn't yours |
+| Rate limit | A cap on how many calls a caller can make | 100 requests per minute |
+| SSRF | Tricking the server into fetching a URL the attacker picks | Server fetching `http://169.254.169.254/` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request"] --> AN{"Who are you?<br/>(authentication)"}
+    AN -- "ok" --> AZ{"May you touch<br/>THIS object?"}
+    AZ -- "yes" --> V{"Input valid,<br/>within limits?"}
+    V -- "yes" --> H["Handler runs"]
+    AN -- "no" --> X["401 / 403 / 429"]
+    AZ -- "no" --> X
+    V -- "no" --> X
+```
+
+**Analogy.** A hotel where the front desk checks your ID at the door but every room key opens every room. Getting in is checked; which room you enter is not.
+Where it breaks: a hotel has a handful of doors; an API has thousands of object IDs and fields, so every one needs its own check in code.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then the ten risks one by one (section 3) and a worked example fixing them in Go (section 4).
+- Then how the API list compares with the web Top 10 (section 5).
+- Finally the SDE-3 deep dive: defense layering, production tooling and the subtle cases like mass assignment and SSRF (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> Most API breaches are not broken crypto; they are a missing "is this object yours?" check.
+
 ## 1. Why it exists
 
 A ride-hailing API exposes `GET /api/v1/trips/{tripId}`. The backend checks that the caller has a valid session, loads the trip by `tripId`, and returns it:
@@ -29,11 +75,17 @@ trip, _ := db.GetTripByID(tripID) // no ownership check
 json.NewEncoder(w).Encode(trip)
 ```
 
-Trip IDs are sequential integers. An authenticated user who was shown trip `48213` for their own ride can change the URL to `48214`, `48215`, … and read every other rider's pickup and drop-off addresses, fare, and driver's name. Nothing was "hacked" — the attacker used their own valid login and the documented endpoint. The bug is that the server authenticated *who is calling* but never authorized *whether they may see this specific object*. This single pattern — **Broken Object Level Authorization (BOLA)** — has been OWASP's #1 API risk in both the 2019 and 2023 editions, because it is easy to introduce (one missing `WHERE owner_id = ?`) and devastating once found (every sequential ID is a free enumeration).
+Trip IDs are sequential integers. An authenticated user who was shown trip `48213` for their own ride can change the URL to `48214`, `48215`, … and read every other rider's pickup and drop-off addresses, fare, and driver's name.
+
+Nothing was "hacked" — the attacker used their own valid login and the documented endpoint. The bug is that the server authenticated *who is calling* but never authorized *whether they may see this specific object*.
+
+This single pattern — **Broken Object Level Authorization (BOLA)** — has been OWASP's #1 API risk in both the 2019 and 2023 editions, because it is easy to introduce (one missing `WHERE owner_id = ?`) and devastating once found (every sequential ID is a free enumeration).
 
 ## 2. Mental model
 
-Think of each API endpoint as a door with two separate locks: an **authentication** lock (do you have a valid key at all?) and an **authorization** lock (does *this specific key* open *this specific door*?). Most of this list is incidents where only the first lock was installed. BOLA is "any valid key opens every room's door." BFLA is "any valid key opens the staff-only doors too." Unrestricted resource consumption is "the door has no limit on how many times per second you can walk through it." Treat every item below as: which lock is missing, and on what resource?
+Think of each API endpoint as a door with two separate locks: an **authentication** lock (do you have a valid key at all?) and an **authorization** lock (does *this specific key* open *this specific door*?).
+
+Most of this list is incidents where only the first lock was installed. BOLA is "any valid key opens every room's door." BFLA is "any valid key opens the staff-only doors too." Unrestricted resource consumption is "the door has no limit on how many times per second you can walk through it." Treat every item below as: which lock is missing, and on what resource?
 
 ## 3. How it works
 
@@ -90,7 +142,9 @@ sequenceDiagram
     Gateway-->>Client: 404 Not Found
 ```
 
-The gateway can confirm the token is genuine (API2) and even do coarse role checks, but it cannot know which specific order belongs to which user — that object-level check has to run in the service, against the database, on every single request. This is why BOLA keeps recurring in audits: teams correctly centralize authentication at the edge and then assume authorization is "handled," when object-level authorization is a per-endpoint, per-query responsibility that a gateway structurally cannot do for you.
+The gateway can confirm the token is genuine (API2) and even do coarse role checks, but it cannot know which specific order belongs to which user — that object-level check has to run in the service, against the database, on every single request.
+
+This is why BOLA keeps recurring in audits: teams correctly centralize authentication at the edge and then assume authorization is "handled," when object-level authorization is a per-endpoint, per-query responsibility that a gateway structurally cannot do for you.
 
 ## 4. Worked example
 
@@ -302,3 +356,8 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
 - **Before this:** [[CSRF, XSS and Security Headers]], [[Authentication vs Authorization]]
 - **Next:** [[Secrets Management]], [[API Abuse and Bot Protection]]
 - **Compare with:** [[CSRF, XSS and Security Headers]] (browser-side attack surface vs this note's server-side authorization surface), [[Rate Limiting - Algorithms and Distributed Design]] (the algorithms behind API4's limits), [[Authentication and Authorization in Go]] and [[Secure Coding for Go Services]] (the Go implementation of these checks)
+
+### Watch on YouTube
+
+- [OWASP API Security Top 10 Course – Secure Your Web Apps](https://www.youtube.com/watch?v=YYe0FdfdgDU) · freeCodeCamp.org · 87 min · 134,006 views
+- [Top 12 Tips For API Security](https://www.youtube.com/watch?v=6WZ6S-qmtqY) · ByteByteGo · 9 min · 251,401 views

@@ -10,7 +10,7 @@ sources:
   - "Edge et al., From Local to Global: A Graph RAG Approach to Query-Focused Summarization (Microsoft Research, 2024)"
   - "Yan et al., Corrective Retrieval Augmented Generation (2024)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Advanced RAG Patterns
@@ -26,6 +26,50 @@ updated: 2026-11-07
 > - Agentic and corrective RAG fix retrieval when you can't know ahead of time that one pass will be enough — the model inspects what came back and decides whether to retry.
 > - Every pattern here costs an extra LLM or embedding call (sometimes several) and adds latency; add one only once you've measured, with [[RAG Evaluation]], which specific failure you have.
 
+## Start here: the basics
+
+**The problem in one story.**
+A company bot searches its documents before answering.
+You ask "What changed in the refund policy after 2024?" and it returns an old 2022 page.
+The search found similar words, not the right document.
+Advanced RAG adds one small extra step to fix each kind of miss like this.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| RAG | Search your documents, then let the LLM answer using what was found | Support bot quoting the manual |
+| Chunk | A small piece of a document stored for search | One paragraph of a PDF |
+| Embedding | A list of numbers that captures a text's meaning | "refund" and "money back" land close |
+| Retrieval | Fetching the chunks most similar to the question | Top 5 chunks for the query |
+| Metadata filter | A hard rule on stored fields, not on meaning | `year > 2024` |
+| Corpus | The full set of documents you search | All HR policy docs |
+| Multi-hop | An answer needing facts from two or more documents | "Who manages the author of doc X?" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Q["Question"] --> F["Fix step<br/>(rewrite, route, filter)"]
+    F --> R["Retrieve chunks"]
+    R --> C{"Good enough?"}
+    C -- "no" --> F
+    C -- "yes" --> G["LLM writes answer"]
+```
+
+**Analogy.** Plain RAG is a person who searches a library once with your exact words. Advanced RAG lets them rephrase, ask a librarian, filter by year, or search again.
+Where it breaks: every extra trick costs an extra model call, so it adds latency and money a real person's second look does not.
+
+**How the rest of this note builds up**
+
+- First, which failures of the single-pass pipeline these patterns fix (section 1) and the library mental model (section 2).
+- Then each pattern in turn: rewriting and HyDE, routing, self-query, parent-child, contextual retrieval, GraphRAG, agentic RAG (section 3).
+- Then a Go worked example (section 4) and a comparison of patterns with trade-offs (sections 5-6).
+- Finally production advice, the SDE-3 deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Measure which retrieval failure you have first, then add the one pattern that fixes it.
+
 ## 1. Why it exists
 
 The single-pass query pipeline in [[RAG Pipeline]] has a specific failure mode built into it: it takes the user's literal question, embeds it once, and searches once. That is fine until one of these happens:
@@ -40,7 +84,17 @@ Each of these is a different, specific failure, and a different pattern below is
 
 ## 2. Mental model
 
-A single-pass retriever is a person who hears a question once, searches for it once, and reads back whatever came up — brittle if the question was oddly phrased, needed a different shelf of the library, or needed two books combined. An advanced-RAG pipeline is the same person given permission to: rephrase the question before searching (query rewriting/HyDE), ask a librarian which section to search first (routing), tell the librarian "only books published after 2024" (self-query filters), pull the whole chapter once they find the right paragraph (parent-child chunking), write a short note on each page's margin before filing it so a page out of context still makes sense (contextual retrieval), follow citations between books (GraphRAG), and glance at what they found before answering — going back for another search if it looks thin (agentic/corrective RAG).
+A single-pass retriever is a person who hears a question once, searches for it once, and reads back whatever came up — brittle if the question was oddly phrased, needed a different shelf of the library, or needed two books combined.
+
+An advanced-RAG pipeline is the same person given permission to:
+
+- rephrase the question before searching (query rewriting/HyDE),
+- ask a librarian which section to search first (routing),
+- tell the librarian "only books published after 2024" (self-query filters),
+- pull the whole chapter once they find the right paragraph (parent-child chunking),
+- write a short note on each page's margin before filing it so a page out of context still makes sense (contextual retrieval),
+- follow citations between books (GraphRAG),
+- and glance at what they found before answering — going back for another search if it looks thin (agentic/corrective RAG).
 
 ## 3. How it works
 
@@ -87,11 +141,19 @@ flowchart TD
 
 ### Self-query filters
 
-A **self-query** retriever asks the LLM to split a natural-language question into a semantic part and a structured metadata filter: `"tickets about login errors from last week priced under $50"` becomes a vector search on `"login errors"` plus a filter `created_at > now() - 7d AND price < 50`. Done correctly, this avoids two failure modes at once: a pure vector search that has no idea `last week` means a date range, and a pure metadata-filter search that can't handle `login errors` (a semantic, not exact, concept). The parsed filter is only as good as the metadata the ingestion pipeline actually attached to each chunk — see [[Document Ingestion and Chunking]].
+A **self-query** retriever asks the LLM to split a natural-language question into a semantic part and a structured metadata filter:
+
+`"tickets about login errors from last week priced under $50"` becomes a vector search on `"login errors"` plus a filter `created_at > now() - 7d AND price < 50`.
+
+Done correctly, this avoids two failure modes at once: a pure vector search that has no idea `last week` means a date range, and a pure metadata-filter search that can't handle `login errors` (a semantic, not exact, concept).
+
+The parsed filter is only as good as the metadata the ingestion pipeline actually attached to each chunk — see [[Document Ingestion and Chunking]].
 
 ### Parent-child (small-to-big) retrieval and contextual retrieval
 
-Small chunks (a paragraph or two) embed well: they're focused, so their vector is a precise summary of one idea, which is exactly what you want when the embedding is doing the matching. But a small chunk, read alone at generation time, is often too little context for the LLM to answer from in full — it's answering from a paragraph with no idea what document, section, or surrounding argument it came from.
+Small chunks (a paragraph or two) embed well: they're focused, so their vector is a precise summary of one idea, which is exactly what you want when the embedding is doing the matching.
+
+But a small chunk, read alone at generation time, is often too little context for the LLM to answer from in full — it's answering from a paragraph with no idea what document, section, or surrounding argument it came from.
 
 **Parent-child chunking** resolves this by indexing the small chunk (the "child") for retrieval, but storing a pointer to a larger surrounding unit (the "parent" — the full section or page) and handing the *parent* to the LLM once the child is matched. You get precise retrieval and generous generation context from the same chunking pass, at the cost of storing (and sometimes de-duplicating) both sizes.
 
@@ -110,13 +172,19 @@ flowchart LR
 
 ### Multi-hop retrieval and GraphRAG
 
-Some questions can't be answered by any single retrieved chunk, because the answer is a combination of facts that live in different documents (`which vendors are affected by both the EU and California privacy changes?`). **Multi-hop retrieval** answers these iteratively: retrieve, extract an intermediate fact or entity from what came back, then retrieve again using that fact as part of the next query, repeating until enough has been gathered to answer.
+Some questions can't be answered by any single retrieved chunk, because the answer is a combination of facts that live in different documents (`which vendors are affected by both the EU and California privacy changes?`).
+
+**Multi-hop retrieval** answers these iteratively: retrieve, extract an intermediate fact or entity from what came back, then retrieve again using that fact as part of the next query, repeating until enough has been gathered to answer.
 
 **GraphRAG** (Microsoft Research, 2024) builds this capability into the index itself instead of improvising it per query: an indexing-time LLM pass extracts entities and relationships from the corpus into a knowledge graph, and (in the original design) clusters that graph into communities with LLM-written summaries at each level. At query time, retrieval can then walk graph edges between entities (answering "how is X connected to Y") or pull a community summary (answering a broad, corpus-wide question a single chunk could never cover, like "what are the main themes across all these documents?"). This is a meaningfully heavier indexing pipeline — extraction and summarization passes over the whole corpus, re-run as it changes — so it earns its cost mainly for a smaller, relationship-dense corpus (an investigation, a knowledge base explicitly about how things relate) rather than as a default upgrade to plain chunk-and-embed indexing.
 
 ### Agentic and corrective RAG
 
-Every pattern so far still runs a fixed, pre-decided sequence of steps. **Agentic RAG** instead gives the model the retrieval tool itself (see [[Structured Outputs and Tool Calling]] and [[AI Agents and Agentic Workflows]]) and lets it decide, per question, whether to retrieve at all, what to search for, and whether one search was enough — as opposed to a developer-authored RAG pipeline that always retrieves exactly once in a fixed way. This is naturally suited to multi-hop questions, since the model can issue a second, follow-up search informed by what the first one returned.
+Every pattern so far still runs a fixed, pre-decided sequence of steps.
+
+**Agentic RAG** instead gives the model the retrieval tool itself (see [[Structured Outputs and Tool Calling]] and [[AI Agents and Agentic Workflows]]) and lets it decide, per question, whether to retrieve at all, what to search for, and whether one search was enough — as opposed to a developer-authored RAG pipeline that always retrieves exactly once in a fixed way.
+
+This is naturally suited to multi-hop questions, since the model can issue a second, follow-up search informed by what the first one returned.
 
 **Corrective RAG** (CRAG) is a narrower, cheaper version of the same idea: after retrieval, a lightweight evaluator (a small classifier or an LLM judge) grades the retrieved chunks as *correct* (confidently relevant — proceed as normal), *ambiguous* (mixed relevance — keep the good parts, possibly supplement with a web search or alternate source), or *incorrect* (nothing relevant — fall back to a different retrieval strategy, a broader search, or an honest "I don't know" rather than generating from bad context). It adds one grading step rather than open-ended agent autonomy, which makes it cheaper and more predictable to operate.
 
@@ -126,7 +194,9 @@ Every pattern so far still runs a fixed, pre-decided sequence of steps. **Agenti
 
 ## 4. Worked example
 
-The code below implements the mechanism behind multi-query retrieval and routing: Reciprocal Rank Fusion over several ranked result lists, and a small rule-based router choosing a retrieval strategy. `QueryRewriter` and `Retriever` are interfaces — in production the rewriter calls an LLM (`claude-haiku-5-5` is a reasonable, cheap choice for a rewrite call as of 2026) and the retriever embeds and searches a real vector index; here, both are fakes, so the fusion and routing logic is tested without any network call or API key.
+The code below implements the mechanism behind multi-query retrieval and routing: Reciprocal Rank Fusion over several ranked result lists, and a small rule-based router choosing a retrieval strategy.
+
+`QueryRewriter` and `Retriever` are interfaces — in production the rewriter calls an LLM (`claude-haiku-5-5` is a reasonable, cheap choice for a rewrite call as of 2026) and the retriever embeds and searches a real vector index; here, both are fakes, so the fusion and routing logic is tested without any network call or API key.
 
 ```go
 // Package ragpatterns implements the fusion math behind multi-query
@@ -494,3 +564,8 @@ ok  	ragpatterns	1.56s
 - **Before this:** [[RAG Pipeline]], [[Keyword, Semantic and Hybrid Search]]
 - **Next:** [[RAG Evaluation]], [[AI Agents and Agentic Workflows]]
 - **Compare with:** [[Vector Databases and ANN Indexes]] (the index these patterns retrieve against), [[Document Ingestion and Chunking]] (parent-child and contextual retrieval both start at ingestion time)
+
+### Watch on YouTube
+
+- [Going Meta - Ep 23: Advanced RAG patterns with Knowledge Graphs](https://www.youtube.com/watch?v=E_JO4-2D5Xs) · Neo4j · 64 min · 9,047 views
+- [AWS re:Invent 2025 - Advanced RAG Architectures: From Basic Retrieval to Agentic RAG  (NTA403)](https://www.youtube.com/watch?v=ADrUp2cEdKg) · AWS Events · 52 min · 5,125 views

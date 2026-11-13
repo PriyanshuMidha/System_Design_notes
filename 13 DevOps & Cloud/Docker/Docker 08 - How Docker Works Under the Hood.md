@@ -9,7 +9,7 @@ sources:
   - "containerd documentation, containerd.io"
   - "runc source and man-pages: namespaces(7), cgroups(7)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 08 - How Docker Works Under the Hood
@@ -23,13 +23,73 @@ updated: 2026-11-07
 > - The filesystem a container sees is **overlay2**: read-only image layers stacked under one writable layer, merged into a single view.
 > - Classic mistake: thinking a container is a lightweight VM. It is one Linux process tree with restricted visibility — there is no second kernel underneath it.
 
+## Start here: the basics
+
+**The problem in one story**
+
+You type `docker run nginx` and a "machine" is up in under a second.
+A virtual machine would take far longer to boot.
+So what is actually running? Not a tiny computer: just a normal Linux program.
+The kernel has been told to hide the rest of the system from it and to cap what it can use.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Kernel | The core of the OS that manages CPU, memory, files and devices | Linux kernel |
+| Process | A running program, with an ID (PID) | `nginx` as PID 4321 |
+| Virtual machine (VM) | Emulated hardware running its own full OS and kernel | A VirtualBox guest |
+| Daemon | A background program that waits for requests | `dockerd` |
+| Namespace | A kernel feature limiting what a process can *see* | Own process list, own network |
+| cgroup | A kernel feature limiting what a process can *use* | Max 512 MiB RAM |
+| Filesystem layer | One read-only slice of files in an image | "Go binary added" layer |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    CLI["docker CLI"] --> D["dockerd"]
+    D --> C["containerd"]
+    C --> R["runc"]
+    R --> P["Your process<br/>(namespaces + cgroup + overlay2)"]
+    P --> K["Shared host kernel"]
+```
+
+**Analogy**
+
+A container is like an office worker in a cubicle with frosted walls and a meter on the power socket: they only see their desk (namespaces) and can only draw so much power (cgroups).
+Where it breaks: every cubicle sits in the same building on the same foundations (one kernel), so a crack in the foundation affects everyone, unlike separate buildings (VMs).
+
+**How the rest of this note builds up**
+
+- First, why a process plus kernel tricks beats a VM for start time, and the mental model of one shared kernel.
+- Then the `docker run` call chain: CLI → dockerd → containerd → shim → runc.
+- Then the three mechanisms: namespaces, cgroups v2 and overlay2, with a Go cgroup-memory parser and BuildKit caching.
+- Finally the SDE-3 deep dive: OCI specs, the shim, rootless Docker and `--privileged`.
+
+> [!tip] Remember
+> A container is one Linux process with a restricted view (namespaces) and a budget (cgroups) on a shared kernel.
+
 ## 1. Why it exists
 
-A VM needs a hypervisor, a full guest kernel, and minutes to boot because it virtualizes hardware. A process just needs the kernel to lie to it convincingly: "you are PID 1, you are the only thing on this network, this is the whole filesystem." Linux has had the primitives for that lie since kernel 2.6.24 introduced cgroups (2008) and user namespaces matured around 3.8 (2013) — Docker (2013) packaged those primitives behind one CLI and one image format, which is the entire reason containers start in milliseconds and VMs take seconds to minutes: a container skips boot, kernel init, and guest-OS overhead entirely, because there is no guest OS.
+A VM needs a hypervisor, a full guest kernel, and minutes to boot because it virtualizes hardware.
+
+A process just needs the kernel to lie to it convincingly: "you are PID 1, you are the only thing on this network, this is the whole filesystem."
+
+Linux has had the primitives for that lie since kernel 2.6.24 introduced cgroups (2008) and user namespaces matured around 3.8 (2013). Docker (2013) packaged those primitives behind one CLI and one image format.
+
+That is the entire reason containers start in milliseconds and VMs take seconds to minutes: a container skips boot, kernel init, and guest-OS overhead entirely, because there is no guest OS.
 
 ## 2. Mental model
 
-Picture one Linux host with one running kernel. Each container is a normal process tree that the kernel has been told to show a restricted view of reality: its own root filesystem (via a mount namespace plus overlay2), its own `eth0` and routing table (a network namespace), its own PID 1 (a PID namespace, so it can't see or signal host processes), and a leash on how much CPU, memory, and PIDs it may use (a cgroup). Nothing here is an emulated CPU or a second kernel — a container escape is dangerous precisely because the kernel really is shared.
+Picture one Linux host with one running kernel. Each container is a normal process tree that the kernel has been told to show a restricted view of reality:
+
+- its own root filesystem (via a mount namespace plus overlay2),
+- its own `eth0` and routing table (a network namespace),
+- its own PID 1 (a PID namespace, so it can't see or signal host processes),
+- and a leash on how much CPU, memory, and PIDs it may use (a cgroup).
+
+Nothing here is an emulated CPU or a second kernel — a container escape is dangerous precisely because the kernel really is shared.
 
 ## 3. How it works
 
@@ -55,7 +115,9 @@ sequenceDiagram
     D-->>U: container ID
 ```
 
-`runc` itself exits once the container's process is running — it is not a supervisor. `containerd-shim` is the long-lived process per container: it keeps stdin/stdout/stderr open, reports exit status, and crucially lets `dockerd` (or even the whole Docker Engine) restart without killing running containers, since the shim — not dockerd — is the container's actual parent.
+`runc` itself exits once the container's process is running — it is not a supervisor.
+
+`containerd-shim` is the long-lived process per container: it keeps stdin/stdout/stderr open, reports exit status, and crucially lets `dockerd` (or even the whole Docker Engine) restart without killing running containers, since the shim — not dockerd — is the container's actual parent.
 
 ### Namespaces: what the process can see
 
@@ -118,7 +180,11 @@ flowchart TB
     UP -- "writes land here; reads of untouched files fall through to lowerdir" --> MERGED
 ```
 
-Reading a file walks top-down through the stacked layers until one of them has it. Writing triggers **copy-up**: the file is copied into `upperdir` first, then modified there — the underlying image layer is never touched, which is what makes one image shareable as the read-only base for many running containers at once, and what "the writable layer is ephemeral" (`docker rm` discards `upperdir`) actually means mechanically.
+Reading a file walks top-down through the stacked layers until one of them has it.
+
+Writing triggers **copy-up**: the file is copied into `upperdir` first, then modified there — the underlying image layer is never touched.
+
+That is what makes one image shareable as the read-only base for many running containers at once, and what "the writable layer is ephemeral" (`docker rm` discards `upperdir`) actually means mechanically.
 
 ## 4. Worked example
 
@@ -232,7 +298,9 @@ func TestUsagePercentNoLimit(t *testing.T) {
 
 ### BuildKit's cache invalidation, traced
 
-BuildKit (the default `docker build` backend since Docker Engine 23.0, replacing the legacy builder) hashes each instruction together with its inputs; the **first instruction whose hash changes invalidates every layer below it**, regardless of which lines changed:
+BuildKit (the default `docker build` backend since Docker Engine 23.0, replacing the legacy builder) hashes each instruction together with its inputs.
+
+The **first instruction whose hash changes invalidates every layer below it**, regardless of which lines changed:
 
 ```dockerfile
 FROM golang:1.24
@@ -315,3 +383,8 @@ Reordering `COPY go.mod go.sum ./` before `COPY . .` means an application-code c
 - **Before this:** [[Docker 02 - Images, Layers and Containers]], [[Docker 03 - CLI Essentials]]
 - **Next:** [[Docker 09 - Container Security and Hardening]]
 - **Compare with:** [[Docker 04 - Writing a Production Dockerfile for Go]] (BuildKit cache ordering in practice), [[Kubernetes Fundamentals]] (containerd as the node runtime)
+
+### Watch on YouTube
+
+- [How Docker Works Under the Hood: A Container Is Just a Process](https://www.youtube.com/watch?v=6_bq2iT3riA) · Beneath the Abstraction · 4 min · 8 views
+- [How Docker REALLY Works Under the Hood (Containers Explained)  #docker #devops #programming](https://www.youtube.com/watch?v=DaBxnaCwJ2s) · DevOps Corner · 8 min · 148 views

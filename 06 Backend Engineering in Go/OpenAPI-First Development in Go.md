@@ -9,7 +9,7 @@ sources:
   - "kin-openapi README (github.com/getkin/kin-openapi)"
   - "RFC 9457, Problem Details for HTTP APIs"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # OpenAPI-First Development in Go
@@ -23,11 +23,64 @@ updated: 2026-11-07
 > - **Request/response validation middleware** (`kin-openapi`) rejects a request that violates the spec — a missing required field, a value outside an enum — before your handler code ever sees it, and validates the response your handler sent against the same spec in tests.
 > - This note is the Go implementation. [[API Contract Design and OpenAPI]] owns the contract concepts (what a good contract looks like, versioning, consumer-driven contracts); this note is what runs once you have one.
 
+## Start here: the basics
+
+**The problem in one story.**
+The backend team and the frontend team agree on what `POST /invoices` sends and returns.
+They write it in a wiki, then the backend renames a field and forgets the wiki.
+The frontend breaks days later in QA.
+OpenAPI-first makes one machine-readable file the agreement, and generates code from it so the two cannot quietly drift.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| API | The set of requests a server accepts and what it returns | `GET /invoices/42` |
+| Contract | The agreed shape of requests and responses | "`amount` is an integer, required" |
+| OpenAPI | A standard YAML/JSON format for writing that contract | `api/openapi.yaml` |
+| Schema | The description of one data shape inside the spec | `Invoice: {id, amount, status}` |
+| Code generation | A tool writing Go code from the spec for you | `oapi-codegen` makes structs |
+| Drift | Code and docs slowly disagreeing | Field renamed in code, not in docs |
+| Validation | Checking data against the schema, rejecting bad input | Missing `amount` → `400` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["openapi.yaml<br/>(source of truth)"] --> G["oapi-codegen"]
+    G --> T["Go types and<br/>server interface"]
+    T --> H["Your handlers<br/>(must compile)"]
+    S --> V["Validation<br/>middleware"]
+    V --> H
+```
+
+**Analogy.** An architect's blueprint: builders work from it, inspectors check the building against it, and nobody draws the blueprint after the house is built.
+Where it breaks: a blueprint cannot check that the plumbing actually works; the spec can say a token is required, but only your Go code can check the token is valid.
+
+**How the rest of this note builds up**
+
+- First, why spec-first exists and how it beats drift (section 1), then the mental model (section 2).
+- Then how it works: OpenAPI versions, the spec file, `oapi-codegen` and strict servers (section 3).
+- Then a full InvoiceOps worked example with validation middleware and tests (section 4).
+- Finally the SDE-3 view: spec-first vs code-first, trade-offs, production failures and the deep dive (sections 5-8).
+
+> [!tip] Remember
+> Write the contract first, generate the code from it, and let the compiler and tests catch any mismatch.
+
 ## 1. Why it exists
 
-A team writes `POST /invoices`, documents it in a wiki page, and ships it. Three sprints later a field gets renamed in the handler but nobody updates the wiki page — the frontend, which was built against the wiki page, breaks in a way that only shows up in QA, three days before a release. This is **drift**: the one thing a hand-maintained doc cannot prevent, because nothing forces it to stay in sync with the code that actually runs.
+A team writes `POST /invoices`, documents it in a wiki page, and ships it.
 
-Spec-first does not eliminate the risk of drift by itself — a handwritten handler can still disagree with the spec it claims to implement. What it adds is two places that make disagreement visible before a release: `oapi-codegen`'s generated types make a response shape that violates the spec a **compile error**, and a validation middleware (or a contract test) makes a request or response that violates the spec a **test failure**. Code-first (generating the spec from annotations on the Go code, like `swaggo`) can't catch either failure mode, because the spec it produces is defined as whatever the code already does — there is nothing independent left to disagree with.
+Three sprints later a field gets renamed in the handler but nobody updates the wiki page — the frontend, which was built against the wiki page, breaks in a way that only shows up in QA, three days before a release.
+
+This is **drift**: the one thing a hand-maintained doc cannot prevent, because nothing forces it to stay in sync with the code that actually runs.
+
+Spec-first does not eliminate the risk of drift by itself — a handwritten handler can still disagree with the spec it claims to implement. What it adds is two places that make disagreement visible before a release:
+
+1. `oapi-codegen`'s generated types make a response shape that violates the spec a **compile error**.
+2. A validation middleware (or a contract test) makes a request or response that violates the spec a **test failure**.
+
+Code-first (generating the spec from annotations on the Go code, like `swaggo`) can't catch either failure mode, because the spec it produces is defined as whatever the code already does — there is nothing independent left to disagree with.
 
 ## 2. Mental model
 
@@ -52,7 +105,11 @@ Every box except `IMPL` (the business logic you actually write by hand) is eithe
 
 ### OpenAPI 3.0 vs 3.1
 
-Most Go tooling (`oapi-codegen`, `kin-openapi`, Swagger UI) is most mature against **3.0.3**; this note and InvoiceOps use it. **3.1.1** aligned the schema format fully with JSON Schema 2020-12 — the practical difference that bites most often is `nullable`: 3.0 has a `nullable: true` keyword on a schema, while 3.1 drops it in favor of `type: ["string", "null"]`, because 3.1's `type` keyword accepts an array the way JSON Schema's always has. Pick 3.1 only once your whole toolchain (codegen, linter, docs renderer) confirms 3.1 support; mixing a 3.1 spec with a 3.0-only tool produces confusing validation errors that look like a spec bug but are really a version mismatch.
+Most Go tooling (`oapi-codegen`, `kin-openapi`, Swagger UI) is most mature against **3.0.3**; this note and InvoiceOps use it.
+
+**3.1.1** aligned the schema format fully with JSON Schema 2020-12 — the practical difference that bites most often is `nullable`: 3.0 has a `nullable: true` keyword on a schema, while 3.1 drops it in favor of `type: ["string", "null"]`, because 3.1's `type` keyword accepts an array the way JSON Schema's always has.
+
+Pick 3.1 only once your whole toolchain (codegen, linter, docs renderer) confirms 3.1 support; mixing a 3.1 spec with a 3.0-only tool produces confusing validation errors that look like a spec bug but are really a version mismatch.
 
 ### A minimal spec
 
@@ -118,7 +175,12 @@ components:
         detail: { type: string }
 ```
 
-Every piece has a job: `operationId` becomes the generated Go method name; `security` says this operation needs a bearer token (verifying that token is Go code — see [[Authentication and Authorization in Go]] — OpenAPI can only assert that *some* credential was presented, never that it was *valid*); `requestBody`/`responses` are what the strict server's types are generated from; `Problem` is this API's one error shape for every 4xx, following RFC 9457 (`application/problem+json`) instead of each endpoint inventing its own error JSON.
+Every piece has a job:
+
+- `operationId` becomes the generated Go method name.
+- `security` says this operation needs a bearer token (verifying that token is Go code — see [[Authentication and Authorization in Go]] — OpenAPI can only assert that *some* credential was presented, never that it was *valid*).
+- `requestBody`/`responses` are what the strict server's types are generated from.
+- `Problem` is this API's one error shape for every 4xx, following RFC 9457 (`application/problem+json`) instead of each endpoint inventing its own error JSON.
 
 ### oapi-codegen: the strict server
 
@@ -128,7 +190,11 @@ Run as a `go:generate` directive against the spec above:
 //go:generate go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.4.1 -generate types,strict-server -package invoiceapi -o server.gen.go api/openapi.yaml
 ```
 
-(`go:generate` directives are not shell lines: each `//go:generate` comment is its own command, and a trailing `\` is passed through literally rather than continuing onto the next directive — two `//go:generate` lines for one invocation silently run as two broken commands. Keep the real invocation on one line, or move the flags into an `oapi-codegen` config YAML and generate with `-config` if the line gets unwieldy.)
+`go:generate` directives are not shell lines: each `//go:generate` comment is its own command.
+
+A trailing `\` is passed through literally rather than continuing onto the next directive — two `//go:generate` lines for one invocation silently run as two broken commands.
+
+Keep the real invocation on one line, or move the flags into an `oapi-codegen` config YAML and generate with `-config` if the line gets unwieldy.
 
 it produces, for `createInvoice`, the equivalent of:
 
@@ -530,3 +596,8 @@ func TestSpecYAML_IsAValidOpenAPIDocument(t *testing.T) {
 - **Before this:** [[API Contract Design and OpenAPI]], [[Building REST Endpoints]], [[Request Decoding, Validation and DTOs]]
 - **Next:** [[Testing Go Services]], [[Middleware]]
 - **Compare with:** [[REST and HTTP API Design]] (the design decisions a spec encodes), [[gRPC]] (protobuf as the equivalent spec-first contract for RPC instead of REST)
+
+### Watch on YouTube
+
+- [Codegen a Go Fiber app with OpenAPI](https://www.youtube.com/watch?v=WkarI2eOzK4) · Duane Bester · shows spec-first codegen with oapi-codegen in practice
+- [Practical OpenAPI in Go](https://www.youtube.com/watch?v=87au30fl5e4) · package main · broader walkthrough of designing and consuming an OpenAPI spec in Go

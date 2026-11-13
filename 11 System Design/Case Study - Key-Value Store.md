@@ -10,13 +10,15 @@ sources:
   - "Apache Cassandra documentation: consistency levels, hinted handoff (max_hint_window), repair"
   - "etcd documentation: storage quota (default 2 GB, suggested maximum 8 GB)"
   - "Lakshman & Malik, Cassandra - A Decentralized Structured Storage System (LADIS 2009)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Key-Value Store
 
 > [!summary] TL;DR
-> Design a distributed key-value store: `put(key, value)` and `get(key)` over billions of keys on dozens of machines, which stays available when machines fail. This case study assembles known building blocks (consistent hashing, replication, quorums, an LSM storage engine, gossip) and spends its time on the decisions between them: which consistency you give up, how conflicts are resolved and how the cluster heals.
+> Design a distributed key-value store: `put(key, value)` and `get(key)` over billions of keys on dozens of machines, which stays available when machines fail.
+>
+> This case study assembles known building blocks (consistent hashing, replication, quorums, an LSM storage engine, gossip) and spends its time on the decisions between them: which consistency you give up, how conflicts are resolved and how the cluster heals.
 
 > [!abstract] Core idea
 > - Partition keys over nodes with consistent hashing and virtual nodes; replicate each key to N nodes (usually 3).
@@ -24,6 +26,52 @@ updated: 2026-11-04
 > - The leaderless (Dynamo) design keeps accepting writes during failures and resolves conflicts later with vector clocks or last-write-wins. The leader-based design (Raft per partition) gives linearizable keys but pauses a partition during leader elections.
 > - Healing happens in three layers: hinted handoff, read repair and Merkle-tree anti-entropy.
 > - Each node stores data in an LSM tree: commit log, memtable, SSTables, compaction, Bloom filters.
+
+## Start here: the basics
+
+**The problem in one story.**
+A map in a program stores `name -> value` and finds it instantly.
+Now imagine that map holds billions of entries, too many for one computer.
+You spread it over dozens of machines, and some of them will crash.
+You still want `get` and `put` to work, and not lose data.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Key-value pair | A name and the data stored under it | `user:42 -> "Asha"` |
+| Node | One machine in the cluster | `node-7` |
+| Partition | One slice of all keys, owned by some nodes | Keys hashing to 0-99 |
+| Replica | An extra copy of the same data on another node | 3 copies of `user:42` |
+| Hash | A function that turns a key into a number | `hash("user:42") = 8812` |
+| Quorum | The minimum number of replicas that must answer | 2 of 3 |
+| Consistency | Whether every reader sees the latest write | Read right after write shows it |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client: put(k, v)"] --> CO["Coordinator node"]
+    CO --> H["hash(k) picks<br/>3 replicas"]
+    H --> A["Replica A"]
+    H --> B["Replica B"]
+    H --> D["Replica C"]
+    A --> OK["2 of 3 said OK<br/>so write succeeds"]
+    B --> OK
+```
+
+**Analogy.** A library splits its books across many branches by the first letter of the title, and keeps three copies of each book in different branches in case one branch floods.
+Where it breaks: a library rarely updates a book in two branches at the same moment, but a key-value store must decide which of two conflicting writes wins.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the high-level design: partitioning, replication, quorums and storage (section 3), plus estimates, API and Go code for vector clocks (section 4).
+- Then variants, trade-offs and production lessons (sections 5-7).
+- Finally the SDE-3 deep dive: healing with hints and Merkle trees, adding nodes, what quorums do not give you (section 8).
+
+> [!tip] Remember
+> Hash keys to pick nodes, keep N copies, wait for enough of them to answer, and repair differences in the background.
 
 ## 1. Why it exists - requirements
 
@@ -46,7 +94,9 @@ A single Redis or PostgreSQL instance holds a few hundred GB and fails as a unit
 
 ## 2. Mental model
 
-Picture a **library spread over many branch buildings**. Every book (key) has a catalogue number that says which three branches keep a copy (replication by consistent hashing). To lend a book you only need two of the three branches to agree (quorum). If one branch is closed, a neighbouring branch keeps a note "return this to branch C when it reopens" (hinted handoff). Every night, branches compare checklists to find copies that drifted apart (anti-entropy).
+Picture a **library spread over many branch buildings**. Every book (key) has a catalogue number that says which three branches keep a copy (replication by consistent hashing). To lend a book you only need two of the three branches to agree (quorum).
+
+If one branch is closed, a neighbouring branch keeps a note "return this to branch C when it reopens" (hinted handoff). Every night, branches compare checklists to find copies that drifted apart (anti-entropy).
 
 The core decision is the **CAP and PACELC choice** ([[CAP and PACELC]]): during a network partition, keep accepting writes on both sides and reconcile later (AP, Dynamo, Cassandra, Riak), or refuse writes on the minority side to keep one true value (CP, etcd, DynamoDB's per-partition Paxos, TiKV). Even without a partition, quorum size trades latency for consistency.
 
@@ -156,7 +206,13 @@ GET /v1/kv/{key}  -> value(s) + X-Context
 | Commit log bandwidth per node | 4,700/s × 1.1 KB | ≈ 5.2 MB/s, easy for NVMe |
 | Re-replication after a node loss | 33 TB / 32 ≈ 1 TB on the lost node, re-copied by 31 peers | ≈ 33 GB per peer; at 50 MB/s throttled streaming per peer ≈ 11 minutes |
 
-**What the numbers decide.** Disk, not CPU, sets the node count. Write rate per node is low enough for an LSM engine without special tuning. The re-replication estimate is why virtual nodes matter: without them, the whole 1 TB would be streamed into one replacement node from the few ring neighbours that share its ranges, so the replacement's own intake becomes the bottleneck: at the same 50 MB/s that is about 5.6 hours (1,000,000 MB / 50 MB/s = 20,000 s), during which those ranges run with one fewer replica.
+**What the numbers decide.** Disk, not CPU, sets the node count. Write rate per node is low enough for an LSM engine without special tuning.
+
+The re-replication estimate is why virtual nodes matter.
+
+Without them, the whole 1 TB would be streamed into one replacement node from the few ring neighbours that share its ranges, so the replacement's own intake becomes the bottleneck.
+
+At the same 50 MB/s that is about 5.6 hours (1,000,000 MB / 50 MB/s = 20,000 s), during which those ranges run with one fewer replica.
 
 ### API
 
@@ -395,11 +451,18 @@ func TestQuorumOverlaps(t *testing.T) {
 Three mechanisms cover different time scales.
 1. **Hinted handoff (seconds to hours).** A stand-in node stores writes meant for a down replica and replays them when gossip reports it up again. It is fast but bounded by the hint window and lost if the stand-in dies.
 2. **Read repair (on access).** When a read sees replicas disagree, the coordinator writes the winner back to stale replicas. It only fixes keys someone reads.
-3. **Anti-entropy with Merkle trees (background).** Each replica builds a hash tree over a token range: leaves hash small key ranges, parents hash children. Two replicas compare roots; if they match, the range is identical. Otherwise they descend only into differing branches. For a range of 1 billion keys split into 2^15 leaves, a single differing key costs about 15 levels of hash comparisons plus streaming one leaf, instead of comparing a billion keys. This is the only mechanism that fixes cold, never-read keys.
+3. **Anti-entropy with Merkle trees (background).** Each replica builds a hash tree over a token range: leaves hash small key ranges, parents hash children.
+   - Two replicas compare roots; if they match, the range is identical. Otherwise they descend only into differing branches.
+   - For a range of 1 billion keys split into 2^15 leaves, a single differing key costs about 15 levels of hash comparisons plus streaming one leaf, instead of comparing a billion keys.
+   - This is the only mechanism that fixes cold, never-read keys.
 
 ### 8.2 Adding a node without downtime
 
-A new node takes 256 virtual-node tokens. For each token it becomes the owner of a slice previously owned by its clockwise neighbour, so it streams that slice from the current replicas while they keep serving. During streaming, writes for those ranges go to both old and new owners ("pending ranges"), so nothing is missed. When streaming completes, the ring update is gossiped and old owners clean up the ranges they no longer own. Because vnodes are spread around the ring, all 32 existing nodes contribute about 1/33 of their data each, instead of one neighbour giving up half of its data.
+A new node takes 256 virtual-node tokens. For each token it becomes the owner of a slice previously owned by its clockwise neighbour, so it streams that slice from the current replicas while they keep serving.
+
+During streaming, writes for those ranges go to both old and new owners ("pending ranges"), so nothing is missed. When streaming completes, the ring update is gossiped and old owners clean up the ranges they no longer own.
+
+Because vnodes are spread around the ring, all 32 existing nodes contribute about 1/33 of their data each, instead of one neighbour giving up half of its data.
 
 ### 8.3 What quorums do not give you
 
@@ -449,3 +512,8 @@ A 45-minute interview script:
 - **Before this:** [[Consistent Hashing]], [[Replication]], [[Quorums and Leaderless Replication]], [[Partitioning and Sharding]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Next:** [[Case Study - Search Autocomplete]], [[Case Study - Distributed Message Queue]], [[Multi-Region Architecture]]
 - **Compare with:** [[In-memory KV Store with TTL and Transactions]] (the class-level LLD twin), [[Wide-Column Stores and Cassandra]], [[Consensus - Raft and Paxos]], [[CRDTs and Conflict Resolution]], [[Failure Detection, Gossip and Membership]], [[Bloom Filters and Probabilistic Data Structures]]
+
+### Watch on YouTube
+
+- [How Key value Stores Work (Redis, DynamoDB, Memcached)?](https://www.youtube.com/watch?v=Dwt8R0KPu7k) · ByteByteGo · 6 min · 60,020 views
+- [Design a Key-Value Store - System Design Mock Interview (with Microsoft Software Engineer)](https://www.youtube.com/watch?v=6fOoXT1HYxk) · Aced (formerly Exponent) · 36 min · 97,938 views

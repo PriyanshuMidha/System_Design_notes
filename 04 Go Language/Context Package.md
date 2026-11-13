@@ -11,7 +11,7 @@ sources:
   - "Go 1.24 release notes: t.Context() in testing"
   - "go vet documentation: lostcancel analyzer"
   - "The Go Memory Model (go.dev/ref/mem)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Context Package
@@ -26,15 +26,70 @@ updated: 2026-11-07
 > - `defer cancel()` right after every `With...` call that returns one — skipping it leaks the context's internal timer or goroutine, and `go vet` has a dedicated check for exactly this.
 > - Classic mistake: stashing request data in `context.Value` that isn't actually request-scoped (a `*sql.DB`, a logger, a feature-flag service) — those are dependencies, and belong in a struct field, injected explicitly.
 
+## Start here: the basics
+
+**The problem in one story.**
+A user opens a page, your server starts a slow database query, and the user closes the tab.
+Without a signal, the server keeps working on an answer nobody will read.
+`context.Context` is that signal: one value handed down every call that says "stop now" or "you have 2 seconds".
+It can also carry a small tag, like a request ID, along the way.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Goroutine | A lightweight thread run by the Go runtime | `go work()` |
+| Channel | A pipe goroutines use to send values or signals | `<-ctx.Done()` waits on one |
+| Cancellation | Telling running work to stop early | Client disconnects, query stops |
+| Deadline / timeout | A time after which work should give up | `WithTimeout(ctx, 2*time.Second)` |
+| Parent / child context | A new context built on top of an older one | `child, cancel := context.WithCancel(parent)` |
+| Request-scoped | Belongs to one request only | A request ID |
+| Leak | Something left running or held after it is no longer needed | A timer never stopped |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    R["Request context<br/>(from net/http)"] --> T["WithTimeout 2s"]
+    T --> DB["DB query"]
+    T --> API["Call other service"]
+    X["Client disconnects<br/>or 2s passes"] -. "cancel flows down" .-> T
+```
+
+**Analogy.** A manager hands each team a walkie-talkie; when the manager says "stop", every team below hears it.
+Where it breaks: a real team can choose to ignore the radio; in Go, work stops only if the code actually checks `ctx.Done()` or passes `ctx` on.
+
+**How the rest of this note builds up**
+
+- First, why Go needed one standard cancellation value (section 1) and the tree mental model (section 2).
+- Then how `Done`, `Err`, `WithCancel`, `WithTimeout`, `WithValue` and `defer cancel()` work (section 3).
+- Then a worked HTTP example with tests (section 4) and comparisons with other approaches (sections 5-6).
+- Finally the SDE-3 deep dive: `context.Cause`, `WithoutCancel`, `AfterFunc`, goroutine propagation and production pitfalls (sections 7-8).
+
+> [!tip] Remember
+> Pass `ctx` first, call `defer cancel()`, check `ctx.Done()`; cancellation only flows down.
+
 ## 1. Why it exists
 
-A handler for `GET /orders/{id}` calls a repository, which runs a query against Postgres, which the database driver sends over a TCP connection. If the client closes the connection after 2 seconds — a mobile client on a flaky network, a load balancer's own timeout, a user who navigated away — nothing *automatically* stops the Postgres query still running on the server's behalf. Without a shared cancellation signal, the handler goroutine, the repository call, and the in-flight query all keep running to completion for a result nobody will ever read, burning a database connection, a goroutine, and CPU time for work that is already pointless.
+A handler for `GET /orders/{id}` calls a repository, which runs a query against Postgres, which the database driver sends over a TCP connection.
 
-`context.Context` is the standard library's answer: one value, threaded through every layer of a call chain, that any layer can use to ask "should I still be doing this?" and that the outermost layer (an HTTP server, a gRPC server, a cron job) can cancel once, with every layer underneath finding out at once. The same mechanism carries **deadlines** (stop this whole chain by 14:02:05.000, not just "when told to") and a small amount of **request-scoped metadata** (a request ID to put in every log line downstream) that needs to reach deeply nested calls without becoming a parameter on every function signature in between.
+If the client closes the connection after 2 seconds — a mobile client on a flaky network, a load balancer's own timeout, a user who navigated away — nothing *automatically* stops the Postgres query still running on the server's behalf.
+
+Without a shared cancellation signal, the handler goroutine, the repository call, and the in-flight query all keep running to completion for a result nobody will ever read, burning a database connection, a goroutine, and CPU time for work that is already pointless.
+
+`context.Context` is the standard library's answer: one value, threaded through every layer of a call chain, that any layer can use to ask "should I still be doing this?" and that the outermost layer (an HTTP server, a gRPC server, a cron job) can cancel once, with every layer underneath finding out at once.
+
+The same mechanism carries **deadlines** (stop this whole chain by 14:02:05.000, not just "when told to") and a small amount of **request-scoped metadata** (a request ID to put in every log line downstream) that needs to reach deeply nested calls without becoming a parameter on every function signature in between.
 
 ## 2. Mental model
 
-A `Context` is a **chain of walkie-talkies handed down a command chain**, not a bag of parameters. The field commander (the HTTP handler) holds the master radio; every unit under them (the repository call, the outbound HTTP call, the background goroutine) gets a radio that is a clone of the commander's, sometimes with its own shorter battery (a tighter deadline) attached. If the commander calls "abort" on the master radio, every clone hears it immediately. If one unit's own radio battery dies (that unit's own deadline passes) or that unit shouts "abort" into its own radio, only that unit and anything *under* it hears it — command and every sibling unit is unaffected.
+A `Context` is a **chain of walkie-talkies handed down a command chain**, not a bag of parameters.
+
+The field commander (the HTTP handler) holds the master radio; every unit under them (the repository call, the outbound HTTP call, the background goroutine) gets a radio that is a clone of the commander's, sometimes with its own shorter battery (a tighter deadline) attached.
+
+If the commander calls "abort" on the master radio, every clone hears it immediately.
+
+If one unit's own radio battery dies (that unit's own deadline passes) or that unit shouts "abort" into its own radio, only that unit and anything *under* it hears it — command and every sibling unit is unaffected.
 
 `context.Background()` is the master radio switched on with nothing yet attached: the context a `main()` or a top-level server loop starts with. `context.TODO()` is "I know this call should take a context, I have not wired it through yet" — a placeholder for code under construction, never a long-term choice.
 
@@ -51,7 +106,11 @@ type Context interface {
 }
 ```
 
-`Done()` returns a channel that is closed exactly once, when the context is canceled or its deadline passes — closing is the one event every layer can `select` on without needing to know *why* it happened. `Err()` explains why, once `Done()` has fired: `nil` before that, `context.Canceled` if something called the context's own `cancel` function, `context.DeadlineExceeded` if its deadline simply arrived. `WithCancel`, `WithTimeout`, `WithDeadline`, and `WithValue` never change the `Context` they are given — each one builds and returns a brand-new child value that wraps the parent, which is why passing `ctx` around by value everywhere is safe: nobody downstream can retroactively change what an upstream caller sees.
+`Done()` returns a channel that is closed exactly once, when the context is canceled or its deadline passes — closing is the one event every layer can `select` on without needing to know *why* it happened.
+
+`Err()` explains why, once `Done()` has fired: `nil` before that, `context.Canceled` if something called the context's own `cancel` function, `context.DeadlineExceeded` if its deadline simply arrived.
+
+`WithCancel`, `WithTimeout`, `WithDeadline`, and `WithValue` never change the `Context` they are given — each one builds and returns a brand-new child value that wraps the parent, which is why passing `ctx` around by value everywhere is safe: nobody downstream can retroactively change what an upstream caller sees.
 
 ### The cancellation tree
 
@@ -73,7 +132,11 @@ flowchart TD
     FANOUT -.->|"cascades down"| W3
 ```
 
-Canceling `requestCtx` (because the client disconnected, or `ServeHTTP` returned) cascades to `dbCtx` and `workCtx` and every worker beneath them, all at once — that is the entire point of building a tree instead of passing one flat context everywhere. The reverse is never true: canceling `workCtx` on its own (say, because the fan-out finished early) has zero effect on `dbCtx`, `requestCtx`, or `Background()`. A child's own deadline passing (`dbCtx`'s 2s elapsing before `requestCtx`'s 5s) only ends `dbCtx` and whatever is under it — `requestCtx` is untouched and keeps running on its own budget.
+Canceling `requestCtx` (because the client disconnected, or `ServeHTTP` returned) cascades to `dbCtx` and `workCtx` and every worker beneath them, all at once — that is the entire point of building a tree instead of passing one flat context everywhere.
+
+The reverse is never true: canceling `workCtx` on its own (say, because the fan-out finished early) has zero effect on `dbCtx`, `requestCtx`, or `Background()`.
+
+A child's own deadline passing (`dbCtx`'s 2s elapsing before `requestCtx`'s 5s) only ends `dbCtx` and whatever is under it — `requestCtx` is untouched and keeps running on its own budget.
 
 ### A deadline flowing through a request
 
@@ -97,7 +160,13 @@ sequenceDiagram
     DB--xG: the in-flight query is cancelled server-side
 ```
 
-`r.Context()` is canceled by `net/http` itself the moment the client disconnects, or the instant the handler's `ServeHTTP` returns — whichever comes first — so a handler that fires a goroutine after returning must not assume `r.Context()` is still alive by the time that goroutine runs (`context.WithoutCancel`, below, is the fix). On the client side, the equivalent is `http.NewRequestWithContext(ctx, ...)`: the outbound call is torn down the moment `ctx` ends, mid-request if necessary. `database/sql`'s `*Context` methods (`QueryContext`, `ExecContext`, ...) and a gRPC client both forward the context's deadline to the server side — gRPC literally sends the remaining time as a `grpc-timeout` header, which the server enforces on its own context. **Deadline budgets should shrink as they go down, never reset**: giving `dbCtx` its own fresh 5 seconds instead of deriving it from the 2 seconds left on the parent means a slow DB call can blow through the request's real deadline while technically honoring its own.
+`r.Context()` is canceled by `net/http` itself the moment the client disconnects, or the instant the handler's `ServeHTTP` returns — whichever comes first — so a handler that fires a goroutine after returning must not assume `r.Context()` is still alive by the time that goroutine runs (`context.WithoutCancel`, below, is the fix).
+
+On the client side, the equivalent is `http.NewRequestWithContext(ctx, ...)`: the outbound call is torn down the moment `ctx` ends, mid-request if necessary.
+
+`database/sql`'s `*Context` methods (`QueryContext`, `ExecContext`, ...) and a gRPC client both forward the context's deadline to the server side — gRPC literally sends the remaining time as a `grpc-timeout` header, which the server enforces on its own context.
+
+**Deadline budgets should shrink as they go down, never reset**: giving `dbCtx` its own fresh 5 seconds instead of deriving it from the 2 seconds left on the parent means a slow DB call can blow through the request's real deadline while technically honoring its own.
 
 ### Constructors
 
@@ -110,7 +179,9 @@ sequenceDiagram
 | `WithDeadlineCause(parent, t, err)` / `WithTimeoutCause(parent, d, err)` | wall-clock time `t` arrives / `d` elapses, or `cancel()` is called | Like `WithDeadline`/`WithTimeout`, but `context.Cause(ctx)` reports `err` specifically when *this* context's own deadline is what ended it — not when a manual `cancel()` call ends it: the returned plain `CancelFunc` does not set the cause, so a manual cancel still leaves `Cause` reporting `context.Canceled` |
 | `WithValue(parent, key, val)` | never on its own; inherits the parent's lifetime | Attaching request-scoped data (request ID, principal) for downstream reads |
 
-Every constructor that returns a `cancel` function (`WithCancel`, `WithTimeout`, `WithDeadline`, `WithCancelCause`, `WithDeadlineCause`, `WithTimeoutCause`) must have that function called on every path, normally with `defer cancel()` right after the call — not calling it leaks the context's internal timer (for the deadline/timeout variants) or its parent-cancellation goroutine (for `WithCancel`/`WithCancelCause`) until the parent itself ends. `go vet`'s `lostcancel` analyzer is built specifically to catch "a cancel function from `context.With...` is not called on some path" — this note's own Go code had to satisfy it (see "Worked example").
+Every constructor that returns a `cancel` function (`WithCancel`, `WithTimeout`, `WithDeadline`, `WithCancelCause`, `WithDeadlineCause`, `WithTimeoutCause`) must have that function called on every path, normally with `defer cancel()` right after the call — not calling it leaks the context's internal timer (for the deadline/timeout variants) or its parent-cancellation goroutine (for `WithCancel`/`WithCancelCause`) until the parent itself ends.
+
+`go vet`'s `lostcancel` analyzer is built specifically to catch "a cancel function from `context.With...` is not called on some path" — this note's own Go code had to satisfy it (see "Worked example").
 
 ## 4. Worked example
 
@@ -173,7 +244,9 @@ func RequestIDFromContext(ctx context.Context) (string, bool) {
 }
 ```
 
-`context.Value` exists for request-scoped data that genuinely crosses API boundaries you do not control (a request ID picked up by middleware and read deep inside a logging call) — never for a dependency such as a `*sql.DB` or a logger, which should be a constructor parameter or a struct field so its absence is a compile error, not a runtime nil-assertion panic.
+`context.Value` exists for request-scoped data that genuinely crosses API boundaries you do not control (a request ID picked up by middleware and read deep inside a logging call).
+
+Never for a dependency such as a `*sql.DB` or a logger, which should be a constructor parameter or a struct field so its absence is a compile error, not a runtime nil-assertion panic.
 
 ### The cancellation tree, proven by test
 
@@ -354,7 +427,9 @@ func TestAuditAfterResponseSurvivesRequestCancel(t *testing.T) {
 }
 ```
 
-The audit write keeps its request ID (a value) but is immune to the parent's cancellation — this is the fire-and-forget pattern a handler needs for genuinely detached work, paired with its own timeout so it cannot run forever: `write(ctx, ...)` should itself wrap `detached` in a fresh `WithTimeout` before doing real I/O. `WatchForCancel`'s own tests confirm both halves of `AfterFunc`: the callback runs once the context is canceled, and calling `stop()` before that happens prevents a late run — `stop()` returning `true` means it genuinely stopped the registration before it fired, the same contract as `time.Timer.Stop`.
+The audit write keeps its request ID (a value) but is immune to the parent's cancellation — this is the fire-and-forget pattern a handler needs for genuinely detached work, paired with its own timeout so it cannot run forever: `write(ctx, ...)` should itself wrap `detached` in a fresh `WithTimeout` before doing real I/O.
+
+`WatchForCancel`'s own tests confirm both halves of `AfterFunc`: the callback runs once the context is canceled, and calling `stop()` before that happens prevents a late run — `stop()` returning `true` means it genuinely stopped the registration before it fired, the same contract as `time.Timer.Stop`.
 
 **Measured:** `go test -race -v ./...` in the scratch module (Go 1.24.4, 2026-11-07) — 13 tests across `whiteboard_test.go`, `tree_test.go`, `worker_test.go`, `cause_test.go`, and `afterfunc_test.go`: 13/13 PASS, 0 race warnings, `go vet ./...` clean (including `lostcancel`).
 
@@ -389,11 +464,21 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
 
 ## 8. Deep dive
 
-- **What `ctx.Err()` actually encodes.** `Err()` returns exactly one of three states: `nil` (context still open), `context.Canceled` (something called this context's own `cancel`, or an ancestor's), or `context.DeadlineExceeded` (this context's own deadline, or an ancestor's shorter one, passed). A context derived with `WithTimeout` from an already-canceled parent is itself immediately canceled — children inherit whichever ended first between their own deadline and their parent's end state.
-- **`context.Cause` vs `ctx.Err()`.** Before Go 1.20's `WithCancelCause`, every context in a cancellation tree could only ever say "Canceled" or "DeadlineExceeded" — never *why*, in cases where "why" mattered (which of five fan-out workers failed; this note's `FanOutWithCause`). `Cause` walks up to find the first ancestor that was canceled with an explicit, non-nil cause; if none was, it falls back to `Err()`'s own value.
-- **Propagation into goroutines is manual.** A context is just a value — nothing automatically passes it from a handler into a goroutine the handler starts; that goroutine must be written to take a `ctx context.Context` parameter and actually check it, the same as any other function. "Forgot to pass ctx into the goroutine" is a distinct bug from "passed it but never checked `Done()`", and both produce the same symptom: a goroutine that outlives the request indefinitely.
-- **`r.Context()`'s exact lifetime.** `net/http` cancels a request's context either when the underlying connection closes (client disconnect, including due to a proxy or load-balancer timeout) or the instant the registered `Handler`'s `ServeHTTP` method returns — whichever happens first. A handler that hands off work to a goroutine and then returns has already started that race: by the time the goroutine runs, `r.Context()` may already be done, which is exactly why fire-and-forget work needs `context.WithoutCancel` plus its own timeout rather than reusing `r.Context()` verbatim.
-- **Testing with context.** `t.Context()` (Go 1.24) returns a context tied to the test's own lifetime, canceled automatically when the test completes — convenient for tests that need *some* context without constructing `context.Background()` by hand. Tests that specifically exercise cancellation behavior (like every test in this note's worked example) still build their own `WithCancel`/`WithTimeout` contexts explicitly, since the behavior under test is the cancellation itself.
+- **What `ctx.Err()` actually encodes.** `Err()` returns exactly one of three states: `nil` (context still open), `context.Canceled` (something called this context's own `cancel`, or an ancestor's), or `context.DeadlineExceeded` (this context's own deadline, or an ancestor's shorter one, passed).
+
+  A context derived with `WithTimeout` from an already-canceled parent is itself immediately canceled — children inherit whichever ended first between their own deadline and their parent's end state.
+- **`context.Cause` vs `ctx.Err()`.** Before Go 1.20's `WithCancelCause`, every context in a cancellation tree could only ever say "Canceled" or "DeadlineExceeded" — never *why*, in cases where "why" mattered (which of five fan-out workers failed; this note's `FanOutWithCause`).
+
+  `Cause` walks up to find the first ancestor that was canceled with an explicit, non-nil cause; if none was, it falls back to `Err()`'s own value.
+- **Propagation into goroutines is manual.** A context is just a value — nothing automatically passes it from a handler into a goroutine the handler starts; that goroutine must be written to take a `ctx context.Context` parameter and actually check it, the same as any other function.
+
+  "Forgot to pass ctx into the goroutine" is a distinct bug from "passed it but never checked `Done()`", and both produce the same symptom: a goroutine that outlives the request indefinitely.
+- **`r.Context()`'s exact lifetime.** `net/http` cancels a request's context either when the underlying connection closes (client disconnect, including due to a proxy or load-balancer timeout) or the instant the registered `Handler`'s `ServeHTTP` method returns — whichever happens first.
+
+  A handler that hands off work to a goroutine and then returns has already started that race: by the time the goroutine runs, `r.Context()` may already be done, which is exactly why fire-and-forget work needs `context.WithoutCancel` plus its own timeout rather than reusing `r.Context()` verbatim.
+- **Testing with context.** `t.Context()` (Go 1.24) returns a context tied to the test's own lifetime, canceled automatically when the test completes — convenient for tests that need *some* context without constructing `context.Background()` by hand.
+
+  Tests that specifically exercise cancellation behavior (like every test in this note's worked example) still build their own `WithCancel`/`WithTimeout` contexts explicitly, since the behavior under test is the cancellation itself.
 
 ## 9. Interview questions
 
@@ -410,7 +495,9 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
 > `ctx.Err()` only ever reports the generic `context.Canceled` or `context.DeadlineExceeded`. `context.Cause(ctx)` (Go 1.21, built on `WithCancelCause`) walks up to the nearest ancestor canceled with an explicit non-nil cause and returns that specific error — useful when several independent reasons could have triggered the same cancellation.
 
 > [!question]- Why does `go vet` warn about a discarded `cancel` function, and what does skipping `defer cancel()` actually leak?
-> `WithTimeout`/`WithDeadline` start an internal timer, and `WithCancel` starts machinery watching the parent for cancellation; calling `cancel` releases both immediately. Skipping it means that timer or goroutine lives until the *parent* context ends instead — in a long-lived parent (like a server's lifetime), that is a real, accumulating leak. `go vet`'s `lostcancel` analyzer flags a `cancel` that is not reachable on every path.
+> `WithTimeout`/`WithDeadline` start an internal timer, and `WithCancel` starts machinery watching the parent for cancellation; calling `cancel` releases both immediately. Skipping it means that timer or goroutine lives until the *parent* context ends instead — in a long-lived parent (like a server's lifetime), that is a real, accumulating leak.
+>
+> `go vet`'s `lostcancel` analyzer flags a `cancel` that is not reachable on every path.
 
 > [!question]- Should a CPU-bound loop with no channel operations check `ctx.Done()` on every iteration?
 > Usually not — a `select` on every iteration of a tight loop can cost more than the loop body itself. Check periodically (every N iterations, picked so the worst-case reaction time is acceptable) instead of on every single step.
@@ -434,3 +521,8 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
 - **Before this:** [[Goroutines and Channels]], [[select and Concurrency Patterns]]
 - **Next:** [[Error Handling]], [[Standard Library Essentials (time, io, files, encoding)]]
 - **Compare with:** [[sync Primitives and Atomics]] (a `Mutex`/`atomic` protects shared memory; a `Context` coordinates when work should stop)
+
+### Watch on YouTube
+
+- [Understanding Go Context - Everything You Need to Know](https://www.youtube.com/watch?v=_zKkEp6edYI) · Matthew Sanabria · thorough single-video coverage of cancellation, deadlines and values
+- [Go Context Package: Cancellation, Timeouts & Concurrent Programming](https://www.youtube.com/watch?v=ljiLd2QsEvA) · CodeLucky · focused tutorial on context with concurrency examples

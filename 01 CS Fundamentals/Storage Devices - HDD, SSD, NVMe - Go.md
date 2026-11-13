@@ -10,13 +10,22 @@ sources:
   - "NVM Express Base Specification (NVMe), nvmexpress.org"
   - "AWS EBS volume type documentation (gp3, io2), 2025"
   - "JEDEC and SNIA solid-state storage glossaries (NAND, FTL, TRIM, write amplification)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Storage Devices - HDD, SSD, NVMe - Go
 
 > [!summary] TL;DR
 > This code builds a toy flash translation layer (FTL) — the firmware logic every real SSD runs — and measures write amplification rising as a drive fills up. It demonstrates in a runnable, testable form the mechanism described in [[Storage Devices - HDD, SSD, NVMe]]: pages, erase blocks, garbage collection, and why over-provisioning matters.
+
+## Before the code
+
+- **Structs with methods** (`FTL`, `func (f *FTL) Write`): the flash translation layer is one struct whose methods change its state.
+- **Pointer receivers** (`*FTL`): methods change the shared FTL itself, not a copy.
+- **Maps and slices** (`map[...]`, `[]int`): the logical-to-physical page mapping and the per-block page lists.
+- **`math/rand` with a fixed seed**: pseudo-random but repeatable writes, so tests give the same write-amplification numbers every run.
+- **Helper functions in tests** (`writeRandom`): shared setup that several tests reuse.
+- **What to run:** `go vet ./... && go test -race ./...` inside the module; add `-v -run TestAmplification` to see the amplification numbers.
 
 ## What this code shows
 
@@ -566,7 +575,11 @@ PASS
 ok  	storage	1.455s
 ```
 
-Reading this output line by line: the first test passes silently (no log line was requested), confirming the ideal 1.0 baseline. The second test's `t.Logf` line is the headline number from the theory note's worked example — a drive at 40% utilization amplifies writes by only 1.06×, while the same drive at 80% utilization amplifies by 2.70×, a 2.5× worse ratio purely from having less spare capacity. The third test's silent pass confirms no data was lost or corrupted across 5,000 writes and repeated garbage collection cycles. `-race` found no data races because this code is single-goroutine; it is run here for consistency with every other Go note in this vault.
+Reading this output line by line: the first test passes silently (no log line was requested), confirming the ideal 1.0 baseline.
+
+The second test's `t.Logf` line is the headline number from the theory note's worked example — a drive at 40% utilization amplifies writes by only 1.06×, while the same drive at 80% utilization amplifies by 2.70×, a 2.5× worse ratio purely from having less spare capacity.
+
+The third test's silent pass confirms no data was lost or corrupted across 5,000 writes and repeated garbage collection cycles. `-race` found no data races because this code is single-goroutine; it is run here for consistency with every other Go note in this vault.
 
 ## Pitfalls in the code
 

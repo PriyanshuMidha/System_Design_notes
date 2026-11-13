@@ -8,7 +8,7 @@ related: ["[[Command, Undo and Memento]]", "[[Observer and Event Bus]]", "[[Faca
 sources:
   - "Go 1.24 standard library docs: container/list, sort.Search"
   - "Larry Harris, Trading and Exchanges: Market Microstructure for Practitioners (2003), order types and price-time priority"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Order Book Matching Engine
@@ -23,6 +23,46 @@ updated: 2026-11-04
 > - A map from order ID to its queue element makes **cancel O(1)** for the queue part.
 > - One goroutine runs every command in order, so the matching code has no locks and the result is deterministic.
 > - Classic mistakes: `float64` prices, filling a level in the wrong order, letting a market order rest, and wrapping the book in a mutex that callers hold across I/O.
+
+## Start here: the basics
+
+**The problem in one story.** On a stock exchange, Asha wants to buy 10 shares at up to ₹100, and Ravi wants to sell 10 at ₹99 or more. Their prices "cross", so a trade happens. If many people want the same price, whoever came first goes first. The engine must decide this fairly, fast and the same way every time.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Bid | An offer to buy at a price | Buy 10 @ 100 |
+| Ask | An offer to sell at a price | Sell 10 @ 99 |
+| Limit order | Trade only at this price or better | Buy at most ₹100 |
+| Market order | Trade right now at the best price available | Buy 10 at whatever price |
+| Price level | All resting orders at one price | Three asks at 99 |
+| FIFO | First in, first out | Older order at 99 fills first |
+| Maker / taker | Maker was resting in the book; taker just arrived | Trade price = maker's price |
+| Tick | Smallest price step, stored as an integer | ₹100.05 = 10005 ticks |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  N[New buy @100] --> C{Best ask <= 100?}
+  C -->|yes| F[Fill against oldest order at best ask]
+  F --> T[Emit trade at maker's price]
+  T --> C
+  C -->|no| R[Rest remainder in bids]
+```
+
+**Analogy.** A queue at a market stall per price: buyers stand in lines labelled with prices, sellers in other lines, and a referee pairs the front of the best lines whenever a buyer will pay at least what a seller asks. Where it breaks: a real referee can get tired or play favourites; the engine is one goroutine that applies the same rule to every command in order.
+
+**How the rest of this note builds up**
+
+- First the problem, requirements and actors (Steps 1-2), then entities like `Order`, `PriceLevel`, `Trade` (Steps 3-4).
+- Then APIs and storage: command log, snapshots, replay (Steps 5-6), and patterns (Step 7).
+- Then the Go code and tests (Step 8): matching loop, cancel, single-goroutine ownership.
+- Finally the SDE-3 depth: edge cases, data-structure trade-offs and interview questions.
+
+> [!tip] Remember
+> Best price first, oldest first within a price, trade at the maker's price.
 
 ## Problem statement
 
@@ -229,7 +269,9 @@ type TradeSink interface {
 }
 ```
 
-Recovery: load the latest snapshot of the book (optional), then replay the command log from the snapshot's sequence number. The `(symbol, seq)` primary key on `trades` makes republishing after a crash harmless. One catch: `Trade.At` comes from the injected clock, so during replay the clock must return each command's logged `received_at`, not the wall clock; otherwise the replayed trades match on price and quantity but carry new timestamps. The general replay idea is [[Event Sourcing]].
+Recovery: load the latest snapshot of the book (optional), then replay the command log from the snapshot's sequence number. The `(symbol, seq)` primary key on `trades` makes republishing after a crash harmless.
+
+One catch: `Trade.At` comes from the injected clock, so during replay the clock must return each command's logged `received_at`, not the wall clock; otherwise the replayed trades match on price and quantity but carry new timestamps. The general replay idea is [[Event Sourcing]].
 
 ## Step 7: Patterns
 
@@ -928,7 +970,9 @@ What the tests prove:
 
 Tradeoffs chosen:
 
-- **Sorted slice of levels with binary search.** Finding a level is O(log L), but inserting or removing a level in the middle shifts the slice, O(L). Most activity is near the best price and L is usually small, so this is fast in practice and simple to code. A balanced tree (for example a red-black tree or a B-tree) gives O(log L) for every operation. Many production engines instead use an array indexed by price tick within a band, which is O(1) per level access.
+- **Sorted slice of levels with binary search.** Finding a level is O(log L), but inserting or removing a level in the middle shifts the slice, O(L). Most activity is near the best price and L is usually small, so this is fast in practice and simple to code.
+
+  A balanced tree (for example a red-black tree or a B-tree) gives O(log L) for every operation. Many production engines instead use an array indexed by price tick within a band, which is O(1) per level access.
 - **Heap instead of a sorted slice.** A heap gives the best price in O(1) and push in O(log L), but depth needs a sort and removing a middle level needs lazy deletion. Good if you only ever need the top.
 - **`container/list` per level.** O(1) push back, pop front and remove from the middle (cancel). The cost is a pointer per node and poor cache locality; an intrusive linked list or a ring buffer with tombstones is faster but longer to code.
 - **Single writer goroutine versus a mutex.** The channel hop costs some microseconds per command (an estimate; measure on your hardware), but gives a total order, no lock contention inside matching, and a natural place to append to a command log. A mutex is fine for a single process with low load; it does not give you a replayable order by itself.
@@ -1004,7 +1048,11 @@ stateDiagram-v2
 ## Interview explanation
 
 ```text
-I keep two sides, bids sorted high to low and asks low to high, each as a sorted list of price levels, and each level is a FIFO queue so the oldest order at a price fills first. An index from order ID to its queue element makes cancel cheap. Submit walks the best opposite level while prices cross, fills the front order for min of the two remaining quantities at the maker's price, emits a trade with a sequence number, and removes filled orders and empty levels. A limit remainder rests at the back of its level; a market remainder is cancelled. Prices are int64 ticks. One goroutine owns the book and runs commands from a channel in order, so matching needs no locks and is deterministic, which lets me rebuild the book by replaying a command log.
+I keep two sides, bids sorted high to low and asks low to high, each as a sorted list of price levels, and each level is a FIFO queue so the oldest order at a price fills first. An index from order ID to its queue element makes cancel cheap.
+
+Submit walks the best opposite level while prices cross, fills the front order for min of the two remaining quantities at the maker's price, emits a trade with a sequence number, and removes filled orders and empty levels.
+
+A limit remainder rests at the back of its level; a market remainder is cancelled. Prices are int64 ticks. One goroutine owns the book and runs commands from a channel in order, so matching needs no locks and is deterministic, which lets me rebuild the book by replaying a command log.
 ```
 
 ## Cheat sheet
@@ -1022,3 +1070,8 @@ I keep two sides, bids sorted high to low and asks low to high, each as a sorted
 - **Before this:** [[LLD Interview Method]], [[Concurrency for LLD]], [[Heaps and Priority Queues]]
 - **Next:** [[Digital Wallet and Ledger]]
 - **Compare with:** [[Event Sourcing]] (rebuild state from a command log), [[Case Study - Payment System]] (where trade money settles at system scale), [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [Stock Trading System Design / Matching Engine, Order Book & Low-Latency Architecture](https://www.youtube.com/watch?v=ckIABmFFiRY) · Arpit Vaish · 22 min · 3,275 views
+- [Design A Limit Order Book / Google SWE Teaches Low Level Design Episode 5](https://www.youtube.com/watch?v=nmYx6tQxtSs) · Jordan has no life · 22 min · 20,770 views

@@ -1,0 +1,7 @@
+{
+  "N":    {"voice": "en-US-EmmaMultilingualNeural", "rate": 4,  "pitch": 0,  "volume": 0},
+  "HERO": {"voice": "en-US-AriaNeural",             "rate": 4,  "pitch": 0,  "volume": 0},
+  "ROOKIE": {"voice": "en-US-ChristopherNeural",    "rate": 6,  "pitch": 3,  "volume": 0},
+  "WIT1": {"voice": "en-GB-RyanNeural",             "rate": -2, "pitch": -2, "volume": 0},
+  "WIT2": {"voice": "en-AU-NatashaNeural",          "rate": 2,  "pitch": 1,  "volume": 0}
+}

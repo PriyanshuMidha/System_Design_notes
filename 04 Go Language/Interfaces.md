@@ -8,7 +8,7 @@ sources:
   - "Go spec, Interface types and Type assertions (go.dev/ref/spec)"
   - "Russ Cox, Go Data Structures: Interfaces (research.swtch.com/interfaces)"
   - "Go 1.21 release notes, Profile-guided optimization (devirtualization)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Interfaces
@@ -22,15 +22,61 @@ updated: 2026-11-07
 > - Keep interfaces small and declare them next to the code that calls them (the consumer), not next to the implementation.
 > - `any` is justified when the shape of the data is genuinely unknown until runtime; when you know the type ahead of time, use it directly or use a generic constraint instead.
 
+## Start here: the basics
+
+**The problem in one story.**
+A phone charger works with any wall socket, because the socket only cares about the shape of the plug.
+Your checkout code should work the same way: it needs "something that can reserve stock", not "this exact Postgres class".
+Then tests can plug in a fake, and production can plug in the real database.
+A Go interface is that socket shape.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Type | The kind of a value | `int`, `string`, `*PostgresInventory` |
+| Method | A function attached to a type | `func (c Circle) Area() float64` |
+| Concrete type | A real type with data, not an interface | `Circle`, `*os.File` |
+| Interface | A list of methods a value must have | `type Shape interface{ Area() float64 }` |
+| Satisfy | A type has every method the interface lists | `Circle` satisfies `Shape` |
+| Nil | "Points at nothing" | `var p *Circle = nil` |
+| Fake | A small test stand-in for a real dependency | `fakeReserver` returning `nil` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["CheckoutService"] --> I{{"StockReserver<br/>Reserve(ctx, id, qty) error"}}
+    P["*PostgresInventory"] -. "has Reserve" .-> I
+    F["fakeReserver (tests)"] -. "has Reserve" .-> I
+```
+
+**Analogy.** An interface is a wall socket: any plug with the right pins fits, with no paperwork.
+Where it breaks: a real socket either has power or not, but a Go interface holding a nil pointer still counts as "something is plugged in" (`err != nil` is true).
+
+**How the rest of this note builds up**
+
+- First, why interfaces exist (section 1) and the socket mental model (section 2).
+- Then implicit satisfaction, "accept interfaces, return structs", and the `(type, data)` pair inside every interface value (section 3).
+- Then nil-interface traps, type assertions, `any`, generics vs. interfaces and interface pollution, with a full example and benchmark (sections 3-4).
+- Finally the SDE-3 deep dive: itabs, inlining cost, PGO devirtualization and generics internals (sections 6-8).
+
+> [!tip] Remember
+> Ask for the smallest set of methods you need, declared where you use them; Go checks the fit for you.
+
 ## 1. Why it exists
 
 A checkout service needs to reserve stock before charging a card. Writing it directly against `*PostgresInventory` works until a test needs to run without a real database, or until the team swaps Postgres for a cache-backed store — at which point every caller of the concrete type needs to change, and every test needs a running database.
 
-An interface breaks that coupling: `CheckoutService` depends on a `StockReserver` — a single method, `Reserve(ctx, productID, qty) error` — instead of on `*PostgresInventory` and its dozen other methods. In production, a real `*PostgresInventory` satisfies it. In tests, a five-line fake satisfies it too, because Go checks the method set, not a declared relationship. Neither `*PostgresInventory` nor the fake ever writes the word `StockReserver` anywhere in their own code.
+An interface breaks that coupling: `CheckoutService` depends on a `StockReserver` — a single method, `Reserve(ctx, productID, qty) error` — instead of on `*PostgresInventory` and its dozen other methods. In production, a real `*PostgresInventory` satisfies it.
+
+In tests, a five-line fake satisfies it too, because Go checks the method set, not a declared relationship. Neither `*PostgresInventory` nor the fake ever writes the word `StockReserver` anywhere in their own code.
 
 ## 2. Mental model
 
-Think of an interface as a **socket**, not a blueprint. A wall socket doesn't care what brand of device you plug in — it only cares that the plug has the right pins in the right places. Any type whose methods line up with the interface's "pins" fits, with no registration required. Go's compiler checks the fit at compile time by comparing method signatures, not by looking for a `type X implements Y` declaration, because Go has no such declaration.
+Think of an interface as a **socket**, not a blueprint. A wall socket doesn't care what brand of device you plug in — it only cares that the plug has the right pins in the right places.
+
+Any type whose methods line up with the interface's "pins" fits, with no registration required. Go's compiler checks the fit at compile time by comparing method signatures, not by looking for a `type X implements Y` declaration, because Go has no such declaration.
 
 An interface **variable**, though, is not the plugged-in device itself — it's a small adapter that remembers two things: which kind of device is plugged in (its concrete type), and where that device actually is (its data). That adapter is always the same fixed size, two machine words, no matter how large or small the plugged-in device is.
 
@@ -106,7 +152,11 @@ flowchart LR
     T -. "method table" .-> M["Circle.Area()"]
 ```
 
-The type word points at an **itab** — a small table built once per (concrete type, interface type) pair, holding the concrete type's identity and a pointer to each method the interface requires. Calling `s.Area()` through the interface means: follow the type word to the itab, look up `Area`'s slot, call that function pointer with the data word as the receiver. That extra hop is the entire cost of dynamic dispatch — there's no reflection and no map lookup involved.
+The type word points at an **itab** — a small table built once per (concrete type, interface type) pair, holding the concrete type's identity and a pointer to each method the interface requires.
+
+Calling `s.Area()` through the interface means: follow the type word to the itab, look up `Area`'s slot, call that function pointer with the data word as the receiver.
+
+That extra hop is the entire cost of dynamic dispatch — there's no reflection and no map lookup involved.
 
 ### Nil interface vs. typed nil
 
@@ -186,7 +236,9 @@ Any type implementing both `Read` and `Save` satisfies `ReadWriter` automaticall
 
 ### `any`, and when it's justified
 
-`any` (the Go 1.18 alias for `interface{}`) satisfies every type, which is exactly why it throws away all compile-time type checking. It is justified when the shape of the data is genuinely unknown until runtime — decoding arbitrary JSON, for example, where a value might be a string, a number, an object, or an array, and the caller must branch on which:
+`any` (the Go 1.18 alias for `interface{}`) satisfies every type, which is exactly why it throws away all compile-time type checking.
+
+It is justified when the shape of the data is genuinely unknown until runtime — decoding arbitrary JSON, for example, where a value might be a string, a number, an object, or an array, and the caller must branch on which:
 
 ```go
 func DecodeLoose(v any) string {
@@ -230,7 +282,11 @@ A repository interface varies in *behaviour* (a real DB call vs. an in-memory fa
 
 ### Interface pollution
 
-The anti-pattern carried over wholesale from Java: an `IOrderService` interface with exactly one implementation, `OrderServiceImpl`, created "for testability" before any second implementation or any test fake actually exists. It adds a layer of indirection, a naming collision (`I`-prefixes and `Impl`-suffixes are not idiomatic Go), and zero benefit until there's a real second shape — a fake, a second backend — that needs it. Declare the interface when a consumer actually needs one, sized to exactly what that consumer calls.
+The anti-pattern carried over wholesale from Java: an `IOrderService` interface with exactly one implementation, `OrderServiceImpl`, created "for testability" before any second implementation or any test fake actually exists.
+
+It adds a layer of indirection, a naming collision (`I`-prefixes and `Impl`-suffixes are not idiomatic Go), and zero benefit until there's a real second shape — a fake, a second backend — that needs it.
+
+Declare the interface when a consumer actually needs one, sized to exactly what that consumer calls.
 
 ## 4. Worked example
 
@@ -505,7 +561,9 @@ BenchmarkAddDirect-10          1000000000    1.000 ns/op   0 B/op   0 allocs/op
 BenchmarkAddViaInterface-10     888754476    1.347 ns/op   0 B/op   0 allocs/op
 ```
 
-The interface call costs about 35% more per call here — the itab lookup and indirect call — with no extra allocation, because `ConcreteAdder` is a zero-size value that fits directly in the interface's data word. A larger concrete type, or one captured by a pointer, would add an allocation on top of this dispatch cost if it has to escape (see [[Pointers, Values and Escape Analysis]]).
+The interface call costs about 35% more per call here — the itab lookup and indirect call — with no extra allocation, because `ConcreteAdder` is a zero-size value that fits directly in the interface's data word.
+
+A larger concrete type, or one captured by a pointer, would add an allocation on top of this dispatch cost if it has to escape (see [[Pointers, Values and Escape Analysis]]).
 
 ## 5. Variants and comparison
 
@@ -520,12 +578,16 @@ The interface call costs about 35% more per call here — the itab lookup and in
 ## 6. Trade-offs and when not to use
 
 - An interface you declare "just in case" before any second implementation or test fake exists is pure overhead: an extra hop on every call, and a layer of indirection a reader has to look through to find the real logic. Add the interface when a concrete second need shows up.
-- Dynamic dispatch defeats inlining: the compiler generally cannot inline a call made through an interface, because it doesn't know the concrete type until runtime. A hot inner loop calling a method millions of times per second may be measurably faster against a concrete type (see the benchmark above); profile before reaching for an interface purely on principle in such a loop.
+- Dynamic dispatch defeats inlining: the compiler generally cannot inline a call made through an interface, because it doesn't know the concrete type until runtime.
+
+  A hot inner loop calling a method millions of times per second may be measurably faster against a concrete type (see the benchmark above); profile before reaching for an interface purely on principle in such a loop.
 - `any` throws away the compiler's help entirely. Every `any` parameter is a promise you're keeping in your head instead of letting `go build` check it — reach for a generic constraint first if the set of valid types is actually fixed.
 
 ## 7. In production
 
-- **Real systems:** `io.Reader`/`io.Writer` are the standard library's own proof of small, decoupling interfaces working at scale — nearly every I/O type in Go satisfies them without ever importing `io`. Repository interfaces at the consumer side (`checkout` declaring `StockReserver`, not `inventory` declaring it) are the standard Go layering for services over a database; see [[Transactions and the Repository Pattern]] in `06 Backend Engineering in Go` for the full pattern in a service.
+- **Real systems:** `io.Reader`/`io.Writer` are the standard library's own proof of small, decoupling interfaces working at scale — nearly every I/O type in Go satisfies them without ever importing `io`.
+
+  Repository interfaces at the consumer side (`checkout` declaring `StockReserver`, not `inventory` declaring it) are the standard Go layering for services over a database; see [[Transactions and the Repository Pattern]] in `06 Backend Engineering in Go` for the full pattern in a service.
 - **Failure modes → fixes:**
   - An `if err != nil` branch never fires even though the callee clearly "failed" → a concrete nil pointer was returned through an `error`-typed result → audit every `return someConcretePointer` where the result type is an interface; only ever `return nil` literally.
   - A one-method interface grows a tenth method over a year, "just in case" → callers now depend on nine methods they never call → split it, or accept that the consumer-side interface should stay exactly as small as what that one consumer uses.
@@ -534,10 +596,24 @@ The interface call costs about 35% more per call here — the itab lookup and in
 
 ## 8. Deep dive
 
-- **The itab in more detail.** An itab is built once per distinct `(concrete type, interface type)` pair the first time that combination is needed, then reused — it is not rebuilt on every assignment. It holds the concrete type's `*rtype` (for type assertions and reflection) and a slice of function pointers, one per method the interface requires, in the interface's declared method order. A method call `s.Area()` through an interface compiles to: load the itab pointer from `s`, index into its function-pointer slice, call that pointer with `s`'s data word as the receiver.
-- **PGO devirtualization (Go 1.21+).** With profile-guided optimization enabled (a `default.pgo` file in the main package, built from a production CPU profile), the compiler can look at a call site through an interface and see that one concrete type accounts for the overwhelming majority of calls there in practice. It then emits a direct, inlinable call for that common case with a fallback to the normal indirect call for anything else — recovering much of the direct-call performance at exactly the call sites profiling shows are hot, without giving up the interface's flexibility in the source code. This is a profile-driven, automatic optimization; it does not change what the code means, only how fast the compiled binary runs the common path.
-- **Interfaces vs. generics, mechanically.** A generic function is either "stenciled" (the compiler emits a separate specialized copy per concrete type argument, trading binary size for speed and inlinability) or compiled once against a runtime "dictionary" describing the type's operations (trading a small per-call dictionary lookup for a smaller binary) — which strategy Go's compiler picks is an implementation detail that can change between versions, but either way the dispatch is resolved far more cheaply than an interface's itab lookup, because the compiler knows far more about the concrete type at compile time.
-- **Why embedding promotes but doesn't override polymorphically.** An interface embedding another interface is purely a textual union of method sets at compile time — there's no runtime relationship between `Reader` and `ReadWriter` the way there would be between a superclass and subclass. A type satisfying `ReadWriter` is simply a type whose method set happens to be a superset of both; `Reader` and `Writer` never "know" `ReadWriter` exists.
+- **The itab in more detail.** An itab is built once per distinct `(concrete type, interface type)` pair the first time that combination is needed, then reused — it is not rebuilt on every assignment.
+
+  It holds the concrete type's `*rtype` (for type assertions and reflection) and a slice of function pointers, one per method the interface requires, in the interface's declared method order.
+
+  A method call `s.Area()` through an interface compiles to: load the itab pointer from `s`, index into its function-pointer slice, call that pointer with `s`'s data word as the receiver.
+- **PGO devirtualization (Go 1.21+).** With profile-guided optimization enabled (a `default.pgo` file in the main package, built from a production CPU profile), the compiler can look at a call site through an interface and see that one concrete type accounts for the overwhelming majority of calls there in practice.
+
+  It then emits a direct, inlinable call for that common case with a fallback to the normal indirect call for anything else — recovering much of the direct-call performance at exactly the call sites profiling shows are hot, without giving up the interface's flexibility in the source code.
+
+  This is a profile-driven, automatic optimization; it does not change what the code means, only how fast the compiled binary runs the common path.
+- **Interfaces vs. generics, mechanically.** A generic function is either:
+  - "stenciled" (the compiler emits a separate specialized copy per concrete type argument, trading binary size for speed and inlinability), or
+  - compiled once against a runtime "dictionary" describing the type's operations (trading a small per-call dictionary lookup for a smaller binary).
+
+  Which strategy Go's compiler picks is an implementation detail that can change between versions, but either way the dispatch is resolved far more cheaply than an interface's itab lookup, because the compiler knows far more about the concrete type at compile time.
+- **Why embedding promotes but doesn't override polymorphically.** An interface embedding another interface is purely a textual union of method sets at compile time — there's no runtime relationship between `Reader` and `ReadWriter` the way there would be between a superclass and subclass.
+
+  A type satisfying `ReadWriter` is simply a type whose method set happens to be a superset of both; `Reader` and `Writer` never "know" `ReadWriter` exists.
 
 ## 9. Interview questions
 
@@ -545,7 +621,9 @@ The interface call costs about 35% more per call here — the itab lookup and in
 > A type satisfies an interface purely by having the right methods with the right signatures — there is no `implements` keyword and no declared link between the type and the interface. The compiler checks this structurally, at every point an interface value is assigned or passed, not just once at a declaration site.
 
 > [!question]- Why is an interface value never smaller or larger than two words, no matter what's stored in it?
-> Because an interface value is a fixed `(type, data)` pair: one word for the type descriptor (the itab), one word for the data — either the concrete value directly, if it fits in a word and is a pointer-like type, or a pointer to it otherwise. A `Circle{R: 1}` and a `*VeryLargeStruct` both occupy exactly two words as an interface value; the size difference lives in what the data word points at, not in the interface header itself.
+> Because an interface value is a fixed `(type, data)` pair: one word for the type descriptor (the itab), one word for the data — either the concrete value directly, if it fits in a word and is a pointer-like type, or a pointer to it otherwise.
+>
+> A `Circle{R: 1}` and a `*VeryLargeStruct` both occupy exactly two words as an interface value; the size difference lives in what the data word points at, not in the interface header itself.
 
 > [!question]- A function returns `error`, and the caller's `if err != nil` fires even though nothing went wrong. What's the mechanism?
 > The function returned a concrete pointer variable (e.g., `*FieldError`) that happened to be nil, through a result declared as the `error` interface. The resulting interface value is `(*FieldError, nil)` — non-nil as an interface, because only the data half is nil, not the type half. Fix: only ever `return nil` literally for an interface-typed result.
@@ -576,3 +654,8 @@ The interface call costs about 35% more per call here — the itab lookup and in
 - **Before this:** [[Structs, Methods and Embedding]], [[Pointers, Values and Escape Analysis]]
 - **Next:** [[Error Handling]], [[Generics and Iterators]]
 - **Compare with:** [[Go Interview Questions and Traps]] (the nil-interface trap as a drill), [[OOP in Go - Structs, Interfaces, Embedding]] (the same mechanics applied to LLD-style class design)
+
+### Watch on YouTube
+
+- [Go Tutorial (Golang) 28 - Interfaces in Golang](https://www.youtube.com/watch?v=VBWdxvauGWU) · ProgrammingKnowledge · clear walkthrough of implicit interface satisfaction basics
+- [interfaces advanced - go tutorial for beginners - part 13](https://www.youtube.com/watch?v=RsCV0d56w70) · Thomas Langhorst · covers interface values and type assertions beyond the basics

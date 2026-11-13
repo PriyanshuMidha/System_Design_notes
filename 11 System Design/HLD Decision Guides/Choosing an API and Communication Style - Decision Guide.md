@@ -13,7 +13,7 @@ sources:
   - "Kubernetes API concepts (watch); etcd v3 API reference (gRPC)"
   - "Kreps, Narkhede, Rao, Kafka: a Distributed Messaging System for Log Processing (NetDB 2011), LinkedIn origin"
   - "AWS docs, Amazon SQS standard queues (at-least-once delivery); AWS Elastic Load Balancing, ALB idle timeout default 60 seconds"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Choosing an API and Communication Style - Decision Guide
@@ -27,6 +27,54 @@ updated: 2026-11-09
 > - **Async events** (queue or log) when the caller does not need the result now or when many consumers care.
 > - Synchronous chains multiply failure and latency. Break them with events where the business allows.
 > - Numbers here are estimates unless a source is named.
+
+## Start here: the basics
+
+**The problem in one story**
+
+A food app needs to show a menu, let two services talk inside the company, push "your rider is near" to a phone, and tell a restaurant's own system about a new order.
+Each of these is a different kind of conversation. Some ask and wait, some push, some just drop a note and move on.
+Picking an API style means picking the right kind of conversation for each.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| API | The agreed way one program asks another for something | `GET /orders/42` |
+| Synchronous | Caller waits for the answer before moving on | Checkout waits for the payment reply |
+| Asynchronous | Caller sends a message and does not wait | Publish `OrderPlaced`; email sends later |
+| REST | HTTP API built around resources and verbs | `POST /orders` |
+| gRPC | Fast binary calls between services, with a typed contract | `OrderService.Get(id)` |
+| GraphQL | Client asks for exactly the fields it wants in one query | `{ order { id total } }` |
+| WebSocket / SSE | Long-lived connection so the server can push | Live score updates |
+| Webhook | An HTTP call your system makes to another company's URL on an event | Payment provider calls `/payment-done` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    M[Mobile app] -- REST/GraphQL --> GW[Gateway]
+    GW -- gRPC --> O[Order service]
+    O -- event --> Q[(Queue / log)]
+    Q --> N[Notifier]
+    N -- WebSocket/SSE --> M
+    O -- webhook --> P[Partner system]
+```
+
+**Analogy**
+
+A phone call (synchronous: both wait on the line), a text message (async: reply later), and a radio broadcast (server push to whoever listens).
+Where it breaks: a text can be lost silently, but a well-built queue keeps the message until a consumer handles it.
+
+**How the rest of this note builds up**
+
+- First, why many styles exist and a mental model of sync vs async (sections 1-2).
+- Then how each style works (section 3) and a worked example (section 4).
+- Next, comparisons, trade-offs and production lessons (sections 5-7).
+- Finally, the SDE-3 deep dive on gRPC streams, webhook guarantees, the dual write trap and timeouts, then interview questions, cheat sheet and drills.
+
+> [!tip] Remember
+> Ask "does the caller need the answer now?" If no, use an event.
 
 ## 1. Why it exists
 
@@ -390,3 +438,8 @@ Every sync call needs a deadline shorter than its caller's deadline, or the chai
 - Messaging: [[Queues vs Streams and Broker Comparison]], [[Kafka and Event Streaming]], [[Delivery Semantics and Exactly-Once]], [[Transactional Outbox and CDC]], [[Dead Letter Queues and Poison Messages]], [[Backpressure and Flow Control]], [[AWS SQS, SNS and EventBridge]], [[Workflow Engines and Durable Execution]]
 - Resilience and scale: [[Saga Pattern]], [[Circuit Breaker]], [[Load Balancing]], [[Scaling WebSockets]], [[Receiving Webhooks Idempotently]], [[WebSockets and SSE in Go]]
 - Related decisions: [[Choosing a Caching Strategy - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[HLD Trade-offs Master Cheat Sheet]], [[System Design Interview Framework]]
+
+### Watch on YouTube
+
+- [Top 6 Most Popular API Architecture Styles](https://www.youtube.com/watch?v=4vLxWqE94l4) · ByteByteGo · 4 min · 1,183,838 views
+- [Every Popular API Style Explained... Like You're 5](https://www.youtube.com/watch?v=xJFzPSAw4Fo) · Code Wrap · 8 min · 74,252 views

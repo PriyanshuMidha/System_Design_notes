@@ -9,13 +9,22 @@ sources:
   - "Linux man-pages: fsync(2), fdatasync(2), open(2), mount(8) (ext4 journal modes)"
   - "PostgreSQL 17 documentation, Reliability and the Write-Ahead Log"
   - "Go 1.24 standard library documentation, os.File.Sync"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Page Cache, File Systems and fsync - Go
 
 > [!summary] TL;DR
 > Two tiny append functions — one that calls `fsync` before returning, one that doesn't — demonstrate the durable-append pattern from [[Page Cache, File Systems and fsync]]: the same pattern a write-ahead log uses to make a commit survive a crash.
+
+## Before the code
+
+- **`os.OpenFile` with flags**: opens a file with options combined by `|`, here append, create and write-only.
+- **`defer`**: schedules `f.Close()` to run when the function returns, on every path.
+- **Multiple return values and `error`**: Go functions return `(result, error)`; a non-nil `error` means it failed.
+- **`f.Sync()`**: Go's wrapper for the `fsync(2)` system call.
+- **`testing` package and `t.TempDir()`**: tests are functions named `TestXxx`; `t.TempDir()` gives a throwaway folder.
+- **What to run**: `go vet ./... && go test -race -v ./...` inside the module folder.
 
 ## What this code shows
 
@@ -34,7 +43,9 @@ flowchart LR
     WANS --> N1["os.OpenFile"] --> N2["f.Write"] --> Done2["returns: in page cache only"]
 ```
 
-The two functions share the same open-write shape; the only difference is the one extra line, `f.Sync()` — which is the entire point: durability is one explicit call away, and skipping it is just as easy, which is exactly how production incidents happen.
+The two functions share the same open-write shape; the only difference is the one extra line, `f.Sync()`.
+
+That is the entire point: durability is one explicit call away, and skipping it is just as easy, which is exactly how production incidents happen.
 
 ## Setup
 
@@ -46,7 +57,11 @@ The two functions share the same open-write shape; the only difference is the on
 
 ### Step 1: the durable append
 
-**Concept.** `WriteAppendSync` implements the durable-append pattern from [[Page Cache, File Systems and fsync#4. Worked example]]: open for append, write the record, then call `Sync()` before telling the caller it is safe to proceed. This is the same shape a database uses after appending a record to its write-ahead log. The alternative — opening with a flag that forces synchronous I/O on every write (`O_SYNC`) — was rejected here because explicit `Sync()` calls let the caller choose exactly when durability matters (e.g. once per batch, not once per byte written).
+**Concept.** `WriteAppendSync` implements the durable-append pattern from [[Page Cache, File Systems and fsync#4. Worked example]]: open for append, write the record, then call `Sync()` before telling the caller it is safe to proceed.
+
+This is the same shape a database uses after appending a record to its write-ahead log.
+
+The alternative — opening with a flag that forces synchronous I/O on every write (`O_SYNC`) — was rejected here because explicit `Sync()` calls let the caller choose exactly when durability matters (e.g. once per batch, not once per byte written).
 
 ```go
 package pagecache
@@ -94,7 +109,9 @@ sequenceDiagram
 
 ### Step 2: the non-durable append, for contrast
 
-**Concept.** `WriteAppendNoSync` is deliberately the "wrong" version, kept in the same package specifically so the two can be compared directly: it implements [[Page Cache, File Systems and fsync#1. Why it exists]]'s point that a successful `write()` only guarantees visibility to other readers, not survival across a crash. There is no good reason to prefer this version for durability-critical data — it exists here only as the control case.
+**Concept.** `WriteAppendNoSync` is deliberately the "wrong" version, kept in the same package specifically so the two can be compared directly: it implements [[Page Cache, File Systems and fsync#1. Why it exists]]'s point that a successful `write()` only guarantees visibility to other readers, not survival across a crash.
+
+There is no good reason to prefer this version for durability-critical data — it exists here only as the control case.
 
 ```go
 // WriteAppendNoSync appends data without fsync. The bytes reach the page
@@ -115,7 +132,7 @@ func WriteAppendNoSync(path string, data []byte) error {
 
 1. Every line is identical to `WriteAppendSync` except the final `return f.Sync()` is replaced with `return err` right after `f.Write` — the one-line difference is the entire durability gap.
 2. A reader opening the same path immediately after this function returns would see the new bytes (page-cache visibility is immediate), which is exactly what makes the missing durability easy to miss in testing: everything *looks* correct until a real crash happens.
-3. This function is not called by the test below precisely because its interesting property — data loss on a crash — cannot be observed from inside a normal test process.
+3. The first test below does not call this function, and the second test only checks visibility, because its interesting property — data loss on a crash — cannot be observed from inside a normal test process.
 
 ## Design decisions
 
@@ -130,7 +147,11 @@ func WriteAppendNoSync(path string, data []byte) error {
 
 ### TestWriteAppendSyncDurableAndReadable
 
-**Property.** Two sequential durable appends must both succeed, and the file's final contents must be exactly the concatenation of both records, in order. This proves `WriteAppendSync` is readable-back and ordered; it does **not** and cannot prove durability across a real power loss — that would require killing the machine mid-write, which no in-process unit test can do, so `fsync`'s actual guarantee has to be taken on the kernel's documented word.
+**Property.** Two sequential durable appends must both succeed, and the file's final contents must be exactly the concatenation of both records, in order.
+
+This proves `WriteAppendSync` is readable-back and ordered.
+
+It does **not** and cannot prove durability across a real power loss — that would require killing the machine mid-write, which no in-process unit test can do, so `fsync`'s actual guarantee has to be taken on the kernel's documented word.
 
 | Step | Call | Expected |
 | --- | --- | --- |
@@ -167,12 +188,37 @@ func TestWriteAppendSyncDurableAndReadable(t *testing.T) {
 2. Two separate calls to `WriteAppendSync` prove the append position carries correctly between calls — each call reopens the file, and `O_APPEND` still lands the second write after the first.
 3. The final `os.ReadFile` reads through the normal (buffered) path, which is also served by the page cache — this test can only observe that the data is *correct*, not that it is *durable*; durability is `fsync`'s documented contract, taken on faith from the kernel, not measured here.
 
-**If it fails.** A content mismatch would point at an append-ordering bug (e.g. `O_APPEND` missing, or a `Seek` happening between calls); an error from either `WriteAppendSync` call would most likely mean a permissions or disk-space problem in the temp directory, not a logic bug in the function itself.
+**If it fails.** A content mismatch would point at an append-ordering bug (e.g. `O_APPEND` missing, or a `Seek` happening between calls).
+
+An error from either `WriteAppendSync` call would most likely mean a permissions or disk-space problem in the temp directory, not a logic bug in the function itself.
 
 ```text
 $ go vet ./pagecache/...
 $ go test -race -v ./pagecache/...
 ```
+
+### TestWriteAppendNoSyncVisibleImmediately
+
+**Property.** After `WriteAppendNoSync` returns, a reader sees the bytes at once. This shows page-cache visibility, the half of the story that makes the missing `fsync` easy to miss.
+
+```go
+func TestWriteAppendNoSyncVisibleImmediately(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.log")
+	if err := WriteAppendNoSync(path, []byte("tmp\n")); err != nil {
+		t.Fatalf("WriteAppendNoSync: %v", err)
+	}
+	// Served from the page cache: visible to readers, durability unknown.
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "tmp\n" {
+		t.Fatalf("got %q, want %q", got, "tmp\n")
+	}
+}
+```
+
+**How it works.** It writes one record without `Sync()`, then reads the file back. The read succeeds because the bytes sit in the page cache, which is exactly why a passing test says nothing about crash safety.
 
 ## Running it
 
@@ -185,7 +231,22 @@ PASS
 ok  	roll4scratch/pagecache	2.372s
 ```
 
-**Reading the output.** The test itself completes in well under a millisecond — two `fsync` calls on a local filesystem during a test run are fast, since the underlying volume here has nothing contending for it. The package-level `2.372s` reported by `go test` is dominated by test-binary build and harness startup, not by the two `fsync` calls themselves. In production, the same two calls on a loaded, network-backed volume could each cost several milliseconds instead — see the fsync cost tiers in the theory note.
+Re-run with both tests on Go 1.24.4, darwin/arm64 (2026-11-13):
+
+```text
+=== RUN   TestWriteAppendSyncDurableAndReadable
+--- PASS: TestWriteAppendSyncDurableAndReadable (0.01s)
+=== RUN   TestWriteAppendNoSyncVisibleImmediately
+--- PASS: TestWriteAppendNoSyncVisibleImmediately (0.00s)
+PASS
+ok  	roll4scratch/pagecache	1.440s
+```
+
+**Reading the output.** The test itself completes in well under a millisecond — two `fsync` calls on a local filesystem during a test run are fast, since the underlying volume here has nothing contending for it.
+
+The package-level `2.372s` reported by `go test` is dominated by test-binary build and harness startup, not by the two `fsync` calls themselves.
+
+In production, the same two calls on a loaded, network-backed volume could each cost several milliseconds instead — see the fsync cost tiers in the theory note.
 
 ## Pitfalls in the code
 

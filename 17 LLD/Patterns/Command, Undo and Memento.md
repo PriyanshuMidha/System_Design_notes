@@ -12,7 +12,7 @@ sources:
   - "PostgreSQL 17 docs: SAVEPOINT, ROLLBACK TO SAVEPOINT, INSERT ON CONFLICT"
   - "pgx v5 docs: Tx.Begin starts a pseudo nested transaction using a savepoint"
   - "asynq docs (NewTask with a type name and payload) and River docs (JobArgs.Kind)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Command, Undo and Memento
@@ -26,6 +26,50 @@ updated: 2026-11-02
 > - Undo uses either an inverse (`Undo()` on each command) or a memento (a snapshot of the state taken before the change).
 > - Classic mistakes: a new edit must clear the redo stack, and a snapshot must deep-copy slices and maps, not just copy the struct.
 
+## Start here: the basics
+
+**The problem in one story.**
+You type in a text editor and press Ctrl+Z to undo.
+For that to work, the editor must have remembered each action as something it can replay or reverse.
+The same idea lets a server put a job in a queue, retry it later, or log what was done.
+This note is about turning "do this" into a value you can keep.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Command | An action stored as a value | `AddItem{SKU: "A1", Qty: 2}` |
+| Closure | A function that remembers variables around it | `func(ctx context.Context) error { ... }` |
+| Queue | A line of waiting work | jobs waiting for a worker |
+| Stack | A pile where the last item in comes out first | undo history |
+| Undo / redo | Reverse the last action / reapply it | Ctrl+Z / Ctrl+Y |
+| Snapshot (memento) | A saved copy of state at one moment | copy of the cart before a change |
+| Deep copy | A copy that also copies inner slices and maps | new slice, not shared one |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User action"] --> C["Command value"]
+    C --> X["Execute"]
+    X --> US["Undo stack"]
+    US -- "Ctrl+Z" --> UN["Undo: inverse or<br/>restore snapshot"]
+    UN --> RS["Redo stack"]
+```
+
+**Analogy.** A restaurant order ticket: written once, it can wait, be read by anyone, be voided or kept for audit.
+Where it breaks: you cannot "undo" a cooked meal, and some real commands (sending an email, charging a card) cannot be undone either.
+
+**How the rest of this note builds up**
+
+- First, why actions as values are useful and the mental model (sections 1-2).
+- Then how commands, inverse undo and memento snapshots work, with a full Go example (sections 3-4).
+- Then variants and trade-offs between inverse commands and snapshots (sections 5-6).
+- Finally the SDE-3 view: durable job queues, idempotency, the deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> A command is "do this" stored as a value; undo comes from an inverse or a deep-copied snapshot, and a new edit clears redo.
+
 ## 1. Why it exists
 
 Two problems that a direct function call cannot solve:
@@ -37,7 +81,9 @@ Command solves the first problem by making the request a value. Undo solves the 
 
 ## 2. Mental model
 
-A restaurant order ticket. The waiter writes the order on a ticket and clips it to the rail. The cook picks it up when free. The ticket can wait in line, be read by anyone, be voided, and be kept for the end-of-day audit. Nobody needs the waiter and the cook to be in the same place at the same time.
+A restaurant order ticket. The waiter writes the order on a ticket and clips it to the rail.
+
+The cook picks it up when free. The ticket can wait in line, be read by anyone, be voided, and be kept for the end-of-day audit. Nobody needs the waiter and the cook to be in the same place at the same time.
 
 | Role | In the restaurant | In Go |
 | --- | --- | --- |
@@ -757,7 +803,9 @@ The second `Process` call printed nothing because the key `cancel:o-42` was alre
 	- `os/exec.Cmd` is a command object: you configure `Path`, `Args`, `Env` and `Dir`, then call `Run` or `Start`. The docs say a `Cmd` cannot be reused after `Run`, `Output` or `CombinedOutput`.
 	- `errgroup.Group.Go(func() error)` runs each closure command in its own goroutine (blocking while a `SetLimit` cap is reached), and `Wait` returns the first non-nil error.
 	- Job libraries use the durable envelope: asynq builds a task from a type name and a payload, and River jobs declare a `Kind()` string that the worker registry maps to a handler.
-	- [[Movie Ticket Booking]]: a background sweeper runs `ReleaseExpiredLocks` (and `ProcessRefunds`) as scheduled jobs that are safe to run twice. [[Delivery Partner Assignment]]: an order nobody could take is parked and becomes a retry job that a 30–60 s ticker runs again, and the third-party booking carries an idempotency key. [[Elevator System]]: in the event-loop alternative, button presses are request commands sent on a channel to the one goroutine that owns the cars, which serves stops in LOOK order, not in arrival order.
+	- [[Movie Ticket Booking]]: a background sweeper runs `ReleaseExpiredLocks` (and `ProcessRefunds`) as scheduled jobs that are safe to run twice.
+	- [[Delivery Partner Assignment]]: an order nobody could take is parked and becomes a retry job that a 30–60 s ticker runs again, and the third-party booking carries an idempotency key.
+	- [[Elevator System]]: in the event-loop alternative, button presses are request commands sent on a channel to the one goroutine that owns the cars, which serves stops in LOOK order, not in arrival order.
 	- PostgreSQL savepoints are a database Memento; in pgx v5, calling `Begin` on an open `Tx` creates a savepoint.
 - **Failure modes → fixes:**
 	- Retried command charges twice → an idempotency key claimed in the same transaction as the side effect (see section 8 and [[Idempotency and Idempotency Keys]]).
@@ -835,3 +883,8 @@ If the side effect lives in another system (a payment provider), pass the same k
 - **Next:** [[Iterator and range-over-func]], [[Background Workers and Job Queues]]
 - **Compare with:** [[Strategy and Template Method]] (a strategy is *how* to do something; a command is *what* to do, stored for later), [[CQRS]] and [[Event Sourcing]] (commands and events at the architecture level), [[Saga Pattern]] (compensation instead of undo), [[Case Study - Ticket Booking]] (seat holds and expiry at system scale)
 - **Practice:** [[Movie Ticket Booking]], [[Delivery Partner Assignment]], [[Elevator System]], [[Task Scheduler (delayed and recurring jobs)]]
+
+### Watch on YouTube
+
+- [How Undo & Redo Actually Work (Ctrl+Z Explained) / Stacks, Command & Memento Pattern](https://www.youtube.com/watch?v=2-ayxAs3kR4) · Anand Sharma · 4 min · 7 views
+- [Undo changes with Memento pattern / Design patterns you must know](https://www.youtube.com/watch?v=Pwm-jrG2ZVA) · Krish Dinesh · 18 min · 3,682 views

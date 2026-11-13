@@ -6,7 +6,7 @@ related: ["[[LLM Evals in Production]]", "[[Guardrails and LLM Security]]", "[[P
 sources:
   - "OWASP Top 10 for LLM Applications 2025"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Production AI Checklist
@@ -21,17 +21,74 @@ updated: 2026-11-07
 > - Require a human in the loop for any action with real-world consequences (a refund, a delete, an email sent on someone's behalf).
 > - Enforce budgets and keep a kill switch that works even when the deploy pipeline doesn't.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your team ships a chatbot, and on day one the AI provider slows down.
+Users see errors, a retry loop burns money, and a prompt change made yesterday quietly gives worse answers.
+None of these are new problems; they are the same problems as any outside service.
+This checklist lists the guards to put in place before real users arrive.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Timeout | Give up on a call after a set time | Stop waiting after 10 s |
+| Retry with backoff | Try again, waiting longer each time | Wait 1 s, then 2 s, then 4 s |
+| Circuit breaker | Stop calling a failing service for a while | After 3 failures, pause 30 s |
+| Fallback | A backup plan when the main path fails | Use a smaller model or a cached answer |
+| Canary | Send a new version to a small slice of traffic first | 10% of users get prompt v2 |
+| Eval / golden set | A fixed test set that scores answers | 100 questions with known good answers |
+| Kill switch | A flag that turns a feature off at once | `ai_enabled=false` |
+| Blast radius | How much damage a wrong action can do | A refund is worse than a search |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request"] --> B{"Budget left<br/>and switch on?"}
+    B -- "no" --> F["Graceful fallback"]
+    B -- "yes" --> CB{"Breaker closed?"}
+    CB -- "no" --> F
+    CB -- "yes" --> M["Model call<br/>with timeout"]
+    M -- "fails" --> F
+    M -- "ok" --> A["Answer<br/>(risky action needs human OK)"]
+```
+
+**Analogy.** It is like a pre-flight checklist for a plane: each item is boring, but skipping one is how accidents happen.
+Where it breaks: a plane's checklist is the same every flight, while model behaviour can change with a new model or prompt version, so the checks must re-run on every change.
+
+**How the rest of this note builds up**
+
+- First, a whiteboard story, why the checklist exists (section 1) and the mental model (section 2).
+- Then each item: versioning, fallbacks, timeouts and breakers, eval gate plus canary, human review, budgets and kill switch (section 3).
+- Then a tested Go worked example wiring a kill switch, circuit breaker, fallback chain and canary gate (section 4), and variants (sections 5-6).
+- Finally the SDE-3 deep dive: production rollout, deterministic canaries and interview traps (sections 7-9).
+
+> [!tip] Remember
+> Treat the LLM like any flaky, metered outside service, then add eval gates, human approval and spend caps.
+
 ### Whiteboard version
 
-A feature ships with a 10% canary on a new prompt version, a circuit breaker in front of the model API, a fallback to a smaller model, and a per-tenant budget cap. One tenant's traffic spikes: the primary model starts timing out, the breaker opens, calls fall back to the smaller model automatically, the tenant's spend cap catches the volume before it becomes a bill, and the eval gate on the canary catches that the new prompt version regressed on a golden-set question before it reaches the other 90% of traffic. None of this is unusual engineering — it's the standard resilience and rollout checklist for any backend dependency, applied to a dependency that happens to be an LLM.
+A feature ships with a 10% canary on a new prompt version, a circuit breaker in front of the model API, a fallback to a smaller model, and a per-tenant budget cap.
+
+One tenant's traffic spikes: the primary model starts timing out, the breaker opens, calls fall back to the smaller model automatically, the tenant's spend cap catches the volume before it becomes a bill, and the eval gate on the canary catches that the new prompt version regressed on a golden-set question before it reaches the other 90% of traffic.
+
+None of this is unusual engineering — it's the standard resilience and rollout checklist for any backend dependency, applied to a dependency that happens to be an LLM.
 
 ## 1. Why it exists
 
-An LLM call is an external, rate-limited, occasionally-flaky HTTP dependency with a cost that scales directly with traffic and a failure mode ("answered confidently but wrong") that a normal 5xx doesn't have. Shipping it without the same checklist you'd apply to a payments API or a third-party shipping-rates API — but with the LLM-specific additions a model call needs — means the first real incident (a provider outage, a cost spike, a prompt that quietly started leaking PII through tool output) has no prepared response. This note is the pre-launch checklist that ties together [[LLM Cost, Latency and Caching]], [[LLM Observability]], [[LLM Evals in Production]] and [[Guardrails and LLM Security]] into one gate a feature passes before it's "production."
+An LLM call is an external, rate-limited, occasionally-flaky HTTP dependency with a cost that scales directly with traffic and a failure mode ("answered confidently but wrong") that a normal 5xx doesn't have.
+
+Shipping it without the same checklist you'd apply to a payments API or a third-party shipping-rates API — but with the LLM-specific additions a model call needs — means the first real incident (a provider outage, a cost spike, a prompt that quietly started leaking PII through tool output) has no prepared response.
+
+This note is the pre-launch checklist that ties together [[LLM Cost, Latency and Caching]], [[LLM Observability]], [[LLM Evals in Production]] and [[Guardrails and LLM Security]] into one gate a feature passes before it's "production."
 
 ## 2. Mental model
 
-Treat the LLM exactly like you'd treat any other unreliable, metered, third-party dependency: it needs a timeout, a retry policy, a circuit breaker, and a fallback, the same as a payments or shipping-rates API (see [[Calling External APIs]]). Then add the parts that are new because the dependency's failure mode is different from a normal API's: it can fail by being confidently wrong, not just by erroring, so you additionally need eval gates on every version change and a human approval step for any high-risk action it's allowed to trigger.
+Treat the LLM exactly like you'd treat any other unreliable, metered, third-party dependency: it needs a timeout, a retry policy, a circuit breaker, and a fallback, the same as a payments or shipping-rates API (see [[Calling External APIs]]).
+
+Then add the parts that are new because the dependency's failure mode is different from a normal API's: it can fail by being confidently wrong, not just by erroring, so you additionally need eval gates on every version change and a human approval step for any high-risk action it's allowed to trigger.
 
 ## 3. How it works
 
@@ -60,15 +117,21 @@ flowchart TD
 
 ### Versioned prompts, models and tools
 
-A prompt, the model it targets, and the tool schemas offered to it are one versioned unit — changing any one without re-testing the others is how "we only changed the prompt" regressions happen. Store them in git alongside the code that calls them (see [[Prompt Engineering]]), tag the version in every trace (see [[LLM Observability]]), and treat a model upgrade exactly like a prompt change: re-run the eval gate, don't assume a newer model is a strict improvement on your specific task.
+A prompt, the model it targets, and the tool schemas offered to it are one versioned unit — changing any one without re-testing the others is how "we only changed the prompt" regressions happen.
+
+Store them in git alongside the code that calls them (see [[Prompt Engineering]]), tag the version in every trace (see [[LLM Observability]]), and treat a model upgrade exactly like a prompt change: re-run the eval gate, don't assume a newer model is a strict improvement on your specific task.
 
 ### Fallbacks
 
-Every call site needs a planned answer for "the primary path failed," not a bare error: a fallback model (cheaper or different provider), a cached or canned answer, or an explicit "I can't answer that right now" — in that preference order, never a raw 500 surfaced to the user. [[LLM Cost, Latency and Caching]] covers the cost side of model cascades; this checklist item is the resilience side of the same mechanism.
+Every call site needs a planned answer for "the primary path failed," not a bare error: a fallback model (cheaper or different provider), a cached or canned answer, or an explicit "I can't answer that right now" — in that preference order, never a raw 500 surfaced to the user.
+
+[[LLM Cost, Latency and Caching]] covers the cost side of model cascades; this checklist item is the resilience side of the same mechanism.
 
 ### Timeouts, retries, circuit breakers
 
-Standard external-dependency hygiene, applied here: a context deadline on every call, a bounded retry policy on transient errors (429/5xx — see [[Calling External APIs]]), and a circuit breaker that stops sending calls to a provider that's clearly down instead of queuing failures behind a timeout on every single request. The breaker is what makes a fallback chain actually fast under an outage — without it, every request still pays the primary's full timeout before falling back.
+Standard external-dependency hygiene, applied here: a context deadline on every call, a bounded retry policy on transient errors (429/5xx — see [[Calling External APIs]]), and a circuit breaker that stops sending calls to a provider that's clearly down instead of queuing failures behind a timeout on every single request.
+
+The breaker is what makes a fallback chain actually fast under an outage — without it, every request still pays the primary's full timeout before falling back.
 
 ```mermaid
 stateDiagram-v2
@@ -88,15 +151,25 @@ stateDiagram-v2
 
 ### Eval gate plus canary
 
-No prompt, model or tool-schema change reaches 100% of traffic without first passing a golden-set and guardrail-set eval (see [[LLM Evals in Production]]) and then running as a canary on a small traffic percentage, watched for cost, latency and guardrail-trigger-rate drift (see [[LLM Observability]]) before a full ramp. This is the same progressive-rollout discipline as any other risky deploy, with LLM-specific signals (guardrail-trigger rate, eval score) added to the usual error-rate and latency signals.
+No prompt, model or tool-schema change reaches 100% of traffic without first passing a golden-set and guardrail-set eval (see [[LLM Evals in Production]]) and then running as a canary on a small traffic percentage, watched for cost, latency and guardrail-trigger-rate drift (see [[LLM Observability]]) before a full ramp.
+
+This is the same progressive-rollout discipline as any other risky deploy, with LLM-specific signals (guardrail-trigger rate, eval score) added to the usual error-rate and latency signals.
 
 ### Human review for risky actions
 
-Classify every action an LLM or agent can take by its blast radius: read-only (safe to automate fully), low-risk and reversible (automate, but log and allow undo), or high-risk/irreversible (refunds, deletions, anything sent externally on someone's behalf) — the last category requires a human approval step before it executes, regardless of how confident the model's output looked. [[Guardrails and LLM Security]] covers the broader threat model (prompt injection driving an agent toward a high-risk action in the first place); this checklist item is the backstop that assumes an injection or a bad decision will eventually get through.
+Classify every action an LLM or agent can take by its blast radius: read-only (safe to automate fully), low-risk and reversible (automate, but log and allow undo), or high-risk/irreversible (refunds, deletions, anything sent externally on someone's behalf).
+
+The last category requires a human approval step before it executes, regardless of how confident the model's output looked.
+
+[[Guardrails and LLM Security]] covers the broader threat model (prompt injection driving an agent toward a high-risk action in the first place); this checklist item is the backstop that assumes an injection or a bad decision will eventually get through.
 
 ### Data governance, budgets, kill switch
 
-Data governance here means knowing what data reaches the model (and, for RAG, what a retrieval filter could leak across tenants — see [[Vector Databases and ANN Indexes]]) and honoring deletion requests through to any cache, log or eval dataset that copied it. Budgets means a hard per-tenant and per-feature spend cap enforced before the call, not an after-the-fact alert (see [[LLM Cost, Latency and Caching]]). A kill switch is a flag checked before any call is made, independent of the normal deploy pipeline, so the feature can be turned off in seconds during an incident even if CI/CD itself is part of the problem.
+Data governance here means knowing what data reaches the model (and, for RAG, what a retrieval filter could leak across tenants — see [[Vector Databases and ANN Indexes]]) and honoring deletion requests through to any cache, log or eval dataset that copied it.
+
+Budgets means a hard per-tenant and per-feature spend cap enforced before the call, not an after-the-fact alert (see [[LLM Cost, Latency and Caching]]).
+
+A kill switch is a flag checked before any call is made, independent of the normal deploy pipeline, so the feature can be turned off in seconds during an incident even if CI/CD itself is part of the problem.
 
 ## 4. Worked example
 
@@ -476,7 +549,15 @@ func TestRunGuardedCallsChainWhenEnabled(t *testing.T) {
 }
 ```
 
-**Measured (this test run, Go 1.24, 2026-11-07):** the breaker opens after exactly 3 consecutive failures, refuses calls immediately while `Open`, and transitions to `HalfOpen` only after its 20ms cooldown elapses, closing again on a successful trial call. Under 20 concurrent callers hitting a `HalfOpen` breaker at once, exactly 1 gets through and the other 19 fail fast, confirming `Allow` admits only one trial call at a time rather than letting every concurrent caller through while the state merely reads `HalfOpen`. The fallback chain, run against two real `httptest.Server` instances (one returning 503, one returning 200), falls through to the working second step and never calls a step whose breaker reports `Open`. The canary gate is exactly deterministic per request ID across 10 repeated calls, and over 10,000 distinct IDs routes 17-23% to a 20%-configured canary (measured: within that band; exact value varies by hash distribution). `RunGuarded` returns `ErrKilled` without calling the chain at all when the switch is disabled, and passes through to the chain's own result otherwise. All tests pass under `go test -race`.
+**Measured (this test run, Go 1.24, 2026-11-07):** the breaker opens after exactly 3 consecutive failures, refuses calls immediately while `Open`, and transitions to `HalfOpen` only after its 20ms cooldown elapses, closing again on a successful trial call.
+
+Under 20 concurrent callers hitting a `HalfOpen` breaker at once, exactly 1 gets through and the other 19 fail fast, confirming `Allow` admits only one trial call at a time rather than letting every concurrent caller through while the state merely reads `HalfOpen`.
+
+The fallback chain, run against two real `httptest.Server` instances (one returning 503, one returning 200), falls through to the working second step and never calls a step whose breaker reports `Open`.
+
+The canary gate is exactly deterministic per request ID across 10 repeated calls, and over 10,000 distinct IDs routes 17-23% to a 20%-configured canary (measured: within that band; exact value varies by hash distribution).
+
+`RunGuarded` returns `ErrKilled` without calling the chain at all when the switch is disabled, and passes through to the chain's own result otherwise. All tests pass under `go test -race`.
 
 ## 5. Variants and comparison
 
@@ -510,15 +591,25 @@ func TestRunGuardedCallsChainWhenEnabled(t *testing.T) {
 
 ## 8. Deep dive
 
-- **Why versioning prompts/models/tools together matters more than it looks.** A prompt that was tuned against one model's behavior (tone, instruction-following strength, tool-calling reliability) can regress silently on a different model even with identical text, because the underlying behavior it was tuned against changed. Treating a model swap as "just a config change" without re-running the eval gate is how a seemingly safe upgrade ships a regression.
-- **Why the circuit breaker and the fallback chain are separate concerns.** A breaker decides *whether to even try* a given step (fail fast once a provider is clearly down); the fallback chain decides *what to try next* once a step is skipped or fails. Conflating them — e.g., retrying a fallback's own fallback inside the breaker's logic — makes the failure path much harder to reason about under an actual incident; keep the breaker per-step and let the chain's ordering express the preference.
-- **The canary's traffic split must be deterministic per identity, not per call.** A random split means the same user or request can land on different versions across retries, which breaks both reproducibility (you can't re-run a bug report deterministically) and clean A/B measurement (you're measuring a different population each time rather than a stable one). Hashing a stable identifier (request ID, user ID, or tenant ID, depending on what you're testing) fixes both.
+- **Why versioning prompts/models/tools together matters more than it looks.**
+
+  A prompt that was tuned against one model's behavior (tone, instruction-following strength, tool-calling reliability) can regress silently on a different model even with identical text, because the underlying behavior it was tuned against changed. Treating a model swap as "just a config change" without re-running the eval gate is how a seemingly safe upgrade ships a regression.
+- **Why the circuit breaker and the fallback chain are separate concerns.** A breaker decides *whether to even try* a given step (fail fast once a provider is clearly down); the fallback chain decides *what to try next* once a step is skipped or fails.
+
+  Conflating them — e.g., retrying a fallback's own fallback inside the breaker's logic — makes the failure path much harder to reason about under an actual incident; keep the breaker per-step and let the chain's ordering express the preference.
+- **The canary's traffic split must be deterministic per identity, not per call.**
+
+  A random split means the same user or request can land on different versions across retries, which breaks both reproducibility (you can't re-run a bug report deterministically) and clean A/B measurement (you're measuring a different population each time rather than a stable one).
+
+  Hashing a stable identifier (request ID, user ID, or tenant ID, depending on what you're testing) fixes both.
 - **A kill switch is only as good as its last fire drill.** A flag nobody has tripped since it was written is a flag of unknown reliability — the same discipline as testing a database failover, applied to an AI feature's off switch.
 
 ## 9. Interview questions
 
 > [!question]- Why does an LLM feature need a circuit breaker in addition to retries?
-> Retries handle a single transient blip (one 503 that would likely succeed on the next attempt); a circuit breaker handles sustained failure by stopping calls to a clearly-down provider altogether, so every request fails fast instead of each one still paying a full timeout before an eventual retry gives up too. Without the breaker, an outage degrades into a latency disaster even though every individual call is "handled" by retry logic.
+> Retries handle a single transient blip (one 503 that would likely succeed on the next attempt); a circuit breaker handles sustained failure by stopping calls to a clearly-down provider altogether, so every request fails fast instead of each one still paying a full timeout before an eventual retry gives up too.
+>
+> Without the breaker, an outage degrades into a latency disaster even though every individual call is "handled" by retry logic.
 
 > [!question]- Trap: "we eval-gated the new prompt and it passed, so it's safe to ship to all traffic." What's missing?
 > A canary step. An eval gate checks the prompt against a fixed golden/guardrail set, which can't cover every real-traffic pattern; a canary on a small percentage of live traffic, watched for cost/latency/guardrail-trigger drift, catches regressions the eval set didn't anticipate before they reach everyone.
@@ -551,6 +642,11 @@ func TestRunGuardedCallsChainWhenEnabled(t *testing.T) {
 - **Before this:** [[LLM Cost, Latency and Caching]], [[LLM Observability]], [[LLM Evals in Production]], [[Guardrails and LLM Security]]
 - **Next:** nothing; this is the closing checklist for the folder
 - **Compare with:** [[Production Readiness Review]] (the general-backend version of this gate)
+
+### Watch on YouTube
+
+- [Is Your AI Agent Production Ready? The Reliability Checklist.](https://www.youtube.com/watch?v=PiaCRgH5vAY) · Eldon Conceicao / AI Operations Journal · 21 min · 1,350 views
+- [AI System Design for Production: The Checklist Most Engineers Skip](https://www.youtube.com/watch?v=3nYoe4mcJCw) · AI in Production · 21 min · 229 views
 
 ## Every note in this folder
 

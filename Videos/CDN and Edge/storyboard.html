@@ -1,0 +1,213 @@
+<storyboard title="CDN and Edge" series="Networking and Web" voice="en-US-EmmaMultilingualNeural" rate="6">
+<!--
+ Source note: 02 Networking & Web/CDN and Edge.md. Every fact comes from that note.
+ Narration cues:  {3} = the elements with data-step="3" appear when this phrase starts.
+                  {:punch} {:warn} {:calm} {:hook} {:question} {:fast} = tone for the phrase.   {pause} = beat of silence.
+-->
+<pron from="CDNs" to="C D Ns"/>
+<pron from="CDN" to="C D N"/>
+<pron from="PoPs" to="pops"/>
+<pron from="PoP" to="pop"/>
+<pron from="TTL" to="T T L"/>
+<pron from="TLS" to="T L S"/>
+<pron from="TCP" to="T C P"/>
+<pron from="GeoDNS" to="Geo D N S"/>
+<pron from="DNS" to="D N S"/>
+<pron from="ETag" to="E Tag"/>
+<pron from="JWT" to="J W T"/>
+<pron from="WAF" to="W A F"/>
+<pron from="MDN" to="M D N"/>
+<pron from="URLs" to="U R Ls"/>
+<pron from="URL" to="U R L"/>
+<pron from="IP" to="I P"/>
+<pron from="CSS" to="C S S"/>
+<pron from="HTTP/3" to="H T T P 3"/>
+<pron from="s-maxage" to="S max age"/>
+<pron from="max-age" to="max age"/>
+<pron from="no-cache" to="no cache"/>
+<pron from="no-store" to="no store"/>
+<pron from="Set-Cookie" to="Set Cookie"/>
+<pron from="Accept-Encoding" to="Accept Encoding"/>
+<pron from="utm_source" to="u t m source"/>
+<pron from="304" to="three oh four"/>
+
+<section layout="title" heading="CDN and Edge" sub="Why a shopper in Mumbai gets a fast page when your server is in Virginia">
+<narration>Quick question. {1}Your server is in Virginia. Your shopper is in Mumbai. How long does one product photo take to reach her? {:punch}Longer than you think. {:calm}So let's fix that, with a CDN.</narration>
+</section>
+
+<section heading="The problem: distance">
+<div class="row">
+  <div class="box blue fill-blue" data-step="1" data-anim="pop"><b>Shopper</b><small>Mumbai</small></div>
+  <div class="arrow" data-step="1" data-anim="wipe"><span>180 to 250 ms each way (typical)</span>⟷</div>
+  <div class="box amber fill-amber" data-step="1" data-anim="pop"><b>Origin server</b><small>Virginia, USA</small></div>
+</div>
+<div class="grid2">
+  <div class="card red" data-step="2"><h2>400 to 600 ms</h2>until the first byte of a cold connection arrives, after the TCP and TLS handshakes</div>
+  <div class="card red" data-step="3"><h2>One server does it all</h2>50,000 users a day means 50,000 TLS connections held, and every byte pushed from Virginia</div>
+</div>
+<div class="callout red" data-step="4" data-anim="zoom">Too slow, and too much work for one machine.</div>
+<narration>Here is the problem. {1}A message between Mumbai and Virginia takes somewhere between a hundred eighty and two hundred fifty milliseconds, each way. {2}Add the TCP and TLS handshakes, and the first byte of a cold connection can take four to six hundred. {3}And your one server has to hold every connection, and send every byte itself. {pause}{4:punch}That is too slow, and too much work for one machine!</narration>
+</section>
+
+<section heading="The idea: a chain of warehouses">
+<div class="row">
+  <div class="box amber fill-amber" data-step="1" data-anim="pop"><b>Factory</b><small>your origin server</small></div>
+  <div class="arrow" data-step="2" data-anim="wipe">→</div>
+  <div class="box purple fill-purple" data-step="2" data-anim="pop"><b>Regional warehouse</b><small>origin shield</small></div>
+  <div class="arrow" data-step="3" data-anim="wipe">→</div>
+  <div class="box green fill-green" data-step="3" data-anim="pop"><b>Local warehouse</b><small>PoP, in Mumbai</small></div>
+  <div class="arrow" data-step="4" data-anim="wipe">→</div>
+  <div class="box blue fill-blue" data-step="4" data-anim="pop"><b>Customer</b><small>the shopper</small></div>
+</div>
+<div class="callout green" data-step="5">Most orders ship from the local shelf. The factory only ships when every warehouse is out of stock.</div>
+<narration>So here is the idea. Think of a chain of warehouses. {1}The factory is your origin server. Do not ship everything from there. {2}Put a regional warehouse in the middle. That is the origin shield. {3}And a local one right in Mumbai. That is a pop, a point of presence. {4}Now the shopper orders from the local shelf. {5:punch}The factory only ships when every warehouse is empty.</narration>
+</section>
+
+<section heading="Four words to know">
+<div class="grid2">
+  <div class="card green" data-step="1" data-anim="pop"><h2>Hit</h2>The PoP has a fresh copy and answers at once</div>
+  <div class="card red" data-step="2" data-anim="pop"><h2>Miss</h2>No copy, so it asks the shield, then the origin</div>
+  <div class="card amber" data-step="3" data-anim="pop"><h2>TTL</h2>How long a copy counts as fresh<small><code>max-age=3600</code> means 1 hour</small></div>
+  <div class="card blue" data-step="4" data-anim="pop"><h2>PoP</h2>One CDN data center in a city<small>for example, the Mumbai PoP</small></div>
+</div>
+<narration>Four words, and you can follow everything else. {1}A hit: the pop has a fresh copy, and answers instantly. {2}A miss: no copy, so it asks the next warehouse up. {3}TTL: how long a copy counts as fresh. Max age equals thirty six hundred means one hour. {4}And a pop is simply one CDN data center, in one city.</narration>
+</section>
+
+<section heading="Getting to the nearest PoP">
+<div class="grid2">
+  <div class="card blue" data-step="1" data-anim="left"><h2>Anycast</h2>Every PoP announces the <b>same IP address</b>. Internet routing sends the user to the closest one.<small>Cloudflare and Fastly work this way. Failover means a bad PoP withdraws its route.</small></div>
+  <div class="card purple" data-step="2" data-anim="right"><h2>GeoDNS</h2>The CDN's DNS servers return a <b>different IP per region</b>, based on where the resolver is.<small>CloudFront and classic Akamai setups use this. It depends on the resolver being near the user.</small></div>
+</div>
+<narration>How does she reach the nearest pop? There are two ways. {1}Anycast. Every pop announces the same IP address, and internet routing simply sends her to the closest one. Cloudflare and Fastly work this way. {2}GeoDNS. The CDN's name servers hand out a different IP address for each region, based on where the resolver is. CloudFront and classic Akamai setups use this.</narration>
+</section>
+
+<section heading="Hit, miss and revalidation">
+<div class="row">
+  <div class="box"><b>Request at the PoP</b><small>look up the cache key</small></div>
+  <div class="arrow">→</div>
+  <div class="col" style="align-items:stretch">
+    <div class="box green fill-green" data-step="1" data-anim="right"><span class="pill green">fresh</span> HIT: serve from cache</div>
+    <div class="box amber fill-amber" data-step="2" data-anim="right"><span class="pill amber">stale + ETag</span> ask origin: changed? <b class="pill amber" data-step="3" data-anim="glow">304 = reuse</b></div>
+    <div class="box red fill-red" data-step="4" data-anim="right"><span class="pill red">no copy</span> MISS: fetch from shield / origin, then store</div>
+  </div>
+</div>
+<narration>Now she asks for the product photo. {1}If the copy is fresh, that is a hit. Served in milliseconds. {2}If it is stale but has an ETag, the pop asks the origin one cheap question: has this changed? {3}A three oh four reply means no. Reuse what you have. {4}And if there is no copy at all? That is a miss. Fetch it, store it, serve it.</narration>
+</section>
+
+<section heading="Real headers from a real CDN">
+<pre><span style="display:block" data-step="1"><span class="k">cache-control:</span> public, max-age=3600</span><span style="display:block" data-step="2"><span class="k">age:</span> <span class="hl">2205</span></span><span style="display:block" data-step="4"><span class="k">x-cache:</span> <span class="hl">MISS, HIT, MISS</span></span></pre>
+<div class="grid2">
+  <div class="callout green" data-step="3"><b>age: 2205</b>. This response had sat in a cache for 2205 seconds. The origin never saw this request.</div>
+  <div class="callout" data-step="4">One <b>x-cache</b> result per tier. The shield and regional structure, in a single header.</div>
+</div>
+<div class="muted" style="font-size:28px">Measured against developer.mozilla.org, served by Fastly.</div>
+<narration>Let us look at real headers from MDN, served by Fastly. {1}Cache control says: keep this for an hour. {2}Now look at age. Two thousand two hundred five. {3:punch}That response had been sitting in a cache for over half an hour. The origin never even saw this request! {4}And x cache lists one result per tier it passed through: miss, hit, miss.</narration>
+</section>
+
+<section heading="Cache-Control: who may keep it, and for how long">
+<table>
+<tr><th>Directive</th><th>Meaning</th></tr>
+<tr data-step="1" data-anim="fade"><td>max-age=N</td><td>Fresh for N seconds in <b>every</b> cache, browser and CDN alike</td></tr>
+<tr data-step="2" data-anim="fade"><td>s-maxage=N</td><td>Overrides max-age for <b>shared</b> caches only, like the CDN</td></tr>
+<tr data-step="3" data-anim="fade"><td>no-cache</td><td>May be cached, but must <b>revalidate</b> before serving</td></tr>
+<tr data-step="4" data-anim="fade"><td>no-store</td><td>Must <b>never</b> be stored anywhere</td></tr>
+<tr data-step="5" data-anim="fade"><td>private</td><td>Only the user's own browser may keep it</td></tr>
+</table>
+<div class="callout red" data-step="3" data-anim="zoom">Common mistake: <b>no-cache does not mean "don't cache"</b>. That is no-store.</div>
+<narration>Headers decide what a CDN may keep. {1}Max age: fresh for this many seconds, in every cache. {2}S max age: the same, but for shared caches only, like the CDN. {3:warn}No cache. It sounds like don't cache, but it is not! It means: cache it, but check with the origin before serving. {4}No store is the real never store. {5}And private means only the user's own browser may keep it.</narration>
+</section>
+
+<section heading="The cache key, and why Vary matters">
+<div class="box" data-step="1" data-anim="pop"><b>cache key</b> = scheme + host + path + query string<small>by default, for most CDNs</small></div>
+<ul class="pts">
+  <li class="green" data-step="2"><code>Vary: Accept-Encoding</code> is safe. Gzip and brotli get separate copies.</li>
+  <li class="red" data-step="3"><code>Vary: Cookie</code> nearly disables caching. Almost every request has a different cookie.</li>
+  <li class="amber" data-step="4">Strip tracking parameters like <code>utm_source</code>, or one page becomes many separate misses.</li>
+</ul>
+<narration>Next, the cache key. {1}By default it is the scheme, host, path and query string. Same key, same copy. {2}Varying on Accept Encoding is fine. Gzip and brotli just get their own copies. {3:warn}But vary on Cookie? Almost every request has a different cookie, so almost every request becomes its own key, and your hit ratio collapses. {4}And strip tracking parameters like u t m source, or one page turns into many misses.</narration>
+</section>
+
+<section heading="Request collapsing and the origin shield">
+<div class="row">
+  <div class="col" data-step="1" data-anim="left">
+    <div class="box blue fill-blue">PoP A</div>
+    <div class="box blue fill-blue">PoP B</div>
+    <div class="box blue fill-blue">PoP C <small>and 97 more</small></div>
+  </div>
+  <div class="arrow" data-step="1" data-anim="wipe"><span>100 requests within 5 ms</span>→</div>
+  <div class="box purple fill-purple" data-step="4" data-anim="pop"><b>Origin shield</b><small>collapses them into one</small></div>
+  <div class="arrow" data-step="6" data-anim="wipe"><span>1 request</span>→</div>
+  <div class="box amber fill-amber" data-step="6" data-anim="pop"><b>Origin</b><small>sees exactly 1 request</small></div>
+</div>
+<div class="callout red" data-step="3" data-anim="zoom">Without protection, all 100 hit the origin: a self-inflicted stampede.</div>
+<narration>Picture a popular photo whose copy has just expired. {1}A hundred requests arrive within five milliseconds, from pops all over. Every one of them misses, at the same instant. {pause}{3:warn}Without protection, all hundred go to your origin. That is a stampede, and you caused it yourself. {4}Request collapsing fixes it. The first request goes. The others wait for it. {5}The origin shield does the same, one tier up. {6:punch}A hundred requests. Exactly one origin request.</narration>
+</section>
+
+<section heading="Invalidation: removing an old copy">
+<div class="grid2">
+  <div class="card green" data-step="1" data-anim="pop"><h2>Versioned URL</h2>New deploy, new URL. The old one is abandoned.<small>Consistency: instant. Origin load: none.</small></div>
+  <div class="card blue" data-step="2" data-anim="pop"><h2>Tag purge</h2>Purge only pages tagged with one object.<small>Consistency: seconds. One fetch per purged page.</small></div>
+  <div class="card purple" data-step="3" data-anim="pop"><h2>Soft purge</h2>Mark stale, keep serving while refreshing.<small>Consistency: seconds. One background fetch per page.</small></div>
+  <div class="card red" data-step="4" data-anim="pop"><h2>Purge everything</h2>Wipe the whole cache.<small>Instant, but every PoP hits the origin at once.</small></div>
+</div>
+<narration>How do you get rid of an old copy? {1:punch}The best answer is: do not purge at all. Use versioned URLs. A new deploy means a new URL, and the old one is simply abandoned. {2}Tag purge removes only the pages tagged with one object. {3}Soft purge marks copies stale, but keeps serving them while a fresh one is fetched. {4:warn}And purge everything? Instant, but every pop hits your origin at once. That is how a routine deploy becomes an outage.</narration>
+</section>
+
+<section heading="Never cache what should not be shared">
+<ul class="pts">
+  <li class="red" data-step="1">Never let a response with <code>Set-Cookie</code> be cached by a shared cache. Mark authenticated responses <code>private</code> or <code>no-store</code>.</li>
+  <li class="green" data-step="2">Paid downloads and video: use <b>signed URLs</b> or signed cookies, checked at the edge.</li>
+  <li class="amber" data-step="3"><b>Cache poisoning:</b> an unkeyed header lets one attacker response reach every user.</li>
+  <li class="amber" data-step="4"><b>Cache deception:</b> adding <code>/nonexistent.css</code> to a private URL tricks the CDN into caching it.</li>
+</ul>
+<div class="callout green" data-step="5">Fix: the cache key must include every input the response varies on.</div>
+<narration>Now, what must never be cached? {1}Anything with Set Cookie. Mark authenticated responses private or no store. {2}For paid downloads or video, use signed URLs, checked at the edge. {3:warn}Then two attacks to know. Cache poisoning: an unkeyed header lets one attacker response reach every user. {4}Cache deception: add slash nonexistent dot CSS to a private page, and the CDN may cache it. {5}The fix for both: the cache key must include everything the response varies on.</narration>
+</section>
+
+<section heading="Even uncacheable requests get faster">
+<ul class="pts">
+  <li data-step="1"><b>TLS and TCP end at the nearby PoP.</b> The slow handshake round trips happen over a short hop.</li>
+  <li data-step="2"><b>Warm connections to the origin.</b> The PoP keeps a pool open and reuses it.</li>
+  <li data-step="3"><b>HTTP/3 (QUIC)</b> avoids head-of-line blocking and survives a Wi-Fi to cellular switch.</li>
+  <li data-step="4"><b>Route optimization.</b> Some providers use their private backbone for the long leg.</li>
+</ul>
+<div class="muted" style="font-size:30px" data-step="4">This is why "dynamic site acceleration" is a real product, separate from caching.</div>
+<narration>Not everything can be cached. Checkout, or a logged in dashboard, must reach the origin. But the CDN still helps. {1}TLS and TCP end at the nearby pop, so the slow handshakes happen over a short hop. {2}The pop keeps warm connections open to your origin, and reuses them. {3}HTTP 3 avoids head of line blocking, and survives a switch from Wi-Fi to cellular. {4}Some providers even carry the long leg over their own private backbone.</narration>
+</section>
+
+<section heading="Edge compute: your code at the PoP">
+<div class="row" style="font-size:30px">
+  <div class="box" data-step="1" data-anim="left">Request</div><div class="arrow" data-step="1" data-anim="wipe">→</div>
+  <div class="box" data-step="1" data-anim="left">WAF and bot checks</div><div class="arrow" data-step="2" data-anim="wipe">→</div>
+  <div class="box green fill-green" data-step="2" data-anim="pop">Fresh in cache? <small>serve it</small></div><div class="arrow" data-step="3" data-anim="wipe">→</div>
+  <div class="box purple fill-purple" data-step="3" data-anim="pop">Edge function <small>auth pre-check, A/B, redirect, geo</small></div>
+</div>
+<div class="grid2">
+  <div class="card green" data-step="4"><h2>At the edge</h2>JWT signature and expiry pre-check, A/B buckets, redirects, header rewrites, light WAF rules</div>
+  <div class="card amber" data-step="5"><h2>Stays at origin</h2>Authoritative authorization, strongly consistent reads, writes with business logic<small>Edge data is only eventually consistent.</small></div>
+</div>
+<narration>Then there is edge compute: your own code, running at the pop. {1}A request first passes the WAF and bot checks. {2}Then the cache. {3}And if needed, your edge function. {4}Good jobs for the edge: a JWT signature and expiry check, A B buckets, redirects, header rewrites. {5:punch}But the real authorization decision stays at the origin, because the edge only has an eventually consistent view of the world.</narration>
+</section>
+
+<section heading="Trade-offs: when a CDN is not the answer">
+<ul class="pts">
+  <li class="amber" data-step="1">It adds a layer that can fail or serve stale data. Debugging "works on my laptop, not in Brazil" means checking a PoP you do not control.</li>
+  <li class="amber" data-step="2">It fixes aggregate traffic, <b>not one hot key</b>. A viral URL still funnels through one cache key.</li>
+  <li class="amber" data-step="3">Highly personalized, rarely repeated responses get little from caching. Lean on dynamic acceleration instead.</li>
+  <li class="amber" data-step="4">An internal service with no spread-out users: a plain reverse proxy or load balancer is simpler.</li>
+</ul>
+<narration>So, is a CDN always the answer? No. {1}It adds a layer that can fail, or serve stale data. And a bug in Brazil means checking a pop you do not control. {2}It fixes aggregate traffic, not one hot key. {3}Highly personalized responses get little from caching. {4}And for an internal service with no spread out users, a plain load balancer is simpler.</narration>
+</section>
+
+<section heading="Recap">
+<ul class="pts">
+  <li class="green" data-step="1">A CDN keeps copies in PoPs close to users, and shields the origin from repeated work.</li>
+  <li class="green" data-step="2">Headers decide what it may keep: max-age, s-maxage, no-cache, no-store, private.</li>
+  <li class="green" data-step="3">The cache key decides what is shared. Avoid Vary: Cookie, and strip tracking parameters.</li>
+  <li class="green" data-step="4">Collapsing and the origin shield turn 100 misses into 1 origin request.</li>
+  <li class="green" data-step="5">Prefer versioned URLs over purges. Never cache private responses.</li>
+  <li class="green" data-step="6">Cheap checks at the edge. Authoritative decisions at the origin.</li>
+</ul>
+<narration>Let us recap. {1}A CDN keeps copies in pops close to your users. {2}Headers say what it may keep. {3}The cache key says what is shared. {4}Collapsing turns a hundred misses into one. {5}Prefer versioned URLs over purges, and never cache private data. {6:punch}Cheap checks at the edge. Real decisions at the origin.</narration>
+</section>
+</storyboard>

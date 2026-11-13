@@ -1,0 +1,103 @@
+# Proxies story, voice script. id | SPEAKER | tone | text. Source: [[Forward and Reverse Proxies - L4 vs L7]]
+# Cast: KAI = client. FIONA = forward proxy (Kai's assistant). RHEA = reverse proxy at Orion Corp's front desk (L7, opens the letters). LOU = L4 doorman (reads only the envelope). OLLY = a backend desk (orders service). MAL = attacker. SID = sidecar. CORA = control plane.
+== s1 Level 1: the words you need first
+l1 | N | hook | Welcome. We go from easy to advanced, in three levels. Level one, the words. Meet Kai. Kai works at a company, and wants to ask a website for his orders.
+l2 | N | normal | Kai is the client, the program that asks. The website is the server, the program that answers, also called the backend. Every program listens at an address, an I P address, and a door number, a port. Like ten dot zero dot zero dot five, port eighty eighty.
+l3 | N | normal | To talk, they open a T C P connection. A reliable two way pipe of bytes, like a phone line. Over it Kai sends an H T T P request, a short note saying, get slash orders, plus headers, name and value lines on the envelope. And T L S wraps the whole thing in encryption, the padlock in the browser.
+l4 | KAI | normal | Get slash orders, please.
+l5 | N | normal | One more pair for later. L four means the network layer that sees connections and ports. L seven means the layer that sees the actual H T T P message. L four sees port four forty three. L seven sees slash orders.
+== s2 Level 1: why a go-between exists
+l6 | N | normal | Behind the name api dot example dot com are not one machine, but three desks. Orders, users, and billing, each at a different internal address. Imagine Kai had to know all three.
+l7 | N | warn | Every client would need three internal names. Every desk would need its own T L S certificate and its own rate limiting code. And none of it could change without redeploying every client.
+l8 | N | normal | The fix is a machine in the middle. A proxy. A proxy is a go between. And there are two kinds, depending on whose side it stands on.
+l9 | N | normal | The forward proxy speaks for the client. That is Fiona, Kai's personal assistant. She makes calls for him, so the other side only sees her number.
+l10 | FIONA | hook | Hi! I will make every outside call for you.
+l11 | N | normal | The reverse proxy speaks for the server. That is Rhea, the receptionist at Orion Corp. Every visitor talks only to her, and she decides which desk handles them.
+l12 | RHEA | normal | Welcome to Orion. Tell me what you need, and I will connect you.
+l13 | N | punch | Remember it like this. A forward proxy hides the client. A reverse proxy hides the server.
+== s3 Level 2: the forward proxy, and the sealed envelope
+l14 | N | normal | Why would a company want a forward proxy? One controlled exit for every laptop. Block known bad sites, and log what left the building. The laptops are set up to use it, through the system proxy settings, or a P A C file pushed by the I T team.
+l15 | N | normal | For plain H T T P, Fiona sees the whole request, and can inspect, filter, or cache it. But for H T T P S, the letter is sealed. So Kai sends a small request called connect, naming only the destination host and port.
+l16 | KAI | normal | Fiona, connect me to developer dot mozilla dot org, port four forty three.
+l17 | FIONA | normal | Done. I opened a tunnel. From now on I just carry sealed bytes both ways, and I cannot read them.
+l18 | N | normal | That is a blind tunnel. Fiona can allow or block by destination hostname, because she saw it in the connect line. But not by path, or body. Those are inside the tunnel.
+l19 | N | warn | Some companies go further. They install their own certificate authority on every laptop, so Fiona can open the envelope. She ends Kai's T L S herself, reads the plain text, and then seals a second T L S connection to the real site. Two connections, stitched together at the proxy.
+l20 | N | normal | The notes measured this on a real corporate network. The certificate shown for developer dot mozilla dot org was signed by Zscaler, not by the site's real authority. Proof that a forward proxy was in the middle, and that the laptop trusted it.
+== s4 Level 2: the reverse proxy and its jobs
+l21 | N | normal | Now the other side. Rhea ends the client's connection, and makes her own separate connections to whichever desk should answer. Let us see what she does for Orion.
+l22 | RHEA | normal | First, T L S termination. I hold the certificate, and I unseal every request. Inside the building, I may pass it on plain, or re seal it, with mutual T L S.
+l23 | RHEA | normal | Second, routing. By host name, by path, or by header. Slash orders goes to Olly. Slash users goes to Uma. Slash billing goes to Bill.
+l24 | RHEA | normal | Third, buffering. If a visitor talks very slowly, I wait for the whole message first, so my desks are not tied up. It costs me memory or disk to hold it.
+l25 | RHEA | normal | Fourth, the shared chores. Compression, caching, rate limits, and a web application firewall. Done once, here, not in every desk.
+l26 | RHEA | normal | And fifth, I hide the building. Visitors only ever see my address. Never the internal ones.
+== s5 Level 2: L4 versus L7
+l27 | N | normal | Now the big question. How much should a proxy look at? Meet two doormen. Lou works at layer four. Rhea works at layer seven.
+l28 | LOU | normal | I only read the envelope. The address, and the port. I move bytes, very fast, and I never open anything.
+l29 | RHEA | normal | I open the letter. The method, the path, the headers, the body. So I can route, rewrite, and apply rules per path.
+l30 | N | normal | The comparison. L four sees I P addresses, ports, and for T L S, the server name in the unencrypted hello. It cannot route by path or header, and it cannot end T L S. It passes the encrypted bytes through. Very low overhead. Tools like the A W S network load balancer, I P tables and I P V S.
+l31 | N | normal | L seven sees the full H T T P request. It can route by path or header, and it holds the certificate and decrypts. More overhead, because it parses, and often re encrypts. Tools like Nginx, Envoy, H A Proxy in layer seven mode, and A P I gateways.
+l32 | N | normal | So when do you choose L four? When you need raw speed, or must keep end to end T L S, because the backend itself, not the proxy, holds the certificate. Choose L seven when you need routing, header changes, firewall rules, or per path policy.
+l33 | N | normal | One clever trick. Even Lou can pick a desk without opening the letter. The T L S hello includes the server name, S N I, sent unencrypted on purpose. Lou reads that name, and picks a backend. This is how one L four listener can front many T L S backends, without ever touching the keys.
+l34 | N | normal | And why does S N I exist? Before it, the server had to choose a certificate before it knew which host the client wanted, so each certificate needed its own I P. S N I puts the host name in the clear, so one address can serve many.
+l35 | N | calm | Which desk gets picked, round robin, least connections, hashing, is a different topic, load balancing. Here we only study the proxying layer.
+== s6 Level 3: who is the real client?
+l36 | N | normal | Level three. The real world gets tricky. Rhea makes her own connection to Olly. So from Olly's view, every request now comes from Rhea's address. How does Olly learn who the client really was?
+l37 | N | normal | Headers. X forwarded for is a comma separated list. Every hop appends the address it saw. And a newer standard, the forwarded header, carries the same facts in a structured form, for, proto, and host.
+l38 | MAL | punch | Hello Olly. My address is one point one point one point one. Trust me.
+l39 | N | warn | The trap. A client can write anything into that header. If the backend trusts the left most value as the real client, an attacker just claims a fake address, to slip past an allow list or a rate limit.
+l40 | N | normal | The only safe rule. Trust exactly as many entries from the right, as you have proxies you control. Everything further left is attacker controlled, and ignored.
+l41 | N | normal | Example. The header says, attacker spoofed, two oh three dot zero dot one thirteen dot nine, ten dot zero dot zero dot five. You control two proxies. So trust the last two. Two oh three dot nine, the second from the right, is the real client. And attacker spoofed is thrown away.
+l42 | N | normal | And the number of trusted hops is a fact about your own infrastructure, never something guessed from the request. With one proxy of yours, take the last entry only. If a C D N sits in front too, it is two.
+l43 | N | normal | One related problem. An L four proxy forwards raw T C P, so there are no H T T P headers at all. The proxy protocol, from H A Proxy, adds a small fixed header at the start of the stream, with the real source and destination. Now even a non H T T P backend learns who called.
+l44 | N | warn | And when you write a proxy yourself, always append to X forwarded for, never overwrite it. Overwriting throws away every earlier hop.
+== s7 Level 3: when things go slow or break
+l45 | N | normal | A reverse proxy has two sides, and a timeout on each. And they fail differently, with two different codes.
+l46 | N | normal | Five oh two, bad gateway, means the proxy could not get a valid answer at all. The connection was refused, reset, or the reply was malformed. Five oh four, gateway timeout, means the proxy reached Olly, but he took too long, and the proxy's own timer fired first.
+l47 | N | normal | Three timers matter. The connect timeout, time to open the connection. Too short, you get five oh twos from a healthy but slow to accept backend. Too long, the proxy piles up waiting on a dead one.
+l48 | N | normal | The read timeout, time waiting for the backend's reply. Too short, five oh fours on slow but legitimate pages, like a big report. Too long, client connections stay open long after the user gave up.
+l49 | N | normal | And the idle timeout, how long a reused connection may sit unused. Too short, extra handshakes. Too long, the proxy reuses a connection the backend already closed, and the request fails.
+l50 | N | normal | That reuse is upstream keep alive. Instead of a fresh connection and handshake for every request, the proxy keeps a pool of ready connections to each backend. Sized to roughly match the backend's own concurrency. Too few, and requests queue. Too many, and you exhaust the backend.
+l51 | N | normal | Three more edge cases. Enforce a maximum body size at the proxy, and answer four thirteen, payload too large, instead of letting a huge upload eat memory. For web sockets, forward the upgrade handshake, then hold the connection as a raw two way pipe. And for H T T P two and g R P C, the proxy must speak H T T P two on both sides, or multiplexing breaks.
+== s8 Level 3: sidecars and the service mesh
+l52 | N | normal | Now the modern twist. In a fleet of many small services, every service instance gets its own personal proxy, running right beside it. A sidecar. Most often Envoy. Meet Sid.
+l53 | SID | normal | I live next to Olly's code. All of his traffic, in and out, goes through me.
+l54 | OLLY | normal | I just call localhost. I do not know how any of it works.
+l55 | N | normal | Olly believes he is calling Uma directly. But Sid catches the call, opens a mutual T L S connection to Uma's own sidecar, retries on a temporary failure, and only then hands the request to Uma's code. Olly wrote none of that.
+l56 | CORA | normal | And I am the control plane. I push routing, retry, timeout and certificate settings to every sidecar, from one place.
+l57 | N | normal | That whole arrangement is a service mesh, like Istio or Linkerd. It moves retries, mutual T L S and metrics out of application code. The price is an extra hop per call, extra memory and C P U across the fleet, and real operational complexity.
+l58 | N | normal | And it changes trust. Instead of trusting the last N entries of a header, each sidecar shows a certificate with its own identity, often a spiffe identity, so every hop can verify who it is really talking to.
+== s9 Names that overlap
+l59 | N | normal | Three words people mix up. A reverse proxy terminates and forwards. A load balancer spreads traffic across many copies of one backend. An A P I gateway fronts an A P I for outside clients, adding login checks, per client quotas, and request changes.
+l60 | N | normal | One program, like Nginx or Envoy, often does all three at once. The difference is which job you are describing, not which software runs it.
+== s10 Trade-offs, failures and what to watch
+l61 | N | warn | Nothing is free. Every proxy hop adds latency, and is a new single point of failure unless it is made redundant. Layer four passthrough keeps end to end T L S, but loses every H T T P feature. A mesh is not worth it for a handful of services that could share a library. And trusting forwarded headers blindly is worse than not using them.
+l62 | N | normal | The classic failures, and fixes. Spoofed client address, trust only a fixed number of hops from the right. Five oh twos after a restart, use health checks, and keep the proxy's idle timeout shorter than the backend's. Five oh fours under load, decide if the backend is truly slow, or the timer is wrong for that route, before changing either.
+l63 | N | normal | Huge uploads exhausting the proxy, cap the body, stream it, or skip the proxy with a presigned upload. And web sockets dropping when idle, raise the proxy's idle timeout, or add application pings.
+l64 | N | normal | What to watch. Five oh two and five oh four counts at the proxy, kept separate from the backend's own five hundreds. Connect and response latency. Pool size. T L S handshake failures. And body size rejections.
+l65 | N | normal | One last deep point. Buffering protects backends from slow clients, but for big uploads it doubles memory, and adds delay. Streaming avoids that, and brings back the slow client risk. So good proxies offer both.
+== s11 In Go: the proxy and the trusted address
+g1 | N | normal | Now the code, in Go. Two pieces. A reverse proxy built on the standard library, with the forwarded header handled correctly. And a tiny function that finds the real client.
+g2 | N | normal | The first function appends the forwarded header. It takes the immediate peer's address, and strips the port. If the header already has a value, it keeps it, and adds this hop after a comma. Append, never overwrite. And it sets the protocol header only if it is missing, so an earlier proxy's correct value is not clobbered.
+g3 | N | normal | The second function is trusted client I P. It splits the header on commas, trims the spaces, and clamps the trusted hop count to the number of entries. Then it returns the entry counted from the right. That one line of index arithmetic is the whole rule.
+g4 | N | normal | Around them, the proxy rewrites the host, appends the header, and forwards. If the backend is unreachable, a custom error handler writes a clean five oh two, instead of letting the client hang. Three tests prove it. Normal forwarding sets the headers. An unreachable backend gives a five oh two. And a forged header yields the right hop. All pass with the race detector on.
+== s12 Interview round
+p0 | N | hook | Interview round. Six questions you will really get.
+p1 | N | normal | One. Forward versus reverse proxy, in one line? A forward proxy is the client's agent, in front of clients, forwarding their outbound requests. A reverse proxy is the server's agent, in front of backends, accepting inbound requests on their behalf.
+p2 | N | normal | Two. A trap. A user is rate limited, although they never made that many requests. What is the likely bug? The code trusts the left most value of the forwarded header, or an unvalidated one. Count only as many hops from the right as you control.
+p3 | N | normal | Three. How can an L four proxy route T L S without decrypting? It reads the server name in the unencrypted hello, picks a backend, and forwards the raw bytes. The backend does the real handshake.
+p4 | N | normal | Four. Five oh two for some requests, five oh four for others, in the same spike. What differs? Five oh two means no valid answer, so check health, refusals and crashes. Five oh four means the backend answered too slowly, so check latency, slow queries, and whether the timeout itself is miscalibrated.
+p5 | N | normal | Five. Why is g R P C trickier than plain R E S T? It needs H T T P two, with long lived multiplexed streams. A proxy that speaks only H T T P one to the backend breaks multiplexing, or fails outright.
+p6 | N | normal | Six. When would you deliberately choose L four passthrough? When end to end T L S is required and no middle box may see plain text. When the backend must see the client's own T L S session, for example for client certificates. Or when you need the least added latency, and need no H T T P features.
+== s13 Summary
+l66 | N | calm | Let us put it all together, from easy to advanced.
+l66a | N | normal | Level one. A proxy is a go between. A forward proxy speaks for the client and hides the client. A reverse proxy speaks for the server and hides the server.
+l66b | N | normal | Level two. A forward proxy tunnels H T T P S with connect, blind, or opens the envelope with a company certificate. A reverse proxy terminates T L S, routes, buffers, shares the chores, and hides the topology.
+l66c | N | normal | L four reads the envelope, fast, and keeps end to end T L S. L seven reads the letter, and routes by path and header. S N I lets L four pick a backend by name.
+l66d | N | warn | Level three. The backend only sees the proxy, so use X forwarded for, but trust only the last N entries, where N is the proxies you control. Always append, never overwrite. Use the proxy protocol for L four.
+l66e | N | normal | Five oh two means no valid answer. Five oh four means too slow. Tune connect, read and idle timeouts, size the keep alive pool, cap bodies, and speak H T T P two for g R P C.
+l66f | N | normal | Sidecars give every service its own proxy, and a control plane configures them all. A mesh moves retries and mutual T L S out of code, at the cost of hops and complexity.
+l66g | N | calm | And the one line to keep: a proxy is a go between. Forward hides the client, reverse hides the server, L four moves bytes, L seven reads requests.
+== s14 Where to go next
+rn1 | N | calm | To go deeper, open the note on forward and reverse proxies, and its Go note, in your vault. Before it, read H T T P fundamentals, and T C P. After it, Nginx, and T L S and H T T P S. Compare it with load balancing, A P I gateway and B F F, and C D N and edge.
+l67 | KAI | hook | Thanks, Fiona. Thanks, Rhea. I got my orders!
+l68 | RHEA | punch | Next!

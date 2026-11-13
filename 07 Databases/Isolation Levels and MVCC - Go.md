@@ -17,13 +17,22 @@ sources:
   - "Cahill, Röhm, Fekete, Serializable Isolation for Snapshot Databases (SIGMOD 2008)"
   - "Ports and Grittner, Serializable Snapshot Isolation in PostgreSQL (VLDB 2012)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 7"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Isolation Levels and MVCC - Go
 
 > [!summary] TL;DR
 > Runnable Go for [[Isolation Levels and MVCC]]: a small model of PostgreSQL's row-version visibility rule (`xmin`, `xmax`, snapshot) with a test that replays one invoice through five situations, and a `Serializable` helper that runs a whole transaction at SERIALIZABLE and runs it again on `40001` or `40P01`, with the credit-limit check built on top of it.
+
+## Before the code
+
+- **Packages**: three packages in one module; `mvccmini` and `mvcc` are pure logic, `txretry` talks to PostgreSQL.
+- **Function types**: `Committed` is a `func(uint32) bool`, so a test can say "105 aborted" in one line.
+- **Table-driven tests**: one slice of cases checked in one loop, each case named in its failure message.
+- **Interfaces**: `Beginner` is the small slice of `pgx` the retry helper needs, so tests can pass a fake.
+- **`context.Context` and `errors.As`**: cancel retries on shutdown, and read the SQLSTATE (`40001`, `40P01`) from a `*pgconn.PgError`.
+- **Run**: `go mod tidy && go vet ./... && go test -race ./...` (no database needed).
 
 ## What this code shows
 
@@ -67,10 +76,14 @@ go test -race ./...
 
 ### Step 1: the visibility rule in 15 lines
 
-**Concept.** PostgreSQL never overwrites a row in place: an `UPDATE` stamps the old version with the updater's transaction id in `xmax` and writes a new version with that id in `xmin` ([[Isolation Levels and MVCC#MVCC in PostgreSQL: versions in the heap]]). Readers then need a rule for which version to show. The rule is "created by a transaction my snapshot considers finished, and not deleted by one". A snapshot is just a cut-off: everything below `Xmax` that is not in the running set is finished. The alternative to this design is locking readers out of rows being written, which is what MVCC exists to avoid. This minimal version leaves out aborts and own writes so the core idea fits in a few lines.
+**Concept.** PostgreSQL never overwrites a row in place: an `UPDATE` stamps the old version with the updater's transaction id in `xmax` and writes a new version with that id in `xmin` ([[Isolation Levels and MVCC#MVCC in PostgreSQL: versions in the heap]]).
+
+Readers then need a rule for which version to show. The rule is "created by a transaction my snapshot considers finished, and not deleted by one". A snapshot is just a cut-off: everything below `Xmax` that is not in the running set is finished.
+
+The alternative to this design is locking readers out of rows being written, which is what MVCC exists to avoid. This minimal version leaves out aborts and own writes so the core idea fits in a few lines.
 
 ```go
-package mvcc
+package mvccmini
 
 type Snap struct {
 	Xmin, Xmax uint32
@@ -108,7 +121,11 @@ flowchart LR
 
 ### Step 2: the full visibility model
 
-**Concept.** The mini rule is wrong in two cases that matter. A transaction must see its own uncommitted changes, and an aborted transaction's versions must stay invisible even though its id is below `Xmax`. PostgreSQL answers the second with the commit log (`pg_xact`), which the model represents as a `Committed` function. The snapshot has the same shape `pg_current_snapshot()` prints, `xmin:xmax:xip_list`. A function type for `Committed` was chosen over a map so tests can express "105 aborted" or "105 committed" in one line. The model still ignores wraparound, command ids and lock-only `xmax`; it is a teaching model, not a clone.
+**Concept.** The mini rule is wrong in two cases that matter. A transaction must see its own uncommitted changes, and an aborted transaction's versions must stay invisible even though its id is below `Xmax`.
+
+PostgreSQL answers the second with the commit log (`pg_xact`), which the model represents as a `Committed` function. The snapshot has the same shape `pg_current_snapshot()` prints, `xmin:xmax:xip_list`.
+
+A function type for `Committed` was chosen over a map so tests can express "105 aborted" or "105 committed" in one line. The model still ignores wraparound, command ids and lock-only `xmax`; it is a teaching model, not a clone.
 
 The types come first. A `Snapshot` has the shape `pg_current_snapshot()` prints, a `Version` is one heap tuple, and `Committed` stands in for the commit log:
 
@@ -188,7 +205,11 @@ flowchart TD
 
 ### Step 3: retry serialization failures
 
-**Concept.** SERIALIZABLE in PostgreSQL is implemented as serializable snapshot isolation: it lets transactions run concurrently on snapshots and aborts one with `40001` when it detects a dangerous pattern ([[Isolation Levels and MVCC#SERIALIZABLE in PostgreSQL: SSI]]). The guarantee is only useful if the application re-runs the aborted transaction. The alternative designs are locking everything (pessimistic, see [[Locking - Optimistic vs Pessimistic - Go]]) or accepting anomalies at lower levels. The helper retries with capped exponential backoff and full jitter ([[Timeouts, Retries and Backoff]]) so that two losers do not collide again in lock-step. It uses `github.com/jackc/pgx/v5`.
+**Concept.** SERIALIZABLE in PostgreSQL is implemented as serializable snapshot isolation: it lets transactions run concurrently on snapshots and aborts one with `40001` when it detects a dangerous pattern ([[Isolation Levels and MVCC#SERIALIZABLE in PostgreSQL: SSI]]).
+
+The guarantee is only useful if the application re-runs the aborted transaction. The alternative designs are locking everything (pessimistic, see [[Locking - Optimistic vs Pessimistic - Go]]) or accepting anomalies at lower levels.
+
+The helper retries with capped exponential backoff and full jitter ([[Timeouts, Retries and Backoff]]) so that two losers do not collide again in lock-step. It uses `github.com/jackc/pgx/v5`.
 
 The package starts with the `Beginner` interface (satisfied by `*pgxpool.Pool` and `*pgx.Conn`, and by a fake in tests) and the error classifier:
 
@@ -277,7 +298,11 @@ sequenceDiagram
 
 ### Step 4: the credit-limit check, made safe
 
-**Concept.** The write-skew story ([[Isolation Levels and MVCC#Write skew]]) has two transactions that each read the customer's open balance, each see room under the limit, and each insert an invoice. Neither writes a row the other wrote, so snapshot isolation lets both commit and the limit is exceeded. At SERIALIZABLE the database sees that each transaction read data the other changed and aborts one with `40001`. `CreateInvoice` is the application code that needs no explicit lock: it just reads, decides, writes, and relies on `Serializable` to run it again. Alternatives are a row lock on the customer (`FOR UPDATE`) or a stored running balance with a `CHECK` constraint.
+**Concept.** The write-skew story ([[Isolation Levels and MVCC#Write skew]]) has two transactions that each read the customer's open balance, each see room under the limit, and each insert an invoice.
+
+Neither writes a row the other wrote, so snapshot isolation lets both commit and the limit is exceeded. At SERIALIZABLE the database sees that each transaction read data the other changed and aborts one with `40001`.
+
+`CreateInvoice` is the application code that needs no explicit lock: it just reads, decides, writes, and relies on `Serializable` to run it again. Alternatives are a row lock on the customer (`FOR UPDATE`) or a stored running balance with a `CHECK` constraint.
 
 The imports and the sentinel error:
 
@@ -441,7 +466,9 @@ Then the table of cases and the loop that counts visible versions and expects ex
 }
 ```
 
-Take the second case: `during` lists 105 in `XIP`, so `sees(105)` is false no matter what the commit log says; the old version is not deleted and the new one is not created, from this snapshot's point of view. A failure message such as `saw [sent paid]` means a version was double-counted (for example the `XIP` check was dropped); `saw []` means both were hidden, which is how a row would disappear mid-transaction.
+Take the second case: `during` lists 105 in `XIP`, so `sees(105)` is false no matter what the commit log says; the old version is not deleted and the new one is not created, from this snapshot's point of view.
+
+A failure message such as `saw [sent paid]` means a version was double-counted (for example the `XIP` check was dropped); `saw []` means both were hidden, which is how a row would disappear mid-transaction.
 
 ### TestMiniVisible
 
@@ -454,7 +481,7 @@ Take the second case: `during` lists 105 in `XIP`, so `sees(105)` is false no ma
 | `Visible(s, 100, 104)` | deleter 104 finished before the snapshot | false |
 
 ```go
-package mvcc
+package mvccmini
 
 import "testing"
 

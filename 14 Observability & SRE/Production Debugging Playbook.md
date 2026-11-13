@@ -8,7 +8,7 @@ sources:
   - "Google, Site Reliability Engineering, ch. 12 'Effective Troubleshooting' (2016)"
   - "PostgreSQL 17 docs, The Cumulative Statistics System and EXPLAIN"
   - "kubectl reference docs (describe, logs, top)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Production Debugging Playbook
@@ -33,11 +33,60 @@ flowchart LR
 
 Each step narrows scope by roughly an order of magnitude: metrics narrow "something is wrong" down to "latency, not errors, and only on `POST /invoices`"; traces narrow that down to "the `db.update_invoice` span"; logs narrow that down to the exact SQL error and the request ID that triggered it.
 
+## Start here: the basics
+
+**The problem in one story.**
+At 2 am your phone buzzes: "checkout is slow".
+You could open the logs and scroll, but there are millions of lines.
+A playbook gives you a fixed order of questions: how bad, what changed, who is affected, then metrics, traces, logs.
+Following it gets you to the cause faster than guessing.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Symptom | What users or alerts notice | p99 latency jumped to 3 s |
+| Scope | How widely the problem spreads | Only `POST /invoices`, only one region |
+| Cohort | A group you slice traffic by | One pod, one tenant, one app version |
+| RED signals | Rate, Errors, Duration of requests | 5xx rate went from 0.1% to 4% |
+| Trace / span | One request's path, and one step in it | `db.update_invoice` span took 2.8 s |
+| Hypothesis | A guess you write down and then test | "The new index made writes slow" |
+| Mitigate | Stop user pain before full understanding | Roll back, or turn off a feature flag |
+| Deploy / feature flag | Shipping code / switching behaviour without shipping | Flag `new_pricing=on` at 01:50 |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    A["Alert fires"] --> I["How bad?<br/>(impact)"]
+    I --> W["What changed?"]
+    W --> S["Scope it:<br/>endpoint, pod, region"]
+    S --> M["Metrics"] --> T["Traces"] --> L["Logs"]
+    L --> X["Mitigate,<br/>then root-cause"]
+```
+
+**Analogy.** A doctor in an emergency room: check how serious it is, ask "what did you eat or take?", narrow down where it hurts, then run the expensive scans.
+Where it breaks: a patient can describe symptoms; a service can't, so you rely only on the telemetry it already emits.
+
+**How the rest of this note builds up**
+
+- First, why a playbook beats intuition (section 1) and the funnel mental model (section 2).
+- Then how it works: the steps from impact to root cause, symptom patterns, a culprit catalogue, and debugging async work (section 3).
+- Then the 02:14 incident worked with real numbers and Go code (section 4), plus variants and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production habits, the deeper failure modes, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> Impact, what changed, scope, then metrics → traces → logs; mitigate first, explain second.
+
 ## 1. Why it exists
 
 At 02:14, InvoiceOps's p99 latency on `GET /invoices/:id` jumps from 180 ms to 2.1 s. p50 stays flat at 40 ms. Without a method, the natural instinct is to open the slowest-looking code path and start reading — which, on a 40,000-line service, is a search with no stopping condition.
 
-With the playbook: metrics show p99 up but p50 and error rate flat, and request volume unchanged — so it is **not** a traffic spike and **not** every request, which rules out "capacity" and "a bad deploy affecting everyone" in under a minute. Scoping by cohort shows the slow requests cluster on one Kubernetes pod. A trace from that pod shows 1.9 s of the 2.1 s sitting in a single span: `db.pool.acquire`. `sql.DBStats` on that pod shows `WaitCount` climbing and `MaxOpenConns` maxed out. One pod's connection pool is exhausted — probably by a long-running query or a connection leak specific to that pod's recent restart — not a database-wide problem. The mitigation (restart the pod, which resets its pool) takes thirty seconds; finding that same fact by reading code would have taken much longer, if it was found at all.
+With the playbook: metrics show p99 up but p50 and error rate flat, and request volume unchanged — so it is **not** a traffic spike and **not** every request, which rules out "capacity" and "a bad deploy affecting everyone" in under a minute.
+
+Scoping by cohort shows the slow requests cluster on one Kubernetes pod. A trace from that pod shows 1.9 s of the 2.1 s sitting in a single span: `db.pool.acquire`. `sql.DBStats` on that pod shows `WaitCount` climbing and `MaxOpenConns` maxed out.
+
+One pod's connection pool is exhausted — probably by a long-running query or a connection leak specific to that pod's recent restart — not a database-wide problem. The mitigation (restart the pod, which resets its pool) takes thirty seconds; finding that same fact by reading code would have taken much longer, if it was found at all.
 
 ## 2. Mental model
 
@@ -67,7 +116,9 @@ A changefeed that lists all of these on one timeline (see the Go example below) 
 
 ### Step 3: Scope by cohort
 
-Compare a cohort that is failing against one that is not, varying one dimension at a time: endpoint, region/AZ, tenant, client version, pod, or client type. "Everyone, everywhere, right now" points at a global dependency or deploy. "One pod only" points at that pod's local state (its connection pool, its memory, a bad local cache). "One tenant only" points at that tenant's data shape or request pattern (a hot key, a pathological query).
+Compare a cohort that is failing against one that is not, varying one dimension at a time: endpoint, region/AZ, tenant, client version, pod, or client type. "Everyone, everywhere, right now" points at a global dependency or deploy.
+
+"One pod only" points at that pod's local state (its connection pool, its memory, a bad local cache). "One tenant only" points at that tenant's data shape or request pattern (a hot key, a pathological query).
 
 ```mermaid
 flowchart TD
@@ -321,7 +372,9 @@ Twenty connections, all in use, 1,842 goroutines having queued for one at some p
 
 **Why order matters, not just coverage.** Teams with all three signals still debug slowly when they read logs first. A log search across a fleet, even a fast one, returns ambiguous matches until you already know roughly where to look; a metrics query answers "where" in milliseconds, and a trace then answers "which exact span," which turns the subsequent log search from "grep everything" into "pull the five log lines with this request ID."
 
-**Reading a waterfall for the unaccounted gap.** The most valuable trace-reading skill is noticing where there is **no span** — a 400 ms gap between two children of the same parent that no instrumented code covers. That gap is time spent somewhere the SDK did not see: scheduler queueing, GC, a connection-pool wait, or a goroutine that never got scheduled. Finding it points straight at the next evidence to pull (a GC trace, `sql.DBStats`, a goroutine dump) without reading application logic at all.
+**Reading a waterfall for the unaccounted gap.** The most valuable trace-reading skill is noticing where there is **no span** — a 400 ms gap between two children of the same parent that no instrumented code covers.
+
+That gap is time spent somewhere the SDK did not see: scheduler queueing, GC, a connection-pool wait, or a goroutine that never got scheduled. Finding it points straight at the next evidence to pull (a GC trace, `sql.DBStats`, a goroutine dump) without reading application logic at all.
 
 **Why hypothesis-driven beats pattern-matching.** "Last time it was the database" is a prior, and priors are useful for ordering which hypothesis to check first — but the playbook's discipline is to still check it against evidence (this time's `pg_stat_activity`, this time's trace) and discard it in seconds if contradicted, rather than committing effort to a fix for the wrong cause because it matched a past incident.
 
@@ -363,3 +416,8 @@ Twenty connections, all in use, 1,842 goroutines having queued for one at some p
 - **Before this:** [[Observability Fundamentals]], [[Metrics and Prometheus]], [[Distributed Tracing with OpenTelemetry]]
 - **Next:** [[Latency, Percentiles and Bottleneck Analysis]], [[Debugging Database Performance]], [[Debugging Memory Leaks and OOMs in Go]]
 - **Compare with:** [[Incident Response]] (the coordination process this method runs inside of), [[Postmortems and Root Cause Analysis]] (what happens after mitigation)
+
+### Watch on YouTube
+
+- [Advanced Techniques for Production Debugging](https://www.youtube.com/watch?v=eghHZvffilA) · Ozcode · 60 min · 1,553 views
+- [Guide to Debugging Production Issues 2026 / Debug Production Related Issues / SCALER](https://www.youtube.com/watch?v=1gqUbq5j9JU) · SCALER · 193 min · 4,210 views

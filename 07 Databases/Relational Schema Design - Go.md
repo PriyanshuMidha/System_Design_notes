@@ -15,13 +15,24 @@ sources:
   - "ISO 4217 currency codes and minor units"
   - "Karwin, SQL Antipatterns (Pragmatic Bookshelf, 2010): Jaywalking, EAV, Polymorphic Associations"
   - "pkg.go.dev, github.com/google/uuid (NewV7 since v1.5.0)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Relational Schema Design - Go
 
 > [!summary] TL;DR
-> The runnable side of [[Relational Schema Design]]: the complete InvoiceOps PostgreSQL 17 DDL (tenant-safe composite keys, soft delete, audit log), the `updated_at` trigger with row-level security, and a small Go `money` package that keeps amounts in integer minor units, with tests that show float drift and exact splitting. Each block is short, explained before and after, and tied to a section of the theory note.
+> The runnable side of [[Relational Schema Design]]: the complete InvoiceOps PostgreSQL 17 DDL (tenant-safe composite keys, soft delete, audit log), the `updated_at` trigger with row-level security, and a small Go `money` package that keeps amounts in integer minor units, with tests that show float drift and exact splitting.
+>
+> Each block is short, explained before and after, and tied to a section of the theory note.
+
+## Before the code
+
+- **Named integer type**: `type Amount int64` gives money its own type so it cannot be mixed up with a plain count.
+- **Integer arithmetic**: amounts stay in paise or cents, so adding and splitting never drifts like `float64` does.
+- **Slices**: `Split` returns a `[]Amount` whose parts always sum to the original.
+- **`reflect.DeepEqual`**: the tests compare whole slices in one call.
+- **SQL blocks**: the DDL is plain PostgreSQL 17 and runs in `psql`, not in Go.
+- **Run**: `go vet ./... && go test -race ./...` inside the `money` module.
 
 ## What this code shows
 
@@ -64,7 +75,11 @@ The code has two halves: SQL (steps 1 to 8) and Go (steps 9 and 10). Design deci
 
 ### Step 1: users, workspaces and membership
 
-**Concept.** A user can belong to many workspaces and a workspace has many users, so the relationship is many-to-many and needs its own table ([[Relational Schema Design#Step 2: entities and relationships]]). The join table's primary key is the pair `(workspace_id, user_id)`, which also forbids duplicate memberships. Emails are unique case-insensitively through an index on `lower(email)`; the alternative, the `citext` extension, does the same with a special type, while the index keeps a plain `text` column. Identity columns are used rather than `serial` because they are the standard SQL form and cannot be overridden by accident.
+**Concept.** A user can belong to many workspaces and a workspace has many users, so the relationship is many-to-many and needs its own table ([[Relational Schema Design#Step 2: entities and relationships]]).
+
+The join table's primary key is the pair `(workspace_id, user_id)`, which also forbids duplicate memberships. Emails are unique case-insensitively through an index on `lower(email)`; the alternative, the `citext` extension, does the same with a special type, while the index keeps a plain `text` column.
+
+Identity columns are used rather than `serial` because they are the standard SQL form and cannot be overridden by accident.
 
 ```sql
 CREATE TABLE users (
@@ -109,7 +124,11 @@ erDiagram
 
 ### Step 2: clients
 
-**Concept.** Every tenant-owned table carries `workspace_id`, and children reference the pair `(workspace_id, id)` rather than `id` alone, so a child row cannot point at a parent from another tenant ([[Relational Schema Design#Step 4: keys]]). For that, the parent needs `UNIQUE (workspace_id, id)` as a foreign-key target. The self-referencing `parent_id` uses the same pair. The alternative is checking tenancy in application code, which every new code path must remember; the composite key makes the database enforce it. Deleting is soft (`deleted_at`), so uniqueness of email must apply only to live rows, which is what the partial index does.
+**Concept.** Every tenant-owned table carries `workspace_id`, and children reference the pair `(workspace_id, id)` rather than `id` alone, so a child row cannot point at a parent from another tenant ([[Relational Schema Design#Step 4: keys]]).
+
+For that, the parent needs `UNIQUE (workspace_id, id)` as a foreign-key target. The self-referencing `parent_id` uses the same pair. The alternative is checking tenancy in application code, which every new code path must remember; the composite key makes the database enforce it.
+
+Deleting is soft (`deleted_at`), so uniqueness of email must apply only to live rows, which is what the partial index does.
 
 ```sql
 CREATE TABLE clients (
@@ -145,7 +164,11 @@ flowchart LR
 
 ### Step 3: invoices
 
-**Concept.** An invoice belongs to one client in the same workspace, so it uses the same composite-key pattern ([[Relational Schema Design#Step 5: constraints are invariants]]). Business rules that can be written as constraints are: allowed statuses, non-negative amounts, and a due date not before the issue date. The `jsonb` columns hold data that is a snapshot (`billing_address`, copied when the invoice is sent) or genuinely free-form (`custom_fields`). The alternative of one table per rule is heavier; the alternative of enforcing these only in Go leaves other writers (scripts, migrations) unchecked.
+**Concept.** An invoice belongs to one client in the same workspace, so it uses the same composite-key pattern ([[Relational Schema Design#Step 5: constraints are invariants]]).
+
+Business rules that can be written as constraints are: allowed statuses, non-negative amounts, and a due date not before the issue date. The `jsonb` columns hold data that is a snapshot (`billing_address`, copied when the invoice is sent) or genuinely free-form (`custom_fields`).
+
+The alternative of one table per rule is heavier; the alternative of enforcing these only in Go leaves other writers (scripts, migrations) unchecked.
 
 ```sql
 CREATE TABLE invoices (
@@ -183,7 +206,11 @@ CREATE INDEX invoices_ws_client_idx ON invoices (workspace_id, client_id);
 
 ### Step 4: items, payments and webhook events
 
-**Concept.** Line items are pure children of an invoice: they cascade. Payments are financial history and do not. Both reference `(workspace_id, id)` of the invoice. Retries are a fact of life with payment providers, so idempotency is built into the keys: a payment is unique per `(provider, provider_ref)`, and a webhook event is unique per `(provider, event_id)`, whose `INSERT` either succeeds (first delivery) or fails with 23505 (duplicate). The alternative is a "have I seen this?" `SELECT` before every insert, which races under concurrency.
+**Concept.** Line items are pure children of an invoice: they cascade. Payments are financial history and do not. Both reference `(workspace_id, id)` of the invoice.
+
+Retries are a fact of life with payment providers, so idempotency is built into the keys: a payment is unique per `(provider, provider_ref)`, and a webhook event is unique per `(provider, event_id)`, whose `INSERT` either succeeds (first delivery) or fails with 23505 (duplicate).
+
+The alternative is a "have I seen this?" `SELECT` before every insert, which races under concurrency.
 
 ```sql
 CREATE TABLE invoice_items (
@@ -245,7 +272,11 @@ sequenceDiagram
 
 ### Step 5: the audit log
 
-**Concept.** An audit log must outlive the rows it describes, so it deliberately has no foreign keys: a foreign key would block deleting a client with history, or cascade the history away. It refers to its subject with `entity_type` and `entity_id`, a polymorphic reference that the database cannot verify. That is acceptable here because the log is append-only and read for investigation, not joined in hot queries. The alternative, one audit table per entity, preserves integrity but multiplies tables. See [[Relational Schema Design#Step 8: soft deletes and audit columns]].
+**Concept.** An audit log must outlive the rows it describes, so it deliberately has no foreign keys: a foreign key would block deleting a client with history, or cascade the history away.
+
+It refers to its subject with `entity_type` and `entity_id`, a polymorphic reference that the database cannot verify. That is acceptable here because the log is append-only and read for investigation, not joined in hot queries.
+
+The alternative, one audit table per entity, preserves integrity but multiplies tables. See [[Relational Schema Design#Step 8: soft deletes and audit columns]].
 
 ```sql
 CREATE TABLE audit_logs (
@@ -271,7 +302,11 @@ CREATE INDEX audit_logs_ws_created_idx ON audit_logs (workspace_id, created_at D
 
 ### Step 6: gapless invoice numbers, the counter row
 
-**Concept.** A database sequence can skip numbers (a rolled-back transaction still consumes one), but invoice numbers must be consecutive per tenant for tax reasons. The fix is one counter row per workspace, incremented in the same transaction that issues the invoice ([[Relational Schema Design#Step 4: keys]]). The row lock taken by `UPDATE` serialises numbering per workspace, and a rollback undoes the increment, so no gap appears. The cost is that concurrent issuers of one workspace queue behind each other, which is acceptable for invoices and not for high-volume ids.
+**Concept.** A database sequence can skip numbers (a rolled-back transaction still consumes one), but invoice numbers must be consecutive per tenant for tax reasons.
+
+The fix is one counter row per workspace, incremented in the same transaction that issues the invoice ([[Relational Schema Design#Step 4: keys]]). The row lock taken by `UPDATE` serialises numbering per workspace, and a rollback undoes the increment, so no gap appears.
+
+The cost is that concurrent issuers of one workspace queue behind each other, which is acceptable for invoices and not for high-volume ids.
 
 ```sql
 CREATE TABLE invoice_counters (
@@ -304,7 +339,9 @@ sequenceDiagram
 
 ### Step 7: the nightly reconciliation query
 
-**Concept.** `paid_minor` is a deliberate copy of `sum(payments.amount_minor)`, kept on the invoice so lists do not need a join ([[Materialized Views and Denormalization]]). Any copy can drift, so a scheduled query checks it. `LEFT JOIN` keeps invoices with no payments, and `coalesce` turns their NULL sum into 0 so they compare correctly. The alternative of trusting the copy forever is the usual way ledgers go wrong silently.
+**Concept.** `paid_minor` is a deliberate copy of `sum(payments.amount_minor)`, kept on the invoice so lists do not need a join ([[Materialized Views and Denormalization]]). Any copy can drift, so a scheduled query checks it.
+
+`LEFT JOIN` keeps invoices with no payments, and `coalesce` turns their NULL sum into 0 so they compare correctly. The alternative of trusting the copy forever is the usual way ledgers go wrong silently.
 
 ```sql
 SELECT i.id, i.paid_minor, coalesce(sum(p.amount_minor), 0) AS payments_sum
@@ -323,7 +360,11 @@ HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 
 ### Step 8: `updated_at` trigger and row-level security
 
-**Concept.** Two protections live in the database so no code path can skip them. The trigger stamps `updated_at` on every update, because application code forgets. Row-level security (RLS) restricts every statement on `invoices` to the workspace set in the transaction-local setting `app.workspace_id`: a backstop against a missing `WHERE workspace_id = ...` in application code, not a replacement for it. The alternatives are setting the column in each Go query (easy to forget) and one database per tenant (strong isolation, high operating cost).
+**Concept.** Two protections live in the database so no code path can skip them. The trigger stamps `updated_at` on every update, because application code forgets.
+
+Row-level security (RLS) restricts every statement on `invoices` to the workspace set in the transaction-local setting `app.workspace_id`: a backstop against a missing `WHERE workspace_id = ...` in application code, not a replacement for it.
+
+The alternatives are setting the column in each Go query (easy to forget) and one database per tenant (strong isolation, high operating cost).
 
 ```sql
 CREATE FUNCTION set_updated_at() RETURNS trigger
@@ -369,7 +410,11 @@ sequenceDiagram
 
 ### Step 9: money in Go, the Amount type and Split
 
-**Concept.** The Go side must keep the same discipline as the `*_minor` columns ([[Relational Schema Design#Money in Go: integer minor units]]): integer minor units, never floats. `Split` divides an amount into n parts that differ by at most one unit and add back exactly, for example an invoice paid in three instalments. The remainder is spread one unit at a time over the first parts. Alternatives are giving the whole remainder to the last part (parts differ by up to n-1 units) or using a decimal library (more code and slower, though sometimes the right call when currencies have different exponents).
+**Concept.** The Go side must keep the same discipline as the `*_minor` columns ([[Relational Schema Design#Money in Go: integer minor units]]): integer minor units, never floats.
+
+`Split` divides an amount into n parts that differ by at most one unit and add back exactly, for example an invoice paid in three instalments. The remainder is spread one unit at a time over the first parts.
+
+Alternatives are giving the whole remainder to the last part (parts differ by up to n-1 units) or using a decimal library (more code and slower, though sometimes the right call when currencies have different exponents).
 
 ```go
 package money
@@ -416,7 +461,11 @@ func Split(a Amount, n int) []Amount {
 
 ### Step 10: money in Go, Percent
 
-**Concept.** Taxes and discounts multiply an amount by a rate. Using basis points (1 bp = 0.01%, so 1800 bps = 18%) keeps the rate an integer too. Multiplying before dividing keeps full precision, and then one explicit rounding rule is applied: half away from zero. Writing the rule once, in one function, is the fix for "every handler rounds differently". Alternatives are banker's rounding (half to even), which is common in finance but surprises invoice readers, and float math, which is wrong by construction.
+**Concept.** Taxes and discounts multiply an amount by a rate. Using basis points (1 bp = 0.01%, so 1800 bps = 18%) keeps the rate an integer too.
+
+Multiplying before dividing keeps full precision, and then one explicit rounding rule is applied: half away from zero. Writing the rule once, in one function, is the fix for "every handler rounds differently".
+
+Alternatives are banker's rounding (half to even), which is common in finance but surprises invoice readers, and float math, which is wrong by construction.
 
 ```go
 // Percent returns a × bps / 10,000, rounded half away from zero. bps is in

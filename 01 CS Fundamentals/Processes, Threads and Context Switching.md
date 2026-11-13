@@ -8,7 +8,7 @@ sources:
   - "Linux kernel documentation, Scheduling (kernel.org Documentation/scheduler)"
   - "Go runtime source, runtime/proc.go and runtime/runtime2.go (Go 1.24)"
   - "Love, Linux Kernel Development, 3rd ed., ch. 3-4 (processes and scheduling)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Processes, Threads and Context Switching
@@ -23,20 +23,81 @@ updated: 2026-11-09
 > - A context switch costs real time, mostly from saving/restoring CPU state and from cold caches and TLB afterward, not from the save/restore instructions themselves.
 > - Go goroutines are not OS threads: the Go runtime multiplexes many goroutines onto a handful of OS threads, so a goroutine "switch" is far cheaper than a thread switch — measured on this machine, about two orders of magnitude cheaper.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your laptop plays music while you type in an editor and a browser downloads a file.
+It has maybe 8 CPU cores but hundreds of programs and tasks want to run.
+The operating system keeps them all moving by giving each a turn, very fast.
+Each "turn swap" has a cost, and knowing that cost is how you build fast servers.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Program | Code sitting on disk, not running | `/usr/bin/ls` |
+| Process | A running program with its own private memory | Your Go server while it runs |
+| Thread | One path of execution inside a process; shares its memory | One worker handling one request |
+| CPU core | Hardware that runs one thread at a time | An 8-core laptop runs 8 at once |
+| Kernel | The core of the OS that controls hardware and scheduling | Linux choosing who runs next |
+| Registers / program counter | Tiny CPU slots holding the current values and "next instruction" | PC = address of next line to run |
+| Context switch | Saving one thread's CPU state and loading another's | Pausing music to run the editor |
+| Goroutine | Go's lightweight task, run by the Go runtime on OS threads | `go handle(conn)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Process<br/>(own memory)"] --> T1["Thread 1"]
+    P --> T2["Thread 2"]
+    T1 --> C["CPU core"]
+    T2 -. "waits its turn" .-> C
+    K["Kernel scheduler"] -- "context switch" --> C
+```
+
+**Analogy.** A process is an office; threads are workers in it sharing the filing cabinets; the kernel is a manager moving workers on and off a few desks (cores).
+Where it breaks: a real manager does not wipe the desk's warm memory each swap, but a switch leaves the CPU caches "cold" for the next thread.
+
+**How the rest of this note builds up**
+
+- First, why threads exist (section 1) and the office mental model (section 2).
+- Then how it works: `fork` + `exec`, the lifecycle states, and what a context switch really does (section 3).
+- Then a measured goroutine vs OS-thread handoff (section 4) and a comparison table (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production failure modes, 1:1 vs M:N threading, `clone()`, zombies (sections 6-8).
+
+> [!tip] Remember
+> A process owns memory, a thread is a turn on the CPU, and swapping turns costs mostly cold caches.
+
 ## 1. Why it exists
 
-Say a web server needs to handle 10,000 concurrent connections. One option is one **process** per connection — a running program with its own private slice of memory. Picture a process as a self-contained office: it has its own address space, its own open files, its own everything, and nothing it does can directly touch another process's memory. That isolation is valuable, but on Linux it has a real setup cost: creating a process means the kernel builds a brand-new address space — new page tables, a new file descriptor table, a new signal table — all copied or freshly allocated from the parent. Even a modest few hundred KB of fixed per-process kernel bookkeeping multiplies to hundreds of MB before any application memory is counted, and creating each one costs a syscall round trip plus kernel address-space setup. 10,000 such offices is impractical on a single host.
+Say a web server needs to handle 10,000 concurrent connections. One option is one **process** per connection — a running program with its own private slice of memory.
 
-**Threads** exist to split "an independent flow of execution" from "an independent address space." All 10,000 connections can be handled by threads inside **one** process: they share the open listening socket, the in-memory cache, and the database connection pool, without inter-process communication. The OS still schedules each thread independently, so one slow connection does not block the others — but the heavier cost, the address space, is paid once per process, not once per connection.
+Picture a process as a self-contained office: it has its own address space, its own open files, its own everything, and nothing it does can directly touch another process's memory.
 
-Go pushes this further still: instead of one OS thread per connection, the Go runtime schedules many **goroutines** onto a small, fixed-ish pool of OS threads (see [[Runtime - Goroutine Scheduler (GMP)]]). Section 4 measures the practical effect on this machine: a goroutine-to-goroutine handoff took around 80-160 nanoseconds, while forcing an equivalent handoff between two real OS threads (pinned with `runtime.LockOSThread`) took about 7 microseconds — roughly two orders of magnitude slower, measured side by side on identical hardware.
+That isolation is valuable, but on Linux it has a real setup cost: creating a process means the kernel builds a brand-new address space — new page tables, a new file descriptor table, a new signal table — all copied or freshly allocated from the parent.
+
+Even a modest few hundred KB of fixed per-process kernel bookkeeping multiplies to hundreds of MB before any application memory is counted, and creating each one costs a syscall round trip plus kernel address-space setup. 10,000 such offices is impractical on a single host.
+
+**Threads** exist to split "an independent flow of execution" from "an independent address space."
+
+All 10,000 connections can be handled by threads inside **one** process: they share the open listening socket, the in-memory cache, and the database connection pool, without inter-process communication.
+
+The OS still schedules each thread independently, so one slow connection does not block the others — but the heavier cost, the address space, is paid once per process, not once per connection.
+
+Go pushes this further still: instead of one OS thread per connection, the Go runtime schedules many **goroutines** onto a small, fixed-ish pool of OS threads (see [[Runtime - Goroutine Scheduler (GMP)]]).
+
+Section 4 measures the practical effect on this machine: a goroutine-to-goroutine handoff took around 80-160 nanoseconds, while forcing an equivalent handoff between two real OS threads (pinned with `runtime.LockOSThread`) took about 7 microseconds — roughly two orders of magnitude slower, measured side by side on identical hardware.
 
 > [!tip] Remember
 > Threads exist because the expensive part of a process (its address space) doesn't need to be duplicated for every independent flow of execution.
 
 ## 2. Mental model
 
-**In plain words:** think of a **process** as an office: it has its own address (the address space), its own filing cabinets (open files), and its own phone line (signal handlers). A **thread** is a worker inside that office. Several workers can share the same filing cabinets and the same address — that is the whole point, it lets them collaborate without mailing documents to each other — but each worker still has their own desk, in-tray and current task (registers, stack, program counter).
+**In plain words:** think of a **process** as an office: it has its own address (the address space), its own filing cabinets (open files), and its own phone line (signal handlers).
+
+A **thread** is a worker inside that office.
+
+Several workers can share the same filing cabinets and the same address — that is the whole point, it lets them collaborate without mailing documents to each other — but each worker still has their own desk, in-tray and current task (registers, stack, program counter).
 
 ```mermaid
 flowchart TB
@@ -54,9 +115,16 @@ flowchart TB
     Manager --> Office
 ```
 
-The kernel is the building manager juggling many offices and many workers across a fixed number of desks (CPU cores). A **context switch** is the manager walking over, writing down exactly what a worker was doing (their state), and bringing a different worker to that desk to continue their own task.
+The kernel is the building manager juggling many offices and many workers across a fixed number of desks (CPU cores).
 
-`fork` and `exec` map to "clone this office including everyone in it" and "throw out everything in this office and move a new business in, keeping the address." They are separate operations because sometimes you want only one of them: `fork` alone gives you a second, independent copy of the current program (classic Unix daemons use this); `exec` alone (via `execve` without a prior `fork`) replaces the current process's program outright, keeping its PID — this is what a shell does for its very last command with `exec cmd`.
+A **context switch** is the manager walking over, writing down exactly what a worker was doing (their state), and bringing a different worker to that desk to continue their own task.
+
+`fork` and `exec` map to "clone this office including everyone in it" and "throw out everything in this office and move a new business in, keeping the address."
+
+They are separate operations because sometimes you want only one of them:
+
+- `fork` alone gives you a second, independent copy of the current program (classic Unix daemons use this).
+- `exec` alone (via `execve` without a prior `fork`) replaces the current process's program outright, keeping its PID — this is what a shell does for its very last command with `exec cmd`.
 
 > [!warning] Common mistake
 > Assuming "thread" means "cheap, independent program." A thread shares everything about its process except its own execution state. A bug in one thread's pointer arithmetic can silently corrupt another thread's data, because there is no office wall between them — only between separate processes.
@@ -92,7 +160,9 @@ sequenceDiagram
 4. The kernel discards the child's old address space entirely and loads `ls`'s code and data in its place, resetting registers to `ls`'s entry point — but keeping the same PID.
 5. When `ls` exits, the kernel sends `SIGCHLD` to the shell, and the shell's `wait()` call returns with the exit status.
 
-**Why it matters:** `fork` is fast even for a process with gigabytes of mapped memory, because nothing is actually duplicated at `fork` time — only when either process later **writes** to a shared page does the kernel fault in, copy that one page, and let the write proceed (see [[Virtual Memory, Paging and the TLB]] for the page-table and fault mechanics). `vfork` and the modern `posix_spawn`/`clone(CLONE_VM | CLONE_VFORK)` skip even the copy-on-write page-table setup when the child is about to `exec` anyway, trading parent/child isolation during the gap for speed.
+**Why it matters:** `fork` is fast even for a process with gigabytes of mapped memory, because nothing is actually duplicated at `fork` time — only when either process later **writes** to a shared page does the kernel fault in, copy that one page, and let the write proceed (see [[Virtual Memory, Paging and the TLB]] for the page-table and fault mechanics).
+
+`vfork` and the modern `posix_spawn`/`clone(CLONE_VM | CLONE_VFORK)` skip even the copy-on-write page-table setup when the child is about to `exec` anyway, trading parent/child isolation during the gap for speed.
 
 > [!tip] Remember
 > `fork` copies bookkeeping, not memory. Memory is only actually duplicated, one page at a time, the moment either side writes to it.
@@ -143,7 +213,9 @@ Two costs stack up here, and only one of them is "the switch" in the narrow sens
 > [!warning] Common mistake
 > Assuming "a context switch is expensive because saving registers is slow." The register save/restore itself is cheap. The real cost is the *aftermath*: cold caches and TLB entries for the newly-running thread, which is also why switching between two threads of the **same** process (no page-table change, so no mandatory TLB flush) is cheaper than switching between threads of different processes.
 
-A switch can be **voluntary** (the running thread calls a blocking syscall, waits on a lock, or reads from an empty channel) or **involuntary/preemptive** (the scheduler's timer interrupt fires and takes the CPU away because the time slice ran out, or a higher-priority thread became ready). [[CPU Scheduling]] covers how the next thread to run is chosen.
+A switch can be **voluntary** (the running thread calls a blocking syscall, waits on a lock, or reads from an empty channel) or **involuntary/preemptive** (the scheduler's timer interrupt fires and takes the CPU away because the time slice ran out, or a higher-priority thread became ready).
+
+[[CPU Scheduling]] covers how the next thread to run is chosen.
 
 > [!tip] Remember
 > Direct switch cost (registers) is tens of nanoseconds. Indirect cost (cold caches/TLB) is what actually puts real thread switches in the microsecond range.
@@ -163,7 +235,11 @@ type PCB struct {
 }
 ```
 
-`fork` copies one of these (plus the address space, copy-on-write). `exec` keeps the same PCB entry but resets `ProgramCtr` and `Registers` to the new program's entry point. A new thread gets its own small slice of that state (its own registers, program counter, stack) but is recorded as belonging to the same process, which is exactly "shares the address space."
+`fork` copies one of these (plus the address space, copy-on-write).
+
+`exec` keeps the same PCB entry but resets `ProgramCtr` and `Registers` to the new program's entry point.
+
+A new thread gets its own small slice of that state (its own registers, program counter, stack) but is recorded as belonging to the same process, which is exactly "shares the address space."
 
 ### Tracing the PCB operations, step by step
 
@@ -174,7 +250,9 @@ type PCB struct {
 
 ### Measuring a goroutine handoff against a real OS-thread handoff
 
-**In plain words:** the theory above claims a goroutine switch "usually never enters the kernel" and is therefore far cheaper than a real OS thread switch. Rather than only citing a general benchmark, here is a controlled, side-by-side measurement on this machine: two goroutines passing a token back and forth, once with the Go scheduler free to keep both on one OS thread, and once with each goroutine pinned to its **own** OS thread (`runtime.LockOSThread`), which forces every hand-off through the kernel.
+**In plain words:** the theory above claims a goroutine switch "usually never enters the kernel" and is therefore far cheaper than a real OS thread switch.
+
+Rather than only citing a general benchmark, here is a controlled, side-by-side measurement on this machine: two goroutines passing a token back and forth, once with the Go scheduler free to keep both on one OS thread, and once with each goroutine pinned to its **own** OS thread (`runtime.LockOSThread`), which forces every hand-off through the kernel.
 
 ```mermaid
 flowchart LR
@@ -196,7 +274,14 @@ flowchart LR
 | 4 | 81 ns | 7.13 µs |
 | 5 | 84 ns | 7.04 µs |
 
-**Why it matters:** the pinned measurement is a real, local, apples-to-apples number for "a kernel context switch on this exact machine," not just a cited literature figure — and it lands squarely inside the commonly-cited **1-10 microsecond** range for same-core thread switches (e.g. `lmbench`'s `lat_ctx` benchmark), roughly **90x** slower than the unpinned goroutine handoff measured on the same hardware, in the same run. The difference is entirely explained by section 3: the pinned version cannot avoid a real kernel trap and (because each goroutine owns its own OS thread) pays the full indirect cost of cold caches and TLB entries on every single hand-off, while the unpinned version typically never leaves userspace at all.
+**Why it matters:** the pinned measurement is a real, local, apples-to-apples number for "a kernel context switch on this exact machine," not just a cited literature figure — and it lands squarely inside the commonly-cited **1-10 microsecond** range for same-core thread switches (e.g. `lmbench`'s `lat_ctx` benchmark).
+
+It is roughly **90x** slower than the unpinned goroutine handoff measured on the same hardware, in the same run.
+
+The difference is entirely explained by section 3:
+
+- The pinned version cannot avoid a real kernel trap and (because each goroutine owns its own OS thread) pays the full indirect cost of cold caches and TLB entries on every single hand-off.
+- The unpinned version typically never leaves userspace at all.
 
 > [!warning] Common mistake
 > Assuming "goroutines are OS threads under a different name." A goroutine's cheap handoff specifically depends on the Go scheduler being free to keep both ends on the same OS thread. Pin each one to a different OS thread (as this measurement deliberately does) and the handoff cost jumps by roughly two orders of magnitude, because now it *is* a real OS thread switch.
@@ -273,3 +358,7 @@ Runnable Go version, including the process-table model, both the unpinned and pi
 - **Next:** [[System Calls and User vs Kernel Mode]], [[CPU Scheduling]], [[Process Memory Layout - Stack vs Heap]]
 - **Compare with:** [[Runtime - Goroutine Scheduler (GMP)]] (how Go schedules goroutines onto OS threads), [[Concurrency Primitives - Mutex, Semaphore, Atomics]] (coordinating threads that share memory)
 - **Runnable code:** [[Processes, Threads and Context Switching - Go]]
+
+### Watch on YouTube
+
+- [Process vs Threads Explained / PCB, Context Switching, Pthreads & Thread Types](https://www.youtube.com/watch?v=wsNpZ4YMen8) · StudyPalz · covers process/thread distinction and context-switch cost together

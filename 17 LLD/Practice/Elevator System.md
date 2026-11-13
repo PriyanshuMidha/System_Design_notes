@@ -8,13 +8,15 @@ related: ["[[Testing LLD Code]]", "[[Case Study - Ride Sharing and Proximity]]"]
 sources:
   - "ASME A17.1 / CSA B44 Safety Code for Elevators, firefighters' emergency operation (Phase I recall), summarized"
   - "Go 1.24 standard library docs: sync, context, time.Ticker"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Elevator System
 
 > [!summary] TL;DR
-> A controller owns N elevator cars. Hall buttons (floor plus up or down) go through a dispatcher that picks a car; cabin buttons go straight to their car. Each car keeps two stop sets, one for calls served going up and one going down, and serves them in LOOK order: keep going while calls remain ahead, then turn. A tick-based `Step()` makes the whole simulation deterministic to test.
+> A controller owns N elevator cars. Hall buttons (floor plus up or down) go through a dispatcher that picks a car; cabin buttons go straight to their car.
+>
+> Each car keeps two stop sets, one for calls served going up and one going down, and serves them in LOOK order: keep going while calls remain ahead, then turn. A tick-based `Step()` makes the whole simulation deterministic to test.
 
 > [!abstract] Core idea
 > - A controller owns N cars; hall calls go through a dispatcher that picks a car, cabin calls go straight to their car.
@@ -22,6 +24,50 @@ updated: 2026-11-02
 > - The one rule (LOOK): keep moving in the current direction while calls remain ahead, then turn.
 > - A tick-based `Step()` moves every car one step, so tests run deterministically without sleeping.
 > - Classic mistake: setting the car to Idle whenever the door closes even though calls remain.
+
+## Start here: the basics
+
+**The problem in one story.**
+A building has 3 elevators and 10 floors.
+Someone on floor 7 presses "Down" while one car goes up past floor 4 and another sits idle on floor 1.
+Which car should come, and in what order should each car stop?
+This note designs the software that answers both questions.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Car | One elevator box | Car 2 |
+| Hall call | A button on a floor: "I want to go up/down" | Floor 7, Down |
+| Cabin call | A button inside the car: "take me to floor N" | Inside car 1, press 9 |
+| Dispatcher | The part that picks which car answers a hall call | Nearest car that is on the way |
+| LOOK | Keep going in one direction while stops remain ahead, then turn | Up to 8, then back down to 3 |
+| Tick | One step of simulated time | Each tick a car moves one floor |
+| Strategy pattern | Swap an algorithm behind an interface | Different dispatchers |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    H["Hall call<br/>(floor + dir)"] --> D["Dispatcher<br/>picks a car"]
+    D --> Car["Car stop sets<br/>(up, down)"]
+    CC["Cabin call<br/>(floor)"] --> Car
+    T["Step() each tick"] --> Car
+    Car --> M["Move one floor<br/>or open door"]
+```
+
+**Analogy.** A bus on a line: it drives one way picking up everyone along the route, then turns at the end.
+Where it breaks: a bus has a fixed last stop; an elevator turns as soon as no calls remain ahead (LOOK, not SCAN).
+
+**How the rest of this note builds up**
+
+- First, the problem statement and Steps 1-4: requirements, actors, entities and the class diagram.
+- Then Steps 5-7: the API (`HallCall`, `CabinCall`, `Step`) and the patterns, mainly the dispatcher strategy.
+- Then Step 8 and the test cases: the Go code for one tick, LOOK order, doors and the floor-per-tick traces.
+- Finally the SDE-3 depth: concurrency (mutex versus event loop), edge cases, and trade-offs.
+
+> [!tip] Remember
+> The dispatcher picks the car; the car serves its stops in LOOK order, one tick at a time.
 
 ## Problem statement
 
@@ -55,7 +101,9 @@ concurrently with the controller loop.
 
 ## Step 2: Actors and use cases
 
-A **passenger at a floor** presses Up or Down (hall call). A **passenger in a car** presses a floor (cabin call) or overloads the car. An **operator** takes a car out of service; a **fire panel** starts recall. The **tick loop** (one goroutine) advances every car and reports door openings. **Displays and tests** read `Status`. The hardest use case: a hall call while the chosen car is already moving.
+A **passenger at a floor** presses Up or Down (hall call). A **passenger in a car** presses a floor (cabin call) or overloads the car. An **operator** takes a car out of service; a **fire panel** starts recall.
+
+The **tick loop** (one goroutine) advances every car and reports door openings. **Displays and tests** read `Status`. The hardest use case: a hall call while the chosen car is already moving.
 
 ## Step 3: Entities
 
@@ -501,9 +549,17 @@ func (c *Controller) withCar(id int, fn func(*car) error) error {
 }
 ```
 
-**One tick of a car:** Maintenance does nothing; an open door counts down (held while overweight) and on close `settle` sets the state from the remaining calls; at a floor where `shouldStop` is true the car clears the answered set entry and opens; otherwise `settle` picks the LOOK direction and the car moves one floor. At the turn-around floor an opposite-direction call is served and the car flips `dir`, so the waiting passenger sees the arrow they asked for.
+**One tick of a car:** Maintenance does nothing; an open door counts down (held while overweight) and on close `settle` sets the state from the remaining calls; at a floor where `shouldStop` is true the car clears the answered set entry and opens; otherwise `settle` picks the LOOK direction and the car moves one floor.
 
-**Concurrency:** button goroutines and the `Run` loop share `Controller.mu`, so a stop set is never read while written (a plain Go map would crash with "concurrent map writes"). Two hall calls pressed at the same moment are dispatched one after the other: `HallCall` builds the `Status` copies, asks the dispatcher and adds the stop under the same lock, so the second call sees the first call's stop. The alternative is an event loop: one goroutine owns all cars and receives presses on a channel with a reply channel. It needs no mutex, but every `Status` read becomes a round trip. With short critical sections the mutex is simpler ([[Concurrency for LLD]]).
+At the turn-around floor an opposite-direction call is served and the car flips `dir`, so the waiting passenger sees the arrow they asked for.
+
+**Concurrency:** button goroutines and the `Run` loop share `Controller.mu`, so a stop set is never read while written (a plain Go map would crash with "concurrent map writes").
+
+Two hall calls pressed at the same moment are dispatched one after the other: `HallCall` builds the `Status` copies, asks the dispatcher and adds the stop under the same lock, so the second call sees the first call's stop.
+
+The alternative is an event loop: one goroutine owns all cars and receives presses on a channel with a reply channel. It needs no mutex, but every `Status` read becomes a round trip.
+
+With short critical sections the mutex is simpler ([[Concurrency for LLD]]).
 
 ## Test cases
 
@@ -808,11 +864,22 @@ func TestConcurrentPressesWithTickLoop(t *testing.T) {
 | Fire recall and other modes | New states (Step 9); fire recall clears calls and sends every car to the recall floor |
 | Real hardware | A ticker goroutine calls `Step`; sensor events become messages to the controller |
 
-**Common mistakes:** `time.Sleep` inside the move logic (slow, flaky tests); first-come order instead of LOOK; dispatch rules inside the car instead of a Strategy; no lock around the stop sets while buttons and the tick loop run; going Idle on every door close; one stop set that ignores the hall-call direction; modelling Button, Door, Display and Floor classes before the core loop works; forgetting the current-floor and duplicate-press cases.
+**Common mistakes:**
+
+- `time.Sleep` inside the move logic (slow, flaky tests)
+- First-come order instead of LOOK
+- Dispatch rules inside the car instead of a Strategy
+- No lock around the stop sets while buttons and the tick loop run
+- Going Idle on every door close
+- One stop set that ignores the hall-call direction
+- Modelling Button, Door, Display and Floor classes before the core loop works
+- Forgetting the current-floor and duplicate-press cases
 
 ## Drawing
 
-No Excalidraw drawing exists for this problem yet. Until one is made, the class diagram (Step 4), the car state machine (Step 8) and the floor-per-tick chart (Test cases) are the drawing. When you sketch it, show the controller owning cars with up and down sets, the LOOK timeline across floors, the state machine and the dispatcher cost formula (cost = distance, plus the penalty for a busy car not on the way).
+No Excalidraw drawing exists for this problem yet. Until one is made, the class diagram (Step 4), the car state machine (Step 8) and the floor-per-tick chart (Test cases) are the drawing.
+
+When you sketch it, show the controller owning cars with up and down sets, the LOOK timeline across floors, the state machine and the dispatcher cost formula (cost = distance, plus the penalty for a busy car not on the way).
 
 ## Interview questions
 
@@ -853,3 +920,8 @@ A Controller owns N cars and exposes HallCall, CabinCall, Status and a tick-base
 - **Before this:** [[State Machines in Go]], [[Strategy and Template Method]], [[Concurrency for LLD]], [[Testing LLD Code]]
 - **Next:** [[Tic-Tac-Toe and Snake and Ladder]], [[Task Scheduler (delayed and recurring jobs)]]
 - **Compare with:** [[Case Study - Ride Sharing and Proximity]] (dispatching by cost at system scale)
+
+### Watch on YouTube
+
+- [Elevator System / Google SWE Teaches Low Level Design Episode 3](https://www.youtube.com/watch?v=4OjHA-BcJhw) · Jordan has no life · 21 min · 28,894 views
+- [🧠 Elevator System Low-Level Design (LLD) – OOP, UML & Best Practices 📊](https://www.youtube.com/watch?v=gV4NeR4Ms9Y) · codeWithAryan · 68 min · 27,208 views

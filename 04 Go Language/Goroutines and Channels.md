@@ -9,7 +9,7 @@ sources:
   - "Go source: runtime/stack.go (stackMin = 2048), runtime/proc.go"
   - "Go 1.25 release notes: sync.WaitGroup.Go"
   - "The Go Memory Model (go.dev/ref/mem)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Goroutines and Channels
@@ -24,17 +24,68 @@ updated: 2026-11-07
 > - Only the sender closes a channel, and only when every sender agrees no more values are coming.
 > - If you cannot say who closes a channel, or what makes a goroutine stop, you have a leak waiting to happen.
 
+## Start here: the basics
+
+**The problem in one story.**
+A restaurant has one waiter who takes an order, walks to the kitchen, waits for the food, and only then serves the next table.
+Everyone else waits a long time.
+Hire many waiters, and you need a way for them to pass orders to the kitchen without shouting over each other.
+In Go, the waiters are goroutines and the order slips passed between them are channels.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Concurrent | Several tasks in progress during the same period | Serving two tables at once |
+| Goroutine | A cheap task Go runs alongside other code | `go sendEmail(order)` |
+| OS thread | The operating system's unit of running code; heavier than a goroutine | Linux default stack 8 MiB |
+| Channel | A typed pipe that carries values between goroutines | `ch := make(chan int)` |
+| Block | Pause until something happens | A receive waits until a value arrives |
+| Buffer | Small queue inside a channel | `make(chan int, 3)` holds 3 values |
+| Deadlock | Every task is waiting on another, so nothing moves | Sending on a channel nobody reads |
+| Leak | A goroutine that waits forever and never ends | A worker stuck on a never-closed channel |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    M["main goroutine"] -- "go worker()" --> W["worker goroutine"]
+    M -- "ch <- job" --> CH(["channel"])
+    CH -- "job := <-ch" --> W
+    W -- "close(results) when done" --> R(["results channel"])
+    R --> M
+```
+
+**Analogy.** Goroutines are coworkers; a channel is a conveyor belt between them. An unbuffered belt needs someone at the other end right now; a buffered belt can hold a few items before the sender has to wait.
+Where it breaks: a real belt does not care who stops it; in Go only the sender should `close` a channel, and closing it twice crashes the program.
+
+**How the rest of this note builds up**
+
+- First, why goroutines exist (section 1) and the coworker/conveyor-belt model (section 2).
+- Then the `go` statement, unbuffered vs. buffered channels, direction types and `close` (section 3).
+- Then deadlocks, ownership, leaks and fire-and-forget traps, plus a worked example (sections 3-4).
+- Finally the SDE-3 deep dive: what really synchronizes under the memory model, stack growth, and production failure modes (sections 6-8).
+
+> [!tip] Remember
+> Start a goroutine only when you know how it stops, and let only the sender close the channel.
+
 ## 1. Why it exists
 
-A web server handling 10,000 concurrent requests cannot afford an OS thread per request: a thread's stack defaults to 8 MiB on Linux, so 10,000 threads would need about 80 GiB of stack space alone, plus the kernel's per-thread scheduling overhead. A goroutine's stack starts at 2 KiB (`runtime/stack.go: stackMin = 2048`, verified in the Go 1.24 source) and grows and shrinks as needed, so the same 10,000 concurrent requests cost around 20 MiB of stack, not 80 GiB.
+A web server handling 10,000 concurrent requests cannot afford an OS thread per request: a thread's stack defaults to 8 MiB on Linux, so 10,000 threads would need about 80 GiB of stack space alone, plus the kernel's per-thread scheduling overhead.
 
-The second problem is coordination. If request handling spawns a goroutine to send a confirmation email, something has to hand the email goroutine its data, know when it is done, and decide what happens if the main handler returns first. Channels are Go's answer: a typed pipe through which one goroutine gives data to another, with the handoff itself acting as the synchronization point.
+A goroutine's stack starts at 2 KiB (`runtime/stack.go: stackMin = 2048`, verified in the Go 1.24 source) and grows and shrinks as needed, so the same 10,000 concurrent requests cost around 20 MiB of stack, not 80 GiB.
+
+The second problem is coordination. If request handling spawns a goroutine to send a confirmation email, something has to hand the email goroutine its data, know when it is done, and decide what happens if the main handler returns first.
+
+Channels are Go's answer: a typed pipe through which one goroutine gives data to another, with the handoff itself acting as the synchronization point.
 
 ## 2. Mental model
 
 A goroutine is a **function call that runs alongside the caller** instead of blocking it. `go sendEmail(order)` is like handing a task to a coworker and continuing your own work, instead of doing the task yourself and making everyone wait.
 
-A channel is a **conveyor belt between two workers**, sized either for instant handoff (unbuffered: the receiver must be standing there) or for a small queue (buffered: a short line can build up before anyone blocks). The only wrinkle: whoever puts items on the belt is the one who tells everyone else "no more items are coming" (`close`), and only once.
+A channel is a **conveyor belt between two workers**, sized either for instant handoff (unbuffered: the receiver must be standing there) or for a small queue (buffered: a short line can build up before anyone blocks).
+
+The only wrinkle: whoever puts items on the belt is the one who tells everyone else "no more items are coming" (`close`), and only once.
 
 ## 3. How it works
 
@@ -59,11 +110,17 @@ go func() {
 wg.Wait() // blocks until every Add has a matching Done
 ```
 
-Calling `Add` inside the new goroutine is a classic race: `Wait()` on the calling goroutine can run before the new goroutine gets scheduled and calls `Add`, so `Wait` returns immediately having counted zero outstanding goroutines. `wg.Go(f)` (new in Go 1.25) does the `Add(1)` / goroutine-start / `Done()` sequence atomically and removes this foot-gun; it does not exist in Go 1.24, so 1.24 code uses `Add` before `go` as shown above. Full mechanics of `WaitGroup`, `Once`, `Mutex` and the atomic types are in [[sync Primitives and Atomics]].
+Calling `Add` inside the new goroutine is a classic race: `Wait()` on the calling goroutine can run before the new goroutine gets scheduled and calls `Add`, so `Wait` returns immediately having counted zero outstanding goroutines.
+
+`wg.Go(f)` (new in Go 1.25) does the `Add(1)` / goroutine-start / `Done()` sequence atomically and removes this foot-gun; it does not exist in Go 1.24, so 1.24 code uses `Add` before `go` as shown above.
+
+Full mechanics of `WaitGroup`, `Once`, `Mutex` and the atomic types are in [[sync Primitives and Atomics]].
 
 ### Goroutines are not OS threads
 
-The Go runtime multiplexes many goroutines onto a much smaller number of OS threads (the **M:N scheduler**: G goroutines, M OS threads, P logical processors — previewed here, detailed in [[Runtime - Goroutine Scheduler (GMP)]]). A goroutine that blocks on a channel or a mutex parks cheaply inside the Go runtime; it does not tie up an OS thread the way a thread blocked in the kernel would.
+The Go runtime multiplexes many goroutines onto a much smaller number of OS threads (the **M:N scheduler**: G goroutines, M OS threads, P logical processors — previewed here, detailed in [[Runtime - Goroutine Scheduler (GMP)]]).
+
+A goroutine that blocks on a channel or a mutex parks cheaply inside the Go runtime; it does not tie up an OS thread the way a thread blocked in the kernel would.
 
 ```mermaid
 flowchart LR
@@ -105,7 +162,9 @@ sequenceDiagram
     C-->>S: 3's send can now complete
 ```
 
-`make(chan int)` is unbuffered: a synchronous handoff where the send and the matching receive are one event with two sides. `make(chan int, 4)` is buffered with capacity 4: a send only blocks once 4 unreceived values are already queued. Buffering decouples the sender's and receiver's pace up to that limit; it does not remove the need for someone to receive eventually.
+`make(chan int)` is unbuffered: a synchronous handoff where the send and the matching receive are one event with two sides. `make(chan int, 4)` is buffered with capacity 4: a send only blocks once 4 unreceived values are already queued.
+
+Buffering decouples the sender's and receiver's pace up to that limit; it does not remove the need for someone to receive eventually.
 
 ### Directional channel types
 
@@ -137,7 +196,9 @@ stateDiagram-v2
 | Send `ch <- v` | succeeds (or blocks if unbuffered/full) | blocks until a receiver | **panics**: "send on closed channel" | panics | blocks forever |
 | `close(ch)` | succeeds | succeeds | **panics**: "close of closed channel" | succeeds | **panics**: "close of nil channel" |
 
-The verified rule that matters most: **only the sender closes a channel, and only once**. A receiver that closes a channel it did not own risks a concurrent send racing the close. If several goroutines send on the same channel, none of them should close it individually; instead, a separate coordinator closes it once every sender is known to be done (commonly with a `sync.WaitGroup`, shown in [[select and Concurrency Patterns]]).
+The verified rule that matters most: **only the sender closes a channel, and only once**. A receiver that closes a channel it did not own risks a concurrent send racing the close.
+
+If several goroutines send on the same channel, none of them should close it individually; instead, a separate coordinator closes it once every sender is known to be done (commonly with a `sync.WaitGroup`, shown in [[select and Concurrency Patterns]]).
 
 A **nil channel** (a `chan T` variable that was never assigned with `make`) blocks forever on both send and receive. That looks useless until you put it inside a `select`: a nil channel's `case` is never ready, so assigning `nil` to a channel variable is a standard trick for disabling exactly one `select` arm — see [[select and Concurrency Patterns]].
 
@@ -153,7 +214,9 @@ This is the idiomatic consumer loop: it needs no explicit `ok` check, and it is 
 
 ### Deadlock detection has a narrow trigger
 
-The Go runtime detects a deadlock only when **every** goroutine in the process is blocked at once, and then it crashes the whole program: `fatal error: all goroutines are asleep - deadlock!`. A single stuck goroutine inside a busy server never triggers this — the other goroutines keep serving requests, and the stuck one just sits there forever, invisible until someone notices rising goroutine counts or a stalled handler.
+The Go runtime detects a deadlock only when **every** goroutine in the process is blocked at once, and then it crashes the whole program: `fatal error: all goroutines are asleep - deadlock!`.
+
+A single stuck goroutine inside a busy server never triggers this — the other goroutines keep serving requests, and the stuck one just sits there forever, invisible until someone notices rising goroutine counts or a stalled handler.
 
 ```go
 jobs := make(chan Job)   // unbuffered
@@ -202,7 +265,9 @@ Detecting leaks: the goroutine count in `runtime.NumGoroutine()` (and the Promet
 
 ### Fire-and-forget from a request handler
 
-`go sendEmail(order)` launched straight from an HTTP handler is a trap: the handler's `context.Context` is cancelled the moment the handler returns (`r.Context()` is tied to the request's lifetime — see [[Context Package]]), so `sendEmail` can be cut off mid-flight with no error reported to anyone. The fix detaches the value-carrying parts of the context while dropping its cancellation, and gives the detached work its own bound:
+`go sendEmail(order)` launched straight from an HTTP handler is a trap: the handler's `context.Context` is cancelled the moment the handler returns (`r.Context()` is tied to the request's lifetime — see [[Context Package]]), so `sendEmail` can be cut off mid-flight with no error reported to anyone.
+
+The fix detaches the value-carrying parts of the context while dropping its cancellation, and gives the detached work its own bound:
 
 ```go
 go func() {
@@ -216,7 +281,9 @@ go func() {
 
 ### Channels vs. a mutex
 
-A channel moves **ownership** of data from one goroutine to another; a mutex lets multiple goroutines **share** one piece of state safely. Guarding a `map[string]int` that many goroutines read and write is a mutex problem — adding channels and `select` statements to serialize access to a struct is usually harder to reason about than one `sync.Mutex`. Channels earn their keep when work or data genuinely needs to move between goroutines: a pipeline stage, a worker pool's job queue, a cancellation signal. The full decision table lives in [[Concurrency for LLD]].
+A channel moves **ownership** of data from one goroutine to another; a mutex lets multiple goroutines **share** one piece of state safely. Guarding a `map[string]int` that many goroutines read and write is a mutex problem — adding channels and `select` statements to serialize access to a struct is usually harder to reason about than one `sync.Mutex`.
+
+Channels earn their keep when work or data genuinely needs to move between goroutines: a pipeline stage, a worker pool's job queue, a cancellation signal. The full decision table lives in [[Concurrency for LLD]].
 
 ## 4. Worked example
 
@@ -396,10 +463,20 @@ func TestNilChannel_BlocksForever(t *testing.T) {
 
 ## 8. Deep dive
 
-- **What actually synchronizes.** Under the Go memory model, a send on a channel happens-before the corresponding receive completes, and (for an unbuffered channel) the receive happens-before the send returns. For a buffered channel of capacity C, the k-th receive happens-before the (k+C)-th send completes — the buffer behaves like a capacity-C semaphore. This is why "pass data through a channel" is a correct way to publish a value to another goroutine without a separate mutex: the happens-before edge covers everything written before the send. Full treatment, including `Mutex` and `atomic`, is [[Memory Model and Data Races]].
-- **Stack growth.** A new goroutine starts with a 2 KiB stack (verified: `runtime/stack.go`, `stackMin = 2048`). When a function call would overflow it, the runtime allocates a new, larger stack (roughly double), copies the old one over — rewriting any pointers into the stack — and frees the old one. This copying is why goroutine stacks can start tiny without a fixed worst-case reservation, and why a pointer into another goroutine's stack is never safe to keep.
-- **`go vet`'s limits here.** A directional channel-type violation is caught by the compiler itself, not `go vet` — it is a plain type error. What `go vet` actually adds for concurrency code is its `copylocks` check: passing or assigning a `sync.Mutex` or `sync.WaitGroup` by value (instead of by pointer) copies its internal state, which silently breaks the lock, and `go vet` flags that copy. Neither the compiler nor `go vet` catches goroutine leaks or who-closes-what; `go.uber.org/goleak` and the race detector cover those, different and non-overlapping gaps, which is why production code runs both in CI.
-- **Why `main` returning kills everything.** The Go runtime has no concept of "wait for all goroutines before exiting" by default — `main` returning is `os.Exit(0)` for the whole process. Any cleanup that must run (flushing a log buffer, finishing an in-flight write) has to be waited on explicitly before `main` returns, typically with a `WaitGroup` or a bounded shutdown `context.Context`.
+- **What actually synchronizes.** Under the Go memory model, a send on a channel happens-before the corresponding receive completes, and (for an unbuffered channel) the receive happens-before the send returns. For a buffered channel of capacity C, the k-th receive happens-before the (k+C)-th send completes — the buffer behaves like a capacity-C semaphore.
+
+  This is why "pass data through a channel" is a correct way to publish a value to another goroutine without a separate mutex: the happens-before edge covers everything written before the send. Full treatment, including `Mutex` and `atomic`, is [[Memory Model and Data Races]].
+- **Stack growth.** A new goroutine starts with a 2 KiB stack (verified: `runtime/stack.go`, `stackMin = 2048`). When a function call would overflow it, the runtime allocates a new, larger stack (roughly double), copies the old one over — rewriting any pointers into the stack — and frees the old one.
+
+  This copying is why goroutine stacks can start tiny without a fixed worst-case reservation, and why a pointer into another goroutine's stack is never safe to keep.
+- **`go vet`'s limits here.** A directional channel-type violation is caught by the compiler itself, not `go vet` — it is a plain type error.
+
+  What `go vet` actually adds for concurrency code is its `copylocks` check: passing or assigning a `sync.Mutex` or `sync.WaitGroup` by value (instead of by pointer) copies its internal state, which silently breaks the lock, and `go vet` flags that copy.
+
+  Neither the compiler nor `go vet` catches goroutine leaks or who-closes-what; `go.uber.org/goleak` and the race detector cover those, different and non-overlapping gaps, which is why production code runs both in CI.
+- **Why `main` returning kills everything.** The Go runtime has no concept of "wait for all goroutines before exiting" by default — `main` returning is `os.Exit(0)` for the whole process.
+
+  Any cleanup that must run (flushing a log buffer, finishing an in-flight write) has to be waited on explicitly before `main` returns, typically with a `WaitGroup` or a bounded shutdown `context.Context`.
 
 ## 9. Interview questions
 
@@ -416,13 +493,17 @@ func TestNilChannel_BlocksForever(t *testing.T) {
 > It is a deliberate design choice: a nil channel's send and receive both block permanently, so inside a `select`, a nil channel's case is never the one chosen. Assigning `nil` to a channel variable is the standard way to disable exactly one `select` arm at runtime, for example to stop retrying a timer after the first success.
 
 > [!question]- You wrote `wg.Add(1)` inside the goroutine instead of before `go func(){...}()`. What can go wrong?
-> `Wait()` on the calling goroutine can execute before the scheduler ever runs the new goroutine's `Add(1)`, so `Wait` sees zero outstanding work and returns immediately — the caller proceeds as if everything finished when nothing has even started. Always call `Add` on the goroutine that will call `Wait`, before starting the new goroutine (or use `wg.Go` on Go 1.25+, which does both atomically).
+> `Wait()` on the calling goroutine can execute before the scheduler ever runs the new goroutine's `Add(1)`, so `Wait` sees zero outstanding work and returns immediately — the caller proceeds as if everything finished when nothing has even started.
+>
+> Always call `Add` on the goroutine that will call `Wait`, before starting the new goroutine (or use `wg.Go` on Go 1.25+, which does both atomically).
 
 > [!question]- Does Go's runtime deadlock detector catch every deadlock in a long-running server?
 > No — it only fires when literally every goroutine in the process is blocked simultaneously. In a server handling many requests, one goroutine stuck forever on a channel just sits there invisibly while the rest of the server keeps working; you will only notice it through a rising goroutine count or a request that never completes, not a crash.
 
 > [!question]- When would you reach for channels instead of a mutex?
-> When ownership of data needs to move between goroutines — a pipeline stage handing processed items to the next stage, or a cancellation signal fanning out to many workers via `ctx.Done()`. When multiple goroutines need to read and write the *same* shared state, a mutex is usually simpler and easier to verify than an equivalent built from channels and `select`.
+> When ownership of data needs to move between goroutines — a pipeline stage handing processed items to the next stage, or a cancellation signal fanning out to many workers via `ctx.Done()`.
+>
+> When multiple goroutines need to read and write the *same* shared state, a mutex is usually simpler and easier to verify than an equivalent built from channels and `select`.
 
 ## 10. Cheat sheet
 
@@ -440,3 +521,8 @@ func TestNilChannel_BlocksForever(t *testing.T) {
 - **Before this:** [[Functions, Closures, Defer, Panic and Recover]], [[Process Memory Layout - Stack vs Heap]]
 - **Next:** [[select and Concurrency Patterns]], [[sync Primitives and Atomics]], [[Context Package]]
 - **Compare with:** [[Concurrency for LLD]] (where invariants live and the channels-vs-mutex decision), [[Processes, Threads and Context Switching]] (OS threads vs. goroutines)
+
+### Watch on YouTube
+
+- [Master Go Channels in 15 Minutes: Goroutines & Concurrency Made Simple for Beginners](https://www.youtube.com/watch?v=WGxJmhGBpuU) · JA Asuquo · 15-min visual intro to goroutines + channels
+- [Go Class: 23 CSP, Goroutines, and Channels](https://www.youtube.com/watch?v=zJd7Dvg3XCk) · Matt KØDVB · deeper dive into CSP theory behind Go's concurrency model

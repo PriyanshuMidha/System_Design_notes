@@ -14,13 +14,24 @@ sources:
   - "Prometheus docs, Storage (head block, WAL, 2-hour blocks, compaction, default retention 15d)"
   - "PostgreSQL 17 docs, Table Partitioning and BRIN Indexes (pages_per_range default 128)"
   - "Apache Parquet format specification (row groups, column chunks, pages); Apache Iceberg table spec"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Time-Series and Columnar Storage - Go
 
 > [!summary] TL;DR
-> Go implementations of the three column encodings a time-series store relies on (delta-of-delta timestamps, Gorilla XOR floats, run-length encoding), plus the ClickHouse, PostgreSQL and TimescaleDB SQL for the InvoiceOps analytics design. It is the runnable companion of [[Time-Series and Columnar Storage]]. Each piece of code is introduced by the idea it implements and followed by a numbered walkthrough, and the tests explain what every size check proves.
+> Go implementations of the three column encodings a time-series store relies on (delta-of-delta timestamps, Gorilla XOR floats, run-length encoding), plus the ClickHouse, PostgreSQL and TimescaleDB SQL for the InvoiceOps analytics design. It is the runnable companion of [[Time-Series and Columnar Storage]].
+>
+> Each piece of code is introduced by the idea it implements and followed by a numbered walkthrough, and the tests explain what every size check proves.
+
+## Before the code
+
+- **Slices of numbers** (`[]int64`, `[]float64`): one slice per column is the whole idea of a column store in memory.
+- **Varints** (`binary.AppendVarint`, `binary.Uvarint`): store small numbers in fewer bytes; zigzag makes small negative numbers small too.
+- **Bit tricks** (`math.Float64bits`, XOR, shifts): view a float as its 64 raw bits so Gorilla encoding can store only the bits that changed.
+- **A small bit writer/reader type**: methods on a struct that append or read single bits, because the encodings are not byte-aligned.
+- **Sentinel errors** (`errors.New`): one `errCorrupt` value returned when encoded input is malformed.
+- **What to run**: concatenate the Go blocks into `colenc.go` and `colenc_test.go`, then `go vet ./... && go test -race -v ./...`.
 
 ## What this code shows
 
@@ -80,7 +91,9 @@ The code implements delta-of-delta timestamps (with zigzag varints, a simpler co
 
 ### Step 1: row store versus column store
 
-**Concept.** The first idea in [[Time-Series and Columnar Storage#Row layout vs column layout]] is that the physical layout decides how much data a query reads. A row store keeps each event together, so summing one field still drags every other field through memory. A column store keeps each field together, so the same sum reads only the slices it names. The alternative of keeping everything as rows is the right choice for point lookups by primary key, which is why the OLTP database stays a row store.
+**Concept.** The first idea in [[Time-Series and Columnar Storage#Row layout vs column layout]] is that the physical layout decides how much data a query reads. A row store keeps each event together, so summing one field still drags every other field through memory. A column store keeps each field together, so the same sum reads only the slices it names.
+
+The alternative of keeping everything as rows is the right choice for point lookups by primary key, which is why the OLTP database stays a row store.
 
 ```mermaid
 flowchart LR
@@ -139,7 +152,9 @@ func paidTotal(c EventColumns) (sum int64) {
 
 ### Step 2: delta-of-delta timestamps
 
-**Concept.** Timestamps in a metric series are almost evenly spaced, as in [[Time-Series and Columnar Storage#Delta-of-delta on timestamps]]. The first difference (delta) between neighbours is nearly constant, so the difference of deltas (delta-of-delta) is mostly zero, and zero is the cheapest number to encode. The code stores the first timestamp, the first delta, then only delta-of-delta values as signed varints. Facebook's Gorilla paper packs these into variable-width bit buckets, which is smaller still; zigzag varints were chosen here because they need no bit-level code and still reach about one byte per sample.
+**Concept.** Timestamps in a metric series are almost evenly spaced, as in [[Time-Series and Columnar Storage#Delta-of-delta on timestamps]]. The first difference (delta) between neighbours is nearly constant, so the difference of deltas (delta-of-delta) is mostly zero, and zero is the cheapest number to encode. The code stores the first timestamp, the first delta, then only delta-of-delta values as signed varints.
+
+Facebook's Gorilla paper packs these into variable-width bit buckets, which is smaller still; zigzag varints were chosen here because they need no bit-level code and still reach about one byte per sample.
 
 Worked trace for five scrapes in milliseconds:
 
@@ -263,7 +278,9 @@ The second half rebuilds each timestamp.
 
 ### Step 3: a bit writer and reader
 
-**Concept.** Gorilla's output is not byte aligned: a single repeated value costs one bit, so the encoder needs to write one bit, then five, then 64. Go's standard library has no bit-level writer, so the code defines two small helpers. See [[Time-Series and Columnar Storage#Gorilla XOR on float values]] for why the format needs them. The alternative is a `bytes.Buffer` per field, which would waste up to seven bits per value and destroy the compression.
+**Concept.** Gorilla's output is not byte aligned: a single repeated value costs one bit, so the encoder needs to write one bit, then five, then 64. Go's standard library has no bit-level writer, so the code defines two small helpers.
+
+See [[Time-Series and Columnar Storage#Gorilla XOR on float values]] for why the format needs them. The alternative is a `bytes.Buffer` per field, which would waste up to seven bits per value and destroy the compression.
 
 ```mermaid
 flowchart LR
@@ -336,7 +353,11 @@ func (r *bitReader) readBits(n uint) (uint64, error) {
 
 ### Step 4: Gorilla XOR floats
 
-**Concept.** Gauge values such as CPU or temperature change slowly, so neighbouring values share most of their 64 bits. XOR of two equal values is zero; XOR of two close values has long runs of leading and trailing zero bits, and only the middle "meaningful" bits differ. [[Time-Series and Columnar Storage#Gorilla XOR on float values]] describes the three cases, and the code implements them: control bit `0` for identical values, `10` to reuse the previous window of meaningful bits, `11` to open a new window. The alternative is a general-purpose compressor such as ZSTD on raw floats, which cannot exploit the bit-level similarity as cheaply and is slower to decode value by value.
+**Concept.** Gauge values such as CPU or temperature change slowly, so neighbouring values share most of their 64 bits. XOR of two equal values is zero; XOR of two close values has long runs of leading and trailing zero bits, and only the middle "meaningful" bits differ.
+
+[[Time-Series and Columnar Storage#Gorilla XOR on float values]] describes the three cases, and the code implements them: control bit `0` for identical values, `10` to reuse the previous window of meaningful bits, `11` to open a new window.
+
+The alternative is a general-purpose compressor such as ZSTD on raw floats, which cannot exploit the bit-level similarity as cheaply and is slower to decode value by value.
 
 ```mermaid
 flowchart TD
@@ -347,7 +368,9 @@ flowchart TD
     FIT -- no --> W11["write 11, 5 bits leading, 6 bits length, then the meaningful bits"]
 ```
 
-A worked case: encoding `0.25, 0.25, 0.5`. The bit patterns are `0x3FD0000000000000` and `0x3FE0000000000000`, so the second value costs 1 bit (`0`), and the third has `x = 0x0030000000000000` with 10 leading zeros, 52 trailing zeros and 2 meaningful bits. It is written as `11`, then lead 10 (5 bits), length 2 (6 bits) and the two bits `11`: 15 bits.
+A worked case: encoding `0.25, 0.25, 0.5`. The bit patterns are `0x3FD0000000000000` and `0x3FE0000000000000`, so the second value costs 1 bit (`0`), and the third has `x = 0x0030000000000000` with 10 leading zeros, 52 trailing zeros and 2 meaningful bits.
+
+It is written as `11`, then lead 10 (5 bits), length 2 (6 bits) and the two bits `11`: 15 bits.
 
 The same example, record by record:
 
@@ -527,7 +550,9 @@ The tail reads the meaningful bits and applies them.
 
 ### Step 5: run-length encoding
 
-**Concept.** A column of low-cardinality strings such as invoice status stores the same value many times in a row once the table is sorted by it, as in [[Time-Series and Columnar Storage#Run-length encoding and the sort key]]. RLE replaces each stretch of equal values with one (value, count) pair. The design choice is that RLE only pays off for adjacent equal values, so the table's sort key decides the compression ratio. The alternative, a dictionary that maps each string to a small integer, works without sorting but still stores one integer per row; real engines combine the two.
+**Concept.** A column of low-cardinality strings such as invoice status stores the same value many times in a row once the table is sorted by it, as in [[Time-Series and Columnar Storage#Run-length encoding and the sort key]]. RLE replaces each stretch of equal values with one (value, count) pair.
+
+The design choice is that RLE only pays off for adjacent equal values, so the table's sort key decides the compression ratio. The alternative, a dictionary that maps each string to a small integer, works without sorting but still stores one integer per row; real engines combine the two.
 
 ```mermaid
 flowchart LR
@@ -586,7 +611,9 @@ func DecodeRLE(runs []Run) []string {
 
 ### Step 6: ClickHouse tables and the rollup
 
-**Concept.** The design in [[Time-Series and Columnar Storage#4.1 InvoiceOps analytics store in ClickHouse]] keeps PostgreSQL as the OLTP database and feeds ClickHouse through CDC and Kafka. The `ORDER BY` of a MergeTree table is its sort key and its sparse index at once, so it decides both RLE-style compression and which reads can skip data. A `ReplacingMergeTree` removes duplicate events by sort key on merge, which makes the at-least-once pipeline safe. The alternative of one wide denormalized table with no sort key would scan everything for every query.
+**Concept.** The design in [[Time-Series and Columnar Storage#4.1 InvoiceOps analytics store in ClickHouse]] keeps PostgreSQL as the OLTP database and feeds ClickHouse through CDC and Kafka. The `ORDER BY` of a MergeTree table is its sort key and its sparse index at once, so it decides both RLE-style compression and which reads can skip data.
+
+A `ReplacingMergeTree` removes duplicate events by sort key on merge, which makes the at-least-once pipeline safe. The alternative of one wide denormalized table with no sort key would scan everything for every query.
 
 ```mermaid
 flowchart LR
@@ -672,7 +699,9 @@ The `-State` functions store partial aggregates; the `-Merge` functions combine 
 
 ### Step 7: PostgreSQL partitioning and BRIN
 
-**Concept.** At tens of millions of rows a separate store is often not worth running, as [[Time-Series and Columnar Storage#4.2 The same idea at modest volume: PostgreSQL partitioning and BRIN]] explains. PostgreSQL 17 handles time-ordered data well with declarative partitioning and a BRIN index (block range index: a tiny index that stores min and max per range of heap pages). Because rows arrive in time order, each block range covers a narrow time window, so BRIN is effective and tiny. The alternative, a B-tree on the timestamp, indexes every row and costs hundreds of megabytes.
+**Concept.** At tens of millions of rows a separate store is often not worth running, as [[Time-Series and Columnar Storage#4.2 The same idea at modest volume: PostgreSQL partitioning and BRIN]] explains. PostgreSQL 17 handles time-ordered data well with declarative partitioning and a BRIN index (block range index: a tiny index that stores min and max per range of heap pages).
+
+Because rows arrive in time order, each block range covers a narrow time window, so BRIN is effective and tiny. The alternative, a B-tree on the timestamp, indexes every row and costs hundreds of megabytes.
 
 ```mermaid
 flowchart TD
@@ -740,7 +769,9 @@ A query on one week of November reads only the November partition (partition pru
 
 ### Step 8: TimescaleDB
 
-**Concept.** TimescaleDB, described in [[Time-Series and Columnar Storage#TimescaleDB]], keeps PostgreSQL and automates the pattern from step 7. A hypertable looks like one table but is split into chunks, each an ordinary PostgreSQL table covering one time interval. Old chunks are compressed into a columnar layout, and continuous aggregates are incrementally refreshed rollups. The trade-off against ClickHouse is lower peak scan speed for full SQL, transactions and one operational system.
+**Concept.** TimescaleDB, described in [[Time-Series and Columnar Storage#TimescaleDB]], keeps PostgreSQL and automates the pattern from step 7. A hypertable looks like one table but is split into chunks, each an ordinary PostgreSQL table covering one time interval.
+
+Old chunks are compressed into a columnar layout, and continuous aggregates are incrementally refreshed rollups. The trade-off against ClickHouse is lower peak scan speed for full SQL, transactions and one operational system.
 
 ```mermaid
 flowchart LR
@@ -1043,7 +1074,9 @@ Reading the output line by line:
 5. `TestConstantSeriesCostsOneBitPerValue` and `TestRLE` log nothing, since they assert exact sizes and run counts instead of printing them.
 6. `PASS` and `ok  colenc` are the package summary. With `-race` enabled, an `ok` also means no data race was detected; the elapsed time varies per run.
 
-How the timestamp size adds up. The count `1000` takes 2 bytes, the first timestamp (about 1.77 trillion) takes about 7 bytes, and the first delta `15000` takes 3 bytes. Of the 998 remaining delta-of-delta values, most are `0` and cost 1 byte each. Each of the 9 jitters at samples 99, 199 and so on produces two non-zero values, `+1000` and `-1000`, which cost 2 bytes each. That is roughly 12 + 980 + 18 * 2 = 1,028 bytes, which matches the measured 1,027 B to within a byte of rounding in the estimate.
+How the timestamp size adds up. The count `1000` takes 2 bytes, the first timestamp (about 1.77 trillion) takes about 7 bytes, and the first delta `15000` takes 3 bytes. Of the 998 remaining delta-of-delta values, most are `0` and cost 1 byte each. Each of the 9 jitters at samples 99, 199 and so on produces two non-zero values, `+1000` and `-1000`, which cost 2 bytes each.
+
+That is roughly 12 + 980 + 18 * 2 = 1,028 bytes, which matches the measured 1,027 B to within a byte of rounding in the estimate.
 
 The test flow for a round trip is the same for every encoder:
 
@@ -1087,7 +1120,9 @@ The last row is the lesson: Gorilla works because real gauges change slowly. Ran
 2. Replace `counter(500)` with a counter that increases by exactly `1.0` and predict whether bits per value goes up or down compared with 11.26. Explain it with the XOR window.
 3. Run `EncodeRLE` on a column of 1,000 alternating `paid` and `open` values and predict the number of runs, then sort the column first and predict again.
 
-Hints. For exercise 1, ten times as many jitters means ten times as many non-zero delta-of-delta entries, each taking 2 bytes instead of 1, so the size grows by roughly 180 B, not 2x. For exercise 2, a counter that steps by exactly `1.0` changes only the same few mantissa bits each time, so the `10` window is reused and the cost per value falls. For exercise 3, alternating values never repeat next to each other, so there are 1,000 runs and no saving at all; after sorting there are 2.
+Hints. For exercise 1, ten times as many jitters means ten times as many non-zero delta-of-delta entries, each taking 2 bytes instead of 1, so the size grows by roughly 180 B, not 2x. For exercise 2, a counter that steps by exactly `1.0` changes only the same few mantissa bits each time, so the `10` window is reused and the cost per value falls.
+
+For exercise 3, alternating values never repeat next to each other, so there are 1,000 runs and no saving at all; after sorting there are 2.
 
 ## Links
 

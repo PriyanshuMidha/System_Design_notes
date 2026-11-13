@@ -11,13 +11,15 @@ sources:
   - "RabbitMQ documentation, Quorum Queues (poison message handling, delivery-limit)"
   - "Apache Kafka documentation, Kafka Connect error handling (errors.deadletterqueue.topic.name)"
   - "Spring for Apache Kafka reference, Non-blocking retries (retry topics and the -dlt suffix)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Dead Letter Queues and Poison Messages
 
 > [!summary] TL;DR
-> A **poison message** is one that fails every time a consumer tries it, for example because its JSON is malformed. A **dead-letter queue (DLQ)** is a separate queue where such messages are moved after a set number of failed attempts, so they stop blocking or looping, and a human can inspect, fix and replay them later.
+> A **poison message** is one that fails every time a consumer tries it, for example because its JSON is malformed.
+>
+> A **dead-letter queue (DLQ)** is a separate queue where such messages are moved after a set number of failed attempts, so they stop blocking or looping, and a human can inspect, fix and replay them later.
 
 > [!abstract] Core idea
 > - Retrying a poison message forever either blocks the queue behind it or burns workers in a loop.
@@ -25,6 +27,52 @@ updated: 2026-11-04
 > - SQS and RabbitMQ dead-letter natively; Kafka does not, so you build retry topics plus a dead-letter topic.
 > - A DLQ is useless without an owner, an alert on depth and age, and a safe replay path into idempotent consumers.
 > - Skipping a message breaks per-key ordering; decide what happens to the later messages for that key.
+
+## Start here: the basics
+
+**The problem in one story.**
+A mail sorter gets a letter with an unreadable address.
+If the sorter keeps trying it again and again, nothing behind it gets sorted.
+So after a few tries it goes on a special shelf, and a person looks at it later.
+A dead-letter queue is that shelf for messages that keep failing.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Message | One piece of data passed through a queue | `{"orderId": 42}` |
+| Consumer | The program that reads and handles messages | Order worker |
+| Retry | Trying the same message again after a failure | Second attempt after 5 s |
+| Transient error | A failure that may pass on its own | Timeout, HTTP 503 |
+| Permanent error | A failure that will happen every time | Malformed JSON |
+| Poison message | A message that fails on every attempt | Missing required field |
+| DLQ | Side queue where failing messages are moved | `orders-dlq` |
+| Replay / redrive | Sending DLQ messages back after a fix | SQS "start DLQ redrive" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Q["Main queue"] --> C["Consumer"]
+    C -- "ok" --> Done["Done"]
+    C -- "transient error" --> R["Retry with backoff"]
+    R --> Q
+    C -- "permanent or too many tries" --> DLQ[("Dead-letter queue")]
+    DLQ --> H["Human fixes,<br/>then replays"]
+```
+
+**Analogy.** The post office shelf of undeliverable letters.
+Where it breaks: a letter on the shelf never blocks the next letter to the same house, but skipping a message can break per-key order in a queue.
+
+**How the rest of this note builds up**
+
+- First, what goes wrong without a DLQ (section 1) and the sorting-room model (section 2).
+- Then how SQS, RabbitMQ and Kafka each dead-letter, and how retention behaves (section 3).
+- Then a Go retry-and-DLQ router with tests (section 4), and ordering-safe variants (section 5).
+- Finally the SDE-3 deep dive: where the attempt count lives, retry topic delays, parking a key and deserialisation poison pills (sections 6-8).
+
+> [!tip] Remember
+> Retry what might pass, dead-letter what never will, and give the DLQ an owner, an alert and a replay path.
 
 ## 1. Why it exists
 
@@ -38,7 +86,9 @@ A DLQ caps the damage: after N attempts the message is moved aside, the queue ke
 
 ## 2. Mental model
 
-A post office sorting room has a shelf labelled "undeliverable". A letter with an unreadable address is tried a couple of times, then put on the shelf instead of being sent round the building forever. The rest of the mail keeps moving. Once a day a clerk goes through the shelf, fixes what can be fixed, and puts those letters back into the normal flow.
+A post office sorting room has a shelf labelled "undeliverable". A letter with an unreadable address is tried a couple of times, then put on the shelf instead of being sent round the building forever. The rest of the mail keeps moving.
+
+Once a day a clerk goes through the shelf, fixes what can be fixed, and puts those letters back into the normal flow.
 
 Terms:
 
@@ -91,7 +141,9 @@ sequenceDiagram
     Note over DLQ: CloudWatch alarm on ApproximateNumberOfMessagesVisible > 0
 ```
 
-A message's retention is measured from when it was **first** sent to the source queue (for standard queues), so a message that sat 3 days in the source and lands in a DLQ with 4-day retention is deleted about one day later. For FIFO queues the timestamp resets when the message moves to the DLQ. Set the DLQ retention longer than the source's, ideally the 14-day maximum.
+A message's retention is measured from when it was **first** sent to the source queue (for standard queues), so a message that sat 3 days in the source and lands in a DLQ with 4-day retention is deleted about one day later.
+
+For FIFO queues the timestamp resets when the message moves to the DLQ. Set the DLQ retention longer than the source's, ideally the 14-day maximum.
 
 **RabbitMQ.** A queue is given a **dead-letter exchange** with the `x-dead-letter-exchange` argument (or a policy). A message is dead-lettered when:
 
@@ -340,10 +392,16 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 
 ## 8. Deep dive
 
-- **Where the attempt count lives.** SQS and RabbitMQ count on the broker side. With Kafka retry topics you must carry the count in a header when republishing, and the delay too: the retry consumer reads the header, and if "not before" is in the future it **pauses** that partition (`consumer.Pause`) until then rather than sleeping inside the poll loop, because sleeping past `max.poll.interval.ms` gets it evicted from the group.
+- **Where the attempt count lives.** SQS and RabbitMQ count on the broker side.
+
+  With Kafka retry topics you must carry the count in a header when republishing, and the delay too: the retry consumer reads the header, and if "not before" is in the future it **pauses** that partition (`consumer.Pause`) until then rather than sleeping inside the poll loop, because sleeping past `max.poll.interval.ms` gets it evicted from the group.
 - **Delays in a log are per topic, not per message.** A retry topic holds messages in arrival order, all with the same delay, so the head is always the next due message. This is why each delay gets its own topic instead of one topic with per-message delays.
-- **Ordering-preserving variant.** When order per key matters, keep an in-memory or DB set of "blocked keys". On failure, write the message to a side table and add its key to the set. Later messages with a blocked key go to the side table too. When the head is fixed, drain that key's side-table rows in order. This is how "park the key" works.
-- **Poison pills in deserialisation.** A message that cannot be deserialised fails before your handler sees it. In Kafka clients the deserialiser error happens inside `poll`, so you must catch it there (Spring's `ErrorHandlingDeserializer` exists for this reason) and route the raw bytes to the DLT. Schema validation at the producer, with a registry, prevents most of these (see [[Event Schemas and Schema Registry]]).
+- **Ordering-preserving variant.** When order per key matters, keep an in-memory or DB set of "blocked keys". On failure, write the message to a side table and add its key to the set. Later messages with a blocked key go to the side table too.
+
+  When the head is fixed, drain that key's side-table rows in order. This is how "park the key" works.
+- **Poison pills in deserialisation.** A message that cannot be deserialised fails before your handler sees it. In Kafka clients the deserialiser error happens inside `poll`, so you must catch it there (Spring's `ErrorHandlingDeserializer` exists for this reason) and route the raw bytes to the DLT.
+
+  Schema validation at the producer, with a registry, prevents most of these (see [[Event Schemas and Schema Registry]]).
 - **Replay safety checklist.** Idempotent consumer; replay preserves the original key; rate limit; a way to tag replayed messages (header `x-replayed-from: orders.dlt`) so metrics and audits can tell them apart.
 - **Choosing the attempt limit.** It should cover the longest transient outage you want to ride out. Tiers of 1 minute and 10 minutes ride out about 11 minutes. If a dependency's typical incident lasts 30 minutes, add a 30-minute tier instead of raising a single tier's count.
 
@@ -383,3 +441,8 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 - **Before this:** [[Delivery Semantics and Exactly-Once]], [[Timeouts, Retries and Backoff]]
 - **Next:** [[Message Ordering and Partition Keys]], [[Backpressure and Flow Control]], [[Kafka and Event Streaming]]
 - **Compare with:** [[AWS SQS, SNS and EventBridge]] (native redrive), [[Background Jobs and Worker Pools]] (job-level discard and archive states), [[Event Schemas and Schema Registry]] (preventing poison messages at the source)
+
+### Watch on YouTube
+
+- [Errors and Dead Letter Queues / Kafka Connect 101 (2023)](https://www.youtube.com/watch?v=GWBk9LIzy-A) · Confluent, an IBM Company · 4 min · 18,650 views
+- [Dead-letter queues and poison messages: what happens after the message lands](https://www.youtube.com/watch?v=Yug4Xsf3L0I) · FDE Interviews · 3 min · 23 views

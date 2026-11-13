@@ -12,13 +12,17 @@ sources:
   - "Yjs documentation (YATA CRDT, awareness protocol) and Automerge documentation"
   - "Kleppmann, Designing Data-Intensive Applications (O'Reilly, 2017), chapter 5: concurrent writes and conflict resolution"
   - "RFC 6455, The WebSocket Protocol"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Collaborative Document Editor
 
 > [!summary] TL;DR
-> A collaborative editor (think Google Docs) lets many people type in the same document at once and see each other's changes within a fraction of a second, with no one's typing lost. The hard part is the **merge**: two people edit the same sentence at the same moment, from different positions in the history, and every screen must still end up identical. The design is a WebSocket session per document, an **operation log** that is the source of truth, a merge algorithm (**OT** or a **CRDT**), and periodic **snapshots** so opening a document never replays millions of edits.
+> A collaborative editor (think Google Docs) lets many people type in the same document at once and see each other's changes within a fraction of a second, with no one's typing lost.
+>
+> The hard part is the **merge**: two people edit the same sentence at the same moment, from different positions in the history, and every screen must still end up identical.
+>
+> The design is a WebSocket session per document, an **operation log** that is the source of truth, a merge algorithm (**OT** or a **CRDT**), and periodic **snapshots** so opening a document never replays millions of edits.
 
 > [!abstract] Core idea
 > - Clients send small **operations** ("insert 'x' at position 5"), never the whole document; the server stores them in an append-only log per document.
@@ -27,9 +31,59 @@ updated: 2026-11-09
 > - A **snapshot** every N operations plus the log tail is how a document opens fast; the log is also the version history.
 > - **Presence** (cursors, "Asha is typing") is ephemeral: fast, lossy, never persisted.
 
+## Start here: the basics
+
+**The problem in one story.**
+You and a friend open the same shopping list in Google Docs.
+You add "milk" at the top while your friend adds "eggs" at the bottom, in the same second.
+Both screens must end up showing both items, in the same order, with nothing lost.
+Making that work for many people typing at once is the collaborative editor problem.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Operation (op) | A small description of one edit | "insert 'x' at position 5" |
+| Concurrent edits | Edits made at the same time without seeing each other | Both type in line 3 at once |
+| Convergence | Everyone ends up with the identical document | Both screens show `hcats` |
+| Operation log | An append-only list of every op, in order | Ops 1, 2, ..., 1207 |
+| Snapshot | A saved full copy of the document at some op number | Full text as of op 1000 |
+| OT | Operational transformation: adjust an op's position for ops that landed first | "insert at 3" becomes "insert at 4" |
+| CRDT | A data type whose ops merge in any order to the same result | Each character has its own ID |
+| WebSocket | A connection that stays open so the server can push edits | Browser keeps one socket per document |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Alice's browser"] -- "op" --> S["Document server:<br/>orders ops"]
+    B["Bob's browser"] -- "op" --> S
+    S --> L["Op log"]
+    S -- "ordered ops" --> A
+    S -- "ordered ops" --> B
+    L --> SN["Snapshots"]
+```
+
+**Analogy.** Cooks with photocopies of one recipe card send small instructions to a single clerk, who numbers them and sends the list back (section 2 expands this).
+Where it breaks: an instruction like "add salt after word 4" goes wrong if someone inserted a word earlier; fixing that is what OT or CRDTs do.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the core conflict, OT vs CRDT, and the overall architecture (section 3), then estimates, API and data model (section 4).
+- Then the deep dives: safe merging, one owner per document, snapshots, presence and offline editing (section 5).
+- Finally variants, trade-offs, production concerns and the SDE-3 scaling extras (sections 6-9).
+
+> [!tip] Remember
+> Send small ops, give them one order per document, merge with OT or a CRDT, and snapshot so documents open fast.
+
 ## 1. Why it exists - requirements
 
-Think of two people editing a shared paper notebook, each with their own copy, and phoning each other when they change a line. If both change line 3 at the same time, whose version wins? Early tools solved this with **locking** ("only one editor at a time") or **last save wins**, and both feel broken: locking blocks your colleague, and last save wins silently deletes work.
+Think of two people editing a shared paper notebook, each with their own copy, and phoning each other when they change a line.
+
+If both change line 3 at the same time, whose version wins?
+
+Early tools solved this with **locking** ("only one editor at a time") or **last save wins**, and both feel broken: locking blocks your colleague, and last save wins silently deletes work.
 
 Real-time collaboration fixes this: everyone types freely, and the system merges every keystroke. The design problem is how to merge when each person's screen has already moved on before the other's edit arrives.
 
@@ -55,7 +109,13 @@ Real-time collaboration fixes this: everyone types freely, and the system merges
 
 ## 2. Mental model
 
-Imagine a **shared recipe card** that lives in a kitchen. Instead of passing the card around, every cook has a photocopy and writes small instructions on a **ledger** ("add salt after word 4"). A single clerk (the document server) numbers each instruction in the order they reach the clerk and hands back the numbered ledger. Each cook replays the ledger on their own copy and gets the same card.
+Imagine a **shared recipe card** that lives in a kitchen.
+
+Instead of passing the card around, every cook has a photocopy and writes small instructions on a **ledger** ("add salt after word 4").
+
+A single clerk (the document server) numbers each instruction in the order they reach the clerk and hands back the numbered ledger.
+
+Each cook replays the ledger on their own copy and gets the same card.
 
 Where the analogy breaks: cooks do not wait for the clerk before writing on their own copy. They apply their change at once and fix it up when the clerk's order arrives. That fix-up is the whole difficulty.
 
@@ -87,7 +147,13 @@ flowchart LR
 
 ### The conflict in one picture
 
-**In plain words:** Alice and Bob both start from the text `cat`. Alice inserts `s` at the end (`cats`). At the same moment Bob inserts `h` at the start (`hcat`). Each applies their own edit at once. If Alice simply applies Bob's "insert h at position 0" it works. But if Bob receives Alice's "insert s at position 3", position 3 in `hcat` is now between `a` and `t`, not the end, and he gets `hcast`. Positions shift when other people edit, and that is the entire problem.
+**In plain words:** Alice and Bob both start from the text `cat`. Alice inserts `s` at the end (`cats`). At the same moment Bob inserts `h` at the start (`hcat`).
+
+Each applies their own edit at once. If Alice simply applies Bob's "insert h at position 0" it works.
+
+But if Bob receives Alice's "insert s at position 3", position 3 in `hcat` is now between `a` and `t`, not the end, and he gets `hcast`.
+
+Positions shift when other people edit, and that is the entire problem.
 
 ```mermaid
 sequenceDiagram
@@ -130,7 +196,11 @@ Steps for one keystroke, client-server OT:
 
 ### Option B: CRDTs
 
-**In plain words:** a **CRDT** (see [[CRDTs and Conflict Resolution]]) removes position shifting by giving every character a unique ID, such as `(client id, counter)`, and describing an insert as "put this character after the character with ID X". IDs never shift, so ops commute: they can arrive in any order, be duplicated, and still produce the same text. Libraries such as **Yjs** (YATA algorithm) and **Automerge** implement this.
+**In plain words:** a **CRDT** (see [[CRDTs and Conflict Resolution]]) removes position shifting by giving every character a unique ID, such as `(client id, counter)`, and describing an insert as "put this character after the character with ID X".
+
+IDs never shift, so ops commute: they can arrive in any order, be duplicated, and still produce the same text.
+
+Libraries such as **Yjs** (YATA algorithm) and **Automerge** implement this.
 
 ```mermaid
 flowchart TB
@@ -344,7 +414,11 @@ flowchart LR
 
 **In plain words:** sticky routing means one process orders the edits of one document. If it dies, a new one must take over without losing or reordering anything.
 
-The owner holds a **lease** in Redis (`SET doc:42:owner srv-7 NX EX 15`, renewed every 5 s). Writes to the op log carry the primary key `(doc_id, rev)`, so even if two servers briefly think they own the document, only one can write revision 1207; the other gets a duplicate-key error and steps down. This is a **fencing** guard: see [[Distributed Locks and Fencing Tokens]] for why a lease alone is not safe, and [[Leader Election]] for the general pattern.
+The owner holds a **lease** in Redis (`SET doc:42:owner srv-7 NX EX 15`, renewed every 5 s).
+
+Writes to the op log carry the primary key `(doc_id, rev)`, so even if two servers briefly think they own the document, only one can write revision 1207; the other gets a duplicate-key error and steps down.
+
+This is a **fencing** guard: see [[Distributed Locks and Fencing Tokens]] for why a lease alone is not safe, and [[Leader Election]] for the general pattern.
 
 ```mermaid
 sequenceDiagram
@@ -516,3 +590,8 @@ A 45-minute script:
 - **Decision guides:** [[Choosing Consistency, Replication and Partitioning - Decision Guide]], [[Choosing an API and Communication Style - Decision Guide]], [[Choosing a Database - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]]
 - **Patterns used:** [[Leader Election]], [[Distributed Locks and Fencing Tokens]], [[Event Sourcing]], [[Idempotency and Idempotency Keys]], [[Consistent Hashing]], [[Multi-Region Architecture]], [[Locking - Optimistic vs Pessimistic]]
 - **Method:** [[HLD Round - Complete Step-by-Step Guide]]
+
+### Watch on YouTube
+
+- [✅ System Design 10: Design Real-time Collaborative Text Editor like Google Docs / Notion / HLD / LLD](https://www.youtube.com/watch?v=-eMtcFqj8vI) · InterviewWithBunny · 66 min · 22,823 views
+- [Build Google Docs / A Real-World LLD Project / Document Editor LLD /](https://www.youtube.com/watch?v=MT9qZFGQXOU) · Coder Army · 45 min · 142,026 views

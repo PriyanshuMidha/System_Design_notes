@@ -1,0 +1,7 @@
+{
+  "N":     {"voice": "en-US-EmmaMultilingualNeural", "rate": 4,  "pitch": 0,  "volume": 0},
+  "MAYA":  {"voice": "en-IN-NeerjaExpressiveNeural", "rate": 6,  "pitch": 4,  "volume": 0},
+  "OSCAR": {"voice": "en-US-GuyNeural",              "rate": -10, "pitch": -8, "volume": 0},
+  "PIA":   {"voice": "en-US-AvaMultilingualNeural",  "rate": 10, "pitch": 3,  "volume": 0},
+  "SAM":   {"voice": "en-US-BrianMultilingualNeural","rate": -6, "pitch": -4, "volume": 0}
+}

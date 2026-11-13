@@ -9,7 +9,7 @@ sources:
   - "Apache Kafka documentation, Design: consumer position and offsets, message delivery semantics"
   - "Google Cloud Pub/Sub documentation, subscriptions: ack deadline, redelivery, dead-letter topics, ordering keys"
   - "Go 1.24 standard library docs, builtins clear and min (since Go 1.21)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Pub-Sub Message Queue
@@ -24,6 +24,46 @@ updated: 2026-11-04
 > - **Bounded buffers**: a topic retains only what some subscription has not committed, capped at `BufferSize`; when full, `Publish` blocks until an ack frees space or its `ctx` ends. `MaxInFlight` bounds each consumer.
 > - **Poison messages** go to a dead-letter list after `MaxAttempts` deliveries so they cannot block the subscription forever.
 > - Classic mistakes: one Go channel per subscriber with no ack (a crash loses messages), unbounded slices (one slow consumer grows memory without limit), and deleting a message when the *first* subscriber acks it.
+
+## Start here: the basics
+
+**The problem in one story.** When an order is placed, three teams care: billing, email and analytics. The order service should announce "order placed" once and not know who listens. Each listener reads at its own speed, and if one crashes mid-way, it must get the message again, not lose it.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Topic | A named stream of messages | `orders` |
+| Publisher | Code that puts messages on a topic | Order service |
+| Subscription | One listener's reading position on a topic | `billing` on `orders` |
+| Offset | A message's position number in the topic | Message #42 |
+| Ack | "I processed it, do not send again" | Billing acks #42 |
+| At-least-once | Every message arrives, maybe more than once | Redelivered after a timeout |
+| Backpressure | Slowing the producer when buffers are full | `Publish` blocks |
+| Dead-letter list | Where a message goes after too many failures | #42 failed 5 times |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  P[Publisher] --> T[Topic log: 1 2 3 4 5]
+  T --> B[Sub billing: cursor at 3]
+  T --> E[Sub email: cursor at 5]
+  B -->|ack| T
+  E -->|ack| T
+```
+
+**Analogy.** A shared notice board where each reader keeps a bookmark: the note is pinned once, every reader moves only their own bookmark, and a note comes down only when every reader has passed it. Where it breaks: a board has no timeout; a queue must notice a reader that stopped mid-note and hand that note out again.
+
+**How the rest of this note builds up**
+
+- First the problem, requirements and actors (Steps 1-2), then entities: topic, subscription, delivery (Steps 3-4).
+- Then APIs and storage (Steps 5-6), and patterns (Step 7).
+- Then the Go code and tests (Step 8): offsets, acks, redelivery timeouts, bounded buffers.
+- Finally the SDE-3 depth: edge cases, trade-offs and extensions, and interview questions.
+
+> [!tip] Remember
+> Topic is a log, subscription is a cursor; ack or it comes back.
 
 ## Problem statement
 
@@ -1063,3 +1103,8 @@ Redraw it from memory:
 - **Before this:** [[LLD Interview Method]], [[Observer and Event Bus]], [[Concurrency for LLD]], [[17 LLD/Practice/Task Scheduler (delayed and recurring jobs)|Task Scheduler (delayed and recurring jobs)]]
 - **Next:** [[Ride Sharing]]
 - **Compare with:** [[Case Study - Distributed Message Queue]] (the system-level design), [[Kafka and Event Streaming]], [[Delivery Semantics and Exactly-Once]], [[Queues vs Streams and Broker Comparison]], [[Notification Service]] (a consumer of such a queue)
+
+### Watch on YouTube
+
+- [Message Queues in System Design Interviews w/ Meta Staff Engineer](https://www.youtube.com/watch?v=1ISRd0bS714) · Hello Interview · 26 min · 271,936 views
+- [Message Queues vs Pub/Sub / System Design](https://www.youtube.com/watch?v=XvnppkWqJbs) · System Design School · 8 min · 28,079 views

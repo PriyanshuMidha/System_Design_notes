@@ -15,13 +15,22 @@ sources:
   - "Figma blog, How Figma's databases team lived to tell the scale (2024)"
   - "AWS docs, DynamoDB: best practices for designing partition keys (per-partition throughput limits)"
   - "Kleppmann, Designing Data-Intensive Applications (2017), chapter 6: Partitioning"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Partitioning and Sharding - Go
 
 > [!summary] TL;DR
 > The full PostgreSQL 17 partitioning DDL (range, list and hash) and a Go logical-shard router with a versioned map and a freeze-and-flip move, as described in [[Partitioning and Sharding]]. The Go code is tested under `go test -race`; the SQL is representative PostgreSQL 17 and was not run here.
+
+## Before the code
+
+- **Hashing**: `hash/fnv` (whiteboard) and `crypto/sha256` (full version) turn a workspace ID into a logical shard number.
+- **`sync.RWMutex`**: many routers read the shard map at once; a move takes the write lock briefly.
+- **Sentinel errors**: `ErrMoving` tells a writer the shard is frozen, checked with `errors.Is`.
+- **Version counter**: one integer tells a router its cached map is stale.
+- **Goroutines**: a concurrency test routes from many goroutines while shards are frozen and flipped.
+- **Run**: `go vet ./... && go test -race -v ./...` (standard library only; the SQL is not run).
 
 ## What this code shows
 
@@ -57,7 +66,11 @@ The note has two halves. The SQL half (steps 1 to 3) shows what PostgreSQL does 
 
 ### Step 1: partitioned tables in SQL
 
-**Concept.** Declarative partitioning ([[Partitioning and Sharding#3.1 Partitioning inside PostgreSQL]]) lets one logical table be stored as many physical tables. The parent holds no rows; PostgreSQL sends each inserted row to the single partition whose bounds match its partition key. The three kinds answer three different questions: RANGE for "which time window", LIST for "which named group" such as a data-residency region, and HASH for "spread evenly when there is no natural grouping". An alternative is to split tables by hand (`audit_logs_2026_10` as ordinary tables behind a UNION view), but then pruning, constraints and inserts are all your job. Declarative partitioning gives the same layout with the planner doing the routing.
+**Concept.** Declarative partitioning ([[Partitioning and Sharding#3.1 Partitioning inside PostgreSQL]]) lets one logical table be stored as many physical tables. The parent holds no rows; PostgreSQL sends each inserted row to the single partition whose bounds match its partition key.
+
+The three kinds answer three different questions: RANGE for "which time window", LIST for "which named group" such as a data-residency region, and HASH for "spread evenly when there is no natural grouping".
+
+An alternative is to split tables by hand (`audit_logs_2026_10` as ordinary tables behind a UNION view), but then pruning, constraints and inserts are all your job. Declarative partitioning gives the same layout with the planner doing the routing.
 
 ```mermaid
 flowchart TD
@@ -138,7 +151,11 @@ CREATE TABLE invoices_p0 PARTITION OF invoices FOR VALUES WITH (MODULUS 4, REMAI
 
 ### Step 2: check pruning
 
-**Concept.** Partition pruning ([[Partitioning and Sharding#3.2 Partition pruning]]) is the payoff of partitioning: the planner reads the `WHERE` clause, compares it to each partition's bounds and removes the partitions that cannot match. Pruning at plan time works when the bounds are constants. When the bound is only known at execution, such as `now()`, PostgreSQL prunes at run time and reports `Subplans Removed`. Without pruning, partitioning would be slower than one table because of per-partition planning overhead. Reading the plan is the only reliable way to know pruning worked.
+**Concept.** Partition pruning ([[Partitioning and Sharding#3.2 Partition pruning]]) is the payoff of partitioning: the planner reads the `WHERE` clause, compares it to each partition's bounds and removes the partitions that cannot match. Pruning at plan time works when the bounds are constants.
+
+When the bound is only known at execution, such as `now()`, PostgreSQL prunes at run time and reports `Subplans Removed`. Without pruning, partitioning would be slower than one table because of per-partition planning overhead.
+
+Reading the plan is the only reliable way to know pruning worked.
 
 ```mermaid
 flowchart LR
@@ -174,7 +191,9 @@ Representative output for both is in [[Partitioning and Sharding#3.2 Partition p
 
 ### Step 3: retention
 
-**Concept.** Retention as a metadata operation ([[Partitioning and Sharding#3.3 Retention as a metadata operation]]) is the second big payoff. Deleting a month of rows with `DELETE` rewrites millions of tuples, generates WAL, and leaves dead rows for vacuum. Detaching a whole partition changes only catalogue entries, and `DROP TABLE` then frees the files at once. The cost is that you must keep creating future partitions and dropping old ones on a schedule.
+**Concept.** Retention as a metadata operation ([[Partitioning and Sharding#3.3 Retention as a metadata operation]]) is the second big payoff. Deleting a month of rows with `DELETE` rewrites millions of tuples, generates WAL, and leaves dead rows for vacuum.
+
+Detaching a whole partition changes only catalogue entries, and `DROP TABLE` then frees the files at once. The cost is that you must keep creating future partitions and dropping old ones on a schedule.
 
 ```sql
 ALTER TABLE audit_logs DETACH PARTITION audit_logs_2025_12 CONCURRENTLY;  -- PostgreSQL 14+
@@ -189,7 +208,11 @@ DROP TABLE audit_logs_2025_12;   -- or archive it to object storage first
 
 ### Whiteboard version
 
-**Concept.** This is the smallest form of the idea in [[Partitioning and Sharding#4. Worked example]]: a key is hashed to one of a fixed number of logical shards, and a table maps each logical shard to a database. Because the hash and the shard count never change, moving data is a single table update rather than a rehash of every key. The alternative, `hash(key) % numberOfDatabases`, ties placement to the server count, so adding a server moves almost every key. The cost of the logical-shard design is one extra lookup and a map you must store and keep consistent.
+**Concept.** This is the smallest form of the idea in [[Partitioning and Sharding#4. Worked example]]: a key is hashed to one of a fixed number of logical shards, and a table maps each logical shard to a database.
+
+Because the hash and the shard count never change, moving data is a single table update rather than a rehash of every key. The alternative, `hash(key) % numberOfDatabases`, ties placement to the server count, so adding a server moves almost every key.
+
+The cost of the logical-shard design is one extra lookup and a map you must store and keep consistent.
 
 ```go
 package wb
@@ -232,7 +255,13 @@ flowchart LR
 
 ### Step 4: the logical shard and the shard map
 
-**Concept.** This step implements the fixed-logical-shards idea from [[Partitioning and Sharding#3.4 Sharding across machines]] and [[Partitioning and Sharding#8.1 Why many logical shards]]. The map stores the owner of each of the 1,024 logical shards, a `frozen` flag per shard for the cut-over, and a version number that routers compare to detect a change. SHA-256 is used instead of FNV because it spreads even sequential IDs uniformly and its output never changes between Go versions. The alternatives are a consistent-hash ring ([[Consistent Hashing - Go]]) and a database table for the map (needed in production so that all routers agree); fixed shards were chosen because a move is exactly one entry and easy to reason about.
+**Concept.** This step implements the fixed-logical-shards idea from [[Partitioning and Sharding#3.4 Sharding across machines]] and [[Partitioning and Sharding#8.1 Why many logical shards]].
+
+The map stores the owner of each of the 1,024 logical shards, a `frozen` flag per shard for the cut-over, and a version number that routers compare to detect a change.
+
+SHA-256 is used instead of FNV because it spreads even sequential IDs uniformly and its output never changes between Go versions.
+
+The alternatives are a consistent-hash ring ([[Consistent Hashing - Go]]) and a database table for the map (needed in production so that all routers agree); fixed shards were chosen because a move is exactly one entry and easy to reason about.
 
 ```mermaid
 classDiagram
@@ -318,7 +347,11 @@ func NewMap(databases ...string) *Map {
 
 ### Step 5: routing, freezing and flipping
 
-**Concept.** The online move in [[Partitioning and Sharding#4. Worked example]] has three phases: copy the data while writes continue, freeze writes for a short final drain, then flip the owner. `Route` implements the read and write rule, `Freeze` starts the cut-over and `Flip` finishes it. Reads can safely keep using the old owner during the freeze because the old database still has all the data. Writes must fail fast instead of queuing, so a stuck move cannot pile up requests. `Flip` refuses to run on an unfrozen shard, because flipping while writes are still arriving could lose them.
+**Concept.** The online move in [[Partitioning and Sharding#4. Worked example]] has three phases: copy the data while writes continue, freeze writes for a short final drain, then flip the owner. `Route` implements the read and write rule, `Freeze` starts the cut-over and `Flip` finishes it.
+
+Reads can safely keep using the old owner during the freeze because the old database still has all the data. Writes must fail fast instead of queuing, so a stuck move cannot pile up requests.
+
+`Flip` refuses to run on an unfrozen shard, because flipping while writes are still arriving could lose them.
 
 ```mermaid
 stateDiagram-v2

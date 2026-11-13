@@ -7,13 +7,17 @@ prereqs: ["[[LLD Interview Method]]", "[[OOP in Go - Structs, Interfaces, Embedd
 related: ["[[State Machines in Go]]", "[[Command, Undo and Memento]]", "[[Testing LLD Code]]", "[[Concurrency for LLD]]", "[[Parking Lot]]"]
 sources:
   - "Go 1.24 language spec, struct types and interfaces"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Tic-Tac-Toe and Snake and Ladder
 
 > [!summary] TL;DR
-> These two board games are the classic machine-coding warm-up. You build one shared skeleton (a `Player`, a turn rotation and a `Game` interface with a status), then each game adds its own rule: tic-tac-toe detects a win in O(1) per move with running row, column and diagonal sums, and snake and ladder resolves every snake and ladder with one map lookup and takes its dice as an injected interface so tests can script every roll.
+> These two board games are the classic machine-coding warm-up.
+> 
+> You build one shared skeleton (a `Player`, a turn rotation and a `Game` interface with a status).
+> 
+> Then each game adds its own rule: tic-tac-toe detects a win in O(1) per move with running row, column and diagonal sums, and snake and ladder resolves every snake and ladder with one map lookup and takes its dice as an injected interface so tests can script every roll.
 
 > [!abstract] Core idea
 > - Shared skeleton: `Player`, a `turns` helper that rotates players, a `Status` (in progress, won, draw) and a `Game` interface both games satisfy.
@@ -21,6 +25,47 @@ updated: 2026-11-04
 > - Snake and ladder: snakes and ladders are the same thing, a jump from one cell to another, stored in one `map[int]int`. Validate the jumps once at construction (no chains, no jump on the last cell).
 > - The dice is an interface. Production uses a random dice; tests use a scripted dice so every game is deterministic.
 > - Classic mistakes: scanning the whole board after every move, separate `Snake` and `Ladder` classes with duplicated code, calling `rand` directly inside `Play`, and forgetting turn validation.
+
+## Start here: the basics
+
+**The problem in one story.** An interviewer asks you to code tic-tac-toe in 45 minutes, then snake and ladder.
+Both games take turns between players, both end with a winner or a draw, and both need tests.
+The trick is to share the common parts and keep each game's rule small and fast.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Interface | A list of methods a type promises to have | `Game` with `Status()` |
+| Turn rotation | Moving to the next player in order | Alice, Bob, Alice, Bob |
+| Counter per line | One number per row, column and diagonal | Row 0 counter is +2 |
+| O(1) | Work that does not grow with board size | Checking four counters per move |
+| Jump map | A map from a start cell to an end cell | `{16: 6, 4: 14}` |
+| Injected dice | Dice passed in as an interface, so tests can fix rolls | Scripted dice returns 6, then 2 |
+| Machine coding | A timed round where you write working code | 60 minutes, runnable program |
+
+**Picture it**
+
+```mermaid
+flowchart TB
+    G[Game interface + turns + Status] --> T[Tic-tac-toe: row, column, diagonal counters]
+    G --> S[Snake and ladder: jumps map + Dice interface]
+    T --> W1{Counter = +n or -n?}
+    S --> W2{Reached last cell?}
+```
+
+**Analogy.** Think of a board-game box with one rulebook chapter on taking turns and separate chapters for each game's rule.
+It breaks down because a real rulebook does not keep score for you, while the counters here keep a running score so no rescan is needed.
+
+**How the rest of this note builds up**
+
+- First the problem statement and requirements (Steps 1-2): players, boards, wins and draws.
+- Then entities, relationships and APIs (Steps 3-5): the shared skeleton and each game's rule.
+- Then storage and patterns (Steps 6-7): where game state lives and which patterns fit.
+- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): O(1) win check, jump validation, deterministic dice and concurrent moves.
+
+> [!tip] Remember
+> Share the turn and status skeleton; tic-tac-toe keeps signed line counters, snake and ladder keeps one jump map and a fake-able dice.
 
 ## Problem statement
 
@@ -861,7 +906,11 @@ Redraw it from memory:
 ## Interview questions
 
 > [!question]- How do you detect a tic-tac-toe win in O(1) per move?
-> Keep one integer per row, per column, and one for each diagonal. Player one adds +1 and player two adds -1 to the counters of the cell's row and column, and to a diagonal only if the cell is on it. A counter equal to +n or -n means one player owns that whole line. Only the four counters touched by the move can change, so the check is O(1); memory is O(n).
+> Keep one integer per row, per column, and one for each diagonal. Player one adds +1 and player two adds -1 to the counters of the cell's row and column, and to a diagonal only if the cell is on it.
+> 
+> A counter equal to +n or -n means one player owns that whole line.
+> 
+> Only the four counters touched by the move can change, so the check is O(1); memory is O(n).
 
 > [!question]- Trap: why can't you just check `rows[r] == n` without the sign trick, counting each player's marks?
 > You can, with one counter per player per line, which doubles memory. The trap is a single unsigned count of marks: a full row of mixed X and O also reaches n and would be reported as a win. The ±1 sum only reaches ±n when every cell in the line belongs to the same player.
@@ -873,7 +922,9 @@ Redraw it from memory:
 > Inject the dice as an interface. Production passes a dice backed by `math/rand/v2`; tests pass a `ScriptedDice` with fixed rolls, so a test can force a ladder, a snake or an overshoot and assert the exact positions. The same idea as injecting a clock.
 
 > [!question]- What jump layouts would you reject, and why?
-> A jump that starts on the last cell (the game becomes unwinnable) or on cell 1, a jump to itself, two jumps from the same cell, and a jump ending on another jump's start. Rejecting chains guarantees at most one jump per move and rules out loops such as a ladder from 10 to 20 and a snake from 20 to 10.
+> A jump that starts on the last cell (the game becomes unwinnable) or on cell 1, a jump to itself, two jumps from the same cell, and a jump ending on another jump's start.
+> 
+> Rejecting chains guarantees at most one jump per move and rules out loops such as a ladder from 10 to 20 and a snake from 20 to 10.
 
 > [!question]- Two HTTP requests for the same player's move arrive together. What happens?
 > In memory, the game mutex makes the move one atomic step; the second request sees that the turn has passed and gets `ErrNotYourTurn` (409). In a database, insert the move with the next sequence number under a primary key `(game_id, seq)`, or bump a version column with a compare-and-set; only one insert or update succeeds.
@@ -896,3 +947,8 @@ Redraw it from memory:
 - **Before this:** [[LLD Interview Method]], [[OOP in Go - Structs, Interfaces, Embedding]], [[Strategy and Template Method]]
 - **Next:** [[ATM]]
 - **Compare with:** [[Parking Lot]] (the other basic practice problem), [[State Machines in Go]], [[Command, Undo and Memento]] (undo and replay), [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [Design Tic Tac Toe: Low Level Design Coding Interview Question](https://www.youtube.com/watch?v=gktZsX9Z8Kw) · Gaurav Sen · 15 min · 360,589 views
+- [TicTacToe / Google Gigachad SWE Teaches Low Level Design Episode 1](https://www.youtube.com/watch?v=Mw0fHf7d-38) · Jordan has no life · 12 min · 44,058 views

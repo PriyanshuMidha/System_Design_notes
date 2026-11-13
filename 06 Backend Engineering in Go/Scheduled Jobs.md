@@ -9,7 +9,7 @@ sources:
   - "Go 1.23 release notes, runtime: Timer and Ticker garbage collection"
   - "PostgreSQL 17 docs, Explicit Locking (advisory locks)"
   - "Kubernetes docs, CronJob"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Scheduled Jobs
@@ -23,13 +23,65 @@ updated: 2026-11-07
 > - The job's own SQL should be idempotent and resumable on its own (`FOR UPDATE SKIP LOCKED`, looping until a batch is empty), so a crash mid-run is a non-event rather than an incident.
 > - Classic mistake: doing the work inside the scheduler goroutine instead of enqueuing it, which lets one slow dependency stall every future tick.
 
+## Start here: the basics
+
+**The problem in one story.**
+A shop owner wants a reminder text sent every evening to customers whose bill is late.
+She hires four helpers, and each one sets an alarm for 6 PM.
+At 6 PM all four send the same text, so every customer gets four messages.
+If she keeps only one helper and that helper is off sick, nobody sends anything.
+A scheduled job needs "exactly one helper does it, every time, even if one is missing".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Scheduled job | Code that runs on a timer, not because a user asked | "Mark late invoices every minute" |
+| Ticker | A Go timer that fires again and again at a fixed interval | `time.NewTicker(time.Minute)` |
+| Cron expression | A short text rule for when to run | `0 2 * * *` = every day at 02:00 |
+| Replica | One of several identical copies of the same service | 4 pods running the same API |
+| Lock | A token only one worker can hold at a time | Postgres advisory lock |
+| Idempotent | Running it twice has the same effect as once | Setting `status = 'overdue'` again changes nothing |
+| Batch | A limited chunk of rows handled in one go | "Claim up to 500 invoices" |
+| Graceful shutdown | Stopping cleanly after finishing current work | Finish the batch, then exit on `SIGTERM` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    T["Timer fires<br/>on every replica"] --> L{"Who gets<br/>the lock?"}
+    L -- "winner" --> B["Claim a batch<br/>of due rows"]
+    L -- "losers" --> S["Skip this tick"]
+    B --> W["Do the work<br/>(safe to repeat)"]
+    W --> M{"More rows?"}
+    M -- "yes" --> B
+    M -- "no" --> R["Release lock"]
+```
+
+**Analogy.** It is like four night guards with one shared key to the alarm panel: whoever grabs the key first does the evening check, and the others carry on.
+Where it breaks: a real key cannot "expire" while someone holds it; a lock with a timeout can, which is why fencing tokens exist.
+
+**How the rest of this note builds up**
+
+- First, why one timer per replica goes wrong (section 1) and the mental model (section 2).
+- Then how it works: the bare ticker dropping ticks, no-overlap wrappers, one-winner locks, idempotent batches and shutdown mid-batch (section 3).
+- Then a full Go worked example (section 4) and the options compared, from `CronJob` to DB-backed schedulers (section 5).
+- Finally the SDE-3 deep dive: production failure modes, monitoring, Go 1.23 timer changes, fencing tokens and catch-up policy (sections 6-8).
+
+> [!tip] Remember
+> Every replica may tick, but only the lock winner works, and the work itself must be safe to run twice.
+
 ## 1. Why it exists
 
-InvoiceOps runs 4 replicas of its API behind a load balancer. One of its jobs marks an invoice `overdue` once its `due_date` has passed and queues a reminder email. If each replica runs `time.NewTicker(time.Minute)` and fires the same query, every tick becomes 4 identical `UPDATE` statements racing each other, and a customer who has one invoice due gets 4 reminder emails instead of one.
+InvoiceOps runs 4 replicas of its API behind a load balancer. One of its jobs marks an invoice `overdue` once its `due_date` has passed and queues a reminder email.
+
+If each replica runs `time.NewTicker(time.Minute)` and fires the same query, every tick becomes 4 identical `UPDATE` statements racing each other, and a customer who has one invoice due gets 4 reminder emails instead of one.
 
 The naive fix — "just run it on one replica" — breaks the moment that replica restarts during a deploy: now nothing runs the job until someone remembers to redeploy its replacement with the right flag. The job needs to run on *some* replica, every tick, without a human picking which one.
 
-A second problem is independent of replica count: if the overdue scan takes 90 seconds on a 2-million-row table and the tick interval is 60 seconds, what happens to the tick that arrives while the first scan is still running? A bare ticker loop answers this by accident, not by design — and the accidental answer (explained below) is "that tick is silently thrown away."
+A second problem is independent of replica count: if the overdue scan takes 90 seconds on a 2-million-row table and the tick interval is 60 seconds, what happens to the tick that arrives while the first scan is still running?
+
+A bare ticker loop answers this by accident, not by design — and the accidental answer (explained below) is "that tick is silently thrown away."
 
 ## 2. Mental model
 
@@ -70,12 +122,20 @@ func RunTicker(ctx context.Context, interval time.Duration, run func(context.Con
 }
 ```
 
-`time.Ticker`'s channel `t.C` holds at most one pending tick: buffered with capacity 1 for modules whose `go.mod` declares a Go version before 1.23, and unbuffered (capacity 0) since Go 1.23 for modules that declare `go 1.23` or later. Either way, delivering a tick is a non-blocking send: if `run` is still executing when the *next* tick would fire, the loop is blocked inside `run`, not reading `t.C`, so the runtime's attempt to deliver that tick finds no ready receiver and simply drops it instead of blocking. The loop never sees two ticks queued up and never "catches up"; it simply runs less often than the interval whenever a run overruns it. A test pins this down for the fixed version below.
+`time.Ticker`'s channel `t.C` holds at most one pending tick: buffered with capacity 1 for modules whose `go.mod` declares a Go version before 1.23, and unbuffered (capacity 0) since Go 1.23 for modules that declare `go 1.23` or later.
+
+Either way, delivering a tick is a non-blocking send: if `run` is still executing when the *next* tick would fire, the loop is blocked inside `run`, not reading `t.C`, so the runtime's attempt to deliver that tick finds no ready receiver and simply drops it instead of blocking.
+
+The loop never sees two ticks queued up and never "catches up"; it simply runs less often than the interval whenever a run overruns it. A test pins this down for the fixed version below.
 
 > [!warning] Since Go 1.23
-> Before Go 1.23, a `Timer` or `Ticker` that was never `Stop`ped could not be garbage-collected: its internal channel held a live reference that kept the whole timer alive, so code that created one per request without stopping it leaked timer state for the life of the process. Since Go 1.23 the runtime can collect an unreachable, unstopped `Timer`/`Ticker`. That is a safety net for a bug, not a reason to skip `Stop`: an unstopped ticker still fires into a channel nothing reads until it is collected, wasting a goroutine wake-up every interval.
+> Before Go 1.23, a `Timer` or `Ticker` that was never `Stop`ped could not be garbage-collected: its internal channel held a live reference that kept the whole timer alive, so code that created one per request without stopping it leaked timer state for the life of the process.
 >
-> The same release also changed `t.C` itself from a buffered channel (capacity 1) to an unbuffered one (capacity 0), for a module that declares `go 1.23` or later — specifically so `Stop` and `Reset` can guarantee no stale tick is left sitting in the channel afterward. The drop-ticks behaviour above is unchanged by this (a non-blocking send with no ready receiver still drops the tick either way), but code that calls `len(t.C)` or `cap(t.C)` to probe for a pending tick sees a different number depending on the module's declared Go version, and this note's Go 1.24 module is on the new, unbuffered side.
+> Since Go 1.23 the runtime can collect an unreachable, unstopped `Timer`/`Ticker`. That is a safety net for a bug, not a reason to skip `Stop`: an unstopped ticker still fires into a channel nothing reads until it is collected, wasting a goroutine wake-up every interval.
+>
+> The same release also changed `t.C` itself from a buffered channel (capacity 1) to an unbuffered one (capacity 0), for a module that declares `go 1.23` or later — specifically so `Stop` and `Reset` can guarantee no stale tick is left sitting in the channel afterward.
+>
+> The drop-ticks behaviour above is unchanged by this (a non-blocking send with no ready receiver still drops the tick either way), but code that calls `len(t.C)` or `cap(t.C)` to probe for a pending tick sees a different number depending on the module's declared Go version, and this note's Go 1.24 module is on the new, unbuffered side.
 
 ### Never overlapping, and saying so
 
@@ -128,7 +188,9 @@ c.Start()
 
 ### Running once across N replicas
 
-Coordination needs one more piece than the in-process loop: a lock that is visible to every replica. This note uses a Postgres advisory lock because InvoiceOps already runs on Postgres and the lock needs no new table, no TTL, and no extra infrastructure — it lives on a session and is released automatically if that session (connection) closes, even on a hard crash.
+Coordination needs one more piece than the in-process loop: a lock that is visible to every replica.
+
+This note uses a Postgres advisory lock because InvoiceOps already runs on Postgres and the lock needs no new table, no TTL, and no extra infrastructure — it lives on a session and is released automatically if that session (connection) closes, even on a hard crash.
 
 ```go
 type Locker interface {
@@ -164,7 +226,11 @@ sequenceDiagram
     R1->>PG: pg_release_advisory_lock(7001)
 ```
 
-Redis is the alternative when the service already depends on Redis more than Postgres: `SET lock:overdue-scan <token> NX PX 30000` acquires a lock that expires on its own if the holder dies, and release must be a Lua script that checks the token before deleting the key (`DEL` alone can delete a lock a *different* holder has since acquired, if this holder's TTL already expired under GC pressure). That token is a **fencing token**: a monotonically increasing number a holder must present with its writes, so a stale holder that wakes up after a long GC pause cannot clobber work the real current holder already did — see [[Distributed Locks and Fencing Tokens]] for why `SET NX` alone is not sufficient on its own. A Kubernetes `Lease` object gives a third option, used when the service already runs client-go leader election for other reasons (see [[Leader Election]]): only the elected leader pod runs any of its in-process schedulers at all.
+Redis is the alternative when the service already depends on Redis more than Postgres: `SET lock:overdue-scan <token> NX PX 30000` acquires a lock that expires on its own if the holder dies, and release must be a Lua script that checks the token before deleting the key (`DEL` alone can delete a lock a *different* holder has since acquired, if this holder's TTL already expired under GC pressure).
+
+That token is a **fencing token**: a monotonically increasing number a holder must present with its writes, so a stale holder that wakes up after a long GC pause cannot clobber work the real current holder already did — see [[Distributed Locks and Fencing Tokens]] for why `SET NX` alone is not sufficient on its own.
+
+A Kubernetes `Lease` object gives a third option, used when the service already runs client-go leader election for other reasons (see [[Leader Election]]): only the elected leader pod runs any of its in-process schedulers at all.
 
 ### Idempotent, resumable batches
 
@@ -181,7 +247,9 @@ WHERE id IN (
 RETURNING id;
 ```
 
-`FOR UPDATE SKIP LOCKED` lets several callers run this exact query concurrently (two replicas that both briefly believed they held the lock during a lock handoff, or two worker goroutines draining the backlog) and each walks away with a **disjoint** batch: a row another caller's transaction already locked is invisible to this one, not blocked behind it. Looping "claim up to 500, enqueue them, claim again" until a claim returns zero rows drains however large the backlog is — including the backlog built up during an outage — without the scheduler ever doing more than one batch's worth of work per loop iteration, so a mid-loop crash only ever loses the batch in flight, not the whole scan.
+`FOR UPDATE SKIP LOCKED` lets several callers run this exact query concurrently (two replicas that both briefly believed they held the lock during a lock handoff, or two worker goroutines draining the backlog) and each walks away with a **disjoint** batch: a row another caller's transaction already locked is invisible to this one, not blocked behind it.
+
+Looping "claim up to 500, enqueue them, claim again" until a claim returns zero rows drains however large the backlog is — including the backlog built up during an outage — without the scheduler ever doing more than one batch's worth of work per loop iteration, so a mid-loop crash only ever loses the batch in flight, not the whole scan.
 
 ```mermaid
 flowchart TD
@@ -196,7 +264,14 @@ The work itself — sending the reminder email — is handed to a worker rather 
 
 ### Graceful shutdown mid-batch
 
-A deploy or a pod eviction can send `SIGTERM` while a replica is partway through the claim-enqueue-claim loop. The loop in `ScanOverdue` already checks `ctx.Err()` at the top of every iteration, so a cancelled context (wired to the process's shutdown signal, the same one that drains in-flight HTTP requests — see [[Graceful Shutdown and Health Checks]]) stops the loop after the batch already claimed finishes enqueuing, not mid-batch: a `SKIP LOCKED` claim is a single statement, so it either commits a whole batch or none of it, and cancellation is only ever observed between batches, never inside one. Two consequences follow from this: the advisory lock's `release()` still runs (it is a `defer`, not conditional on how the loop exited), so the next replica up can claim the lock immediately instead of waiting for a lease to expire; and any rows already claimed and hand-off to the worker channel in `enqueue` are the caller's responsibility to drain before the process exits, the same shutdown-ordering question every worker pool has (see [[Background Workers and Job Queues]]) — a scheduler that stops claiming new batches but abandons a channel full of already-claimed work on exit has only moved the dropped-work problem, not fixed it.
+A deploy or a pod eviction can send `SIGTERM` while a replica is partway through the claim-enqueue-claim loop.
+
+The loop in `ScanOverdue` already checks `ctx.Err()` at the top of every iteration, so a cancelled context (wired to the process's shutdown signal, the same one that drains in-flight HTTP requests — see [[Graceful Shutdown and Health Checks]]) stops the loop after the batch already claimed finishes enqueuing, not mid-batch: a `SKIP LOCKED` claim is a single statement, so it either commits a whole batch or none of it, and cancellation is only ever observed between batches, never inside one.
+
+Two consequences follow from this:
+
+1. The advisory lock's `release()` still runs (it is a `defer`, not conditional on how the loop exited), so the next replica up can claim the lock immediately instead of waiting for a lease to expire.
+2. Any rows already claimed and hand-off to the worker channel in `enqueue` are the caller's responsibility to drain before the process exits, the same shutdown-ordering question every worker pool has (see [[Background Workers and Job Queues]]) — a scheduler that stops claiming new batches but abandons a channel full of already-claimed work on exit has only moved the dropped-work problem, not fixed it.
 
 ## 4. Worked example
 
@@ -410,10 +485,20 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 
 ## 8. Deep dive
 
-- **Go 1.23's timer GC change, precisely.** Before 1.23, the runtime kept a `Timer`/`Ticker` reachable (via its internal heap entry holding a reference back to it) for as long as it had not fired and not been stopped, even if the Go value itself had no other references. A service that created a short-lived `time.After` or an unstopped `Ticker` per request leaked that structure until the process restarted. Go 1.23 changed the internal representation so an unreferenced, unstopped timer becomes collectible like any other garbage. This is documented, not a workaround for calling `Stop`: you should still stop a `Ticker` you are done with, both to release its slot in the runtime's timer heap promptly and because an un-stopped ticker keeps firing into a channel nothing drains until it is finally collected.
-- **Why `pg_try_advisory_lock` and not a plain row lock via `SELECT ... FOR UPDATE`.** An advisory lock has no backing row to conflict with concurrent DML on the real table, costs one function call instead of a row round-trip, and is explicitly meant for exactly this "coordinate app logic, not data" use. It is scoped to the session (connection), so the connection holding it must not be returned to a pool mid-lock — a reason some teams prefer `pg_advisory_xact_lock`, the transaction-scoped variant that releases automatically at `COMMIT`/`ROLLBACK` with no explicit release call to forget.
-- **Fencing tokens in one sentence.** Every successful lock acquisition returns a strictly increasing number; the protected resource (here, the `invoices` table through a trigger or an application check) rejects any write tagged with a token lower than the highest it has already accepted. This is what stops the "replica 1 paused for 40 seconds, woke up after replica 2 already took over and ran, and then replica 1's stale write lands anyway" failure mode that a lock with only a TTL cannot prevent on its own — see [[Distributed Locks and Fencing Tokens]] for the full argument and a Go implementation.
-- **Catch-up policy is a product decision, not just an engineering one.** "Send a due-soon reminder" should usually *not* catch up after a long outage (a reminder for a date that already passed is worse than no reminder). "Mark invoices overdue" and "reconcile payments" should always catch up, because skipping them leaves the data wrong. Decide this per job, and encode it in the batch query's `WHERE` clause (by due date, not by "how many ticks did we miss"), not in scheduler configuration.
+- **Go 1.23's timer GC change, precisely.** Before 1.23, the runtime kept a `Timer`/`Ticker` reachable (via its internal heap entry holding a reference back to it) for as long as it had not fired and not been stopped, even if the Go value itself had no other references.
+
+  A service that created a short-lived `time.After` or an unstopped `Ticker` per request leaked that structure until the process restarted. Go 1.23 changed the internal representation so an unreferenced, unstopped timer becomes collectible like any other garbage.
+
+  This is documented, not a workaround for calling `Stop`: you should still stop a `Ticker` you are done with, both to release its slot in the runtime's timer heap promptly and because an un-stopped ticker keeps firing into a channel nothing drains until it is finally collected.
+- **Why `pg_try_advisory_lock` and not a plain row lock via `SELECT ... FOR UPDATE`.** An advisory lock has no backing row to conflict with concurrent DML on the real table, costs one function call instead of a row round-trip, and is explicitly meant for exactly this "coordinate app logic, not data" use.
+
+  It is scoped to the session (connection), so the connection holding it must not be returned to a pool mid-lock — a reason some teams prefer `pg_advisory_xact_lock`, the transaction-scoped variant that releases automatically at `COMMIT`/`ROLLBACK` with no explicit release call to forget.
+- **Fencing tokens in one sentence.** Every successful lock acquisition returns a strictly increasing number; the protected resource (here, the `invoices` table through a trigger or an application check) rejects any write tagged with a token lower than the highest it has already accepted.
+
+  This is what stops the "replica 1 paused for 40 seconds, woke up after replica 2 already took over and ran, and then replica 1's stale write lands anyway" failure mode that a lock with only a TTL cannot prevent on its own — see [[Distributed Locks and Fencing Tokens]] for the full argument and a Go implementation.
+- **Catch-up policy is a product decision, not just an engineering one.** "Send a due-soon reminder" should usually *not* catch up after a long outage (a reminder for a date that already passed is worse than no reminder).
+
+  "Mark invoices overdue" and "reconcile payments" should always catch up, because skipping them leaves the data wrong. Decide this per job, and encode it in the batch query's `WHERE` clause (by due date, not by "how many ticks did we miss"), not in scheduler configuration.
 
 ## 9. Interview questions
 
@@ -427,7 +512,9 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 > A separate check-then-update has a race: two concurrent callers can both pass the `SELECT` before either commits its `UPDATE`, so both act on the same rows. `SKIP LOCKED` makes the claim atomic and makes a row already locked by another in-flight transaction invisible to this one, so concurrent callers partition the work instead of racing over it.
 
 > [!question]- What does a fencing token solve that a Redis `SET key value NX PX 30000` lock alone does not?
-> The TTL alone only bounds how long a lock is held, not whether the holder is still alive and correct; a holder that pauses past the TTL can wake up and write after a second holder has already taken over. A fencing token lets the protected resource reject that stale write by comparing token versions, which a bare lock has no way to do.
+> The TTL alone only bounds how long a lock is held, not whether the holder is still alive and correct; a holder that pauses past the TTL can wake up and write after a second holder has already taken over.
+>
+> A fencing token lets the protected resource reject that stale write by comparing token versions, which a bare lock has no way to do.
 
 > [!question]- The scheduler was down for 6 hours. Do you replay the 360 missed one-minute ticks when it comes back?
 > No — query for what is actually due now (`WHERE due_date < now()`), not for how many ticks were missed. A batch query written this way naturally catches up everything that became due during the outage on its very next real tick, with no special replay logic and no risk of re-sending something already handled.
@@ -454,3 +541,8 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 - **Before this:** [[Context Package]], [[Background Workers and Job Queues]]
 - **Next:** [[Receiving Webhooks Idempotently]], [[Observability in Go Services]]
 - **Compare with:** [[Scheduled Jobs - Cron to Durable Schedulers]] (the broker/queue-level view of durable scheduling), [[Distributed Locks and Fencing Tokens]], [[Leader Election]], [[Kubernetes Fundamentals]], [[Graceful Shutdown and Health Checks]]
+
+### Watch on YouTube
+
+- [How to build a Distributed Task Scheduler with Go, Postgres, and gRPC](https://www.youtube.com/watch?v=bBp5AOTkJcg) · Jyotinder Singh · builds a replica-safe scheduled job system with Go and Postgres locking
+- [Distributed Locking Explained / Redis + Spring Boot + Jedis Demo](https://www.youtube.com/watch?v=Sr0FoVwz0zs) · codingX krishna · general distributed-lock concept (SET NX-style) behind single-winner-per-tick scheduling

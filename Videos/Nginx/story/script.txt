@@ -1,0 +1,108 @@
+# Nginx story: "Opening Night at Hotel Nginx". id | SPEAKER | tone | text. Source: [[Nginx]]
+# Cast: MARTA = the hotel manager, the master process (hero). RUDY = the new hire, asks the questions. WES = a receptionist, a worker process. BEA = the bellhop who reads the signs (location matching). OZ = the orders department, a backend. CHIP = the chat department, a backend.
+== s1 Opening night: ten thousand guests
+l1 | N | hook | Opening night at Hotel Nginx. Ten thousand guests arrive at the same moment. Many of them are on slow phones, so each request trickles in, one word at a time. If the hotel gives every guest their own receptionist, it runs out of rooms, and memory, just waiting for slow talkers.
+l2 | MARTA | normal | I am Marta, the manager. Rudy, tonight we do not hire ten thousand receptionists. We hire a few, and teach them to juggle.
+l3 | RUDY | question | Why can't each guest have their own receptionist?
+l4 | N | normal | A traditional thread per connection server needs one operating system thread, with its own stack, typically megabytes, for every open connection. At ten thousand slow clients, the classic C ten K problem, that is gigabytes of stacks, and brutal context switching, most of it spent on connections that are simply idle, waiting on a slow network.
+l5 | N | punch | Nginx was built to answer exactly that. A small fixed number of worker processes, often one per core, each managing tens of thousands of connections through a non blocking event loop. An idle connection costs a small state struct, not a whole thread.
+l6 | N | normal | The words you need. A web server answers H T T P requests. A reverse proxy receives them and forwards them to your real app. An upstream, or backend, is a server nginx forwards to. A connection is an open link between client and server. An event loop handles whichever connection is ready next, never waiting on one. A timeout is how long to wait before giving up. And a load balancer spreads requests across backends.
+l7 | N | normal | Think of nginx as a hotel receptionist who greets every guest, answers easy questions, the static files, directly, and sends the rest to the right department, the backends.
+== s2 The manager and the receptionists
+l8 | MARTA | normal | Here is the rule of my hotel. I, the master process, never serve a guest. I read and check the rule book, I open the front doors, and I hire, watch, and replace the receptionists.
+l9 | WES | normal | I am Wes, a receptionist. A worker. One person, one thread, one event loop. I do not stand waiting at one guest. I watch a board of bells, and serve whoever rings.
+l10 | N | normal | That board is epoll, on Linux. The worker registers interest in many sockets at once, and the kernel says which ones are ready, so one thread serves many connections without ever blocking on a single slow one.
+l11 | N | normal | Two numbers set the ceiling. Worker processes, commonly auto, one per detected C P U core. And worker connections, how many connections one worker holds open. Their product is nginx's practical connection limit on one machine. One worker can even serve everything, if asked.
+l12 | MARTA | punch | And when I change the rule book, nobody is thrown out. Nginx dash s reload. I hire new receptionists with the new rules, while the old ones finish their current guests, and then leave. Zero downtime, zero dropped connections.
+l13 | N | normal | The picture to remember. One master that never touches traffic. N workers that do all the work, each juggling many connections, switching to whichever is ready next. Never one worker per connection.
+== s3 The floor plan: http, server, location
+l14 | N | normal | Now the hotel's floor plan, the config. Three drawers nested inside each other. The outer drawer, http, holds settings every site shares. Logging, gzip, the upstream blocks, and every server.
+l15 | N | normal | Inside it, a folder per website, a server block. It listens on a port, and matches a server name. Much like one tenant of the whole nginx. Inside each folder, an index card per U R L pattern, a location, says exactly what to do. Proxy it, serve a file, redirect it.
+l16 | N | normal | A request for https, api dot example dot com, slash orders slash forty two, takes exactly one path down this tree. First the server block whose server name matches api dot example dot com on that port. Then, inside it, one location.
+l17 | N | warn | Settings flow one way only, outer to inner. A location can override something from its http block. And an http level setting silently applies to every server and location below it, unless overridden.
+== s4 Reading the signs: location matching
+l18 | BEA | normal | I am Bea, the bellhop. I read the signs. And here is my secret. I do not read them top to bottom, and stop at the first match.
+l19 | N | normal | Nginx applies a fixed precedence, wherever each block sits in the file. First, equals slash exact. An exact match, and the search stops at once. Second, caret tilde slash prefix. The longest matching prefix, and if it wins, regex checks are skipped entirely.
+l20 | N | normal | Third, tilde, or tilde star, a regex. Case sensitive or insensitive. The first matching regex, in file order. And last, a plain prefix. The longest plain match, used only if nothing above matched.
+l21 | RUDY | question | A trap, Bea. Slash images slash comes first in the file. A regex for dot jpg and dot png comes second. Which serves slash images slash logo dot png?
+l22 | BEA | punch | The regex. Any matching regex outranks a plain prefix, however specific the prefix looks, once the plain prefix search is done. File order only breaks a tie between two regexes.
+l23 | N | warn | The common mistake. Reading locations like an if, else if chain. It is not. Exact beats everything. After that, a caret tilde prefix skips regex entirely. Otherwise, any matching regex beats any plain prefix.
+== s5 The departments: upstream and load balancing
+l24 | N | normal | Now the departments. A pool of backends is an upstream block. Orders, with three desks. Nginx forwards a request with proxy pass, to the pool.
+l25 | OZ | normal | I am Oz, the orders department. Three desks, three addresses. Two are normal. The third is a backup, used only if the other two are down.
+l26 | N | normal | Nginx also adds headers. Proxy add x forwarded for appends the immediate client's address, rather than overwriting it. The same append only rule from the reverse proxy video. A backend reading it still trusts only as many hops as it controls.
+l27 | N | normal | And it can balance several ways, chosen per upstream. Round robin, the default, cycles in order. Weighted round robin, some servers get proportionally more. Least conn, to whichever has the fewest open connections. I P hash, the same client address always reaches the same server, which gives stickiness, but can leave load uneven. And a generic consistent hash, a custom key, like the U R I, maps to a server, minimising remapping when one is added or removed.
+l28 | N | warn | Health checks. Open source nginx only does passive checks. Max fails failures within fail timeout marks a server down for a while, and traffic stops going to it until fail timeout passes. So the first few real requests during an outage still reach the bad server.
+l29 | N | normal | Active checks, probing a health endpoint on a timer, are an Nginx Plus feature. Open source setups pair nginx with an external health checker, or let the orchestrator, like Kubernetes readiness probes, do it.
+== s6 The crisis: a slow database
+l30 | N | warn | Eleven thirty. Orders slows down. Some guests see five oh four, gateway timeout. And the department's health desk, a trivial check, answers fine. Marta investigates.
+l31 | N | normal | Nginx has three different clocks. Proxy connect timeout, the time to open the connection to the upstream, five seconds. Proxy send timeout, the time between successive writes to it. And proxy read timeout, the time between successive reads from it, the default is sixty seconds.
+l32 | MARTA | punch | And here is the catch. Read timeout is not one deadline for the whole request. It resets on every chunk nginx receives.
+l33 | N | normal | A backend that streams a few bytes every twenty seconds for five minutes never trips a thirty second read timeout, because each new chunk restarts the clock. A backend that goes fully silent for thirty one seconds does.
+l34 | OZ | warn | My slow query takes forty five seconds before the first byte.
+l35 | N | normal | So at thirty seconds, nothing has arrived, and nginx gives up, and answers five oh four. When the backend finally replies at forty five, nginx has already closed that side, and discards the answer. A refused or reset connection, by contrast, gives five oh two.
+l36 | MARTA | normal | The fix is a per route timeout, tuned to that endpoint's real slow case, or fixing the slow query. Not a global increase that hides genuinely hung requests everywhere else.
+l37 | N | normal | And buffering. With proxy buffering on, nginx reads the upstream's response, up to the buffer limits, before forwarding it to a slow client, freeing the upstream connection quickly. Turn it off for real time streaming, like server sent events, where the client must see each chunk immediately.
+== s7 The front door: TLS, HTTP/2, HSTS
+l38 | N | normal | The front door. A server block that listens on port four forty three with S S L, turns on H T T P two, and points at a certificate and a key. It prefers T L S one point three, with one point two as a fallback.
+l39 | N | normal | And it adds one header, strict transport security, max age thirty one million five hundred thirty six thousand seconds. That tells browsers, for a year, only ever speak H T T P S to this site.
+== s8 The buffet: static files and micro-caching
+l40 | N | normal | Easy requests never reach a department. For slash static, nginx serves files from a root folder. G zip static serves a pre compressed dot g z sibling if one exists. And expires thirty days sets cache control, max age two million five hundred ninety two thousand.
+l41 | N | normal | For a hot endpoint, nginx can micro cache. Proxy cache valid, two hundred, five seconds. Proxy cache use stale, updating, error, timeout. A five second cache in front of a popular, rapidly repeated endpoint can turn thousands of identical requests per second into a handful per second upstream.
+l42 | N | normal | It is the same request collapsing idea as a C D N's origin shield, applied at a single reverse proxy.
+l43 | N | warn | But the safety window is narrow. A micro cache is safe for public, non personalised responses. Caching anything that varies per user, even for five seconds, risks the same private data leak as a C D N. The cache key must include every dimension the response varies on.
+== s9 The bouncer: rate limiting
+l44 | N | normal | The bouncer at the door. Imagine a bucket with a small hole, draining water at a fixed rate, however fast you pour. Pour faster, and it fills. Faster still, it overflows. Those overflows are the rejected requests. That is a leaky bucket, and it is what limit req implements.
+l45 | N | normal | Requests drain at the rate, here ten per second per client I P. Burst allows a short spike to queue, instead of being rejected at once. No delay serves burst requests immediately, instead of spacing them out to the steady rate. Without no delay, queued burst requests are delayed to fit the rate. Past both, nginx returns five oh three by default.
+l46 | N | normal | An example. Rate ten per second, burst twenty, no delay. A client suddenly sends twenty five requests in the same instant. The first twenty are served immediately. The remaining five are rejected with five oh three. And none of the twenty are throttled to ten per second, because no delay is set.
+l47 | N | normal | A different guard is limit conn. It caps simultaneous open connections per key, whatever the request rate. It defends against a client opening many slow, long lived connections. One request a minute over fifty connections trips limit conn, not limit req.
+l48 | N | warn | And a classic false alarm. Many users behind one corporate N A T share one public address, so they all count against one bucket. Key on an authenticated user I D or an A P I key where you can.
+== s10 The open line: WebSocket
+l49 | CHIP | normal | I am Chip, the chat department. My guests keep the line open for hours.
+l50 | N | normal | A web socket starts as an H T T P request, then upgrades to a raw, long lived, two way pipe. Nginx must forward the Upgrade and Connection upgrade headers, and use H T T P one point one, to know to hold the connection open as a pipe, instead of a single request and response.
+l51 | N | warn | And raise the read timeout on that route, to thirty six hundred seconds. The default sixty seconds applies to web sockets too, and would drop every idle chat connection after exactly one minute.
+== s11 The complete rule book: reading a real config
+l52 | N | normal | Marta's complete rule book, condensed. An upstream named orders backend. Least conn. Two servers, each marked down after three failures within ten seconds. And keepalive thirty two, to reuse connections to the backend.
+l53 | N | normal | A rate limit zone, orders r l, ten megabytes of state, twenty requests per second. Then one server on four forty three, with H T T P two, the server name, the certificate, the protocols, and the strict transport header.
+l54 | N | normal | Inside, the orders location. Limit req, burst forty, no delay. Proxy pass to the upstream. H T T P one point one, and an empty Connection header, so keepalive to the backend is not defeated. Host, real I P, forwarded for, and forwarded proto, passed along. Connect timeout five seconds, read timeout thirty. And a static location, thirty days.
+l55 | N | warn | One trap in there. Keepalive in the upstream block needs proxy H T T P version one point one, and a cleared Connection header. Miss either, and it silently falls back to one connection per request. H T T P one point oh has no persistent connections by default.
+== s12 The hotel next door: other proxies, and trade-offs
+l56 | N | normal | Other hotels. H A Proxy, an event loop with very low overhead, best in class load balancing and a stats page, often paired with nginx for static files. Envoy, built for dynamic configuration through x D S, a service mesh data plane, an A P I gateway. Caddy, automatic H T T P S out of the box. And Traefik, which discovers routes from Docker and Kubernetes labels.
+l57 | N | warn | A warning. The Kubernetes ingress nginx controller, a project built around nginx, was announced for retirement in November twenty twenty five, and stopped receiving releases and security updates in March twenty twenty six. New Kubernetes ingress should target the Gateway A P I.
+l58 | N | normal | The trade offs. Open source nginx load balancing is simpler than a dedicated L four balancer or a mesh: no active health checks, no per request retry budgets or circuit breaking out of the box. One event loop per worker is brilliant for I O bound proxying, but will not spread one C P U heavy request across cores. And its config is static, a reload is graceful, but still a file change. For deep observability and dynamic config, Envoy is usually better suited.
+== s13 Production failures and what to watch
+t1 | N | warn | Five failures, and fixes. Five oh twos after a backend deploy. Passive checks need time to notice a bad instance, so also remove it from D N S or service discovery. Five oh fours on one slow endpoint, give that route its own read timeout. Web sockets dropping at exactly sixty seconds, raise that location's read timeout.
+t2 | N | warn | Keepalive to the upstream not reused, you are missing H T T P one point one, or the cleared Connection header. And limit req rejecting legitimate users behind a corporate N A T, key on a user or A P I key, not the shared address.
+t3 | N | normal | What to monitor. The four xx and five xx split by upstream, using upstream status in the logs, which is different from nginx's own response code. Upstream response time against total request time. Active, reading and writing connection counts from stub status. The rate limit rejection count. And worker connection saturation.
+== s14 Deep dive: the details that bite
+d1 | N | normal | A few deeper points. First, why epoll beats select and poll at scale. Select and poll make the kernel rescan the entire set of watched file descriptors on every call, an O of n cost, however many are ready. Epoll keeps the set registered in the kernel and returns only the ready ones, so each check is proportional to ready events, not watched connections.
+d2 | N | normal | Second, why worker processes auto is usually right. One worker per core avoids both under use and needless context switching. On a machine also running other C P U heavy processes, you may deliberately use fewer.
+d3 | N | normal | Third, why upstream keepalive needs proxy H T T P version one point one. H T T P one point oh has no persistent connection concept by default. Without bumping the version, nginx cannot keep that backend connection open, whatever the keepalive number says.
+d4 | N | normal | And last, micro caching's narrow safety window. Safe for public responses. For anything per user, the cache key must include every dimension the response varies on. Same rule as a C D N, a smaller blast radius.
+== s15 Interview round: Rudy's exam
+q0 | RUDY | hook | Marta, test me. Six questions you will really get.
+q1 | RUDY | question | Why can one worker handle thousands of connections with one thread?
+q2 | MARTA | normal | A non blocking event loop on epoll. The worker registers many sockets, and the kernel says which are ready. So one thread serves whichever connection is ready, never blocking on one slow client.
+q3 | RUDY | question | A trap. Slash images slash, then a regex for jpg and png, in that order. Who serves logo dot png?
+q4 | MARTA | normal | The regex. Precedence is exact, then caret tilde prefix, then the first matching regex in file order, then plain prefix. A plain prefix only wins if no regex matches.
+q5 | RUDY | question | A proxied endpoint returns intermittent five oh fours under load, but its health check is always fine. What do I check?
+q6 | MARTA | normal | The proxy read timeout, against that endpoint's real p ninety nine. A health check does trivial work. Give the route its own timeout, or fix the slow path.
+q7 | RUDY | question | Passive versus active health checks?
+q8 | MARTA | normal | Passive marks a server down only after real traffic fails, so the first requests during an outage still hit it. Active probes a health endpoint on a timer, independent of traffic. Active is Nginx Plus only.
+q9 | RUDY | question | Why does web socket proxying need extra config?
+q10 | MARTA | normal | It upgrades to a raw, long lived pipe. Nginx needs the Upgrade and Connection upgrade headers, and H T T P one point one, to hold it open, and a longer read timeout.
+q11 | RUDY | question | What does limit req, burst twenty, no delay, do?
+q12 | MARTA | normal | The rate is the steady leak. Burst lets twenty queue above it. No delay serves those at once. Past twenty above the rate, five oh three.
+== s16 The doors open: summary
+f1 | N | hook | Midnight. The doors of Hotel Nginx open, and ten thousand guests flow in. Three receptionists, one manager, no queue, no crash.
+f2 | MARTA | punch | Ten thousand guests, and not one thread per guest.
+f3 | N | calm | So, in short. One master that never touches traffic, N workers, each a single threaded event loop on epoll. Worker processes times worker connections is the ceiling.
+f4 | N | normal | Two. Config nests http, server, location. Location precedence is exact, caret tilde, first regex, then plain prefix. Never first block in the file.
+f5 | N | normal | Three. Upstream plus proxy pass is the backend pool pattern. Least conn, I P hash, and consistent hash balance. Active health checks are Nginx Plus only.
+f6 | N | normal | Four. Three different timeouts. A silent upstream trips read timeout, five oh four. A refused or reset connection gives five oh two. Keepalive needs one point one and a cleared Connection header.
+f7 | N | normal | Five. Limit req limits rate. Limit conn limits simultaneous connections. Web sockets need Upgrade forwarding and a longer read timeout. And nginx dash s reload is zero downtime.
+f8 | N | calm | And the one line to keep. Nginx is a cheap front door. A few workers juggle many connections, and route each request to files or backends.
+== s17 Where to go next
+rn1 | N | calm | To go deeper, open the Nginx note in your vault. Before it, read forward and reverse proxies, and H T T P fundamentals. After it, T L S and H T T P S, and what happens when you type a U R L. Compare it with load balancing, rate limiting, and C D N and edge.
+e1 | RUDY | hook | We opened on time, Marta.
+e2 | MARTA | punch | Next night.

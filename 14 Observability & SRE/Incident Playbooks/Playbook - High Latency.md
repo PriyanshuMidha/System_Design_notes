@@ -11,7 +11,7 @@ sources:
   - "Go documentation: net/http/pprof and runtime/trace; Go diagnostics guide"
   - "curl manual: --write-out variables (time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total)"
   - "Kubernetes documentation: kubectl top, CPU limits and CFS throttling"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - High Latency
@@ -25,6 +25,57 @@ updated: 2026-11-09
 > - Slow is usually "waiting", not "working": queues, locks, exhausted connection pools, retries and timeouts cause more latency than slow code.
 > - Mitigate before you diagnose. Rolling back a bad deploy in two minutes beats a perfect root-cause analysis in two hours.
 
+## Start here: the basics
+
+**The problem in one story**
+
+A checkout page usually loads in a fraction of a second.
+Today some users wait 3 seconds, while most are still fast.
+The average looks fine, but the slowest requests are much slower.
+You need to find which part of the request is waiting.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Latency | Time from sending a request to getting the reply | 80 ms |
+| Percentile (p50, p99) | p99 is the time that 99 percent of requests beat | p99 = 1.2 s means 1 in 100 is slower |
+| Tail latency | The slowest requests, the high percentiles | p99 and p99.9 |
+| Throughput | Requests handled per second | 2,000 rps |
+| Saturation | A resource fully busy, so work waits in a queue | Thread pool all busy |
+| Timeout | Max time you wait before giving up | Client gives up after 2 s |
+| Trace / span | A record of one request's path; a span is one step | DB query span took 900 ms |
+| GC pause | Time the language runtime spends cleaning memory | Go GC assist slowing requests |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User"] --> LB["Load balancer"]
+    LB --> S["Service"]
+    S --> DB["Database"]
+    S --> EXT["Other service"]
+    S --> Q{"Where is time spent?"}
+    Q --> W["Queue wait, CPU, GC, I/O"]
+```
+
+**Analogy**
+
+A supermarket checkout: most people pass quickly, but if one till is slow or the queue is long, some customers wait far longer. Measuring the average hides those angry customers.
+
+Where it breaks: in a shop you can see the queue; in software you need percentiles and traces to see it.
+
+**How the rest of this note builds up**
+
+- First, **Why it exists** and **Mental model** explain percentiles and why averages lie.
+- Then **How it works** splits a request into parts: network, queueing, CPU, dependencies, GC.
+- Next, the **Worked example** traces a slowdown to its cause.
+- Then **Variants and comparison**, **Trade-offs** and **In production** cover timeouts and capacity.
+- Finally, the SDE-3 **Deep dive** covers queueing theory, Little's Law and percentile aggregation.
+
+> [!tip] Remember
+> Look at p99, not the average, and find where requests wait.
+
 ## 1. Why it exists
 
 Symptoms you will see:
@@ -36,7 +87,9 @@ Symptoms you will see:
 
 User impact: abandoned carts and sign-ups, support tickets, and a risk of a **retry storm** (clients retry slow requests, which adds load, which makes the system slower).
 
-Example numbers (illustrative): an API normally answers in 80 ms at p50 and 250 ms at p99. After a deploy, p50 is still 90 ms but p99 is 4 s. Only 1 request in 100 is slow, but a page that makes 20 API calls hits at least one slow call in about 18% of loads (1 - 0.99^20, a computed figure). This is why the tail matters.
+Example numbers (illustrative): an API normally answers in 80 ms at p50 and 250 ms at p99. After a deploy, p50 is still 90 ms but p99 is 4 s.
+
+Only 1 request in 100 is slow, but a page that makes 20 API calls hits at least one slow call in about 18% of loads (1 - 0.99^20, a computed figure). This is why the tail matters.
 
 > [!tip] Remember
 > A small slow tail becomes a large share of user-visible pain once one page makes many calls.
@@ -166,7 +219,9 @@ curl -s -o /dev/null -w \
 https://api.example.com/v1/orders
 ```
 
-How to read it: the values are cumulative seconds. If `dns` is large, look at DNS. If `connect` minus `dns` is large, the network or a load balancer is slow. If `ttfb` minus `tls` is large, the server is slow to respond (queue, CPU, database). If `total` minus `ttfb` is large, the response body is big or the network is slow.
+How to read it: the values are cumulative seconds. If `dns` is large, look at DNS. If `connect` minus `dns` is large, the network or a load balancer is slow.
+
+If `ttfb` minus `tls` is large, the server is slow to respond (queue, CPU, database). If `total` minus `ttfb` is large, the response body is big or the network is slow.
 
 **Trace example.** Open a slow trace in your tracing UI (see [[Distributed Tracing with OpenTelemetry]]). The longest span tells you the box. A trace with a long gap and no child span means time was spent waiting inside the service (queue, lock, GC) rather than in a call.
 
@@ -555,7 +610,9 @@ You cannot average percentiles across instances. The correct approach is to expo
 
 ### 8.2 Queueing theory in one paragraph
 
-As utilization of a server approaches 100%, waiting time grows sharply, not linearly. For a simple single-queue model the wait grows roughly like utilization divided by (1 minus utilization) (a standard M/M/1 result). Going from 50% to 90% busy makes the queue about nine times longer, and from 90% to 99% about eleven times longer again. This is why a system "suddenly" gets slow at high load even though traffic rose only a little. Keep headroom, see [[Performance Engineering and Capacity Planning]].
+As utilization of a server approaches 100%, waiting time grows sharply, not linearly. For a simple single-queue model the wait grows roughly like utilization divided by (1 minus utilization) (a standard M/M/1 result).
+
+Going from 50% to 90% busy makes the queue about nine times longer, and from 90% to 99% about eleven times longer again. This is why a system "suddenly" gets slow at high load even though traffic rose only a little. Keep headroom, see [[Performance Engineering and Capacity Planning]].
 
 ### 8.3 Coordinated omission
 
@@ -563,7 +620,9 @@ If your load test waits for each response before sending the next request, a sta
 
 ### 8.4 Little's law for finding pool sizes
 
-In-flight requests = arrival rate x average time in system. If you receive 500 requests per second and each holds a database connection for 40 ms, the average number of busy connections is 500 x 0.04 = 20. A pool of 20 has no margin, and any slowdown in the query time makes requests queue. This also shows why a slow query so quickly empties a pool.
+In-flight requests = arrival rate x average time in system. If you receive 500 requests per second and each holds a database connection for 40 ms, the average number of busy connections is 500 x 0.04 = 20.
+
+A pool of 20 has no margin, and any slowdown in the query time makes requests queue. This also shows why a slow query so quickly empties a pool.
 
 ### 8.5 The retry amplification problem
 
@@ -571,30 +630,42 @@ If each of 3 layers makes up to 3 attempts, one user request can become 27 reque
 
 ### 8.6 GC and the tail in Go
 
-A Go GC cycle runs mostly concurrently, but allocation-heavy services can see assists (goroutines forced to help the GC) that add latency to individual requests. Symptoms: p99 rises while p50 stays flat, and `gctrace` shows frequent cycles. Remedies: reduce allocations (reuse buffers with `sync.Pool`, avoid needless conversions), and set a soft memory limit with `GOMEMLIMIT` to avoid both OOM and over-aggressive collection.
+A Go GC cycle runs mostly concurrently, but allocation-heavy services can see assists (goroutines forced to help the GC) that add latency to individual requests. Symptoms: p99 rises while p50 stays flat, and `gctrace` shows frequent cycles.
+
+Remedies: reduce allocations (reuse buffers with `sync.Pool`, avoid needless conversions), and set a soft memory limit with `GOMEMLIMIT` to avoid both OOM and over-aggressive collection.
 
 ## 9. Interview questions
 
 > [!question]- Your API's p99 doubled ten minutes ago. Walk me through what you do.
-> Confirm with percentiles and find the blast radius (which routes, regions, customers). Check what changed: deploy, config, flag, traffic, dependencies. Mitigate before diagnosing: roll back the recent deploy, scale out if load-driven, shed load or open a circuit breaker if a dependency is slow. Communicate in an incident channel. Then split the request time using a trace or per-layer metrics (CPU, database, cache, downstream, network), fix the cause, and write a postmortem with prevention actions.
+> Confirm with percentiles and find the blast radius (which routes, regions, customers). Check what changed: deploy, config, flag, traffic, dependencies. Mitigate before diagnosing: roll back the recent deploy, scale out if load-driven, shed load or open a circuit breaker if a dependency is slow.
+>
+> Communicate in an incident channel. Then split the request time using a trace or per-layer metrics (CPU, database, cache, downstream, network), fix the cause, and write a postmortem with prevention actions.
 
 > [!question]- p50 is unchanged but p99 is ten times worse. What does that tell you?
-> The slowdown affects a slice of requests, not all of them. Likely causes: one route or tenant, a slow shard or a lock, occasional GC pauses, a cache miss path, timeouts and retries on one dependency, or one bad pod. Break the percentile down by route, pod, and tenant, and look at traces of slow requests to find what they share.
+> The slowdown affects a slice of requests, not all of them. Likely causes: one route or tenant, a slow shard or a lock, occasional GC pauses, a cache miss path, timeouts and retries on one dependency, or one bad pod.
+>
+> Break the percentile down by route, pod, and tenant, and look at traces of slow requests to find what they share.
 
 > [!question]- The database CPU is fine, but the application shows database calls taking 2 seconds. Why?
 > The time may be spent waiting for a connection from the application's pool, not in the database. Check pool wait metrics (`WaitDuration` in Go's `db.Stats()`), connections held in long transactions, and connection leaks (missing `rows.Close()`). Also check lock waits in `pg_locks` and `pg_stat_activity`, and network latency between the app and the database.
 
 > [!question]- Why can scaling out make a latency incident worse?
-> If the bottleneck is a shared resource, such as the database, a lock, or a slow dependency, more application instances send more concurrent requests to it, which raises its load and slows everything further. Scale out only when the bottleneck is stateless CPU or queueing at the app tier. Otherwise reduce load on the shared resource: shed traffic, cache, or cap concurrency.
+> If the bottleneck is a shared resource, such as the database, a lock, or a slow dependency, more application instances send more concurrent requests to it, which raises its load and slows everything further.
+>
+> Scale out only when the bottleneck is stateless CPU or queueing at the app tier. Otherwise reduce load on the shared resource: shed traffic, cache, or cap concurrency.
 
 > [!question]- Trap: "CPU is only at 60% so the service can't be CPU-bound." What can still be wrong?
 > In Kubernetes a container with a CPU limit can be throttled by the CFS quota even while the node CPU is idle, and average usage hides bursts within each 100 ms period. Check `container_cpu_cfs_throttled_periods_total` against total periods and the `nr_throttled` counter in `cpu.stat`. Also, a single-threaded component (like Redis) can be saturated while overall machine CPU looks low.
 
 > [!question]- How do retries and missing timeouts turn a small slowdown into an outage?
-> Without timeouts, workers wait on the slow dependency and the pool of workers fills, so the service stops answering even unrelated requests. With retries, each failing call is multiplied, increasing load on the already weak dependency (a retry storm), and across several layers the multiplication compounds. The fix is deadlines on every call, bounded retries with backoff and jitter at one layer, circuit breakers and bulkheads.
+> Without timeouts, workers wait on the slow dependency and the pool of workers fills, so the service stops answering even unrelated requests. With retries, each failing call is multiplied, increasing load on the already weak dependency (a retry storm), and across several layers the multiplication compounds.
+>
+> The fix is deadlines on every call, bounded retries with backoff and jitter at one layer, circuit breakers and bulkheads.
 
 > [!question]- How do you prove a fix worked and prevent a repeat?
-> Compare p50, p95, p99 and error rate before and after, at the same traffic level, and keep the deploy marker on the graph. Roll out by canary with automatic rollback on SLO burn. Add the missing alert (for example outbound calls per inbound request), a load test that reproduces the pattern, and a code-review rule such as "every outbound call has a timeout". Record the actions in the postmortem and track them to completion.
+> Compare p50, p95, p99 and error rate before and after, at the same traffic level, and keep the deploy marker on the graph. Roll out by canary with automatic rollback on SLO burn.
+>
+> Add the missing alert (for example outbound calls per inbound request), a load test that reproduces the pattern, and a code-review rule such as "every outbound call has a timeout". Record the actions in the postmortem and track them to completion.
 
 ## 10. Cheat sheet
 
@@ -628,3 +699,7 @@ A Go GC cycle runs mostly concurrently, but allocation-heavy services can see as
 - **Debugging deep dives:** [[Debugging Database Performance]], [[Debugging Memory Leaks and OOMs in Go]], [[Distributed Tracing with OpenTelemetry]], [[Network Debugging Toolkit - dig, curl, ss, tcpdump]], [[Benchmarks, Profiling and Tracing]]
 - **Databases and caching:** [[Query Plans and EXPLAIN]], [[Connection Pooling]], [[N+1 Query Problem]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]], [[Redis in Production - Memory, Latency, Security]]
 - **Resilience:** [[Timeouts, Retries and Backoff]], [[Circuit Breaker]], [[Bulkheads and Concurrency Limits]], [[Load Shedding and Graceful Degradation]], [[Autoscaling]], [[Deployment Strategies - Rolling, Blue-Green, Canary]], [[Rollback and Safe Migrations]]
+
+### Watch on YouTube
+
+- [19 Milliseconds That Decide Wall Street / High-Frequency Trading & Latency Explained ](https://www.youtube.com/watch?v=dxlqEGGw3ns) · Axiom Explained · 9 min · 1,600 views

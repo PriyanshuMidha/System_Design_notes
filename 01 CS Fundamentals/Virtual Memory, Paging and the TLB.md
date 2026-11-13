@@ -9,7 +9,7 @@ sources:
   - "Bovet & Cesati, Understanding the Linux Kernel, 3rd ed., ch. 2 (memory addressing) and ch. 17 (page frame reclaiming)"
   - "Love, Linux Kernel Development, 3rd ed., ch. 15 (the page cache and page writeback), ch. 19 (portability, page size)"
   - "oom-killer, Linux kernel documentation, Documentation/admin-guide/sysctl/vm.rst (overcommit_memory)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Virtual Memory, Paging and the TLB
@@ -26,23 +26,92 @@ updated: 2026-11-09
 > - "Minor" page faults just map in a page already resident in RAM (or freshly zeroed); "major" page faults must pull the page's data in from disk/swap, which is orders of magnitude slower.
 > - This is why two processes can each believe they own address `0x1000`, why `fork` can be fast (section 3), and why Linux will overcommit memory and sometimes kill a process (the OOM killer) rather than honor every promise it made.
 
+## Start here: the basics
+
+**The problem in one story.**
+You run two programs at once: a browser and a music player.
+Both were written assuming "my data starts at address 1000".
+If they both really wrote to the same spot in RAM, one would wreck the other.
+Virtual memory gives each program its own private copy of "address 1000" that points somewhere different in real RAM.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Address | A number naming one byte of memory | `0x1000` = byte number 4096 |
+| RAM (physical memory) | The real memory chips in the machine | 16 GB of DDR5 |
+| Process | One running program with its own memory | Your Go server is one process |
+| Kernel | The core of the OS that controls hardware | Linux deciding which process gets RAM |
+| Page | A fixed-size chunk of memory handled as one unit | 4 KB = 4096 bytes |
+| Cache | A small, fast copy of data you used recently | Browser keeping images you just saw |
+| Disk / swap | Slow storage the kernel can park memory on | Part of an SSD used as overflow RAM |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Program uses<br/>virtual address"] --> TLB{"TLB:<br/>seen recently?"}
+    TLB -- "yes" --> RAM["Real RAM location"]
+    TLB -- "no" --> PT["Page table<br/>(lookup in memory)"]
+    PT -- "found" --> RAM
+    PT -- "not there" --> K["Page fault:<br/>kernel fixes it"]
+    K --> RAM
+```
+
+**Analogy.** Each program has its own phone contact list. "Mom" in your phone and "Mom" in your friend's phone dial different numbers. The phone (MMU) looks up the real number every time you call.
+Where it breaks: a phone never secretly swaps a contact's number to someone else's; the kernel does reassign real RAM behind a program's back (swap, eviction).
+
+**How the rest of this note builds up**
+
+- First, why virtual memory exists (section 1) and a mental model of private addresses (section 2).
+- Then the translation path: TLB, page table, page faults (section 3), plus multi-level tables and huge pages.
+- Then a small worked example in Go and a latency ladder (section 4), and variants like copy-on-write and `mmap` (section 5).
+- Finally the SDE-3 deep dive: overcommit and the OOM killer, thrashing, production debugging, ASLR, RSS vs VSZ and `fork` internals (sections 6-8).
+
+> [!tip] Remember
+> Every program gets made-up addresses; hardware and the kernel quietly map them to real RAM, one page at a time.
+
 ## 1. Why it exists
 
-Before virtual memory, programs addressed physical RAM directly: if your program's code happened to load at physical address `0x8000`, every pointer, every jump target, baked in `0x8000`-relative addresses. Two programs couldn't be loaded into memory at the same time without one of them being relinked to avoid overlapping the other, and one program's bug (an out-of-bounds write) could silently corrupt another program's memory or the OS itself — there was no boundary.
+Before virtual memory, programs addressed physical RAM directly: if your program's code happened to load at physical address `0x8000`, every pointer, every jump target, baked in `0x8000`-relative addresses.
 
-Virtual memory gives every process its own **address space**: a private range of addresses from `0` up to the architecture's limit, that only *that* process can use, and which the MMU translates to real physical memory behind the scenes. Two processes can both have code at virtual address `0x400000` and never collide, because the kernel maps each one's `0x400000` to a different physical page. A buggy write to a bad pointer faults (segfaults) instead of corrupting another process, because the MMU simply refuses translations outside a process's own mappings.
+Two programs couldn't be loaded into memory at the same time without one of them being relinked to avoid overlapping the other.
 
-It also decouples "how much memory a process is promised" from "how much physical RAM actually backs it right now": pages can be mapped in lazily on first use (demand paging, section 3), shared between processes that both want the same read-only data (shared libraries, `fork`'s copy-on-write), or pushed out to disk under memory pressure (swap) — all without the process's own view of its addresses ever changing.
+And one program's bug (an out-of-bounds write) could silently corrupt another program's memory or the OS itself — there was no boundary.
+
+Virtual memory gives every process its own **address space**: a private range of addresses from `0` up to the architecture's limit, that only *that* process can use, and which the MMU translates to real physical memory behind the scenes.
+
+Two processes can both have code at virtual address `0x400000` and never collide, because the kernel maps each one's `0x400000` to a different physical page.
+
+A buggy write to a bad pointer faults (segfaults) instead of corrupting another process, because the MMU simply refuses translations outside a process's own mappings.
+
+It also decouples "how much memory a process is promised" from "how much physical RAM actually backs it right now". Pages can be:
+
+1.  mapped in lazily on first use (demand paging, section 3);
+2. shared between processes that both want the same read-only data (shared libraries, `fork`'s copy-on-write);
+3. or pushed out to disk under memory pressure (swap).
+
+All of this happens without the process's own view of its addresses ever changing.
 
 ## 2. Mental model
 
 **In plain words:** before reading any mechanism, build one picture: every process has its own private, made-up set of addresses, and one piece of hardware (helped by the kernel) silently rewrites each one to a real location in RAM.
 
-**Analogy:** think of a hotel with one lobby directory (the MMU + page table) per guest, not one global room list. Every guest has their own private floor plan starting at "Room 1, Room 2, Room 3…" — **virtual** room numbers that only exist on that guest's own map. The hotel's actual physical rooms are numbered completely differently, and the front desk (MMU) translates "guest A, Room 12" to physical room 847 and "guest B, Room 12" to physical room 203, with neither guest ever seeing the real room numbers.
+**Analogy:** think of a hotel with one lobby directory (the MMU + page table) per guest, not one global room list.
 
-Guests don't get individually sized rooms — the hotel only has one room size (a **page**, 4 KB), so a guest needing more space gets more rooms, not one bigger room. The front desk doesn't look up every single step you take inside your room (every byte you touch); it only looks up which physical room a virtual room maps to, and remembers the last several lookups on a sticky note (the **TLB**) so repeat visits to the same room are instant. If a guest asks for a room that hasn't been assigned a physical room yet, that's a **page fault**: the front desk scrambles to assign one, which is cheap if a spare room is sitting ready (**minor fault**) and slow if it has to move someone's stuff back from the hotel's off-site storage first (**major fault**, i.e. swap).
+Every guest has their own private floor plan starting at "Room 1, Room 2, Room 3…" — **virtual** room numbers that only exist on that guest's own map.
 
-**Where the analogy breaks down:** a real hotel's front desk never repossesses an occupied room to give to another guest without evicting them first; the kernel does exactly that under memory pressure (that's the eviction and swap-out machinery in the diagrams below), and it can even promise a guest a room it doesn't currently have spare capacity for — the **overcommit** behaviour covered in section 6.
+The hotel's actual physical rooms are numbered completely differently, and the front desk (MMU) translates "guest A, Room 12" to physical room 847 and "guest B, Room 12" to physical room 203, with neither guest ever seeing the real room numbers.
+
+Guests don't get individually sized rooms — the hotel only has one room size (a **page**, 4 KB), so a guest needing more space gets more rooms, not one bigger room.
+
+The front desk doesn't look up every single step you take inside your room (every byte you touch); it only looks up which physical room a virtual room maps to, and remembers the last several lookups on a sticky note (the **TLB**) so repeat visits to the same room are instant.
+
+If a guest asks for a room that hasn't been assigned a physical room yet, that's a **page fault**: the front desk scrambles to assign one, which is cheap if a spare room is sitting ready (**minor fault**) and slow if it has to move someone's stuff back from the hotel's off-site storage first (**major fault**, i.e. swap).
+
+**Where the analogy breaks down:** a real hotel's front desk never repossesses an occupied room to give to another guest without evicting them first.
+
+The kernel does exactly that under memory pressure (that's the eviction and swap-out machinery in the diagrams below), and it can even promise a guest a room it doesn't currently have spare capacity for — the **overcommit** behaviour covered in section 6.
 
 > [!tip] Remember
 > Virtual addresses are a story every process is told; physical addresses are where the bytes actually live. The MMU is the only thing that knows how the two relate, per process.
@@ -72,9 +141,19 @@ flowchart TD
     Resume --> Done
 ```
 
-A **minor fault** never touches a disk: the page just wasn't mapped yet (a freshly `mmap`'d region, a stack growing into a new page, a copy-on-write page about to be duplicated) and the kernel can satisfy it from RAM alone — allocate a frame, maybe zero it, update the page table. A **major fault** means the data has to be fetched from backing storage (a memory-mapped file, or swap), which can cost milliseconds instead of microseconds: this is the single biggest cause of a process suddenly feeling "stuck" under memory pressure.
+A **minor fault** never touches a disk: the page just wasn't mapped yet (a freshly `mmap`'d region, a stack growing into a new page, a copy-on-write page about to be duplicated) and the kernel can satisfy it from RAM alone — allocate a frame, maybe zero it, update the page table.
 
-**Example, with numbers:** say a process touches a brand-new 4 KB page for the first time. That single access walks the path above once: TLB miss (page was never cached, ~1 ns wasted), page-table miss (entry doesn't exist yet), then a minor fault — allocate a frame, zero it, insert the page-table entry, fill the TLB — costing perhaps 2 µs total. Every later access to any byte in that same 4 KB page costs the TLB-hit price instead, under 1 ns, for as long as the TLB keeps the entry. That roughly 2,000× cost difference between the first touch and every later touch is why "working set fits in the TLB" matters so much for performance.
+A **major fault** means the data has to be fetched from backing storage (a memory-mapped file, or swap), which can cost milliseconds instead of microseconds. This is the single biggest cause of a process suddenly feeling "stuck" under memory pressure.
+
+**Example, with numbers:** say a process touches a brand-new 4 KB page for the first time. That single access walks the path above once:
+
+1. TLB miss (page was never cached, ~1 ns wasted).
+2. Page-table miss (entry doesn't exist yet).
+3. Then a minor fault — allocate a frame, zero it, insert the page-table entry, fill the TLB — costing perhaps 2 µs total.
+
+Every later access to any byte in that same 4 KB page costs the TLB-hit price instead, under 1 ns, for as long as the TLB keeps the entry.
+
+That roughly 2,000× cost difference between the first touch and every later touch is why "working set fits in the TLB" matters so much for performance.
 
 > [!warning] Common mistake
 > Treating a TLB miss and a page fault as the same kind of event. A TLB miss still finds the translation — just one memory access away, in the page table — and never traps into the kernel. A page fault means the page table itself has no valid mapping, and *always* traps into the kernel, whether that turns out to be a cheap minor fault or an expensive major one.
@@ -101,7 +180,11 @@ flowchart TD
     E1 -.->|"replaced by"| NEWENTRY["page 0x7 -> frame 3"]
 ```
 
-**Example:** a TLB with only 4 slots, all full, sees an access to a 5th page it has never cached. It must evict one entry to make room — typically the **least-recently-used** one, on the theory that a page nobody has touched in a while is the least likely to be touched again soon. The evicted page isn't lost data; its translation still lives in the page table, so the next access to it simply costs one more page-table walk (a TLB miss, not a fault) to bring it back.
+**Example:** a TLB with only 4 slots, all full, sees an access to a 5th page it has never cached. It must evict one entry to make room.
+
+It typically picks the **least-recently-used** one, on the theory that a page nobody has touched in a while is the least likely to be touched again soon.
+
+The evicted page isn't lost data; its translation still lives in the page table, so the next access to it simply costs one more page-table walk (a TLB miss, not a fault) to bring it back.
 
 **Why it matters:** a working set (the pages actively being touched) bigger than the TLB's capacity causes a steady stream of evictions and refills — this is exactly the problem huge pages, covered next, are built to reduce.
 
@@ -109,7 +192,11 @@ flowchart TD
 
 **In plain words:** a page table big enough to have one entry for every possible virtual page, all the time, would be enormous — so real systems build it as a tree instead, and most of that tree simply doesn't exist for addresses a process never uses.
 
-A single flat table mapping every possible virtual page directly to a physical frame would be enormous (a 48-bit virtual address space with 4 KB pages has 2^36 possible pages) — far too large to keep resident for every process. Real page tables are **multi-level** (radix trees): a top-level table of pointers to second-level tables of pointers to third-level tables, and so on, down to the entries that finally hold a physical frame number. x86-64 Linux commonly uses 4 levels (PGD → PUD → PMD → PTE); only the branches a process actually uses need to exist, so an address space with large unused gaps costs almost nothing in page-table memory.
+A single flat table mapping every possible virtual page directly to a physical frame would be enormous (a 48-bit virtual address space with 4 KB pages has 2^36 possible pages) — far too large to keep resident for every process.
+
+Real page tables are **multi-level** (radix trees): a top-level table of pointers to second-level tables of pointers to third-level tables, and so on, down to the entries that finally hold a physical frame number.
+
+x86-64 Linux commonly uses 4 levels (PGD → PUD → PMD → PTE); only the branches a process actually uses need to exist, so an address space with large unused gaps costs almost nothing in page-table memory.
 
 **Picture it:**
 
@@ -118,7 +205,9 @@ flowchart LR
     VA["Virtual address<br/>(split into index bits per level)"] --> L1["Level 1 table<br/>(e.g. PGD)"] --> L2["Level 2 table<br/>(PUD)"] --> L3["Level 3 table<br/>(PMD)"] --> L4["Level 4 table<br/>(PTE)"] --> PF["Physical frame number<br/>+ permission bits"]
 ```
 
-**Example:** a 48-bit virtual address is split into five pieces — four 9-bit indices (one per level, 512 entries per table) plus a 12-bit in-page offset (2^12 = 4096 bytes, matching the 4 KB page size). Each level adds a memory access on a TLB miss — a full 4-level walk is up to 4 extra memory reads before the real access, which is exactly why the TLB matters so much: without it, *every* memory access would cost 4-5× a normal memory access.
+**Example:** a 48-bit virtual address is split into five pieces — four 9-bit indices (one per level, 512 entries per table) plus a 12-bit in-page offset (2^12 = 4096 bytes, matching the 4 KB page size).
+
+Each level adds a memory access on a TLB miss — a full 4-level walk is up to 4 extra memory reads before the real access, which is exactly why the TLB matters so much: without it, *every* memory access would cost 4-5× a normal memory access.
 
 > [!tip] Remember
 > The page table is a tree so unused address ranges cost nothing; only the branches a process actually touches get allocated.
@@ -127,7 +216,9 @@ flowchart LR
 
 **In plain words:** if one TLB entry could cover far more memory than 4 KB, a process touching gigabytes of data would need far fewer TLB entries to keep its whole working set cached.
 
-Because each TLB entry only covers one page, a process that touches gigabytes of memory (a large in-memory cache, a database buffer pool) needs far more TLB entries than a TLB can hold (TLBs typically hold dozens to a few thousand entries), causing frequent TLB misses. **Huge pages** (2 MB or 1 GB on x86-64, configurable on arm64) make one TLB entry cover far more memory, trading flexibility (can't swap or partially map a huge page as finely) for a much lower TLB miss rate on large working sets.
+Because each TLB entry only covers one page, a process that touches gigabytes of memory (a large in-memory cache, a database buffer pool) needs far more TLB entries than a TLB can hold (TLBs typically hold dozens to a few thousand entries), causing frequent TLB misses.
+
+**Huge pages** (2 MB or 1 GB on x86-64, configurable on arm64) make one TLB entry cover far more memory, trading flexibility (can't swap or partially map a huge page as finely) for a much lower TLB miss rate on large working sets.
 
 **Picture it:**
 
@@ -169,7 +260,11 @@ func translate(pt PageTable, tlb TLB, vpn uint64) (frame uint64, hit bool) {
 }
 ```
 
-**Trace it:** with `tlb = {}` and `pt = {5: 42}`, calling `translate(pt, tlb, 5)` finds nothing in `tlb`, falls through to `pt`, finds frame `42`, and returns `(42, false)` — a TLB miss, not a fault, because the page table *did* have the mapping. Calling `translate(pt, tlb, 9)` finds nothing in either map and returns `(0, false)` — this time a real page fault, since page `9` was never mapped at all. The runnable version distinguishes exactly these two `false` cases (and fills the TLB on a hit), adds a fixed-capacity LRU TLB, demand paging bounded by a small number of physical frames (so eviction and swap-in are observable), and tests that pin down the whole event sequence section 3 describes. Runnable Go version: [[Virtual Memory, Paging and the TLB - Go]].
+**Trace it:** with `tlb = {}` and `pt = {5: 42}`, calling `translate(pt, tlb, 5)` finds nothing in `tlb`, falls through to `pt`, finds frame `42`, and returns `(42, false)` — a TLB miss, not a fault, because the page table *did* have the mapping.
+
+Calling `translate(pt, tlb, 9)` finds nothing in either map and returns `(0, false)` — this time a real page fault, since page `9` was never mapped at all.
+
+The runnable version distinguishes exactly these two `false` cases (and fills the TLB on a hit), adds a fixed-capacity LRU TLB, demand paging bounded by a small number of physical frames (so eviction and swap-in are observable), and tests that pin down the whole event sequence section 3 describes. Runnable Go version: [[Virtual Memory, Paging and the TLB - Go]].
 
 **Latency ladder for this mechanism** (documented, 2025-era order-of-magnitude; DDR5/NVMe figures per vendor datasheets and widely published measurements, not benchmarked in this vault):
 
@@ -194,7 +289,11 @@ func translate(pt PageTable, tlb TLB, vpn uint64) (frame uint64, hit bool) {
 ## 6. Trade-offs and when not to use
 
 - Virtual memory is not optional in any general-purpose OS — the question is tuning, not whether. Huge pages trade reclaim/compaction flexibility for TLB efficiency; most server workloads with large resident working sets benefit, interactive/short-lived workloads often don't need them.
-- **What happens if the kernel promises more memory than it has?** This is overcommit: the kernel can promise more virtual memory than it has physical RAM + swap to back, betting that not every process will touch every page it allocated. Linux's default overcommit heuristic allows this; a program that then touches memory it was "promised" can trigger the kernel's **OOM killer**, which picks a process (scored by `oom_score`, roughly RSS usage) and `SIGKILL`s it — a surprise to anyone expecting `malloc`/`mmap` to fail cleanly instead.
+- **What happens if the kernel promises more memory than it has?** This is overcommit: the kernel can promise more virtual memory than it has physical RAM + swap to back, betting that not every process will touch every page it allocated.
+
+  Linux's default overcommit heuristic allows this; a program that then touches memory it was "promised" can trigger the kernel's **OOM killer**, which picks a process (scored by `oom_score`, roughly RSS usage) and `SIGKILL`s it.
+
+  That is a surprise to anyone expecting `malloc`/`mmap` to fail cleanly instead.
 
   ```mermaid
   flowchart TD
@@ -207,7 +306,11 @@ func translate(pt PageTable, tlb TLB, vpn uint64) (frame uint64, hit bool) {
 
   **Why it matters:** the process that gets killed is often not the one whose allocation finally tipped the system over — it is whichever process scores worst on the kernel's heuristic, which surprises operators expecting a clean allocation failure instead.
 - Swapping anything latency-sensitive is close to always wrong: a major fault to a disk is 10,000-100,000× slower than a TLB-hit memory access. Databases and caches typically run with swap disabled or minimized (low `vm.swappiness` on Linux) precisely to avoid trading a little extra RAM headroom for occasional multi-millisecond stalls.
-- **Thrashing** is what happens when memory pressure is bad enough that the kernel spends more time paging data in and out than running processes: every process's working set keeps getting evicted before it finishes using it, so the next access is almost always a major fault, which evicts someone else's page in turn. The symptom is a system that looks "stuck" with high disk I/O and low useful CPU work; the fix is adding RAM, shrinking the working set, or killing something, not tuning page-replacement policy.
+- **Thrashing** is what happens when memory pressure is bad enough that the kernel spends more time paging data in and out than running processes: every process's working set keeps getting evicted before it finishes using it.
+
+  So the next access is almost always a major fault, which evicts someone else's page in turn.
+
+  The symptom is a system that looks "stuck" with high disk I/O and low useful CPU work; the fix is adding RAM, shrinking the working set, or killing something, not tuning page-replacement policy.
 
 > [!tip] Remember
 > Overcommit turns a memory problem into a surprise `SIGKILL` later, not a clean allocation failure now — that's the trade-off, not a bug.
@@ -224,8 +327,16 @@ func translate(pt PageTable, tlb TLB, vpn uint64) (frame uint64, hit bool) {
 
 ## 8. Deep dive
 
-- **ASLR and ISA-specific translation.** Address space layout randomization places the stack, heap, libraries and sometimes the executable itself at randomized virtual base addresses each run, specifically to make memory-corruption exploits harder to write (an attacker can't hardcode "the stack is at address X"). This rides entirely on virtual memory: the randomized addresses are virtual, so it costs nothing in physical layout. x86-64 Linux's 4-level page tables (5-level on very large-memory systems, extending the addressable range) and arm64's broadly similar scheme are different concrete implementations of the same multi-level idea in section 3.
-- **RSS vs VSZ, and why they diverge.** `VSZ` (virtual size) counts every page a process has *mapped*, whether or not it's ever been touched; `RSS` (resident set size) counts pages actually backed by physical RAM right now. A process that `mmap`s a 10 GB file but only reads the first 10 MB of it has a `VSZ` near 10 GB and an `RSS` near 10 MB. Go programs often show `VSZ` far larger than intuition suggests because the runtime reserves large stretches of virtual address space up front for its heap arenas, without that space costing physical memory until touched.
+- **ASLR and ISA-specific translation.** Address space layout randomization places the stack, heap, libraries and sometimes the executable itself at randomized virtual base addresses each run, specifically to make memory-corruption exploits harder to write (an attacker can't hardcode "the stack is at address X").
+
+  This rides entirely on virtual memory: the randomized addresses are virtual, so it costs nothing in physical layout.
+
+  x86-64 Linux's 4-level page tables (5-level on very large-memory systems, extending the addressable range) and arm64's broadly similar scheme are different concrete implementations of the same multi-level idea in section 3.
+- **RSS vs VSZ, and why they diverge.** `VSZ` (virtual size) counts every page a process has *mapped*, whether or not it's ever been touched; `RSS` (resident set size) counts pages actually backed by physical RAM right now.
+
+  A process that `mmap`s a 10 GB file but only reads the first 10 MB of it has a `VSZ` near 10 GB and an `RSS` near 10 MB.
+
+  Go programs often show `VSZ` far larger than intuition suggests because the runtime reserves large stretches of virtual address space up front for its heap arenas, without that space costing physical memory until touched.
 
   ```mermaid
   flowchart LR
@@ -269,7 +380,9 @@ func translate(pt PageTable, tlb TLB, vpn uint64) (frame uint64, hit bool) {
   ```
 
   **Why it matters:** a `fork` of a multi-gigabyte process returns almost instantly, because the "copy" that intuition expects only ever happens one page at a time, and only for pages that are actually written to afterward — most forked processes (for example, one that immediately calls `exec`) never trigger a single one of these copies.
-- **Why huge pages cause latency jitter.** Allocating a 2 MB huge page needs 512 contiguous physical 4 KB frames. Under long-running memory pressure, physical memory fragments, and the kernel's `khugepaged`/compaction machinery may need to actively move pages around to free up a contiguous 2 MB block before it can satisfy the request — work that can stall the requesting (or an unrelated) process for milliseconds, the documented reason several databases default THP to `madvise`.
+- **Why huge pages cause latency jitter.** Allocating a 2 MB huge page needs 512 contiguous physical 4 KB frames. Under long-running memory pressure, physical memory fragments.
+
+  The kernel's `khugepaged`/compaction machinery may need to actively move pages around to free up a contiguous 2 MB block before it can satisfy the request — work that can stall the requesting (or an unrelated) process for milliseconds, the documented reason several databases default THP to `madvise`.
 
 ## 9. Interview questions
 
@@ -310,3 +423,8 @@ func translate(pt PageTable, tlb TLB, vpn uint64) (frame uint64, hit bool) {
 - **Before this:** [[Memory Hierarchy and CPU Caches]], [[Processes, Threads and Context Switching]]
 - **Next:** [[Process Memory Layout - Stack vs Heap]], [[Page Cache, File Systems and fsync]]
 - **Compare with:** [[System Calls and User vs Kernel Mode]] (a page fault is itself a kind of trap into the kernel)
+
+### Watch on YouTube
+
+- [Virtual Memory Explained (including Paging)](https://www.youtube.com/watch?v=fGP6VHxqkIM) · BitLemon · 15-min visual intro to virtual addresses, page tables and paging
+- [Virtual Memory - 03 : Implementation of Page Table and Associative memory (TLB)](https://www.youtube.com/watch?v=49INMdDm1CU) · Learn with Maitrik Shah · deep dive specifically on TLB/page-table implementation and hit/miss cost

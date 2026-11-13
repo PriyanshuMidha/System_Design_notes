@@ -6,7 +6,7 @@ prereqs: ["[[Data Structures Overview and Big-O Cheat Sheet]]", "[[Arrays and Dy
 related: ["[[Stacks, Queues and Deques]]", "[[Hash Tables and Go Maps]]", "[[Memory Hierarchy and CPU Caches]]"]
 sources:
   - "Go std lib docs, package container/list (go.dev/pkg/container/list)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Linked Lists
@@ -20,13 +20,59 @@ updated: 2026-11-09
 > - In Go, a slice beats a linked list for almost everything, because contiguous memory wins on cache locality even when the Big-O looks worse on paper; the exception is when you already hold a reference to the node you need to change.
 > - The textbook case where that exception matters is an LRU cache: a hash map for `O(1)` lookup by key, paired with a doubly linked list for `O(1)` reordering by recency.
 
+## Start here: the basics
+
+**The problem in one story.**
+You keep a "recently viewed" list of 50 products.
+When someone views product 37 again, it must jump to the front.
+With a numbered list, everything in front of it shifts down one slot.
+A linked list lets you just "unhook" it and "re-hook" it at the front.
+
+**Words you need first.**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Node | One box holding a value plus link(s) to other boxes | `{Val: 20, Next: →30}` |
+| Pointer | A value that stores where another thing lives in memory | `Next *Node` |
+| Head / tail | The first node / the last node of the chain | head = 10, tail = 30 |
+| `nil` | "Points to nothing": marks the end of the chain | `30.Next = nil` |
+| Heap | The memory area where nodes are allocated, scattered anywhere | each `&Node{}` lands somewhere new |
+| Big-O (`O(1)`, `O(n)`) | How work grows with list size: constant vs grows with `n` | walking to item 37 is `O(n)` |
+| Cache locality | CPUs read neighbouring memory fast; scattered memory is slow | a slice beats a list when scanning |
+| LRU cache | A cache that evicts the Least Recently Used item when full | "recently viewed" capped at 50 |
+
+**Picture it.**
+
+```mermaid
+flowchart LR
+    H["head"] --> A["10"] -->|next| B["20"] -->|next| C["30"] -->|next| N["nil"]
+    B -.->|"prev (doubly linked only)"| A
+```
+
+**Analogy.** A train: each carriage is coupled only to its neighbours. Uncoupling one carriage and re-coupling it elsewhere is quick, but to reach carriage 37 you walk through the 36 before it.
+Where it breaks: real train carriages sit side by side, while list nodes are scattered across memory, which is why walking a list is slower than the analogy suggests.
+
+**How the rest of this note builds up.**
+
+- First, why linked lists exist and a mental model (sections 1-2).
+- Then how singly and doubly linked lists work, with `O(1)` delete at a known node (section 3).
+- Then a worked example, variants, and when a slice is the better choice (sections 4-6).
+- Finally the SDE-3 material: production use, the LRU cache deep dive, and interview questions (sections 7-9).
+
+> [!tip] Remember
+> A linked list is fast to rewire at a node you hold, slow to find a node in the first place.
+
 ## 1. Why it exists
 
 Say you're building the "recently viewed items" list for a user, capped at 50 entries. Viewing an already-listed item must move it back to the front instead of adding a duplicate.
 
-With a plain slice, moving entry 37 of 50 to the front means shifting the 36 entries in front of it over by one position each time — `O(n)` work on every single view. With a doubly linked list, you already hold a reference to that item's node (because a side map stores it for you), so moving it to the front is just "unlink it from its current spot, relink it at the head": four pointer writes, `O(1)`, no matter where the node started.
+With a plain slice, moving entry 37 of 50 to the front means shifting the 36 entries in front of it over by one position each time — `O(n)` work on every single view.
 
-This is the one situation a **linked list** — a chain of nodes, each holding a value and a pointer to the next — is built for: frequent insert or delete at a node you already hold, where a slice's *shifting* cost would otherwise dominate. It's rarely the right default collection (see "Trade-offs" below for why), but it is exactly the data structure behind this one real pattern, and a few related ones: splicing two lists together in `O(1)`, or an iterator that keeps working even while other parts of the same list are being modified.
+With a doubly linked list, you already hold a reference to that item's node (because a side map stores it for you), so moving it to the front is just "unlink it from its current spot, relink it at the head": four pointer writes, `O(1)`, no matter where the node started.
+
+This is the one situation a **linked list** — a chain of nodes, each holding a value and a pointer to the next — is built for: frequent insert or delete at a node you already hold, where a slice's *shifting* cost would otherwise dominate.
+
+It's rarely the right default collection (see "Trade-offs" below for why), but it is exactly the data structure behind this one real pattern, and a few related ones: splicing two lists together in `O(1)`, or an iterator that keeps working even while other parts of the same list are being modified.
 
 > [!tip] Remember
 > A linked list trades fast *random access* for fast *local* insert/delete — it is a specialist tool for the second job, not a general-purpose replacement for a slice.
@@ -67,7 +113,9 @@ flowchart LR
 
 **Picture it.** The diagram above: the singly linked chain only has forward arrows; the doubly linked chain has both directions, drawn as solid forward arrows and dashed backward ones.
 
-**Example.** To delete node `20` from the singly linked chain, you must already be holding node `10` (its predecessor), because only `10` can have its `next` pointer rewritten to skip over `20`. If you only have a reference to `20` itself, you're stuck walking from the head to find `10` first — `O(n)`. In the doubly linked chain, `20` already stores a pointer to `10` directly, so no walk is needed.
+**Example.** To delete node `20` from the singly linked chain, you must already be holding node `10` (its predecessor), because only `10` can have its `next` pointer rewritten to skip over `20`. If you only have a reference to `20` itself, you're stuck walking from the head to find `10` first — `O(n)`.
+
+In the doubly linked chain, `20` already stores a pointer to `10` directly, so no walk is needed.
 
 **Why it matters.** This is the entire reason doubly linked lists exist: they turn "delete a node I'm holding" from an `O(n)` search-then-delete into a genuine `O(1)` operation.
 
@@ -246,3 +294,7 @@ flowchart LR
 - **Next:** [[Stacks, Queues and Deques]]
 - **Compare with:** [[Hash Tables and Go Maps]] (the other half of the LRU pattern), [[Memory Hierarchy and CPU Caches]] (why pointer-chasing is expensive)
 - **Runnable Go version:** [[Linked Lists - Go]]
+
+### Watch on YouTube
+
+- [Linked List Data Structure explained with animations / Common Operations / Study Algorithms](https://www.youtube.com/watch?v=lrXpTVEAXCM) · Nikhil Lohia · animated walkthrough of node/pointer structure and core operations

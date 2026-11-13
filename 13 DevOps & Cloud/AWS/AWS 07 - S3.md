@@ -12,13 +12,15 @@ sources:
   - "AWS S3 User Guide, Using Amazon S3 storage classes"
   - "AWS S3 User Guide, Blocking public access and Object Ownership (bucket owner enforced)"
   - "AWS KMS Developer Guide, SSE-KMS"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 07 - S3
 
 > [!summary] TL;DR
-> S3 is an object store: you put whole files ("objects") under string keys inside flat containers ("buckets") and get back one of the few AWS services with **11 nines of annual durability**. There is no real folder tree, no partial-file edits, and no server to patch; every read and write goes over HTTPS to an API, and almost every production feature (presigned URLs, lifecycle rules, event notifications, replication) exists to keep bytes out of your own servers.
+> S3 is an object store: you put whole files ("objects") under string keys inside flat containers ("buckets") and get back one of the few AWS services with **11 nines of annual durability**.
+>
+> There is no real folder tree, no partial-file edits, and no server to patch; every read and write goes over HTTPS to an API, and almost every production feature (presigned URLs, lifecycle rules, event notifications, replication) exists to keep bytes out of your own servers.
 
 > [!abstract] Core idea
 > - A bucket is a flat namespace of key → object. "Folders" are just keys containing `/`, rendered as a tree by the console.
@@ -27,9 +29,56 @@ updated: 2026-11-07
 > - Upload and download directly between the client and S3 with presigned URLs; never proxy file bytes through your own API.
 > - Storage class + lifecycle rules move cold data to cheaper tiers automatically; security defaults as of 2023 are "everything private, no ACLs, IAM/bucket-policy only".
 
+## Start here: the basics
+
+**The problem in one story.**
+Your app lets users upload profile photos.
+If you save them on your server's disk, the disk fills up, and if the server dies the photos die too.
+You want a place that never loses files, never runs out of space, and serves them to millions of people.
+S3 is that place: you hand it a file and a name, and later ask for the file back by name.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Object | One whole file plus some info about it | `user-7.jpg` and its content-type |
+| Bucket | A named container that holds objects | `myapp-uploads` |
+| Key | The full name of an object inside a bucket | `tenants/42/avatars/user-7.jpg` |
+| HTTP API | Talking to a service by web requests | `PUT` to upload, `GET` to download |
+| Availability Zone (AZ) | One separate data center group in a region | `ap-south-1a` |
+| Durability | Chance your data is never lost | 11 nines = almost never |
+| Availability | Chance a request works right now | 99.99% of requests succeed |
+| IAM policy | Rules saying who may do what | "this role may read this bucket" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client app"] -- "PUT key + bytes" --> B["S3 bucket"]
+    C -- "GET key" --> B
+    B --> A1["Copy in AZ 1"]
+    B --> A2["Copy in AZ 2"]
+    B --> A3["Copy in AZ 3"]
+```
+
+**Analogy.** S3 is a giant coat check: you hand over a coat (the file), get a ticket with a name on it (the key), and get the exact coat back when you show the ticket.
+Where it breaks: a coat check has no pricing per visit or storage tier, and you can't edit part of a coat in place; in S3 you also replace the whole object, never a piece of it.
+
+**How the rest of this note builds up**
+
+- First, why S3 exists and the key-value mental model (sections 1-2).
+- Then how it works: prefix scaling, the security model, presigned URLs, multipart upload, storage classes, events and CloudFront (section 3).
+- Then a Go worked example and comparisons with other storage (sections 4-6).
+- Finally the SDE-3 deep dive: production pitfalls, how strong consistency was built, throttling, and ETag gotchas (sections 7-9).
+
+> [!tip] Remember
+> S3 is a key → file store over HTTPS: whole files in, whole files out, almost never lost.
+
 ## 1. Why it exists
 
-A backend team needs somewhere to put user uploads, static assets, logs, and backups — files that do not fit a row in a relational database and that traffic can spike on without warning (a viral post with 50,000 image views in a minute). Running your own file servers means provisioning disks for peak size, replicating them for durability, writing your own backup process, and scaling read bandwidth by hand.
+A backend team needs somewhere to put user uploads, static assets, logs, and backups — files that do not fit a row in a relational database and that traffic can spike on without warning (a viral post with 50,000 image views in a minute).
+
+Running your own file servers means provisioning disks for peak size, replicating them for durability, writing your own backup process, and scaling read bandwidth by hand.
 
 S3 replaces all of that with an HTTP API over effectively unlimited storage: single objects up to **5 TiB**, buckets with no size or object-count limit, data replicated across a minimum of three Availability Zones in the region by design. You pay per GB stored per month, per request, and per GB transferred out — nothing for the servers underneath.
 
@@ -54,7 +103,9 @@ Because there's no real hierarchy, S3 can shard by key prefix behind the scenes 
 
 ### Request-rate scaling by prefix
 
-S3 automatically partitions a bucket's keyspace to spread load, and the official guidance is **3,500 PUT/COPY/POST/DELETE and 5,500 GET/HEAD requests per second, per prefix** — and a bucket can have many prefixes, so total throughput scales with how your keys are distributed. Before mid-2018 you had to randomize a hash prefix (`a3f9/photo.jpg`) to force S3 to split partitions early; since then S3 scales automatically regardless of key naming, so the old "randomize your prefix" advice is no longer required, though spreading high-throughput key ranges (e.g. `tenants/{id}/...` instead of one shared prefix for all tenants) still helps if you expect to burst past the per-prefix numbers immediately rather than ramping into them.
+S3 automatically partitions a bucket's keyspace to spread load, and the official guidance is **3,500 PUT/COPY/POST/DELETE and 5,500 GET/HEAD requests per second, per prefix** — and a bucket can have many prefixes, so total throughput scales with how your keys are distributed.
+
+Before mid-2018 you had to randomize a hash prefix (`a3f9/photo.jpg`) to force S3 to split partitions early; since then S3 scales automatically regardless of key naming, so the old "randomize your prefix" advice is no longer required, though spreading high-throughput key ranges (e.g. `tenants/{id}/...` instead of one shared prefix for all tenants) still helps if you expect to burst past the per-prefix numbers immediately rather than ramping into them.
 
 ### Security model
 
@@ -82,7 +133,9 @@ flowchart TB
 - **Block Public Access** is four switches (block public ACLs/policies, ignore public ACLs, restrict public buckets) that override everything else — a bucket policy that grants `s3:GetObject` to `*` still 403s if Block Public Access is on. New buckets have it on by default.
 - **Object Ownership: Bucket owner enforced** (the default for buckets created since April 2023) disables ACLs entirely; access is granted only through IAM identity policies and bucket policies, which is simpler to reason about than the old ACL + policy + ownership mix.
 - **IAM policy vs bucket policy**: an IAM policy is attached to a principal (user/role) and can reference many buckets; a bucket policy is attached to the bucket and can grant access to other accounts. S3 evaluates both (plus Block Public Access and any Service Control Policy) and denies if any explicit `Deny` matches, so **an explicit `Deny` in either one wins**.
-- **SSE-S3** (`AES256`) encrypts with a key S3 manages entirely; no extra cost, no audit trail of individual key uses. **SSE-KMS** (`aws:kms`) encrypts with a KMS key you control (rotation, audit via CloudTrail, cross-account grants) at the cost of a KMS API call per object GET/PUT (billed, and rate-limited by KMS request quotas) — use it when you need to prove who decrypted what, or a customer-managed key you can revoke.
+- **SSE-S3** (`AES256`) encrypts with a key S3 manages entirely; no extra cost, no audit trail of individual key uses.
+
+  **SSE-KMS** (`aws:kms`) encrypts with a KMS key you control (rotation, audit via CloudTrail, cross-account grants) at the cost of a KMS API call per object GET/PUT (billed, and rate-limited by KMS request quotas) — use it when you need to prove who decrypted what, or a customer-managed key you can revoke.
 
 ### Presigned URLs and direct upload
 
@@ -112,7 +165,9 @@ This is the pattern [[File Upload Architecture]] builds the whole upload flow ar
 
 Required above 5 GiB, recommended above ~100 MB:
 
-- Initiate → get an `UploadId` → upload parts in parallel (each part **5 MiB–5 GiB, except the last**, up to **10,000 parts**) → complete with the list of part ETags. The **5 TiB max object size** is a separate, independent cap — 10,000 parts at 5 GiB each would in principle sum to far more than 5 TiB, so it is not derived from multiplying part count by max part size; S3 enforces the 5 TiB ceiling directly.
+- Initiate → get an `UploadId` → upload parts in parallel (each part **5 MiB–5 GiB, except the last**, up to **10,000 parts**) → complete with the list of part ETags.
+
+  The **5 TiB max object size** is a separate, independent cap — 10,000 parts at 5 GiB each would in principle sum to far more than 5 TiB, so it is not derived from multiplying part count by max part size; S3 enforces the 5 TiB ceiling directly.
 - A failed part just gets re-uploaded; you never restart the whole object.
 - Abandoned multipart uploads **still bill for storage** until completed or aborted — add a **lifecycle rule to abort incomplete multipart uploads** after N days, or orphaned parts quietly accumulate cost forever.
 
@@ -146,11 +201,15 @@ A lifecycle rule is a bucket-level policy (prefix or tag filter → transition a
 
 ### Event notifications
 
-S3 can push `s3:ObjectCreated:*` / `s3:ObjectRemoved:*` (and more) events to **SQS**, **SNS**, **Lambda**, or **EventBridge**. EventBridge is the usual default for anything non-trivial because one event can fan out to many independent rules/consumers (a processing worker, an audit log, a metrics counter) without you wiring up separate SNS topics per consumer; plain SQS is simplest when there is exactly one queue of work to process.
+S3 can push `s3:ObjectCreated:*` / `s3:ObjectRemoved:*` (and more) events to **SQS**, **SNS**, **Lambda**, or **EventBridge**.
+
+EventBridge is the usual default for anything non-trivial because one event can fan out to many independent rules/consumers (a processing worker, an audit log, a metrics counter) without you wiring up separate SNS topics per consumer; plain SQS is simplest when there is exactly one queue of work to process.
 
 ### CloudFront in front of S3
 
-Static assets (built frontend bundles, processed images, public downloads) go behind **CloudFront** with an **Origin Access Control (OAC)** — the modern replacement for the older Origin Access Identity — so the S3 bucket itself stays fully private (Block Public Access on) and only CloudFront's signed requests can read it. Private content uses CloudFront **signed URLs/cookies** instead of S3 presigned URLs when you want one signing key to cover many paths or a whole CDN session rather than one object.
+Static assets (built frontend bundles, processed images, public downloads) go behind **CloudFront** with an **Origin Access Control (OAC)** — the modern replacement for the older Origin Access Identity — so the S3 bucket itself stays fully private (Block Public Access on) and only CloudFront's signed requests can read it.
+
+Private content uses CloudFront **signed URLs/cookies** instead of S3 presigned URLs when you want one signing key to cover many paths or a whole CDN session rather than one object.
 
 ## 4. Worked example
 
@@ -280,8 +339,12 @@ A browser-direct upload from HTML instead uses a **presigned POST policy**, whic
 
 ## 8. Deep dive
 
-- **Why strong consistency was hard, and how S3 did it.** Before December 2020, a `GET` immediately after an overwrite `PUT` could return either the old or new version for a short window, because S3's metadata was served from multiple internal replicas that could momentarily disagree. AWS re-architected the metadata layer so every request is now strongly consistent across all AZs in the region, with no performance cliff and no new cost — this removed an entire class of "read my own write" workarounds application code used to need (retry loops, version stamping).
-- **Why per-prefix throughput limits exist at all.** Internally S3 still partitions the keyspace to parallelize request handling; the per-prefix number is the ceiling on a single partition's handling capacity before it needs to split, and partition splitting is itself not instantaneous. A workload that suddenly jumps from near-zero to tens of thousands of requests/second on a brand-new prefix can briefly see throttling (503 Slow Down) while S3 catches up, even though a gradually-ramping workload to the same eventual rate would not.
+- **Why strong consistency was hard, and how S3 did it.** Before December 2020, a `GET` immediately after an overwrite `PUT` could return either the old or new version for a short window, because S3's metadata was served from multiple internal replicas that could momentarily disagree.
+
+  AWS re-architected the metadata layer so every request is now strongly consistent across all AZs in the region, with no performance cliff and no new cost — this removed an entire class of "read my own write" workarounds application code used to need (retry loops, version stamping).
+- **Why per-prefix throughput limits exist at all.** Internally S3 still partitions the keyspace to parallelize request handling; the per-prefix number is the ceiling on a single partition's handling capacity before it needs to split, and partition splitting is itself not instantaneous.
+
+  A workload that suddenly jumps from near-zero to tens of thousands of requests/second on a brand-new prefix can briefly see throttling (503 Slow Down) while S3 catches up, even though a gradually-ramping workload to the same eventual rate would not.
 - **ETag is not always an MD5.** For a single-part PUT, the ETag is the MD5 of the object. For a multipart upload, the ETag is `MD5-of-concatenated-part-MD5s-N` (a hash of hashes, suffixed with the part count) — it is still useful as a change-detection token, but code that assumes "ETag == MD5(object bytes)" to verify downloaded content will silently fail for every multipart-uploaded object.
 
 ## 9. Interview questions
@@ -321,3 +384,8 @@ A browser-direct upload from HTML instead uses a **presigned POST policy**, whic
 - **Before this:** [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]], [[AWS 02 - IAM]]
 - **Next:** [[AWS 08 - RDS and Aurora]], [[AWS 09 - Route 53 and ACM]]
 - **Compare with:** [[File Upload Architecture]] (the end-to-end upload flow this note's presigned-URL and event pieces slot into), [[AWS SQS, SNS and EventBridge]] (what receives S3's event notifications)
+
+### Watch on YouTube
+
+- [AWS re:Invent 2025 - How Netflix uses Amazon S3 Storage Lens to track exabytes of data (STG214)](https://www.youtube.com/watch?v=Q2YoHfhFuI8) · AWS Events · 51 min · 1,231 views
+- [AWS re:Invent 2025 - Deep dive on Amazon S3 (STG407)](https://www.youtube.com/watch?v=S4swTRi1i0w) · AWS Events · 39 min · 4,944 views

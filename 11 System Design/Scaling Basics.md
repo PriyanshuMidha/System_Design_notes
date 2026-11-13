@@ -9,7 +9,7 @@ sources:
   - "Neil J. Gunther, Guerrilla Capacity Planning (Springer 2007), Universal Scalability Law"
   - "Abbott & Fisher, The Art of Scalability (2009), the AKF scale cube"
   - "AWS EC2 instance types page (largest general-purpose and memory-optimised sizes)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Scaling Basics
@@ -23,6 +23,54 @@ updated: 2026-11-04
 > - Adding nodes has diminishing returns: serial work (Amdahl) and coordination between nodes (USL) cap and can even reverse the gain.
 > - The app tier is easy to scale; the database is the hard part.
 > - Measure first, keep headroom (run at 50-70% at peak), and scale the actual bottleneck.
+
+## Start here: the basics
+
+**The problem in one story.**
+A small bakery sells 100 cakes a day with one baker.
+A festival week brings 400 orders a day.
+The owner can buy a bigger oven (one stronger baker) or hire more bakers.
+More bakers only helps if any baker can make any cake, and if the single cash register keeps up.
+That is scaling.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Load | How much work arrives | 2,500 requests per second |
+| Server / node | One machine running your program | A 4-vCPU VM |
+| Vertical scaling | Make one machine bigger | 4 vCPU → 16 vCPU |
+| Horizontal scaling | Add more machines | 1 VM → 5 VMs |
+| Load balancer | Spreads requests across servers | Sends request 1 to A, 2 to B |
+| Stateless | Server keeps no user data between requests | Session lives in Redis, not RAM |
+| Bottleneck | The slowest part that limits everything | The single database |
+| p99 latency | 99% of requests finish faster than this | p99 = 120 ms |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Users"] --> LB["Load balancer"]
+    LB --> A1["App server 1"]
+    LB --> A2["App server 2"]
+    LB --> A3["App server 3"]
+    A1 --> DB[("Database<br/>(the hard part)")]
+    A2 --> DB
+    A3 --> DB
+```
+
+**Analogy.** Checkout lanes in a supermarket: open more lanes when the queue grows.
+Where it breaks: adding lanes does not help if every cashier must call the same manager to approve each sale (shared database, coordination).
+
+**How the rest of this note builds up**
+
+- First, why scaling matters (section 1) and the supermarket model (section 2).
+- Then vertical vs horizontal, stateless services, the scale cube, read vs write paths and the growth journey (section 3).
+- Then a worked example: Amdahl and USL limits, and sizing with headroom (section 4).
+- Finally the SDE-3 view: comparisons, trade-offs, production practice and deep dive (sections 5-8).
+
+> [!tip] Remember
+> Make servers stateless so you can add more of them, and remember the database is usually the real limit.
 
 ## 1. Why it exists
 
@@ -134,7 +182,9 @@ Rule: measure -> find the bottleneck -> cheapest fix on the right path (read or 
 
 **Amdahl's law:** if a fraction `p` of the work can run in parallel and `1 − p` must run serially (one lock, one primary database, one leader), then with `N` workers the speed-up is `S(N) = 1 / ((1 − p) + p/N)`. It can never exceed `1 / (1 − p)`.
 
-**Universal Scalability Law (USL):** Gunther adds a second penalty. Capacity relative to one node is `C(N) = N / (1 + α(N − 1) + βN(N − 1))`, where `α` is **contention** (queueing for a shared resource) and `β` is **coherency** (nodes keeping each other in sync, which grows with every pair of nodes). With `β > 0` throughput peaks at `N* = √((1 − α)/β)` and then **falls**.
+**Universal Scalability Law (USL):** Gunther adds a second penalty. Capacity relative to one node is `C(N) = N / (1 + α(N − 1) + βN(N − 1))`, where `α` is **contention** (queueing for a shared resource) and `β` is **coherency** (nodes keeping each other in sync, which grows with every pair of nodes).
+
+With `β > 0` throughput peaks at `N* = √((1 − α)/β)` and then **falls**.
 
 This Go code computes both and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -297,3 +347,8 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 - **Before this:** [[System Design Fundamentals]]
 - **Next:** [[Back-of-the-Envelope Estimation]], [[Load Balancing]], [[Caching Patterns]], [[Replication]], [[Partitioning and Sharding]]
 - **Compare with:** [[Autoscaling]] (the mechanism that adds instances), [[Performance Engineering and Capacity Planning]] (measuring before scaling), [[Monolith vs Microservices]] (the Y axis as an architecture choice)
+
+### Watch on YouTube
+
+- [What is Scaling: Horizontal Scaling vs Vertical Scaling / System Design Basics ](https://www.youtube.com/watch?v=pX-7v9nf8Wg) · designKarle - System Design By Shivam Tiwari · 15 min · 1,449 views
+- [Database Scaling Basics Explained](https://www.youtube.com/watch?v=CXOZd2OkGGA) · Hayk Simonyan · 6 min · 6,445 views

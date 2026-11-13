@@ -12,7 +12,7 @@ sources:
   - "go-redis v9 docs, Options (PoolSize default 10 per GOMAXPROCS, timeouts, ParseURL)"
   - "NIST SP 800-63B, out-of-band authenticators (short-lived codes, attempt limits)"
   - "Measured on Redis 8.2.1 locally: redis-cli sessions, maxmemory test, Go tests against port 6392"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis Hands-on Setup with Go
@@ -27,13 +27,59 @@ updated: 2026-11-04
 > - Configure `maxmemory` and `maxmemory-policy` on day one; the default `noeviction` makes writes fail when memory is full.
 > - Decide per feature what happens when Redis is down: a cache falls back to the database, an OTP check fails closed.
 
+## Start here: the basics
+
+**The problem in one story.**
+You want your Go app to remember things fast, like a login code sent by SMS.
+You install Redis on your laptop and connect to it from Go.
+It works on day one, but in production it can hang, fill up, or get hacked.
+This note sets it up the safe way from the start.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Docker container | A packaged program that runs isolated on your machine | `docker run redis:8` |
+| Port | A numbered door a server listens on | Redis listens on 6379 |
+| `redis-cli` | The command-line tool to talk to Redis by hand | `redis-cli PING` → `PONG` |
+| Client / connection pool | Your app's Redis handle, reusing a set of open connections | go-redis keeps 10 connections per CPU by default |
+| Timeout | Max time to wait before giving up | Read timeout of 200 ms |
+| `context` (Go) | A value that carries a deadline or cancel signal into a call | `ctx, cancel := context.WithTimeout(...)` |
+| ACL | Access control list: which user may run which commands | User `app` cannot run `FLUSHALL` |
+| OTP | One-time password, a short code valid for minutes | `482913`, expires in 5 min |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Dev["You at redis-cli"] --> R["Redis container<br/>(password, maxmemory)"]
+    App["Go app<br/>(go-redis client + timeouts)"] -- "REDIS_URL" --> R
+    R --> V["Named volume<br/>(data on disk)"]
+    X["Internet"] -. "blocked: no public port" .-x R
+```
+
+**Analogy.** Setting up Redis is like installing a safe in a shop: you pick where it goes, set a combination (password), decide how much it can hold (maxmemory), and tell staff how long to wait if it jams (timeouts).
+Where it breaks: a full safe just refuses new items; Redis can instead throw out old keys if you pick an eviction policy.
+
+**How the rest of this note builds up**
+
+- First, what goes wrong without a careful setup (section 1) and the mental model (section 2).
+- Then hands-on: starting Redis, daily `redis-cli` commands, memory config and security basics (section 3).
+- Then a full worked example: a go-redis client and an OTP service with tests (section 4).
+- Finally variants, trade-offs, production settings, the SDE-3 deep dive and interview questions (sections 5-9).
+
+> [!tip] Remember
+> Timeouts, `maxmemory` with a policy, and no public port: set all three on day one.
+
 ## 1. Why it exists
 
 A new backend engineer adds Redis to a Go service. Three things usually go wrong in the first month:
 
 1. The client has no read timeout. Redis stalls for 2 seconds during a failover, every request goroutine waits, and the service's p99 jumps from 40 ms to 2 s.
 2. Nobody set `maxmemory`. The cache grows until the container's 512 MB limit and the kernel kills Redis. Or `maxmemory` is set but the policy stays `noeviction`, and writes start failing (measured below: 13,741 of 30,000 writes rejected).
-3. Port 6379 is published to the internet without a password. Exposed Redis servers are a well-known target for attackers who write SSH keys or cron jobs through `CONFIG SET dir`. Since Redis 7.0, `enable-protected-configs` (default `no`, measured on Redis 8.2) blocks changing `dir` at runtime, but an open port still leaks or wipes all data.
+3. Port 6379 is published to the internet without a password.
+	- Exposed Redis servers are a well-known target for attackers who write SSH keys or cron jobs through `CONFIG SET dir`.
+	- Since Redis 7.0, `enable-protected-configs` (default `no`, measured on Redis 8.2) blocks changing `dir` at runtime, but an open port still leaks or wipes all data.
 
 This note sets Redis up so none of these happen, and then builds one real feature end to end.
 
@@ -650,3 +696,8 @@ How a feature should behave when Redis is unavailable:
 - **Next:** [[Redis Data Structures and When to Use Each]], [[Redis Use Cases]], [[Redis in Go]]
 - **Go deeper:** [[Redis in Production - Memory, Latency, Security]], [[Redis Persistence - RDB and AOF]]
 - **Compare with:** [[Docker 07 - Docker Compose for Local Development]], [[Sessions and Cookies]]
+
+### Watch on YouTube
+
+- [Beginner's Guide to Redis with Go!](https://www.youtube.com/watch?v=1C3Ym_JjkMw) · TutorialEdge · concise intro to connecting to Redis from Go
+- [Setup Redis & Go with Docker Compose ( Redis CLI setup included )](https://www.youtube.com/watch?v=nxubvWC0MNc) · Jason Cheung · hands-on local setup walkthrough with Docker Compose and redis-cli

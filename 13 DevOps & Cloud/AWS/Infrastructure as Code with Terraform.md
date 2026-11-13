@@ -11,7 +11,7 @@ sources:
   - "HashiCorp Developer, Terraform CLI, terraform plan and apply"
   - "OpenTofu documentation, opentofu.org/docs (fork rationale and compatibility)"
   - "AWS Prescriptive Guidance, Terraform on AWS best practices"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Infrastructure as Code with Terraform
@@ -26,9 +26,56 @@ updated: 2026-11-07
 > - **Modules** are reusable, parameterized bundles of resources (e.g. "an ECS service" as one module instantiated per microservice).
 > - Classic mistake: running `apply` without a remote, locked state backend, so two engineers (or two CI runs) stomp on each other's state.
 
+## Start here: the basics
+
+**The problem in one story.**
+You built your AWS setup by clicking around the console.
+Months later nobody remembers which settings were chosen, and building a copy for staging takes a week of guessing.
+With Terraform you write the setup down as code, and a tool builds it the same way every time.
+Changes go through code review like any other code.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Infrastructure | The servers, networks and databases your app runs on | A VPC, an ALB, an RDS instance |
+| HCL | Terraform's config language | `resource "aws_s3_bucket" "logs" {}` |
+| Resource | One thing Terraform manages | One S3 bucket |
+| Provider | A plugin that talks to a cloud's API | The `aws` provider |
+| State file | Terraform's record of what it built | `terraform.tfstate` |
+| Plan / apply | Preview changes, then make them | `terraform plan`, `terraform apply` |
+| Module | A reusable bundle of resources | One "ECS service" module per microservice |
+| Lock | Stops two people changing state at once | DynamoDB or S3 lock |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Code["HCL code<br/>(desired state)"] --> Plan["terraform plan"]
+    State["State file<br/>(what exists)"] --> Plan
+    Plan -- "diff" --> Apply["terraform apply"]
+    Apply --> AWS["AWS APIs"]
+    Apply --> State
+```
+
+**Analogy.** Terraform is an architect's blueprint plus a builder: you change the blueprint, the builder compares it to the house and only does the difference.
+Where it breaks: a builder can see the house, but Terraform mostly trusts its state file, so a lost or out-of-date state file means it misjudges what exists.
+
+**How the rest of this note builds up**
+
+- First, why IaC exists and the desired-state mental model (sections 1-2).
+- Then how it works: providers, state, plan/apply, remote backends and locking, modules (section 3).
+- Then a full worked example and comparisons with other tools (sections 4-6).
+- Finally the SDE-3 deep dive: state drift, refactoring, and running Terraform safely in CI (sections 7-9).
+
+> [!tip] Remember
+> Write what you want, read the plan, then apply; the state file is Terraform's memory, so guard it.
+
 ## 1. Why it exists
 
-Before IaC, "provision an ECS service with its own ALB target group, RDS instance, and security groups" meant a person clicking through the AWS console, or a shell script calling the AWS CLI dozens of times with no way to know what already existed. Two problems follow: nobody can diff "what we have" against "what we intended," and tearing down an environment means hunting down every resource by hand.
+Before IaC, "provision an ECS service with its own ALB target group, RDS instance, and security groups" meant a person clicking through the AWS console, or a shell script calling the AWS CLI dozens of times with no way to know what already existed.
+
+Two problems follow: nobody can diff "what we have" against "what we intended," and tearing down an environment means hunting down every resource by hand.
 
 Terraform fixes both. You write what the 3 pieces should look like once:
 
@@ -84,7 +131,9 @@ sequenceDiagram
     TF-->>Dev: apply complete: 1 added, 1 changed
 ```
 
-If the lock is already held (another `apply` is mid-flight), the second run blocks or fails instead of racing against the first — this is the entire reason a remote backend with locking exists. Local state files (the default, `terraform.tfstate` on disk) have no locking, which is fine for a solo experiment and actively dangerous the moment a second person or a CI pipeline touches the same infrastructure.
+If the lock is already held (another `apply` is mid-flight), the second run blocks or fails instead of racing against the first — this is the entire reason a remote backend with locking exists.
+
+Local state files (the default, `terraform.tfstate` on disk) have no locking, which is fine for a solo experiment and actively dangerous the moment a second person or a CI pipeline touches the same infrastructure.
 
 ### Resources, data sources, modules, and variables
 
@@ -109,7 +158,9 @@ flowchart TB
 
 ### `plan` and `apply`, and the three change kinds
 
-Every resource change in a plan is one of: **create**, **update in place**, or **replace** (destroy then create — shown as `-/+` and flagged because it usually means downtime or data loss for stateful resources). A CI gate should always stop and ask a human before auto-applying a plan containing a replace of a database, not just any plan at all.
+Every resource change in a plan is one of: **create**, **update in place**, or **replace** (destroy then create — shown as `-/+` and flagged because it usually means downtime or data loss for stateful resources).
+
+A CI gate should always stop and ask a human before auto-applying a plan containing a replace of a database, not just any plan at all.
 
 ## 4. Worked example
 
@@ -253,7 +304,11 @@ resource "aws_ecs_service" "this" {
 
 ### Go: gating a CI apply on what the plan actually changes
 
-The reference architecture's CI/CD pipeline (see [[CI-CD Pipelines (GitHub Actions for Go)]]) runs `terraform plan -out=plan.tfplan`, then `terraform show -json plan.tfplan` to get a machine-readable plan. A Go step parses that JSON to decide whether the change needs a human: any create/update auto-applies, but a delete or replace of a stateful resource (the database, its subnet group) must pause for approval, even in an otherwise fully automated pipeline. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+The reference architecture's CI/CD pipeline (see [[CI-CD Pipelines (GitHub Actions for Go)]]) runs `terraform plan -out=plan.tfplan`, then `terraform show -json plan.tfplan` to get a machine-readable plan.
+
+A Go step parses that JSON to decide whether the change needs a human: any create/update auto-applies, but a delete or replace of a stateful resource (the database, its subnet group) must pause for approval, even in an otherwise fully automated pipeline.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 // Package tfplan parses the JSON that `terraform show -json <planfile>`
@@ -438,8 +493,14 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 
 ## 8. Deep dive
 
-- **State locking mechanics:** with the S3 + DynamoDB backend, `apply` writes a lock item (keyed by the state file's path) into DynamoDB before touching state, and removes it after. A crashed `apply` can leave a stale lock behind; `terraform force-unlock <lock-id>` clears it, but only after confirming no other apply is actually still running. Newer Terraform releases also support locking the S3 backend natively (via conditional writes on the state object itself), so a brand-new project may not need a separate DynamoDB table at all — the S3 + DynamoDB pattern above is still the one you'll meet in most existing codebases and is what this note's diagrams show.
-- **`for_each` vs `count` for near-identical resources:** `count` indexes resources by position (`0`, `1`, `2`, ...), so removing the middle item shifts every later index and Terraform plans to destroy and recreate resources that didn't conceptually change. `for_each` over a map or set indexes by a stable key, so removing one entry only destroys that one resource — prefer `for_each` whenever the set of things can change over time (e.g. "one SQS queue per event type").
+- **State locking mechanics:** with the S3 + DynamoDB backend, `apply` writes a lock item (keyed by the state file's path) into DynamoDB before touching state, and removes it after.
+
+  A crashed `apply` can leave a stale lock behind; `terraform force-unlock <lock-id>` clears it, but only after confirming no other apply is actually still running.
+
+  Newer Terraform releases also support locking the S3 backend natively (via conditional writes on the state object itself), so a brand-new project may not need a separate DynamoDB table at all — the S3 + DynamoDB pattern above is still the one you'll meet in most existing codebases and is what this note's diagrams show.
+- **`for_each` vs `count` for near-identical resources:** `count` indexes resources by position (`0`, `1`, `2`, ...), so removing the middle item shifts every later index and Terraform plans to destroy and recreate resources that didn't conceptually change.
+
+  `for_each` over a map or set indexes by a stable key, so removing one entry only destroys that one resource — prefer `for_each` whenever the set of things can change over time (e.g. "one SQS queue per event type").
 - **Drift and `terraform plan -refresh-only`:** a refresh-only plan updates Terraform's recorded state to match reality without proposing any resource changes, useful for reconciling after a deliberate out-of-band change (an incident fix made directly in the console) before the next real apply.
 - **OpenTofu's relationship to Terraform:** HashiCorp moved Terraform from MPL-2.0 to the Business Source License (BSL) in 2023; OpenTofu is the Linux Foundation-governed fork of the last MPL-licensed version, aiming for command and state-file compatibility with Terraform so existing `.tf` files and modules work with either CLI. New projects choosing between them is mostly a licensing/governance decision, not a technical one, as of Terraform 1.9+/OpenTofu's current releases.
 
@@ -452,10 +513,14 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 > Without locking, both read the same state, compute diffs independently, and write their own updated state back — the second write can silently overwrite the first's changes, leaving state that doesn't match reality. A locking backend (S3 + DynamoDB, or HCP Terraform) makes the second `apply` wait or fail instead of racing.
 
 > [!question]- Your plan shows `-/+ aws_db_instance.primary` ("must be replaced"). What does that mean and what do you do?
-> Terraform cannot change that attribute in place (e.g. a storage-engine-level change), so it will destroy the existing database and create a new one — meaning data loss unless you've planned a migration path. Never let a CI pipeline auto-apply a plan with a replace on a stateful resource; gate it for manual review, or find an in-place-compatible way to make the change (snapshot/restore, blue-green).
+> Terraform cannot change that attribute in place (e.g. a storage-engine-level change), so it will destroy the existing database and create a new one — meaning data loss unless you've planned a migration path.
+>
+> Never let a CI pipeline auto-apply a plan with a replace on a stateful resource; gate it for manual review, or find an in-place-compatible way to make the change (snapshot/restore, blue-green).
 
 > [!question]- Trap: "We don't need remote state, we're a small team." When does that stop being true?
-> The moment more than one person, or any CI pipeline, can run `apply` — which is nearly immediately in practice. Local state has no locking, isn't backed up by anything but the laptop it sits on, and can't be read by a teammate's next plan. Remote state with locking is cheap (an S3 bucket and a small DynamoDB table) and should be set up on day one.
+> The moment more than one person, or any CI pipeline, can run `apply` — which is nearly immediately in practice. Local state has no locking, isn't backed up by anything but the laptop it sits on, and can't be read by a teammate's next plan.
+>
+> Remote state with locking is cheap (an S3 bucket and a small DynamoDB table) and should be set up on day one.
 
 > [!question]- `count` vs `for_each`: which would you use for "one SQS queue per event type" and why?
 > `for_each` over a set or map of event-type names. `count` indexes by position, so deleting one entry from the middle of the list shifts every subsequent index and Terraform plans to destroy and recreate resources that logically didn't change. `for_each` keys by the event-type name itself, so removing one only ever touches that one queue.
@@ -479,3 +544,8 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 - **Before this:** [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]], [[CI-CD Pipelines (GitHub Actions for Go)]]
 - **Next:** [[Deploying a Go API on AWS (Reference Architecture)]]
 - **Compare with:** [[Secrets Management]] (where Terraform pulls secrets from instead of hardcoding them), [[Cloud Native and the 12-Factor App]] (config as environment, provisioned here)
+
+### Watch on YouTube
+
+- [What is Infrastructure as Code? Difference of Infrastructure as Code Tools](https://www.youtube.com/watch?v=POPP2WTJ8es) · TechWorld with Nana · 8 min · 241,093 views
+- [What is Infrastructure as Code?](https://www.youtube.com/watch?v=zWw2wuiKd5o) · IBM Technology · 8 min · 187,470 views

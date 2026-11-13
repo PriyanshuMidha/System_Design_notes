@@ -14,13 +14,22 @@ sources:
   - "MySQL 8.0 Reference Manual, Clustered and Secondary Indexes; InnoDB page size (16 KB default); Skip Scan Range Access Method (8.0.13)"
   - "Lehman and Yao, Efficient Locking for Concurrent Operations on B-Trees (ACM TODS, 1981)"
   - "RFC 9562, Universally Unique IDentifiers (UUIDv7)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Indexing Fundamentals - Go
 
 > [!summary] TL;DR
 > This note models the leaf level of a composite B-tree index `(workspace_id, status, due_date)` as a sorted Go slice, and shows with counted comparisons why the leftmost-prefix rule works. It also computes B+tree height from fan-out. The concepts are explained in [[Indexing Fundamentals]]; here each function is explained piece by piece.
+
+## Before the code
+
+- **Structs with several fields** (`Entry`): one index entry holding `workspace_id`, `status`, `due_date` and the row id.
+- **A three-way compare function** (`compare(a, b) int`): returns negative, zero or positive, the same contract `slices.SortFunc` uses.
+- **Sorted slices plus binary search** (`sort.Search`): the slice plays the leaf level of a B+tree.
+- **Multiple return values** (`ids, examined`): each search also reports how many entries it looked at, to make the cost visible.
+- **Integer loops** (`Height`): repeated division by the fan-out gives the tree height.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module.
 
 ## What this code shows
 
@@ -61,7 +70,11 @@ idx/
 
 ### Step 1: the index entry and the sorted slice
 
-**Concept.** A B+tree index keeps its leaf level in sorted order, and a composite index sorts by the first column, then the second, then the third ([[Indexing Fundamentals#Why column order matters: the leftmost-prefix rule]]). A real leaf is a chain of 8 kB pages; for teaching, a flat sorted slice has the same order and the same search behaviour, minus page splits and locking. The row id is the last sort key so that two entries with equal columns still have one fixed order, as a real index does by adding the heap pointer. The alternative of a real B-tree implementation would hide the lesson under pointer code.
+**Concept.** A B+tree index keeps its leaf level in sorted order, and a composite index sorts by the first column, then the second, then the third ([[Indexing Fundamentals#Why column order matters: the leftmost-prefix rule]]).
+
+A real leaf is a chain of 8 kB pages; for teaching, a flat sorted slice has the same order and the same search behaviour, minus page splits and locking.
+
+The row id is the last sort key so that two entries with equal columns still have one fixed order, as a real index does by adding the heap pointer. The alternative of a real B-tree implementation would hide the lesson under pointer code.
 
 ```go
 package idx
@@ -129,7 +142,11 @@ Notice that after sorting, all entries of workspace 1 are adjacent, and within t
 
 ### Step 2: seek by prefix
 
-**Concept.** Because the data is sorted by `(workspace, status, ...)`, all entries with one `(workspace, status)` pair form a single contiguous run. Finding a run needs only two binary searches: the first position at or after the key, and the first position after it. This is how a B-tree answers `WHERE workspace_id = ? AND status = ?` in logarithmic time ([[Indexing Fundamentals#Why column order matters: the leftmost-prefix rule]]). The code counts how many entries the comparison function touched, so the test can prove the claim with a number. The alternative, a linear loop, is the next step and is the baseline to beat.
+**Concept.** Because the data is sorted by `(workspace, status, ...)`, all entries with one `(workspace, status)` pair form a single contiguous run. Finding a run needs only two binary searches: the first position at or after the key, and the first position after it.
+
+This is how a B-tree answers `WHERE workspace_id = ? AND status = ?` in logarithmic time ([[Indexing Fundamentals#Why column order matters: the leftmost-prefix rule]]). The code counts how many entries the comparison function touched, so the test can prove the claim with a number.
+
+The alternative, a linear loop, is the next step and is the baseline to beat.
 
 ```go
 // SeekPrefix finds rows with WorkspaceID = ws AND Status = st using two binary
@@ -170,7 +187,11 @@ The arithmetic: log2(10,000) is about 13.3, so each search needs about 13 compar
 
 ### Step 3: scan by non-prefix
 
-**Concept.** Status alone is not a leftmost prefix. In the sorted order, entries with `status = 'overdue'` are scattered across every workspace, one small run per workspace. There is no single contiguous run to binary-search, so the only correct method is to look at every entry. This is the code version of "an index on `(workspace_id, status)` does not help a query on `status` alone" ([[Indexing Fundamentals#When the planner ignores your index]]). Real databases may use skip scan for this shape, but only when the leading column has few distinct values; this model shows the general case.
+**Concept.** Status alone is not a leftmost prefix. In the sorted order, entries with `status = 'overdue'` are scattered across every workspace, one small run per workspace.
+
+There is no single contiguous run to binary-search, so the only correct method is to look at every entry. This is the code version of "an index on `(workspace_id, status)` does not help a query on `status` alone" ([[Indexing Fundamentals#When the planner ignores your index]]).
+
+Real databases may use skip scan for this shape, but only when the leading column has few distinct values; this model shows the general case.
 
 ```go
 // ScanStatus finds rows with Status = st alone. Status is NOT a leftmost
@@ -200,7 +221,9 @@ func (c *Composite) ScanStatus(st string) (ids []int64, examined int) {
 
 ### Step 4: tree height from fan-out
 
-**Concept.** A B+tree page holds hundreds of entries, so each level multiplies capacity by the fan-out. The height is the number of levels, which is the number of page reads to find one entry ([[Indexing Fundamentals#Fan-out and tree height, step by step]]). The smallest height `h` with `fanout^h >= rows` is the answer; the loop multiplies until capacity covers the rows. A closed form with logarithms exists, but floating-point `math.Log` can be off by one at exact powers, so an integer loop is safer.
+**Concept.** A B+tree page holds hundreds of entries, so each level multiplies capacity by the fan-out. The height is the number of levels, which is the number of page reads to find one entry ([[Indexing Fundamentals#Fan-out and tree height, step by step]]).
+
+The smallest height `h` with `fanout^h >= rows` is the answer; the loop multiplies until capacity covers the rows. A closed form with logarithms exists, but floating-point `math.Log` can be off by one at exact powers, so an integer loop is safer.
 
 ```go
 // Height returns the number of B+tree levels needed to hold rows entries

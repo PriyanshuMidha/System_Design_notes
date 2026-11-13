@@ -9,7 +9,7 @@ sources:
   - "Anthropic Go SDK (github.com/anthropics/anthropic-sdk-go), v1.84.0"
   - "Yao et al., ReAct: Synergizing Reasoning and Acting in Language Models (ICLR 2023)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AI Agents and Agentic Workflows
@@ -24,13 +24,66 @@ updated: 2026-11-07
 > - Agents fail by looping, picking the wrong tool, or compounding a small early error into a large wrong final action — so every real agent needs stop conditions, least-privilege tools, and human approval before anything with a side effect.
 > - Autonomy is a spectrum, not a binary: a single tool call with a fixed next step is barely an agent; an open-ended loop that plans its own steps is a full agent, and most production systems sit somewhere between.
 
+## Start here: the basics
+
+**The problem in one story.**
+You ask a chatbot: "Find my last three orders and refund the broken one."
+One answer is not enough. It has to look up orders, read them, pick one, then call a refund system.
+Something has to decide those steps in order and stop when the job is done.
+An agent is a loop where the model picks the next step; a workflow is a sequence you wrote yourself.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| LLM | A model that reads text and writes the next text | GPT or Claude answering a question |
+| Prompt | All the text you send the model in one call | System rules + user question + past results |
+| Tool | A function your code exposes for the model to request | `getOrders(userID)` |
+| Tool call | The model's structured request to run a tool | `{"name":"getOrders","args":{"userID":42}}` |
+| Loop | Repeat: ask model, run tool, send result back | Up to 10 rounds, then stop |
+| Stop condition | A rule that ends the loop | Model says "done", or step limit hit |
+| Side effect | An action that changes the real world | Sending a refund or an email |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User goal"] --> M["Model decides<br/>next step"]
+    M -- "tool call" --> T["Your code<br/>runs the tool"]
+    T -- "result" --> M
+    M -- "done" --> A["Final answer"]
+```
+
+**Analogy.** A workflow is a recipe card: step 1, step 2, step 3. An agent is a cook who looks in the fridge, decides what to make, and keeps checking as they go.
+Where it breaks: a real cook remembers the kitchen; the model remembers nothing unless your code resends the history every call.
+
+**How the rest of this note builds up**
+
+- First, why agents exist (section 1) and the workflow vs agent mental model (section 2).
+- Then how the tool loop, memory and workflow patterns work (section 3), and a Go worked example (section 4).
+- Then variants, trade-offs and production concerns: stop conditions, least-privilege tools, human approval (sections 5-7).
+- Finally the SDE-3 deep dive and interview questions (sections 8-9).
+
+> [!tip] Remember
+> An agent is just a loop: the model asks for a tool, your code runs it, and you decide when the loop must stop.
+
 ## 1. Why it exists
 
-A chatbot answers from its context window. It cannot check today's inventory, issue a refund, or look two steps ahead at what a user's question will require. The first fix is a **workflow**: your code calls the model once to classify a support ticket, calls it again with a category-specific prompt, maybe calls it a third time to draft a reply. Every step is a function call you wrote; the LLM only fills in natural-language reasoning at each fixed point.
+A chatbot answers from its context window. It cannot check today's inventory, issue a refund, or look two steps ahead at what a user's question will require.
 
-That breaks down once the number of steps depends on the problem itself. "Issue a refund for order 42" might take one lookup, or five (find the order, check the return window, check for a prior refund, check the customer's dispute history, then act) depending on what the first lookup returns. Hard-coding every branch becomes a combinatorial mess. An **agent** hands that branching decision to the model: give it a `lookup_order` tool, a `check_refund_eligibility` tool, and an `issue_refund` tool, describe each one, and let the model call them in whatever order and however many times the situation requires, stopping when it has enough information to answer or act.
+The first fix is a **workflow**: your code calls the model once to classify a support ticket, calls it again with a category-specific prompt, maybe calls it a third time to draft a reply.
 
-The concrete cost of getting this wrong is real: Anthropic's own engineering guidance reports that teams who reach for a full autonomous agent before a simpler workflow would do routinely end up with something slower, more expensive, and harder to debug than the workflow would have been — "use the simplest pattern that solves the problem" is advice from running into this repeatedly, not a hedge.
+Every step is a function call you wrote; the LLM only fills in natural-language reasoning at each fixed point.
+
+That breaks down once the number of steps depends on the problem itself. "Issue a refund for order 42" might take one lookup, or five (find the order, check the return window, check for a prior refund, check the customer's dispute history, then act) depending on what the first lookup returns.
+
+Hard-coding every branch becomes a combinatorial mess.
+
+An **agent** hands that branching decision to the model: give it a `lookup_order` tool, a `check_refund_eligibility` tool, and an `issue_refund` tool, describe each one, and let the model call them in whatever order and however many times the situation requires, stopping when it has enough information to answer or act.
+
+The concrete cost of getting this wrong is real:
+
+Anthropic's own engineering guidance reports that teams who reach for a full autonomous agent before a simpler workflow would do routinely end up with something slower, more expensive, and harder to debug than the workflow would have been — "use the simplest pattern that solves the problem" is advice from running into this repeatedly, not a hedge.
 
 ## 2. Mental model
 
@@ -133,7 +186,9 @@ A single agent with too many tools and too broad a goal tends to confuse itself 
 - **Supervisor (orchestrator)**: one agent holds the overall goal and a small number of "call this other agent" tools, each wrapping a narrower specialist (a research agent, a coding agent, a billing agent). The supervisor decides which specialist to invoke and in what order, the same way it would decide which ordinary tool to call.
 - **Handoff**: a specialist agent, partway through its own loop, decides the request actually belongs to a different specialist and transfers control (and relevant context) directly, rather than bouncing back through the supervisor.
 
-Multi-agent setups cost more (more model calls, more context duplicated across agents) and add a new failure mode — information getting lost or distorted at the handoff boundary — so they earn their complexity only when a single agent's tool list and system prompt have genuinely become too broad to be reliable, not as a default architecture. Most tasks that look like they need "a team of agents" are better served by one agent with better tools, or by one of the five workflow patterns above.
+Multi-agent setups cost more (more model calls, more context duplicated across agents) and add a new failure mode — information getting lost or distorted at the handoff boundary — so they earn their complexity only when a single agent's tool list and system prompt have genuinely become too broad to be reliable, not as a default architecture.
+
+Most tasks that look like they need "a team of agents" are better served by one agent with better tools, or by one of the five workflow patterns above.
 
 ### Stop conditions
 
@@ -174,11 +229,15 @@ This is the same idea LangGraph's `interrupt()` formalizes as a first-class prim
 
 ### Tool design and MCP as the transport
 
-The tool-design rules — clear name, a description that says *when* to use it, a strict schema, predictable output, explicit error handling — are exactly the rules from [[Structured Outputs and Tool Calling]]; an agent is just that mechanism called in a loop instead of once. [[Model Context Protocol (MCP)]] standardizes how an agent *discovers and connects to* a set of tools (and resources, and prompts) exposed by a separate server, over a documented transport, instead of every team hand-rolling its own tool-registration format — it is a transport and discovery protocol for tools, not a different kind of tool-calling mechanism.
+The tool-design rules — clear name, a description that says *when* to use it, a strict schema, predictable output, explicit error handling — are exactly the rules from [[Structured Outputs and Tool Calling]]; an agent is just that mechanism called in a loop instead of once.
+
+[[Model Context Protocol (MCP)]] standardizes how an agent *discovers and connects to* a set of tools (and resources, and prompts) exposed by a separate server, over a documented transport, instead of every team hand-rolling its own tool-registration format — it is a transport and discovery protocol for tools, not a different kind of tool-calling mechanism.
 
 ## 4. Worked example
 
-A refund agent with one read-only tool (`lookup_order`) that auto-executes, and one side-effecting tool (`issue_refund`) that stops the loop for human approval — implementing the stop-conditions and human-in-the-loop sections above as code. It compiles and passes `go vet` and `go test -race` on Go 1.24, using the official Anthropic Go SDK and an `httptest` fake (there is no API key in this environment, so all "model" output below is representative, not a captured response).
+A refund agent with one read-only tool (`lookup_order`) that auto-executes, and one side-effecting tool (`issue_refund`) that stops the loop for human approval — implementing the stop-conditions and human-in-the-loop sections above as code.
+
+It compiles and passes `go vet` and `go test -race` on Go 1.24, using the official Anthropic Go SDK and an `httptest` fake (there is no API key in this environment, so all "model" output below is representative, not a captured response).
 
 ```go
 // Package agent shows a minimal ReAct-style tool-calling loop with two stop
@@ -646,3 +705,8 @@ ok  	agent	1.56s
 - **Before this:** [[Structured Outputs and Tool Calling]], [[LLM Fundamentals]]
 - **Next:** [[LangChain and LangGraph]], [[Model Context Protocol (MCP)]]
 - **Compare with:** [[Guardrails and LLM Security]] (constraining and auditing tool use), [[LLM Evals in Production]] (trajectory and task-success evaluation), [[OWASP API Security Top 10]] (excessive agency, broken object-level authorization apply to every tool an agent can call)
+
+### Watch on YouTube
+
+- [Agentic AI: Workflows vs. agents](https://www.youtube.com/watch?v=Qd6anWv0mv0) · Google Cloud Tech · 5 min · 138,453 views
+- [Agentic AI Frameworks Explained: Workflows, Multi-Agent, & Production](https://www.youtube.com/watch?v=ZVPlLaehjLk) · IBM Technology · 11 min · 140,322 views

@@ -8,13 +8,17 @@ related: ["[[Concurrency for LLD]]", "[[Repository and Unit of Work]]", "[[Locki
 sources:
   - "PostgreSQL 17 docs, SELECT: The Locking Clause (FOR UPDATE, SKIP LOCKED)"
   - "Go time package docs, Time.Date and Time.AddDate"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Library Management
 
 > [!summary] TL;DR
-> The library round is about one modelling split and three rules. A `Book` is the catalog title you search and reserve; a `BookCopy` is the physical item you borrow, hold or lose. Borrowing the last copy must be atomic, a returned copy is held for the first member in a FIFO queue (and the hold expires after N days), and fines count the library's calendar days late through a swappable strategy.
+> The library round is about one modelling split and three rules.
+>
+> A `Book` is the catalog title you search and reserve; a `BookCopy` is the physical item you borrow, hold or lose.
+>
+> Borrowing the last copy must be atomic, a returned copy is held for the first member in a FIFO queue (and the hold expires after N days), and fines count the library's calendar days late through a swappable strategy.
 
 > [!abstract] Core idea
 > - A `Book` is the title you search and reserve; a `BookCopy` is the physical item you borrow.
@@ -22,6 +26,53 @@ updated: 2026-11-02
 > - The one rule: borrowing the last copy is one atomic step, so exactly one member gets it.
 > - A returned copy is held for the first member in the FIFO reservation queue, and that hold expires after N days.
 > - Classic mistake: computing fines as `now.Sub(due) / 24h`, which charges nothing for 23 hours late; count calendar days instead.
+
+## Start here: the basics
+
+**The problem in one story.**
+A library owns 3 copies of a popular novel.
+Two members at two counters try to borrow the last copy at the same moment, while five others are waiting in line for it.
+When a copy comes back it should go to whoever asked first, and a late return should cost a fair fine.
+This note designs those rules so exactly one member gets each copy and nobody jumps the queue.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Book (title) | The catalog entry you search for | "Clean Code" by Robert C. Martin |
+| BookCopy | One physical item with its own barcode | Copy #2 of "Clean Code" |
+| Loan | A record that a member has a copy until a due date | Due in 14 days |
+| Reservation queue | First-come, first-served waiting list for a title | FIFO: first to reserve, first served |
+| Hold | A returned copy kept aside for the next member in line | Kept for a few days (`HoldDays`), then released |
+| Atomic | Happens as one step nobody can interrupt | Check-and-claim the last copy |
+| Strategy | A swappable rule behind an interface | `PerDayFine`: a fixed amount per day late |
+| Calendar day | A date on the library's calendar, not a 24-hour block | Due Mon, returned Tue morning = 1 day late |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Available
+    Available --> Issued: borrow
+    Issued --> Available: return, nobody waiting
+    Issued --> Held: return, queue not empty
+    Held --> Issued: first in queue borrows
+    Held --> Available: hold expires
+    Issued --> Lost: reported lost
+```
+
+**Analogy.** A copy is like a single table at a busy restaurant: one party sits at a time, and when it frees up the host calls the next name on the waiting list, who must show up soon or lose the spot.
+Where it breaks: a restaurant does not fine you for staying late, and a library title has several copies, so one queue feeds many "tables".
+
+**How the rest of this note builds up**
+
+- First, the problem statement and requirements (Step 1).
+- Then the `Book` versus `BookCopy` split, the copy states and the API (Steps 3-5).
+- Then storage: an atomic claim in SQL and the loan limit in one transaction (Step 6), and the fine strategy (Step 7).
+- Finally the code, tests, edge cases and the SDE-3 questions on concurrency, hold expiry and calendar-day fines (Step 8 onwards).
+
+> [!tip] Remember
+> Search and reserve titles, borrow copies; claim the last copy atomically, serve the queue in order, and count fines in calendar days.
 
 ## Problem statement
 
@@ -233,7 +284,11 @@ UPDATE loans SET returned_at = $2, fine_paise = $3
 WHERE copy_id = $1 AND returned_at IS NULL;
 ```
 
-Run the limit update, the copy claim and the loan insert in one transaction, so a failed claim rolls back the limit increment; the return transaction closes the loan and decrements `active_loans`. The SQL claim covers available copies only; a copy held for this member is claimed with `WHERE id = $1 AND status = 'held' AND held_for = $2`. Row-lock trade-offs live in [[Locking - Optimistic vs Pessimistic]].
+Run the limit update, the copy claim and the loan insert in one transaction, so a failed claim rolls back the limit increment.
+
+The return transaction closes the loan and decrements `active_loans`.
+
+The SQL claim covers available copies only; a copy held for this member is claimed with `WHERE id = $1 AND status = 'held' AND held_for = $2`. Row-lock trade-offs live in [[Locking - Optimistic vs Pessimistic]].
 
 ```go
 type BookRepo interface {
@@ -1012,3 +1067,8 @@ The key modelling decision is separating Book, the catalog entry by ISBN that yo
 - **Before this:** [[Vending Machine]], [[Strategy and Template Method]], [[Observer and Event Bus]]
 - **Next:** [[Meeting Room Scheduler]]
 - **Compare with:** [[Case Study - Notification System]] (the notifier at system scale), [[Concurrency for LLD]], [[Testing LLD Code]]
+
+### Watch on YouTube
+
+- [Google Interview Question Solved / Low Level Design of Library Management System - Part 1](https://www.youtube.com/watch?v=71W8QTdFWw8) · Soumyajit Bhattacharyay · 8 min · 48,963 views
+- [Library Management System LLD - Low Level Design](https://www.youtube.com/watch?v=fVqv4B8sG1s) · Reactify Labs · 21 min · 7,270 views

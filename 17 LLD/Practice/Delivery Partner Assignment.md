@@ -11,19 +11,69 @@ sources:
   - "Go 1.24 standard library docs: maps.Clone, errors.Join, sync.Mutex"
   - "H. W. Kuhn (1955), The Hungarian Method for the Assignment Problem; J. Munkres (1957), Algorithms for the Assignment and Transportation Problems"
   - "J. Edmonds and R. M. Karp (1972), Theoretical Improvements in Algorithmic Efficiency for Network Flow Problems; N. Tomizawa (1971): the O(n³) assignment algorithm"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Delivery Partner Assignment
 
 > [!summary] TL;DR
-> When an order is packed, find a free delivery rider near the store, **hold** them with an atomic compare-and-set (`available → busy`), and send an offer that expires in 20 seconds. On reject or timeout, free the rider and offer the next one; when nobody is left, widen the radius, then book a third-party logistics company (3PL), then park the order in a retry queue. The core rule for the code: decide under the lock, make network calls with no lock held, then re-check.
+> When an order is packed, find a free delivery rider near the store, **hold** them with an atomic compare-and-set (`available → busy`), and send an offer that expires in 20 seconds.
+>
+> On reject or timeout, free the rider and offer the next one; when nobody is left, widen the radius, then book a third-party logistics company (3PL), then park the order in a retry queue.
+>
+> The core rule for the code: decide under the lock, make network calls with no lock held, then re-check.
 
 > [!abstract] Core idea
 > - A rider can carry one order at a time, so claim a rider with compare-and-set (CAS: change `available` to `busy` only if it is still `available`). Two orders can never both win.
 > - An offer has a deadline. Reject or timeout frees the rider and the next candidate gets the offer; when nobody is left, widen the radius, then book a 3PL, then park the order for retry.
 > - The one rule: decide under the lock, make network calls (DB claim, 3PL) with no lock held, then re-check under the lock before saving.
 > - Classic mistake: calling the 3PL while holding the service mutex, so one slow vendor call freezes every accept and reject in the city.
+
+## Start here: the basics
+
+**The problem in one story.**
+A grocery order is packed and waiting at the store.
+Somebody has to carry it, so the app looks for a free rider nearby and asks "will you take this?".
+If the rider says no or does not answer, it asks the next one.
+The tricky part: two orders must never grab the same rider at the same moment.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Rider (delivery partner) | The person who carries the order | Rider 42 on a bike |
+| Offer | A "will you take this order?" message with a deadline | Expires in 20 s |
+| Compare-and-set (CAS) | Change a value only if it still has the value you expect | `available → busy` only if still `available` |
+| Radius search | Find things within a distance of a point | Riders within 1 km of the store |
+| 3PL | A third-party logistics company you can book as a backup | An outside courier |
+| Mutex / lock | Only one goroutine at a time may touch the protected data | `sync.Mutex` |
+| Injected clock | Code asks an interface for the time, so tests can fake it | Tests jump 20 s instantly |
+| Retry queue | A list of orders to try again later | Every 30-60 s |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    O["Order packed"] --> S["Find riders<br/>within 1 km"]
+    S --> C["Claim one<br/>(CAS)"]
+    C --> F["Send offer<br/>(20 s)"]
+    F -- "accept" --> A["Assigned"]
+    F -- "reject / timeout" --> S
+    S -- "nobody left" --> W["Wider radius,<br/>then 3PL,<br/>then retry queue"]
+```
+
+**Analogy.** A taxi dispatcher on the radio: call the nearest free cab, and if the driver says no, call the next one.
+Where it breaks: the radio dispatcher is one person, so two calls never collide; the app runs many searches at once, so it needs the atomic claim.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and Steps 1-4: requirements, actors, entities (offer versus assignment) and the state machines.
+- Then Steps 5-7: the APIs, storage (Postgres conditional updates, Redis GEO for live positions) and patterns.
+- Then Step 8 and the test cases: the Go code for claim, offer, reject, expiry and fallback, with no lock held during network calls.
+- Finally the SDE-3 depth: edge cases, cancel races, batched assignment with the Hungarian algorithm and the live location pipeline.
+
+> [!tip] Remember
+> Claim the rider atomically, offer with a deadline, and never hold a lock across a network call.
 
 ## Problem statement
 
@@ -60,9 +110,24 @@ Questions to ask, with the assumptions this design makes:
 - 3PL booking sync or async? *Sync booking API with an idempotency reference; status by webhook.*
 - Nobody at all? *1 km → 2 km → 3 km, then 3PL, then a retry queue every 30–60 s and an ops alert.*
 
-**Functional:** riders go online and offline and stream GPS; find the best available rider with a fresh location within 1 km, widening in steps; offer to one rider at a time and hold them meanwhile; on reject or timeout free the rider and never re-offer them this order; fall back to 3PL, then the retry queue; the customer cancels before assignment; the customer tracks the rider live.
+**Functional:**
 
-**Non-functional:** never two orders on one rider; assignment under 1–2 s excluding think time; location writes are the hot path (estimate: 10k riders × 1 ping per 4 s = 2.5k writes/s per city); skip riders whose last ping is older than 30 s; 3PL calls have a timeout, an idempotency key and a circuit breaker; timeouts testable with an injected clock.
+- Riders go online and offline and stream GPS
+- Find the best available rider with a fresh location within 1 km, widening in steps
+- Offer to one rider at a time and hold them meanwhile
+- On reject or timeout free the rider and never re-offer them this order
+- Fall back to 3PL, then the retry queue
+- The customer cancels before assignment
+- The customer tracks the rider live
+
+**Non-functional:**
+
+- Never two orders on one rider
+- Assignment under 1–2 s excluding think time
+- Location writes are the hot path (estimate: 10k riders × 1 ping per 4 s = 2.5k writes/s per city)
+- Skip riders whose last ping is older than 30 s
+- 3PL calls have a timeout, an idempotency key and a circuit breaker
+- Timeouts testable with an injected clock
 
 **Out of scope:** route optimisation, payouts, ratings, serviceability (checked at checkout), maps internals.
 
@@ -92,7 +157,11 @@ The use case to code: **Start → offer → Accept / Reject / expire**, ending i
 | `dispatchState` | order, phase, offerID, tried | Where one order is in dispatch, and who already said no |
 | `Fleet` | partners, staleAfter, clock | Live location and status (prod: Redis GEO + Postgres) |
 
-Two modelling insights. **Offer is separate from Assignment**: an order can have many offers (A rejected, B timed out, C accepted) but one assignment, and the offer rows give the "who said no" history and a clean answer to a late accept. **The order has a phase**: only the goroutine that moved an order to `searching` may advance it, so a reject and the expiry sweeper can never run two searches for one order.
+Two modelling insights.
+
+**Offer is separate from Assignment**: an order can have many offers (A rejected, B timed out, C accepted) but one assignment, and the offer rows give the "who said no" history and a clean answer to a late accept.
+
+**The order has a phase**: only the goroutine that moved an order to `searching` may advance it, so a reject and the expiry sweeper can never run two searches for one order.
 
 ## Step 4: Relationships
 
@@ -301,7 +370,13 @@ GEOADD riders:available:blr 77.5946 12.9725 rider-42
 GEOSEARCH riders:available:blr FROMLONLAT 77.5946 12.9716 BYRADIUS 1 km ASC COUNT 20 WITHDIST
 ```
 
-A Redis sorted set holds no per-member TTL, so staleness needs its own record: a `rider:last_seen` sorted set scored by timestamp, trimmed by a sweeper that reads members older than 30 s with `ZRANGE ... BYSCORE` and `ZREM`s them from both sets. Alternatives are PostGIS `ST_DWithin` on a GiST index, or geohash or H3 cells where the search reads the store's cell plus its neighbours (see [[Geospatial Indexing]]). In the code below, `Fleet` plays both the partner repository and the location index in memory, and `OfferService` keeps offers in maps, the way [[Repository and Unit of Work]] swaps storage in tests. These are the production ports they stand in for (compiled with the package below):
+A Redis sorted set holds no per-member TTL, so staleness needs its own record: a `rider:last_seen` sorted set scored by timestamp, trimmed by a sweeper that reads members older than 30 s with `ZRANGE ... BYSCORE` and `ZREM`s them from both sets.
+
+Alternatives are PostGIS `ST_DWithin` on a GiST index, or geohash or H3 cells where the search reads the store's cell plus its neighbours (see [[Geospatial Indexing]]).
+
+In the code below, `Fleet` plays both the partner repository and the location index in memory, and `OfferService` keeps offers in maps, the way [[Repository and Unit of Work]] swaps storage in tests.
+
+These are the production ports they stand in for (compiled with the package below):
 
 ```go
 type PartnerRepository interface {
@@ -364,7 +439,15 @@ Not used: a Singleton `Fleet` (it is injected, so each test builds a fresh one),
 > **Talk through only (extensions):** `ThirdPartyProvider` and `PorterAdapter`, `RetryParked` and the parked queue, `Cancel` with undo of a claimed rider or 3PL trip, stale-location filtering, Redis GEO, and batched matching.
 
 > [!warning] No network call under the mutex
-> If `claimNearest` and then `bookThirdParty` → `CreateDelivery` ran while holding `OfferService.mu` (on the Start, Reject, ExpireDue and late-Accept paths), a 3PL call that takes 3 seconds would block every Accept and Reject for every order for 3 seconds. So every external call (the fleet claim, which is a DB update in production, and the 3PL call) runs with no lock held, in three steps: **decide** under the lock (snapshot the order and its tried set), **call** outside it, **re-check** under the lock (is the order still `searching`?) before storing the result. If the order was cancelled meanwhile, the code undoes its work: it frees the claimed rider or cancels the 3PL trip. See [[Concurrency for LLD]] for the general rule.
+> If `claimNearest` and then `bookThirdParty` → `CreateDelivery` ran while holding `OfferService.mu` (on the Start, Reject, ExpireDue and late-Accept paths), a 3PL call that takes 3 seconds would block every Accept and Reject for every order for 3 seconds.
+>
+> So every external call (the fleet claim, which is a DB update in production, and the 3PL call) runs with no lock held, in three steps:
+>
+> 1. **decide** under the lock (snapshot the order and its tried set),
+> 2. **call** outside it,
+> 3. **re-check** under the lock (is the order still `searching`?) before storing the result.
+>
+> If the order was cancelled meanwhile, the code undoes its work: it frees the claimed rider or cancels the 3PL trip. See [[Concurrency for LLD]] for the general rule.
 
 Complete package, Go 1.24, standard library only. `HaversineM` is the same function the [[Inventory Order Assignment (Dark Store)]] solution uses; in a real codebase both import it from one `geo` package instead of keeping two copies.
 
@@ -1311,7 +1394,19 @@ func TestCancelDuring3PLCallUndoesBooking(t *testing.T) {
 | Fairness between riders | Ranking adds idle time and earnings so far today |
 | Search latency | Precomputed geohash or H3 cells; query only the store's cell and its neighbours |
 
-**Batched assignment rounds.** Greedy dispatch takes orders one at a time and gives each the nearest free rider. That is simple, but a single round can be poor: order 1 takes rider A at 300 m, and order 2, for which A was the only rider within 1 km, falls back to a 3PL, although giving order 1 rider B at 400 m would have served both. A batch dispatcher collects orders and free riders for a short window (an estimate: 2–5 s), builds a cost matrix (distance or ETA, with a large penalty for "too far"), and solves it as an assignment problem. The Hungarian algorithm (Kuhn 1955, refined by Munkres 1957) finds the minimum-cost matching for an n × n cost matrix; when orders and riders differ in number, the matrix is padded with dummy rows or columns. Munkres's original version runs in O(n⁴); the shortest-augmenting-path form that libraries implement today runs in O(n³) (Edmonds and Karp 1972, Tomizawa 1971). At a few hundred orders per zone per round that is a few million to a few tens of millions of steps, well under a second (an estimate). The cost is extra waiting before the first offer, and a solver that must still claim each matched rider atomically, because riders change state during the round.
+**Batched assignment rounds.** Greedy dispatch takes orders one at a time and gives each the nearest free rider.
+
+That is simple, but a single round can be poor: order 1 takes rider A at 300 m, and order 2, for which A was the only rider within 1 km, falls back to a 3PL, although giving order 1 rider B at 400 m would have served both.
+
+A batch dispatcher collects orders and free riders for a short window (an estimate: 2–5 s), builds a cost matrix (distance or ETA, with a large penalty for "too far"), and solves it as an assignment problem.
+
+The Hungarian algorithm (Kuhn 1955, refined by Munkres 1957) finds the minimum-cost matching for an n × n cost matrix; when orders and riders differ in number, the matrix is padded with dummy rows or columns.
+
+Munkres's original version runs in O(n⁴); the shortest-augmenting-path form that libraries implement today runs in O(n³) (Edmonds and Karp 1972, Tomizawa 1971).
+
+At a few hundred orders per zone per round that is a few million to a few tens of millions of steps, well under a second (an estimate).
+
+The cost is extra waiting before the first offer, and a solver that must still claim each matched rider atomically, because riders change state during the round.
 
 Live location pipeline:
 
@@ -1341,13 +1436,25 @@ Tradeoffs chosen:
 - **Sync 3PL booking:** easy to reason about, and safe now that no lock is held; it still needs a short timeout so one vendor does not slow dispatch.
 - **Straight-line distance:** good enough inside 1–3 km; ETA drops in as a strategy.
 
-Common mistakes: checking "is the rider free?" and assigning in two separate steps; Haversine over every rider in the database per order instead of a geo index; one Postgres row per GPS ping; no staleness check; offers with no deadline, or accepting a late answer; a 3PL call with no timeout, idempotency key or circuit breaker; failing the order when nobody is within 1 km instead of widening; vendor SDK types leaking into the domain; and holding a lock across the 3PL call.
+Common mistakes:
+
+- Checking "is the rider free?" and assigning in two separate steps
+- Haversine over every rider in the database per order instead of a geo index
+- One Postgres row per GPS ping
+- No staleness check
+- Offers with no deadline, or accepting a late answer
+- A 3PL call with no timeout, idempotency key or circuit breaker
+- Failing the order when nobody is within 1 km instead of widening
+- Vendor SDK types leaking into the domain
+- Holding a lock across the 3PL call
 
 ## Drawing
 
 ![[Delivery Partner Assignment LLD Drawing.excalidraw]]
 
-The drawing has five sections: the entities and interfaces; the core flow (search 1 km → claim → offer → accept, with reject and timeout looping to the next rider, then the wider radius, the 3PL and the retry queue); the partner and offer state machines; the live location pipeline; and the storage tables with their key constraints. Redraw it from memory, then add the one thing it predates: the decide, call, re-check steps around the 3PL call.
+The drawing has five sections: the entities and interfaces; the core flow (search 1 km → claim → offer → accept, with reject and timeout looping to the next rider, then the wider radius, the 3PL and the retry queue); the partner and offer state machines; the live location pipeline; and the storage tables with their key constraints.
+
+Redraw it from memory, then add the one thing it predates: the decide, call, re-check steps around the 3PL call.
 
 - [ ] `Assigner` and `OfferService` in the middle, `Fleet` below, the two interfaces on the side
 - [ ] The fallback chain 1 km → 2 km → 3 km → 3PL → retry queue, with the reject and timeout loop back to "next rider"

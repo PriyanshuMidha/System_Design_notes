@@ -9,13 +9,22 @@ sources:
   - "Cormen, Leiserson, Rivest, Stein, Introduction to Algorithms (3rd ed.), ch. 12–13, 18"
   - "PostgreSQL 17 docs, Index Types (B-tree)"
   - "Linux kernel documentation, rbtree.rst"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Trees, BSTs and Balanced Trees - Go
 
 > [!summary] TL;DR
 > This code implements a plain binary search tree in Go — insert, search, delete (all three cases), height, four traversals, and the single/double rotations balanced trees build on — and tests that delete and rotation both preserve the BST property. See [[Trees, BSTs and Balanced Trees]] for the theory.
+
+## Before the code
+
+- **Pointer-linked structs** (`type Node struct { Left, Right *Node }`): each node points to its children; `nil` means "no child".
+- **Recursion** (`Insert`, `Delete`, `Height`, `InOrder`): each function handles one node and calls itself on a subtree.
+- **Returning the new root** (`root = Insert(root, k)`): insert, delete and rotations may change which node is on top, so callers reassign.
+- **Function arguments** (`visit func(int)`): traversals call back into your code for each key instead of building a list.
+- **A slice as a queue** (`LevelOrder`): breadth-first traversal appends children to the back and reads from the front.
+- **What to run:** `go vet ./... && go test -race ./...` inside the module; add `-v -run TestDeleteLeafOneChildTwoChildren` for one test.
 
 ## What this code shows
 

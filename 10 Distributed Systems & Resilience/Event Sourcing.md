@@ -12,7 +12,7 @@ sources:
   - "Amazon DynamoDB documentation: conditional writes, 400 KB item size limit, DynamoDB Streams"
   - "Axon Framework documentation: aggregate snapshots, upcasters"
   - "GDPR (Regulation (EU) 2016/679), Article 17: right to erasure"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Event Sourcing
@@ -26,6 +26,51 @@ updated: 2026-11-04
 > - Writes append with an **expected version**, so two concurrent writers cannot both succeed on stale state.
 > - Queries are served by projections (read models) built from the events, which makes event sourcing almost always paired with CQRS.
 > - Classic mistake: using Kafka alone as the event store. It cannot append "only if this invoice is still at version 7".
+
+## Start here: the basics
+
+**The problem in one story.**
+Your bank app shows a balance of ₹2,000.
+You ask "why?", and the bank shows the full statement: every deposit and withdrawal, in order.
+The balance is just the sum of that list.
+Event sourcing stores data the same way: keep the statement, compute the balance.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Event | A fact that already happened, named in past tense | `PaymentRecorded ₹30,000` |
+| Stream | The ordered list of events for one thing | All events of invoice INV-7 |
+| Aggregate | The one business object a stream belongs to | One invoice, one account |
+| Append-only | You only add to the end; never edit or delete | Like a bank statement |
+| Replay (fold) | Apply events in order to rebuild current state | Start at 0, add each payment |
+| Projection | A query table built from events | "Unpaid invoices by customer" |
+| Snapshot | A saved state at some version, to skip early events | State of INV-7 at version 500 |
+| Expected version | "Only append if the stream is still at version N" | Append at v8 only if current is v7 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    CMD["Command:<br/>record payment"] --> AGG["Load stream,<br/>replay, check rules"]
+    AGG --> ST["Event store:<br/>append event"]
+    ST --> PR["Projector"]
+    PR --> RM["Read model<br/>for queries"]
+    ST -. "replay" .-> AGG
+```
+
+**Analogy.** A chess game written as a list of moves. You can rebuild the board at any move by replaying from the start.
+Where it breaks: chess moves never change meaning, but business event formats evolve, so old events need upcasting.
+
+**How the rest of this note builds up**
+
+- First, why storing only current state loses history (section 1) and the mental model of state as a fold (section 2).
+- Then the command cycle, snapshots and how to design events (section 3).
+- Then a Go event-sourced invoice and the same store in PostgreSQL (section 4), and storage choices and neighbouring patterns like CQRS (section 5).
+- Finally the SDE-3 deep dive: upcasting, GDPR crypto-shredding, why Kafka alone is weak, ordering across projections and side effects in replay (sections 6-8).
+
+> [!tip] Remember
+> Store what happened, not what is; current state is just a replay of the events.
 
 ## 1. Why it exists
 
@@ -597,7 +642,11 @@ A common, sound design: PostgreSQL or EventStoreDB as the store, and Kafka as th
 
 ### Ordering and projections
 
-Within one stream, order is total. Across streams there is no meaningful order except the store's global position. Projectors that combine streams (a per-customer dashboard) must either follow the global position or tolerate events from different invoices arriving in any order, which works when their updates commute (sum, count). Projectors must be idempotent, because subscriptions deliver at least once (see [[Delivery Semantics and Exactly-Once]]).
+Within one stream, order is total. Across streams there is no meaningful order except the store's global position.
+
+Projectors that combine streams (a per-customer dashboard) must either follow the global position or tolerate events from different invoices arriving in any order, which works when their updates commute (sum, count).
+
+Projectors must be idempotent, because subscriptions deliver at least once (see [[Delivery Semantics and Exactly-Once]]).
 
 ### Side effects during replay
 
@@ -642,3 +691,8 @@ Replaying events must rebuild state, not resend emails or recharge cards. Keep s
 - **Before this:** [[CQRS]], [[Transactions and ACID]], [[Locking - Optimistic vs Pessimistic]], [[Event-Driven Architecture Basics]]
 - **Next:** [[Saga Pattern]], [[Practice/Digital Wallet and Ledger]], [[Event Schemas and Schema Registry]]
 - **Compare with:** [[Transactional Outbox and CDC]] (state stays the truth, events are notifications), [[Kafka and Event Streaming]] (a log for publishing, not an aggregate store)
+
+### Watch on YouTube
+
+- [What is the Event Sourcing Pattern? / Designing Event-Driven Microservices](https://www.youtube.com/watch?v=wPwD9CQAGsk) · Confluent, an IBM Company · 5 min · 36,439 views
+- [Event Sourcing 101: Event Sourcing vs. Event Streaming](https://www.youtube.com/watch?v=I3Mlt7GCeIU) · Confluent, an IBM Company · 3 min · 20,258 views

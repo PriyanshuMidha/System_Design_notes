@@ -8,7 +8,7 @@ sources:
   - "Docker docs, Build images (docs.docker.com/build)"
   - "Open Container Initiative, Image Format Specification v1.1 (github.com/opencontainers/image-spec)"
   - "Docker docs, docker history reference (docs.docker.com/reference/cli/docker/image/history)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 02 - Images, Layers and Containers
@@ -34,17 +34,67 @@ flowchart LR
 
 Think of the image as a sealed stack of transparencies, each one adding or changing some files on top of the one below. A container clips one more, blank transparency on top that you're allowed to write on — the stack underneath never changes.
 
+## Start here: the basics
+
+**The problem in one story.**
+You build your app into a 300 MB package and push it to ten servers.
+Next you change one line of code.
+Pushing another 300 MB to every server for one line would be slow and wasteful.
+Docker images are built from stacked layers, so only the changed layer travels.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Image | A read-only package of files and settings for an app | `golang:1.23` |
+| Layer | One read-only slice of files added by one build step | The layer from `COPY . .` |
+| Container | A running instance of an image, with its own writable layer | `docker run golang:1.23` |
+| Registry | A server that stores and shares images | Docker Hub, Amazon ECR |
+| Tag | A human-friendly, movable name for an image | `myapi:latest` |
+| Digest | An exact content hash that never changes | `sha256:9f86d0...` |
+| Hash | A short fingerprint computed from content | Same bytes always give the same hash |
+
+**Picture it**
+
+```mermaid
+flowchart BT
+    L1["Layer 1: base OS files"] --> L2["Layer 2: dependencies"]
+    L2 --> L3["Layer 3: your binary"]
+    L3 --> W1["Container A:<br/>thin writable layer"]
+    L3 --> W2["Container B:<br/>thin writable layer"]
+```
+
+**Analogy.** Transparent sheets stacked on an overhead projector: each sheet adds drawings, and you see the combined picture.
+A container adds one blank sheet on top that it can draw on.
+Where it breaks: you cannot truly erase a lower sheet; deleting a file in a later layer only hides it, the bytes still ship.
+
+**How the rest of this note builds up**
+
+- First, why layers exist and the image vs container mental model (sections 1-2).
+- Then how layers stack (union filesystem, copy-on-write) and tags vs digests (section 3).
+- Then a worked example, including one image running as many containers (section 4).
+- Finally variants, trade-offs and the SDE-3 production and deep-dive material.
+
+> [!tip] Remember
+> An image is a stack of read-only layers; a container is that stack plus one thin writable layer on top.
+
 ## 1. Why it exists
 
 Without layering, every image rebuild would re-upload and re-store the entire filesystem, even when only one file changed. Teams pushing images several times a day would pay for and wait on gigabytes of redundant transfer and storage every time, and two images sharing the same base (say, `golang:1.24-alpine`) would duplicate that base entirely on every host that pulled both.
 
-Concretely: a Go service's image is roughly 350 MB total, but around 320 MB of that is the Alpine base and Go runtime layers shared by every other Go service's image on the same registry and the same host. Docker stores and transfers each of those shared layers exactly once; only the remaining ~30 MB of application-specific layers differs per service. A CI pipeline redeploying the same service after a one-line code change re-pushes and re-pulls only the layer(s) that actually changed — typically a few megabytes, not the full 350 MB.
+Concretely: a Go service's image is roughly 350 MB total, but around 320 MB of that is the Alpine base and Go runtime layers shared by every other Go service's image on the same registry and the same host.
+
+Docker stores and transfers each of those shared layers exactly once; only the remaining ~30 MB of application-specific layers differs per service.
+
+A CI pipeline redeploying the same service after a one-line code change re-pushes and re-pulls only the layer(s) that actually changed — typically a few megabytes, not the full 350 MB.
 
 ## 2. Mental model
 
 An **image** is a recipe already baked into a stack of read-only ingredients: you can't eat off it (run it as a process) directly, but you can make as many identical cakes (containers) from it as you want, and baking a second cake never disturbs the recipe.
 
-A **container** is one specific cake you can still poke at: it has the full baked stack underneath (read-only) plus a plate you're free to put crumbs, icing, or a bite mark on (the writable layer). Throwing that cake away and baking a fresh one from the same recipe gets you back to the exact same starting stack — nothing you did to the plate persists.
+A **container** is one specific cake you can still poke at: it has the full baked stack underneath (read-only) plus a plate you're free to put crumbs, icing, or a bite mark on (the writable layer).
+
+Throwing that cake away and baking a fresh one from the same recipe gets you back to the exact same starting stack — nothing you did to the plate persists.
 
 ## 3. How it works
 
@@ -77,7 +127,11 @@ flowchart LR
     READ["Process reads an unchanged file"] --> LOWER
 ```
 
-Reading a file the image already shipped is served straight from the read-only lower layers. Writing a file — even editing one byte of an existing file — triggers **copy-on-write**: overlay2 copies that whole file up into the writable `upperdir` first, then applies the change there. The original in the image is never touched, which is exactly why many containers can share one image's layers safely and why removing a container (`docker rm`) only discards its `upperdir` — the image underneath is unaffected and ready for the next container.
+Reading a file the image already shipped is served straight from the read-only lower layers.
+
+Writing a file — even editing one byte of an existing file — triggers **copy-on-write**: overlay2 copies that whole file up into the writable `upperdir` first, then applies the change there.
+
+The original in the image is never touched, which is exactly why many containers can share one image's layers safely and why removing a container (`docker rm`) only discards its `upperdir` — the image underneath is unaffected and ready for the next container.
 
 ### Tags vs. digests
 
@@ -126,7 +180,11 @@ flowchart TD
 
 Running `docker run` three times against the same image produces three independent processes, each with its own writable layer, network identity, and lifecycle — stopping or removing `web-1` has no effect on `web-2`, `worker-1`, or the shared image.
 
-A container is not just storage — it is a **process**. Its main process (the image's `CMD`/`ENTRYPOINT`) becomes **PID 1** inside the container's own PID namespace, receives `SIGTERM` directly when the container is asked to stop (see [[Docker 03 - CLI Essentials]]), and its exit code becomes the container's own exit code, visible in `docker ps -a`. That exit code is what tells `web-1` apart from a container that's still alive: "container" names a running (or exited) process plus its writable layer, while "image" names only the inert bytes it was started from.
+A container is not just storage — it is a **process**.
+
+Its main process (the image's `CMD`/`ENTRYPOINT`) becomes **PID 1** inside the container's own PID namespace, receives `SIGTERM` directly when the container is asked to stop (see [[Docker 03 - CLI Essentials]]), and its exit code becomes the container's own exit code, visible in `docker ps -a`.
+
+That exit code is what tells `web-1` apart from a container that's still alive: "container" names a running (or exited) process plus its writable layer, while "image" names only the inert bytes it was started from.
 
 **Image vs. container, side by side:**
 
@@ -207,3 +265,8 @@ A container is not just storage — it is a **process**. Its main process (the i
 - **Before this:** [[Docker 01 - Why Containers]]
 - **Next:** [[Docker 03 - CLI Essentials]], [[Docker 04 - Writing a Production Dockerfile for Go]]
 - **Compare with:** [[Docker 08 - How Docker Works Under the Hood]] (overlay2 and the rest of the runtime stack in full depth)
+
+### Watch on YouTube
+
+- [Docker Images & Containers Explained / Layers, Registries & Pulling Images](https://www.youtube.com/watch?v=QQkgHJp2C3M) · TechOps Tutorials · 30 min · 258 views
+- [#578 Containers Explained: Docker Images, Containers and Layers](https://www.youtube.com/watch?v=LeGlK6VyE_Y) · LetsLearn AI · 8 min · 2 views

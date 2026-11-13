@@ -15,13 +15,22 @@ sources:
   - "PostgreSQL 17 docs, pg_trgm, btree_gist, pgstattuple modules; Monitoring Statistics (pg_stat_user_indexes)"
   - "MySQL 8.0 Reference Manual, Skip Scan Range Access Method (8.0.13), Functional Key Parts (8.0.13), Invisible Indexes"
   - "MongoDB Manual, Index Types (compound, multikey, wildcard, TTL); The ESR (Equality, Sort, Range) Guideline"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Index Types and Index Design - Go
 
 > [!summary] TL;DR
 > This note implements a small checker for B-tree index design: given an index key and a query shape, `Analyze` reports how many leading columns the query can seek on and whether the index already returns rows in `ORDER BY` order, and `ESR` proposes a key using the equality–sort–range rule. The concepts are explained in [[Index Types and Index Design]].
+
+## Before the code
+
+- **Structs and slices** (`Col`, `Query`, `[]Col`): an index is just an ordered list of columns with a sort direction.
+- **Maps as sets** (`map[string]bool`): track which columns are fixed by equality filters.
+- **Pure functions** (`ESR`, `Analyze`): no I/O and no state, so each one is easy to test in isolation.
+- **Table-driven tests**: a slice of cases, each with an index, a query and the expected result.
+- **`reflect.DeepEqual`**: compares whole slices and structs in the tests.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the `idx` module.
 
 ## What this code shows
 
@@ -70,7 +79,11 @@ flowchart TD
 
 ### Step 1: describe the query and the index
 
-**Concept.** The theory note reduces any hot query to three facts: which columns are compared with `=`, which one column carries a range, and what `ORDER BY` asks for ([[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]). The code mirrors exactly those three facts in a `Query` struct, so a query is data, not SQL text. An alternative would be to parse real SQL or call `EXPLAIN`, but that needs a database and hides the rule being taught. An index is just an ordered `[]Col`, because a multicolumn B-tree is defined by its column order and directions and nothing else matters for this check.
+**Concept.** The theory note reduces any hot query to three facts: which columns are compared with `=`, which one column carries a range, and what `ORDER BY` asks for ([[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]).
+
+The code mirrors exactly those three facts in a `Query` struct, so a query is data, not SQL text. An alternative would be to parse real SQL or call `EXPLAIN`, but that needs a database and hides the rule being taught.
+
+An index is just an ordered `[]Col`, because a multicolumn B-tree is defined by its column order and directions and nothing else matters for this check.
 
 ```go
 package idx
@@ -112,7 +125,11 @@ Before and after for the running example, the invoice list API `WHERE workspace_
 
 ### Step 2: propose a key with ESR
 
-**Concept.** This implements the equality, sort, range ordering from [[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]. Equality columns go first so the matching entries form one contiguous run. Sort columns go next so that run is already in `ORDER BY` order. The range column goes last because a range run is not ordered by anything after it. The function is a pure transformation with no search, which is why it is short; a cost-based advisor would try many orders, but ESR gives a good answer in one pass.
+**Concept.** This implements the equality, sort, range ordering from [[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]. Equality columns go first so the matching entries form one contiguous run. Sort columns go next so that run is already in `ORDER BY` order.
+
+The range column goes last because a range run is not ordered by anything after it.
+
+The function is a pure transformation with no search, which is why it is short; a cost-based advisor would try many orders, but ESR gives a good answer in one pass.
 
 ```go
 // ESR proposes a B-tree key for q: equality columns, then sort columns,
@@ -156,7 +173,13 @@ Trace for equality `workspace_id, status`, range `amount_minor`, sort `due_date 
 
 ### Step 3: count the seek columns
 
-**Concept.** `Analyze` implements the leftmost-prefix rule ([[Index Types and Index Design#4.1 Column order against three queries]]): a B-tree can only seek on a prefix of its key. The walk stops at the first index column that is not in the equality set, and one more column counts if it is the range column. The code deliberately has no skip scan, which PostgreSQL 18 and MySQL 8.0.13 added for some cases, because the rule without it is the one every engine guarantees. The alternative of modelling skip scan would need cardinality estimates, which a pure shape check does not have.
+**Concept.** `Analyze` implements the leftmost-prefix rule ([[Index Types and Index Design#4.1 Column order against three queries]]): a B-tree can only seek on a prefix of its key.
+
+The walk stops at the first index column that is not in the equality set, and one more column counts if it is the range column.
+
+The code deliberately has no skip scan, which PostgreSQL 18 and MySQL 8.0.13 added for some cases, because the rule without it is the one every engine guarantees.
+
+The alternative of modelling skip scan would need cardinality estimates, which a pure shape check does not have.
 
 ```go
 // Analyze applies the leftmost-prefix rule (no skip scan).
@@ -197,7 +220,11 @@ flowchart LR
 
 ### Step 4: decide whether the sort is free
 
-**Concept.** The theory note says a forward or a fully backward scan of the index serves `ORDER BY`, but mixed directions do not ([[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]). `sortMatches` encodes that. It first removes `ORDER BY` columns that equality has pinned, since every row in the run has the same value for them. Then it checks that the remaining sort columns are a prefix of what is left of the index and that the directions are all the same or all flipped. A simpler check, comparing names only, would wrongly approve mixed directions.
+**Concept.** The theory note says a forward or a fully backward scan of the index serves `ORDER BY`, but mixed directions do not ([[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]). `sortMatches` encodes that.
+
+It first removes `ORDER BY` columns that equality has pinned, since every row in the run has the same value for them.
+
+Then it checks that the remaining sort columns are a prefix of what is left of the index and that the directions are all the same or all flipped. A simpler check, comparing names only, would wrongly approve mixed directions.
 
 ```go
 // sortMatches reports whether rest (the index after its equality prefix)
@@ -342,7 +369,9 @@ func TestESR(t *testing.T) {
 }
 ```
 
-**What a failure means.** A `DeepEqual` failure means the order of equality, sort and range in `ESR` is wrong. A failure on the second check, with a correct key, means `Analyze` and `ESR` disagree about what counts as a seek column. Note that `SeekCols` is 2, not 3: the range column sits after `due_date`, so the sort column breaks the prefix, which is the intended price of serving the sort.
+**What a failure means.** A `DeepEqual` failure means the order of equality, sort and range in `ESR` is wrong. A failure on the second check, with a correct key, means `Analyze` and `ESR` disagree about what counts as a seek column.
+
+Note that `SeekCols` is 2, not 3: the range column sits after `due_date`, so the sort column breaks the prefix, which is the intended price of serving the sort.
 
 ## Running it
 

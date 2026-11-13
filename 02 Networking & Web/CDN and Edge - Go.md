@@ -11,13 +11,21 @@ sources:
   - "Fastly docs, Request collapsing and shielding"
   - "AWS docs, Amazon CloudFront key concepts"
   - "RFC 9111, HTTP Caching"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # CDN and Edge - Go
 
 > [!summary] TL;DR
 > This code is a miniature **origin shield**: a `Shield` type that collapses concurrent cache misses on the same key into one call to a backing fetcher, so a mass TTL expiry at a real CDN turns into one origin request instead of one per concurrent caller. See the theory in [[CDN and Edge]].
+
+## Before the code
+
+- **Goroutines**: functions running concurrently (`go f()`); the tests start 100 at once to simulate a burst of cache misses.
+- **`sync.Mutex`**: a lock so only one goroutine touches the `inFlight` map at a time.
+- **Channels (`chan struct{}`)**: closing a channel wakes every goroutine waiting on it, which is how one result is broadcast to all waiters.
+- **Maps**: `map[string]*call` tracks which cache keys already have a fetch running.
+- **What to run**: `go vet ./...` and `go test -race ./...` (the race detector checks for unsafe shared memory).
 
 ## What this code shows
 
@@ -75,7 +83,11 @@ func New(fetch Fetcher) *Shield {
 }
 ```
 
-**Concept.** This implements the shield box in [[CDN and Edge#Request collapsing and the origin shield]]: a map from cache key to "a fetch is already happening for this key." The alternative design would be a mutex per key held for the whole fetch duration, but that forces every waiter to block on a lock rather than a channel, and gives no easy way to count how many callers actually shared one fetch — which is exactly what the test below needs to prove collapsing happened. A `sync.Map` was also considered, but a plain map plus one `sync.Mutex` is simpler here because every access already needs the mutex for the waiter count, so a lock-free map buys nothing.
+**Concept.** This implements the shield box in [[CDN and Edge#Request collapsing and the origin shield]]: a map from cache key to "a fetch is already happening for this key."
+
+The alternative design would be a mutex per key held for the whole fetch duration, but that forces every waiter to block on a lock rather than a channel, and gives no easy way to count how many callers actually shared one fetch — which is exactly what the test below needs to prove collapsing happened.
+
+A `sync.Map` was also considered, but a plain map plus one `sync.Mutex` is simpler here because every access already needs the mutex for the waiter count, so a lock-free map buys nothing.
 
 **How it works.**
 1. `Fetcher` is the shape of "go ask the origin" — kept as a type so the shield has no idea whether `fetch` means an HTTP call, a database read, or anything else.
@@ -113,7 +125,9 @@ func (s *Shield) Get(key string) (value []byte, shared int, err error) {
 }
 ```
 
-**Concept.** This is the section [[CDN and Edge#Request collapsing and the origin shield]] describes as "the PoP recognizes a fetch is already in flight and makes every other caller wait." The alternative of using a `sync.WaitGroup` per key was rejected because a `WaitGroup` carries no result value back to the waiters — a closed channel plus fields read only after the channel closes is the idiomatic Go way to broadcast one result to many goroutines.
+**Concept.** This is the section [[CDN and Edge#Request collapsing and the origin shield]] describes as "the PoP recognizes a fetch is already in flight and makes every other caller wait."
+
+The alternative of using a `sync.WaitGroup` per key was rejected because a `WaitGroup` carries no result value back to the waiters — a closed channel plus fields read only after the channel closes is the idiomatic Go way to broadcast one result to many goroutines.
 
 **How it works.**
 1. The mutex is held only long enough to check the map and either register a waiter or create a new `call` — never across the actual fetch, so unrelated keys never block on each other.
@@ -270,7 +284,9 @@ Once all 100 goroutines have had a chance to register as waiters, the test relea
 
 ### TestNewFetchAfterInFlightCompletes
 
-**Property proved:** collapsing is temporary. Once a fetch finishes and its entry is removed from `inFlight`, the next caller for the same key is a genuine cache miss again, not an accidental join onto a stale call. Without this property, a key would permanently share its very first fetch's result forever, which is wrong — a shield must still eventually ask the origin again on the next real miss.
+**Property proved:** collapsing is temporary. Once a fetch finishes and its entry is removed from `inFlight`, the next caller for the same key is a genuine cache miss again, not an accidental join onto a stale call.
+
+Without this property, a key would permanently share its very first fetch's result forever, which is wrong — a shield must still eventually ask the origin again on the next real miss.
 
 | Input | Expected output |
 | --- | --- |
@@ -312,7 +328,9 @@ PASS
 ok  	cdn	1.555s
 ```
 
-Reading it line by line: `go vet` printed nothing, meaning no suspicious constructs (unreachable code, wrong `Printf` verbs, lock-copying) were found. Both tests ran under `-race`, Go's data-race detector, which instruments every memory access and would fail the build if two goroutines touched the same memory without synchronization — passing here is the actual proof that the mutex-and-channel design has no race, not just that the assertions happened to pass.
+Reading it line by line: `go vet` printed nothing, meaning no suspicious constructs (unreachable code, wrong `Printf` verbs, lock-copying) were found.
+
+Both tests ran under `-race`, Go's data-race detector, which instruments every memory access and would fail the build if two goroutines touched the same memory without synchronization — passing here is the actual proof that the mutex-and-channel design has no race, not just that the assertions happened to pass.
 
 ## Pitfalls in the code
 

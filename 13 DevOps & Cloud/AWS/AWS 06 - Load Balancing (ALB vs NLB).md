@@ -8,7 +8,7 @@ sources:
   - "AWS Elastic Load Balancing, Application Load Balancers User Guide"
   - "AWS Elastic Load Balancing, Network Load Balancers User Guide"
   - "AWS Elastic Load Balancing, Target groups for your Application Load Balancers"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # AWS 06 - Load Balancing (ALB vs NLB)
@@ -22,9 +22,58 @@ updated: 2026-11-07
 > - A target's health state is its own small state machine: `HealthyThreshold`/`UnhealthyThreshold` consecutive passes/fails, independent of which algorithm picked it.
 > - Deregistration delay is what makes a rolling deployment or scale-in safe: a draining target keeps serving in-flight connections for a grace period before it is removed.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your API runs as 6 copies on different machines, so one crash should not take the site down.
+But users type one address, not six, and someone has to pick which copy answers each request.
+If a copy dies, traffic must stop going to it within seconds.
+A load balancer is that single front door that spreads requests over healthy copies.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Load balancer | One entry point that spreads traffic across many servers | `api.example.com` → 6 tasks |
+| Target | One backend that can receive traffic | An ECS task's IP on port 8080 |
+| Target group | A named set of targets plus their health-check rules | `orders-api-tg` |
+| Health check | A periodic probe to see if a target is OK | `GET /readyz` every 10 s |
+| Layer 7 (L7) | Understands the HTTP request itself | Route `/images/*` elsewhere |
+| Layer 4 (L4) | Only sees connections: IPs, ports, TCP/UDP | Forward any TCP on port 443 |
+| TLS termination | Decrypting HTTPS at the load balancer | ALB holds the certificate |
+| Draining | Letting a target finish current requests before removal | 30 s grace during a deploy |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Clients"] --> LB{"Load balancer<br/>ALB (L7) or NLB (L4)"}
+    LB --> TG["Target group<br/>+ health checks"]
+    TG --> A["Task A ✓"]
+    TG --> B["Task B ✓"]
+    TG -.->|"no traffic"| X["Task C ✗ unhealthy"]
+```
+
+**Analogy.** An ALB is a receptionist who reads each letter before choosing a department; an NLB is a mail sorter who looks only at the envelope and forwards it fast.
+Where it breaks: a receptionist handles one letter at a time, while both load balancers scale out across many nodes automatically.
+
+**How the rest of this note builds up**
+
+- First, why managed load balancing exists (section 1) and the two-receptionists mental model (section 2).
+- Then how listeners, target groups, health checks and deregistration delay work (section 3).
+- Then a Go health-check state machine you can test (section 4), and ALB vs NLB vs others (section 5).
+- Finally the SDE-3 view: trade-offs, production practice, client IP preservation deep dive and interview questions (sections 6-9).
+
+> [!tip] Remember
+> ALB for HTTP-aware routing, NLB for raw connections and static IPs; both send traffic only to healthy targets in a target group.
+
 ## 1. Why it exists
 
-An ECS service with 6 tasks across 2 AZs needs one stable entry point that clients and DNS can point at, one place to terminate TLS (or not), and one place to decide which of those 6 tasks gets each new request or connection. AWS could ask every team to run their own load-balancing software (HAProxy, Envoy, Nginx) on EC2, but that means patching it, scaling it, and making it highly available — undifferentiated work every team would otherwise duplicate. Elastic Load Balancing is a managed, horizontally-scaling product that does this instead, and AWS offers two shapes of it because HTTP-aware routing and raw-connection throughput have genuinely different implementations and trade-offs.
+An ECS service with 6 tasks across 2 AZs needs one stable entry point that clients and DNS can point at, one place to terminate TLS (or not), and one place to decide which of those 6 tasks gets each new request or connection.
+
+AWS could ask every team to run their own load-balancing software (HAProxy, Envoy, Nginx) on EC2, but that means patching it, scaling it, and making it highly available — undifferentiated work every team would otherwise duplicate.
+
+Elastic Load Balancing is a managed, horizontally-scaling product that does this instead, and AWS offers two shapes of it because HTTP-aware routing and raw-connection throughput have genuinely different implementations and trade-offs.
 
 ## 2. Mental model
 
@@ -292,3 +341,7 @@ func TestBecomesUnhealthyAfterThresholdFailures(t *testing.T) {
 - **Before this:** [[AWS 05 - ECS, Fargate and ECR]], [[Load Balancing]]
 - **Next:** [[AWS 09 - Route 53 and ACM]], [[Autoscaling]]
 - **Compare with:** [[Forward and Reverse Proxies - L4 vs L7]] (the general L4/L7 distinction this note applies to AWS's products), [[TLS and HTTPS]] (what ALB terminates and NLB can pass through)
+
+### Watch on YouTube
+
+- [AWS Elastic Load Balancing Explained / ALB vs NLB vs GLB Features & Use Cases / Uplatz](https://www.youtube.com/watch?v=k_COzzYvxYU) · Uplatz · 5 min · 180 views

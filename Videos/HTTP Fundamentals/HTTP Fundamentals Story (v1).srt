@@ -1,0 +1,360 @@
+1
+00:00:02,399 --> 00:00:18,114
+Narrator: Lunch rush at the H T T P counter. A hundred customers, and one clerk, Max, who forgets every customer the moment they walk away. Zoe, a new customer, only wants to see her orders. Max has until two o'clock to survive the rush, without mixing up a single order.
+
+2
+00:00:18,544 --> 00:00:34,497
+Narrator: Zoe taps, my orders, on her phone. Her phone has to ask a faraway computer for the list, and the computer has to answer. The two were built by different people, in different languages. H T T P is the shared set of rules that lets any app ask, and any server answer.
+
+3
+00:00:34,927 --> 00:00:49,634
+Narrator: Level one, the words. The client is the program that asks, a browser, or a Go H T T P client. The server is the program that answers. A request is one message from the client. A response is the server's reply to that one request.
+
+4
+00:00:50,064 --> 00:01:09,018
+Narrator: A header is a name and value line of extra information, like content type, application slash json. The body is the actual data carried by a message. A status code is a three digit number saying what happened. Four oh four means not found. And a cookie is a small value the browser stores, and sends back every time.
+
+5
+00:01:09,447 --> 00:01:22,834
+Narrator: Think of ordering at a restaurant counter. You say what you want, that is the method and the path. You add notes like, no onions, those are headers. And you get a tray back, with a receipt saying done, or sold out. That is the status code.
+
+6
+00:01:23,263 --> 00:01:32,834
+Max: I am Max, the counter clerk. And I forget you the moment you walk away. Every time, you must tell me everything again.
+
+7
+00:01:33,263 --> 00:01:45,498
+Narrator: Remember it like this. H T T P is asking with a method and a path, and being answered with a status code. And nothing is remembered between requests, unless a cookie or a token carries it.
+
+8
+00:01:48,447 --> 00:01:58,762
+Narrator: Imagine every website invented its own private way of asking for a page, and its own private way of saying, found it, or not found. A browser built for one site could not talk to any other.
+
+9
+00:01:59,191 --> 00:02:25,514
+Narrator: Before H T T P, every service that served documents over a network invented its own protocol. H T T P, the hypertext transfer protocol, standardised the exchange into one shape. First defined in R F C nineteen forty five, now specified across R F C ninety one ten to ninety one fourteen. A browser from nineteen ninety six and a Go server written today still agree on what, get slash index dot H T M L, means.
+
+10
+00:02:25,943 --> 00:02:44,921
+Narrator: An example. A client calls post slash orders. It needs a way to say what kind of operation this is, create something. And the server needs a way to say what happened. Created, two oh one. Rejected, four hundred. The server broke, five hundred. All without the client learning a custom error format for every backend.
+
+11
+00:02:45,352 --> 00:02:52,713
+Narrator: So H T T P's whole job is to be a vocabulary every client and every server already agree on, so nobody invents their own.
+
+12
+00:02:55,663 --> 00:03:12,289
+Narrator: The mental model. A request is a short, structured letter. The first line says what you want, and from where. A block of headers gives context. Who you are, which formats you accept, whether you already hold a cached copy. And an optional body carries data for the server to act on.
+
+13
+00:03:12,719 --> 00:03:20,873
+Narrator: The response mirrors it. A status line says what happened. Headers describe the reply. And an optional body carries the result.
+
+14
+00:03:21,304 --> 00:03:34,954
+Narrator: The clerk has no memory of you from your last visit. That is called statelessness, and it is part of the design, not an accident. Anything that must persist, a login, a shopping cart, has to ride along on every request, usually in a cookie or a token.
+
+15
+00:03:35,383 --> 00:03:50,138
+Narrator: A common mistake. Thinking the server remembers you because the connection stayed open. The T C P connection may persist, but H T T P itself carries no memory across requests. The server knows only what this exact request tells it.
+
+16
+00:03:50,568 --> 00:03:58,169
+Narrator: And that is the gift of statelessness. Every request is understandable on its own, so any server in a pool can answer any request.
+
+17
+00:04:01,120 --> 00:04:15,825
+Narrator: Level two. Here is a real exchange, measured against a local Go server with curl. The request says, get slash items slash one, H T T P one point one. Then a host header, a user agent header, and an accept header.
+
+18
+00:04:16,255 --> 00:04:35,641
+Narrator: The reply starts with a status line. H T T P one point one, two hundred, O K. Then headers. Cache control, max age sixty. Content type, application slash json. An E tag. A date. And content length, twenty six. Then a blank line, and the body, a small piece of J S O N.
+
+19
+00:04:36,072 --> 00:04:43,865
+Narrator: The arrows in curl's output show who said what. A greater than sign is what curl sent. A less than sign is what the server replied.
+
+20
+00:04:46,815 --> 00:04:59,410
+Narrator: Incident one, twelve fifteen. A customer's payment screen froze, so the app sent the order again. The till shows two charges for one lunch. Max has to work out why, before the next customer pays.
+
+21
+00:04:59,839 --> 00:05:15,649
+Narrator: Now methods. Two separate promises hide behind every method's name. Safe means the method never changes server state, so a crawler, a prefetcher, or the back button can call it freely. Idempotent means calling it many times has the same effect on server state as calling it once.
+
+22
+00:05:16,079 --> 00:05:27,978
+Pat: I am Pat, a crawler. I only ever ask safe questions. Get, head, options. I visit thousands of pages, and I never change anything.
+
+23
+00:05:28,408 --> 00:05:47,434
+Narrator: Here is the table. Get, head and options are safe, and idempotent. Put replaces a resource entirely, and delete removes it. Both are idempotent, but not safe. Post creates something, or triggers a side effect. It is neither, so a retry can create a duplicate. And patch is usually not idempotent.
+
+24
+00:05:47,863 --> 00:06:03,697
+Narrator: The trap hides in patch. Patch with status equals shipped is harmless to repeat. But patch with a relative change, decrement stock by one, runs twice and removes two. The method's name does not decide idempotency. The meaning of the operation does.
+
+25
+00:06:04,127 --> 00:06:19,434
+Narrator: And a classic mistake. Idempotent does not mean the response is identical every time. It means the end state is the same. A second delete of an item can return four oh four, instead of two oh four, and it is still idempotent, because the item is gone either way.
+
+26
+00:06:19,863 --> 00:06:30,129
+Narrator: This is why operations that must survive client retries, like creating a payment or placing an order, need an explicit idempotency key. The method alone is not enough.
+
+27
+00:06:33,079 --> 00:06:47,185
+Narrator: Incident two, twelve forty five. Complaints pile up at the counter. Not found. Not allowed. Bad request. Kitchen too slow. Every customer got a different number, and nobody knows what the numbers mean.
+
+28
+00:06:47,615 --> 00:07:03,233
+Narrator: Status codes fall into five families, by their first digit. Two hundreds mean success. Three hundreds mean redirection or not modified. Four hundreds mean the client did something wrong. Five hundreds mean the server broke. The family tells you who should act next.
+
+29
+00:07:03,663 --> 00:07:19,737
+Narrator: Now the pairs people mix up. Four oh one versus four oh three. Four oh one means you are not authenticated. Missing or invalid credentials. It says, log in. Four oh three means you are authenticated, but not authorised. I know who you are, and the answer is still no.
+
+30
+00:07:20,168 --> 00:07:32,185
+Narrator: Do not treat them as, logged in or not. A perfectly logged in user who hits an admin only route with a normal token gets four oh three, not four oh one. Their credentials are valid, just not enough.
+
+31
+00:07:32,615 --> 00:07:47,370
+Narrator: Four hundred versus four twenty two. Four hundred means the request is malformed. Broken J S O N, a wrong type, a missing field. Four twenty two means it was understood perfectly, but fails a business rule. An end date before a start date.
+
+32
+00:07:47,800 --> 00:07:58,954
+Narrator: Four oh nine, conflict, is about state. A version mismatch on optimistic locking. A duplicate unique key. It is about the current state of the server, not the shape of the request.
+
+33
+00:07:59,384 --> 00:08:11,137
+Gia: I am Gia, a gateway runner. I carry requests between clients and upstream servers. When something goes wrong, I report it with one of three codes.
+
+34
+00:08:11,567 --> 00:08:30,089
+Narrator: Five oh two, bad gateway. The upstream answered, but badly, not in a valid shape. Five oh three, service unavailable. The server is temporarily unable, overloaded or in maintenance, often with a retry after header. And five oh four, gateway timeout. The upstream gave no response in time at all.
+
+35
+00:08:30,519 --> 00:08:37,905
+Narrator: Remember. Four oh one, I do not know who you are. Four oh three, I know exactly who you are, and the answer is still no.
+
+36
+00:08:40,855 --> 00:08:48,769
+Narrator: Headers are name and value metadata, riding next to the request line or status line. A handful appear in almost every real system.
+
+37
+00:08:49,200 --> 00:09:07,025
+Narrator: Host says which domain is asked for, mandatory since H T T P one point one. Content type is the media type of the body, J S O N, or multipart form data. Content length is the body size in bytes, so the receiver knows where the body ends. Authorization carries credentials, bearer token, or basic.
+
+38
+00:09:07,456 --> 00:09:24,922
+Narrator: Cache control carries caching directives, max age, no store, must revalidate. E tag, and if none match, are a fingerprint, and a conditional request. Set cookie, and cookie, are how the server asks the client to store a value, and how the client sends it back. And connection says keep alive, or close.
+
+39
+00:09:27,871 --> 00:09:40,274
+Narrator: Conditional requests avoid resending what you already have. The server tags a representation with an E tag, a hash of its content. A client that has a copy sends, if none match, with that tag, on its next get.
+
+40
+00:09:40,703 --> 00:09:47,586
+Max: If nothing changed, I reply, three oh four, not modified. With no body at all.
+
+41
+00:09:48,015 --> 00:10:04,210
+Narrator: A two kilobyte J S O N is fetched once, in full. A minute later, the check costs a few bytes of headers, and nothing else. A three oh four is the server proving, nothing changed, cheaply. It is caching working, not failing. The full story is in the H T T P caching note.
+
+42
+00:10:07,159 --> 00:10:20,977
+Narrator: Incident three, one thirty. A thief called Mal has been standing near the door, watching customers wave their wristbands. Max's customers keep their identity on a wristband, a cookie. If it is stolen, Mal can order as them.
+
+43
+00:10:21,408 --> 00:10:28,145
+Mal: Nice wristband. Nobody is checking how it travels. I will borrow it.
+
+44
+00:10:28,576 --> 00:10:40,690
+Narrator: How does state survive a stateless protocol? Cookies. A cookie is just a header the server asks the client to store, and resend on every later request. Its attributes decide how exposed it is.
+
+45
+00:10:41,120 --> 00:10:57,025
+Narrator: Secure means only sent over H T T P S. Without it, the session token can be sniffed on plain H T T P. Http only means not readable from JavaScript. A malicious script literally cannot read it, which blunts theft through cross site scripting.
+
+46
+00:10:57,456 --> 00:11:18,138
+Narrator: Same site controls whether the cookie is sent on cross site requests. Strict, lax, or none. It blunts cross site request forgery, by not attaching the session cookie to requests that started on another site. Domain says which hosts receive it, and too broad a domain leaks it to unrelated subdomains. Path scopes it, for example to slash admin only.
+
+47
+00:11:18,567 --> 00:11:31,186
+Narrator: A well set session cookie. Secure, http only, same site strict, path slash. Sent over H T T P S only, invisible to any script, and never attached to a request that started on another site.
+
+48
+00:11:31,615 --> 00:11:50,666
+Narrator: The mistake. Setting only http only, and assuming it is safe. It blocks scripts from reading the cookie. It does nothing against sniffing on plain H T T P, that needs secure. And nothing against a forged cross site request, that needs same site. Three attributes block three different attacks.
+
+49
+00:11:53,615 --> 00:12:10,889
+Narrator: One more idea. H T T P one point oh opened a fresh T C P connection for every request. H T T P one point one defaults to keep alive, reusing one connection for several requests, avoiding a new handshake, and under T L S, a new T L S handshake, each time.
+
+50
+00:12:11,320 --> 00:12:25,953
+Narrator: But keep alive saves handshakes, not ordering. On one H T T P one connection, requests are still answered one at a time. That is why browsers open several connections per host, and why H T T P two multiplexing exists.
+
+51
+00:12:28,903 --> 00:12:37,274
+Narrator: Let us trace one put, sent twice. First, put slash items slash forty two, with body v one. The store has no entry for forty two yet.
+
+52
+00:12:37,703 --> 00:12:46,265
+Narrator: The handler writes it. The store now holds forty two equals v one. It responds two oh one, created, because the resource did not exist before.
+
+53
+00:12:46,696 --> 00:13:00,514
+Narrator: The same put arrives again, as if the client retried after a timeout. The handler writes the same value. The store still holds exactly forty two equals v one. This time it responds two hundred, because the resource already existed.
+
+54
+00:13:00,943 --> 00:13:10,682
+Narrator: The responses differ, two oh one then two hundred. But the stored state after both calls is identical. That is what idempotent means, traced through real state.
+
+55
+00:13:13,631 --> 00:13:22,793
+Narrator: Now the code, in Go. A tiny in memory store that shows method semantics. Get is safe. Put and delete are idempotent. Post is not.
+
+56
+00:13:23,224 --> 00:13:32,769
+Narrator: A store holds a mutex, a map from I D to value, and a counter. Handle get is safe. It looks up the item under the lock, and returns four oh four if missing.
+
+57
+00:13:33,200 --> 00:13:51,385
+Narrator: Then it computes the E tag, a hash of the body, and sets the E tag and cache control headers. If the request's if none match equals the tag, it writes three oh four and returns, with no body. Otherwise it writes the J S O N. It never changes state, so it can be cached, retried and prefetched freely.
+
+58
+00:13:51,816 --> 00:14:06,570
+Narrator: Handle put decodes the body, and answers four hundred if the J S O N is broken. It then writes the value under the lock. If the item existed, it replies two hundred, otherwise two oh one. Doing it twice leaves the same state, so it is idempotent.
+
+59
+00:14:07,000 --> 00:14:29,649
+Narrator: Handle delete removes the item, and always replies two oh four, whether or not it existed. Deleting twice still ends with it gone. And handle post creates a brand new item with a new I D every time, and counts how many it created. Retry it after a timeout, and you get a duplicate. That is why post is not idempotent. The tests prove each of these properties, with the race detector on.
+
+60
+00:14:32,600 --> 00:14:54,457
+Narrator: A comparison. H T T P one point one is a plain text protocol, one request at a time per connection, easy to debug by hand. H T T P two keeps the same methods, status codes and headers, in multiplexed binary frames over one T C P connection. H T T P three keeps the same semantics again, over Quick streams, for lossy and mobile networks.
+
+61
+00:14:54,888 --> 00:15:08,081
+Narrator: An interview trap. Methods, status codes and headers are the same across all three. Only the wire format and connection model changed. Anyone who says H T T P two added new status codes has it backwards.
+
+62
+00:15:11,032 --> 00:15:27,922
+Narrator: Deeper points. First, why does four twenty two exist at all? The standard defines four hundred as any client error, which technically covers everything, from broken J S O N to a business rule. Four twenty two, borrowed from web dav, gives a separate signal for, understood, but invalid.
+
+63
+00:15:28,351 --> 00:15:43,802
+Narrator: Second, why safe methods matter beyond, do not delete things. Safety lets infrastructure the author never thought about, prefetchers, crawlers, C D Ns, retry logic in client libraries, treat get, head and options as free to issue speculatively. A get with a side effect breaks all of them.
+
+64
+00:15:44,231 --> 00:15:56,466
+Narrator: Third, idempotency is about end state, not about identical responses. The second delete may return four oh four, and the method is still idempotent. Confusing the two leads to rejecting correct designs.
+
+65
+00:15:56,895 --> 00:16:16,618
+Narrator: And last, content length versus chunked transfer. Content length needs the full body size before the first byte, which fails for a streamed response like a long export. Chunked transfer sends the body in pieces, each prefixed with its own size, ended by a zero length chunk. H T T P two and three replace it with their own framing.
+
+66
+00:16:19,567 --> 00:16:26,018
+Narrator: Two o'clock approaches. The rush is almost over, but Max must still check what went wrong, and what to watch tomorrow.
+
+67
+00:16:26,447 --> 00:16:54,186
+Narrator: Trade offs. Statelessness is a deliberate simplicity. Every request carries its own context, auth token, session cookie, which is overhead. But it is why any server in a pool can answer any request. Repeated text headers on every H T T P one request are wasteful, and H T T P two's header compression exists to fix that. And for chat or live updates, request response is the wrong shape. Use web sockets, server sent events, or long polling.
+
+68
+00:16:54,615 --> 00:17:12,321
+Narrator: Four production failures. A client treats four oh three as, please log in, and redirects to a login page. Wrong, because logging in again will not help. A non idempotent post is retried blindly by a client library on timeout, giving duplicate orders. Use an idempotency key.
+
+69
+00:17:12,751 --> 00:17:29,521
+Narrator: A get endpoint with a side effect, like mark as read on fetch. It breaks prefetching, crawling and caching, which all assume get is safe. And a session cookie missing secure or http only, so the token is stealable over plain H T T P, or through any script injection.
+
+70
+00:17:29,951 --> 00:17:48,665
+Narrator: What to watch. The status code distribution by class. A rising share of five hundreds is a server health signal. A rising share of four hundreds is often a client or contract problem. The three oh four hit rate on cacheable gets. And the rate of connection close, since frequent forced closes defeat keep alive.
+
+71
+00:17:51,615 --> 00:17:54,897
+Narrator: Interview round. Seven questions you will really get.
+
+72
+00:17:55,327 --> 00:18:10,034
+Narrator: One. Safe versus idempotent? Safe never changes state, so get, head and options can be called freely. Idempotent means repeating has the same effect as once, but it can change state the first time. Put and delete are idempotent but not safe.
+
+73
+00:18:10,463 --> 00:18:22,890
+Narrator: Two. Four oh one versus four oh three? Four oh one, the request lacks valid credentials. Four oh three, the server knows who you are, and you are not allowed. A valid user on an admin route gets four oh three.
+
+74
+00:18:23,319 --> 00:18:38,122
+Narrator: Three. Four hundred versus four twenty two? Four hundred, the request could not be understood. Four twenty two, understood, but fails a business rule. A four hundred is usually a client bug. A four twenty two is usually a message to show the user.
+
+75
+00:18:38,551 --> 00:18:54,577
+Narrator: Four. Intermittent five oh twos and five oh fours from one endpoint. First check whether the upstream responds at all. Five oh four, it never answered in time, so check latency and health. Five oh two, it answered with something invalid, so check its raw response, or a crash mid response.
+
+76
+00:18:55,008 --> 00:19:12,018
+Narrator: Five. A trap. Is patch always non idempotent, and put always idempotent? No to both. A put is idempotent by definition, but a buggy one that appends to a log each time is not. A patch with absolute values is idempotent in practice, a relative one is not.
+
+77
+00:19:12,448 --> 00:19:29,602
+Narrator: Six. Why both secure and http only? They block different attacks. Secure stops sending over plain H T T P, where an observer could read it. Http only stops scripts reading it, so cross site scripting cannot exfiltrate it. Either alone is not enough.
+
+78
+00:19:30,031 --> 00:19:50,329
+Narrator: Seven. What does same site solve, and strict versus lax? It controls whether a cookie rides on a request that began on another site, the basis of cross site request forgery. Strict never sends it cross site, but breaks logging in from an emailed link. Lax, the modern default, allows top level navigation, not embedded requests.
+
+79
+00:19:53,279 --> 00:19:56,442
+Narrator: Let us put it all together, from easy to advanced.
+
+80
+00:19:56,872 --> 00:20:09,970
+Narrator: One. H T T P is a shared vocabulary. A request is a method, a path, headers, and an optional body. A response is a status code, headers, and an optional body. And it is stateless.
+
+81
+00:20:10,400 --> 00:20:22,801
+Narrator: Two. Safe means no state change. Idempotent means the same end state if repeated. Get, head, options are both. Put and delete are idempotent. Post is neither, and patch is usually not.
+
+82
+00:20:23,231 --> 00:20:43,458
+Narrator: Three. Status families. Two success, three redirect, four client error, five server error. Four oh one, who are you. Four oh three, you may not. Four hundred is malformed, four twenty two is invalid, four oh nine is a state conflict. Five oh two, bad answer. Five oh three, unavailable. Five oh four, too slow.
+
+83
+00:20:43,887 --> 00:20:55,809
+Narrator: Four. A few headers do most of the work. Host, content type, content length, authorization, cache control, E tag, cookies, and connection. E tag with if none match gives a three oh four, no body.
+
+84
+00:20:56,240 --> 00:21:06,218
+Narrator: Five. Cookies need all three. Secure stops sniffing. Http only stops script theft. Same site stops forged cross site requests.
+
+85
+00:21:06,647 --> 00:21:18,857
+Narrator: Six. Keep alive saves handshakes, not ordering. The semantics are the same in H T T P one, two and three. Only the wire format changed. And chunked transfer streams a body of unknown size.
+
+86
+00:21:19,288 --> 00:21:29,842
+Narrator: And the one line to keep. H T T P is asking with a method and a path, answering with a status code, and remembering nothing, unless a cookie or token carries it.
+
+87
+00:21:32,791 --> 00:21:59,665
+Narrator: To go deeper, open the H T T P fundamentals note, and its Go note, in your vault. Before it, read T C P. After it, H T T P one versus two versus three, H T T P caching, and R E S T and H T T P A P I design. Compare it with sessions and cookies, idempotency and idempotency keys, C O R S and same origin policy, and C S R F, X S S and security headers.
+
+88
+00:22:00,096 --> 00:22:09,713
+Narrator: Two o'clock. The rush is over. A hundred customers, not one mixed up order, and no double charge. Max sits down, and, as always, forgets every one of them.
+
+89
+00:22:10,144 --> 00:22:13,930
+Zoe: Thank you, Max! I got my orders.
+
+90
+00:22:14,359 --> 00:22:18,266
+Max: Next! And who are you again?
+

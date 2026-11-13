@@ -15,13 +15,17 @@ sources:
   - "CA/Browser Forum Ballot SC-081v3 (2025): schedule for reducing maximum public TLS certificate validity"
   - "Dyn, 'Dyn Analysis Summary of Friday October 21 Attack' (2016)"
   - "Prometheus blackbox_exporter docs: probe_ssl_earliest_cert_expiry; CoreDNS metrics plugin: coredns_dns_responses_total"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - TLS Certificate and DNS Failures
 
 > [!summary] TL;DR
-> Two of the most avoidable outages in production: a TLS certificate that expired or does not match, and DNS that returns the wrong answer, no answer, or a stale answer. Both look like "the site is down" yet your servers are healthy. The fastest path is to ask two questions in order: **can the name be resolved (`dig`)?** then **does the TLS handshake succeed with a valid certificate (`openssl s_client`)?** The fix is usually renewing a cert or correcting a record, and the prevention is automation plus expiry alerts.
+> Two of the most avoidable outages in production: a TLS certificate that expired or does not match, and DNS that returns the wrong answer, no answer, or a stale answer.
+>
+> Both look like "the site is down" yet your servers are healthy.
+>
+> The fastest path is to ask two questions in order: **can the name be resolved (`dig`)?** then **does the TLS handshake succeed with a valid certificate (`openssl s_client`)?** The fix is usually renewing a cert or correcting a record, and the prevention is automation plus expiry alerts.
 
 > [!abstract] Core idea
 > - **Name first, then handshake, then application.** DNS failure shows as "cannot resolve host". TLS failure shows as a certificate or handshake error. Only after both pass is it an HTTP problem.
@@ -45,6 +49,51 @@ flowchart LR
     D -- "yes" --> E["Success"]
 ```
 
+## Start here: the basics
+
+**The problem in one story.**
+You type a shop's web address and the browser says "Your connection is not private".
+The shop's servers are running perfectly.
+But the security certificate expired at midnight, so every browser refuses to talk to them.
+Another day, the address book (DNS) points the name at an old server, with the same result: "site down".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Domain name | Human name for a server | `api.example.com` |
+| DNS | The internet's address book: name to IP address | `api.example.com` -> `93.184.216.34` |
+| DNS record / TTL | One address book entry, and how long others may cache it | `A` record, TTL 300 seconds |
+| TLS / HTTPS | Encryption plus identity check for a connection | The padlock in the browser |
+| Certificate | A signed file proving "this server really is api.example.com" | Valid until 2026-12-01 |
+| CA (Certificate Authority) | The trusted signer of certificates | Let's Encrypt |
+| Handshake | The opening exchange where client checks the certificate | `openssl s_client` shows it |
+| Intermediate / chain | The middle certificates linking yours to a trusted CA | Missing one breaks some clients |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Client"] --> B["DNS: name to IP"]
+    B --> C["TLS handshake:<br/>check certificate"]
+    C --> D["HTTP request<br/>reaches app"]
+    B -. "fails" .-> X["cannot resolve host"]
+    C -. "fails" .-> Y["certificate error"]
+```
+
+**Analogy.** DNS is looking up a friend's address; TLS is checking their ID at the door. A wrong address or an expired ID both stop the visit, even if the friend is home.
+Where it breaks: a wrong address you fix in your own book can stay wrong in other people's copies until their cache (TTL) expires.
+
+**How the rest of this note builds up**
+
+- First, why these outages are so common and avoidable (section 1), and the three-gate model (section 2).
+- Then the hands-on checks: `dig` for DNS, `openssl s_client` for TLS, and Kubernetes DNS (section 3).
+- Then a worked expiry incident, variants and trade-offs (sections 4-6).
+- Finally the SDE-3 depth: renewal automation, alerts, chain and SNI subtleties, DNS caching internals (sections 7-8).
+
+> [!tip] Remember
+> Check the name first (`dig`), then the handshake (`openssl`), and only then the app.
+
 ## 1. Why it exists
 
 Certificates are issued with a fixed lifetime and DNS depends on records, caches and delegations spread across many parties. Both fail in ways that are sudden, global and confusing.
@@ -64,7 +113,9 @@ The real-world scale of this class: in September 2021 the expiry of Let's Encryp
 
 ## 2. Mental model
 
-Think of a request as mailing a letter to a company. **DNS is the phone book**: it tells you the street address. **The certificate is the company's ID card** shown at the door: it must be unexpired, issued by someone you trust, and show the name you came to visit. Only then do you walk in and talk to the receptionist (HTTP).
+Think of a request as mailing a letter to a company. **DNS is the phone book**: it tells you the street address.
+
+**The certificate is the company's ID card** shown at the door: it must be unexpired, issued by someone you trust, and show the name you came to visit. Only then do you walk in and talk to the receptionist (HTTP).
 
 Where the analogy breaks: phone books are copied everywhere. Even after you publish a corrected address, copies (resolver caches) keep serving the old one until their time-to-live runs out, so a fix is not instant. ID cards, by contrast, are checked fresh by each client, but each client has its own trust list and clock.
 
@@ -285,7 +336,9 @@ gantt
 
 ## 4. Worked example
 
-**An expired certificate behind a CDN origin (fictional, but a real pattern).** (The error codes below are Cloudflare's; other CDNs use other codes, often a plain 502.) `InvoiceOps` serves `api.invoiceops.example` through a CDN, with the origin behind an ALB. The public certificate is on the CDN (managed, fine). The CDN-to-origin connection uses a separate certificate on the ALB, issued by an internal process.
+**An expired certificate behind a CDN origin (fictional, but a real pattern).** (The error codes below are Cloudflare's; other CDNs use other codes, often a plain 502.) `InvoiceOps` serves `api.invoiceops.example` through a CDN, with the origin behind an ALB.
+
+The public certificate is on the CDN (managed, fine). The CDN-to-origin connection uses a separate certificate on the ALB, issued by an internal process.
 
 ```mermaid
 sequenceDiagram
@@ -359,11 +412,25 @@ sequenceDiagram
 
 ## 8. Deep dive
 
-**How certificate validation actually works.** The client builds a chain from the leaf to a trusted root: the leaf's issuer must match an intermediate, whose issuer must match a root in the client's trust store. For each certificate it checks the validity window against its own clock, the signature, key usage and name constraints, and that the leaf's subject alternative names include the host (the common name is not used for matching in modern clients). It may also check revocation (OCSP stapling, CRLs); many clients soft-fail on revocation. This is why the same server can pass in one client and fail in another: different trust stores, different clock, different chain-building behaviour.
+**How certificate validation actually works.** The client builds a chain from the leaf to a trusted root: the leaf's issuer must match an intermediate, whose issuer must match a root in the client's trust store.
 
-**Why the old Let's Encrypt root expiry broke things.** In 2021 the cross-signed chain used an expiring root (DST Root CA X3). Clients with an old trust store lacked the newer root (ISRG Root X1) and failed validation; some servers also served an alternate chain with the expired root which strict libraries (OpenSSL 1.0.x) rejected even when a valid path existed. The lesson: trust stores in old devices, container base images and custom bundles are part of your dependency graph.
+For each certificate it checks the validity window against its own clock, the signature, key usage and name constraints, and that the leaf's subject alternative names include the host (the common name is not used for matching in modern clients).
 
-**DNS resolution path and failure isolation.** A stub resolver (in your app or libc) asks a recursive resolver (CoreDNS, the VPC resolver, 8.8.8.8). The recursive walks root, TLD, then the authoritative servers for your zone and caches answers by TTL. Failures can occur at any hop: the registrar's delegation (NS and DS at the parent), authoritative servers (all down, or serving different data), the recursive resolver (overloaded, rate limited, SERVFAIL cached) or the stub. `dig +trace` from the outside and queries to individual authoritative servers separate those layers. The Meta 2021 outage is a notable example of the authoritative layer: the DNS servers were healthy but withdrew their own routes when they decided the network was unhealthy, so the world could not reach them.
+It may also check revocation (OCSP stapling, CRLs); many clients soft-fail on revocation. This is why the same server can pass in one client and fail in another: different trust stores, different clock, different chain-building behaviour.
+
+**Why the old Let's Encrypt root expiry broke things.** In 2021 the cross-signed chain used an expiring root (DST Root CA X3).
+
+Clients with an old trust store lacked the newer root (ISRG Root X1) and failed validation; some servers also served an alternate chain with the expired root which strict libraries (OpenSSL 1.0.x) rejected even when a valid path existed.
+
+The lesson: trust stores in old devices, container base images and custom bundles are part of your dependency graph.
+
+**DNS resolution path and failure isolation.** A stub resolver (in your app or libc) asks a recursive resolver (CoreDNS, the VPC resolver, 8.8.8.8). The recursive walks root, TLD, then the authoritative servers for your zone and caches answers by TTL.
+
+Failures can occur at any hop: the registrar's delegation (NS and DS at the parent), authoritative servers (all down, or serving different data), the recursive resolver (overloaded, rate limited, SERVFAIL cached) or the stub.
+
+`dig +trace` from the outside and queries to individual authoritative servers separate those layers.
+
+The Meta 2021 outage is a notable example of the authoritative layer: the DNS servers were healthy but withdrew their own routes when they decided the network was unhealthy, so the world could not reach them.
 
 **Why renewals fail silently.** Auto-renewal is a chain: schedule, challenge, issuance, deployment, reload. Each link can break without any user-visible effect until the old cert expires.
 
@@ -386,7 +453,9 @@ flowchart LR
 ## 9. Interview questions
 
 > [!question]- Users report the site is down but your dashboards look healthy and traffic dropped. How do you find out it is TLS or DNS?
-> A traffic cliff with healthy servers means requests are not arriving. Test gate by gate: `dig +short host` from several resolvers for DNS, then `openssl s_client -connect host:443 -servername host` for expiry, chain and names, then `curl -vI`. External synthetic probes and the CDN or load balancer error rate (for example Cloudflare's 525 handshake failure or 526 invalid certificate) usually point to the gate quickly.
+> A traffic cliff with healthy servers means requests are not arriving. Test gate by gate: `dig +short host` from several resolvers for DNS, then `openssl s_client -connect host:443 -servername host` for expiry, chain and names, then `curl -vI`.
+>
+> External synthetic probes and the CDN or load balancer error rate (for example Cloudflare's 525 handshake failure or 526 invalid certificate) usually point to the gate quickly.
 
 > [!question]- A certificate works in Chrome but fails in your Go service with "unknown authority". Why?
 > Most likely the server does not send the intermediate certificate. Browsers fetch missing intermediates and cache them; Go and `curl` do not. Confirm with `openssl s_client -showcerts` and fix by serving the full chain. A second cause is a minimal container image without CA certificates or a private CA missing from the trust store.
@@ -425,3 +494,8 @@ flowchart LR
 - **Platform specifics:** [[AWS 09 - Route 53 and ACM]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[CDN and Edge]]
 - **Related playbooks:** [[Playbook - Third-Party Dependency Outage]]
 - **After the incident:** [[Postmortems and Root Cause Analysis]]
+
+### Watch on YouTube
+
+- [What are SSL/TLS Certificates? Why do we Need them? and How do they Work?](https://www.youtube.com/watch?v=r1nJT63BFQ0) · Hussein Nasser · 14 min · 219,511 views
+- [HTTPS, SSL, TLS & Certificate Authority Explained](https://www.youtube.com/watch?v=EnY6fSng3Ew) · Laiture · 43 min · 372,273 views

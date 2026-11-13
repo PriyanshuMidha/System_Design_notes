@@ -12,13 +12,26 @@ sources:
   - "OpenSearch docs: Intro to OpenSearch (inverted index), segment replication"
   - "PostgreSQL 17 docs: Full Text Search (tsvector, tsquery, websearch_to_tsquery, ts_rank, GIN indexes), pg_trgm"
   - "Cormack, Clarke & Buettcher, Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods (SIGIR 2009)"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Search Engines and Inverted Indexes - Go
 
 > [!summary] TL;DR
-> A teaching-sized inverted index in Go: an analyzer, postings lists with positions, BM25 ranking with the Lucene defaults (`k1 = 1.2`, `b = 0.75`) and a phrase query. It is the runnable companion of [[Search Engines and Inverted Indexes]], and it also holds the Postgres full-text search SQL used to compare against a search engine. Every piece of code below is small, is introduced by the theory it implements, and is followed by a numbered walkthrough.
+> A teaching-sized inverted index in Go: an analyzer, postings lists with positions, BM25 ranking with the Lucene defaults (`k1 = 1.2`, `b = 0.75`) and a phrase query.
+>
+> It is the runnable companion of [[Search Engines and Inverted Indexes]], and it also holds the Postgres full-text search SQL used to compare against a search engine.
+>
+> Every piece of code below is small, is introduced by the theory it implements, and is followed by a numbered walkthrough.
+
+## Before the code
+
+- **Maps of slices**: the index is `map[string][]Posting`, term to postings list.
+- **`unicode` and `strings`**: the analyzer splits on non-letters, lowercases and strips a plural `s`.
+- **Methods on a struct**: `Add`, `Search` and `Phrase` are methods on `*Index`.
+- **`math.Log` and `sort.Slice`**: compute BM25 scores, then sort hits best first.
+- **Table tests with `reflect.DeepEqual`**: compare whole result slices.
+- **Run**: `go vet ./... && go test -race -v ./...` inside the `search` module.
 
 ## What this code shows
 
@@ -90,7 +103,11 @@ The package implements the analyzer, postings with positions, BM25 with Lucene's
 
 ### Step 1: the analyzer
 
-**Concept.** Search engines never match raw text. They first turn text into normalized terms, as explained in [[Search Engines and Inverted Indexes#3.1 Analysis: text to terms]]. The important rule is that the same analyzer must run at index time and at query time, otherwise `Invoices` in a document and `invoice` in a query would never meet. This toy chain has four stages: split, lowercase, drop stop words, stem. Real engines make each stage pluggable (Lucene analyzers, Elasticsearch `analyzer` setting) and use proper stemmers such as Porter or Snowball; a one-rule stemmer was chosen here so the whole chain fits on one screen and the tests can predict every output.
+**Concept.** Search engines never match raw text. They first turn text into normalized terms, as explained in [[Search Engines and Inverted Indexes#3.1 Analysis: text to terms]].
+
+The important rule is that the same analyzer must run at index time and at query time, otherwise `Invoices` in a document and `invoice` in a query would never meet. This toy chain has four stages: split, lowercase, drop stop words, stem.
+
+Real engines make each stage pluggable (Lucene analyzers, Elasticsearch `analyzer` setting) and use proper stemmers such as Porter or Snowball; a one-rule stemmer was chosen here so the whole chain fits on one screen and the tests can predict every output.
 
 ```mermaid
 flowchart LR
@@ -152,7 +169,11 @@ func Analyze(text string) []string {
 
 ### Step 2: postings and indexing
 
-**Concept.** The inverted index in [[Search Engines and Inverted Indexes#3.2 The inverted index]] flips the usual document-to-words direction into term to documents. Each term owns a postings list: one `Posting` per document containing it, with the positions where it occurs. Positions make phrase queries possible; the document length and the total length are the extra statistics BM25 needs. The alternative design, a hash map from term to a plain set of document ids, is smaller but cannot answer phrase queries or compute term frequency. A sorted postings list is also what allows merge-style AND intersection and delta compression in a real engine, which is why `Add` insists on increasing document ids.
+**Concept.** The inverted index in [[Search Engines and Inverted Indexes#3.2 The inverted index]] flips the usual document-to-words direction into term to documents. Each term owns a postings list: one `Posting` per document containing it, with the positions where it occurs.
+
+Positions make phrase queries possible; the document length and the total length are the extra statistics BM25 needs. The alternative design, a hash map from term to a plain set of document ids, is smaller but cannot answer phrase queries or compute term frequency.
+
+A sorted postings list is also what allows merge-style AND intersection and delta compression in a real engine, which is why `Add` insists on increasing document ids.
 
 ```mermaid
 flowchart LR
@@ -224,7 +245,11 @@ func (ix *Index) Postings(term string) []Posting { return ix.postings[term] }
 
 ### Step 3: BM25 search
 
-**Concept.** Ranking by raw term count would reward long documents and common words. BM25, explained in [[Search Engines and Inverted Indexes#3.4 Relevance: TF-IDF to BM25]], fixes both with three ideas: IDF (rare terms count more), saturating term frequency (the tenth occurrence adds little) and length normalization (a match in a short document counts more). The code uses the Lucene and Elasticsearch defaults `k1 = 1.2` and `b = 0.75`. Alternatives are plain TF-IDF, which has no saturation, and learned rankers, which need training data; BM25 needs only the statistics this index already holds.
+**Concept.** Ranking by raw term count would reward long documents and common words.
+
+BM25, explained in [[Search Engines and Inverted Indexes#3.4 Relevance: TF-IDF to BM25]], fixes both with three ideas: IDF (rare terms count more), saturating term frequency (the tenth occurrence adds little) and length normalization (a match in a short document counts more).
+
+The code uses the Lucene and Elasticsearch defaults `k1 = 1.2` and `b = 0.75`. Alternatives are plain TF-IDF, which has no saturation, and learned rankers, which need training data; BM25 needs only the statistics this index already holds.
 
 The score of one document for one query term is:
 
@@ -309,7 +334,11 @@ Then the map of scores is turned into a ranked slice.
 
 ### Step 4: phrase queries from positions
 
-**Concept.** A phrase query such as `"overdue invoice"` needs the terms to be adjacent and in order. As described in [[Search Engines and Inverted Indexes#3.3 Query execution: AND, OR and phrases]], that is possible only because the postings store positions: find documents that contain the first term, then check that term `i` sits at position `start + i`. The alternative is to index shingles (word pairs) as terms, which answers a fixed phrase length quickly but bloats the index. Checking positions needs no extra index data.
+**Concept.** A phrase query such as `"overdue invoice"` needs the terms to be adjacent and in order.
+
+As described in [[Search Engines and Inverted Indexes#3.3 Query execution: AND, OR and phrases]], that is possible only because the postings store positions: find documents that contain the first term, then check that term `i` sits at position `start + i`.
+
+The alternative is to index shingles (word pairs) as terms, which answers a fixed phrase length quickly but bloats the index. Checking positions needs no extra index data.
 
 ```mermaid
 sequenceDiagram
@@ -383,7 +412,11 @@ func (ix *Index) followedBy(doc int, rest []string, at int) bool {
 
 ### Step 5: Postgres full-text search
 
-**Concept.** [[Search Engines and Inverted Indexes#4.3 Postgres full-text search: the "good enough" option]] argues that many products never need a search cluster. Postgres already has the same ingredients as the Go code above: an analyzer (a text search configuration such as `english`), an inverted index (GIN) and a ranking function. The trade-off is weaker relevance and no facets, in return for no second system to run and keep in sync.
+**Concept.** [[Search Engines and Inverted Indexes#4.3 Postgres full-text search: the "good enough" option]] argues that many products never need a search cluster.
+
+Postgres already has the same ingredients as the Go code above: an analyzer (a text search configuration such as `english`), an inverted index (GIN) and a ranking function.
+
+The trade-off is weaker relevance and no facets, in return for no second system to run and keep in sync.
 
 ```mermaid
 flowchart LR
@@ -560,7 +593,11 @@ func TestBM25PrefersShortDocAndRareTerms(t *testing.T) {
 }
 ```
 
-By hand, with N = 4 and an average length of 5, both terms have df = 2, so `idf = ln(1 + 2.5 / 2.5) = ln 2 = 0.6931`. For doc 1 the term part is `2.2 / (1 + 1.2 * (0.25 + 0.75 * 4/5)) = 2.2 / 2.02 = 1.0891`, and two terms give `2 * 0.6931 * 1.0891 = 1.5098`. For doc 3 the length is 8, the denominator is 2.74, and the score is 1.1131. A failure would mean length normalization is missing or wrong.
+By hand, with N = 4 and an average length of 5, both terms have df = 2, so `idf = ln(1 + 2.5 / 2.5) = ln 2 = 0.6931`.
+
+For doc 1 the term part is `2.2 / (1 + 1.2 * (0.25 + 0.75 * 4/5)) = 2.2 / 2.02 = 1.0891`, and two terms give `2 * 0.6931 * 1.0891 = 1.5098`.
+
+For doc 3 the length is 8, the denominator is 2.74, and the score is 1.1131. A failure would mean length normalization is missing or wrong.
 
 ### TestRareTermOutweighsCommonTerm
 

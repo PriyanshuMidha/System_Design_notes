@@ -13,7 +13,7 @@ sources:
   - "MySQL 8.0 Reference Manual, Clustered and Secondary Indexes; InnoDB page size (16 KB default); Skip Scan Range Access Method (8.0.13)"
   - "Lehman and Yao, Efficient Locking for Concurrent Operations on B-Trees (ACM TODS, 1981)"
   - "RFC 9562, Universally Unique IDentifiers (UUIDv7)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Indexing Fundamentals
@@ -28,6 +28,51 @@ updated: 2026-11-07
 > - Every `INSERT` updates every index on the table, so each extra index costs write speed, disk and memory.
 > - PostgreSQL indexes point to a row's physical location; InnoDB secondary indexes store the primary key, so a lookup walks two trees.
 
+## Start here: the basics
+
+**The problem in one story.**
+A table holds 10 million invoices and you want the ones for workspace 7.
+Without help, the database reads every page of the table to find them, which can take seconds.
+An index is a sorted list that lets it jump straight to workspace 7, in a few page reads.
+This note explains how that sorted structure works and when it helps.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Row / table | One record / a set of records with the same columns | One invoice in `invoices` |
+| Page | The fixed-size block the database reads from disk | 8 KB in PostgreSQL, 16 KB in InnoDB |
+| Sequential scan | Reading every page of the table | `Seq Scan on invoices` in `EXPLAIN` |
+| Index | A separate sorted structure pointing to rows | `CREATE INDEX ON invoices (workspace_id)` |
+| B+tree | A short, wide sorted tree; data pointers live in the leaves | 3 levels can cover millions of rows |
+| Fan-out | How many children one tree page points to | ~300 keys per page |
+| Composite index | One index sorted by several columns in order | `(workspace_id, status, due_date)` |
+| Query planner | Picks the cheapest way to run a query | Chooses seq scan or index scan |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    Q["WHERE workspace_id = 7"] --> ROOT["Root page"]
+    ROOT --> INT["Inner page"]
+    INT --> LEAF["Leaf page:<br/>sorted keys + row pointers"]
+    LEAF --> ROWS["Matching rows in the table"]
+    Q -.->|"no index"| SCAN["Read every table page"]
+```
+
+**Analogy.** An index is the index at the back of a textbook: look up "TLB", get page 212, turn straight there instead of reading the whole book.
+Where it breaks: a book index never changes, but a database index must be updated on every insert, which slows writes.
+
+**How the rest of this note builds up**
+
+- First, why full scans get slow (section 1) and the sorted-list mental model (section 2).
+- Then the B+tree, fan-out and tree height, seq scan vs index scan, and where the pointer goes in PostgreSQL vs InnoDB (section 3).
+- Then a worked example with `EXPLAIN` before and after, the leftmost-prefix rule, column order and covering indexes (section 4).
+- Finally the SDE-3 deep dive: when the planner ignores an index, page splits, HOT updates and UUID keys (sections 6-8).
+
+> [!tip] Remember
+> An index is a sorted copy of some columns in a short tree, so a lookup reads a few pages instead of the whole table.
+
 ## 1. Why it exists
 
 InvoiceOps (the running example in these notes: a multi-tenant invoicing SaaS) has an `invoices` table with 10 million rows across 20,000 workspaces. The invoice list page runs:
@@ -40,7 +85,9 @@ ORDER BY due_date
 LIMIT 20;
 ```
 
-Without an index, PostgreSQL must read every row to find the few hundred that belong to workspace 7. At roughly 120 bytes per row, 10 million rows fill about 150,000 pages of 8 kB, around 1.2 GB (an estimate from row width). Even fully cached, that scan takes hundreds of milliseconds and pushes useful data out of memory; from disk it takes seconds. And it repeats on every page view.
+Without an index, PostgreSQL must read every row to find the few hundred that belong to workspace 7. At roughly 120 bytes per row, 10 million rows fill about 150,000 pages of 8 kB, around 1.2 GB (an estimate from row width).
+
+Even fully cached, that scan takes hundreds of milliseconds and pushes useful data out of memory; from disk it takes seconds. And it repeats on every page view.
 
 With an index on `(workspace_id, status, due_date)`, PostgreSQL walks 3 or 4 index pages to the first matching entry, reads 20 entries in order, and fetches 20 rows. That is a few dozen page reads instead of 150,000, typically well under a millisecond when cached.
 
@@ -127,7 +174,11 @@ flowchart LR
     S --> X["Sort matches by due_date<br/>then LIMIT 20"]
 ```
 
-A **sequential scan** (`Seq Scan` in a plan) reads the table front to back. An **index scan** walks the tree, then fetches each matching row. A **bitmap scan** sits in between: it collects all matching row locations from the index, sorts them by page, and reads each needed table page once; PostgreSQL picks it when "some but not most" rows match. Reading these plans is covered in [[Query Plans and EXPLAIN]].
+A **sequential scan** (`Seq Scan` in a plan) reads the table front to back. An **index scan** walks the tree, then fetches each matching row.
+
+A **bitmap scan** sits in between: it collects all matching row locations from the index, sorts them by page, and reads each needed table page once; PostgreSQL picks it when "some but not most" rows match.
+
+Reading these plans is covered in [[Query Plans and EXPLAIN]].
 
 ### Where the pointer goes: PostgreSQL heap versus InnoDB clustered index
 
@@ -146,7 +197,9 @@ flowchart TB
 - **PostgreSQL** stores rows in an unordered **heap** (the table file). Every index, including the primary key, maps keys to a **TID** (tuple identifier: block number and item number inside the block). One index lookup plus one heap page read finds the row.
 - **MySQL InnoDB** stores the table itself **inside the primary-key B+tree**: the leaf pages of the primary key *are* the rows. This is a **clustered index**. A secondary index stores the primary-key value, not a location, so a lookup by `number` walks the secondary tree, then walks the primary-key tree a second time.
 
-Consequences: in InnoDB, range scans by primary key are very fast (the rows are physically in key order), a long primary key makes every secondary index larger, and random primary keys scatter inserts. In PostgreSQL, all indexes are equal, but an update that moves a row to a new location must update every index, unless it qualifies as a HOT update (section 8).
+Consequences: in InnoDB, range scans by primary key are very fast (the rows are physically in key order), a long primary key makes every secondary index larger, and random primary keys scatter inserts.
+
+In PostgreSQL, all indexes are equal, but an update that moves a row to a new location must update every index, unless it qualifies as a HOT update (section 8).
 
 ## 4. Worked example
 
@@ -233,7 +286,9 @@ There is no `Sort` node: the index already returns entries for `(7, 'overdue')` 
 
 ### Why column order matters: the leftmost-prefix rule
 
-A composite index is one sorted list ordered by the first column, then the second within ties, and so on, like a phone book sorted by surname and then first name. You can binary-search for a surname, or for a surname plus first name. You cannot binary-search for a first name alone, because people called "Asha" are scattered across every surname.
+A composite index is one sorted list ordered by the first column, then the second within ties, and so on, like a phone book sorted by surname and then first name. You can binary-search for a surname, or for a surname plus first name.
+
+You cannot binary-search for a first name alone, because people called "Asha" are scattered across every surname.
 
 ```mermaid
 flowchart TB
@@ -255,7 +310,11 @@ flowchart TB
 
 The matching entries for a leftmost prefix always form one contiguous run, so the database finds the start and the end with binary search and reads only the run. For a column that is not a prefix, the matches are scattered through the whole list.
 
-**Example with numbers.** In the Go model, the index holds 10,000 entries (100 workspaces, 100 invoices each, 4 statuses, so 25 entries per workspace and status). The query `workspace_id = 42 AND status = 'overdue'` runs two binary searches, about 2 x log2(10,000) = 28 comparisons in theory. Measured with `go test -race -v` (Go 1.24.4), it examined **26 of 10,000** entries and found 25 rows. The query `status = 'overdue'` alone examined **all 10,000** entries to find 2,500 rows.
+**Example with numbers.** In the Go model, the index holds 10,000 entries (100 workspaces, 100 invoices each, 4 statuses, so 25 entries per workspace and status).
+
+The query `workspace_id = 42 AND status = 'overdue'` runs two binary searches, about 2 x log2(10,000) = 28 comparisons in theory. Measured with `go test -race -v` (Go 1.24.4), it examined **26 of 10,000** entries and found 25 rows.
+
+The query `status = 'overdue'` alone examined **all 10,000** entries to find 2,500 rows.
 
 ### Choosing the column order
 
@@ -273,7 +332,13 @@ CREATE INDEX CONCURRENTLY idx_invoices_list
     ON invoices (workspace_id, status, due_date) INCLUDE (number, total_minor);
 ```
 
-`INCLUDE` adds payload columns to the leaf entries without making them part of the sort key. There is one PostgreSQL caveat: the index does not know whether a row version is visible to your transaction (see [[Isolation Levels and MVCC]]), so for each entry it checks the **visibility map**, a small per-table bitmap of pages whose rows are all visible to everyone. If the page is not marked all-visible, it must visit the heap anyway; `EXPLAIN ANALYZE` reports these visits as `Heap Fetches`. Recently vacuumed tables get close to zero heap fetches. In InnoDB, a secondary index that includes all needed columns is "covering" and skips the second (primary-key) tree walk.
+`INCLUDE` adds payload columns to the leaf entries without making them part of the sort key.
+
+There is one PostgreSQL caveat: the index does not know whether a row version is visible to your transaction (see [[Isolation Levels and MVCC]]), so for each entry it checks the **visibility map**, a small per-table bitmap of pages whose rows are all visible to everyone.
+
+If the page is not marked all-visible, it must visit the heap anyway; `EXPLAIN ANALYZE` reports these visits as `Heap Fetches`. Recently vacuumed tables get close to zero heap fetches.
+
+In InnoDB, a secondary index that includes all needed columns is "covering" and skips the second (primary-key) tree walk.
 
 ```mermaid
 sequenceDiagram
@@ -293,7 +358,9 @@ sequenceDiagram
 
 ### Unique indexes are constraints
 
-`PRIMARY KEY` and `UNIQUE` are enforced with a unique B-tree: before inserting, the database descends the tree to check that the key is absent. That is why `UNIQUE (workspace_id, number)` both prevents duplicate invoice numbers per workspace and speeds up lookups by number. PostgreSQL does **not** create an index for a foreign key automatically; add one on `invoices.customer_id` yourself if you join or delete by it, or every `DELETE FROM customers` scans `invoices`.
+`PRIMARY KEY` and `UNIQUE` are enforced with a unique B-tree: before inserting, the database descends the tree to check that the key is absent. That is why `UNIQUE (workspace_id, number)` both prevents duplicate invoice numbers per workspace and speeds up lookups by number.
+
+PostgreSQL does **not** create an index for a foreign key automatically; add one on `invoices.customer_id` yourself if you join or delete by it, or every `DELETE FROM customers` scans `invoices`.
 
 Runnable Go version: [[Indexing Fundamentals - Go]]
 
@@ -433,3 +500,7 @@ Indexing a frequently updated column such as `updated_at` disables HOT for those
 - **Next:** [[Query Plans and EXPLAIN]], [[Index Types and Index Design]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Compare with:** [[Search Engines and Inverted Indexes]] (inverted index for text instead of a sorted tree), [[Hash Tables and Go Maps]] (O(1) equality lookup without order)
 - **Go implementation:** [[Indexing Fundamentals - Go]]
+
+### Watch on YouTube
+
+- [How Database Indexing Works in Real Life (B-Tree Explained Simply)](https://www.youtube.com/watch?v=pQQVpROjOgU) · Tech Pulse Labs · simple visual B-tree explanation for basics-level note

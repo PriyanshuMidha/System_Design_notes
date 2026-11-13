@@ -15,7 +15,7 @@ sources:
   - "PostgreSQL wiki, Number Of Database Connections ((core_count * 2) + effective_spindle_count)"
   - "AWS docs, Avoiding pinning an RDS Proxy"
   - "golang-migrate v4.18.3 source, postgres driver (pg_advisory_lock)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Connection Pooling
@@ -28,6 +28,50 @@ updated: 2026-11-07
 > - A pool is a bounded queue: when every connection is busy, requests wait in the app instead of overloading the database.
 > - Size it with Little's Law (busy connections = requests/s x seconds each holds one), and keep the total across all pods under the database limit.
 > - Classic mistake: forgetting `rows.Close()` or holding a connection across a network call, which drains the pool.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your web app gets a request and needs to read from the database.
+Opening a fresh database connection takes a handshake, a login and a new server process, which can cost several milliseconds.
+Doing that for every request wastes time and can overload the database when traffic spikes.
+A pool keeps a few connections open and lends them out, like library books.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Connection | An open, logged-in line between the app and the database | One TCP socket to PostgreSQL on port 5432 |
+| Pool | A fixed set of open connections that requests borrow and return | 10 connections shared by 200 requests |
+| Borrow / return | Take a connection for a query, then give it back | `db.QueryContext` borrows; `rows.Close()` returns |
+| Leak | A borrowed connection that is never returned | Forgetting `rows.Close()` |
+| Timeout | How long a request waits before giving up | Wait at most 2 s for a free connection |
+| Throughput | Requests handled per second | 500 req/s |
+| Little's Law | Busy items = arrival rate x time each one is busy | 500 req/s x 0.02 s = 10 busy connections |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R1["Request A"] --> P{"Pool:<br/>free connection?"}
+    R2["Request B"] --> P
+    P -- "yes" --> C["Borrow connection"] --> DB[("Database")]
+    P -- "no" --> W["Wait in line<br/>(up to a timeout)"] --> P
+    C -->|"query done"| BACK["Return to pool"]
+```
+
+**Analogy.** A pool is a taxi rank with ten taxis. Passengers take a waiting taxi; if none is there they queue, and each taxi comes back after its trip.
+Where it breaks: a taxi that never returns is noticed; a leaked connection silently shrinks the rank until everyone waits.
+
+**How the rest of this note builds up**
+
+- First, why opening a connection per request is expensive (section 1) and the bounded-queue mental model (section 2).
+- Then how borrowing, waiting, ageing and the knobs work (section 3).
+- Then worked numbers: sizing with Little's Law, queueing under load, and a leak traced end to end (section 4).
+- Finally the SDE-3 deep dive: PgBouncer modes and session state, production limits across pods, and what really happens under load (sections 5-8).
+
+> [!tip] Remember
+> Keep a few connections open, lend them out, and make extra requests wait in the app instead of drowning the database.
 
 ## 1. Why it exists
 
@@ -53,7 +97,11 @@ sequenceDiagram
 
 Borrowing an idle pooled connection costs microseconds; opening one costs milliseconds (an estimate for the same region). Opening one per request would multiply latency and burn database CPU on process churn.
 
-The limit matters as much as the cost. `max_connections` is typically 100, and changing it needs a restart. A classic outage: 10 containers each set their pool to 50. That allows 500 connections against a limit of 100, so new connections fail with `FATAL: sorry, too many clients already` (SQLSTATE 53300). Even below the limit, hundreds of *active* backends on 8 cores spend their time on context switches and lock contention instead of queries.
+The limit matters as much as the cost. `max_connections` is typically 100, and changing it needs a restart.
+
+A classic outage: 10 containers each set their pool to 50. That allows 500 connections against a limit of 100, so new connections fail with `FATAL: sorry, too many clients already` (SQLSTATE 53300).
+
+Even below the limit, hundreds of *active* backends on 8 cores spend their time on context switches and lock contention instead of queries.
 
 ```mermaid
 flowchart LR
@@ -466,3 +514,8 @@ flowchart LR
 - **Runnable code:** [[Connection Pooling - Go]] (a channel pool, a fake driver that measures the cap, leak tests, production configuration)
 - **Next:** [[Database Access (database-sql, pgx, sqlc)]], [[Replication]], [[Debugging Database Performance]]
 - **Compare with:** [[Bulkheads and Concurrency Limits]] (the pool as a bulkhead), [[N+1 Query Problem]] (the other way to waste connections), [[AWS 08 - RDS and Aurora]] (RDS Proxy)
+
+### Watch on YouTube
+
+- [Connection pooling, routing, and queuing with PgBouncer](https://www.youtube.com/watch?v=CAKI_eZiRAU) · Postgres Conference · conference deep dive on pool modes and sizing
+- [PgBouncer Tutorial](https://www.youtube.com/watch?v=ddKm7a7xOpk) · Code with Lucian · step-by-step PgBouncer setup tutorial

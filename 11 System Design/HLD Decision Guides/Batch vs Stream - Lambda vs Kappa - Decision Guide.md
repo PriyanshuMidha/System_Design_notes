@@ -14,13 +14,21 @@ sources:
   - "Apache Kafka documentation: Kafka Streams (library, no separate cluster), processing.guarantee=exactly_once_v2"
   - "Dean and Ghemawat, MapReduce: Simplified Data Processing on Large Clusters (OSDI 2004)"
   - "Apache Iceberg, Delta Lake and Apache Hudi documentation: table formats that support both batch reads and incremental or streaming reads (stated at a high level only)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Batch vs Stream - Lambda vs Kappa - Decision Guide
 
 > [!summary] TL;DR
-> **Batch** processing runs a job over a finished, bounded pile of data (yesterday's orders). **Stream** processing runs continuously over an endless flow of events and keeps results fresh in seconds. Choose by three things: how fresh the answer must be, how correct it must be, and how often you will need to recompute history. **Lambda** runs both paths side by side (two codebases). **Kappa** runs only the stream path and reprocesses by replaying the log (one codebase). The modern default is a replayable log plus one engine that can run both modes.
+> **Batch** processing runs a job over a finished, bounded pile of data (yesterday's orders).
+>
+> **Stream** processing runs continuously over an endless flow of events and keeps results fresh in seconds.
+>
+> Choose by three things: how fresh the answer must be, how correct it must be, and how often you will need to recompute history.
+>
+> **Lambda** runs both paths side by side (two codebases). **Kappa** runs only the stream path and reprocesses by replaying the log (one codebase).
+>
+> The modern default is a replayable log plus one engine that can run both modes.
 
 > [!abstract] Core idea
 > - Ask "what is the cost of a stale answer?" first. If minutes-to-hours is fine, batch is simpler, cheaper and easier to fix.
@@ -28,6 +36,52 @@ updated: 2026-11-09
 > - Stream needs three extra decisions batch does not: event time, windows with late data, and state with checkpoints.
 > - Lambda's weakness is two codebases that must give the same answer. Kappa's weakness is long replays and retention cost.
 > - Numbers here are rough estimates unless a source is named.
+
+## Start here: the basics
+
+**The problem in one story.**
+A food delivery app collects every order as it happens.
+Finance needs yesterday's revenue per restaurant, and tomorrow morning is fine.
+Operations needs "orders stuck for 10 minutes" right now, not tomorrow.
+You can process data in big scheduled piles (batch) or one event at a time as it arrives (stream).
+This guide is about picking one, or both, and fixing results when the code had a bug.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Event | One small record that something happened | "order 991 placed at 12:03" |
+| Batch job | A program run on a fixed pile of data, then it stops | Nightly revenue job at 02:00 |
+| Stream job | A program that never stops and handles events as they come | Live "stuck orders" counter |
+| Log (Kafka) | An append-only, replayable list of events | Topic `orders` kept 30 days |
+| Latency / freshness | How old the answer is when you read it | Batch: hours; stream: seconds |
+| Reprocessing / backfill | Re-running logic over old data after a fix | Recompute last month's totals |
+| Window | A time bucket a stream groups events into | Orders per 5 minutes |
+| Event time | When the event really happened, not when it arrived | Phone was offline, sent late |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    E[Events] --> L[(Replayable log)]
+    L --> B[Batch job: hourly or nightly]
+    L --> S[Stream job: always on]
+    B --> R1[Correct, but late answers]
+    S --> R2[Fresh answers in seconds]
+```
+
+**Analogy.** Batch is doing the laundry once a week in one big load. Stream is washing each shirt the moment it gets dirty.
+Where it breaks: re-washing last month's laundry is impossible, but a data system can replay old events if it kept them.
+
+**How the rest of this note builds up**
+
+- First, why it exists and the mental model (sections 1-2).
+- Then the decision steps (section 3): freshness, reprocessing, Lambda, Kappa, the modern middle path, windows and late data, choosing the tool.
+- Then a worked example, a full comparison and scenario drills (sections 4-5).
+- Finally the SDE-3 deep dive (section 8): exactly-once as a combination, why batch is easier to make correct, and sizing by data and state.
+
+> [!tip] Remember
+> Ask how stale an answer may be and how you will recompute history; that picks batch, stream or both.
 
 ## 1. Why it exists
 
@@ -407,7 +461,13 @@ State in a stream lives in memory or an embedded store (RocksDB in Flink) and is
 > When the answer may be hours old, when correctness or audit matters more than speed (payouts, tax), when data is already in a warehouse, or when the team cannot operate an always-on cluster. Batch is cheaper and reprocessing is just a rerun.
 
 > [!question]- Explain Lambda and Kappa and why Kappa became popular.
-> Lambda runs a speed layer (stream) and a batch layer over the same data and merges them at read time; the downside is two codebases that must agree. Kappa runs only the stream and reprocesses by replaying a retained log. It became popular because stream engines got exactly-once and event-time support, so the batch path was no longer needed for correctness. In practice many teams use one engine in both modes plus a lake for backfill.
+> Lambda runs a speed layer (stream) and a batch layer over the same data and merges them at read time; the downside is two codebases that must agree.
+>
+> Kappa runs only the stream and reprocesses by replaying a retained log.
+>
+> It became popular because stream engines got exactly-once and event-time support, so the batch path was no longer needed for correctness.
+>
+> In practice many teams use one engine in both modes plus a lake for backfill.
 
 > [!question]- How do you handle late-arriving data in a stream?
 > Use event time, a watermark with a tolerance, and allowed lateness to update emitted windows. Send events beyond that to a side output and correct them in a periodic batch recompute. State the lateness tolerance as a business number.
@@ -447,3 +507,8 @@ State in a stream lives in memory or an embedded store (RocksDB in Flink) and is
 - Case studies: [[Case Study - Ad Click Aggregation]], [[Case Study - Metrics and Logging Platform]], [[Case Study - Leaderboard and Top-K]].
 - Sibling guides: [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[HLD Trade-offs Master Cheat Sheet]].
 - Framework: [[System Design Interview Framework]], [[HLD Round - Complete Step-by-Step Guide]].
+
+### Watch on YouTube
+
+- [Lambda vs Kappa Architecture / Batch vs Stream Processing Explained](https://www.youtube.com/watch?v=Bnrk9Jz5ko0) · Arpit Vaish · 9 min · 704 views
+- [Lambda vs Kappa Architecture: Stream vs Batch Processing in Big Data / Uplatz](https://www.youtube.com/watch?v=oj3QFdRr8xE) · Uplatz · 7 min · 59 views

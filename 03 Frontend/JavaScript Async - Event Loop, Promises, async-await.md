@@ -8,13 +8,15 @@ sources:
   - "MDN, Using Promises"
   - "MDN, Microtasks and the JavaScript runtime environment"
   - "Node.js docs, process.on('unhandledRejection')"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # JavaScript Async - Event Loop, Promises, async-await
 
 > [!summary] TL;DR
-> JavaScript runs on one thread with a **call stack**. Slow work (timers, network, file I/O) is handed to the browser or Node runtime, and when it finishes, the runtime queues a **callback** to run later. A **Promise** is an object that represents a value which isn't ready yet; `async`/`await` is syntax that lets you write Promise code as if it were sequential.
+> JavaScript runs on one thread with a **call stack**. Slow work (timers, network, file I/O) is handed to the browser or Node runtime, and when it finishes, the runtime queues a **callback** to run later.
+>
+> A **Promise** is an object that represents a value which isn't ready yet; `async`/`await` is syntax that lets you write Promise code as if it were sequential.
 
 > [!abstract] Core idea
 > - The call stack runs one thing at a time; it never blocks waiting for a timer or a network call.
@@ -22,6 +24,49 @@ updated: 2026-11-04
 > - A Promise is `pending`, then settles exactly once to `fulfilled` or `rejected`.
 > - `async`/`await` is sugar over `.then()` chains; it does not make code run in parallel.
 > - Classic bugs: an unhandled rejection crashes a Node process; `await` inside a `for` loop runs one request at a time when they could all run together.
+
+## Start here: the basics
+
+**The problem in one story.**
+A web page asks a server for your profile. The answer takes 300 ms.
+JavaScript has only one thread, so if it simply waited, every button on the page would freeze for 300 ms.
+Instead it says "call me back when the data is here" and keeps handling clicks.
+Promises and `async`/`await` are tidy ways to write that "call me back".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Thread | One line of execution that does one thing at a time | JS runs your code on one main thread |
+| Call stack | The list of functions currently running, newest on top | `main` → `render` → `format` |
+| Callback | A function you hand over to be run later | `setTimeout(() => log("hi"), 0)` |
+| Queue | A waiting line, first in first out | Finished timers waiting to run |
+| Promise | An object standing for a value that arrives later | `fetch(url)` returns one |
+| Resolve / reject | The promise finished OK / failed | `.then(ok)` / `.catch(err)` |
+| `await` | Pause this async function until the promise settles | `const r = await fetch(url)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Call stack<br/>runs sync code"] --> E{"Stack empty?"}
+    E -- "yes" --> M["Run ALL<br/>microtasks<br/>(promise callbacks)"]
+    M --> T["Run ONE<br/>macrotask<br/>(e.g. setTimeout)"]
+    T --> S
+```
+
+**Analogy.** A single waiter takes your order, hands it to the kitchen and serves other tables instead of standing by the stove; when the food is ready the kitchen rings a bell and the waiter brings it over.
+Where it breaks: a real waiter can be interrupted mid-task; JavaScript always finishes the current function before picking up the next callback.
+
+**How the rest of this note builds up**
+
+- First, why async exists and a mental model of the event loop (sections 1-2).
+- Then how it works: the call stack, microtasks vs macrotasks, and promise states (section 3).
+- Then `async`/`await` as sugar, sequential vs `Promise.all`, and unhandled rejections (section 4).
+- Finally variants, trade-offs, production practice and the deep dive, then interview questions (sections 5-9).
+
+> [!tip] Remember
+> One thread, one stack: sync code first, then every microtask, then one macrotask — repeat.
 
 ## 1. Why it exists
 
@@ -85,7 +130,9 @@ console.log("5: sync end");
 2: setTimeout (macrotask)
 ```
 
-All synchronous code (1, 5) runs first because the stack must empty before anything else is considered. Then every microtask (3, 4) runs, in the order they were queued, before the engine even looks at the macrotask queue. Only then does the `setTimeout` callback (2) run — even though it was scheduled with a 0 ms delay, which means "as soon as possible", not "immediately".
+All synchronous code (1, 5) runs first because the stack must empty before anything else is considered. Then every microtask (3, 4) runs, in the order they were queued, before the engine even looks at the macrotask queue.
+
+Only then does the `setTimeout` callback (2) run — even though it was scheduled with a 0 ms delay, which means "as soon as possible", not "immediately".
 
 **Picture the same trace as a timeline**, watching what sits in each queue at each moment:
 
@@ -339,3 +386,8 @@ risky(); // no .catch and no await: this becomes an unhandled rejection
 - **Before this:** [[DOM, Events and Timers]]
 - **Next:** [[React Fundamentals - Components, JSX, Props, State]], [[React Hooks]] (`useEffect` cleanup races with this exact async lifecycle)
 - **Compare with:** [[JavaScript Core - Types, Scope, Hoisting, Closures, this]], [[Goroutines and Channels]] (true OS-scheduled concurrency vs a single-threaded event loop)
+
+### Watch on YouTube
+
+- [How does the Event Loop work?](https://www.youtube.com/watch?v=WNrHrwm1wkU) · Boot dev · clean conceptual explanation of call stack, queues, and event loop
+- [Async in Javascript : Promise & Microtask Queue in Browser & Node](https://www.youtube.com/watch?v=PI_dwjy-KAk) · Eulier Gonzalez · deep dive on microtask vs macrotask ordering with Promises

@@ -19,7 +19,7 @@ sources:
   - "GitHub REST API docs: conditional requests, and 404 instead of 403 for private resources"
   - "Stripe API docs: idempotent requests"
   - "Kubernetes API concepts: resourceVersion and 409 Conflict on update"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # REST and HTTP API Design
@@ -33,6 +33,50 @@ updated: 2026-11-02
 > - An **ETag** is a version label: `If-None-Match` saves bandwidth (`304`), `If-Match` prevents lost updates (`412`).
 > - Classic mistake: verbs in URLs (`/createOrder`) and `200 OK` with an error inside the body.
 
+## Start here: the basics
+
+**The problem in one story.**
+A mobile app, a website and a partner company all talk to your booking server.
+If every endpoint has its own made-up name and rules, each team must read special docs for each one.
+REST gives everyone the same rules: things have addresses, a few standard verbs act on them, and standard codes say what happened.
+Then caches, retries, browsers and monitoring tools all work without extra effort.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HTTP | The protocol browsers and servers talk over | A request line `GET /bookings/42` |
+| URL | The address of something on the web | `https://api.example.com/orders/42` |
+| Resource | A thing the API exposes, named by a URL | Booking 42 |
+| HTTP method | The verb that says what to do to a resource | `GET` reads, `DELETE` removes |
+| Status code | A 3-digit number saying how the request went | `200` OK, `404` not found |
+| Header | Extra key-value info on a request or response | `Content-Type: application/json` |
+| Idempotent | Repeating it has the same effect as doing it once | Two identical `PUT`s leave one state |
+| Cache / CDN | Stored copies of responses close to the user | A CDN serves `GET /products` without hitting the server |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client"] -- "GET /bookings/42" --> S["Server"]
+    S -- "200 OK + JSON + ETag" --> C
+    C -- "PATCH /bookings/42<br/>If-Match: ETag" --> S
+    S -- "200 if unchanged<br/>412 if someone else edited" --> C
+```
+
+**Analogy.** A library catalogue: every book has a shelf address, you only look, add, replace, amend or remove books, and you show your card on every visit.
+Where it breaks: a library hands you the book itself; an API hands you a copy (a representation), and the original can change while you hold it, which is why ETags exist.
+
+**How the rest of this note builds up**
+
+- First, why an API without rules hurts (section 1) and the library-catalogue mental model (section 2).
+- Then resource naming, methods, status codes, ETags and long-running operations (section 3).
+- Then a Go worked example of optimistic concurrency, trade-offs, and production practice.
+- Finally, the SDE-3 deep dive on strong vs weak ETags, caching details and HTTP edge cases, plus interview questions.
+
+> [!tip] Remember
+> Nouns in URLs, standard verbs, honest status codes, and ETags to stop lost updates.
+
 ## 1. Why it exists
 
 Imagine an API that grew without rules:
@@ -44,9 +88,17 @@ POST /updateBookingSeats        {"bookingId": 42, "seats": 3}
 200 OK                          {"error": "booking not found"}
 ```
 
-Every endpoint is a `POST`, so nothing can be cached and nothing can be retried safely. Every error is a `200`, so load balancers, dashboards and client libraries think everything works. Each new client must read the docs for every endpoint, because nothing follows a pattern.
+Every endpoint is a `POST`, so nothing can be cached and nothing can be retried safely.
 
-REST replaces those private conventions with shared ones that HTTP already defines. `GET /bookings/42` is safe to retry and can be cached by a CDN (content delivery network: a fleet of caches close to users). `404` means the same thing to every client, proxy and monitoring tool. When two support agents edit the same booking, HTTP's conditional requests stop one from silently overwriting the other.
+Every error is a `200`, so load balancers, dashboards and client libraries think everything works.
+
+Each new client must read the docs for every endpoint, because nothing follows a pattern.
+
+REST replaces those private conventions with shared ones that HTTP already defines:
+
+- `GET /bookings/42` is safe to retry and can be cached by a CDN (content delivery network: a fleet of caches close to users).
+- `404` means the same thing to every client, proxy and monitoring tool.
+- When two support agents edit the same booking, HTTP's conditional requests stop one from silently overwriting the other.
 
 ## 2. Mental model
 
@@ -217,7 +269,11 @@ flowchart TD
     D -- "failed" --> I["200, status failed, error as problem details"]
 ```
 
-The operation itself is a resource, so `GET /operations/op_81` returns `200` even when the job failed: the request to read the status succeeded. RFC 9110 gives `Location` and `Retry-After` no defined meaning on a `202`; using them to point at the status monitor is a common convention (Azure names its header `Operation-Location`), so document it in the contract. Clients that cannot poll can register a webhook instead (see [[Webhooks - Sending and Receiving]]).
+The operation itself is a resource, so `GET /operations/op_81` returns `200` even when the job failed: the request to read the status succeeded.
+
+RFC 9110 gives `Location` and `Retry-After` no defined meaning on a `202`; using them to point at the status monitor is a common convention (Azure names its header `Operation-Location`), so document it in the contract.
+
+Clients that cannot poll can register a webhook instead (see [[Webhooks - Sending and Receiving]]).
 
 ### Bulk endpoints
 
@@ -271,7 +327,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 ### Full version
 
-Optimistic concurrency and cache revalidation in Go 1.24 with only the standard library. The `{id}` path patterns need Go 1.22 or later. An in-memory map stands in for the table; the lock makes the version check and the write one atomic step, exactly as the `UPDATE ... WHERE version = $4` statement does. It passes `go vet` and `go test -race`.
+Optimistic concurrency and cache revalidation in Go 1.24 with only the standard library. The `{id}` path patterns need Go 1.22 or later.
+
+An in-memory map stands in for the table; the lock makes the version check and the write one atomic step, exactly as the `UPDATE ... WHERE version = $4` statement does. It passes `go vet` and `go test -race`.
 
 ```go
 package booking
@@ -597,7 +655,10 @@ The IETF draft for this header answers `409` while the first request with that k
 - **Idempotent does not mean "same response".** The first `DELETE /bookings/42` returns `204` and the second returns `404`, yet the server state after both is the same. The guarantee is about effects, which is why retry libraries may resend `PUT` and `DELETE` but not `POST`.
 - **Why `PATCH` is not idempotent in general.** A JSON Patch `{"op": "add", "path": "/tags/-", "value": "vip"}` appends to an array on every call. A merge patch that only sets fields is idempotent in practice, but the method does not promise it, so clients cannot assume it.
 - **Create-only and update-only `PUT`.** `If-None-Match: *` on `PUT /users/42/avatar` means "create only if nothing exists" and returns `412` if something does. `If-Match: *` means "update only if it exists". A client sends one or the other, so a `PUT` with a client-chosen ID never silently overwrites (create-only) or silently creates (update-only).
-- **Strong and weak ETags.** `W/"v1"` is a weak tag: the representations are equivalent but maybe not byte-identical. `If-None-Match` uses weak comparison, so weak tags are fine for revalidation. `If-Match` uses strong comparison, so a weak tag never matches (the Go test above checks this). Proxies that compress on the fly may weaken strong ETags (nginx's gzip module turns `"v1"` into `W/"v1"`), so clients that echo the weak tag in `If-Match` get `412` on every write.
+- **Strong and weak ETags.** `W/"v1"` is a weak tag: the representations are equivalent but maybe not byte-identical.
+	- `If-None-Match` uses weak comparison, so weak tags are fine for revalidation.
+	- `If-Match` uses strong comparison, so a weak tag never matches (the Go test above checks this).
+	- Proxies that compress on the fly may weaken strong ETags (nginx's gzip module turns `"v1"` into `W/"v1"`), so clients that echo the weak tag in `If-Match` get `412` on every write.
 - **How to build ETags.** A version column is cheapest: no need to render the body to compare. Hashing the rendered body works for any resource but costs the full render. The tag must change whenever anything that shapes the representation changes, including `?fields=` and language, or clients get the wrong `304`.
 - **What a `304` must carry.** It has no body but must repeat headers a `200` would have sent, such as `ETag`, `Cache-Control`, `Vary` and `Expires`, so caches can refresh their stored metadata.
 - **Statelessness and sessions.** Fielding's constraint puts session state on the client. A server-side session store reached through a cookie technically breaks it but scales fine if the store is shared. The practical rule: no request depends on which instance served the previous one.
@@ -646,3 +707,8 @@ The IETF draft for this header answers `409` while the first request with that k
 - **Next:** [[API Contract Design and OpenAPI]], [[API Error Handling]], [[Pagination, Filtering and Sorting]], [[API Versioning and Backward Compatibility]], [[Idempotency and Idempotency Keys]]
 - **Compare with:** [[GraphQL]], [[gRPC]], [[HTTP Caching - Cache-Control, ETag, Conditional Requests]]
 - **Build it in Go:** [[Building REST Endpoints]]
+
+### Watch on YouTube
+
+- [REST API Best Practices: How to Use the Right HTTP Methods and Status Codes](https://www.youtube.com/watch?v=XLQxfpDmqbM) · Coding with Nam · covers resource naming, HTTP methods and status codes as the note does
+- [HTTP Status Codes Explained for REST APIs (200, 400, 404, 500)](https://www.youtube.com/watch?v=x2d59rJ7vgo) · Topictrick · focused reference on the status-code side of REST design

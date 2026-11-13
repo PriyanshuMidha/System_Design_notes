@@ -14,13 +14,24 @@ sources:
   - "Verbitski et al., Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases (SIGMOD 2017)"
   - "Elhemali et al., Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022)"
   - "Kleppmann, Designing Data-Intensive Applications (2017), chapter 5: Replication"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Replication - Go
 
 > [!summary] TL;DR
-> A read router in Go that keeps read-your-writes on asynchronous PostgreSQL replicas: it parses WAL positions (LSNs), tracks each replica's replay position, and only sends a read to a replica that has replayed past the user's last write, as explained in [[Replication]]. The router logic is tested under `go test -race`; the pgx calls need a live PostgreSQL 17 cluster and are verified to compile only.
+> A read router in Go that keeps read-your-writes on asynchronous PostgreSQL replicas: it parses WAL positions (LSNs), tracks each replica's replay position, and only sends a read to a replica that has replayed past the user's last write, as explained in [[Replication]].
+>
+> The router logic is tested under `go test -race`; the pgx calls need a live PostgreSQL 17 cluster and are verified to compile only.
+
+## Before the code
+
+- **Generics**: `Router[T any]` and `Replica[T any]` work for any connection type, so tests use `string` and production uses `*pgxpool.Pool`.
+- **Atomics**: each replica's replay position is read and written with `sync/atomic`, so the poller and readers never race.
+- **Goroutines and `sync.WaitGroup`**: the concurrency test starts many goroutines and waits for all to finish.
+- **`context.Context`**: `PollReplay` stops when its context is cancelled.
+- **`time.Ticker`**: fires on a fixed interval to refresh replay positions.
+- **Run**: `go mod tidy`, then `go vet ./... && go test -race -v ./...`; the tests need no database.
 
 ## What this code shows
 
@@ -66,7 +77,9 @@ sequenceDiagram
 
 ## How to read this note
 
-The note has two halves. The first is operational SQL and shell commands (create a slot, take a base backup, read lag, set up logical replication), which you run against a real cluster. The second is the Go read router, which you can run anywhere. Each step has a Concept paragraph, a short block and a numbered How it works list; blocks of one file continue each other.
+The note has two halves. The first is operational SQL and shell commands (create a slot, take a base backup, read lag, set up logical replication), which you run against a real cluster. The second is the Go read router, which you can run anywhere.
+
+Each step has a Concept paragraph, a short block and a numbered How it works list; blocks of one file continue each other.
 
 The core idea in one line: **a write returns a WAL position (the token), every replica reports how far it has replayed, and a read may go to a replica only when its position is at least the token.**
 
@@ -84,7 +97,13 @@ flowchart LR
 
 ### Step 1: replica setup commands
 
-**Concept.** A physical replica is a byte-for-byte copy of the primary that replays the primary's write-ahead log ([[Replication#3.1 PostgreSQL streaming replication]]). Two things are needed to start one: a base backup to copy the data directory, and a replication slot so the primary does not delete WAL that the replica has not received yet ([[Replication#3.4 Replication slots]]). The alternative to a slot is `wal_keep_size` or an archive, which are simpler but let the primary recycle WAL the replica still needs if the replica is slow or offline. The cost of a slot is the opposite risk: a dead replica makes the primary keep WAL forever.
+**Concept.** A physical replica is a byte-for-byte copy of the primary that replays the primary's write-ahead log ([[Replication#3.1 PostgreSQL streaming replication]]).
+
+Two things are needed to start one: a base backup to copy the data directory, and a replication slot so the primary does not delete WAL that the replica has not received yet ([[Replication#3.4 Replication slots]]).
+
+The alternative to a slot is `wal_keep_size` or an archive, which are simpler but let the primary recycle WAL the replica still needs if the replica is slow or offline.
+
+The cost of a slot is the opposite risk: a dead replica makes the primary keep WAL forever.
 
 ```sql
 -- On the primary (PostgreSQL 17)
@@ -118,7 +137,9 @@ sequenceDiagram
 
 ### Step 2: monitoring and tuning SQL
 
-**Concept.** Replication needs measurement. The primary tracks each connected replica in `pg_stat_replication`, with the byte lag and three time lags (write, flush and replay), and tracks slots in `pg_replication_slots` ([[Replication#3.3 Measuring lag]]). The router in this note trusts the replay position, so you should know how to read the same number by hand. The alternatives are an exporter that scrapes the same views, or the cloud provider's lag metric; the SQL shows what those tools read.
+**Concept.** Replication needs measurement. The primary tracks each connected replica in `pg_stat_replication`, with the byte lag and three time lags (write, flush and replay), and tracks slots in `pg_replication_slots` ([[Replication#3.3 Measuring lag]]).
+
+The router in this note trusts the replay position, so you should know how to read the same number by hand. The alternatives are an exporter that scrapes the same views, or the cloud provider's lag metric; the SQL shows what those tools read.
 
 ```sql
 -- On the primary: one row per connected replica
@@ -206,7 +227,9 @@ The full version adds LSN parsing, a background poller, round-robin, concurrency
 
 ### Step 4: parse and print LSNs
 
-**Concept.** PostgreSQL prints an LSN as two hexadecimal numbers separated by a slash, the high and the low 32 bits, such as `16/B374D848` ([[Replication#3.3 Measuring lag]]). The numbers are not zero-padded, so as text `16/FFFFFF` sorts after `16/1000000` even though it is the smaller position. Parsing into one `uint64` makes positions comparable numerically. The alternative is to ask PostgreSQL to compare them with `pg_wal_lsn_diff`, which costs a round trip for each comparison; parsing once in Go costs nothing.
+**Concept.** PostgreSQL prints an LSN as two hexadecimal numbers separated by a slash, the high and the low 32 bits, such as `16/B374D848` ([[Replication#3.3 Measuring lag]]). The numbers are not zero-padded, so as text `16/FFFFFF` sorts after `16/1000000` even though it is the smaller position.
+
+Parsing into one `uint64` makes positions comparable numerically. The alternative is to ask PostgreSQL to compare them with `pg_wal_lsn_diff`, which costs a round trip for each comparison; parsing once in Go costs nothing.
 
 ```go
 // Package rwsplit sends reads to replicas without breaking read-your-writes.
@@ -271,7 +294,13 @@ The last two rows show why strings must not be compared: as text `16/FFFFFF` is 
 
 ### Step 5: a replica that never moves backwards
 
-**Concept.** Each replica carries the last replay position seen by a poller, and several goroutines may update it. The position must never move backwards, because a stale value that overwrote a newer one would make a replica look further behind than it is, and a stale value that looked further ahead would break read-your-writes. Under-reporting is safe (the read just goes elsewhere), over-reporting is not. A compare-and-swap loop on an atomic integer keeps the maximum without a mutex ([[Replication#3.3 Measuring lag]]). The alternative is a `sync.Mutex` around a plain field, which is also correct but takes a lock on the hot read path of every `ForRead`.
+**Concept.** Each replica carries the last replay position seen by a poller, and several goroutines may update it.
+
+The position must never move backwards, because a stale value that overwrote a newer one would make a replica look further behind than it is, and a stale value that looked further ahead would break read-your-writes.
+
+Under-reporting is safe (the read just goes elsewhere), over-reporting is not. A compare-and-swap loop on an atomic integer keeps the maximum without a mutex ([[Replication#3.3 Measuring lag]]).
+
+The alternative is a `sync.Mutex` around a plain field, which is also correct but takes a lock on the hot read path of every `ForRead`.
 
 ```go
 // Replica is a read target plus the last replay position seen by a poller.
@@ -316,7 +345,11 @@ sequenceDiagram
 
 ### Step 6: the router
 
-**Concept.** The router decides, for each read, which connection to use. A read that carries a token goes to a replica whose replay position is at least that token; a session that never wrote passes 0 and may use any replica. If no replica qualifies, the read goes to the primary, which is always up to date. This is the read-your-writes fix for the stale read in [[Replication#The stale read]]. Starting from a rotating index spreads load round-robin. The alternatives are pinning a user to one replica, which also keeps later reads consistent but does not survive a replica restart, or reading everything from the primary, which is correct but wastes the replicas.
+**Concept.** The router decides, for each read, which connection to use. A read that carries a token goes to a replica whose replay position is at least that token; a session that never wrote passes 0 and may use any replica.
+
+If no replica qualifies, the read goes to the primary, which is always up to date. This is the read-your-writes fix for the stale read in [[Replication#The stale read]]. Starting from a rotating index spreads load round-robin.
+
+The alternatives are pinning a user to one replica, which also keeps later reads consistent but does not survive a replica restart, or reading everything from the primary, which is correct but wastes the replicas.
 
 ```go
 // Router picks a connection for each read.
@@ -376,7 +409,11 @@ flowchart TD
 
 ### Step 7: the database calls
 
-**Concept.** Two small functions connect the router to PostgreSQL. After a write commits, `WriteToken` reads the primary's current WAL insert position; this is never behind the commit record, so a replica that has replayed it has certainly replayed the write ([[Replication#The stale read]]). `PollReplay` runs in a goroutine and refreshes a replica's replay position every interval. The alternative to polling is asking the replica on every read with `pg_last_wal_replay_lsn()`, which is always exact but adds a round trip to every read; a cached value is cheaper and can only under-report. The token function comes first.
+**Concept.** Two small functions connect the router to PostgreSQL. After a write commits, `WriteToken` reads the primary's current WAL insert position; this is never behind the commit record, so a replica that has replayed it has certainly replayed the write ([[Replication#The stale read]]).
+
+`PollReplay` runs in a goroutine and refreshes a replica's replay position every interval.
+
+The alternative to polling is asking the replica on every read with `pg_last_wal_replay_lsn()`, which is always exact but adds a round trip to every read; a cached value is cheaper and can only under-report. The token function comes first.
 
 ```go
 // WriteToken reads the primary's WAL insert position. Call it after COMMIT and
@@ -577,7 +614,11 @@ func TestObserveConcurrent(t *testing.T) {
 }
 ```
 
-**How it works.** Goroutine `g` observes the values `g*1000+1` to `g*1000+1000`, so the largest value anywhere is `7*1000 + 1000 = 8000`, from the last goroutine. Because the goroutines interleave, many `Observe` calls carry a value lower than the current one; the CAS loop must ignore those. The `ForRead` call in the loop reads the position while it is being written, which is what `-race` checks. The file imports `sync` and `testing`.
+**How it works.** Goroutine `g` observes the values `g*1000+1` to `g*1000+1000`, so the largest value anywhere is `7*1000 + 1000 = 8000`, from the last goroutine.
+
+Because the goroutines interleave, many `Observe` calls carry a value lower than the current one; the CAS loop must ignore those. The `ForRead` call in the loop reads the position while it is being written, which is what `-race` checks.
+
+The file imports `sync` and `testing`.
 
 **If it fails.** A final value below 8000 means a stale write overwrote a newer one, so `Observe` can move backwards. A race report means the position is accessed without atomics.
 

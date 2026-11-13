@@ -13,7 +13,7 @@ sources:
   - "Kleppmann, Designing Data-Intensive Applications, chapter 8 (The Trouble with Distributed Systems)"
   - "Lamport, Shostak & Pease, The Byzantine Generals Problem (TOPLAS 1982)"
   - "Elhemali et al., Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Distributed Systems Fundamentals
@@ -27,6 +27,52 @@ updated: 2026-11-04
 > - So every remote write must be safe to repeat (idempotent) or checkable afterwards.
 > - You design against a **system model**: which failures you assume can happen (crash, restart, lies) and how slow things can get.
 > - Classic mistake: treating a remote call like a local function call that either returns or throws.
+
+## Start here: the basics
+
+**The problem in one story.**
+You text a friend "please pay the electricity bill" and get no reply.
+Did the message arrive? Did they pay? Are they paying right now?
+If you pay too, the bill might be paid twice; if you do nothing, maybe nobody pays.
+Every program that talks to another machine lives in this situation all the time.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Node | One machine (or process) in the system | One payment-service instance |
+| Message / RPC | A request sent over the network to another node | HTTP `POST /charge` |
+| Timeout | How long you wait before giving up | 2-second deadline on a call |
+| Partial failure | Some parts broken while others keep running | Payment DB down, checkout up |
+| Partition | Two groups of nodes that cannot reach each other | A switch failure splits a rack |
+| Idempotent | Safe to repeat with the same result | Charge with key `order-42` once only |
+| Latency | Time a request takes end to end | 0.5 ms round trip in one data centre |
+| System model | The list of failures you assume can happen | "Nodes crash and restart; nobody lies" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Checkout"] -- "charge ₹500" --> B["Payment service"]
+    B -- "reply lost" --> X["Network drops it"]
+    A --> T{"Timeout:<br/>what happened?"}
+    T --> N1["Never charged"]
+    T --> N2["Charged"]
+    T --> N3["Still running"]
+```
+
+**Analogy.** Posting letters with no tracking: silence can mean the letter was lost, the reply was lost, or the other side is slow.
+Where it breaks: post rarely duplicates letters, but networks and retries can deliver the same request twice.
+
+**How the rest of this note builds up**
+
+- First, why partial failure appears once a program spans machines (section 1) and the mental model of unknown outcomes (section 2).
+- Then the eight fallacies, what a caller can conclude, system models, partitions and gray failures (section 3).
+- Then a full Go example of a lost reply and a fooled failure detector (section 4), and how models compare (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production practice and the theory results such as FLP (sections 6-8).
+
+> [!tip] Remember
+> A timeout means "I stopped waiting", not "it failed"; design every remote write to be safely repeatable.
 
 ## 1. Why it exists
 
@@ -527,3 +573,8 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 - **Before this:** [[TCP - Handshake, Reliability, Flow and Congestion Control]], [[Context Package]]
 - **Next:** [[Timeouts, Retries and Backoff]], [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]], [[CAP and PACELC]]
 - **Compare with:** [[Failure Detection, Gossip and Membership]] (detection in depth), [[Clocks and Ordering]] (why there is no shared time), [[Replication]] (keeping copies in sync)
+
+### Watch on YouTube
+
+- [System Design Primer ⭐️: How to start with distributed systems?](https://www.youtube.com/watch?v=SqcXvc3ZmRU) · Gaurav Sen · 9 min · 2,095,426 views
+- [Data Consistency and Tradeoffs in Distributed Systems](https://www.youtube.com/watch?v=m4q7VkgDWrM) · Gaurav Sen · 25 min · 251,352 views

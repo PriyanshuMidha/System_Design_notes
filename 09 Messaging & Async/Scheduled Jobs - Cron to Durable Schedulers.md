@@ -12,13 +12,15 @@ sources:
   - "Varghese & Lauck, Hashed and Hierarchical Timing Wheels (SOSP 1987)"
   - "Go 1.23 release notes, Timer changes"
   - "crontab(5) manual page (field order and syntax)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Scheduled Jobs - Cron to Durable Schedulers
 
 > [!summary] TL;DR
-> A **scheduled job** is work that must start at a time rather than in response to a request: "every night at 02:00, mark invoices overdue" (**recurring**, written as a **cron** expression) or "remind this user at 9 am tomorrow" (**one-off**, a **delayed job**). The easy part is the timer; the hard parts are running it **once** across many replicas, surviving restarts and missed runs, and making a repeated run harmless.
+> A **scheduled job** is work that must start at a time rather than in response to a request: "every night at 02:00, mark invoices overdue" (**recurring**, written as a **cron** expression) or "remind this user at 9 am tomorrow" (**one-off**, a **delayed job**).
+>
+> The easy part is the timer; the hard parts are running it **once** across many replicas, surviving restarts and missed runs, and making a repeated run harmless.
 
 > [!abstract] Core idea
 > - A cron line in each of 3 replicas runs the job 3 times. Use one scheduler, a lock, or leader election.
@@ -26,6 +28,49 @@ updated: 2026-11-04
 > - Execution is at least once: jobs must be idempotent, checkpointed and safe to overlap or forbid overlap.
 > - Decide explicitly what happens to runs missed during downtime: skip, run once, or run all.
 > - Run schedules in UTC and alert when a job did **not** run (dead man's switch).
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app must email reminders at 9 am and clean up old data every night.
+Nobody clicks a button for this; the clock has to start the work.
+On one server a simple timer works. With three copies of the server, each copy fires, and customers get three emails.
+If the server restarts at the wrong minute, the job silently never runs.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cron | A classic Unix tool and syntax for "run at these times" | `0 2 * * *` = 02:00 daily |
+| Replica | One of several identical copies of a service | 3 pods of the API |
+| Timer / ticker | Code that wakes up after a delay or every period | `time.NewTicker(time.Minute)` |
+| Durable | Saved so it survives a crash or restart | A row in a PostgreSQL table |
+| Lock | A claim so only one worker does a thing at a time | Row locked with `FOR UPDATE` |
+| Idempotent | Running twice has the same effect as once | "Set status = overdue" |
+| UTC | One global clock time with no daylight saving | `2026-11-13T02:00:00Z` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Scheduler<br/>(one leader)"] -->|"insert run_at"| T[("Jobs table")]
+    W1["Worker 1"] -->|"claim due job<br/>SKIP LOCKED"| T
+    W2["Worker 2"] -->|"claim another job"| T
+    W1 --> D["Run job, mark done"]
+```
+
+**Analogy.** A hospital medication chart on the wall: nurses read it, initial a dose before giving it, and the chart survives shift changes.
+Where it breaks: nurses notice a missed dose by looking; software needs an explicit catch-up policy and an alert when a job did not run.
+
+**How the rest of this note builds up**
+
+- First, the four problems of scheduled jobs (section 1) and the medication-chart mental model (section 2).
+- Then levels of schedulers from one timer to durable job tables (section 3), with a Go worked example (section 4).
+- Then variants (Kubernetes CronJob, Temporal, cloud schedulers) and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: production pitfalls, timing wheels, scaling DB-backed schedulers and Redis ZSET delays (sections 7-8), then interview questions.
+
+> [!tip] Remember
+> The timer is easy; run once across replicas, survive restarts, handle missed runs, and make reruns harmless.
 
 ## 1. Why it exists
 
@@ -36,7 +81,13 @@ An invoicing service has these jobs (kept from the owner's original job list):
 - delete expired refresh tokens hourly;
 - reconcile payments with the provider every 15 minutes.
 
-The first version is a `time.Ticker` inside the API process. Then the service scales to 3 replicas, and every customer gets **three** reminder emails. A deploy at 01:59 restarts all pods, and that night's overdue run never happens. In March, the server's local time zone jumps from 02:00 to 03:00 for daylight saving, and, depending on the cron implementation, the 02:00 job either runs late or silently does not run at all.
+The first version is a `time.Ticker` inside the API process.
+
+Then the service scales to 3 replicas, and every customer gets **three** reminder emails.
+
+A deploy at 01:59 restarts all pods, and that night's overdue run never happens.
+
+In March, the server's local time zone jumps from 02:00 to 03:00 for daylight saving, and, depending on the cron implementation, the 02:00 job either runs late or silently does not run at all.
 
 Each of these is a different problem: **duplication**, **durability**, **missed runs** and **time zones**. This note covers all four.
 
@@ -60,7 +111,11 @@ Terms:
 
 ### Level 1: one process, one timer
 
-`cron` on one VM, or a loop around `time.Ticker` in Go. Simple and fine for one machine. It breaks as soon as there are two copies of the process or the machine restarts at the wrong moment. A Go `Ticker` also drops ticks when the job is slower than the period, because it delivers at most one pending tick; the Go-side details (and the Go 1.23 timer changes) are in [[Scheduled Jobs]].
+`cron` on one VM, or a loop around `time.Ticker` in Go. Simple and fine for one machine.
+
+It breaks as soon as there are two copies of the process or the machine restarts at the wrong moment.
+
+A Go `Ticker` also drops ticks when the job is slower than the period, because it delivers at most one pending tick; the Go-side details (and the Go 1.23 timer changes) are in [[Scheduled Jobs]].
 
 ### Level 2: make "N replicas" run once
 
@@ -427,9 +482,17 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 
 ## 8. Deep dive
 
-- **Timing wheels for millions of timers.** A heap gives `O(log n)` insert and pop (see [[Heaps and Priority Queues]]). A **timing wheel** is a circular array of buckets, one per tick (say 1 second, 3,600 buckets for an hour). Inserting a timer is `O(1)`: put it in bucket `(now + delay) mod 3600`. Each tick, fire the current bucket. Delays longer than one revolution go into a **hierarchical** wheel (seconds, minutes, hours, like a clock's hands) and cascade down as they get close. Kafka uses hierarchical timing wheels for delayed operations inside the broker, and Netty provides a `HashedWheelTimer`.
-- **Scaling a DB-backed scheduler.** Partition jobs by `hash(id) % P` and give each poller a set of partitions, or partition the table by `run_at` day and drop old partitions instead of deleting rows. A load of 10,000 due jobs per second is past the comfortable range of one polled PostgreSQL table (an estimate; measure on your hardware). The full design, including sharding and timer buckets, is [[Case Study - Distributed Job Scheduler]].
-- **Redis ZSET pattern, done safely.** Score = due Unix time. A poller runs a Lua script that does `ZRANGEBYSCORE delayed -inf <now> LIMIT 0 100`, `ZREM`s those IDs, and `LPUSH`es them to a ready list, all atomically, so two pollers never move the same ID. Without the script, two pollers can both read the same due IDs. Data structure choice is covered in [[Redis Data Structures and When to Use Each]].
+- **Timing wheels for millions of timers.** A heap gives `O(log n)` insert and pop (see [[Heaps and Priority Queues]]).
+  A **timing wheel** is a circular array of buckets, one per tick (say 1 second, 3,600 buckets for an hour). Inserting a timer is `O(1)`: put it in bucket `(now + delay) mod 3600`.
+  Each tick, fire the current bucket. Delays longer than one revolution go into a **hierarchical** wheel (seconds, minutes, hours, like a clock's hands) and cascade down as they get close.
+  Kafka uses hierarchical timing wheels for delayed operations inside the broker, and Netty provides a `HashedWheelTimer`.
+- **Scaling a DB-backed scheduler.** Partition jobs by `hash(id) % P` and give each poller a set of partitions, or partition the table by `run_at` day and drop old partitions instead of deleting rows.
+  A load of 10,000 due jobs per second is past the comfortable range of one polled PostgreSQL table (an estimate; measure on your hardware).
+  The full design, including sharding and timer buckets, is [[Case Study - Distributed Job Scheduler]].
+- **Redis ZSET pattern, done safely.** Score = due Unix time.
+  A poller runs a Lua script that does `ZRANGEBYSCORE delayed -inf <now> LIMIT 0 100`, `ZREM`s those IDs, and `LPUSH`es them to a ready list, all atomically, so two pollers never move the same ID.
+  Without the script, two pollers can both read the same due IDs.
+  Data structure choice is covered in [[Redis Data Structures and When to Use Each]].
 - **Exactly when?** No scheduler runs at an exact instant. Pollers add up to one poll interval of delay, Kubernetes adds pod start time, EventBridge Scheduler offers a flexible time window on purpose. State the precision you need ("within 60 seconds") and design to it.
 - **Long periodic jobs should checkpoint.** Store progress (`last_processed_id`) in a table after each chunk. A restart resumes from the checkpoint instead of starting over, and the catch-up policy only has to decide about new slots.
 
@@ -472,3 +535,8 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 - **Before this:** [[Background Jobs and Worker Pools]], [[Delivery Semantics and Exactly-Once]], [[Locking - Optimistic vs Pessimistic]]
 - **Next:** [[Workflow Engines and Durable Execution]], [[Case Study - Distributed Job Scheduler]]
 - **Compare with:** [[Scheduled Jobs]] (the Go code: ticker loops, robfig/cron, advisory locks), [[Leader Election]] (one scheduler among replicas), [[Distributed Locks and Fencing Tokens]] (why a lock alone is not enough)
+
+### Watch on YouTube
+
+- [Scheduling Jobs with @Scheduled Annotation (Cron Expression) / Spring Scheduler Tutorial](https://www.youtube.com/watch?v=pFpi-Fm23DU) · Ram N Java · 4 min · 2,279 views
+- [Moving Cron Jobs to the Cloud](https://www.youtube.com/watch?v=7Z1mgOxWTs8) · Google Cloud Tech · 3 min · 20,040 views

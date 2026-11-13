@@ -14,7 +14,7 @@ sources:
   - "Amazon S3 User Guide, Object Lock (governance and compliance modes)"
   - "GitLab, Postmortem of database outage of January 31 (2017)"
   - "pgBackRest, WAL-G and Barman project documentation"
-updated: 2026-11-03
+updated: 2026-11-13
 ---
 
 # Backup, PITR and Disaster Recovery
@@ -28,6 +28,50 @@ updated: 2026-11-03
 > - RPO (data you can lose) and RTO (time to recover) are business numbers; they decide the tools and the cost.
 > - Keep 3 copies on 2 kinds of storage, 1 off-site, and make at least one immutable.
 > - A backup you have never restored is a hope, not a backup: automate restore drills and verify the data.
+
+## Start here: the basics
+
+**The problem in one story.**
+A teammate runs `DELETE FROM invoices` and forgets the `WHERE`.
+The database has two replicas, but they copy the delete within milliseconds.
+Every copy now agrees: the invoices are gone.
+A backup lets you go back to "one second before the mistake" and get them back.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Backup | A saved copy of the data kept somewhere else | Last night's copy of the database in S3 |
+| Replica | A live copy that follows the main database | A read-only server that copies every write |
+| WAL (write-ahead log) | A diary of every change, written before the change is applied | "10:01:05 deleted invoice 42" |
+| PITR | Point-in-time recovery: restore to any chosen second | Restore to 10:01:04, just before the bad delete |
+| RPO | How much recent data you can afford to lose | RPO 1 min = lose at most the last minute |
+| RTO | How long you can afford to be down while restoring | RTO 1 h = service back within an hour |
+| Restore drill | A practice restore to prove backups work | Every Monday, restore to a test server and check row counts |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    DB["Live database"] -->|"nightly copy"| BB["Base backup"]
+    DB -->|"every change"| WAL["WAL archive"]
+    BB --> R["Restore server"]
+    WAL -->|"replay up to 10:01:04"| R
+    R --> OK["Data as it was<br/>just before the mistake"]
+```
+
+**Analogy.** A base backup is a photo of your room taken last night; the WAL is a video of everything that changed since. To see the room at 10:01, start from the photo and play the video up to 10:01.
+Where it breaks: a lost piece of the video means you cannot get past that point, while a real video would just skip a few frames.
+
+**How the rest of this note builds up**
+
+- First, why replicas are not backups (section 1) and the mental model of snapshot plus log (section 2).
+- Then how it works: logical vs physical backups, base backup plus WAL archive, the restore procedure and where RPO comes from (section 3).
+- Then worked numbers for InvoiceOps: setting RPO/RTO, restore-time math, a one-tenant restore and a drill (section 4).
+- Finally the SDE-3 view: DR tiers, managed vs self-managed tools, immutable copies and lessons from real incidents (sections 5-8).
+
+> [!tip] Remember
+> A replica copies mistakes; a base backup plus the WAL lets you rewind to the second before them.
 
 ## 1. Why it exists
 
@@ -98,7 +142,11 @@ flowchart TD
 
 ### 3.2 Base backup plus WAL archive
 
-Every change PostgreSQL makes is first written to the **WAL** (write-ahead log; see [[Storage Engines - B-tree vs LSM and WAL]]) in 16 MB files called segments. With `archive_mode = on`, each completed segment is handed to `archive_command` (or an `archive_library` since PostgreSQL 15), which copies it to object storage. A **base backup** is a copy of the data directory taken while the server runs; the files are inconsistent on their own, but together with the WAL from the backup's start to its end they become consistent.
+Every change PostgreSQL makes is first written to the **WAL** (write-ahead log; see [[Storage Engines - B-tree vs LSM and WAL]]) in 16 MB files called segments.
+
+With `archive_mode = on`, each completed segment is handed to `archive_command` (or an `archive_library` since PostgreSQL 15), which copies it to object storage.
+
+A **base backup** is a copy of the data directory taken while the server runs; the files are inconsistent on their own, but together with the WAL from the backup's start to its end they become consistent.
 
 ```mermaid
 flowchart LR
@@ -154,7 +202,11 @@ flowchart LR
     S3 -->|"archive_timeout = 60s forces a switch"| S4["segment 43 closed early and archived"]
 ```
 
-With WAL archiving, the data at risk is whatever sits in the current, not yet archived segment. On a quiet database a 16 MB segment can take hours to fill, so `archive_timeout = 60s` forces a switch to a new segment at least every 60 seconds, bounding RPO to about a minute plus the upload time. Tools such as `pg_receivewal`, pgBackRest and Barman can also stream WAL continuously, as a replica does, for an RPO of seconds.
+With WAL archiving, the data at risk is whatever sits in the current, not yet archived segment.
+
+On a quiet database a 16 MB segment can take hours to fill, so `archive_timeout = 60s` forces a switch to a new segment at least every 60 seconds, bounding RPO to about a minute plus the upload time.
+
+Tools such as `pg_receivewal`, pgBackRest and Barman can also stream WAL continuously, as a replica does, for an RPO of seconds.
 
 ### 3.4 Disaster recovery tiers
 
@@ -280,7 +332,11 @@ WHERE NOT EXISTS (SELECT 1 FROM clients c WHERE c.id = r.id);
 COMMIT;
 ```
 
-`COPY ... TO` a server file needs superuser or the `pg_write_server_files` role; from a laptop use `psql`'s `\copy`. If the schema uses identity columns, keep the original `id` values so foreign keys from invoices still match; for a `GENERATED ALWAYS` identity column the `INSERT` needs `OVERRIDING SYSTEM VALUE`, otherwise PostgreSQL rejects explicit ids. A per-tenant `workspace_id` on every table is what makes this cheap; see [[Partitioning and Sharding]].
+`COPY ... TO` a server file needs superuser or the `pg_write_server_files` role; from a laptop use `psql`'s `\copy`.
+
+If the schema uses identity columns, keep the original `id` values so foreign keys from invoices still match; for a `GENERATED ALWAYS` identity column the `INSERT` needs `OVERRIDING SYSTEM VALUE`, otherwise PostgreSQL rejects explicit ids.
+
+A per-tenant `workspace_id` on every table is what makes this cheap; see [[Partitioning and Sharding]].
 
 ### 4.5 Restore drill
 
@@ -314,7 +370,13 @@ The drill produces measured RTO and RPO each week. If the measured restore time 
 | Volume snapshot (EBS) | Snapshot interval | Minutes to start, slow first reads | Server loss, coarse rollback | Fine-grained point in time |
 | Managed RDS automated backups | ~5 min (latest restorable time) | Instance creation plus replay | Logical errors within retention | Account compromise unless copied out |
 
-**Managed services.** Amazon RDS automated backups take a daily snapshot plus transaction logs and allow restore to any second within the retention period, which can be set from 1 to 35 days (0 disables them). The latest restorable time is typically within the last 5 minutes. A restore always creates a **new** DB instance with a new endpoint. Manual snapshots are kept until you delete them, even after the instance is deleted. RDS can replicate automated backups to another Region, and manual snapshots can be copied cross-Region and shared with another account (an encrypted snapshot needs a customer-managed KMS key to be shared). Aurora works differently: storage is continuously backed up, and its backtrack feature (Aurora MySQL) rewinds in place.
+**Managed services.** Amazon RDS automated backups take a daily snapshot plus transaction logs and allow restore to any second within the retention period, which can be set from 1 to 35 days (0 disables them).
+
+The latest restorable time is typically within the last 5 minutes. A restore always creates a **new** DB instance with a new endpoint. Manual snapshots are kept until you delete them, even after the instance is deleted.
+
+RDS can replicate automated backups to another Region, and manual snapshots can be copied cross-Region and shared with another account (an encrypted snapshot needs a customer-managed KMS key to be shared).
+
+Aurora works differently: storage is continuously backed up, and its backtrack feature (Aurora MySQL) rewinds in place.
 
 **Self-managed tools.** pgBackRest, WAL-G and Barman add what raw `pg_basebackup` lacks: parallel compressed transfer, full/differential/incremental backups, retention policies, checksum verification, encryption and direct S3/GCS/Azure storage. PostgreSQL 17 added native incremental backups (`pg_basebackup --incremental` with `summarize_wal = on`, combined with `pg_combinebackup`).
 
@@ -333,9 +395,15 @@ The drill produces measured RTO and RPO each week. If the measured restore time 
 
 **The 3-2-1 rule:** at least **3** copies of the data, on **2** different kinds of storage, **1** of them off-site. A modern extension is 3-2-1-1-0: one copy immutable or offline, and zero errors in restore verification.
 
-**Immutability.** S3 Object Lock in **compliance mode** prevents anyone, including the root user, from deleting or overwriting an object version until its retention date; **governance mode** can be bypassed by users with a special permission. AWS Backup Vault Lock offers the same for backup vaults. Put backups in a separate AWS account with its own credentials, so one leaked admin key cannot delete both production and backups.
+**Immutability.** S3 Object Lock in **compliance mode** prevents anyone, including the root user, from deleting or overwriting an object version until its retention date; **governance mode** can be bypassed by users with a special permission. AWS Backup Vault Lock offers the same for backup vaults.
 
-**Real incident: GitLab, 31 January 2017.** During a replication problem an engineer removed the data directory on the primary instead of the replica. GitLab's postmortem reports that its regular `pg_dump` backups had been failing silently (the dump binary did not match the server version, and the failure emails were rejected), disk snapshots were not enabled for the database servers, and replication itself had broken. Recovery used a copy of the database made about six hours earlier for staging, so about six hours of database changes were lost. The lesson they drew: every backup method needs an owner and automated restore testing.
+Put backups in a separate AWS account with its own credentials, so one leaked admin key cannot delete both production and backups.
+
+**Real incident: GitLab, 31 January 2017.** During a replication problem an engineer removed the data directory on the primary instead of the replica.
+
+GitLab's postmortem reports that its regular `pg_dump` backups had been failing silently (the dump binary did not match the server version, and the failure emails were rejected), disk snapshots were not enabled for the database servers, and replication itself had broken.
+
+Recovery used a copy of the database made about six hours earlier for staging, so about six hours of database changes were lost. The lesson they drew: every backup method needs an owner and automated restore testing.
 
 **Failure modes → fixes:**
 - Archive command failing → WAL piles up in `pg_wal` until the disk fills and the primary stops. Alert on `pg_stat_archiver.failed_count` and on `pg_wal` size.
@@ -411,3 +479,8 @@ flowchart LR
 - **Before this:** [[Storage Engines - B-tree vs LSM and WAL]], [[Replication]]
 - **Next:** [[High Availability and Failover]], [[Multi-Region Architecture]], [[Incident Response]]
 - **Compare with:** [[Zero-Downtime Schema Migrations]], [[Partitioning and Sharding]], [[Transactional Outbox and CDC]]
+
+### Watch on YouTube
+
+- [Never lose data again with Postgres point-in-time recovery (PITR) & Kamal](https://www.youtube.com/watch?v=5AMLVUPrL0w) · Sam's Notes · practical PITR walkthrough with a real restore scenario
+- [PG-03: Point-in-Time Recovery (PITR) in PostgreSQL with pgBackRest using Timestamp](https://www.youtube.com/watch?v=RkESdFnXo8I) · mynoteoracledba · hands-on PITR to a timestamp using pgBackRest

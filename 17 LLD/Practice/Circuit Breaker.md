@@ -9,13 +9,15 @@ sources:
   - "Martin Fowler, CircuitBreaker (martinfowler.com/bliki/CircuitBreaker.html)"
   - "Resilience4j documentation, CircuitBreaker (failure rate threshold, minimum number of calls, sliding window, permitted calls in half-open state)"
   - "sony/gobreaker source (generation counter for results from an earlier state)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Circuit Breaker
 
 > [!summary] TL;DR
-> A circuit breaker sits in front of one dependency and stops calling it after the recent failure rate crosses a threshold. While **open** it fails fast. After a cool-down it lets a few **half-open** probe calls through. If they succeed it **closes** again; if one fails it opens again. This note codes it as a thread-safe Go type with a sliding failure-rate window, a probe limit and an injected clock.
+> A circuit breaker sits in front of one dependency and stops calling it after the recent failure rate crosses a threshold. While **open** it fails fast. After a cool-down it lets a few **half-open** probe calls through.
+>
+> If they succeed it **closes** again; if one fails it opens again. This note codes it as a thread-safe Go type with a sliding failure-rate window, a probe limit and an injected clock.
 
 > [!abstract] Core idea
 > - Three states: **closed** (calls flow, outcomes counted), **open** (fail fast with `ErrOpen`), **half-open** (at most N probes; all succeed: close, one fails: open).
@@ -23,6 +25,51 @@ updated: 2026-11-04
 > - The move from open to half-open is **lazy**: the first call after the cool-down performs it, so there is no timer goroutine.
 > - A **generation counter** drops results of calls admitted in an earlier state, so a slow call from before the trip cannot close or re-open the breaker.
 > - Classic mistakes: one breaker for the whole process, counting the caller's own cancellation as a dependency failure, and letting unlimited traffic through in half-open.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your app calls a payment service, and that service goes down.
+Every request now waits 10 seconds for a timeout, piles up threads, and slows your whole app.
+It would be better to notice "it is broken" and say "try later" right away.
+A house fuse does this for electricity; a circuit breaker does it for remote calls.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Dependency | Another service your code calls over the network | A payment API |
+| Failure rate | Share of recent calls that failed | 6 failures out of 10 calls = 60% |
+| Threshold | The limit that triggers an action | "Open when failure rate ≥ 50%" |
+| Sliding window | Only the last few seconds of results count | Calls from the last 10 s |
+| Fail fast | Return an error at once instead of waiting | `ErrOpen` in microseconds |
+| Probe | A single trial call to check if the service is back | 1 call let through after 30 s |
+| Mutex | A lock so only one goroutine changes shared state at a time | `sync.Mutex` around counters |
+| State machine | A thing that is in exactly one state and moves by rules | closed → open → half-open |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: failure rate too high
+    Open --> HalfOpen: cool-down passed
+    HalfOpen --> Closed: probes succeed
+    HalfOpen --> Open: a probe fails
+```
+
+**Analogy.** The fuse box in your house: too much trouble on a line and it cuts the power, so nothing burns.
+Where it breaks: a fuse stays off until a human resets it; a circuit breaker tests the line by itself after a cool-down (half-open).
+
+**How the rest of this note builds up**
+
+- First, the problem statement and Steps 1-4: what trips the breaker, what counts as a failure, the entities and the state machine.
+- Then Steps 5-7: the public API (`Allow`, `Execute`), why state stays in memory, and the patterns used.
+- Then Step 8 and the test cases: the Go code with a time-bucket window, an injected clock and tests that never sleep.
+- Finally the SDE-3 depth: the generation counter, cancellation versus real failures, half-open limits, edge cases and tuning.
+
+> [!tip] Remember
+> Closed counts failures, open fails fast, half-open lets a few probes decide.
 
 ## Problem statement
 
@@ -184,7 +231,11 @@ var _ CircuitBreaker = (*Breaker)(nil) // compile-time check
 
 ## Step 6: Storage and repositories
 
-None. Breaker state is per process and in memory on purpose: it reflects what *this* instance sees, and it must answer in microseconds. Persisting it, or sharing it through Redis, adds a network call to the very path the breaker is meant to make cheap, and a shared breaker trips every instance when one instance has a bad network path. The only things that leave the process are metrics and the `OnStateChange` events.
+None. Breaker state is per process and in memory on purpose: it reflects what *this* instance sees, and it must answer in microseconds.
+
+Persisting it, or sharing it through Redis, adds a network call to the very path the breaker is meant to make cheap, and a shared breaker trips every instance when one instance has a bad network path.
+
+The only things that leave the process are metrics and the `OnStateChange` events.
 
 ## Step 7: Patterns
 
@@ -497,7 +548,9 @@ func (b *Breaker) transition(to State, now time.Time) {
 
 All tests pass under `go test -race -count=50` (Go 1.24.4).
 
-The mixed-traffic test does not assert "stays closed at 20% failures". Such an assertion would be flaky: goroutine order is random, so 5 of the first 10 calls can be failures, and then the breaker correctly opens. The test checks accounting instead. The same thing happens in production right after a deploy, which is why `MinRequests` should be large enough to make an early burst unlikely.
+The mixed-traffic test does not assert "stays closed at 20% failures". Such an assertion would be flaky: goroutine order is random, so 5 of the first 10 calls can be failures, and then the breaker correctly opens.
+
+The test checks accounting instead. The same thing happens in production right after a deploy, which is why `MinRequests` should be large enough to make an early burst unlikely.
 
 ```go
 package breaker
@@ -873,3 +926,8 @@ Redraw it from memory:
 - **Before this:** [[LLD Interview Method]], [[State Machines in Go]], [[Concurrency for LLD]]
 - **Next:** [[Pub-Sub Message Queue]]
 - **Compare with:** [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]] (the resilience pattern at system level), [[Timeouts, Retries and Backoff]], [[Bulkheads and Concurrency Limits]], [[Rate Limiter]] (the other "admit or reject" class design)
+
+### Watch on YouTube
+
+- [Software Architecture in Golang: Circuit Breaker Cloud Design Pattern for Reliability](https://www.youtube.com/watch?v=UnL2iGcD7vE) · Mario Carrion · 12 min · 4,200 views
+- [Go (Golang) Circuit Breaker Example Implementation Tutorial](https://www.youtube.com/watch?v=hyasWpxP32c) · Satyajit Das · 12 min · 5,802 views

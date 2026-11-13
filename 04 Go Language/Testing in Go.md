@@ -12,7 +12,7 @@ sources:
   - "Go 1.24 release notes: testing.B.Loop; testing/synctest added as GOEXPERIMENT, with synctest.Run (go.dev/doc/go1.24)"
   - "Go 1.25 release notes: testing/synctest promoted out of experimental; synctest.Run replaced by synctest.Test, Run deprecated (go.dev/doc/go1.25)"
   - "go.uber.org/goleak README"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Testing in Go
@@ -27,7 +27,54 @@ updated: 2026-11-07
 > - Coverage and the race detector are cheap to run on every commit (`go test -race -cover ./...`) and catch different bugs: coverage finds untested branches, `-race` finds unsynchronized memory access.
 > - Fuzzing and property tests (`FuzzXxx`) state what must always be true and let the tool search for an input that breaks it — the deep end of "test the rules," not a replacement for table tests.
 
-This note is Go's testing *mechanics*: what the `testing` package gives you and how to use each piece. It does not cover **what** to test or **which layer** (unit vs integration vs E2E) — that's [[Testing Strategy and the Test Pyramid]] and [[Unit, Integration and E2E Tests]]. Fakes vs mocks as a design topic is [[Test Doubles and Mocking in Go]]; testing an LLD design end-to-end, including the concurrent "exactly one winner" test, is [[Testing LLD Code]]; fuzzing's theory and property-based testing with `rapid`/`gopter` is [[Fuzz and Property-Based Testing]]; CI staging and flaky tests are [[Testing in CI-CD, Flaky Tests and Testing in Production]].
+This note is Go's testing *mechanics*: what the `testing` package gives you and how to use each piece. It does not cover **what** to test or **which layer** (unit vs integration vs E2E) — that's [[Testing Strategy and the Test Pyramid]] and [[Unit, Integration and E2E Tests]].
+
+Fakes vs mocks as a design topic is [[Test Doubles and Mocking in Go]]; testing an LLD design end-to-end, including the concurrent "exactly one winner" test, is [[Testing LLD Code]]; fuzzing's theory and property-based testing with `rapid`/`gopter` is [[Fuzz and Property-Based Testing]]; CI staging and flaky tests are [[Testing in CI-CD, Flaky Tests and Testing in Production]].
+
+## Start here: the basics
+
+**The problem in one story.**
+You fix a bug in a discount function and ship it.
+A week later a different change silently breaks the same function again.
+A test is a small program that calls your code with known inputs and checks the outputs, every time you run `go test`.
+Once written, it catches the regression for you, forever.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Test function | A function `go test` runs automatically | `func TestAdd(t *testing.T)` |
+| `_test.go` file | File where tests live, not built into the program | `price_test.go` |
+| Assertion | A check that fails the test if wrong | `if got != 5 { t.Errorf(...) }` |
+| Test case | One input plus its expected output | `{in: 2, want: 4}` |
+| Subtest | A named test inside a test | `t.Run("negative", ...)` |
+| Coverage | Which lines your tests actually ran | `go test -cover` prints `82.0%` |
+| Race | Two goroutines touching the same memory unsafely | `go test -race` reports it |
+| Benchmark | A test that measures speed | `func BenchmarkAdd(b *testing.B)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    G["go test"] --> F["finds TestXxx<br/>in _test.go"]
+    F --> T["table of cases"]
+    T --> R["t.Run per case"]
+    R --> P["PASS"]
+    R --> X["FAIL: names<br/>the broken case"]
+```
+
+**Analogy.** Tests are a checklist a pilot runs before every flight: same items, same order, and any failed item stops takeoff.
+Where it breaks: a checklist only covers what someone thought to write; tests prove nothing about cases nobody listed (fuzzing helps with that).
+
+**How the rest of this note builds up**
+
+- First, why Go builds testing into the toolchain (section 1) and a mental model (section 2).
+- Then the mechanics: table-driven tests, `t.Run`, `t.Parallel`, `t.Cleanup`, helpers, coverage, `-race`, benchmarks and examples (section 3).
+- Then a full worked example (section 4) and comparisons and trade-offs (sections 5-6).
+- Finally production habits (section 7) and the SDE-3 deep dive: how `-race` works, `t.Parallel` scheduling, coverage-guided fuzzing, the `synctest` bubble and example tests (section 8).
+
+> [!tip] Remember
+> One test function, a table of cases, `t.Run` per case; run `go test -race -cover ./...` on every commit.
 
 ## 1. Why it exists
 
@@ -39,7 +86,9 @@ A billing service has a `Total(items []Item) int64` function and a handler that 
 
 ## 2. Mental model
 
-`go test` compiles your package together with every `*_test.go` file in the same directory into one temporary test binary, then runs every function matching `func TestXxx(t *testing.T)` (and `BenchmarkXxx`, `ExampleXxx`, `FuzzXxx`). Think of `*testing.T` as a **scoped reporter**: it doesn't stop your code, it just tracks pass/fail for the current test (or subtest) and lets you register side effects (`Cleanup`, `Helper`, `Parallel`) that only apply to that scope.
+`go test` compiles your package together with every `*_test.go` file in the same directory into one temporary test binary, then runs every function matching `func TestXxx(t *testing.T)` (and `BenchmarkXxx`, `ExampleXxx`, `FuzzXxx`).
+
+Think of `*testing.T` as a **scoped reporter**: it doesn't stop your code, it just tracks pass/fail for the current test (or subtest) and lets you register side effects (`Cleanup`, `Helper`, `Parallel`) that only apply to that scope.
 
 ```mermaid
 flowchart LR
@@ -53,7 +102,9 @@ flowchart LR
 
 ### Files, packages, and the `_test.go` suffix
 
-A file named `x_test.go` is excluded from a normal build and only compiled in by `go test`. It can declare `package x` (**white-box**: sees unexported names, for testing internals) or `package x_test` (**black-box**: imports `x` like any other caller, sees only the exported API). Prefer black-box by default — it tests what callers actually have — and use white-box only when you genuinely need to reach an unexported helper.
+A file named `x_test.go` is excluded from a normal build and only compiled in by `go test`. It can declare `package x` (**white-box**: sees unexported names, for testing internals) or `package x_test` (**black-box**: imports `x` like any other caller, sees only the exported API).
+
+Prefer black-box by default — it tests what callers actually have — and use white-box only when you genuinely need to reach an unexported helper.
 
 ```go
 // white-box: same package, sees unexported names
@@ -127,11 +178,21 @@ Neither replaces the other; many Go codebases use plain `if` + `t.Errorf` for si
 
 ### Test doubles and an injectable clock
 
-Depending on a small interface you declare (not one the real dependency hands you) is what lets a test substitute a fake, stub, or mock — the vocabulary and design tradeoffs live in [[Test Doubles and Mocking in Go]]. Time-based code is the recurring case: an injected `Clock` interface with a `FakeClock.Advance(d)` method lets a test assert "the hold expires at exactly 10 minutes" without `time.Sleep`. `testing/synctest` takes a different approach: it runs a function in an isolated "bubble" with a fake clock built into the runtime itself, so goroutines that call `time.Sleep` or wait on a timer inside the bubble can be fast-forwarded by `synctest.Wait()`/advancing the bubble's clock, without threading a `Clock` interface through your code at all. It shipped **experimentally in Go 1.24** behind `GOEXPERIMENT=synctest`, with the function named `synctest.Run(f func())`; **Go 1.25 promoted it to the standard library** and replaced that entry point with `synctest.Test(t *testing.T, f func(t *testing.T))`, which hands the bubble its own `*testing.T` and plugs into normal test reporting — `synctest.Run` is deprecated since Go 1.25 and go.dev's own docs say it is scheduled for removal, so new code should call `synctest.Test`, not `Run`. Use an injected `Clock` interface when the design should be testable without any experimental flag or when the code must also support Go <1.25; reach for `synctest.Test` on Go 1.25+ when you want to test real `time.Timer`/`time.Sleep`-based code unchanged.
+Depending on a small interface you declare (not one the real dependency hands you) is what lets a test substitute a fake, stub, or mock — the vocabulary and design tradeoffs live in [[Test Doubles and Mocking in Go]].
+
+Time-based code is the recurring case: an injected `Clock` interface with a `FakeClock.Advance(d)` method lets a test assert "the hold expires at exactly 10 minutes" without `time.Sleep`.
+
+`testing/synctest` takes a different approach: it runs a function in an isolated "bubble" with a fake clock built into the runtime itself, so goroutines that call `time.Sleep` or wait on a timer inside the bubble can be fast-forwarded by `synctest.Wait()`/advancing the bubble's clock, without threading a `Clock` interface through your code at all.
+
+It shipped **experimentally in Go 1.24** behind `GOEXPERIMENT=synctest`, with the function named `synctest.Run(f func())`; **Go 1.25 promoted it to the standard library** and replaced that entry point with `synctest.Test(t *testing.T, f func(t *testing.T))`, which hands the bubble its own `*testing.T` and plugs into normal test reporting — `synctest.Run` is deprecated since Go 1.25 and go.dev's own docs say it is scheduled for removal, so new code should call `synctest.Test`, not `Run`.
+
+Use an injected `Clock` interface when the design should be testable without any experimental flag or when the code must also support Go <1.25; reach for `synctest.Test` on Go 1.25+ when you want to test real `time.Timer`/`time.Sleep`-based code unchanged.
 
 ### testdata and golden files
 
-A directory named `testdata` anywhere in a package is ignored by the Go toolchain's build (never compiled, never mistaken for a package) and is the conventional place for test fixtures: `.golden` expected-output files, sample JSON, fuzz corpora. The golden-file pattern renders real output and diffs it against a checked-in file, with a flag to refresh the file when the expected output intentionally changes:
+A directory named `testdata` anywhere in a package is ignored by the Go toolchain's build (never compiled, never mistaken for a package) and is the conventional place for test fixtures: `.golden` expected-output files, sample JSON, fuzz corpora.
+
+The golden-file pattern renders real output and diffs it against a checked-in file, with a flag to refresh the file when the expected output intentionally changes:
 
 ```go
 var update = flag.Bool("update", false, "update golden files")
@@ -176,7 +237,9 @@ TotalHandler(rec, req)
 // rec.Code, rec.Body.Bytes()
 ```
 
-`httptest.NewServer` goes one step further and starts a real local HTTP server for cases that need an actual round trip (a client library under test, redirect following) — slower, but closer to production. For testing a service's own HTTP **client** code (calling an upstream), `httptest.NewServer` with a handler that returns canned responses is the usual approach; `httptest`-style handler testing, testcontainers-backed repository tests, and bufconn-backed gRPC tests for a real service are covered in `06 Backend Engineering in Go/Testing Go Services`.
+`httptest.NewServer` goes one step further and starts a real local HTTP server for cases that need an actual round trip (a client library under test, redirect following) — slower, but closer to production.
+
+For testing a service's own HTTP **client** code (calling an upstream), `httptest.NewServer` with a handler that returns canned responses is the usual approach; `httptest`-style handler testing, testcontainers-backed repository tests, and bufconn-backed gRPC tests for a real service are covered in `06 Backend Engineering in Go/Testing Go Services`.
 
 ### TestMain, build tags and -short
 
@@ -197,19 +260,33 @@ A typical CI pipeline runs `go test -short -race ./...` on every push and `go te
 
 ### The race detector
 
-`go test -race` instruments every memory access and synchronization event and reports a **data race** — two goroutines accessing the same memory where at least one is a write, with no happens-before relationship between them — as a build-breaking failure with both goroutines' stacks, even if the test's assertions all passed. It roughly doubles memory use and slows execution several-fold, which is why it is normal to run it in CI but not necessarily on every local `go test` during rapid iteration. A race is probabilistic: `go test -race -count=5` (or more) reruns the whole suite that many times, because one race-free run proves nothing about the next one.
+`go test -race` instruments every memory access and synchronization event and reports a **data race** — two goroutines accessing the same memory where at least one is a write, with no happens-before relationship between them — as a build-breaking failure with both goroutines' stacks, even if the test's assertions all passed.
+
+It roughly doubles memory use and slows execution several-fold, which is why it is normal to run it in CI but not necessarily on every local `go test` during rapid iteration. A race is probabilistic: `go test -race -count=5` (or more) reruns the whole suite that many times, because one race-free run proves nothing about the next one.
 
 ### Coverage
 
-`go test -cover ./...` prints the percentage of statements executed by the tests. `go test -coverprofile=cover.out` writes a machine-readable profile; `go tool cover -html=cover.out` renders it as a browsable, line-by-line HTML view, and `go tool cover -func=cover.out` prints per-function percentages. `-coverpkg=./...` on an integration test's invocation attributes coverage back to packages that test exercises indirectly (e.g., a handler test that also covers a repository package it calls through), which plain per-package coverage would miss. Coverage percentage is a **lower bound on what's untested**, not a measure of test quality — 100% coverage with no real assertions proves nothing; use it to find the gaps, not as the goal. For coverage from an **integration** test (a built binary exercised by an external driver, not `go test` itself), `go build -cover -o svc ./cmd/svc` produces an instrumented binary that writes its coverage data to a directory named by `GOCOVERDIR` when it exits; `go tool covdata textfmt` turns that directory into the same profile format `go tool cover` reads — this is how a service gets a coverage number for scenarios driven by a real HTTP client or CLI invocation, not by `go test`.
+`go test -cover ./...` prints the percentage of statements executed by the tests. `go test -coverprofile=cover.out` writes a machine-readable profile; `go tool cover -html=cover.out` renders it as a browsable, line-by-line HTML view, and `go tool cover -func=cover.out` prints per-function percentages.
+
+`-coverpkg=./...` on an integration test's invocation attributes coverage back to packages that test exercises indirectly (e.g., a handler test that also covers a repository package it calls through), which plain per-package coverage would miss.
+
+Coverage percentage is a **lower bound on what's untested**, not a measure of test quality — 100% coverage with no real assertions proves nothing; use it to find the gaps, not as the goal.
+
+For coverage from an **integration** test (a built binary exercised by an external driver, not `go test` itself), `go build -cover -o svc ./cmd/svc` produces an instrumented binary that writes its coverage data to a directory named by `GOCOVERDIR` when it exits; `go tool covdata textfmt` turns that directory into the same profile format `go tool cover` reads — this is how a service gets a coverage number for scenarios driven by a real HTTP client or CLI invocation, not by `go test`.
 
 ### Fuzzing
 
-`func FuzzXxx(f *testing.F)` declares a fuzz target; `f.Add(...)` seeds the corpus with known-interesting inputs, and `f.Fuzz(func(t *testing.T, ...) { ... })` is the property to check against every generated input. `go test` (no `-fuzz` flag) only runs the seed corpus, like a normal test — fast, deterministic, safe for CI. `go test -fuzz=FuzzXxx -fuzztime=30s` actually generates new inputs; a crashing input is written under `testdata/fuzz/FuzzXxx/<hash>` and becomes a permanent regression test from then on, re-run on every ordinary `go test` without needing `-fuzz` again. The theory behind what makes a good property, and property-based testing libraries (`rapid`, `gopter`) for when native fuzzing's single-string-or-[]byte inputs aren't expressive enough, are in [[Fuzz and Property-Based Testing]].
+`func FuzzXxx(f *testing.F)` declares a fuzz target; `f.Add(...)` seeds the corpus with known-interesting inputs, and `f.Fuzz(func(t *testing.T, ...) { ... })` is the property to check against every generated input. `go test` (no `-fuzz` flag) only runs the seed corpus, like a normal test — fast, deterministic, safe for CI.
+
+`go test -fuzz=FuzzXxx -fuzztime=30s` actually generates new inputs; a crashing input is written under `testdata/fuzz/FuzzXxx/<hash>` and becomes a permanent regression test from then on, re-run on every ordinary `go test` without needing `-fuzz` again.
+
+The theory behind what makes a good property, and property-based testing libraries (`rapid`, `gopter`) for when native fuzzing's single-string-or-[]byte inputs aren't expressive enough, are in [[Fuzz and Property-Based Testing]].
 
 ### Goroutine leaks and flakiness controls
 
-`go.uber.org/goleak`'s `goleak.VerifyTestMain(m)` (shown above) or `goleak.VerifyNone(t)` inside one test asserts that no unexpected goroutine is still running — catching a forgotten `context.CancelFunc`, a worker that never sees its stop channel closed, or a `time.After` left blocking forever. Two flags make tests more honest about hidden assumptions: `-count=1` disables the test cache (by default, `go test` skips re-running a test whose inputs haven't changed — fine for speed, misleading when debugging a suspected flake) and `-shuffle=on` randomizes test and subtest order within a package, surfacing tests that secretly depend on running after another one (shared package-level state, accumulated side effects).
+`go.uber.org/goleak`'s `goleak.VerifyTestMain(m)` (shown above) or `goleak.VerifyNone(t)` inside one test asserts that no unexpected goroutine is still running — catching a forgotten `context.CancelFunc`, a worker that never sees its stop channel closed, or a `time.After` left blocking forever.
+
+Two flags make tests more honest about hidden assumptions: `-count=1` disables the test cache (by default, `go test` skips re-running a test whose inputs haven't changed — fine for speed, misleading when debugging a suspected flake) and `-shuffle=on` randomizes test and subtest order within a package, surfacing tests that secretly depend on running after another one (shared package-level state, accumulated side effects).
 
 ## 4. Worked example
 
@@ -592,7 +669,9 @@ func TestTotalHandler_AgainstRealPaymentSandbox(t *testing.T) {
 > A build tag when the test needs infrastructure the normal build shouldn't even compile against (a real database driver, testcontainers) — it is excluded from `go test ./...` entirely. `testing.Short()` when the test compiles fine and needs nothing external, it's just slow (a big table, many iterations) and you want a fast pre-commit run to skip it.
 
 > [!question]- A benchmark claims an "optimization" doubled speed, but you're suspicious. What would you check?
-> Whether the loop uses `for b.Loop()` (Go 1.24) rather than the manual `for i := 0; i < b.N; i++`; the latter can have its call optimized away by the compiler if the result is unused, making an unoptimized baseline look artificially slow and an "optimized" version look artificially fast. Also check the benchmark actually does equivalent work before and after.
+> Whether the loop uses `for b.Loop()` (Go 1.24) rather than the manual `for i := 0; i < b.N; i++`; the latter can have its call optimized away by the compiler if the result is unused, making an unoptimized baseline look artificially slow and an "optimized" version look artificially fast.
+>
+> Also check the benchmark actually does equivalent work before and after.
 
 > [!question]- What exactly does `go test -cover` tell you, and what does it not tell you?
 > The percentage of **statements** executed by the test run. It does not tell you whether the assertions made on those statements are meaningful — a test that calls a function and checks nothing still counts every line as covered.
@@ -621,3 +700,8 @@ func TestTotalHandler_AgainstRealPaymentSandbox(t *testing.T) {
 - **Before this:** [[Error Handling]], [[Packages, Modules and Dependency Management]]
 - **Next:** [[Testing Strategy and the Test Pyramid]], [[Test Doubles and Mocking in Go]], [[Fuzz and Property-Based Testing]]
 - **Compare with:** [[Testing LLD Code]] (testing a concurrent LLD design end-to-end), [[Unit, Integration and E2E Tests]] (which layer to put a test in), [[Testing in CI-CD, Flaky Tests and Testing in Production]] (how CI stages `-short`, `-race`, and integration runs)
+
+### Watch on YouTube
+
+- [Master Table-Driven Tests in Go: Clean Code & Better Coverage!](https://www.youtube.com/watch?v=3e3i5ulspoM) · CodeLucky · Practical guide to writing table-driven tests, the note's idiomatic pattern
+- [Go Table Driven Tests](https://www.youtube.com/watch?v=w-nZp39_UPk) · Leetware · Short, focused walkthrough of the table-driven test + t.Run pattern

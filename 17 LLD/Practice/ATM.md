@@ -7,7 +7,7 @@ prereqs: ["[[LLD Interview Method]]", "[[State Machines in Go]]", "[[Concurrency
 related: ["[[Chain of Responsibility and Pipelines]]", "[[Idempotency and Idempotency Keys]]", "[[Vending Machine]]", "[[Saga Pattern]]", "[[Testing LLD Code]]"]
 sources:
   - "Go 1.21 release notes, context.WithoutCancel"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # ATM
@@ -21,6 +21,52 @@ updated: 2026-11-04
 > - Dispensing is bounded change-making: use at most `have[d]` notes of each denomination, hit the amount exactly, use the fewest notes. Greedy is wrong with limited notes (₹600 from one ₹500 and three ₹200 notes needs 3 × ₹200). A small dynamic programme solves it.
 > - Order of the withdrawal: plan the notes, debit the bank with an idempotent transaction ID, dispense, and only then subtract the notes from the cassette. If the dispense fails, reverse the debit and go out of service.
 > - Money is `int64` paise; the bank and the hardware are interfaces, so every failure is testable.
+
+## Start here: the basics
+
+**The problem in one story.**
+You put your card in an ATM, type your PIN and ask for ₹600.
+The machine must check the PIN with your bank, take ₹600 from your account, and push out exactly ₹600 in notes.
+If the notes get stuck after the bank has taken the money, you must get it back.
+This note designs that machine as code that cannot lose or invent money.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| State machine | An object that is in one named situation and only moves along allowed paths | `Idle -> CardInserted` |
+| Session | One customer's visit, from card in to card out | Insert, PIN, withdraw, eject |
+| Denomination | The value of one kind of note | ₹500, ₹200, ₹100 |
+| Cassette | The box inside the ATM holding notes of one denomination | 40 notes of ₹200 |
+| Debit / reversal | Take money from the account / put it back | Reverse after a jam |
+| Idempotent | Doing it twice has the same effect as once | Same transaction ID, one debit |
+| Dynamic programming (DP) | Solve a big problem by building up answers to smaller ones | Best notes for ₹100, then ₹200, ... |
+| Paise | 1/100 of a rupee; money kept as whole numbers | ₹6 = 600 paise |
+
+**Picture it**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> CardInserted: insert card
+    CardInserted --> Authenticated: correct PIN
+    CardInserted --> Idle: 3 wrong PINs (card kept)
+    Authenticated --> Idle: withdraw done / eject
+    Authenticated --> OutOfService: dispense fails
+```
+
+**Analogy.** A bank teller with a cash drawer: they check your ID, write the withdrawal in the ledger, then count notes from the drawer.
+Where it breaks: a teller can see a miscount and fix it by hand; the ATM must plan the exact notes before debiting and must undo the debit itself if the hardware fails.
+
+**How the rest of this note builds up**
+
+- First, the problem statement, requirements and actors (Steps 1-2).
+- Then the entities, relationships, APIs and storage (Steps 3-6), and the patterns used (Step 7).
+- Then the core Go code: the session state machine, the note-planning DP and the debit-dispense-reverse order (Step 8), with tests.
+- Finally the SDE-3 view: edge cases, trade-offs and interview questions (Steps 9-10 onward).
+
+> [!tip] Remember
+> Check the state first, plan the exact notes, debit idempotently, dispense, and reverse the debit if the hardware fails.
 
 ## Problem statement
 
@@ -248,7 +294,9 @@ cmd/atm/main.go -> wires the real bank client, the hardware driver and time.Now
 
 Why greedy fails, worked through: amount ₹600, cassette {₹500: 1, ₹200: 3}. Greedy takes ₹500, leaving ₹100, and there is no ₹100 note: it refuses a withdrawal that is possible. The table finds 3 × ₹200. With ₹100 notes also loaded, the fewest-notes answer for ₹600 is ₹500 + ₹100 (2 notes), which `TestWithdrawHappyPath` asserts.
 
-Cost: the table has `amount/g + 1` entries, and each denomination tries up to `min(count, amount/d) + 1` values of `k` per entry. For ₹20,000 with ₹100 as the unit that is 201 entries and at most 41 + 101 + 201 tries per entry across the three denominations, about 70,000 steps, which is negligible (an estimate by counting, not a benchmark).
+Cost: the table has `amount/g + 1` entries, and each denomination tries up to `min(count, amount/d) + 1` values of `k` per entry.
+
+For ₹20,000 with ₹100 as the unit that is 201 entries and at most 41 + 101 + 201 tries per entry across the three denominations, about 70,000 steps, which is negligible (an estimate by counting, not a benchmark).
 
 `Withdraw(ctx, amount)`:
 
@@ -923,3 +971,8 @@ Redraw it from memory:
 - **Before this:** [[State Machines in Go]], [[Tic-Tac-Toe and Snake and Ladder]], [[Concurrency for LLD]]
 - **Next:** [[In-memory KV Store with TTL and Transactions]]
 - **Compare with:** [[Vending Machine]] (the same state-machine-plus-cash shape), [[Case Study - Payment System]] (money movement at system scale), [[Saga Pattern]], [[Two-Phase Commit]], [[Locking - Optimistic vs Pessimistic]]
+
+### Watch on YouTube
+
+- [Design ATM Machine (LLD) / Cash Withdrawal Flow / State + COR Pattern](https://www.youtube.com/watch?v=GSuaqBR0Wpc) · Shubh Patel · 30 min · 15,110 views
+- [Low level design of an ATM machine / Understand State design pattern](https://www.youtube.com/watch?v=JEi7i7poflM) · Sanket Singh · 64 min · 8,838 views

@@ -11,7 +11,7 @@ sources:
   - "Redis docs: Persistence (appendfsync everysec), WAIT and WAITAOF (since 7.2), Replication (asynchronous)"
   - "hibiken/asynq README; BullMQ docs (taskforce.sh)"
   - "Measured: Redis 8.2.1 on an Apple M4 laptop, redis-cli and redis-benchmark against localhost:6394"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis as a Queue - Lists, Streams and Pub-Sub
@@ -26,9 +26,58 @@ updated: 2026-11-04
 > - Everything is at least once, and an acked write can still be lost on failover or with `appendfsync everysec`. Handlers must be idempotent.
 > - Choose Kafka, RabbitMQ or SQS when you need long retention, replay at scale, or data bigger than RAM.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your web app must send 2,000 emails a minute, but sending one takes time.
+You want the web request to say "send this later" and let background workers do it.
+You already run Redis for caching, so why not keep the to-do list there?
+You can, but only if you pick the right Redis structure, or jobs quietly get lost.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Redis | A fast in-memory key-value server | Stores `user:42 -> "Asha"` |
+| Job / task | One unit of background work | "Send welcome email to user 42" |
+| Worker | A program that takes jobs and runs them | 5 goroutines sending emails |
+| Blocking pop | Wait until an item exists, then take it | `BRPOP jobs 0` |
+| Ack | Worker saying "this job is done" | `XACK` after the email is sent |
+| Consumer group | Team of workers sharing one stream | Group `mailers` with c1 and c2 |
+| Idempotent | Running twice has the same effect as once | Skip email if already marked sent |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App["Web app"] -->|"LPUSH / XADD"| R[("Redis")]
+    R -->|"List: BLMOVE"| W1["Worker 1"]
+    R -->|"Stream: XREADGROUP"| W2["Worker 2"]
+    W2 -->|"XACK when done"| R
+    R -.->|"Pub/Sub: live only"| S["Subscriber<br/>misses if offline"]
+```
+
+**Analogy.** A list is a pile of envelopes, a stream is a numbered logbook with bookmarks, and Pub/Sub is a radio broadcast.
+Where it breaks: unlike a paper logbook, Redis lives in RAM, so a crash or failover can lose recent entries.
+
+**How the rest of this note builds up**
+
+- First, why Redis is tempting as a queue (section 1) and the three-structure mental model (section 2).
+- Then how lists, streams and Pub/Sub really work, including reliable patterns (section 3), with a Go worked example (section 4).
+- Then comparisons with libraries and real brokers, and when not to use Redis (sections 5-6).
+- Finally the SDE-3 deep dive: production issues, stream storage internals, IDs and ordering (sections 7-8), then interview questions.
+
+> [!tip] Remember
+> Lists for simple jobs (with `BLMOVE`), Streams for reliable queues with acks, Pub/Sub only for live broadcast.
+
 ## 1. Why it exists
 
-A team already runs Redis for caching and needs a queue for 2,000 email jobs per minute. Adding RabbitMQ or Kafka means another cluster to run, monitor and secure. Redis can do the job: on a laptop (Apple M4, Redis 8.2.1, `redis-benchmark` with its default 50 clients and no pipelining), `LPUSH` measured about 183,000 ops/s, `RPOP` about 188,000 ops/s and `XADD` about 171,000 ops/s, each with a p50 latency near 0.2 ms. That is two orders of magnitude more than this team needs.
+A team already runs Redis for caching and needs a queue for 2,000 email jobs per minute.
+
+Adding RabbitMQ or Kafka means another cluster to run, monitor and secure.
+
+Redis can do the job: on a laptop (Apple M4, Redis 8.2.1, `redis-benchmark` with its default 50 clients and no pipelining), `LPUSH` measured about 183,000 ops/s, `RPOP` about 188,000 ops/s and `XADD` about 171,000 ops/s, each with a p50 latency near 0.2 ms.
+That is two orders of magnitude more than this team needs.
 
 The catch is that the obvious Redis queue is not reliable, and the most obvious "messaging" command, `PUBLISH`, is not a queue at all. This note shows which structure to use and how to close the gaps. Data-structure basics are in [[Redis Data Structures and When to Use Each]].
 
@@ -151,7 +200,11 @@ OK
    4) (integer) 2
 ```
 
-Read it line by line: c1 got both entries and acked only the first. The PEL showed entry 43 owned by c1 with 1 delivery. After it had been idle for more than 1,000 ms, `XAUTOCLAIM` moved it to c2 and the delivery count became 2. The first reply element `0-0` is the cursor (scan finished); the third lists IDs that were in the PEL but have since been deleted from the stream (empty here).
+Read it line by line: c1 got both entries and acked only the first.
+
+- The PEL showed entry 43 owned by c1 with 1 delivery.
+- After it had been idle for more than 1,000 ms, `XAUTOCLAIM` moved it to c2 and the delivery count became 2.
+- The first reply element `0-0` is the cursor (scan finished); the third lists IDs that were in the PEL but have since been deleted from the stream (empty here).
 
 ### Pub/Sub
 
@@ -501,7 +554,13 @@ One go-redis detail surfaced while testing: `BLMove` with a timeout under 1 s lo
 | Offline consumer | Gets it later | Misses it |
 | Retries | Yes (with the patterns above) | No |
 
-**Libraries.** In Go, **asynq** stores tasks in Redis and gives you retries with backoff, scheduled tasks (`ProcessIn`, `ProcessAt`), unique tasks (deduplicated for a TTL), periodic tasks via its scheduler, weighted or strict queue priorities, and a web UI (asynqmon). In Node, **BullMQ** offers delayed and repeatable jobs, priorities, rate limiting, parent-child "flows" and retries with backoff. Both still deliver at least once.
+**Libraries.**
+
+In Go, **asynq** stores tasks in Redis and gives you retries with backoff, scheduled tasks (`ProcessIn`, `ProcessAt`), unique tasks (deduplicated for a TTL), periodic tasks via its scheduler, weighted or strict queue priorities, and a web UI (asynqmon).
+
+In Node, **BullMQ** offers delayed and repeatable jobs, priorities, rate limiting, parent-child "flows" and retries with backoff.
+
+Both still deliver at least once.
 
 ## 6. Trade-offs and when not to use
 
@@ -526,9 +585,19 @@ One go-redis detail surfaced while testing: `BLMove` with a timeout under 1 s lo
 
 ## 8. Deep dive
 
-**How streams are stored.** A stream is a radix tree whose nodes are listpacks holding many entries (`stream-node-max-entries`, default 100, measured on this server). Entries with the same fields are delta-encoded against the node's first entry, which is why streams with stable field names are compact. Trimming with `~` drops whole nodes, which is why it is cheap; exact `MAXLEN` may have to split a node.
+**How streams are stored.** A stream is a radix tree whose nodes are listpacks holding many entries (`stream-node-max-entries`, default 100, measured on this server).
 
-**IDs and ordering.** IDs are `<milliseconds>-<sequence>` and strictly increasing per stream. If the server clock goes backwards, Redis keeps using the last ID's millisecond and increases the sequence, so order holds. Order is per stream; one consumer group spreads entries across consumers, so processing order across consumers is not guaranteed. For per-entity order, shard streams by entity key and give each shard one consumer.
+Entries with the same fields are delta-encoded against the node's first entry, which is why streams with stable field names are compact.
+
+Trimming with `~` drops whole nodes, which is why it is cheap; exact `MAXLEN` may have to split a node.
+
+**IDs and ordering.** IDs are `<milliseconds>-<sequence>` and strictly increasing per stream.
+
+If the server clock goes backwards, Redis keeps using the last ID's millisecond and increases the sequence, so order holds.
+
+Order is per stream; one consumer group spreads entries across consumers, so processing order across consumers is not guaranteed.
+
+For per-entity order, shard streams by entity key and give each shard one consumer.
 
 **Group lag.** Since Redis 7.0, `XINFO GROUPS` reports `entries-read` and `lag` (entries not yet delivered to the group). Measured on 8.2.1 after the test sequence: `pending 0`, `lag 0`, `entries-read 2`. `lag` can be unknown (nil) after some trims or `XSETID` operations, so alert on PEL age as well.
 
@@ -574,3 +643,8 @@ One go-redis detail surfaced while testing: `BLMove` with a timeout under 1 s lo
 - **Before this:** [[Redis Data Structures and When to Use Each]], [[Queues vs Streams and Broker Comparison]], [[Background Jobs and Worker Pools]]
 - **Next:** [[Delivery Semantics and Exactly-Once]], [[Dead Letter Queues and Poison Messages]], [[Kafka and Event Streaming]]
 - **Compare with:** [[AWS SQS, SNS and EventBridge]], [[Redis Persistence - RDB and AOF]], [[Background Workers and Job Queues]]
+
+### Watch on YouTube
+
+- [Redis Streams vs Pub/Sub: Performance](https://www.youtube.com/watch?v=F27loUSoIno) · Anton Putra · 4 min · 36,324 views
+- [Redis Streams vs Pub/Sub: Stop Using Redis as a Broken Message Queue](https://www.youtube.com/watch?v=upr5Mn8thZM) · JM Tech Explain · 3 min · 21 views

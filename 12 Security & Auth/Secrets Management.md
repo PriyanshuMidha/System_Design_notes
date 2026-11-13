@@ -8,7 +8,7 @@ sources:
   - "HashiCorp Vault documentation, dynamic secrets and leases"
   - "NIST SP 800-57, key management"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Secrets Management
@@ -22,15 +22,65 @@ updated: 2026-11-07
 > - Rotation without downtime needs two active credentials at once — the old one keeps working until every consumer has picked up the new one.
 > - The strongest fix for "a service needs a secret" is often to need no long-lived secret at all: workload identity (IRSA, GitHub OIDC) lets a service assume a cloud role instead of holding a credential.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your app needs a database password to start.
+A developer pastes it into the code "just for now" and pushes to Git.
+Now everyone with repo access, forever, can read it, even after the line is deleted.
+Secrets management is how apps get passwords and keys without them leaking like this.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Secret | Any value that grants access if someone else gets it | DB password, API key, TLS private key |
+| Environment variable | A named value the OS hands to a process at start | `DB_PASSWORD=...` |
+| Secrets manager | A service that stores secrets and hands them only to allowed identities | HashiCorp Vault, AWS Secrets Manager |
+| Rotation | Replacing a secret with a fresh one on a schedule or after a leak | New DB password every 30 days |
+| KMS | Key Management Service: holds master keys that never leave it | AWS KMS |
+| Envelope encryption | Encrypt data with a data key, then encrypt that key with a master key | KMS wraps a per-secret key |
+| Audit log | A record of who read which secret when | "payments-svc read db/prod at 10:02" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["App starts"] --> I["Proves its identity<br/>(IAM role, k8s SA)"]
+    I --> SM["Secrets manager"]
+    SM -- "checks policy,<br/>logs access" --> A2["App gets secret<br/>in memory"]
+    SM --> AU["Audit log"]
+    G["Git / logs / images"] -. "never" .-> A2
+```
+
+**Analogy.** A house key. Make as few copies as possible, know who holds each, and if one goes missing change the lock instead of hoping.
+Where it breaks: a lost house key is noticed; a copied secret is usually not, so you must assume leaks happen and keep rotation cheap.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then where secrets leak and how stores and envelope encryption work (section 3), plus a Go worked example (section 4).
+- Then env vars vs mounted files vs a secrets manager (section 5).
+- Finally the SDE-3 deep dive: dynamic secrets, rotation without downtime and leak response (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> Keep secrets out of code, images and logs; fetch them by identity from a store, and make rotation easy.
+
 ## 1. Why it exists
 
-A production incident, reconstructed from common cases: a developer debugging a flaky integration adds `fmt.Println(cfg)` to print the loaded config, ships it, and the log line includes the database password because the config struct has no `json:"-"` tag hiding it. The log is shipped to a log aggregator that a wider team has read access to than the database itself. Separately, a `.env` file with a staging AWS key was committed "temporarily" eight months ago and never removed — `git log -p` still shows it in the history even though the file was deleted in a later commit, because Git preserves every version it has ever seen.
+A production incident, reconstructed from common cases: a developer debugging a flaky integration adds `fmt.Println(cfg)` to print the loaded config, ships it, and the log line includes the database password because the config struct has no `json:"-"` tag hiding it.
 
-Neither path required a sophisticated attacker. Both are "a secret existed somewhere it shouldn't have, for however briefly," and in both cases the fix only starts after the leak: revoke the credential, issue a new one, and audit what it was used for while it was exposed. Secrets management is the set of practices that make the *leak path* narrow (so secrets rarely end up in Git, logs or images in the first place) and the *response path* fast (so a leak that happens anyway is cheap to close).
+The log is shipped to a log aggregator that a wider team has read access to than the database itself. Separately, a `.env` file with a staging AWS key was committed "temporarily" eight months ago and never removed — `git log -p` still shows it in the history even though the file was deleted in a later commit, because Git preserves every version it has ever seen.
+
+Neither path required a sophisticated attacker. Both are "a secret existed somewhere it shouldn't have, for however briefly," and in both cases the fix only starts after the leak: revoke the credential, issue a new one, and audit what it was used for while it was exposed.
+
+Secrets management is the set of practices that make the *leak path* narrow (so secrets rarely end up in Git, logs or images in the first place) and the *response path* fast (so a leak that happens anyway is cheap to close).
 
 ## 2. Mental model
 
-A secret is like a house key: it should exist in as few physical copies as possible, each copy should be traceable to who holds it, and if one copy goes missing you change the lock rather than hoping the missing key is never found. A secrets manager is the key safe: it hands out a key only to an identity that's allowed to have one, logs every time it does so, and lets you swap the lock (rotate) without reprinting the house's address on every door.
+A secret is like a house key: it should exist in as few physical copies as possible, each copy should be traceable to who holds it, and if one copy goes missing you change the lock rather than hoping the missing key is never found.
+
+A secrets manager is the key safe: it hands out a key only to an identity that's allowed to have one, logs every time it does so, and lets you swap the lock (rotate) without reprinting the house's address on every door.
 
 ## 3. How it works
 
@@ -52,7 +102,9 @@ flowchart TD
     class Env,Image,Logs,Bundle bad
 ```
 
-Every anti-pattern on the right shares one trait: the secret ends up somewhere with a *much wider audience* than the one process that needs it — anyone with repo clone access, anyone who can `docker history` the image, anyone with log-read access, anyone who opens dev tools on the website. The store on the left is built around narrowing that audience to exactly the identities that need the secret, with every access logged.
+Every anti-pattern on the right shares one trait: the secret ends up somewhere with a *much wider audience* than the one process that needs it — anyone with repo clone access, anyone who can `docker history` the image, anyone with log-read access, anyone who opens dev tools on the website.
+
+The store on the left is built around narrowing that audience to exactly the identities that need the secret, with every access logged.
 
 A specific, frequently missed layer: `docker history --no-trunc` reveals every `ENV`/`ARG`/`RUN` value baked into an image, even from a layer a later `RUN rm` tried to delete — the earlier layer is still in the image. The fix is BuildKit's `--mount=type=secret`, which makes a secret available to a single `RUN` step's filesystem without ever writing it into a layer.
 
@@ -68,7 +120,9 @@ None of the three eliminates risk; they trade *where* the narrowest remaining ex
 
 ### Envelope encryption
 
-Secrets managers don't encrypt every stored secret directly with one master key — that would mean every decrypt call needs the master key material available, and rotating the master key means re-encrypting everything it has ever touched. Instead they use **envelope encryption**: generate a random, one-time **data key** for the payload, encrypt the payload with it, then encrypt (*wrap*) only that small data key with the **master key**, which usually lives inside a dedicated key-management service (KMS) and never leaves it in plaintext.
+Secrets managers don't encrypt every stored secret directly with one master key — that would mean every decrypt call needs the master key material available, and rotating the master key means re-encrypting everything it has ever touched.
+
+Instead they use **envelope encryption**: generate a random, one-time **data key** for the payload, encrypt the payload with it, then encrypt (*wrap*) only that small data key with the **master key**, which usually lives inside a dedicated key-management service (KMS) and never leaves it in plaintext.
 
 ```mermaid
 flowchart LR
@@ -85,7 +139,9 @@ flowchart LR
     end
 ```
 
-Only the small, fixed-size wrapped data key ever needs the master key to touch it; the bulk payload is encrypted with a key that exists in memory for the duration of one operation. Rotating the master key only means re-wrapping data keys (cheap), not re-encrypting every payload (expensive). This is exactly what AWS KMS `GenerateDataKey`, Vault's `transit` engine, and Google Cloud KMS's envelope-encryption pattern do; the Go example below reproduces the mechanism locally so it can be tested without a live KMS.
+Only the small, fixed-size wrapped data key ever needs the master key to touch it; the bulk payload is encrypted with a key that exists in memory for the duration of one operation. Rotating the master key only means re-wrapping data keys (cheap), not re-encrypting every payload (expensive).
+
+This is exactly what AWS KMS `GenerateDataKey`, Vault's `transit` engine, and Google Cloud KMS's envelope-encryption pattern do; the Go example below reproduces the mechanism locally so it can be tested without a live KMS.
 
 ### Rotation without downtime
 
@@ -109,7 +165,9 @@ sequenceDiagram
     Store->>DB: revoke v1
 ```
 
-The key invariant: **two credentials are valid at once** for an overlap window. A rotation that immediately invalidates the old credential will break every process still holding a cached copy — which, with no coordination mechanism, is every long-running process until its next restart. AWS Secrets Manager's built-in rotation Lambda follows exactly this create-new → test → mark-current → (later) delete-old sequence; Vault's dynamic database credentials sidestep the problem differently, by generating a short-lived, unique credential per consumer with a lease, so there's no single shared secret to rotate at all — each lease simply expires.
+The key invariant: **two credentials are valid at once** for an overlap window. A rotation that immediately invalidates the old credential will break every process still holding a cached copy — which, with no coordination mechanism, is every long-running process until its next restart.
+
+AWS Secrets Manager's built-in rotation Lambda follows exactly this create-new → test → mark-current → (later) delete-old sequence; Vault's dynamic database credentials sidestep the problem differently, by generating a short-lived, unique credential per consumer with a lease, so there's no single shared secret to rotate at all — each lease simply expires.
 
 ## 4. Worked example
 
@@ -386,3 +444,8 @@ func TestOpenFailsOnTamperedCiphertext(t *testing.T) {
 - **Before this:** [[OWASP API Security Top 10]]
 - **Next:** [[OAuth 2.0 and OpenID Connect]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]]
 - **Compare with:** [[OAuth 2.0 and OpenID Connect]] (tokens as a different kind of credential, with their own rotation story), [[CSRF, XSS and Security Headers]] (protecting a session secret in the browser rather than a backend secret at rest)
+
+### Watch on YouTube
+
+- [Secrets Management: Secure Credentials & Avoid Data Leaks](https://www.youtube.com/watch?v=BqekRTA6VCs) · IBM Technology · 9 min · 17,593 views
+- [What is Secrets Management?](https://www.youtube.com/watch?v=iETENR5MEB8) · IBM Technology · 9 min · 23,822 views

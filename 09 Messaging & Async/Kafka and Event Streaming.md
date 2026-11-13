@@ -10,7 +10,7 @@ sources:
   - "KIP-98 (idempotent producer and transactions), KIP-345 (static membership), KIP-429 (cooperative rebalancing), KIP-405 (tiered storage), KIP-500 (KRaft), KIP-794 (uniform sticky partitioner), KIP-848 (next-generation consumer rebalance protocol)"
   - "Apache Kafka 4.0 release notes (ZooKeeper removed, KIP-848 generally available)"
   - "Kreps, The Log: What every software engineer should know about real-time data's unifying abstraction (2013)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Kafka and Event Streaming
@@ -25,11 +25,61 @@ updated: 2026-11-04
 > - Durability comes from replication: `replication.factor=3`, `acks=all`, `min.insync.replicas=2`.
 > - Classic mistake: thinking more consumers always means more speed. Consumers beyond the partition count sit idle.
 
+## Start here: the basics
+
+**The problem in one story.**
+A taxi app records every ride: where it started, where it ended, how much it cost.
+Pricing wants these records right now, the finance team wants them tonight, and a new team wants last week's.
+If records vanish once one team reads them, the others miss out.
+Kafka keeps every record in a long, numbered list so each team can read at its own pace, even re-reading old ones.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Event / record | One small fact written as data | `{"trip": 42, "fare": 310}` |
+| Log | A list you only add to at the end, never edit | A diary where you only write new lines |
+| Producer | Program that writes records | The trip service |
+| Consumer | Program that reads records | The pricing service |
+| Server / broker | A machine that stores the records and answers reads | 3 Kafka brokers in a cluster |
+| Replica | An extra copy of data on another machine | Same partition stored on 3 brokers |
+| Acknowledge (ack) | "I got it" reply that says it is safe | Broker acks after writing to disk copies |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    P["Producer"] -->|"key decides partition"| T["Topic: rides"]
+    T --> P0["Partition 0<br/>offsets 0,1,2..."]
+    T --> P1["Partition 1<br/>offsets 0,1,2..."]
+    P0 --> G1["Pricing group<br/>bookmark at 120"]
+    P0 --> G2["Finance group<br/>bookmark at 15"]
+    P1 --> G1
+    P1 --> G2
+```
+
+**Analogy.** A shared ledger book: writers only add lines at the bottom, and each reader team keeps its own bookmark.
+Where it breaks: a real book has one page order, but Kafka has many pages (partitions) and only keeps order within one page.
+
+**How the rest of this note builds up**
+
+- First, why a log beats a queue for many readers (section 1) and the ledger mental model (section 2).
+- Then how it works: partitions, offsets, consumer groups, replication and commits (section 3), with a Go worked example (section 4).
+- Then variants and trade-offs versus other brokers (sections 5-6).
+- Finally the SDE-3 deep dive: production tuning, rebalances, internals and interview questions (sections 7-10).
+
+> [!tip] Remember
+> Kafka is a durable, partitioned log: writers append, readers keep their own offset, and order holds only within a partition.
+
 ## 1. Why it exists
 
 A ride-hailing app emits 50,000 location and trip events per second. Five teams need them: pricing (real time), fraud (real time), the data warehouse (hourly), a machine-learning feature store, and a new team that wants last week's data to backfill a model.
 
-With a classic queue (RabbitMQ, SQS) a message is gone once one consumer acknowledges it. Five readers means five copies of every message, set up by the producer, and the new team cannot get last week at all. With direct HTTP calls the producer must know all five teams and slows down when any of them does.
+With a classic queue (RabbitMQ, SQS) a message is gone once one consumer acknowledges it.
+
+Five readers means five copies of every message, set up by the producer, and the new team cannot get last week at all.
+
+With direct HTTP calls the producer must know all five teams and slows down when any of them does.
 
 A log fixes all three:
 - The producer writes each event once.
@@ -38,7 +88,11 @@ A log fixes all three:
 
 ## 2. Mental model
 
-Think of a **ledger book with several numbered pages running in parallel** (the partitions). Writers only add lines at the bottom of a page. Each line has a line number (the offset). Readers keep a bookmark per page. Different reader teams keep different bookmarks, so they never interfere. Old pages are torn out after a week, regardless of who has read them.
+Think of a **ledger book with several numbered pages running in parallel** (the partitions).
+
+Writers only add lines at the bottom of a page. Each line has a line number (the offset).
+
+Readers keep a bookmark per page. Different reader teams keep different bookmarks, so they never interfere. Old pages are torn out after a week, regardless of who has read them.
 
 Terms used below:
 - **Broker:** one Kafka server. A **cluster** is several brokers.
@@ -78,7 +132,8 @@ flowchart LR
 
 ### Producing
 
-1. The producer picks a partition. With a key, the Java client's default is `toPositive(murmur2(keyBytes)) % numPartitions`, so the same key always goes to the same partition while the partition count stays the same. Without a key, since Kafka 3.3 (KIP-794) the client fills a batch for one partition and then moves on ("uniform sticky"), which gives bigger batches than round-robin.
+1. The producer picks a partition. With a key, the Java client's default is `toPositive(murmur2(keyBytes)) % numPartitions`, so the same key always goes to the same partition while the partition count stays the same.
+   Without a key, since Kafka 3.3 (KIP-794) the client fills a batch for one partition and then moves on ("uniform sticky"), which gives bigger batches than round-robin.
 2. Records are grouped into **batches** per partition. `batch.size` (default 16,384 bytes) caps a batch; `linger.ms` lets the producer wait a few milliseconds to fill it. Batches are compressed as a unit (`compression.type` = `lz4`, `zstd`, `snappy` or `gzip`).
 3. The leader appends the batch to its log; followers fetch it.
 4. The producer's `acks` decides when it hears "success":
@@ -115,7 +170,9 @@ sequenceDiagram
 - A consumer that takes longer than `max.poll.interval.ms` (default 5 minutes) between polls is considered dead and its partitions are reassigned, which is a common cause of rebalance storms with slow handlers.
 
 **When to commit:**
-- `enable.auto.commit=true` (the default) commits, inside a later `poll()` call and at most every 5 s (`auto.commit.interval.ms`), the offsets of records the previous `poll()` returned. With a simple loop that finishes each batch before polling again this is at-least-once, and a crash repeats up to 5 s of records. If records are handed to other goroutines or threads, the offset can be committed before they are processed, and a crash loses them.
+- `enable.auto.commit=true` (the default) commits, inside a later `poll()` call and at most every 5 s (`auto.commit.interval.ms`), the offsets of records the previous `poll()` returned.
+  With a simple loop that finishes each batch before polling again this is at-least-once, and a crash repeats up to 5 s of records.
+  If records are handed to other goroutines or threads, the offset can be committed before they are processed, and a crash loses them.
 - Manual commit **after** processing gives at-least-once: a crash before the commit means the batch is read again. Handlers must then be idempotent; see [[Delivery Semantics and Exactly-Once]].
 
 ### Storage and retention
@@ -533,3 +590,8 @@ Partition 2's lag of 425 while the others are near zero points to a slow consume
 - **Before this:** [[Queues vs Streams and Broker Comparison]], [[Message Ordering and Partition Keys]], [[Replication]]
 - **Next:** [[Event Schemas and Schema Registry]], [[Stream Processing Basics]], [[Delivery Semantics and Exactly-Once]]
 - **Compare with:** [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[AWS SQS, SNS and EventBridge]], [[Transactional Outbox and CDC]] (how events get into Kafka safely)
+
+### Watch on YouTube
+
+- [What is Event Streaming? / Apache Kafka for .NET Developers](https://www.youtube.com/watch?v=qzEnjyJPI1g) · Confluent, an IBM Company · 3 min · 21,939 views
+- [Event Sourcing 101: Event Sourcing vs. Event Streaming](https://www.youtube.com/watch?v=I3Mlt7GCeIU) · Confluent, an IBM Company · 3 min · 20,258 views

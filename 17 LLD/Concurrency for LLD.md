@@ -14,7 +14,7 @@ sources:
   - "Go race detector article (go.dev/doc/articles/race_detector)"
   - "PostgreSQL 17 docs: SELECT ... FOR UPDATE / SKIP LOCKED, partial unique indexes"
   - "Martin Kleppmann, How to do distributed locking (2016): fencing tokens"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Concurrency for LLD
@@ -30,6 +30,53 @@ updated: 2026-11-04
 > - A Go mutex protects one process. With N instances the invariant moves into the database (conditional `UPDATE`, unique index, `FOR UPDATE`) or a fenced lock.
 
 This note is the LLD angle: where invariants live and how to defend them in an interview design. The mechanics of each primitive live in [[Goroutines and Channels]], [[sync Primitives and Atomics]] and [[select and Concurrency Patterns]].
+
+## Start here: the basics
+
+**The problem in one story.**
+A shop has one packet of milk left.
+Two customers press "Pay" at the same moment.
+Both apps ask "is there milk?", both hear "yes", both pay.
+Now the shop owes milk it does not have. This note is about stopping that.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Goroutine | A lightweight task Go runs at the same time as others | Each HTTP request runs in its own goroutine |
+| Shared state | Data that more than one goroutine reads or writes | The `stock` map inside an inventory service |
+| Invariant | A rule that must always be true | "Stock is never below zero" |
+| Critical section | Code that only one goroutine may run at a time | The lines between `mu.Lock()` and `mu.Unlock()` |
+| Mutex | A lock: one holder at a time, others wait | `sync.Mutex` |
+| Atomic operation | A single step nobody can interrupt halfway | `counter.Add(1)` with `atomic.Int64` |
+| Deadlock | Two tasks each wait for the other forever | A holds lock 1 and wants 2; B holds 2 and wants 1 |
+| Instance | One running copy of your server | Three pods behind a load balancer |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Request A"] --> L{"Lock free?"}
+    B["Request B"] --> L
+    L -- "A gets it" --> C["Check stock and take it<br/>(one step)"]
+    L -- "B waits" --> W["Wait"]
+    C --> U["Unlock"]
+    U --> W
+    W --> C2["B checks: stock is 0<br/>so B is refused"]
+```
+
+**Analogy.** A single-key bathroom: whoever holds the key goes in, checks, and uses it; everyone else waits at the door.
+Where it breaks: with several server instances there are several bathrooms with several keys, so the key no longer protects anything; the rule must move to the shared database.
+
+**How the rest of this note builds up**
+
+- First, data race versus race condition and the milk oversell (section 1), then a mental model of "where the invariant lives" (section 2).
+- Then the tools and rules: the decision table, check-and-act in one lock, lock granularity, lock ordering, no lock across I/O (section 3).
+- Then tested Go code: seat booking, wallet transfer, worker pool, `atomic.Pointer` config, semaphores, `errgroup` and `singleflight` (section 4).
+- Finally the SDE-3 deep dive: multi-instance invariants in PostgreSQL, fencing tokens, failure modes and what to monitor (sections 5-8).
+
+> [!tip] Remember
+> Name the rule that must never break, then make "check and change" one uninterruptible step.
 
 ## 1. Why it exists
 
@@ -124,7 +171,11 @@ Move down this list only when you can say which lock is contended. Each step add
 
 ### Lock ordering and deadlock
 
-A **deadlock** happens when goroutine 1 holds lock A and waits for B while goroutine 2 holds B and waits for A. Neither can move. The fix is a fixed global order: whenever one operation needs several locks, it takes them sorted by a stable key (wallet ID, seat ID). Then the cycle can never form. Go's runtime only detects the case where **every** goroutine is blocked (`fatal error: all goroutines are asleep - deadlock!`); a server with one stuck pair just hangs those requests.
+A **deadlock** happens when goroutine 1 holds lock A and waits for B while goroutine 2 holds B and waits for A. Neither can move.
+
+The fix is a fixed global order: whenever one operation needs several locks, it takes them sorted by a stable key (wallet ID, seat ID). Then the cycle can never form.
+
+Go's runtime only detects the case where **every** goroutine is blocked (`fatal error: all goroutines are asleep - deadlock!`); a server with one stuck pair just hangs those requests.
 
 ### Never hold a lock across I/O
 
@@ -149,7 +200,11 @@ sequenceDiagram
     end
 ```
 
-The claim in step 1 is an **atomic pick-and-claim**: the check ("is it free?") and the claim ("now it is HELD by me") happen in one critical section, so only one goroutine can move the seat out of FREE. The re-check in step 3 matters because the world may have changed while the lock was released. The code below keeps the hold-expiry janitor out for brevity, so its `ErrSeatTaken` branch in step 3 only fires once a TTL sweeper is added; in that branch a failed charge is masked by `ErrSeatTaken`, and a successful one must be refunded.
+The claim in step 1 is an **atomic pick-and-claim**: the check ("is it free?") and the claim ("now it is HELD by me") happen in one critical section, so only one goroutine can move the seat out of FREE.
+
+The re-check in step 3 matters because the world may have changed while the lock was released.
+
+The code below keeps the hold-expiry janitor out for brevity, so its `ErrSeatTaken` branch in step 3 only fires once a TTL sweeper is added; in that branch a failed charge is masked by `ErrSeatTaken`, and a successful one must be refunded.
 
 ## 4. Worked example
 
@@ -366,7 +421,11 @@ func (b *SeatBooker) Free() int {
 
 ### A bounded worker pool that drains on shutdown
 
-The pool has a fixed number of workers and a bounded queue. `Submit` never blocks: a full queue returns `ErrQueueFull`, which is **backpressure** (the caller learns the system is saturated and can return HTTP 429 or store the job durably). `Stop` refuses new jobs, closes the channel, and the workers' `range` loop keeps going until the queue is empty, so nothing accepted is silently dropped. The `RWMutex` makes "check closed, then send" atomic with respect to `close`, so a late `Submit` cannot panic with "send on closed channel".
+The pool has a fixed number of workers and a bounded queue. `Submit` never blocks: a full queue returns `ErrQueueFull`, which is **backpressure** (the caller learns the system is saturated and can return HTTP 429 or store the job durably).
+
+`Stop` refuses new jobs, closes the channel, and the workers' `range` loop keeps going until the queue is empty, so nothing accepted is silently dropped.
+
+The `RWMutex` makes "check closed, then send" atomic with respect to `close`, so a late `Submit` cannot panic with "send on closed channel".
 
 ```mermaid
 flowchart LR
@@ -500,7 +559,9 @@ The rule that makes this safe: a published `*Config` is never mutated. A reload 
 
 ### Semaphore, rate limit and sync.Cond
 
-A **semaphore** limits how many operations run at once. A **rate limiter** limits how many start per second. They answer different questions, and calls to a fragile partner API often need both. `sync.Cond` lets goroutines sleep until a condition on locked state becomes true; it is the textbook tool for a blocking bounded queue, although a buffered channel does the same job in most Go code.
+A **semaphore** limits how many operations run at once. A **rate limiter** limits how many start per second. They answer different questions, and calls to a fragile partner API often need both.
+
+`sync.Cond` lets goroutines sleep until a condition on locked state becomes true; it is the textbook tool for a blocking bounded queue, although a buffered channel does the same job in most Go code.
 
 ```go
 package conc
@@ -1022,7 +1083,9 @@ Measured: `ok example.com/conc 3.048s` on an Apple Silicon laptop with Go 1.24.4
 
 The conditional `UPDATE` is the multi-instance version of `Store.Reserve`: the check (`qty >= $1`) and the act (`qty = qty - $1`) run in one statement, and PostgreSQL's row lock serialises concurrent updates to the same row. The deeper story of row locks, `NOWAIT`, `SKIP LOCKED` and optimistic retries is in [[Locking - Optimistic vs Pessimistic]].
 
-A **fencing token** is a number that increases every time the lock is granted. The lock holder sends it with every write, and the storage rejects any write carrying a token lower than one it has already seen. Without it, a holder that paused (GC, network) past its TTL can still write after someone else got the lock. Details are in [[Distributed Locks and Fencing Tokens]].
+A **fencing token** is a number that increases every time the lock is granted. The lock holder sends it with every write, and the storage rejects any write carrying a token lower than one it has already seen.
+
+Without it, a holder that paused (GC, network) past its TTL can still write after someone else got the lock. Details are in [[Distributed Locks and Fencing Tokens]].
 
 ### Where this shows up in the practice problems
 
@@ -1106,3 +1169,8 @@ A **fencing token** is a number that increases every time the lock is granted. T
 - **Before this:** [[Goroutines and Channels]], [[sync Primitives and Atomics]], [[OOP in Go - Structs, Interfaces, Embedding]]
 - **Next:** [[Testing LLD Code]], [[Movie Ticket Booking]], [[Inventory Order Assignment (Dark Store)]]
 - **Compare with:** [[Locking - Optimistic vs Pessimistic]] (the same invariants inside PostgreSQL), [[Distributed Locks and Fencing Tokens]] (locks across instances), [[select and Concurrency Patterns]] (pipelines and fan-out mechanics)
+
+### Watch on YouTube
+
+- [Logger System LLD in Java / UML, Concurrency & Design Patterns Explained 📝](https://www.youtube.com/watch?v=hOzH7ecc8vg) · Shubh Patel · 26 min · 17,212 views
+- [Watch This Before Your Next LLD Interview (Concurrency Cheatsheet)](https://www.youtube.com/watch?v=Qa6ePZYmTEU) · bhavika pawani · 21 min · 2,193 views

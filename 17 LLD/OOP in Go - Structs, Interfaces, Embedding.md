@@ -10,7 +10,7 @@ sources:
   - "Go FAQ (go.dev/doc/faq): Why is my nil error value not equal to nil?"
   - "Go Code Review Comments (go.dev/wiki/CodeReviewComments): Interfaces, Receiver Type"
   - "Go docs, Organizing a Go module (go.dev/doc/modules/layout): internal directories"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # OOP in Go - Structs, Interfaces, Embedding
@@ -24,6 +24,50 @@ updated: 2026-11-04
 > - Pointer-receiver methods belong only to `*T`, so only `*T` satisfies an interface that needs them.
 > - Embedding promotes the inner type's methods, but the inner type never calls back into the outer one: there is no virtual dispatch.
 > - Classic mistake: returning a nil `*MyError` as an `error`; the caller sees `err != nil`.
+
+## Start here: the basics
+
+**The problem in one story.**
+You know Java or Python, where you write `class Car extends Vehicle`.
+In Go there is no `class` and no `extends`, so your first design looks broken.
+Go still lets you group data with behaviour, swap implementations and reuse code.
+It just uses three smaller tools: structs, interfaces and embedding.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Class (other languages) | A blueprint for objects with data and methods | `class Car { ... }` in Java |
+| Inheritance | A child class gets a parent's code automatically | `Car extends Vehicle` |
+| Struct | Go's record of named fields | `type Car struct { Plate string }` |
+| Method | A function attached to a type | `func (c *Car) Park() {}` |
+| Receiver | The value a method is called on | The `c *Car` in the method above |
+| Pointer | A value holding the address of another value | `&car` gives a `*Car` |
+| Interface | A named set of methods; any type with them fits | `type Parker interface { Park() }` |
+| Nil | The "nothing here" value for pointers and interfaces | `var c *Car = nil` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Struct<br/>(data)"] --> M["Methods<br/>(behaviour)"]
+    M --> I["Interface<br/>(any type with these methods)"]
+    S --> E["Embedding<br/>(reuse another struct)"]
+    I --> U["Caller depends on interface,<br/>not on concrete type"]
+```
+
+**Analogy.** A power socket: any plug with the right shape works, and the socket does not care who made the device. That is an interface.
+Where it breaks: a plug fits once the shape matches, but in Go a method on a pointer receiver means only the pointer "fits", which a physical plug has no equivalent for.
+
+**How the rest of this note builds up**
+
+- First, why Go chose this design (section 1) and a mental model of struct plus interface (section 2).
+- Then the Java-to-Go translation, value versus pointer receivers, implicit interfaces, embedding, enums and package privacy (section 3).
+- Then a full tested worked example with constructor injection (section 4).
+- Finally variants, trade-offs, production traps like the nil-interface bug, and the deep dive (sections 5-9).
+
+> [!tip] Remember
+> Struct plus methods is the class, a small interface is the contract, and embedding is reuse without inheritance.
 
 ## 1. Why it exists
 
@@ -500,7 +544,9 @@ func main() {
 }
 ```
 
-For a handful of services, hand wiring like this is the common Go choice: it is explicit and the compiler checks it. google/wire generates the same wiring code at build time; uber/fx wires at run time with reflection and adds lifecycle hooks (check each project's current maintenance status before adopting it). Both pay off only when the dependency graph is large. Layout details are in [[Service Project Layout and Wiring]].
+For a handful of services, hand wiring like this is the common Go choice: it is explicit and the compiler checks it. google/wire generates the same wiring code at build time; uber/fx wires at run time with reflection and adds lifecycle hooks (check each project's current maintenance status before adopting it).
+
+Both pay off only when the dependency graph is large. Layout details are in [[Service Project Layout and Wiring]].
 
 ## 5. Variants and comparison
 
@@ -592,3 +638,7 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 - **Before this:** [[Structs, Methods and Embedding]], [[Interfaces]], [[Pointers, Values and Escape Analysis]]
 - **Next:** [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]], [[SOLID in Go]], [[LLD Interview Method]]
 - **Compare with:** [[Strategy and Template Method]] (the right way to vary a step), [[Generics and Iterators]], [[Error Handling]]
+
+### Watch on YouTube
+
+- [The Power Of Struct Embedding And Interfaces In Golang](https://www.youtube.com/watch?v=fXZJu_JuH0A) · Anthony GG · 15 min · 22,688 views

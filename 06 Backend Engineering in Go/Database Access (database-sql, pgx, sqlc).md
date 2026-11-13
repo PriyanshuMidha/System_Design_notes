@@ -8,7 +8,7 @@ sources:
   - "Go source: database/sql/sql.go, defaultMaxIdleConns = 2 (as of Go 1.24.4)"
   - "jackc/pgx v5 documentation"
   - "sqlc documentation (sqlc.dev)"
-updated: 2026-11-07
+updated: 2026-11-13
 status: reviewed
 ---
 
@@ -24,11 +24,61 @@ status: reviewed
 > - `pgx` talks Postgres's wire protocol directly and is faster and more feature-complete than `database/sql` + a generic driver; `sqlc` removes hand-written `Scan` calls on top of either.
 > - N+1 queries are a Go-side problem: loop-and-query where one batched query would do.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your API saves invoices in Postgres.
+Opening a new database connection for every request is slow.
+So Go keeps a small set of open connections and lends them out.
+You must return each one, read errors correctly, and avoid asking the database 100 times when once would do.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| SQL | The language you use to ask a database for data | `SELECT * FROM invoices` |
+| Connection | One open network link to the database | A TCP socket to port 5432 |
+| Pool | A set of reusable open connections | `sql.DB` holding 10 connections |
+| Query | One request sent to the database | `SELECT ... WHERE id = $1` |
+| Row / Scan | One result record / copying its columns into Go variables | `rows.Scan(&id, &amount)` |
+| Driver | Code that speaks one database's protocol | `pgx` for Postgres |
+| `context.Context` | A value that carries a deadline or cancel signal | Stop the query after 2s |
+| N+1 queries | One query for a list, then one more per item | 1 + 100 queries for 100 invoices |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    H["Handler"] --> P["Pool (sql.DB)"]
+    P -- "borrow" --> C["Connection"]
+    C --> DB[("Postgres")]
+    DB --> R["Rows"]
+    R --> S["Scan into<br/>Go structs"]
+    S -- "rows.Close()" --> P
+```
+
+**Analogy.** A library lends a fixed number of books. You borrow one, read it, and must return it, or the next reader waits.
+Where it breaks: a library book does not time out by itself, but a query can be cancelled by its context deadline.
+
+**How the rest of this note builds up**
+
+- First, why a pool exists (section 1) and the pool mental model (section 2).
+- Then opening the pool, borrowing connections, sizing knobs, NULLs, timeouts, and pgx vs `database/sql` vs sqlc (section 3).
+- Then a worked repository example (section 4) and comparisons (section 5).
+- Finally the SDE-3 deep dive: N+1 fixes, pool exhaustion, and production debugging (sections 6-8).
+
+> [!tip] Remember
+> `sql.DB` is a pool: size it, close every `rows`, check `rows.Err()`, and batch instead of looping queries.
+
 ## 1. Why it exists
 
-InvoiceOps needs to read and write Postgres from Go: look up an invoice, list unpaid ones, mark one as paid. Go has no built-in ORM and no single blessed driver. `database/sql` is the standard library's answer: a generic `*sql.DB` type and `Rows`/`Row`/`Result` types that any database driver can implement, so the same calling code works against Postgres, MySQL, or SQLite by swapping the driver import and the connection string.
+InvoiceOps needs to read and write Postgres from Go: look up an invoice, list unpaid ones, mark one as paid. Go has no built-in ORM and no single blessed driver.
 
-What `database/sql` does **not** do is manage a single connection per call. A naive read of `db.QueryRowContext(...)` looks like one call to one database — but `*sql.DB` silently opens, reuses, and closes a pool of underlying connections behind it. Get the pool sizing wrong and the symptoms show up far from the code that caused them: requests blocked in `db.Stats().WaitDuration`, or `FATAL: too many connections` while every Go profiler says the app is idle.
+`database/sql` is the standard library's answer: a generic `*sql.DB` type and `Rows`/`Row`/`Result` types that any database driver can implement, so the same calling code works against Postgres, MySQL, or SQLite by swapping the driver import and the connection string.
+
+What `database/sql` does **not** do is manage a single connection per call. A naive read of `db.QueryRowContext(...)` looks like one call to one database — but `*sql.DB` silently opens, reuses, and closes a pool of underlying connections behind it.
+
+Get the pool sizing wrong and the symptoms show up far from the code that caused them: requests blocked in `db.Stats().WaitDuration`, or `FATAL: too many connections` while every Go profiler says the app is idle.
 
 ## 2. Mental model
 
@@ -100,7 +150,9 @@ The handler never sees "connection #7". It sees a `*sql.Row`, and the underlying
 | `SetConnMaxLifetime(d)` | `0` (unlimited) | Forces a connection to close and reopen after `d`, even mid-use of the pool. Needed behind load balancers or proxies (PgBouncer, cloud LBs) that silently drop long-lived TCP connections. |
 | `SetConnMaxIdleTime(d)` | `0` (unlimited) | Closes an idle connection after `d` of no use. Matters when the DB itself has no pooler in front and would otherwise hold connections open forever. |
 
-Size `MaxOpenConns` against `max_connections` on the server, divided by however many replicas of your service share that server: a Postgres instance with `max_connections = 100` behind 10 pods leaves roughly 8-9 connections per pod once you reserve headroom for migrations and superuser access. `db.Stats()` (`WaitCount`, `WaitDuration`, `InUse`, `Idle`) is the metric to graph to find out if the pool is actually too small.
+Size `MaxOpenConns` against `max_connections` on the server, divided by however many replicas of your service share that server: a Postgres instance with `max_connections = 100` behind 10 pods leaves roughly 8-9 connections per pod once you reserve headroom for migrations and superuser access.
+
+`db.Stats()` (`WaitCount`, `WaitDuration`, `InUse`, `Idle`) is the metric to graph to find out if the pool is actually too small.
 
 ### RETURNING and NULLs
 
@@ -110,11 +162,17 @@ Size `MaxOpenConns` against `max_connections` on the server, divided by however 
 INSERT INTO invoices (workspace_id, total_cents) VALUES ($1, $2) RETURNING id, created_at;
 ```
 
-For nullable columns, three options exist: `sql.Null[T]` (generic, Go 1.22+, used in the worked example below), the older per-type wrappers (`sql.NullString`, `sql.NullInt64`, ...), or a plain `*T` pointer field. A fourth option skips Go-side null handling entirely: `COALESCE(paid_at, '1970-01-01')` or `COALESCE(discount_cents, 0)` in the `SELECT` list converts `NULL` to a sentinel value in SQL, so the Go side can scan a non-nullable type — useful when the sentinel is unambiguous and simpler than threading `Valid` checks through calling code.
+For nullable columns, three options exist: `sql.Null[T]` (generic, Go 1.22+, used in the worked example below), the older per-type wrappers (`sql.NullString`, `sql.NullInt64`, ...), or a plain `*T` pointer field.
+
+A fourth option skips Go-side null handling entirely: `COALESCE(paid_at, '1970-01-01')` or `COALESCE(discount_cents, 0)` in the `SELECT` list converts `NULL` to a sentinel value in SQL, so the Go side can scan a non-nullable type — useful when the sentinel is unambiguous and simpler than threading `Valid` checks through calling code.
 
 ### Context timeouts
 
-Every `*Context` method takes a `context.Context`; a query only stops early if you pass one with a deadline or cancellation. A context canceled by the caller, or timed out, aborts the query against Postgres (via the driver sending a cancel request), not just the Go-side wait. Without a deadline, a slow query — a missing index, a lock wait — blocks that pooled connection, and therefore one slot of your pool, for as long as the query runs. See [[Context Package]] for how deadlines propagate.
+Every `*Context` method takes a `context.Context`; a query only stops early if you pass one with a deadline or cancellation.
+
+A context canceled by the caller, or timed out, aborts the query against Postgres (via the driver sending a cancel request), not just the Go-side wait.
+
+Without a deadline, a slow query — a missing index, a lock wait — blocks that pooled connection, and therefore one slot of your pool, for as long as the query runs. See [[Context Package]] for how deadlines propagate.
 
 ### pgx vs database/sql vs sqlc
 
@@ -144,7 +202,13 @@ flowchart LR
     end
 ```
 
-The pattern is Go-side, not SQL-side: a loop that calls a single-row query function once per item in a slice. The fix is to collect the keys first and issue one query with `WHERE id = ANY($1)` (pgx, passing a slice directly) or a dynamic `IN (?, ?, ...)` list (`database/sql`, which has no native array binding); when the loop was actually fetching a related table per row, a `JOIN` that pulls both tables in one query is often the better fix instead of two batched queries. See [[N+1 Query Problem]] for the general pattern and its detection.
+The pattern is Go-side, not SQL-side: a loop that calls a single-row query function once per item in a slice.
+
+The fix is to collect the keys first and issue one query with `WHERE id = ANY($1)` (pgx, passing a slice directly) or a dynamic `IN (?, ?, ...)` list (`database/sql`, which has no native array binding).
+
+When the loop was actually fetching a related table per row, a `JOIN` that pulls both tables in one query is often the better fix instead of two batched queries.
+
+See [[N+1 Query Problem]] for the general pattern and its detection.
 
 ## 4. Worked example
 
@@ -441,3 +505,7 @@ The table below is drawn from each project's own documentation, not from running
 - **Before this:** [[Syntax, Types and Control Flow]], [[Error Handling]], [[Context Package]]
 - **Next:** [[Transactions and the Repository Pattern]], [[Testing Go Services]]
 - **Compare with:** [[Connection Pooling]] (pool theory shared across languages), [[N+1 Query Problem]] (the general pattern and its detection)
+
+### Watch on YouTube
+
+- [The Secret to Clean Go Database Code (SQLC Tutorial)](https://www.youtube.com/watch?v=iYFxgZkechE) · Andi Wibowo · sqlc typed-query generation walkthrough on top of pgx/database-sql

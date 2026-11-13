@@ -10,7 +10,7 @@ sources:
   - "Apache Cassandra documentation, lightweight transactions (INSERT ... IF NOT EXISTS)"
   - "Flickr engineering blog (2010), Ticket Servers: Distributed Unique Primary Keys on the Cheap"
   - "Google Safe Browsing API v4 documentation (Lookup and Update APIs)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - URL Shortener
@@ -24,6 +24,51 @@ updated: 2026-11-04
 > - Redirects are served from CDN and Redis; the database sees only cache misses.
 > - Choose 302 when you need click analytics, 301 when you want browsers to remember the redirect.
 > - Click analytics go to a queue and an analytics store, never into the redirect's critical path.
+
+## Start here: the basics
+
+**The problem in one story.**
+You want to share a very long link in a text message.
+A short link like `sho.rt/aZ3k9Qx` is easier to send.
+When someone taps it, they must land on the original page almost instantly.
+Billions of links exist, and two links must never get the same short code.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Short code | The few characters after the domain | `aZ3k9Qx` |
+| Redirect | The server telling the browser "go here instead" | HTTP 301 or 302 with a `Location` header |
+| Key-value store | A database that looks up a value by a key | `aZ3k9Qx → https://...` |
+| Base62 | Writing numbers with 0-9, a-z, A-Z (62 symbols) | 125 → `21` |
+| Counter | A number that only goes up, one per new link | 1, 2, 3, ... |
+| Collision | Two different links getting the same code | Must never happen |
+| Cache | A fast copy of popular answers in memory | Hot codes served from Redis |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["User clicks<br/>sho.rt/aZ3k9Qx"] --> S["Redirect service"]
+    S --> C["Cache"]
+    C -- "miss" --> DB["Key-value store:<br/>code → long URL"]
+    S --> R["302 to long URL"]
+    N["Create link"] --> K["Counter → base62 code"]
+    K --> DB
+```
+
+**Analogy.** A coat check: you hand in a long coat and get a small numbered ticket; the ticket brings the coat back.
+Where it breaks: a coat check runs one counter in one room, while here many servers hand out numbers at once, so they take blocks of numbers.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model (section 2).
+- Then the high-level design for creating and following links (section 3).
+- Then estimates, API, data model, Go code for base62 and block allocation, and one traced request (section 4).
+- Finally the SDE-3 deep dive: unguessable codes, custom-alias races and expiry (sections 5-8).
+
+> [!tip] Remember
+> A short link is just a key: make unique keys from a counter in base62, then look them up fast.
 
 ## 1. Why it exists - requirements
 
@@ -471,7 +516,11 @@ Scrambling hides sequence, not existence: with 182.5B of 3.52T codes used (5.2%)
 
 ### 8.2 Custom aliases and the race
 
-Two users ask for `diwali-sale` at the same moment. A "read, then write if absent" check has a race window. The fix is to make the store decide: a conditional put (`attribute_not_exists`), an `INSERT ... IF NOT EXISTS`, or in PostgreSQL 17 `INSERT ... ON CONFLICT (code) DO NOTHING RETURNING code`, where an empty result means "taken, return 409". Custom aliases share the table with generated codes, so reserve a namespace: generated codes are exactly 7 base62 characters, and aliases must be longer or contain a `-`, so they can never collide with a future generated code.
+Two users ask for `diwali-sale` at the same moment. A "read, then write if absent" check has a race window. The fix is to make the store decide: a conditional put (`attribute_not_exists`), an `INSERT ...
+
+IF NOT EXISTS`, or in PostgreSQL 17 `INSERT ... ON CONFLICT (code) DO NOTHING RETURNING code`, where an empty result means "taken, return 409".
+
+Custom aliases share the table with generated codes, so reserve a namespace: generated codes are exactly 7 base62 characters, and aliases must be longer or contain a `-`, so they can never collide with a future generated code.
 
 ### 8.3 Expiry and cleanup
 
@@ -517,3 +566,8 @@ A 45-minute interview script:
 - **Before this:** [[System Design Interview Framework]], [[Back-of-the-Envelope Estimation]], [[Unique ID Generation]], [[Caching Patterns]]
 - **Next:** [[Case Study - Notification System]], [[Rate Limiting - Algorithms and Distributed Design]], [[Case Study - Key-Value Store]]
 - **Compare with:** [[Hot Keys and Hot Partitions]], [[CDN and Edge]], [[Bloom Filters and Probabilistic Data Structures]], [[Kafka and Event Streaming]]
+
+### Watch on YouTube
+
+- [How Does a URL Shortener Work?](https://www.youtube.com/watch?v=HHUi8F_qAXM) · ByteByteGo · 6 min · 199,030 views
+- [Design a URL Shortener (TinyURL, Bit.ly) / Systems Design Questions 3.0 With Ex-Google SWE](https://www.youtube.com/watch?v=xFeWVugaouk) · Jordan has no life · 17 min · 61,147 views

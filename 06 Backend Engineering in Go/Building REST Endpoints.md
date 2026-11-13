@@ -8,7 +8,7 @@ sources:
   - "RFC 9457, Problem Details for HTTP APIs"
   - "Go 1.22 release notes, net/http ServeMux enhanced routing"
   - "Go 1.24 net/http package docs, MaxBytesReader and ResponseController"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Building REST Endpoints
@@ -22,9 +22,56 @@ updated: 2026-11-07
 > - Every error the service returns is mapped to an HTTP status in exactly one place, using `errors.Is`/`errors.As`, never scattered string comparisons.
 > - Pagination, idempotency keys and optimistic concurrency (ETags) are endpoint-level concerns, not service concerns — the service layer never imports `net/http`.
 
+## Start here: the basics
+
+**The problem in one story.** A shop counter takes orders by form.
+The clerk checks the form is not too big, reads it, checks it is filled in right, passes it to the back office, and hands back a clear receipt.
+If you hand in the same form twice because you did not hear the answer, a good shop does not charge you twice.
+A REST endpoint is that counter for one URL.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| REST endpoint | A URL plus HTTP method that does one thing | `POST /v1/invoices` creates an invoice |
+| HTTP method | The verb of the request | `GET` reads, `POST` creates, `PATCH` updates |
+| Status code | Number telling the client what happened | 201 created, 404 not found, 409 conflict |
+| `http.ServeMux` | Go's built-in router | `mux.HandleFunc("GET /v1/invoices/{id}", h)` |
+| JSON decode | Turning request bytes into a Go struct | `json.NewDecoder(r.Body).Decode(&in)` |
+| Idempotency key | Client-chosen ID so a retry does not repeat the action | `Idempotency-Key: 7c1e...` |
+| Pagination | Returning a long list in pages | `?limit=50&after=inv_99` |
+| ETag | Version tag of a resource for safe updates | `If-Match: "v3"` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R[Request] --> S[Size gate]
+    S --> D[Decode JSON]
+    D --> V[Validate]
+    V --> SV[Call service]
+    SV --> E[Map error to status]
+    E --> O[Encode response]
+```
+
+**Analogy.** A counter with a row of checks: any check can stop the form and give an answer.
+Where it breaks: a real clerk can scribble two notes on one form; an HTTP response has only one status line, so only one gate may write it.
+
+**How the rest of this note builds up**
+
+- First, why routing, status codes, pagination and idempotency need policies (sections 1-2).
+- Then Go 1.22 routing, idempotency keys, error mapping, `problem+json`, keyset pagination and ETags (section 3).
+- Then a full invoice endpoint in code (section 4).
+- Finally, the SDE-3 deep dive on variants, trade-offs and production (sections 5-9).
+
+> [!tip] Remember
+> Gate, decode, validate, call the service, map the error in one place, encode.
+
 ## 1. Why it exists
 
-Say InvoiceOps exposes `POST /v1/invoices` to create an invoice, and two clients retry on timeout. Without an idempotency key, a request that actually succeeded but whose *response* got lost over a flaky connection creates two invoices when the client retries — a real customer gets billed twice. Without a status-code policy, one engineer returns `400` for "invoice not found" and another returns `500`; client code ends up branching on response body text instead of the status line. Without pagination that scales, `GET /v1/invoices?page=400` on a 2-million-row table makes Postgres walk and discard 399 pages before it can return page 400, so an endpoint that was fast at launch gets slower every month even though query load per request never changed.
+Say InvoiceOps exposes `POST /v1/invoices` to create an invoice, and two clients retry on timeout. Without an idempotency key, a request that actually succeeded but whose *response* got lost over a flaky connection creates two invoices when the client retries — a real customer gets billed twice.
+
+Without a status-code policy, one engineer returns `400` for "invoice not found" and another returns `500`; client code ends up branching on response body text instead of the status line. Without pagination that scales, `GET /v1/invoices?page=400` on a 2-million-row table makes Postgres walk and discard 399 pages before it can return page 400, so an endpoint that was fast at launch gets slower every month even though query load per request never changed.
 
 These are not abstract complaints: they are the concrete reasons a REST endpoint needs a routing convention, a status-code policy, a pagination strategy, and idempotency — before a single line of business logic is written.
 
@@ -168,7 +215,9 @@ The cursor sent back to the client is an opaque, base64-encoded `(created_at, id
 
 ### PATCH and optimistic concurrency
 
-A `PATCH` only changes the fields the client actually sent. A pointer field (`*string`) tells "the client didn't send `status`" (`nil`) apart from "the client wants to set it" — see [[Request Decoding, Validation and DTOs]] for the same absent-vs-null problem on the decode side. To stop a `PATCH` from silently overwriting a concurrent writer's change, the client must echo back the `ETag` it last read as `If-Match`; a stale value gets `412 Precondition Failed` instead of a quiet overwrite.
+A `PATCH` only changes the fields the client actually sent. A pointer field (`*string`) tells "the client didn't send `status`" (`nil`) apart from "the client wants to set it" — see [[Request Decoding, Validation and DTOs]] for the same absent-vs-null problem on the decode side.
+
+To stop a `PATCH` from silently overwriting a concurrent writer's change, the client must echo back the `ETag` it last read as `If-Match`; a stale value gets `412 Precondition Failed` instead of a quiet overwrite.
 
 ## 4. Worked example
 
@@ -527,3 +576,8 @@ func TestList_KeysetPagination_CoversAllRowsOnceInOrder(t *testing.T) {
 - **Before this:** [[HTTP Server Fundamentals (net-http)]], [[REST and HTTP API Design]], [[Error Handling]]
 - **Next:** [[Request Decoding, Validation and DTOs]], [[Middleware]]
 - **Compare with:** [[API Error Handling]] (the design-level error contract this note implements in Go), [[Pagination, Filtering and Sorting]] (the design-level pagination tradeoffs), [[Idempotency and Idempotency Keys]] (the general pattern this note's `idempotencyStore` implements)
+
+### Watch on YouTube
+
+- [Building RESTful APIs with Golang 1.22's ServeMux](https://www.youtube.com/watch?v=cs1wlUb2Zq0) · Donutloop · shows the Go 1.22 stdlib-only routing this note is built around
+- [Go (Golang) REST API Example (Without Framework)](https://www.youtube.com/watch?v=8S30eoBSojU) · Golang Cafe · full endpoint build without a framework, decode-validate-respond flow

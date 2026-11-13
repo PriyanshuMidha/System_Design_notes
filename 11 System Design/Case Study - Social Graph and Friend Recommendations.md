@@ -12,13 +12,15 @@ sources:
   - "Kleppmann, Designing Data-Intensive Applications, chapter 2 (graph-like data models) and chapter 6 (partitioning)"
   - "Neo4j documentation: native graph storage and index-free adjacency"
   - "Roaring bitmaps: Chambi, Lemire et al., Better bitmap performance with Roaring bitmaps (Software: Practice and Experience, 2016)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Social Graph and Friend Recommendations
 
 > [!summary] TL;DR
-> A **social graph** stores who is connected to whom. The product needs four fast answers: "list my friends", "are A and B friends?", "who are our mutual friends?" and "who might I know?". The design stores each person's **adjacency list** on one shard (partitioned by user id), keeps both directions of a friendship in sync with an outbox, caches hot lists, and computes "people you may know" offline as a friends-of-friends join, then serves the precomputed top results from a key-value store.
+> A **social graph** stores who is connected to whom. The product needs four fast answers: "list my friends", "are A and B friends?", "who are our mutual friends?" and "who might I know?".
+>
+> The design stores each person's **adjacency list** on one shard (partitioned by user id), keeps both directions of a friendship in sync with an outbox, caches hot lists, and computes "people you may know" offline as a friends-of-friends join, then serves the precomputed top results from a key-value store.
 
 > [!abstract] Core idea
 > - Model people as **nodes** and friendships as **edges**. Shard by `user_id` so a friend list is one shard read, never a scatter-gather.
@@ -26,6 +28,50 @@ updated: 2026-11-09
 > - Mutual friends is a **set intersection** of two lists (hundreds of ids each). Celebrities with millions of followers need special handling (supernodes).
 > - "Degrees of separation" is a **bidirectional BFS** that stops at depth 2 or 3 online.
 > - "People you may know" counts friends-of-friends, ranks them with features, and is **precomputed in batch**; online it is a lookup plus filtering (blocked, already friends, dismissed).
+
+## Start here: the basics
+
+**The problem in one story.**
+You open a social app and see your 300 friends.
+You visit a stranger's profile and see "12 mutual friends".
+A box says "People you may know" with someone from your old school.
+All three answers must come back fast for a billion users.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Graph | A set of things (nodes) joined by links (edges) | People joined by friendships |
+| Node / edge | A person / one friendship between two people | Asha — Ravi |
+| Adjacency list | The list of everyone one node links to | Asha: [Ravi, Meera, ...] |
+| Shard | One slice of the data on its own server | Users 0-1M on shard 1 |
+| Friends-of-friends | People your friends know but you do not | Ravi's friend Kiran |
+| Set intersection | Items that appear in both of two lists | Mutual friends of A and B |
+| Outbox | A table of "events to send" written with the main change | "A and B are now friends" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    A["Asha"] --- R["Ravi"]
+    A --- M["Meera"]
+    R --- K["Kiran"]
+    M --- K
+    K -. "2 mutual friends:<br/>suggest to Asha" .- A
+```
+
+**Analogy.** A city phone book where each person has a page listing their friends.
+Where it breaks: a phone book is printed once, but friendships change every second and each page may sit on a different server.
+
+**How the rest of this note builds up**
+
+- First, the four questions the product asks (section 1) and the phone-book mental model (section 2).
+- Then storage options and the architecture (section 3).
+- Then estimates, API, data model, the friend-request lifecycle and one traced friendship (section 4).
+- Finally the SDE-3 deep dive: mutual friends at scale, the suggestions pipeline, bidirectional BFS, supernodes and keeping both sides in sync (sections 5-8).
+
+> [!tip] Remember
+> Shard friend lists by user, write both sides of every friendship, and compute suggestions offline.
 
 ## 1. Why it exists - requirements
 
@@ -80,7 +126,9 @@ flowchart LR
 
 ## 2. Mental model
 
-Think of a **city phone book where every person has a personal page listing their friends**. Finding your friends is turning to your own page: one lookup. Finding mutual friends is laying two pages side by side and ticking off names that appear on both. Finding someone's friends-of-friends is opening each friend's page, which is about 300 more lookups. Finding suggestions for everyone means opening every page in the city for every person, which is why we do it overnight with many clerks instead of at the moment someone asks.
+Think of a **city phone book where every person has a personal page listing their friends**. Finding your friends is turning to your own page: one lookup. Finding mutual friends is laying two pages side by side and ticking off names that appear on both.
+
+Finding someone's friends-of-friends is opening each friend's page, which is about 300 more lookups. Finding suggestions for everyone means opening every page in the city for every person, which is why we do it overnight with many clerks instead of at the moment someone asks.
 
 Where the analogy breaks: pages are on different floors (shards), and when two people become friends, both pages must be updated, on two different floors, at the same time.
 
@@ -542,7 +590,9 @@ flowchart TD
 ## 9. Interview questions
 
 > [!question]- How do you store a graph of one billion users and 300 billion friendship entries?
-> Partition by user id so each person's adjacency list lives on one shard, store both directions of each friendship (about 300 B entries, about 7 TB raw), cache hot lists, and keep a separate counter for friend counts. A relation row per pair is the canonical truth; adjacency rows are projections. A graph database is not required for one-hop reads.
+> Partition by user id so each person's adjacency list lives on one shard, store both directions of each friendship (about 300 B entries, about 7 TB raw), cache hot lists, and keep a separate counter for friend counts.
+>
+> A relation row per pair is the canonical truth; adjacency rows are projections. A graph database is not required for one-hop reads.
 
 > [!question]- A friendship is two writes on two shards. How do you avoid a half-written friendship?
 > Make a single canonical row per ordered pair the truth, update it in one local transaction with an outbox row, and let an idempotent projector write both adjacency rows from the event. If it crashes midway, replay fixes it, and a repair job reconciles drift. A distributed transaction would work but is slower and less available.
@@ -551,7 +601,9 @@ flowchart TD
 > Intersect the two adjacency lists: hash the smaller list and probe with the larger. For a supernode, probe the smaller list's ids against the large list with batched existence lookups. Return a count and a small sample, and cache sorted id arrays. For dense id ranges use Roaring bitmaps.
 
 > [!question]- Design "people you may know" for a billion users.
-> Count friends-of-friends. Offline, self-join the edge snapshot on the middle node, prune (cap high-degree middle nodes, drop existing friends and blocked users), group by pair to get the mutual count, add features such as shared school and contacts, keep the top 100 per user in a KV store. Online, fetch the 100, filter again and return 20. A stream job refreshes fresh friendships.
+> Count friends-of-friends. Offline, self-join the edge snapshot on the middle node, prune (cap high-degree middle nodes, drop existing friends and blocked users), group by pair to get the mutual count, add features such as shared school and contacts, keep the top 100 per user in a KV store.
+>
+> Online, fetch the 100, filter again and return 20. A stream job refreshes fresh friendships.
 
 > [!question]- Trap: "Use a graph database for everything." Good idea at this scale?
 > Usually not for the primary serving path. One-hop list and exists lookups are served better and cheaper by sharded stores with a cache. Graph databases suit deep traversals when the data fits their memory and sharding model; sharding a graph is hard because edges cross every cut.
@@ -590,3 +642,8 @@ A 45-minute script:
 - **Building blocks:** [[Consistent Hashing]], [[Transactional Outbox and CDC]], [[Idempotency and Idempotency Keys]], [[Hot Keys and Hot Partitions]], [[Stream Processing Basics]], [[Kafka and Event Streaming]], [[Bloom Filters and Probabilistic Data Structures]], [[Wide-Column Stores and Cassandra]], [[Indexing Fundamentals]]
 - **Decision guides:** [[Choosing a Database - Decision Guide]], [[Choosing Consistency, Replication and Partitioning - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]]
 - **Compare with:** [[Case Study - News Feed]], [[Case Study - Distributed Counter (Likes and Views)]], [[Case Study - Search Autocomplete]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]
+
+### Watch on YouTube
+
+- [System Design: Social Graph (with FAANG Senior Engineer)](https://www.youtube.com/watch?v=Jdj2OsGeiA8) · System Design Fight Club · 50 min · 4,187 views
+- [Social Network Friend Recommendation System in JavaFX / JavaFx / JavaProject / DS](https://www.youtube.com/watch?v=czOP1uBvhP4) · CodingWorldHere · 7 min · 101 views

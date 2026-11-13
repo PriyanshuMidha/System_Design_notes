@@ -10,7 +10,7 @@ sources:
   - "Go 1.24 release notes, os.Root (go.dev/doc/go1.24)"
   - "Go blog, Share Memory By Communicating; Go blog, Timer rework (background on time internals)"
   - "Go 1.22 release notes, math/rand/v2"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Standard Library Essentials (time, io, files, encoding)
@@ -24,6 +24,48 @@ updated: 2026-11-07
 > - Writing a file safely means checking the error from `Close`, not just from `Write`, and renaming a finished temp file into place instead of writing in place.
 > - `bufio.Scanner` silently stops at 64KB per token unless you grow its buffer.
 > - Stdlib crypto/encoding helpers (`base64`, `hex`, `sha256`, `hmac`) are usually enough; reach for a library only past that.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your service must log the time, read a 2 GB upload, save it to disk and return JSON.
+Writing date maths, file handling and JSON parsing yourself would take weeks and be buggy.
+Go's standard library ships all of these, built around a few small interfaces that plug together.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Standard library | Packages that come with Go | `time`, `io`, `os`, `encoding/json` |
+| Interface | A set of methods a type promises to have | `io.Reader` has `Read(p []byte)` |
+| Stream | Data handled piece by piece, not all at once | Copying a file in 32 KB chunks |
+| Buffer | Temporary memory that batches small reads or writes | `bufio.NewWriter(f)` |
+| Duration | A length of time | `5 * time.Second` |
+| Monotonic clock | A clock that only moves forward, for measuring | `time.Since(start)` uses it |
+| Encoding | Turning data into bytes and back | `json.Marshal(user)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    F["os.File / HTTP body"] -- "io.Reader" --> B["bufio / gzip /<br/>hash (wrappers)"]
+    B -- "io.Reader" --> D["json.Decoder"]
+    D --> S["Go struct"]
+    S --> E["json.Encoder"] -- "io.Writer" --> W["file / response"]
+```
+
+**Analogy.** `io.Reader` and `io.Writer` are standard pipe fittings: any pipe connects to any other.
+Where it breaks: real pipes leak visibly; a forgotten `Close` or `Flush` loses data silently.
+
+**How the rest of this note builds up**
+
+- First, why a small set of shared interfaces matters and the mental model (sections 1-2).
+- Then each area: `time`, `io` and `bufio`, files and paths, encoding and hashing (section 3).
+- Then a worked example wiring them together, plus comparisons and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive: production gotchas (timers, buffering, atomic writes), interview questions (sections 7-9).
+
+> [!tip] Remember
+> Most of the standard library is small types plugged together through `io.Reader` and `io.Writer`.
 
 ## 1. Why it exists
 
@@ -48,7 +90,9 @@ io.LimitReader(r, n)   stops after n bytes, even if r has more
 io.MultiWriter(ws...)  one Write fans out to every w
 ```
 
-`time.Time` is a value, not a pointer: it carries a wall-clock reading (what a calendar/clock would show), an optional **monotonic** reading (a clock that only moves forward, used for measuring elapsed time on the same machine), and a `*Location`. Two `time.Time` values for "the same instant" can still differ in location or in whether they carry a monotonic reading, so `==` is the wrong comparison; `Equal` compares the instant only.
+`time.Time` is a value, not a pointer: it carries a wall-clock reading (what a calendar/clock would show), an optional **monotonic** reading (a clock that only moves forward, used for measuring elapsed time on the same machine), and a `*Location`.
+
+Two `time.Time` values for "the same instant" can still differ in location or in whether they carry a monotonic reading, so `==` is the wrong comparison; `Equal` compares the instant only.
 
 ## 3. How it works
 
@@ -364,3 +408,7 @@ func TestReadConfigHandlesLineOverDefaultScannerLimit(t *testing.T) {
 - **Before this:** [[Syntax, Types and Control Flow]], [[Error Handling]], [[Strings, Bytes, Runes and Unicode]]
 - **Next:** [[Testing in Go]], [[Context Package]]
 - **Compare with:** [[Packages, Modules and Dependency Management]] (module layout vs runtime I/O), [[Hash Tables and Go Maps]] (the `map` used by `ReadConfig`'s result)
+
+### Watch on YouTube
+
+- [Go (golang) Tutorials - Buffered File I/O](https://www.youtube.com/watch?v=9BGfjOMeLEc) · Ambasoft Java · practical walkthrough of buffered file reading/writing

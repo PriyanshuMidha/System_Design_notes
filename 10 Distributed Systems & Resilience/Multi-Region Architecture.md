@@ -16,7 +16,7 @@ sources:
   - "GDPR (Regulation (EU) 2016/679), Chapter V: transfers to third countries"
   - "India Digital Personal Data Protection Act, 2023, Section 16: transfer outside India"
   - "Reserve Bank of India circular on Storage of Payment System Data (April 2018)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Multi-Region Architecture
@@ -31,6 +31,50 @@ updated: 2026-11-04
 > - Most active-active designs avoid write conflicts by giving each user or tenant a **home region** that owns its writes.
 > - Classic mistake: assuming DNS failover is instant. Detection plus TTL plus resolvers that ignore TTL take minutes.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your app runs in a Mumbai data centre region.
+One day the whole region has an outage, and your app is down with it.
+Meanwhile users in Germany complain that every click feels slow, and a law says EU user data must stay in the EU.
+Running in more than one region fixes all three, but now your data lives in several places at once.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Region | A cloud provider's group of data centres in one city area | AWS `ap-south-1` (Mumbai) |
+| Availability Zone (AZ) | One separate data centre inside a region | `ap-south-1a` |
+| Replication | Copying data from one place to another | Mumbai DB copies writes to Singapore |
+| Async vs sync | Copy later (fast, may lose data) vs copy before saying OK (safe, slower) | Async lag of about 1 s |
+| Round-trip time (RTT) | Time for a message to go there and back | Mumbai-Frankfurt about 120 ms |
+| DNS | The internet's name-to-address phone book | `api.shop.com` resolves to an IP |
+| Failover | Moving traffic to another copy when one fails | Users sent to Singapore after Mumbai dies |
+| Data residency | A rule that data must stay in a country | Indian payment data stored only in India |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    UI["Indian users"] --> M["Mumbai region<br/>(home for India)"]
+    UE["EU users"] --> F["Frankfurt region<br/>(home for EU)"]
+    M -- "async copy" --> F
+    F -- "async copy" --> M
+```
+
+**Analogy.** A company with offices in two cities: each customer has one home office holding the master file, and the other keeps a slightly old photocopy.
+Where it breaks: a photocopy is never written to by mistake, but two regions can both accept writes for the same record unless you enforce a home region.
+
+**How the rest of this note builds up**
+
+- First, the three reasons to go multi-region (section 1) and the office mental model with RPO/RTO terms (section 2).
+- Then how it works: routing users, replicating data, DR patterns from backup-restore to active-active (section 3), with a worked Go example (section 4).
+- Then variants, trade-offs and when one region is enough (sections 5-6).
+- Finally the SDE-3 deep dive: failover in practice, conflicts, cells and data-residency law (sections 7-8).
+
+> [!tip] Remember
+> Multi-region is a data problem: decide which region owns each write and how much you lose when a region dies.
+
 ## 1. Why it exists
 
 A billing SaaS runs in one AWS region, `ap-south-1` (Mumbai), spread over three availability zones (AZs: separate data centres within a region). That already survives a single data-centre failure (see [[High Availability and Failover]]). It does not survive:
@@ -43,7 +87,11 @@ Each reason leads to a different design. DR alone can be a cold copy in a second
 
 ## 2. Mental model
 
-Think of a company with offices in Mumbai and Frankfurt. Each customer account has one **home office** that keeps the master file; the other office keeps a photocopy that is a few seconds out of date, good for answering questions but not for changing the account. If the Mumbai office burns down, Frankfurt promotes its photocopies to masters, accepting that the last few seconds of changes might be missing. Moving a customer's home office is a deliberate, planned operation.
+Think of a company with offices in Mumbai and Frankfurt.
+
+Each customer account has one **home office** that keeps the master file; the other office keeps a photocopy that is a few seconds out of date, good for answering questions but not for changing the account.
+
+If the Mumbai office burns down, Frankfurt promotes its photocopies to masters, accepting that the last few seconds of changes might be missing. Moving a customer's home office is a deliberate, planned operation.
 
 Terms used below:
 
@@ -149,13 +197,17 @@ Mumbai primary, Singapore warm standby, Route 53 failover routing, Aurora Global
 | Scale API fleet from 25% to 100% | 3–5 min | Estimate for an autoscaling group; pre-warm to shorten |
 | **RTO** | **roughly 5–8 minutes** | Estimate; drills give the real number |
 
-RPO: replication lag at the moment of failure. Aurora documents typical lag under 1 second. At 2,000 writes per second, 1 s of lag means up to about 2,000 committed writes exist only in Mumbai when it fails (an estimate from those two numbers). Those writes are not destroyed; they are **unreachable** until Mumbai returns, and then they must be reconciled against what Singapore accepted meanwhile.
+RPO: replication lag at the moment of failure. Aurora documents typical lag under 1 second. At 2,000 writes per second, 1 s of lag means up to about 2,000 committed writes exist only in Mumbai when it fails (an estimate from those two numbers).
+
+Those writes are not destroyed; they are **unreachable** until Mumbai returns, and then they must be reconciled against what Singapore accepted meanwhile.
 
 If that loss is unacceptable for some data (payments), that data needs synchronous cross-region commits: every write waits for at least one other region, adding at least one inter-region round trip (≈ 55–65 ms Mumbai–Singapore, an estimate) to its latency.
 
 ### Go: router with health thresholds, failover and fencing
 
-The router sends writes to the tenant's home region, fails over to the paired standby only after a threshold of consecutive failed health checks (and fails back only after the same number of good ones, to avoid flapping), serves stale-tolerant reads from the caller's own region, and hands out an **epoch** per tenant. Each shard rejects writes with an older epoch, so a delayed request routed to the old home cannot overwrite data after ownership moved. It passes `go vet` and `go test -race` on Go 1.24.
+The router sends writes to the tenant's home region, fails over to the paired standby only after a threshold of consecutive failed health checks (and fails back only after the same number of good ones, to avoid flapping), serves stale-tolerant reads from the caller's own region, and hands out an **epoch** per tenant.
+
+Each shard rejects writes with an older epoch, so a delayed request routed to the old home cannot overwrite data after ownership moved. It passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 package region
@@ -484,7 +536,11 @@ Cost and judgement:
 	- Aurora Global Database: one write region, up to several read-only secondary regions, with managed switchover (planned, no data loss) and failover (unplanned, may lose the replication lag).
 	- DynamoDB global tables: in the default multi-Region eventual consistency mode, every replica region accepts writes and conflicts are resolved by last writer wins. DynamoDB itself is leader-based within a region (Multi-Paxos per partition), not Dynamo-style leaderless.
 	- Spanner and CockroachDB: consensus groups span regions, so commits are strongly consistent and cost cross-region round trips; leaders can be placed near the main writers.
-	- **Cell-based architecture:** the system is split into many independent, identical **cells**, each serving a subset of customers with its own stack and data; a thin routing layer maps customers to cells. A bad deploy or a poison request takes down one cell, not everyone. Cells and regions combine: each region holds several cells, and a customer's cell has a partner cell in another region.
+	- **Cell-based architecture:** the system is split into many independent, identical **cells**, each serving a subset of customers with its own stack and data; a thin routing layer maps customers to cells.
+
+	  A bad deploy or a poison request takes down one cell, not everyone.
+
+	  Cells and regions combine: each region holds several cells, and a customer's cell has a partner cell in another region.
 - **Failure modes → fixes:**
 	- Failover by flapping health checks → require several failures in a row and several successes before failing back; make the final promotion a human decision for databases if the RPO cost is high.
 	- Split brain: old primary returns and keeps taking writes → fence with epochs or by revoking its write credentials before promotion.
@@ -503,11 +559,17 @@ Cost and judgement:
 
 ### Why sync replication across regions is slow
 
-A synchronous commit must reach a quorum. With three regions (Mumbai, Singapore, Tokyo), a Mumbai leader needs one other region's acknowledgement: one round trip to the nearest, Singapore, at about 55–65 ms (estimate). Users near Tokyo writing through that leader pay their own round trip to Mumbai plus that. This is the PACELC trade-off in practice (see [[CAP and PACELC]]): even without a partition, you choose between latency and consistency. Designs reduce it by placing leaders near the writers of each row (CockroachDB's regional tables) or by keeping only the data that needs it (money, uniqueness) synchronous.
+A synchronous commit must reach a quorum. With three regions (Mumbai, Singapore, Tokyo), a Mumbai leader needs one other region's acknowledgement: one round trip to the nearest, Singapore, at about 55–65 ms (estimate).
+
+Users near Tokyo writing through that leader pay their own round trip to Mumbai plus that. This is the PACELC trade-off in practice (see [[CAP and PACELC]]): even without a partition, you choose between latency and consistency.
+
+Designs reduce it by placing leaders near the writers of each row (CockroachDB's regional tables) or by keeping only the data that needs it (money, uniqueness) synchronous.
 
 ### Picking a home region
 
-Choose by who writes most: the tenant's billing address, the region where most of its users log in, or the jurisdiction the contract names. Store it in a directory that every region can read, cache it at the edge, and version it with an epoch. Moving a tenant: copy its data to the new region while writes continue, stop writes briefly (seconds), copy the final delta, flip the directory with a new epoch, and resume. The epoch fences any request still in flight to the old home.
+Choose by who writes most: the tenant's billing address, the region where most of its users log in, or the jurisdiction the contract names. Store it in a directory that every region can read, cache it at the edge, and version it with an epoch.
+
+Moving a tenant: copy its data to the new region while writes continue, stop writes briefly (seconds), copy the final delta, flip the directory with a new epoch, and resume. The epoch fences any request still in flight to the old home.
 
 ### Global uniqueness
 
@@ -521,7 +583,9 @@ A username must be unique across all regions. Options: route all signups to one 
 
 ### Caches and sessions across regions
 
-Per-region caches are normal; what matters is invalidation. If the database replicates asynchronously, an invalidation sent at write time can arrive before the replica has the new row, and the cache refills with stale data. Invalidate from the replication stream in each region (after the replica applied the change), or rely on short TTLs. For sessions, signed tokens avoid cross-region lookups; if server-side sessions are needed, replicate them (a CRDT-based store suits this) or accept a re-login after failover.
+Per-region caches are normal; what matters is invalidation. If the database replicates asynchronously, an invalidation sent at write time can arrive before the replica has the new row, and the cache refills with stale data.
+
+Invalidate from the replication stream in each region (after the replica applied the change), or rely on short TTLs. For sessions, signed tokens avoid cross-region lookups; if server-side sessions are needed, replicate them (a CRDT-based store suits this) or accept a re-login after failover.
 
 ## 9. Interview questions
 
@@ -562,3 +626,8 @@ Per-region caches are normal; what matters is invalidation. If the database repl
 - **Before this:** [[High Availability and Failover]], [[Replication]], [[CAP and PACELC]], [[DNS - Resolution, Records and Caching]]
 - **Next:** [[CRDTs and Conflict Resolution]], [[Distributed SQL]], [[Backup, PITR and Disaster Recovery]]
 - **Compare with:** [[High Availability and Failover]] (within one region, across AZs), [[CDN and Edge]] (moving only cacheable content close to users)
+
+### Watch on YouTube
+
+- [AWS re:Invent 2024 - Best practices for creating multi-Region architectures on AWS (ARC323)](https://www.youtube.com/watch?v=CbkqQznZS9Y) · AWS Events · 55 min · 9,968 views
+- [AWS re:Invent 2025 - Building resilient multi-Region applications with Capital One (ARC404)](https://www.youtube.com/watch?v=PnWTWjmbNp0) · AWS Events · 50 min · 2,186 views

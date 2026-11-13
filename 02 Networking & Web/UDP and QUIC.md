@@ -10,7 +10,7 @@ sources:
   - "RFC 9001, Using TLS to Secure QUIC"
   - "RFC 9114, HTTP/3"
   - "Iyengar & Thomson (eds.), QUIC Working Group documents (IETF)"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # UDP and QUIC
@@ -24,18 +24,71 @@ updated: 2026-11-09
 > - Because QUIC's streams are independent, one dropped packet only stalls the one stream it belonged to — not the whole connection, unlike HTTP/2 over TCP.
 > - Classic mistake: assuming QUIC is "unreliable like UDP." QUIC is reliable and ordered per stream; only the *transport it rides on* (UDP) is unreliable.
 
+## Start here: the basics
+
+**The problem in one story.** You ask a friend a one-word question across a noisy room.
+Shaking hands first, then asking, then waiting for "got it" would be silly; you just shout.
+If they don't hear, you shout again. That is UDP.
+But if you are sending a whole book, you want page numbers and "resend page 7", without stopping the other chapters. That is QUIC.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Packet / datagram | One small chunk of data sent on the network by itself | A 40-byte DNS question |
+| Port | A number that picks which program on a machine gets the data | DNS uses port 53 |
+| Handshake | Setup messages exchanged before real data moves | TCP's SYN, SYN-ACK, ACK |
+| Round trip (RTT) | Time for a message to go there and a reply to come back | 50 ms on a phone network |
+| Retransmission | Sending a lost piece of data again | Resending page 7 of the book |
+| Head-of-line blocking | One missing piece makes everything behind it wait | One lost packet stalls all HTTP/2 streams on TCP |
+| Stream | One ordered, reliable flow of bytes inside a connection | The HTML download in a page load |
+| TLS | The encryption layer that makes HTTPS secure | The lock icon in a browser |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App[Application] --> Q["QUIC: streams, retries, TLS encryption"]
+    Q --> U["UDP: just send a datagram"]
+    U --> IP["IP: deliver to an address"]
+    App -. "or use UDP directly (DNS, games)" .-> U
+```
+
+**Analogy.** UDP is a postcard: cheap, fast, no proof it arrived. QUIC is several tracked parcels sharing one courier van, each tracked on its own.
+Where it breaks: a real courier can't keep your parcel's identity when you move house mid-delivery; QUIC's Connection ID can.
+
+**How the rest of this note builds up**
+
+- First, why UDP and QUIC exist (section 1) and a mental model (section 2).
+- Then how UDP works, and how QUIC adds streams, a 1-RTT handshake, 0-RTT and connection migration (section 3).
+- Then a traced example and a comparison table (sections 4-5).
+- Finally trade-offs, production failure modes and the SDE-3 deep dive on packet numbers and loss recovery (sections 6-8).
+
+> [!tip] Remember
+> UDP = send and hope. QUIC = reliable, encrypted, independent streams built on top of UDP.
+
 ## 1. Why it exists
 
-Every guarantee TCP gives costs a round trip or a byte of bookkeeping somewhere. A 3-way handshake has to finish before any data moves. In-order delivery means one lost packet stalls everything behind it, even data the application could otherwise use right away. Congestion control is tuned for a general-purpose byte stream, not for a single small message.
+Every guarantee TCP gives costs a round trip or a byte of bookkeeping somewhere.
+
+- A 3-way handshake has to finish before any data moves.
+- In-order delivery means one lost packet stalls everything behind it, even data the application could otherwise use right away.
+- Congestion control is tuned for a general-purpose byte stream, not for a single small message.
 
 Some applications don't want to pay any of that. Picture two very different jobs:
 
 - A **DNS query** sends one small request and gets one small reply. Paying for a handshake to move 40 bytes would double the cost of every single lookup, for a protocol that runs millions of times a second across the internet.
 - A **live video frame or a game position update** is time-sensitive and loss-tolerant. A frame that arrives late is worse than a frame that never arrives at all — retransmitting a stale packet is actively the wrong behavior, because by the time it lands, a newer frame has already made it obsolete.
 
-Both jobs want to skip TCP's guarantees entirely, or build only the exact piece they need. That's what **UDP** (User Datagram Protocol, RFC 768 — one of the oldest RFCs still in daily use) is for: it is what's left of IP once you add only port numbers and an optional checksum. One datagram, fire and forget, no connection state anywhere. An application that wants reliability on top can build exactly the amount it needs, which is what QUIC does — and what DNS mostly doesn't, since DNS just lives with occasional loss and retries at the resolver level, falling back to TCP only for large or sensitive responses.
+Both jobs want to skip TCP's guarantees entirely, or build only the exact piece they need. That's what **UDP** (User Datagram Protocol, RFC 768 — one of the oldest RFCs still in daily use) is for: it is what's left of IP once you add only port numbers and an optional checksum. One datagram, fire and forget, no connection state anywhere.
 
-**QUIC** (Quick UDP Internet Connections, RFC 9000, standardized 2021, carries HTTP/3 per RFC 9114) exists for a different reason: HTTP/2 exposed a sharp limit of building multiplexing *inside* TCP. With many logical HTTP streams sharing one TCP connection, a single lost IP packet stalls literally all of them until it's retransmitted, because TCP's one ordered byte stream can't deliver stream 2's bytes to the application while it's still waiting on stream 1's missing segment. QUIC moves stream multiplexing below the reliability layer instead of above it, over UDP, so one stream's loss no longer blocks the others.
+An application that wants reliability on top can build exactly the amount it needs, which is what QUIC does — and what DNS mostly doesn't, since DNS just lives with occasional loss and retries at the resolver level, falling back to TCP only for large or sensitive responses.
+
+**QUIC** (Quick UDP Internet Connections, RFC 9000, standardized 2021, carries HTTP/3 per RFC 9114) exists for a different reason: HTTP/2 exposed a sharp limit of building multiplexing *inside* TCP.
+
+With many logical HTTP streams sharing one TCP connection, a single lost IP packet stalls literally all of them until it's retransmitted, because TCP's one ordered byte stream can't deliver stream 2's bytes to the application while it's still waiting on stream 1's missing segment.
+
+QUIC moves stream multiplexing below the reliability layer instead of above it, over UDP, so one stream's loss no longer blocks the others.
 
 ```mermaid
 sequenceDiagram
@@ -65,7 +118,9 @@ UDP is a postcard: you write an address and a message, drop it in the mailbox, a
 
 QUIC is what happens if you decide postcards aren't enough, but instead of switching to TCP's single registered-mail envelope, you put several independent registered-mail threads inside one envelope, each with its own sequence numbers and its own retransmission — so a lost page in thread 2 only reprints thread 2, not the whole letter.
 
-**Where the analogy breaks down:** real registered mail can't change delivery address mid-transit and still be recognized as the same letter. QUIC can: a phone switching from Wi-Fi to cellular keeps the same "envelope identity" (its Connection ID) even though the return address (its IP) changed underneath it. No postal analogy captures that part cleanly — it's closer to a courier recognizing your voice on a new phone number than to anything physical mail can do.
+**Where the analogy breaks down:** real registered mail can't change delivery address mid-transit and still be recognized as the same letter.
+
+QUIC can: a phone switching from Wi-Fi to cellular keeps the same "envelope identity" (its Connection ID) even though the return address (its IP) changed underneath it. No postal analogy captures that part cleanly — it's closer to a courier recognizing your voice on a new phone number than to anything physical mail can do.
 
 ## 3. How it works
 
@@ -152,7 +207,9 @@ sequenceDiagram
     Note over C,S: connection usable for application data after 1 RTT
 ```
 
-**Example:** a fresh QUIC connection reaches a usable, encrypted state in **1 round trip**. TCP + TLS 1.3 needs **2 separate round trips** — one to establish the TCP connection, a second for the TLS handshake — before the first encrypted application byte can move. There is no such thing as unencrypted QUIC in practice; the spec has no cleartext mode for application data.
+**Example:** a fresh QUIC connection reaches a usable, encrypted state in **1 round trip**. TCP + TLS 1.3 needs **2 separate round trips** — one to establish the TCP connection, a second for the TLS handshake — before the first encrypted application byte can move.
+
+There is no such thing as unencrypted QUIC in practice; the spec has no cleartext mode for application data.
 
 **Why it matters:** halving the handshake cost matters most on high-latency links (mobile networks), where one round trip can be 50–150 ms — a cost paid on every cold connection.
 
@@ -176,7 +233,9 @@ sequenceDiagram
     Note over S: server cannot yet tell the replay from the original
 ```
 
-**Example:** a client resuming a session sends a GET request for a product page as 0-RTT data. An on-path attacker who captured that first flight can resend the exact same encrypted packet later, and the server has no way yet to distinguish the resend from the original — so **0-RTT data must be limited to operations that are safe to receive more than once**, like an idempotent GET, never something like a payment submission.
+**Example:** a client resuming a session sends a GET request for a product page as 0-RTT data.
+
+An on-path attacker who captured that first flight can resend the exact same encrypted packet later, and the server has no way yet to distinguish the resend from the original — so **0-RTT data must be limited to operations that are safe to receive more than once**, like an idempotent GET, never something like a payment submission.
 
 **Why it matters:** the speed gain is real, but it comes with a specific, documented security trade-off that the application layer — not QUIC itself — has to respect.
 
@@ -185,7 +244,9 @@ sequenceDiagram
 
 ### Connection migration: surviving a change of address mid-connection
 
-**In plain words:** TCP identifies a connection by its 4-tuple (source IP, source port, destination IP, destination port). Change the IP — say, a phone switching from Wi-Fi to cellular — and the 4-tuple no longer matches any open socket, so the connection dies silently from the OS's point of view. QUIC instead identifies a connection by a **Connection ID** the endpoints chose themselves, completely independent of IP and port.
+**In plain words:** TCP identifies a connection by its 4-tuple (source IP, source port, destination IP, destination port). Change the IP — say, a phone switching from Wi-Fi to cellular — and the 4-tuple no longer matches any open socket, so the connection dies silently from the OS's point of view.
+
+QUIC instead identifies a connection by a **Connection ID** the endpoints chose themselves, completely independent of IP and port.
 
 **Picture it:**
 
@@ -283,7 +344,9 @@ Runnable Go version: [[UDP and QUIC - Go]].
 ## 8. Deep dive
 
 - **Why QUIC can't just be "TCP but faster."** TCP's state machine, congestion control and retransmission all live in kernel code that changes on OS-release timescales. QUIC deliberately lives in userspace specifically so it can evolve as fast as application code ships — a new congestion controller or a bug fix deploys with the next binary release, not the next OS kernel update across billions of devices.
-- **Packet numbers vs TCP sequence numbers.** TCP sequence numbers describe bytes in the stream, so a retransmission reuses the *same* sequence number as the original — which creates the "retransmission ambiguity problem": an ACK for that sequence number can't tell the sender whether it acknowledges the original or the retransmit, which matters for RTT estimation. QUIC gives every packet, including every retransmission, a strictly increasing packet number, so an ACK for packet number N is unambiguous about exactly which transmission attempt it covers — cleaner RTT samples, among other benefits.
+- **Packet numbers vs TCP sequence numbers.** TCP sequence numbers describe bytes in the stream, so a retransmission reuses the *same* sequence number as the original — which creates the "retransmission ambiguity problem": an ACK for that sequence number can't tell the sender whether it acknowledges the original or the retransmit, which matters for RTT estimation.
+
+  QUIC gives every packet, including every retransmission, a strictly increasing packet number, so an ACK for packet number N is unambiguous about exactly which transmission attempt it covers — cleaner RTT samples, among other benefits.
 
   ```mermaid
   flowchart LR
@@ -302,7 +365,9 @@ Runnable Go version: [[UDP and QUIC - Go]].
   **Why it matters:** this ambiguity is the reason TCP's RTT estimation has historically needed extra heuristics (Karn's algorithm) to avoid being fooled by a retransmitted segment's ACK; QUIC's design removes the ambiguity at the packet-numbering level instead of patching around it.
 - **Loss recovery and congestion control** are reimplemented inside QUIC itself (not reused from the OS's TCP stack) using these packet-number-based ACKs and a pluggable congestion controller — most implementations ship a CUBIC- or BBR-like algorithm, same ideas as [[TCP - Handshake, Reliability, Flow and Congestion Control]], just running in userspace per connection instead of in the kernel per socket.
 - **Multipath potential.** Because a QUIC connection is identified by a Connection ID rather than a 4-tuple, and path validation is already part of the spec for migration, QUIC is a more natural base than TCP for using multiple network paths (Wi-Fi and cellular at once) simultaneously, not just migrating between them — an active area of extension work, not yet universal.
-- **Why DNS mostly stays on UDP instead of moving to QUIC.** DNS-over-QUIC (DoQ, RFC 9250) exists and gives DNS privacy plus QUIC's fast resumption, but plain UDP DNS remains dominant because a typical query/response round trip is already one datagram each way — there's very little head-of-line blocking to fix when there's only one "stream" per query to begin with. QUIC earns its keep most clearly when many logical exchanges share one connection, which is HTTP's situation, not a single DNS lookup's.
+- **Why DNS mostly stays on UDP instead of moving to QUIC.** DNS-over-QUIC (DoQ, RFC 9250) exists and gives DNS privacy plus QUIC's fast resumption, but plain UDP DNS remains dominant because a typical query/response round trip is already one datagram each way — there's very little head-of-line blocking to fix when there's only one "stream" per query to begin with.
+
+  QUIC earns its keep most clearly when many logical exchanges share one connection, which is HTTP's situation, not a single DNS lookup's.
 
 ## 9. Interview questions
 
@@ -344,3 +409,8 @@ Runnable Go version: [[UDP and QUIC - Go]].
 - **Next:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Compare with:** [[TLS and HTTPS]] (the handshake QUIC embeds), [[DNS - Resolution, Records and Caching]] (the best-known UDP-first protocol)
 - **Code:** [[UDP and QUIC - Go]]
+
+### Watch on YouTube
+
+- [Learn in 5 Minutes: HTTP/3 (QUIC)](https://www.youtube.com/watch?v=aJZeI8w5kAs) · SoftwareEngenius · short visual intro to QUIC/HTTP-3 basics
+- [HOW QUIC WORKS - Intro to the QUIC Transport Protocol](https://www.youtube.com/watch?v=HnDsMehSSY4) · Chris Greer · deeper look at QUIC's per-stream reliability and independence from TCP's head-of-line blocking

@@ -13,7 +13,7 @@ sources:
   - "Bronson et al., TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC 2013): association counts kept next to the edge lists"
   - "Shapiro, Preguica, Baquero, Zawirski, Conflict-free Replicated Data Types (2011): G-Counter and PN-Counter"
   - "Kleppmann, Designing Data-Intensive Applications, chapters on partitioning, stream processing and exactly-once effects"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Case Study - Distributed Counter (Likes and Views)
@@ -28,9 +28,59 @@ updated: 2026-11-09
 > - "Exactly once" is built from at-least-once delivery plus an idempotent write, such as saving the counter delta and the Kafka offset in the same transaction.
 > - Users do not need the exact current number. They need their own like to show up instantly and the total to look sane and never go backwards.
 
+## Start here: the basics
+
+**The problem in one story.**
+A celebrity posts a photo.
+In one second, 50,000 people tap the heart.
+If all of them try to change the same number in the same database row, they wait in line and the app slows down.
+A distributed counter lets many places count at once and adds them up later.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Counter | A number that only goes up or down by small steps | Likes on post 7 = 1,204 |
+| Row lock | The database letting only one writer change a row at a time | Two `UPDATE likes+1` wait for each other |
+| Hot key | One item getting far more traffic than others | A viral post |
+| Shard | One of several pieces a value is split into | Likes stored as 8 sub-counters |
+| Event / delta | A small message saying what changed | `{post:7, +1}` |
+| Idempotent | Doing it twice has the same effect as once | Retrying a like does not count it twice |
+| Eventual consistency | All copies agree after a short delay | Count shows 1,200 now, 1,204 a second later |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Many users tap like"] --> Q["Event log<br/>(Kafka)"]
+    Q --> A["Aggregator sums<br/>deltas per post"]
+    A --> S[("Counter store")]
+    S --> Ca["Cache"]
+    Ca --> V["Viewers read count"]
+```
+
+**Analogy.** Like ticket booths at a stadium: each booth tallies its own clipboard, and someone adds them up for the scoreboard every few seconds.
+Where it breaks: real booths never double-count a fan, but network retries can, so the system needs dedup (idempotency) to stay honest.
+
+**How the rest of this note builds up**
+
+- First, why `likes = likes + 1` fails at scale (section 1) and the scoreboard mental model (section 2).
+- Then the high-level design: event log, aggregation, sharded counters and caching (section 3), with estimates and data model (section 4).
+- Then variants and trade-offs: exact vs approximate counts (sections 5-6).
+- Finally the SDE-3 deep dive: production systems, hot partitions, dedup and multi-region CRDT counters (sections 7-8).
+
+> [!tip] Remember
+> Count in many places, add up later; never make everyone fight over one row.
+
 ## 1. Why it exists - requirements
 
-Open any social app. Under each post you see a heart with a number, and a view count. It looks trivial, so teams build it as `UPDATE posts SET likes = likes + 1 WHERE id = ?`. That works at ten likes per second. It breaks on the day a celebrity posts and 50,000 people tap the heart in one second: every update fights for the same row lock, the database queues them, latency climbs, and the whole feed slows down because every post card reads from the same table.
+Open any social app. Under each post you see a heart with a number, and a view count. It looks trivial, so teams build it as `UPDATE posts SET likes = likes + 1 WHERE id = ?`. That works at ten likes per second.
+
+It breaks on the day a celebrity posts and 50,000 people tap the heart in one second:
+
+- every update fights for the same row lock,
+- the database queues them and latency climbs,
+- and the whole feed slows down because every post card reads from the same table.
 
 > [!tip] Remember
 > A counter is easy until one key is hot. All the design is about making one hot number cheap to write and cheap to read.
@@ -73,7 +123,9 @@ flowchart TB
 
 ## 2. Mental model
 
-Think of a **stadium scoreboard with ticket booths**. Every fan who enters buys a ticket at one of many booths. Each booth keeps its own tally on a clipboard. Nobody asks a single clerk to write on one shared sheet, because 50,000 people would queue. The scoreboard operator walks round every few seconds, adds up the clipboards and updates the big display. The display is slightly behind, but nobody minds, and the total is always the sum of real tallies.
+Think of a **stadium scoreboard with ticket booths**. Every fan who enters buys a ticket at one of many booths. Each booth keeps its own tally on a clipboard. Nobody asks a single clerk to write on one shared sheet, because 50,000 people would queue.
+
+The scoreboard operator walks round every few seconds, adds up the clipboards and updates the big display. The display is slightly behind, but nobody minds, and the total is always the sum of real tallies.
 
 Where the analogy breaks: real clipboards never lose paper, but servers crash. So each booth also writes a durable ticket stub (the like event) that lets us recount from scratch.
 
@@ -309,7 +361,13 @@ flowchart TD
 | HyperLogLog | Hash, bucket by prefix, keep max leading zeros | Unique viewers | About 0.81% error; cannot remove an item; cannot list members |
 | Count-Min Sketch | Grid of counters, min of rows | Frequencies for millions of keys | Over-counts; not for a single known post |
 
-Real systems. Facebook's TAO paper (2013) describes keeping an **association count** next to each edge list, such as likes on an object, so a count read does not scan the list. Google documents the Firestore **distributed counter** pattern as the official answer to its per-document write limit. AWS documents **write sharding** for DynamoDB hot partition keys. These are public, documented patterns, not guesses about private designs.
+Real systems:
+
+- Facebook's TAO paper (2013) describes keeping an **association count** next to each edge list, such as likes on an object, so a count read does not scan the list.
+- Google documents the Firestore **distributed counter** pattern as the official answer to its per-document write limit.
+- AWS documents **write sharding** for DynamoDB hot partition keys.
+
+These are public, documented patterns, not guesses about private designs.
 
 See [[Choosing a Database - Decision Guide]] for where to keep the likes fact, [[Choosing a Caching Strategy - Decision Guide]] for the count cache, [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]] for the event pipe, and [[Choosing Consistency, Replication and Partitioning - Decision Guide]] for the convergence promise.
 
@@ -414,7 +472,9 @@ stateDiagram-v2
 
 **Why it matters.** Sharding turns one impossible hot spot into many ordinary ones, at a price you pay only for the posts that need it.
 
-The same hot-partition problem exists at the Kafka layer: keying by `post_id` sends all of a viral post's events to one partition. Fix with a **salted key** `post_id + (event_id mod 8)` for posts flagged hot, so deltas for one post spread over 8 partitions; aggregators still sum per post because addition is commutative. See [[Message Ordering and Partition Keys]] (ordering is not needed for sums).
+The same hot-partition problem exists at the Kafka layer: keying by `post_id` sends all of a viral post's events to one partition.
+
+Fix with a **salted key** `post_id + (event_id mod 8)` for posts flagged hot, so deltas for one post spread over 8 partitions; aggregators still sum per post because addition is commutative. See [[Message Ordering and Partition Keys]] (ordering is not needed for sums).
 
 ### 8.2 Exactly-once effect: delta and offset in one transaction
 
@@ -521,7 +581,13 @@ flowchart TD
 
 ### 8.5 Multi-region and CRDT counters
 
-If users in the US and EU both like the same post and each region writes locally, the regions need a merge rule that needs no coordination. A **PN-Counter** (see [[CRDTs and Conflict Resolution]]) gives each region two numbers, `P` (likes added) and `N` (likes removed). The total is `sum(P) - sum(N)`. Merging two copies takes the larger value per region per field. Because every replica only ever increases its own entries, replays and out-of-order merges are harmless.
+If users in the US and EU both like the same post and each region writes locally, the regions need a merge rule that needs no coordination. A **PN-Counter** (see [[CRDTs and Conflict Resolution]]) works like this:
+
+- Each region keeps two numbers, `P` (likes added) and `N` (likes removed).
+- The total is `sum(P) - sum(N)`.
+- Merging two copies takes the larger value per region per field.
+
+Because every replica only ever increases its own entries, replays and out-of-order merges are harmless.
 
 Where it fits: a global product with active-active regions. Where it does not: single-region systems (extra complexity), or counters with limits such as "only 100 seats" (a CRDT cannot enforce a cap without coordination).
 
@@ -593,3 +659,8 @@ A 45-minute script:
 - **Building blocks:** [[Bloom Filters and Probabilistic Data Structures]], [[Stream Processing Basics]], [[Kafka and Event Streaming]], [[Message Ordering and Partition Keys]], [[Idempotency and Idempotency Keys]], [[Partitioning and Sharding]], [[CRDTs and Conflict Resolution]], [[Wide-Column Stores and Cassandra]]
 - **Decision guides:** [[Choosing a Database - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Consistency, Replication and Partitioning - Decision Guide]]
 - **Compare with:** [[Case Study - Leaderboard and Top-K]], [[Case Study - News Feed]], [[Case Study - Payment System]]
+
+### Watch on YouTube
+
+- [Twitter Likes Count Design / Youtube Views Count Design / Near Realtime Counter System Design](https://www.youtube.com/watch?v=0V-Ns9vovzE) · Think Software · 16 min · 27,847 views
+- [How Facebook & YouTube Handle BILLIONS of Likes & Views!](https://www.youtube.com/watch?v=LGOnP9Udffo) · ByteMonk · 8 min · 138,418 views

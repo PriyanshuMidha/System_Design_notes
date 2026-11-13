@@ -10,7 +10,7 @@ sources:
   - "RFC 4291, IP Version 6 Addressing Architecture"
   - "RFC 3021, Using 31-Bit Prefixes on IPv4 Point-to-Point Links"
   - "AWS VPC User Guide, Subnets and Route Tables"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # IP Addressing, Subnets, NAT and VPC Basics
@@ -25,6 +25,49 @@ updated: 2026-11-09
 > - NAT/PAT lets a whole private network share one public IP by rewriting (and tracking) the port numbers of outbound connections.
 > - A VPC "public subnet" is just a subnet whose route table sends `0.0.0.0/0` to an internet gateway; a "private subnet" sends it to a NAT gateway instead, or nowhere.
 > - This note builds directly on [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] and goes into AWS-specific subnet reservation details, which is why it is tagged intermediate rather than basic.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your home has a laptop, two phones and a TV, but your internet provider gives you just one public address.
+Each device still needs its own address so replies come back to the right one.
+At work, a cloud team must carve one big address range into pieces for web servers and databases.
+This note explains how addresses are numbered, split up, and shared.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| IP address | A number that names one device on a network | `10.0.1.17` |
+| Bit | One binary digit, 0 or 1; an IPv4 address is 32 of them | `/24` = first 24 bits fixed |
+| Network vs host part | The shared "street" part and the per-device "house" part of an address | `10.0.1` + `.17` |
+| Port | A number naming one program/connection on a device | `443` for HTTPS |
+| Router | A box that forwards packets toward their destination | Your home Wi-Fi router |
+| Public vs private address | Reachable from the internet vs only inside your network | `8.8.8.8` vs `192.168.1.5` |
+| Route table | A list of "traffic for this range goes there" rules | `0.0.0.0/0 -> internet gateway` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    L["Laptop<br/>192.168.1.5"] --> R["Home router<br/>(NAT)"]
+    P["Phone<br/>192.168.1.6"] --> R
+    R -- "one public IP<br/>203.0.113.7" --> I["Internet"]
+    I --> S["Website"]
+```
+
+**Analogy.** An address block is like a street: everyone shares the street name (network part) and each house has its own number (host part). NAT is the building front desk that forwards mail to the right flat.
+Where it breaks: a real street cannot be resized, but a CIDR block can be split into smaller blocks just by changing the prefix number.
+
+**How the rest of this note builds up**
+
+- First, why addressing and NAT exist (section 1) and a mental model (section 2).
+- Then CIDR math, IPv4 vs IPv6, private ranges, NAT/PAT and AWS VPC subnets (section 3).
+- Then a worked subnetting example and comparisons (sections 4-5).
+- Finally the SDE-3 deep dive on PAT port limits, longest prefix match and dual-stack (sections 6-8).
+
+> [!tip] Remember
+> `/N` fixes the first N bits; NAT lets many private devices share one public IP.
 
 ## 1. Why it exists
 
@@ -64,9 +107,13 @@ flowchart LR
 - The prefix (`/24` = first 24 bits = `10.0.1`) is the "neighborhood" — everything inside it shares that prefix.
 - The remaining bits (the last 8, here) number the "houses" (hosts) inside the neighborhood: 256 possible numbers, two of which are reserved (the neighborhood's own address, and its "broadcast to everyone" address), leaving 254 usable houses.
 
-Where the analogy helps: just like a neighborhood has a fixed boundary everyone inside it shares, a `/24` block has a fixed 24-bit prefix every host inside it shares — only the last 8 bits vary per device.
+Where the analogy helps: just like a neighborhood has a fixed boundary everyone inside it shares, a `/24` block has a fixed 24-bit prefix every host inside it shares.
 
-**Analogy — NAT as an office building's front desk.** NAT is like an office building with one public street address but many internal apartment numbers: mail addressed to the building's front desk (the public IP) gets routed to the right apartment (an internal private IP) because the building keeps a log of who's expecting a delivery — the NAT translation table, keyed by port.
+Only the last 8 bits vary per device.
+
+**Analogy — NAT as an office building's front desk.** NAT is like an office building with one public street address but many internal apartment numbers.
+
+Mail addressed to the building's front desk (the public IP) gets routed to the right apartment (an internal private IP) because the building keeps a log of who's expecting a delivery — the NAT translation table, keyed by port.
 
 Where this analogy breaks down: a front desk forwards *existing* expected mail; NAT also handles brand-new *outbound* mail from any apartment, assigning it a tracking number (a port) on the fly so the reply knows where to come back to — more like a building that also hands out its own temporary return-address stickers for outgoing letters.
 
@@ -137,7 +184,9 @@ The first 24 bits (three full bytes: `10`, `0`, `1`) are the fixed network prefi
 | Private-range equivalent | RFC 1918 (`10.0.0.0/8`, etc.) | Unique local addresses (`fc00::/7`), same motivation |
 | Written as | Four dotted decimal bytes | Eight colon-separated hex groups |
 
-**Why it matters:** dual-stack hosts (common today) hold both an IPv4 and an IPv6 address and prefer IPv6 when both the client and server support it (`AAAA` records; see [[DNS - Resolution, Records and Caching]]). IPv6's abundance removes the *scarcity* that made NAT a practical necessity for IPv4 — but private ranges still exist in IPv6 for the same organizational reasons RFC 1918 exists in IPv4.
+**Why it matters:** dual-stack hosts (common today) hold both an IPv4 and an IPv6 address and prefer IPv6 when both the client and server support it (`AAAA` records; see [[DNS - Resolution, Records and Caching]]).
+
+IPv6's abundance removes the *scarcity* that made NAT a practical necessity for IPv4 — but private ranges still exist in IPv6 for the same organizational reasons RFC 1918 exists in IPv4.
 
 ### Private IPv4 ranges (RFC 1918)
 
@@ -191,7 +240,9 @@ sequenceDiagram
 
 ### AWS VPC: subnets, route tables, NAT gateway
 
-**In plain words:** a **VPC** (Virtual Private Cloud) is a customer's own private IPv4/IPv6 address space inside AWS, sliced into **subnets**, each pinned to one Availability Zone. Each subnet has a **route table** that decides where traffic for each destination prefix goes. The public/private distinction is entirely about that route table — there is no separate "public subnet" resource type in AWS.
+**In plain words:** a **VPC** (Virtual Private Cloud) is a customer's own private IPv4/IPv6 address space inside AWS, sliced into **subnets**, each pinned to one Availability Zone.
+
+Each subnet has a **route table** that decides where traffic for each destination prefix goes. The public/private distinction is entirely about that route table — there is no separate "public subnet" resource type in AWS.
 
 - A **public subnet**'s route table sends `0.0.0.0/0` (everything not matched more specifically) to an **internet gateway (IGW)** — and its instances need a public or Elastic IP to actually be reachable.
 - A **private subnet**'s route table sends `0.0.0.0/0` to a **NAT gateway** sitting in a public subnet — instances here have only private IPs, can still reach the internet outbound (to pull packages, call external APIs), but nothing from the internet can initiate a connection to them.
@@ -304,9 +355,15 @@ Runnable Go version, including the full subnet-splitting function, the AWS reser
 
 ## 8. Deep dive
 
-- **Why PAT's limit is ~64K, not unlimited:** the NAT table's key on the public side is (public IP, public port), and TCP/UDP ports are 16 bits, so one public IP can track at most 65,536 simultaneous outbound connections to *distinct* destinations before it must reuse a port — in practice routers reserve some ports and track per-destination, so real limits are often tighter. Large-scale CGNAT deployments solve this by giving each subscriber a *range* of ports on a shared public IP rather than the whole 64K.
-- **CIDR vs classful addressing:** before 1993 (RFC 1519), IPv4 only had fixed-size Class A (`/8`), B (`/16`) and C (`/24`) allocations — if your company needed 300 addresses, you got a wasteful `/16` (65,536) because nothing in between existed. CIDR let allocators hand out exactly `/23` (510 usable) instead, which is also why routing tables shrank: CIDR enabled **route aggregation**, where an ISP advertises one summarized prefix for many customer blocks instead of one route per customer.
-- **VPC route table precedence:** AWS route tables use **longest prefix match**, same as internet routers — a route for `10.0.1.0/24` wins over a route for `10.0.0.0/16` for a destination inside the smaller block, regardless of the order the routes were added. This is how a VPC can route most traffic to a NAT gateway (`0.0.0.0/0`) while sending traffic to a specific peered VPC's CIDR (`10.1.0.0/16`) directly across the peering connection instead.
+- **Why PAT's limit is ~64K, not unlimited:** the NAT table's key on the public side is (public IP, public port), and TCP/UDP ports are 16 bits, so one public IP can track at most 65,536 simultaneous outbound connections to *distinct* destinations before it must reuse a port.
+
+  In practice routers reserve some ports and track per-destination, so real limits are often tighter. Large-scale CGNAT deployments solve this by giving each subscriber a *range* of ports on a shared public IP rather than the whole 64K.
+- **CIDR vs classful addressing:** before 1993 (RFC 1519), IPv4 only had fixed-size Class A (`/8`), B (`/16`) and C (`/24`) allocations — if your company needed 300 addresses, you got a wasteful `/16` (65,536) because nothing in between existed.
+
+  CIDR let allocators hand out exactly `/23` (510 usable) instead, which is also why routing tables shrank: CIDR enabled **route aggregation**, where an ISP advertises one summarized prefix for many customer blocks instead of one route per customer.
+- **VPC route table precedence:** AWS route tables use **longest prefix match**, same as internet routers — a route for `10.0.1.0/24` wins over a route for `10.0.0.0/16` for a destination inside the smaller block, regardless of the order the routes were added.
+
+  This is how a VPC can route most traffic to a NAT gateway (`0.0.0.0/0`) while sending traffic to a specific peered VPC's CIDR (`10.1.0.0/16`) directly across the peering connection instead.
 - **Dual-stack and 6to4 transition realities:** most cloud providers now default new VPCs to dual-stack (IPv4 + IPv6) capable, but a huge share of enterprise internal tooling still assumes IPv4-only, so NAT and RFC 1918 planning remain a day-one decision even in 2026, not a legacy relic.
 - **The "isolated subnet" tier most tutorials skip:** databases and internal caches often sit in a subnet with *no* default route at all (not even to a NAT gateway), reachable only from the app-tier security group — an extra layer beyond "public vs private" that materially reduces blast radius if an app server is compromised.
 
@@ -350,3 +407,9 @@ Runnable Go version, including the full subnet-splitting function, the AWS reser
 - **Next:** [[DNS - Resolution, Records and Caching]], [[TCP - Handshake, Reliability, Flow and Congestion Control]]
 - **Compare with:** [[Load Balancing]] (what sits in front of instances across these subnets), [[Forward and Reverse Proxies - L4 vs L7]]
 - **Runnable code:** [[IP Addressing, Subnets, NAT and VPC Basics - Go]]
+
+### Watch on YouTube
+
+- [Subnetting Made Easy: CIDR and VLSM Explained for Beginners!](https://www.youtube.com/watch?v=VTp_Jb8baag) · CodeLucky · beginner-friendly CIDR/subnetting math walkthrough
+- [AWS VPC Explained: How to Design Secure Cloud Networks in 2026](https://www.youtube.com/watch?v=zHarvgAdHe0) · LearnITGuide Tutorials · covers VPC subnets, routing and NAT gateway design end-to-end
+- [AWS VPC NAT Gateway In-depth intuition](https://www.youtube.com/watch?v=2OrZd4p6EfI) · Knowledge Amplifier · deep dive specifically on how NAT/PAT works for a private subnet

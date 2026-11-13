@@ -9,7 +9,7 @@ sources:
   - "Docker docs, Build cache mounts (`--mount=type=cache`)"
   - "Google, distroless images (gcr.io/distroless)"
   - "Go docs, `os/signal.NotifyContext`"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Docker 04 - Writing a Production Dockerfile for Go
@@ -24,9 +24,57 @@ updated: 2026-11-07
 > - The container's PID 1 must forward `SIGTERM` to the app, or `docker stop` always takes the full 10-second grace period and then kills it.
 > - Classic mistake: treating `EXPOSE` as if it opens a port. It is documentation; `-p` on `docker run` is what publishes a port (see [[Docker 05 - Networking and Port Publishing]]).
 
+## Start here: the basics
+
+**The problem in one story.**
+Your first Go Dockerfile works, but the image is 900 MB.
+It contains the whole Go compiler, your source code, and runs as root.
+Every deploy is slow, and a security scanner flags dozens of issues.
+A production Dockerfile builds in one stage and ships only the tiny binary in another.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Dockerfile | A recipe of steps that builds an image | `FROM`, `COPY`, `RUN` lines |
+| Instruction | One step in the Dockerfile | `RUN go build ./...` |
+| Build cache | Reused results of steps whose inputs did not change | `go mod download` skipped on rebuild |
+| Multi-stage build | Using one image to build and a smaller one to run | `builder` stage → `distroless` stage |
+| Static binary | A program needing no shared libraries at runtime | `CGO_ENABLED=0 go build` |
+| Base image | The starting image for a stage | `gcr.io/distroless/static` |
+| PID 1 | The first process in a container; it receives signals | Your Go binary when using exec form |
+| Root user | The all-powerful user; risky to run apps as | Prefer `USER nonroot` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Source code"] --> B["Stage 1: builder<br/>(golang image)"]
+    B --> BIN["Static binary"]
+    BIN --> R["Stage 2: runtime<br/>(distroless, non-root)"]
+    R --> IMG["Small final image"]
+```
+
+**Analogy.** A bakery kitchen vs the shop counter: you bake with ovens and flour in the back, but only the finished bread goes on the counter.
+Where it breaks: bread does not need updates; your image still needs CA certificates, timezone data and a rebuild whenever the base image gets a security fix.
+
+**How the rest of this note builds up**
+
+- First, why a production Dockerfile differs from a quick one, and the mental model (sections 1-2).
+- Then the instruction reference, layer caching order, and exec vs shell form with PID 1 (section 3).
+- Then a full production Dockerfile, line by line (section 4).
+- Finally the SDE-3 material: variants, trade-offs, production concerns and the deep dive.
+
+> [!tip] Remember
+> Build in a fat stage, ship only the static binary in a tiny, non-root stage.
+
 ## 1. Why it exists
 
-The old note `how to dockerize` shipped a single-stage Node Dockerfile that copies the whole repo, runs `npm install`, and starts the app in the same image used to build it. Carried over to Go verbatim, that pattern produces a 900 MB+ image containing the Go toolchain, module cache, test files, and `.git`, none of which the running service needs. It also runs as root, has no health check, and rebuilds the dependency layer on every source-code change because `COPY . .` comes before `go mod download`.
+The old note `how to dockerize` shipped a single-stage Node Dockerfile that copies the whole repo, runs `npm install`, and starts the app in the same image used to build it.
+
+Carried over to Go verbatim, that pattern produces a 900 MB+ image containing the Go toolchain, module cache, test files, and `.git`, none of which the running service needs.
+
+It also runs as root, has no health check, and rebuilds the dependency layer on every source-code change because `COPY . .` comes before `go mod download`.
 
 A production Dockerfile fixes four separate problems at once:
 
@@ -37,7 +85,9 @@ A production Dockerfile fixes four separate problems at once:
 
 ## 2. Mental model
 
-Think of the Dockerfile as two separate kitchens. The first kitchen (`builder` stage) has every tool: compilers, caches, source code, test files. It cooks the dish (the binary) and nothing from that kitchen leaves except the finished plate. The second kitchen (the runtime stage) only has a plate warmer: `FROM distroless/static`, `COPY --from=builder /app/server /server`. Nobody in the second kitchen can even see a knife, because there is no shell and no package manager in it to attack.
+Think of the Dockerfile as two separate kitchens. The first kitchen (`builder` stage) has every tool: compilers, caches, source code, test files. It cooks the dish (the binary) and nothing from that kitchen leaves except the finished plate.
+
+The second kitchen (the runtime stage) only has a plate warmer: `FROM distroless/static`, `COPY --from=builder /app/server /server`. Nobody in the second kitchen can even see a knife, because there is no shell and no package manager in it to attack.
 
 ## 3. How it works
 
@@ -72,7 +122,9 @@ flowchart TD
     style D fill:#fde68a,stroke:#b45309,color:#000
 ```
 
-Docker invalidates a layer, and every layer after it, the moment any input to that layer changes. Putting `go.mod`/`go.sum` first means a source-only change re-runs only `COPY . .` and `go build`; the module-download layer (the slow network step) is reused from cache. Get the order backwards — `COPY . .` before `go mod download` — and *any* source change re-downloads every module.
+Docker invalidates a layer, and every layer after it, the moment any input to that layer changes. Putting `go.mod`/`go.sum` first means a source-only change re-runs only `COPY . .` and `go build`; the module-download layer (the slow network step) is reused from cache.
+
+Get the order backwards — `COPY . .` before `go mod download` — and *any* source change re-downloads every module.
 
 ### Exec form vs shell form, and PID 1
 
@@ -94,7 +146,11 @@ sequenceDiagram
     App-->>Docker: exits 0 once in-flight requests finish
 ```
 
-Exec-form `CMD`/`ENTRYPOINT` (`["/server"]`) makes the binary itself PID 1, so it receives `SIGTERM` directly. Shell-form (`CMD /server` or `CMD ["sh", "-c", "/server"]`) makes `/bin/sh` PID 1; POSIX shells do not forward signals to child processes by default, so the app only dies when the grace period expires and Docker sends `SIGKILL` — too late for a graceful drain. If a process genuinely needs PID 1 responsibilities it doesn't implement (reaping zombie children, signal forwarding to a process group), add `--init` on `docker run` (or `init: true` in Compose), which injects `tini` as PID 1 ahead of the app.
+Exec-form `CMD`/`ENTRYPOINT` (`["/server"]`) makes the binary itself PID 1, so it receives `SIGTERM` directly.
+
+Shell-form (`CMD /server` or `CMD ["sh", "-c", "/server"]`) makes `/bin/sh` PID 1; POSIX shells do not forward signals to child processes by default, so the app only dies when the grace period expires and Docker sends `SIGKILL` — too late for a graceful drain.
+
+If a process genuinely needs PID 1 responsibilities it doesn't implement (reaping zombie children, signal forwarding to a process group), add `--init` on `docker run` (or `init: true` in Compose), which injects `tini` as PID 1 ahead of the app.
 
 ## 4. Worked example
 
@@ -403,3 +459,8 @@ func TestRunShutsDownQuicklyWithNoInFlightRequests(t *testing.T) {
 - **Before this:** [[Docker 01 - Why Containers]], [[Docker 02 - Images, Layers and Containers]], [[Docker 03 - CLI Essentials]]
 - **Next:** [[Docker 05 - Networking and Port Publishing]], [[Docker 06 - Volumes and Bind Mounts]]
 - **Compare with:** [[Containerizing Go Services]] (Go-specific packaging and runtime tuning on top of this Dockerfile), [[Docker 09 - Container Security and Hardening]] (non-root, scanning, SBOM, signing on top of this image)
+
+### Watch on YouTube
+
+- [Dockerfile Tutorial - Docker in Practice // Docker Tutorial 10](https://www.youtube.com/watch?v=WmcdMiyqfZs) · TechWorld with Nana · 24 min · 278,884 views
+- [My Production Dockerfile Rules: How I Build Docker Images](https://www.youtube.com/watch?v=ueTe-VQaD7c) · DevOps & AI Toolkit · 17 min · 19,568 views

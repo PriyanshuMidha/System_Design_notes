@@ -9,13 +9,17 @@ sources:
   - "Redis Stack / RedisBloom documentation (built into Redis Open Source from Redis 8): TOPK (HeavyKeeper) and CMS commands"
   - "Cormode and Muthukrishnan, An Improved Data Stream Summary: The Count-Min Sketch and its Applications (Journal of Algorithms, 2005)"
   - "IEEE 754 binary64: integers are exact up to 2^53"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Leaderboard and Top-K
 
 > [!summary] TL;DR
-> A **leaderboard** ranks players by score and answers "who is in the top 100?" and "what is my rank?" in real time. **Top-K** (heavy hitters) finds the K most frequent items in a huge stream, such as the 100 most played songs in the last hour. Exact leaderboards use a sorted set (Redis ZSET); stream top-K uses a small sketch plus a heap because counting every item exactly would not fit in memory.
+> A **leaderboard** ranks players by score and answers "who is in the top 100?" and "what is my rank?" in real time.
+>
+> **Top-K** (heavy hitters) finds the K most frequent items in a huge stream, such as the 100 most played songs in the last hour.
+>
+> Exact leaderboards use a sorted set (Redis ZSET); stream top-K uses a small sketch plus a heap because counting every item exactly would not fit in memory.
 
 > [!abstract] Core idea
 > - A Redis sorted set keeps members ordered by score; adding, updating and finding a rank each cost `O(log N)`.
@@ -23,6 +27,50 @@ updated: 2026-11-04
 > - One sorted set holds tens of millions of players on one node; beyond that, shard and combine per-shard answers.
 > - For streams with millions of distinct keys, a **Count-Min Sketch** (a small table of counters that never undercounts) plus a **min-heap of size K** finds the heavy hitters in fixed memory.
 > - Time windows (daily, weekly, last hour) are separate keys or tumbling windows that are merged, never one ever-growing counter.
+
+## Start here: the basics
+
+**The problem in one story.**
+A mobile game has 10 million players, and scores change every second.
+Every player wants to see the top 100 and "you are rank 48,213".
+Sorting all players on every request is far too slow.
+A music app has a similar job: "top 100 songs in the last hour" from billions of plays.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Rank | Your position when everyone is sorted by score | Rank 1 = highest score |
+| Sorted set (ZSET) | Redis structure that keeps members ordered by score | `ZADD board 900 alice` |
+| `O(log N)` | Cost grows very slowly as data grows | 10M players = about 23 steps |
+| Heap | A structure that always knows its smallest (or largest) item | Min-heap of the top 100 |
+| Stream | Events arriving nonstop | "song played" events |
+| Sketch | A small, approximate summary of a huge stream | Count-Min Sketch |
+| Shard | One slice of the data on one machine | Players A-M on node 1 |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    E["Score update"] --> Z["Sorted set<br/>(ordered by score)"]
+    Z --> T["Top 100<br/>read the top"]
+    Z --> R["My rank<br/>count above me"]
+    P["Play events stream"] --> CMS["Count-Min Sketch<br/>(approx counts)"]
+    CMS --> H["Min-heap of K<br/>= Top-K songs"]
+```
+
+**Analogy.** A sports table on a stadium screen: when a team scores, it moves up a few places, and nobody re-sorts the whole league by hand.
+Where it breaks: a league has 20 teams, a game may have millions of players, so the table must be a smart data structure and sometimes split across machines.
+
+**How the rest of this note builds up**
+
+- First, requirements (section 1) and the mental model of a sorted set (section 2).
+- Then the high-level design (section 3) and estimates, API, data model and Go code for packed scores and stream top-K (section 4).
+- Then variants and trade-offs (sections 5-6) and production lessons (section 7).
+- Finally the SDE-3 deep dive (section 8) and interview questions (section 9).
+
+> [!tip] Remember
+> Exact ranks come from a sorted set; huge streams use a small sketch plus a heap of size K.
 
 ## 1. Why it exists - requirements
 
@@ -32,7 +80,9 @@ A game has 25 million players. After each match it must show the player's new gl
 SELECT count(*) + 1 AS rank FROM scores WHERE points > (SELECT points FROM scores WHERE player_id = $1);
 ```
 
-On 25 million rows, even with an index on `points`, counting every player above a mid-table score reads millions of index entries, and it runs after every match. Rank is a **global order statistic**: it depends on every other row. A sorted structure that keeps subtree counts, such as the skip list inside a Redis sorted set, answers it in `O(log N)`.
+On 25 million rows, even with an index on `points`, counting every player above a mid-table score reads millions of index entries, and it runs after every match. Rank is a **global order statistic**: it depends on every other row.
+
+A sorted structure that keeps subtree counts, such as the skip list inside a Redis sorted set, answers it in `O(log N)`.
 
 The streaming variant is different: "top 100 songs in the last hour" over 50,000 plays per second across 10 million distinct songs. An exact hash map of counts per window would need memory for every distinct song, per window, per partition, and merging those maps is heavy. Approximate counting with a fixed-size sketch is good enough for "trending" lists.
 
@@ -106,7 +156,11 @@ sequenceDiagram
     W->>K: commit offset
 ```
 
-The `INSERT ... ON CONFLICT DO NOTHING` on `(match_id, player_id)` makes the worker idempotent, which matters for `ZINCRBY`: replaying an increment would double-count, while replaying `ZADD GT` would be harmless. One gap remains: if the worker crashes after the PostgreSQL commit but before `EXEC`, the replayed event is skipped as a duplicate and Redis never gets the update. Close it by also deduping inside Redis: run the board updates in one Lua script that first does `SET applied:{match_id}:{player_id} 1 NX EX 604800` and applies the writes only if that succeeded, and let the worker always call the script (PostgreSQL dedupe guards the durable copy, the Redis marker guards the boards).
+The `INSERT ... ON CONFLICT DO NOTHING` on `(match_id, player_id)` makes the worker idempotent, which matters for `ZINCRBY`: replaying an increment would double-count, while replaying `ZADD GT` would be harmless.
+
+One gap remains: if the worker crashes after the PostgreSQL commit but before `EXEC`, the replayed event is skipped as a duplicate and Redis never gets the update.
+
+Close it by also deduping inside Redis: run the board updates in one Lua script that first does `SET applied:{match_id}:{player_id} 1 NX EX 604800` and applies the writes only if that succeeded, and let the worker always call the script (PostgreSQL dedupe guards the durable copy, the Redis marker guards the boards).
 
 **Leaderboard read path.**
 
@@ -470,13 +524,25 @@ Reading the packed score back: `points = uint64(score) >> 32`. With 200,000 play
 
 **Why a skip list can return a rank.** Each forward pointer in a Redis skip-list node stores a *span*: how many level-0 nodes it jumps over. Walking from the head to a member and adding the spans of the pointers taken gives the member's rank in `O(log N)` expected time, without visiting the members in between.
 
-**Rank across shards.** With players hashed across `S` shards, a player's global rank is `1 + Σ ZCOUNT(shard_i, "(" + score, "+inf")` (the `(` makes the bound exclusive), one `O(log N)` call per shard, which is `S` round trips done in parallel. The global top 100 is the merge of each shard's top 100, because any global top-100 member is in its own shard's top 100.
+**Rank across shards.** With players hashed across `S` shards, a player's global rank is `1 + Σ ZCOUNT(shard_i, "(" + score, "+inf")` (the `(` makes the bound exclusive), one `O(log N)` call per shard, which is `S` round trips done in parallel.
 
-**Merging stream top-K across partitions.** Count-Min Sketches with the same width, depth and hash functions merge by adding counters cell by cell, so per-partition sketches sum into a global one exactly as if one machine had seen every event. Heaps do not merge that way: an item that is 101st on every partition can be first globally. The fix is to send each partition's candidates (its top K, or a larger list such as top 3K) to the merger, query the merged sketch for each candidate, and take the global top K from that. A larger candidate list lowers, but does not remove, the chance of missing a true top item; the nightly exact batch job catches what slips through.
+The global top 100 is the merge of each shard's top 100, because any global top-100 member is in its own shard's top 100.
 
-**Sliding windows.** Keep one sketch per minute (109 KB each in the example). The "last hour" sketch is the sum of the last 60; sliding forward subtracts the oldest minute's sketch (sketches are linear, so subtraction is exact) and adds the newest. This is a stream-processing job with tumbling windows; see [[Stream Processing Basics]] and [[Kafka and Event Streaming]]. A nightly exact batch job reconciles the approximate answer.
+**Merging stream top-K across partitions.** Count-Min Sketches with the same width, depth and hash functions merge by adding counters cell by cell, so per-partition sketches sum into a global one exactly as if one machine had seen every event.
 
-**Choosing ε and δ.** Width `⌈e/ε⌉` controls the size of the overcount (at most `εN`), and depth `⌈ln(1/δ)⌉` controls how often that bound may be exceeded (probability `δ`). Heavy hitters are items above some share `φ` of the stream; choose `ε` well below `φ` (for example `φ = 1%`, `ε = 0.1%`) so overcounting cannot push a tail item above the threshold.
+Heaps do not merge that way: an item that is 101st on every partition can be first globally.
+
+The fix is to send each partition's candidates (its top K, or a larger list such as top 3K) to the merger, query the merged sketch for each candidate, and take the global top K from that.
+
+A larger candidate list lowers, but does not remove, the chance of missing a true top item; the nightly exact batch job catches what slips through.
+
+**Sliding windows.** Keep one sketch per minute (109 KB each in the example). The "last hour" sketch is the sum of the last 60; sliding forward subtracts the oldest minute's sketch (sketches are linear, so subtraction is exact) and adds the newest.
+
+This is a stream-processing job with tumbling windows; see [[Stream Processing Basics]] and [[Kafka and Event Streaming]]. A nightly exact batch job reconciles the approximate answer.
+
+**Choosing ε and δ.** Width `⌈e/ε⌉` controls the size of the overcount (at most `εN`), and depth `⌈ln(1/δ)⌉` controls how often that bound may be exceeded (probability `δ`).
+
+Heavy hitters are items above some share `φ` of the stream; choose `ε` well below `φ` (for example `φ = 1%`, `ε = 0.1%`) so overcounting cannot push a tail item above the threshold.
 
 **Precision of packed scores.** Redis stores sorted-set scores as IEEE 754 double-precision floats. With 21 bits of points and 32 bits of time, the packed integer stays below 2^53 and every value is exact. A design that packs 32-bit points and 32-bit time (64 bits) would silently lose the low bits, and ties would break incorrectly.
 
@@ -519,3 +585,8 @@ A 45-minute script:
 - **Before this:** [[Redis Data Structures and When to Use Each]], [[Heaps and Priority Queues]], [[Bloom Filters and Probabilistic Data Structures]], [[Back-of-the-Envelope Estimation]]
 - **Next:** [[Case Study - Payment System]], [[Case Study - Ad Click Aggregation]]
 - **Compare with:** [[Case Study - Search Autocomplete]] (top-K per prefix), [[Stream Processing Basics]], [[Hot Keys and Hot Partitions]], [[Partitioning and Sharding]]
+
+### Watch on YouTube
+
+- [17: Top K Leaderboard / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=nQpkRONzEQI) · Jordan has no life · 32 min · 60,009 views
+- [Top-K Leaderboard: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=D6FKzYYm0eo) · TechPrep · 18 min · 9,203 views

@@ -13,7 +13,7 @@ sources:
   - "Cloudflare blog, Bandwidth Alliance and R2 zero-egress pricing"
   - "FinOps Foundation, FinOps Framework"
   - "All dollar figures in this note are rounded, approximate list prices for illustration. Check current pricing before quoting."
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Cost-Aware System Design
@@ -28,11 +28,64 @@ updated: 2026-11-09
 > - Match the **purchase model** to the load shape: reserved for the steady base, on-demand for the swing, spot for work that can be interrupted.
 > - Say the number. "About 3 cents per thousand requests" is stronger than "it should be cheap".
 
+## Start here: the basics
+
+**The problem in one story**
+
+A startup launches a photo app on the cloud. It works, and users love it.
+At the end of the month the cloud bill is bigger than the revenue.
+Most of it is not servers: it is data sent out to users and between data centres.
+A good design checks what each choice costs before the bill arrives.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Egress | Data leaving the cloud provider's network, paid per GB | Images downloaded by users |
+| Availability zone (AZ) | A separate data centre inside one region | `ap-south-1a` |
+| Cross-AZ traffic | Data between zones, often charged both ways | App in zone A reading DB in zone B |
+| On-demand | Pay per hour, no commitment | A VM started for a test |
+| Reserved / savings plan | Commit for 1-3 years for a discount | Always-on database server |
+| Spot | Spare capacity, cheap, can be taken back any time | Nightly batch job |
+| Storage tier | Hot (fast, pricey) vs cold (slow, cheap) storage | S3 Standard vs Glacier |
+| CDN | Edge caches near users | Serves images so origin does not pay egress each time |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  D[Design choice] --> C[Compute]
+  D --> S[Storage]
+  D --> N[Network / egress]
+  D --> M[Managed services]
+  C --> B[Monthly bill]
+  S --> B
+  N --> B
+  M --> B
+```
+
+**Analogy**
+
+Running a restaurant: rent, ingredients, delivery fees and caterers each add to the bill, and the owner controls profit by choosing how much of each to use.
+Where it breaks: a restaurant's prices are on a menu you can read, while cloud costs hide in per-GB and per-request charges you only see in the bill.
+
+**How the rest of this note builds up**
+
+- First why cost matters and the mental model of where money goes (sections 1-2).
+- Then how each cost lever works: compute purchase models, storage tiers, network, caching (section 3).
+- Then a worked cost estimate (section 4).
+- Finally variants, trade-offs, production practice (FinOps) and the SDE-3 deep dive (sections 5-8).
+
+> [!tip] Remember
+> Every design choice has a price; estimate egress, cross-AZ traffic and storage tier first.
+
 ## 1. Why it exists
 
 You design a photo sharing app. 10 million daily users each view 50 images of 300 KB.
 
-That is 10M x 50 x 300 KB = 150 TB per day of image traffic (an estimate). If served from origin to the internet at roughly $0.09 per GB (a typical first-tier cloud egress list price, approximate), that is about $13,500 per day, or over $400,000 per month, for bandwidth alone. The servers are a rounding error next to it.
+That is 10M x 50 x 300 KB = 150 TB per day of image traffic (an estimate).
+
+If served from origin to the internet at roughly $0.09 per GB (a typical first-tier cloud egress list price, approximate), that is about $13,500 per day, or over $400,000 per month, for bandwidth alone. The servers are a rounding error next to it.
 
 A CDN with a 95 percent hit ratio (an estimate) cuts origin egress to 7.5 TB per day, and a CDN's own per-GB price is usually lower than cloud egress. The architecture is the same boxes. The bill is about a tenth.
 
@@ -43,7 +96,15 @@ Interviewers at SDE-3 level notice when a candidate sees this unprompted.
 
 ## 2. Mental model
 
-Think of running a **restaurant**. Rent (compute you keep on), ingredients (storage), delivery fees (network), and the catering company you hire for desserts (managed services). You control profit by: not paying rent for empty tables (autoscaling), buying flour in bulk for what you surely use (reserved), buying surplus produce cheap for jobs that can wait (spot), keeping the best-selling dishes ready (cache), and not hiring a caterer for something the kitchen does in five minutes (build versus buy).
+Think of running a **restaurant**. Rent (compute you keep on), ingredients (storage), delivery fees (network), and the catering company you hire for desserts (managed services).
+
+You control profit by:
+
+- not paying rent for empty tables (autoscaling),
+- buying flour in bulk for what you surely use (reserved),
+- buying surplus produce cheap for jobs that can wait (spot),
+- keeping the best-selling dishes ready (cache),
+- and not hiring a caterer for something the kitchen does in five minutes (build versus buy).
 
 The analogy breaks at one point: restaurant costs are visible on one invoice, but cloud costs show up as thousands of line items, and the expensive ones (data transfer) hide inside architecture decisions.
 
@@ -418,3 +479,10 @@ Interview habit: estimate, find the dominant line, one lever, one number, one tr
 - Cloud: [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]], [[AWS 07 - S3]], [[Autoscaling]]
 - Resilience cost: [[Multi-Region Architecture]]
 - Framework: [[System Design Interview Framework]], [[Security, Privacy and Compliance in HLD]]
+
+## Links
+
+### Watch on YouTube
+
+- [8 Most Important System Design Concepts You Should Know](https://www.youtube.com/watch?v=BTjxUS_PylA) · ByteByteGo · 6 min · 612,191 views
+- [Agentic AI System Design: Evals, Guardrails and Cost](https://www.youtube.com/watch?v=dDXgPTDpcis) · codebasics · 92 min · 38,810 views

@@ -11,13 +11,15 @@ sources:
   - "Thanos documentation: Compactor downsampling (5m after 40 hours, 1h after 10 days)"
   - "Grafana Loki documentation: label-only index, compressed chunks in object storage, LogQL"
   - "OpenTelemetry Collector documentation: receivers, processors, exporters"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Case Study - Metrics and Logging Platform
 
 > [!summary] TL;DR
-> Design a shared platform that collects metrics and logs from every service in a company, stores them cheaply for weeks, answers dashboard and search queries in seconds, and fires alerts. Metrics are small numbers on a schedule, so they go into a compressed **time-series database**; logs are big text, so the key decision is how much of them to **index**.
+> Design a shared platform that collects metrics and logs from every service in a company, stores them cheaply for weeks, answers dashboard and search queries in seconds, and fires alerts.
+>
+> Metrics are small numbers on a schedule, so they go into a compressed **time-series database**; logs are big text, so the key decision is how much of them to **index**.
 
 > [!abstract] Core idea
 > - Metrics: each unique `name + labels` combination is a **series**. Cost grows with the number of series (cardinality), not with traffic.
@@ -25,6 +27,54 @@ updated: 2026-11-04
 > - Logs: either index every word (fast search, expensive) or index only a few labels and scan compressed chunks at query time (cheap, slower search).
 > - Protect the platform from its tenants: per-tenant limits on series, ingest rate and query cost.
 > - Alerting runs as queries on a timer, close to the data, and must keep working when other parts are degraded.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your company runs 500 small services.
+At 2 a.m. checkout starts failing and someone has to find out why, fast.
+They need graphs ("errors jumped at 01:58") and the actual error lines ("card service timed out").
+This platform collects both from every service, keeps them for weeks, and wakes someone up when numbers look wrong.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Metric | A number measured again and again over time | Requests per second = 1,200 |
+| Label | A tag attached to a metric to tell series apart | `service="checkout"` |
+| Log line | One line of text a program writes about what it did | `ERROR card timeout order=42` |
+| Time-series database | A store tuned for (time, value) points | Prometheus |
+| Index | A lookup table that finds data without scanning all of it | Book index: word to page numbers |
+| Object storage | Cheap, huge file storage reached over HTTP | Amazon S3 bucket |
+| Tenant | One team or customer sharing the platform | The payments team |
+| Alert | A rule that notifies a human when a condition holds | Error rate > 5% for 5 minutes |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["Services"] --> C["Collector<br/>(agent)"]
+    C --> M["Metrics store<br/>(time series)"]
+    C --> L["Log store<br/>(labels + chunks)"]
+    M --> O["Object storage<br/>(old data)"]
+    L --> O
+    M --> D["Dashboards"]
+    L --> D
+    M --> A["Alerts"]
+```
+
+**Analogy.** Metrics are electricity meters that report one number every few seconds; logs are a diary each machine writes.
+Where it breaks: real meters are few and fixed, but a careless label (like a user ID) can create millions of "meters" overnight.
+
+**How the rest of this note builds up**
+
+- First, the requirements and the mental model (sections 1-2).
+- Then the high-level design and the worked example: estimates, API, data model and Go code for cardinality limits and downsampling (sections 3-4).
+- Then variants, trade-offs and production lessons (sections 5-7).
+- Finally the SDE-3 deep dive: Gorilla compression, head/WAL/blocks, downsampling tiers, hash rings and label-only log indexing (section 8).
+
+> [!tip] Remember
+> Metrics cost grows with the number of distinct series, logs cost grows with how much you index.
 
 ## 1. Why it exists - requirements
 
@@ -44,11 +94,17 @@ A company runs 5,000 services on 20,000 pods. Every team ships its own Prometheu
 - Cost per GB stored and per million series is a first-class requirement.
 - Out of scope: traces (see [[Distributed Tracing with OpenTelemetry]]), business analytics.
 
-**Glossary.** A **sample** is one `(timestamp, value)`. A **series** is all samples with the same metric name and label set, for example `http_requests_total{service="checkout",code="500"}`. **Cardinality** is the number of distinct series. A **block** is an immutable file set covering a time range. **Downsampling** replaces raw samples with per-interval aggregates (min, max, sum, count). A **log stream** in label-indexed systems is all lines sharing a label set.
+**Glossary.** A **sample** is one `(timestamp, value)`. A **series** is all samples with the same metric name and label set, for example `http_requests_total{service="checkout",code="500"}`. **Cardinality** is the number of distinct series. A **block** is an immutable file set covering a time range.
+
+**Downsampling** replaces raw samples with per-interval aggregates (min, max, sum, count). A **log stream** in label-indexed systems is all lines sharing a label set.
 
 ## 2. Mental model
 
-Metrics are like electricity meters: every 15 seconds each meter reports one number, and the numbers barely change, so you can store them in about one byte each. The expensive part is the **number of meters**. Logs are like a diary from every machine: lots of free text. You either build a full index at the back of every diary (fast lookup, the index can be as large as the diary) or you just label each diary by owner and date and read the relevant pages when someone asks (cheap to store, slower to search).
+Metrics are like electricity meters: every 15 seconds each meter reports one number, and the numbers barely change, so you can store them in about one byte each. The expensive part is the **number of meters**.
+
+Logs are like a diary from every machine: lots of free text.
+
+You either build a full index at the back of every diary (fast lookup, the index can be as large as the diary) or you just label each diary by owner and date and read the relevant pages when someone asks (cheap to store, slower to search).
 
 ## 3. How it works - high-level design
 
@@ -155,7 +211,9 @@ What the numbers decide:
 
 ### The cardinality trap in one line
 
-`http_requests_total` with labels `method` (5 values) × `route` (200) × `code` (10) × `pod` (500) is 5 × 200 × 10 × 500 = **5,000,000 series** for one metric. Adding `user_id` with 1 M users multiplies it by up to a million. That is why the distributor enforces per-tenant series limits and why IDs belong in logs and traces, not in metric labels.
+`http_requests_total` with labels `method` (5 values) × `route` (200) × `code` (10) × `pod` (500) is 5 × 200 × 10 × 500 = **5,000,000 series** for one metric. Adding `user_id` with 1 M users multiplies it by up to a million.
+
+That is why the distributor enforces per-tenant series limits and why IDs belong in logs and traces, not in metric labels.
 
 ### API
 
@@ -221,7 +279,9 @@ Alertmanager then groups related alerts (one page for 40 pods failing the same c
 
 ### Go: series identity, cardinality guard and downsampling
 
-Three pieces of the write and compaction path: building a canonical series key, a per-tenant cardinality limiter that drops only *new* series once the limit is hit (existing dashboards keep working), and a downsampler that keeps min, max, sum and count per bucket. `DeltaOfDeltas` shows why Gorilla timestamps compress so well. The clock is injected so tests control the limiter window.
+Three pieces of the write and compaction path: building a canonical series key, a per-tenant cardinality limiter that drops only *new* series once the limit is hit (existing dashboards keep working), and a downsampler that keeps min, max, sum and count per bucket.
+
+`DeltaOfDeltas` shows why Gorilla timestamps compress so well. The clock is injected so tests control the limiter window.
 
 ```go
 package metrics
@@ -495,7 +555,9 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 
 ## 6. Trade-offs
 
-- **Index everything vs index labels.** Full-text indexing makes "find this request ID across all services in 30 days" instant, at a cost of index storage and indexing CPU on 69 TB/day. Label-only indexing stores logs at close to their compressed size and pushes the cost to query time. Many companies use label-only for everything plus a full-text index for a small, high-value subset (security and audit logs).
+- **Index everything vs index labels.** Full-text indexing makes "find this request ID across all services in 30 days" instant, at a cost of index storage and indexing CPU on 69 TB/day.
+
+  Label-only indexing stores logs at close to their compressed size and pushes the cost to query time. Many companies use label-only for everything plus a full-text index for a small, high-value subset (security and audit logs).
 - **Replication factor 3 on ingest vs storage cost.** RF 3 keeps writes and recent queries available through an ingester failure, but triples head memory and uploads three copies of every block until the compactor deduplicates them.
 - **Drop vs block under overload.** Metrics and debug logs can be sampled or dropped under pressure; audit logs cannot. Route them through different pipelines with different backpressure policies (see [[Backpressure and Flow Control]]).
 - **Raw vs downsampled.** Downsampled data makes year-long dashboards cheap but loses spikes shorter than the step, unless you keep `max` as well as `avg`, as the rollup above does.
@@ -512,15 +574,29 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 
 ## 8. Deep dive
 
-**Gorilla compression.** Timestamps are stored as the difference of differences. With a fixed 15 s scrape, consecutive deltas are 15, 15, 15, so the delta-of-delta is 0 and costs one bit; the Gorilla paper reports about 96% of timestamps compressed to a single bit. Values are XORed with the previous value: identical values produce 0 (one bit), and similar floats share sign, exponent and high mantissa bits, so only the middle "meaningful" bits are stored. The paper reports an average of about 1.37 bytes per sample instead of 16 bytes for a raw `(int64, float64)` pair, roughly a 12× saving.
+**Gorilla compression.** Timestamps are stored as the difference of differences. With a fixed 15 s scrape, consecutive deltas are 15, 15, 15, so the delta-of-delta is 0 and costs one bit; the Gorilla paper reports about 96% of timestamps compressed to a single bit.
 
-**Head, WAL and blocks.** Prometheus keeps the most recent data in a mutable in-memory head, appends every sample to a write-ahead log so a crash can replay it, cuts chunks of about 120 samples per series, and every 2 hours persists the head as an immutable block with its own index. Blocks are later compacted into larger ones. Immutability is what makes object storage work: blocks are written once, cached aggressively, and deleted whole when retention passes, with no in-place updates.
+Values are XORed with the previous value: identical values produce 0 (one bit), and similar floats share sign, exponent and high mantissa bits, so only the middle "meaningful" bits are stored.
 
-**Downsampling tiers.** Thanos's compactor creates a 5-minute resolution copy of blocks older than 40 hours and a 1-hour resolution copy of blocks older than 10 days. A typical policy keeps raw data 15 days, 5-minute data 90 days and 1-hour data 13 months. Each downsampled point keeps count, sum, min, max and counter values so `rate()`, `avg`, `max` all stay correct.
+The paper reports an average of about 1.37 bytes per sample instead of 16 bytes for a raw `(int64, float64)` pair, roughly a 12× saving.
 
-**Why a hash ring with replication.** Series are spread over ingesters by hashing `(tenant, labels)`, so one tenant's series land on many ingesters and the load is even. Adding an ingester moves only about 1/N of series (consistent hashing). With RF 3 and a write quorum of 2, one ingester can crash or restart without losing writes; on restart it replays its WAL. Queries for recent data must ask all ingesters that may own a series and deduplicate the replicas.
+**Head, WAL and blocks.** Prometheus keeps the most recent data in a mutable in-memory head, appends every sample to a write-ahead log so a crash can replay it, cuts chunks of about 120 samples per series, and every 2 hours persists the head as an immutable block with its own index.
 
-**Logs: why label-only indexing scales.** The index size grows with the number of streams, not with the bytes logged, so 69 TB/day may need an index of only gigabytes. The price is query-time work: a search for a string reads and decompresses every chunk of the matching streams in the time range, parallelised across queriers. That is cheap for "checkout errors in the last hour" and expensive for "this UUID anywhere in 30 days", which is exactly the case to route to traces (look up by trace ID) or to a small full-text index.
+Blocks are later compacted into larger ones. Immutability is what makes object storage work: blocks are written once, cached aggressively, and deleted whole when retention passes, with no in-place updates.
+
+**Downsampling tiers.** Thanos's compactor creates a 5-minute resolution copy of blocks older than 40 hours and a 1-hour resolution copy of blocks older than 10 days. A typical policy keeps raw data 15 days, 5-minute data 90 days and 1-hour data 13 months.
+
+Each downsampled point keeps count, sum, min, max and counter values so `rate()`, `avg`, `max` all stay correct.
+
+**Why a hash ring with replication.** Series are spread over ingesters by hashing `(tenant, labels)`, so one tenant's series land on many ingesters and the load is even. Adding an ingester moves only about 1/N of series (consistent hashing).
+
+With RF 3 and a write quorum of 2, one ingester can crash or restart without losing writes; on restart it replays its WAL. Queries for recent data must ask all ingesters that may own a series and deduplicate the replicas.
+
+**Logs: why label-only indexing scales.** The index size grows with the number of streams, not with the bytes logged, so 69 TB/day may need an index of only gigabytes.
+
+The price is query-time work: a search for a string reads and decompresses every chunk of the matching streams in the time range, parallelised across queriers.
+
+That is cheap for "checkout errors in the last hour" and expensive for "this UUID anywhere in 30 days", which is exactly the case to route to traces (look up by trace ID) or to a small full-text index.
 
 ## 9. Interview questions
 
@@ -534,7 +610,9 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 > Each series is written to 3 ingesters and acknowledged on 2, so writes continue. The dead ingester replays its WAL on restart. Queries for recent data read from the surviving replicas and deduplicate. The compactor later dedupes the replicas' uploaded blocks.
 
 > [!question]- Elasticsearch or Loki for logs?
-> Depends on query patterns and budget. Elasticsearch indexes every token: fast arbitrary text search, but indexing CPU and index storage at 69 TB/day are large. Loki indexes only labels and scans compressed chunks: much cheaper storage, fast when queries start from service and time, slow for needle-in-haystack searches. A common mix is Loki for application logs and a full-text index for security and audit logs.
+> Depends on query patterns and budget. Elasticsearch indexes every token: fast arbitrary text search, but indexing CPU and index storage at 69 TB/day are large.
+>
+> Loki indexes only labels and scans compressed chunks: much cheaper storage, fast when queries start from service and time, slow for needle-in-haystack searches. A common mix is Loki for application logs and a full-text index for security and audit logs.
 
 > [!question]- How do you stop one team's query from slowing everyone's dashboards?
 > A query frontend that splits by time, caches results, queues per tenant and enforces per-query limits on series, samples and range; downsampled blocks for long ranges; separate query capacity (or priority) for the ruler so alerting is never starved by dashboards.
@@ -562,3 +640,8 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 - **Building blocks:** [[Consistent Hashing]], [[Replication]], [[Quorums and Leaderless Replication]], [[Partitioning and Sharding]], [[Kafka and Event Streaming]], [[Search Engines and Inverted Indexes]], [[Backpressure and Flow Control]], [[Caching Patterns]]
 - **Next:** [[Alerting and On-Call]], [[SLIs, SLOs, SLAs and Error Budgets]], [[Case Study - Ad Click Aggregation]]
 - **Compare with:** [[Logging Library]] (class-level LLD twin), [[Distributed Tracing with OpenTelemetry]], [[Case Study - Distributed Job Scheduler]] (a system this platform would watch)
+
+### Watch on YouTube
+
+- [14: Distributed Logging & Metrics Framework / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=p_q-n09B8KA) · Jordan has no life · 28 min · 80,020 views
+- [Distributed Metrics/Logging Design Deep Dive with Google SWE! / Systems Design Interview Question 14](https://www.youtube.com/watch?v=_KoiMoZZ3C8) · Jordan has no life · 21 min · 29,655 views

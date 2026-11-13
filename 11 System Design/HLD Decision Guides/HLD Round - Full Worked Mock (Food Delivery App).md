@@ -10,13 +10,17 @@ sources:
   - "Chris Richardson, Microservices Patterns (2018): saga and transactional outbox"
   - "Stripe API documentation: idempotent requests (Idempotency-Key header)"
   - "All traffic figures in this note are assumptions chosen for the mock, not data from any real company"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HLD Round - Full Worked Mock (Food Delivery App)
 
 > [!summary] TL;DR
-> A complete 60-minute HLD answer for "design a food delivery app" (think Swiggy, Zomato, DoorDash), written as a transcript with timestamps. At every decision point it lists the alternatives, the pick and the reason, and points to the note that teaches the choice. Use it as a model for pacing and phrasing, then redo it yourself against [[HLD Round - Complete Step-by-Step Guide]].
+> A complete 60-minute HLD answer for "design a food delivery app" (think Swiggy, Zomato, DoorDash), written as a transcript with timestamps.
+>
+> At every decision point it lists the alternatives, the pick and the reason, and points to the note that teaches the choice.
+>
+> Use it as a model for pacing and phrasing, then redo it yourself against [[HLD Round - Complete Step-by-Step Guide]].
 
 > [!abstract] Core idea
 > - Three flows make the system: **browse** (read-heavy, cacheable), **order** (money, must not duplicate or be lost) and **deliver** (real-time, geo, write-heavy).
@@ -24,6 +28,51 @@ updated: 2026-11-09
 > - The order lifecycle is a **saga** across payment, restaurant and courier, driven by events published through a transactional outbox.
 > - The deep dives are courier matching and order consistency: the two places a mistake costs money.
 > - Every figure below is an assumption stated to the interviewer, not a measured fact.
+
+## Start here: the basics
+
+**The problem in one story.**
+You open a food app, scroll restaurants, order a biryani, pay, and watch a rider move on a map.
+That feels like one app, but it is really three jobs: showing menus, taking money safely, and tracking riders live.
+In an interview you get 60 minutes to design all three out loud.
+This note is a full sample answer, minute by minute.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| HLD (high-level design) | The boxes-and-arrows plan of a system, not the code | "App → API → Order service → Postgres" |
+| QPS | Queries (requests) per second | 2,000 order QPS at dinner peak |
+| Service | A separately deployed program owning one job | Order service, Courier service |
+| Cache | A fast copy of data that is read often | Menus kept in Redis |
+| Message broker | A system that carries events between services | Kafka topic `order-events` |
+| Idempotent | Safe to repeat: doing it twice has the same effect as once | Retrying "create order" with the same key |
+| Saga | A multi-step process where each step can be undone if a later step fails | Refund the payment if no courier is found |
+| Geo index | A lookup that finds things near a location | "Couriers within 3 km" |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App["Customer app"] --> B["Browse: menus<br/>(cache)"]
+    App --> O["Order: payment<br/>(SQL, saga)"]
+    O --> E["Events<br/>(broker)"]
+    E --> D["Deliver: courier match<br/>(geo index)"]
+    D --> T["Live tracking<br/>to the app"]
+```
+
+**Analogy.** A restaurant chain has a menu board (browse), a cash counter (order), and delivery riders with a dispatcher (deliver). Each runs differently but they pass tickets to each other.
+Where it breaks: a real counter clerk can just shout to the kitchen; services must survive lost or duplicated messages.
+
+**How the rest of this note builds up**
+
+- First, why a worked mock helps and the three-flow mental model (sections 1-2).
+- Then the transcript: requirements, estimates, API and data model, high-level design (section 3).
+- Then each decision point: sync vs async, broker, outbox, courier locations, matching, the payment saga, tracking and menu caching.
+- Finally the SDE-3 deep dive spoken out loud, scale and failure handling, wrap-up, variants and trade-offs (sections 4-8).
+
+> [!tip] Remember
+> Split the app into browse, order and deliver; give each the store and guarantees it needs, and justify every choice with a number.
 
 ## 1. Why it exists
 
@@ -322,7 +371,9 @@ Choice: WebSocket, with SSE as a valid simpler alternative because the customer 
 
 #### Decision 11: caching menus
 
-Cache-aside in Redis keyed by `restaurant_id`, TTL 5 minutes, explicit invalidation when a restaurant edits the menu; prices are re-read from the database at checkout so a stale cache can never charge a wrong price. Cost: up to 5 minutes of stale display. Read: [[Caching Patterns]], [[Cache Invalidation, TTL and Consistency]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+Cache-aside in Redis keyed by `restaurant_id`, TTL 5 minutes, explicit invalidation when a restaurant edits the menu; prices are re-read from the database at checkout so a stale cache can never charge a wrong price.
+
+Cost: up to 5 minutes of stale display. Read: [[Caching Patterns]], [[Cache Invalidation, TTL and Consistency]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 
 > [!warning] Common mistake
 > Trusting cached prices at checkout. Show from cache, charge from the source of truth.
@@ -347,7 +398,11 @@ FAIL   Kafka down -> outbox grows, checkout still works | geo node down -> couri
 
 "The riskiest parts are dispatch and order consistency.
 
-First, dispatch. We get 40 k pings per second, so I keep only the latest position in RAM, sharded by city. A request for a courier looks up the restaurant's cell and its neighbours, filters by real distance, ranks by estimated time, then tries candidates in order with a conditional update from AVAILABLE to OFFERED. If the update affects zero rows, another order got them and I try the next. A courier who does not accept in 15 seconds returns to AVAILABLE by a timeout sweeper. That prevents double assignment without any lock service.
+First, dispatch. We get 40 k pings per second, so I keep only the latest position in RAM, sharded by city.
+
+A request for a courier looks up the restaurant's cell and its neighbours, filters by real distance, ranks by estimated time, then tries candidates in order with a conditional update from AVAILABLE to OFFERED.
+
+If the update affects zero rows, another order got them and I try the next. A courier who does not accept in 15 seconds returns to AVAILABLE by a timeout sweeper. That prevents double assignment without any lock service.
 
 Second, order consistency. The client sends an idempotency key; a unique constraint on the key in `payment_attempts` means retries cannot double-charge. The order row and outbox row commit together, so an event is never lost. Consumers are idempotent because delivery is at least once. If the restaurant rejects or no courier appears in 10 minutes, a compensating refund runs."
 
@@ -374,7 +429,11 @@ Read: [[Load Shedding and Graceful Degradation]], [[Timeouts, Retries and Backof
 
 ### Minutes 55-60: Wrap-up
 
-"We split the product into browse, order and deliver. Menus come from cache; orders are in Postgres with an outbox that feeds Kafka; couriers live in an in-memory geo index sharded by city. The two key trade-offs: async saga over a synchronous chain (accepting intermediate states), and in-memory soft state over durable location storage (accepting a short loss on restart). First to break at 10x is the orders primary, fixed by sharding by customer. Next I would add surge-aware dispatch scoring and multi-region failover."
+"We split the product into browse, order and deliver. Menus come from cache; orders are in Postgres with an outbox that feeds Kafka; couriers live in an in-memory geo index sharded by city.
+
+The two key trade-offs: async saga over a synchronous chain (accepting intermediate states), and in-memory soft state over durable location storage (accepting a short loss on restart).
+
+First to break at 10x is the orders primary, fixed by sharding by customer. Next I would add surge-aware dispatch scoring and multi-region failover."
 
 ## 5. Variants and comparison
 
@@ -475,3 +534,8 @@ If the payment call times out, the result is unknown. Retry with the same idempo
 - **Case studies to read next:** [[Case Study - Ride Sharing and Proximity]], [[Case Study - Payment System]], [[Case Study - Notification System]]
 - **Decision theory:** [[Queues vs Streams and Broker Comparison]], [[Transactional Outbox and CDC]], [[Saga Pattern]], [[Geospatial Indexing]], [[SQL vs NoSQL]], [[Caching Patterns]]
 - **Compare with:** [[Case Study - Ticket Booking]] (scarce resource) and [[Case Study - News Feed]] (fan-out)
+
+### Watch on YouTube
+
+- [✅ System Design 6: Design Food Delivery Application like Zomato / Swiggy / Uber Eats / HLD / LLD](https://www.youtube.com/watch?v=rZyAgZuuZiA) · InterviewWithBunny · 67 min · 47,803 views
+- [How Food Delivery Apps Like Swiggy & Zomato Work – Full Backend Architecture Explained](https://www.youtube.com/watch?v=F9x686m-yYo) · FullStackDev · 6 min · 11,096 views

@@ -12,7 +12,7 @@ sources:
   - "Prometheus docs, histogram_quantile and querying functions"
   - "kube-state-metrics docs, Deployment and Pod metrics"
   - "Go docs, runtime/debug.ReadBuildInfo and 'go version -m'"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Playbook - Bad Deploy and Rollback
@@ -43,6 +43,52 @@ flowchart TD
     F --> G
 ```
 
+## Start here: the basics
+
+**The problem in one story.**
+At 14:02 your team ships a new version of the checkout service.
+At 14:05 errors jump from 0.1% to 9%.
+You could spend an hour reading code to find the bug.
+Or you could put the old version back in 2 minutes and read the code afterwards.
+This playbook is about doing the second one safely.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Deploy | Replacing running code with a new version | `v42` replaces `v41` |
+| Rollback | Putting the previous version back | `kubectl rollout undo` |
+| Roll forward | Fixing by shipping another new version | Hotfix `v43` |
+| Canary | Sending a small share of traffic to the new version first | 5% of users get `v42` |
+| Feature flag | A switch that turns code on or off without a deploy | `new_discount=false` |
+| Migration | A change to the database schema | Adding a column |
+| Mitigate | Stop the user pain, even before you know the cause | Roll back first |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    D["Deploy v42"] --> E["Errors rise"]
+    E --> Q{"Started right<br/>after the deploy?"}
+    Q -- "yes" --> R["Roll back to v41"]
+    Q -- "no" --> O["Look at other causes"]
+    R --> C["Confirm recovery"]
+    C --> I["Investigate calmly"]
+```
+
+**Analogy.** If the new recipe makes customers sick, you go back to the old recipe tonight and study the new one tomorrow.
+Where it breaks: food already served can't be un-served; data already written by the new version (migrations, messages, cache) may not work with the old code.
+
+**How the rest of this note builds up**
+
+- First, why bad deploys are the top incident cause (section 1) and the "mitigate before you understand" model (section 2).
+- Then the five-step playbook: prove the deploy is guilty, check the rollout, read pod evidence, mitigate, confirm (section 3).
+- Then a worked incident (section 4) and ways to undo a release, rollback versus roll forward, and trade-offs (sections 5-6).
+- Finally the SDE-3 deep dive: rollback readiness, how `kubectl rollout undo` works, and why state makes rollback hard (sections 7-8).
+
+> [!tip] Remember
+> If it broke right after a change, undo the change first and ask why later.
+
 ## 1. Why it exists
 
 Every deploy is a bet that the new code behaves better than the old code in a place you cannot fully test: production traffic, production data, production dependencies. Most of the time the bet pays. Sometimes it does not.
@@ -55,14 +101,18 @@ Every deploy is a bet that the new code behaves better than the old code in a pl
 - A single feature breaks (for example, "Pay now" returns 500) while the rest of the site works.
 - Business metrics fall quietly while technical metrics look fine: orders per minute drop, but no errors are logged.
 
-**User impact, with numbers (illustrative).** A shop does 600 orders/minute at an average of 40 USD. A bad deploy makes 30% of checkouts fail. Every minute of delay costs 600 x 0.30 x 40 = 7,200 USD in lost orders. If detection takes 6 minutes and the rollback takes 4, the incident costs about 72,000 USD. If an automated canary had caught it at 5% of traffic, the cost would be a few thousand.
+**User impact, with numbers (illustrative).** A shop does 600 orders/minute at an average of 40 USD. A bad deploy makes 30% of checkouts fail. Every minute of delay costs 600 x 0.30 x 40 = 7,200 USD in lost orders.
+
+If detection takes 6 minutes and the rollback takes 4, the incident costs about 72,000 USD. If an automated canary had caught it at 5% of traffic, the cost would be a few thousand.
 
 > [!tip] Remember
 > The cost of a bad deploy is (users affected) x (minutes until mitigation). Both factors shrink with canaries, fast alerts and one-command rollback.
 
 ## 2. Mental model
 
-**Analogy: replacing a part in a running machine.** You swap one gear and the machine starts to rattle. The first response is to put the old gear back, not to study the rattle while the machine keeps running. The analogy breaks down when the new gear changed something other gears now depend on (data formats, schemas). Then putting the old gear back can jam the machine in a different way.
+**Analogy: replacing a part in a running machine.** You swap one gear and the machine starts to rattle. The first response is to put the old gear back, not to study the rattle while the machine keeps running.
+
+The analogy breaks down when the new gear changed something other gears now depend on (data formats, schemas). Then putting the old gear back can jam the machine in a different way.
 
 Think of every release as three independent things that can each go wrong:
 
@@ -397,7 +447,9 @@ flowchart LR
 
 ### How `kubectl rollout undo` works
 
-A Deployment owns ReplicaSets. Each Pod template change creates a new ReplicaSet and a new revision number. `undo` copies the Pod template of the target revision into the Deployment spec, which creates (or scales up) the matching ReplicaSet and scales down the current one under the rolling update rules. If the old ReplicaSet was pruned by `revisionHistoryLimit`, there is nothing to undo to.
+A Deployment owns ReplicaSets. Each Pod template change creates a new ReplicaSet and a new revision number. `undo` copies the Pod template of the target revision into the Deployment spec, which creates (or scales up) the matching ReplicaSet and scales down the current one under the rolling update rules.
+
+If the old ReplicaSet was pruned by `revisionHistoryLimit`, there is nothing to undo to.
 
 Only Pod template changes create revisions. Changing `replicas` alone does not, which is why rollback never restores a replica count.
 
@@ -472,3 +524,8 @@ This join works only if `build_info` carries a `pod` label matching the request 
 5. Create actions with owners and dates: one to prevent, one to detect faster, one to mitigate faster.
 6. Hold a blameless review: [[Postmortems and Root Cause Analysis]].
 7. Rehearse the rollback command so the next one takes 2 minutes.
+
+### Watch on YouTube
+
+- [Deployment in Kubernetes: A Comprehensive Guide to Rollout, Update, and Rollback](https://www.youtube.com/watch?v=-uO400iEuKo) · DevOps Pro · 8 min · 13,710 views
+- [Rollback A Deployments in Kubernetes Using ArgoCD](https://www.youtube.com/watch?v=f40Dl1_V6lE) · Valaxy Technologies · 11 min · 1,259 views

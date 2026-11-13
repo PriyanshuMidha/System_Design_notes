@@ -8,7 +8,7 @@ sources:
   - "Go blog, Strings, bytes, runes and characters in Go (go.dev/blog/strings)"
   - "Go spec, String types and Conversions (go.dev/ref/spec)"
   - "Unicode UAX #29, Text Segmentation"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Strings, Bytes, Runes and Unicode
@@ -22,6 +22,48 @@ updated: 2026-11-07
 > - `[]byte(s)` and `[]rune(s)` both copy. They are never free.
 > - A rune is not always what a human calls one "character" — that's a grapheme cluster, and Go's standard library doesn't compute those for you.
 
+## Start here: the basics
+
+**The problem in one story.**
+You cut a user's name to 20 characters for a profile card.
+English names look fine, but a Japanese name turns into garbage with a `�` box.
+That's because Go counted bytes, and one Japanese character takes 3 bytes.
+To handle text safely you need to know bytes, runes and characters apart.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Byte | 8 bits, the smallest unit Go strings are made of | `"A"` is 1 byte |
+| String | Read-only sequence of bytes | `s := "héllo"` (6 bytes) |
+| Unicode code point | A number for one symbol in the Unicode table | `é` is U+00E9 |
+| Rune | Go's type for one code point (`int32`) | `r := 'é'` |
+| UTF-8 | Encoding using 1-4 bytes per code point | `é` = 2 bytes, `製` = 3 bytes |
+| `[]byte` | A changeable slice of bytes | `b := []byte(s)` copies |
+| Grapheme | What a human sees as one character | An emoji with skin tone = several runes |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    S["string \"hé\""] --> B["bytes: 68 C3 A9<br/>(len = 3)"]
+    B -- "range / utf8.Decode" --> R["runes: 'h' 'é'<br/>(count = 2)"]
+    R --> G["graphemes:<br/>what the user sees"]
+```
+
+**Analogy.** A string is a row of beads; some letters use one bead, some use three.
+Where it breaks: beads look alike, but UTF-8 bytes carry markers that tell you where each letter starts.
+
+**How the rest of this note builds up**
+
+- First, why bytes vs runes matters and the mental model (sections 1-2).
+- Then indexing, `range`, conversions, `strings.Builder` and the `utf8` package (section 3).
+- Then a worked example counting and safely truncating text, plus comparisons and trade-offs (sections 4-6).
+- Finally the SDE-3 deep dive: zero-copy conversions, normalization, interview questions (sections 7-9).
+
+> [!tip] Remember
+> `len` counts bytes, `range` walks runes, and humans see graphemes; never slice text by byte index blindly.
+
 ## 1. Why it exists
 
 Say you take a client-facing invoice note field and truncate it to 20 characters before storing it, using plain byte slicing:
@@ -31,7 +73,9 @@ name := "製造元：株式会社レビュー" // a vendor name, in Japanese
 short := name[:20]
 ```
 
-This panics at runtime with `panic: runtime error: slice bounds out of range`... no, worse: it doesn't panic, it silently cuts a multi-byte rune in half and produces invalid UTF-8 that will later fail JSON encoding or render as a `�` replacement box in the UI. Every Han character here is 3 bytes in UTF-8, so byte index 20 lands in the middle of the 7th character.
+This panics at runtime with `panic: runtime error: slice bounds out of range`... no, worse: it doesn't panic, it silently cuts a multi-byte rune in half and produces invalid UTF-8 that will later fail JSON encoding or render as a `�` replacement box in the UI.
+
+Every Han character here is 3 bytes in UTF-8, so byte index 20 lands in the middle of the 7th character.
 
 The fix needs to know that Go strings are bytes, that slicing works on bytes, and that only `range` or `utf8.DecodeRuneInString` know where rune boundaries actually are. That distinction — bytes vs runes vs what a human perceives as one character — is this note.
 
@@ -289,3 +333,8 @@ func TestInvalidUTF8BecomesReplacementRune(t *testing.T) {
 - **Before this:** [[Syntax, Types and Control Flow]], [[Arrays and Dynamic Arrays (Go Slices)]]
 - **Next:** [[Standard Library Essentials (time, io, files, encoding)]], [[Structs, Methods and Embedding]]
 - **Compare with:** [[Go Interview Questions and Traps]] (string/byte/rune traps)
+
+### Watch on YouTube
+
+- [Runes, Bytes, and Strings in Go](https://www.youtube.com/watch?v=OKshtT6g0_k) · Gary Clarke · Clear walkthrough of how Go strings/bytes/runes relate and why len() counts bytes
+- [Characters do not exist in Go: Everything about runes!](https://www.youtube.com/watch?v=1pOfYd0y6_4) · Flo Woelki · Deep dive on runes vs grapheme clusters, directly covers the note's 'character' nuance

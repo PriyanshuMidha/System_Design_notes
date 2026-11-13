@@ -13,13 +13,17 @@ sources:
   - "hashicorp/golang-lru v2 README and expirable package docs"
   - "dgraph-io/ristretto v2 README and API docs (TinyLFU admission, SampledLFU eviction, SetWithTTL, Wait)"
   - "Caffeine wiki, Design (read buffers replayed in batches)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # LRU Cache with TTL
 
 > [!summary] TL;DR
-> An LRU (least recently used) cache keeps at most N entries and, when full, throws out the entry nobody has touched for the longest time. A hash map finds an entry in O(1), and a doubly linked list ordered by recency tells you the oldest one in O(1). TTL (time to live) gives each entry an expiry time: expired entries are never returned, are removed lazily on read and actively by a sweeper, and are evicted before any live entry when the cache is full.
+> An LRU (least recently used) cache keeps at most N entries and, when full, throws out the entry nobody has touched for the longest time.
+>
+> A hash map finds an entry in O(1), and a doubly linked list ordered by recency tells you the oldest one in O(1).
+>
+> TTL (time to live) gives each entry an expiry time: expired entries are never returned, are removed lazily on read and actively by a sweeper, and are evicted before any live entry when the cache is full.
 
 > [!abstract] Core idea
 > - A hash map finds an entry by key in O(1).
@@ -27,6 +31,53 @@ updated: 2026-11-02
 > - Every `Get` and `Put` moves the entry to the front; the node stores its key so eviction can delete it from the map.
 > - An expired entry is never returned: drop it when read, sweep it in the background, and evict it before any live entry.
 > - Classic mistake: using `RLock` in `Get`, although `Get` moves the node and so writes to the list.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your service asks a slow database for a user's profile on every request.
+You keep recent answers in memory so the next request is instant.
+Memory is limited, so when the box is full something must be thrown out, and old answers go stale after a while.
+An LRU cache with TTL throws out the least recently used entry and never hands back an expired one.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Cache | A small, fast copy of data you used recently | Profiles kept in a Go map |
+| Capacity | The most entries the cache may hold | `New(3)` holds 3 keys |
+| LRU (least recently used) | Evict the entry untouched for the longest time | A, B, C, then use A: B goes first |
+| TTL (time to live) | How long an entry stays valid | 60 s, then treated as missing |
+| Hash map | Finds a value by key in O(1) | `m["user:1"]` |
+| Doubly linked list | Nodes with next and prev pointers; move or remove in O(1) | Move a node to the front on `Get` |
+| Min-heap | Always gives the smallest item first | Entry that expires soonest |
+| Mutex | Lets only one goroutine change shared data at a time | `mu.Lock()` in `Get` and `Put` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    G["Get(key)"] --> M{"In map?"}
+    M -- "no" --> MISS["Miss"]
+    M -- "yes" --> E{"Expired?"}
+    E -- "yes" --> DEL["Remove it, miss"]
+    E -- "no" --> F["Move to front<br/>of list, return"]
+    P["Put when full"] --> V["Evict expired first,<br/>else back of list"]
+```
+
+**Analogy.** Think of a short pile of papers on a desk: each paper you use goes back on top, and when the pile is too tall you drop the one at the bottom.
+Some papers carry a use-by date and get dropped first once it passes.
+Where it breaks: a real stack only lets you take from the top, while the cache uses the map to jump straight to any plate in the middle.
+
+**How the rest of this note builds up**
+
+- First, the problem statement and clarifying questions (Step 1).
+- Then the entities and the "one node, three indexes" model: map, list and expiry heap (Steps 3-4), and the API (Step 5).
+- Then the core code: `Get`, `Put`, eviction, lazy and active expiry (Step 8) and its tests.
+- Finally edge cases, trade-offs against Redis and `container/list`, and the SDE-3 interview questions on locking and sharding (Steps 9-10 onwards).
+
+> [!tip] Remember
+> Map for "where is it", list for "who is oldest", heap for "who expires first"; one lock, because `Get` writes.
 
 ## Problem statement
 
@@ -90,7 +141,15 @@ The hardest use case, and the one to code first: **Put into a full cache** where
 | `expiryHeap` | slice of nodes with a TTL | Earliest deadline on top: active expiry and expired-first eviction without a scan |
 | `Reason` | Capacity, Expired | Tells the callback why an entry left |
 
-The modelling insight: **one node, three indexes.** The map answers "where is key k", the list answers "who is least recently used", and the heap answers "who expires first". The node stores its own `key` because eviction starts from a node (`tail.prev` or the heap top) and must delete the map entry. It stores `heapIdx` so `heap.Remove` and `heap.Fix` run in O(log n) without searching.
+The modelling insight: **one node, three indexes.**
+
+- The map answers "where is key k".
+- The list answers "who is least recently used".
+- The heap answers "who expires first".
+
+The node stores its own `key` because eviction starts from a node (`tail.prev` or the heap top) and must delete the map entry.
+
+It stores `heapIdx` so `heap.Remove` and `heap.Fix` run in O(log n) without searching.
 
 ## Step 4: Relationships
 
@@ -162,7 +221,13 @@ No `context.Context` on `Get`/`Put`: they never block on I/O. Only the janitor, 
 
 ## Step 6: Storage and repositories
 
-Nothing is persisted, so there is no repository. When the cache must be shared by many instances or survive restarts, use Redis instead: `SET key val EX 60` gives the TTL and `maxmemory-policy allkeys-lru` gives eviction ([[Redis Fundamentals]]). Redis also offers `volatile-ttl`, which evicts keys that have a TTL, shortest remaining TTL first (approximated by sampling, like its LRU). That is close to this design's expired-first rule, but it evicts live keys that expire soon, while this cache only puts dead keys ahead of the LRU entry.
+Nothing is persisted, so there is no repository.
+
+When the cache must be shared by many instances or survive restarts, use Redis instead: `SET key val EX 60` gives the TTL and `maxmemory-policy allkeys-lru` gives eviction ([[Redis Fundamentals]]).
+
+Redis also offers `volatile-ttl`, which evicts keys that have a TTL, shortest remaining TTL first (approximated by sampling, like its LRU).
+
+That is close to this design's expired-first rule, but it evicts live keys that expire soon, while this cache only puts dead keys ahead of the LRU entry.
 
 ## Step 7: Patterns
 
@@ -752,7 +817,11 @@ Common mistakes: a map without a list (no order) or a slice for order (O(n) move
 **Choices made:**
 
 - **Expired-first eviction:** a full cache drops a dead entry before a live one. The cost is the heap: `Put` with a TTL becomes O(log n) and each node carries `heapIdx`. The cheaper alternative is to evict `tail.prev` always and state that policy; it is O(1) but can throw out a live entry while dead ones hold memory.
-- **Lazy plus active expiry:** lazy removal on `Get` keeps "never return expired" exact; the janitor reclaims memory from keys nobody reads. Redis does the same: a key expires passively when a client touches it, and an active cycle periodically checks keys that have a TTL and deletes the expired ones. The EXPIRE docs for Redis before 6.0 gave fixed numbers (10 runs per second, 20 random keys per run, repeat while more than 25% were expired). Redis 6.0 rewrote the cycle and made its effort tunable with `active-expire-effort` (1 to 10, default 1); at the default it tries to keep expired-but-unreclaimed keys under about 10% while bounding the CPU it spends. The current docs give no fixed numbers, so quote the old ones only as the classic algorithm.
+- **Lazy plus active expiry:** lazy removal on `Get` keeps "never return expired" exact; the janitor reclaims memory from keys nobody reads.
+  - Redis does the same: a key expires passively when a client touches it, and an active cycle periodically checks keys that have a TTL and deletes the expired ones.
+  - The EXPIRE docs for Redis before 6.0 gave fixed numbers (10 runs per second, 20 random keys per run, repeat while more than 25% were expired).
+  - Redis 6.0 rewrote the cycle and made its effort tunable with `active-expire-effort` (1 to 10, default 1); at the default it tries to keep expired-but-unreclaimed keys under about 10% while bounding the CPU it spends.
+  - The current docs give no fixed numbers, so quote the old ones only as the classic algorithm.
 - **Absolute TTL:** `Get` does not extend it. A sliding TTL (session caches) would call `setExpiry` in `Get` too.
 - **Hand-rolled list vs `container/list`:** `list.Element.Value` is `any`, so you lose type safety; the generic hand-rolled list shows the pointer work interviewers ask for.
 
@@ -785,7 +854,9 @@ Common mistakes: a map without a list (no order) or a slice for order (O(n) move
 
 ![[LRU Cache LLD Drawing.excalidraw]]
 
-The drawing shows the map pointing into the doubly linked list with head and tail sentinels, the Get flow with its expired branch, and the Put flow with update and evict branches. It predates the expiry heap: when you redraw it, add the heap under the list with arrows to the TTL nodes, and the "heap top expired?" decision before "evict tail.prev".
+The drawing shows the map pointing into the doubly linked list with head and tail sentinels, the Get flow with its expired branch, and the Put flow with update and evict branches.
+
+It predates the expiry heap: when you redraw it, add the heap under the list with arrows to the TTL nodes, and the "heap top expired?" decision before "evict tail.prev".
 
 Redraw it from memory: the map arrows into list nodes, the sentinels and which end is evicted, the node fields and why `key` and `heapIdx` are stored, both flows, and where the lock is taken and the callback runs.
 
@@ -830,3 +901,8 @@ I combine a hash map from key to node with a doubly linked list ordered by recen
 - **Before this:** [[Heaps and Priority Queues]], [[Concurrency for LLD]], [[Testing LLD Code]]
 - **Next:** [[Elevator System]], [[In-memory KV Store with TTL and Transactions]], [[Rate Limiter]]
 - **Compare with:** [[Cache Eviction Policies - LRU, LFU, TTL]], [[Redis Fundamentals]], [[Consistent Hashing]]
+
+### Watch on YouTube
+
+- [LRU Cache - Twitch Interview Question - Leetcode 146](https://www.youtube.com/watch?v=7ABFKPK2hD4) · NeetCode · 17 min · 565,626 views
+- [L18. Implement LRU Cache](https://www.youtube.com/watch?v=z9bJUPxzFOw) · take U forward · 24 min · 390,857 views

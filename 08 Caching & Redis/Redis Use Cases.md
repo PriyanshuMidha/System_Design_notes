@@ -11,13 +11,15 @@ sources:
   - "redis.io docs, Sorted sets (ZINCRBY, ZREVRANGE WITHSCORES, ZREVRANK)"
   - "OWASP Session Management Cheat Sheet (random session IDs of at least 64 bits of entropy)"
   - "Measured on Redis 8.2.1: redis-cli sessions for ZSET, bitmap, geo; Go tests against port 6392"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Redis Use Cases
 
 > [!summary] TL;DR
-> Redis earns its place in a backend through a handful of recurring jobs: caching, sessions, one-time codes, counters and rate limits, leaderboards, unique counts, daily-active bitmaps, nearby search, short-lived locks, idempotency keys and lightweight messaging. Each job maps to one data structure, one key pattern and one TTL rule; this note shows that mapping, the correct commands, and where Redis is the wrong tool.
+> Redis earns its place in a backend through a handful of recurring jobs: caching, sessions, one-time codes, counters and rate limits, leaderboards, unique counts, daily-active bitmaps, nearby search, short-lived locks, idempotency keys and lightweight messaging.
+>
+> Each job maps to one data structure, one key pattern and one TTL rule; this note shows that mapping, the correct commands, and where Redis is the wrong tool.
 
 > [!abstract] Core idea
 > - Every use case is "data structure + key pattern + TTL + failure policy". Get those four right and the feature is simple.
@@ -25,6 +27,51 @@ updated: 2026-11-04
 > - Sessions are keyed by a random session ID, never by user ID; locks carry a random token and are released only by their owner.
 > - A Redis lock is a lease that can expire under you; correctness-critical locks also need fencing tokens.
 > - Classic mistake: making Redis the only copy of data you cannot lose.
+
+## Start here: the basics
+
+**The problem in one story.**
+Your ticketing app keeps everything in a normal database.
+Then product asks for live leaderboards, login codes, "max 5 tries per minute" limits and "don't charge twice" checks.
+Each one is slow or awkward in SQL but takes one or two Redis commands.
+This note is the catalogue of those jobs and how to do each one right.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Data structure | A shape for storing data | Hash, list, set, sorted set |
+| Key pattern | A naming scheme for keys | `session:<random-id>`, `rl:user:42:min` |
+| TTL | Auto-delete timer on a key | `SET otp:42 913 EX 300` = 5 minutes |
+| Rate limit | A cap on how often something may happen | 5 login tries per minute |
+| Lock / lease | "Only one worker may do this right now", with an expiry | `SET lock:report <token> NX PX 30000` |
+| Idempotency key | An ID that makes a repeated request run only once | Retrying a payment does not charge twice |
+| Sorted set | A set where each member has a score, kept in order | Leaderboard: player → points |
+| Lua script | A small program Redis runs atomically on the server | Check-and-delete a lock in one step |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    F["Feature need"] --> D["Pick data structure"]
+    D --> K["Pick key pattern"]
+    K --> T["Pick TTL rule"]
+    T --> P["Pick failure policy<br/>(Redis down?)"]
+    P --> Done["Simple, correct feature"]
+```
+
+**Analogy.** Redis is a toolbox: a leaderboard needs the sorted-set tool, a login code needs a string with a timer, a counter needs `INCR`. Pick the right tool and the job takes one move.
+Where it breaks: a toolbox never loses its tools, but Redis can lose recent data in a crash, so it must not be the only copy of anything you cannot lose.
+
+**How the rest of this note builds up**
+
+- First, the kinds of requests that push a team to Redis (section 1) and the "structure + key + TTL + failure policy" model (section 2).
+- Then each use case mapped to its structure and key pattern, plus the lock hazard (section 3).
+- Then working Go code: leaderboard, owner-token lock, idempotency key, sessions, with tests (section 4).
+- Finally alternatives, trade-offs, production notes and the SDE-3 deep dive including fencing tokens and the Redlock debate (sections 5-9).
+
+> [!tip] Remember
+> Every Redis use case is four choices: data structure, key pattern, TTL, and what happens when Redis is down.
 
 ## 1. Why it exists
 
@@ -139,7 +186,12 @@ sequenceDiagram
     R-->>B: 1, released
 ```
 
-Two things save the day here. The **token check** on release stops A from deleting B's lock. The **fencing token** (a number that increases each time the lock is granted, checked by the resource) stops A's late write. Redis alone gives you the first. The second needs a source of increasing numbers (for example `INCR lock:report:fence` at acquire time, or a consensus store's revision) and a storage layer that rejects lower tokens; `SET NX PX` itself produces no fencing token.
+Two things save the day here:
+
+- The **token check** on release stops A from deleting B's lock.
+- The **fencing token** (a number that increases each time the lock is granted, checked by the resource) stops A's late write.
+
+Redis alone gives you the first. The second needs a source of increasing numbers (for example `INCR lock:report:fence` at acquire time, or a consensus store's revision) and a storage layer that rejects lower tokens; `SET NX PX` itself produces no fencing token.
 
 ## 4. Worked example
 
@@ -531,7 +583,13 @@ Measured: `go test -race ./usecases/` against Redis 8.2 passed all five tests. I
 | Idempotency | `SET NX EX` | Unique constraint in the database | Always also do this for money |
 | Messaging | Pub/Sub, Streams | Kafka, NATS, SQS | Long retention, huge throughput, replay over days |
 
-The **Redlock debate** in brief: Redlock acquires the same lock on a majority of independent Redis primaries (for example 3 of 5) to survive one node failing. Martin Kleppmann argued in 2016 that it still depends on bounded clock drift and pauses, and cannot give fencing tokens, so it is unsafe for correctness; Salvatore Sanfilippo (antirez) replied that its assumptions are reasonable in practice. The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (avoiding duplicate work); for correctness, use fencing tokens with a consensus-based store. See [[Distributed Locks and Fencing Tokens]].
+The **Redlock debate** in brief:
+
+- Redlock acquires the same lock on a majority of independent Redis primaries (for example 3 of 5) to survive one node failing.
+- Martin Kleppmann argued in 2016 that it still depends on bounded clock drift and pauses, and cannot give fencing tokens, so it is unsafe for correctness.
+- Salvatore Sanfilippo (antirez) replied that its assumptions are reasonable in practice.
+
+The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (avoiding duplicate work); for correctness, use fencing tokens with a consensus-based store. See [[Distributed Locks and Fencing Tokens]].
 
 ## 6. Trade-offs and when not to use
 
@@ -603,3 +661,8 @@ The **Redlock debate** in brief: Redlock acquires the same lock on a majority of
 - **Next:** [[Caching Patterns]], [[Redis in Production - Memory, Latency, Security]]
 - **Owned elsewhere:** [[Rate Limiting - Algorithms and Distributed Design]], [[Distributed Locks and Fencing Tokens]], [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Sessions and Cookies]], [[Idempotency and Idempotency Keys]], [[Case Study - Leaderboard and Top-K]]
 - **Compare with:** [[Hot Keys and Hot Partitions]], [[Redis in Go]]
+
+### Watch on YouTube
+
+- [Top 5 Redis Use Cases](https://www.youtube.com/watch?v=a4yX7RUgTxI) · ByteByteGo · 6 min · 273,898 views
+- [Redis Crash Course - the What, Why and How to use Redis as your primary database](https://www.youtube.com/watch?v=OqCK95AS-YE) · TechWorld with Nana · 23 min · 590,386 views

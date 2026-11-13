@@ -10,7 +10,7 @@ sources:
   - "go.dev/security/vuln (govulncheck)"
   - "github.com/go-delve/delve documentation"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Go Toolchain, Tooling and Debugging
@@ -24,6 +24,50 @@ updated: 2026-11-07
 > - `GOOS`/`GOARCH` let you build a Linux binary from a Mac without installing Linux.
 > - `GOTOOLCHAIN` can download and switch to a newer Go version automatically when a dependency needs it.
 > - Delve runs your program under a debugger so you can stop it at a breakpoint and read its goroutines and variables directly, instead of guessing from `fmt.Println`.
+
+## Start here: the basics
+
+**The problem in one story.**
+You write some Go code and it compiles with no errors.
+You ship it, and a log line prints `%!d(string=alice)` instead of a user ID.
+The compiler only checked that the code was legal, not that it made sense.
+The Go toolchain is the kit of commands that catches these mistakes, formats your code, builds it for other machines, and lets you pause a running program to look inside.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Compiler | Turns source code into a program the machine can run | `go build` makes a binary |
+| Binary | The single runnable file the compiler produces | `./server` |
+| Linter | A tool that reads code and flags likely mistakes | `go vet` spotting a wrong `%d` |
+| Cross-compile | Build a program for a different OS or CPU than yours | Linux binary built on a Mac |
+| Debugger | Runs your program so you can pause it and inspect values | Delve (`dlv`) stopping at line 42 |
+| Stack trace | The list of function calls active when something crashed | `main.handler` → `main.parse` |
+| Goroutine | A lightweight task Go runs concurrently | `go worker()` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Your code"] --> F["gofmt:<br/>same style"]
+    F --> V["go vet / linters:<br/>likely bugs"]
+    V --> B["go build:<br/>binary"]
+    B --> T["go test:<br/>checks behavior"]
+    B --> D["Delve:<br/>pause and inspect"]
+```
+
+**Analogy.** Writing code is like writing an essay: the compiler is a grammar check, `go vet` is a teacher spotting sentences that are grammatical but wrong, `gofmt` is the house style guide, and Delve is pausing a video to study one frame.
+Where it breaks: a teacher reads all of it; `go vet` only knows a fixed list of patterns, so it misses bugs outside them.
+
+**How the rest of this note builds up**
+
+- First, why tooling exists (section 1) and the "rings around your code" mental model (section 2).
+- Then the daily commands, `go vet`, build flags, cross-compiling and `GOTOOLCHAIN` (section 3).
+- Then Delve, reading panics and goroutine dumps, and `govulncheck`, with a worked example (sections 3-4).
+- Finally the SDE-3 deep dive: production practice, why vet is separate from the compiler, and `-ldflags -X` details (sections 6-8).
+
+> [!tip] Remember
+> Compiling proves the code is legal; `go vet`, tests and the debugger prove it does what you meant.
 
 ## 1. Why it exists
 
@@ -72,7 +116,9 @@ flowchart LR
 
 ### Installing and upgrading Go
 
-The official installer (go.dev/dl) replaces the whole toolchain in place: download the archive for your OS/arch, and a new `go` on `PATH` is the only change — no separate updater, no package-manager-specific quirks to track across machines (though `brew install go`, `apt install golang-go` and similar work too, each on its own upgrade cadence). To keep more than one version side by side instead of replacing the default, install a specific release as its own binary:
+The official installer (go.dev/dl) replaces the whole toolchain in place: download the archive for your OS/arch, and a new `go` on `PATH` is the only change — no separate updater, no package-manager-specific quirks to track across machines (though `brew install go`, `apt install golang-go` and similar work too, each on its own upgrade cadence).
+
+To keep more than one version side by side instead of replacing the default, install a specific release as its own binary:
 
 ```bash
 go install golang.org/dl/go1.25.0@latest   # fetches a small wrapper binary named go1.25.0
@@ -143,7 +189,9 @@ bin/invoiceops-linux-arm64: ELF 64-bit LSB executable, ARM aarch64, ... statical
 ```
 *(measured: cross-compiled on darwin/arm64 to GOOS=linux GOARCH=arm64, Go 1.24.4, 2026-11-07)*
 
-`CGO_ENABLED=0` matters for container images: with cgo off, the binary is statically linked and needs no C runtime, so it runs in a `FROM scratch` or `distroless` image. With cgo on (the default when a C toolchain is present and you're not cross-compiling), the binary dynamically links `libc`, and cross-compiling it needs a matching C cross-toolchain, which is why most Dockerfiles building Go set `CGO_ENABLED=0` explicitly.
+`CGO_ENABLED=0` matters for container images: with cgo off, the binary is statically linked and needs no C runtime, so it runs in a `FROM scratch` or `distroless` image.
+
+With cgo on (the default when a C toolchain is present and you're not cross-compiling), the binary dynamically links `libc`, and cross-compiling it needs a matching C cross-toolchain, which is why most Dockerfiles building Go set `CGO_ENABLED=0` explicitly.
 
 ### GOTOOLCHAIN: the Go version can switch itself
 
@@ -180,7 +228,9 @@ require (
 
 ### go generate
 
-`//go:generate` directives are comments that `go generate` executes literally; the compiler ignores them completely. The common ones: `stringer -type=InvoiceStatus` writes a `String()` method for an enum (by hand in the worked example below, since `stringer` needs a network install); `mockgen` writes mock implementations of an interface for tests; `sqlc generate` turns annotated SQL files into typed Go query functions. None of this runs automatically — `go build` never invokes `go:generate` — so generated files are committed, and CI should run `go generate ./... && git diff --exit-code` to catch a stale generated file.
+`//go:generate` directives are comments that `go generate` executes literally; the compiler ignores them completely. The common ones: `stringer -type=InvoiceStatus` writes a `String()` method for an enum (by hand in the worked example below, since `stringer` needs a network install); `mockgen` writes mock implementations of an interface for tests; `sqlc generate` turns annotated SQL files into typed Go query functions.
+
+None of this runs automatically — `go build` never invokes `go:generate` — so generated files are committed, and CI should run `go generate ./... && git diff --exit-code` to catch a stale generated file.
 
 ### gopls in the editor
 
@@ -196,7 +246,15 @@ echo $(go env GOROOT)/src   # where the standard library's source lives locally
 
 `pkg.go.dev` is the same documentation rendered as a public, linkable website — useful for browsing a package's full API or an unfamiliar third-party module in a browser, including past versions, where `go doc` only shows what is on disk right now for the module you're standing in.
 
-A repeatable way to read an unfamiliar package (worth doing for `net/http`, `context`, `database/sql`, `encoding/json`, `sync`, `time`): start from its exported API in `go doc`, open the type whose name the package centers on, read its doc comment, find where it implements the interfaces you already know (`io.Reader`, `error`), trace one call on its happy path, then trace what happens when it returns an error. Finish by running a five-line experiment against the real package rather than trusting your read of it. Reading `net/http.Server.Shutdown`'s source this way is the fastest way to actually understand graceful shutdown, rather than repeating the shape of it from a blog post (see [[Graceful Shutdown and Health Checks]], which is where that pattern is used).
+A repeatable way to read an unfamiliar package (worth doing for `net/http`, `context`, `database/sql`, `encoding/json`, `sync`, `time`):
+
+1. Start from its exported API in `go doc`.
+2. Open the type whose name the package centers on, and read its doc comment.
+3. Find where it implements the interfaces you already know (`io.Reader`, `error`).
+4. Trace one call on its happy path.
+5. Then trace what happens when it returns an error.
+
+Finish by running a five-line experiment against the real package rather than trusting your read of it. Reading `net/http.Server.Shutdown`'s source this way is the fastest way to actually understand graceful shutdown, rather than repeating the shape of it from a blog post (see [[Graceful Shutdown and Health Checks]], which is where that pattern is used).
 
 ### Debugging with Delve
 
@@ -236,7 +294,9 @@ main.main()
 ```
 *(verified shape: `go run` on a function that indexes past the end of a 3-element slice; checked against an actual run)*
 
-`[running]` is the goroutine's state (others: `[chan receive]`, `[select]`, `[IO wait]`, `[semacquire]` for a blocked mutex); `+0x1a4` is a program-counter offset, useful mainly for matching two reports of the same crash, not for reading by hand. Goroutine 1 (the one `main` runs on) never gets a `created by` footer, because nothing but the runtime started it; a goroutine launched with `go f()` does get one, naming the function and line that ran the `go` statement — often the most useful line for finding *why* that goroutine exists at all:
+`[running]` is the goroutine's state (others: `[chan receive]`, `[select]`, `[IO wait]`, `[semacquire]` for a blocked mutex); `+0x1a4` is a program-counter offset, useful mainly for matching two reports of the same crash, not for reading by hand.
+
+Goroutine 1 (the one `main` runs on) never gets a `created by` footer, because nothing but the runtime started it; a goroutine launched with `go f()` does get one, naming the function and line that ran the `go` statement — often the most useful line for finding *why* that goroutine exists at all:
 
 ```text
 goroutine 3 [chan receive]:
@@ -265,7 +325,9 @@ stateDiagram-v2
     Running --> [*]: returns / panics
 ```
 
-A process that is stuck rather than crashed can still be inspected: sending `SIGQUIT` (`kill -QUIT <pid>`, or Ctrl-\ in a foreground terminal) makes Go print every goroutine's stack and then exit — the single fastest way to answer "what is this hung process actually doing" in production. `GOTRACEBACK=all` (the default for a crash) or `=system` controls how much of that dump includes runtime-internal goroutines.
+A process that is stuck rather than crashed can still be inspected: sending `SIGQUIT` (`kill -QUIT <pid>`, or Ctrl-\ in a foreground terminal) makes Go print every goroutine's stack and then exit — the single fastest way to answer "what is this hung process actually doing" in production.
+
+`GOTRACEBACK=all` (the default for a crash) or `=system` controls how much of that dump includes runtime-internal goroutines.
 
 `GODEBUG` is a single environment variable carrying multiple comma-separated settings that change runtime behaviour or print diagnostics: `GODEBUG=gctrace=1` prints one line per garbage-collection cycle; `GODEBUG=schedtrace=1000` prints scheduler state every 1000ms; `GODEBUG=http2debug=1` traces HTTP/2 frames. These are opt-in and meant for a one-off investigation, not for always-on production logging.
 
@@ -382,8 +444,12 @@ ok  	toolchaindemo	2.605s
 
 ## 8. Deep dive
 
-- **Why vet is separate from the compiler.** The compiler's job is "is this valid Go", a yes/no question with no false positives allowed, because a false positive would break every build using a legal pattern. `go vet`'s analyzers are allowed occasional false positives because they are advisory, not blocking by default — which is also why `go vet` runs automatically before `go test` but a vet failure does not stop `go build`.
-- **Why `-ldflags -X` only works on `var`, never `const`.** A `const` is substituted at compile time into every place it's used, so there is no single memory location left to overwrite at link time. A package-level `var string` has one address in the resulting binary that the linker can patch after compilation but before the final executable is written — the entire mechanism depends on that one addressable, mutable location existing.
+- **Why vet is separate from the compiler.** The compiler's job is "is this valid Go", a yes/no question with no false positives allowed, because a false positive would break every build using a legal pattern.
+
+  `go vet`'s analyzers are allowed occasional false positives because they are advisory, not blocking by default — which is also why `go vet` runs automatically before `go test` but a vet failure does not stop `go build`.
+- **Why `-ldflags -X` only works on `var`, never `const`.** A `const` is substituted at compile time into every place it's used, so there is no single memory location left to overwrite at link time.
+
+  A package-level `var string` has one address in the resulting binary that the linker can patch after compilation but before the final executable is written — the entire mechanism depends on that one addressable, mutable location existing.
 - **How `GOTOOLCHAIN=auto` decides what to download.** It compares the `go` line in your own `go.mod` and the `go` lines of every dependency's `go.mod`; if any requires a higher minimum than your installed `go`, it downloads and execs that exact version as a subprocess (cached under `$GOPATH/pkg/mod/golang.org/toolchain@<version>`), leaving the originally installed `go` binary completely unchanged on disk.
 - **Why the race detector is 5-10x slower.** It instruments every memory access and synchronization operation to record a vector clock per goroutine, so it can detect "goroutine A wrote X, goroutine B read X, with no happens-before edge between them" — a check that costs real CPU and memory on every read and write, not just occasionally.
 
@@ -393,13 +459,17 @@ ok  	toolchaindemo	2.605s
 > Either `go vet` wasn't run at all (no CI step), or it ran only locally where a developer can ignore its output. The fix is to make `go vet ./...` (or a linter that includes it) a blocking CI step, not an optional local habit.
 
 > [!question]- What's the difference between `go build -race` and `go vet`'s `copylocks` check?
-> `copylocks` is static: it flags a `sync.Mutex` copied by value just by reading the code, with no execution needed. `-race` is dynamic: it instruments a running binary and only reports races that the actual test run exercises, so it can miss a race in an untested code path. They catch overlapping but different things — static structural mistakes versus actually-observed concurrent access.
+> `copylocks` is static: it flags a `sync.Mutex` copied by value just by reading the code, with no execution needed. `-race` is dynamic: it instruments a running binary and only reports races that the actual test run exercises, so it can miss a race in an untested code path.
+>
+> They catch overlapping but different things — static structural mistakes versus actually-observed concurrent access.
 
 > [!question]- Trap: if `GOTOOLCHAIN=auto` downloads a newer Go version for a build, does that change what's installed on my machine?
 > No. It downloads a toolchain into Go's module cache and execs it as a subprocess for that build only; the `go` binary on your `PATH` is untouched. Only `go install golang.org/dl/go1.x@latest` plus running that installer actually installs a new version on `PATH`.
 
 > [!question]- Why does `-ldflags "-X main.version=..."` require a `var`, and what happens if you try it on a `const`?
-> The `go build` command silently does nothing: `-X` patches the value at a specific address in the compiled binary, and a `const` has no address because the compiler inlines its value everywhere it's used at compile time. There is no error; the binary just keeps the default value, which is a common source of "my version injection isn't working" confusion.
+> The `go build` command silently does nothing: `-X` patches the value at a specific address in the compiled binary, and a `const` has no address because the compiler inlines its value everywhere it's used at compile time.
+>
+> There is no error; the binary just keeps the default value, which is a common source of "my version injection isn't working" confusion.
 
 > [!question]- A service is unresponsive in production, with no crash and no useful logs. What's the fastest way to see what it's actually doing, without restarting it?
 > Send it `SIGQUIT`. Go prints every goroutine's current stack trace and state (`running`, `chan receive`, `semacquire`, etc.) to stderr, then the process exits. That single dump usually shows the blocked call (a DB query, a channel send with no receiver) directly, faster than adding logging and redeploying.
@@ -426,3 +496,8 @@ ok  	toolchaindemo	2.605s
 - **Before this:** none — this is the entry point for the folder.
 - **Next:** [[Syntax, Types and Control Flow]], [[Testing in Go]]
 - **Compare with:** [[Benchmarks, Profiling and Tracing]] (pprof and tracing go deeper on performance tools than this note's brief mention), [[Go Interview Questions and Traps]]
+
+### Watch on YouTube
+
+- [Go (Golang) Debugging with Delve](https://www.youtube.com/watch?v=a1SneuI65O0) · Golang Cafe · practical intro to debugging Go programs with Delve
+- [Hands on debugging with Delve](https://www.youtube.com/watch?v=iQZHMic9dWk) · source{d} · hands-on demo of real Delve debugging sessions

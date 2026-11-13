@@ -10,7 +10,7 @@ sources:
   - "Go issue tracker and release notes, tls10server GODEBUG setting (Go 1.22 TLS 1.2 floor)"
   - "RFC 9113, HTTP/2 (ALPN protocol id \"h2\")"
   - "golang.org/x/net/http2 source (ConfigureServer, ConfigureTransport) and net/http/httptest source (Server.StartTLS), read while building and fixing this note's test harness"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # TLS, HTTPS and HTTP2 in Go Servers
@@ -24,6 +24,51 @@ updated: 2026-11-07
 > - `ListenAndServeTLS` only accepts file paths; `ServeTLS` (or `TLSConfig` + `ListenAndServe`) is what you need for certificates built or stored anywhere else.
 > - mTLS is `ClientAuth: RequireAndVerifyClientCert` plus a `ClientCAs` pool — it is Go's generic service-to-service auth primitive, not just a browser feature.
 > - What TLS version and cipher theory actually mean is [[TLS and HTTPS]]'s job; this note only covers the Go server code that configures them.
+
+## Start here: the basics
+
+**The problem in one story.**
+A customer opens your invoice site on café Wi-Fi.
+Without encryption, anyone on that Wi-Fi can read their login and invoices.
+HTTPS wraps every request in TLS, so only your server can read it.
+Your Go server must also prove it is really your site, using a certificate, and swap that certificate when it expires without going offline.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| TLS | The encryption layer under HTTPS | TLS 1.3 handshake |
+| HTTPS | HTTP sent inside TLS | `https://api.invoiceops.com` |
+| Certificate | A signed file proving a server owns a domain | Issued by Let's Encrypt |
+| Handshake | The opening exchange that agrees keys and checks the certificate | ClientHello, ServerHello |
+| SNI | The domain name the client asks for at the start | `api.invoiceops.com` |
+| ALPN | The handshake field choosing which protocol to speak | `"h2"` or `"http/1.1"` |
+| HTTP/2 | HTTP that sends many requests at once on one connection | Multiplexed streams |
+| mTLS | Both sides show certificates, not just the server | Service-to-service auth |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C["Client connects"] --> H["TLS handshake<br/>(SNI + ALPN)"]
+    H --> G["Server picks cert<br/>via GetCertificate"]
+    G --> A{"ALPN result"}
+    A -- "h2" --> H2["HTTP/2"]
+    A -- "http/1.1" --> H1["HTTP/1.1"]
+```
+
+**Analogy.** TLS is a sealed envelope plus an ID card: the card (certificate) proves who you are, the seal keeps the letter private.
+Where it breaks: a real ID card does not get replaced every 90 days while you keep talking; a Go server must hot-swap certificates mid-traffic.
+
+**How the rest of this note builds up**
+
+- First, why HTTPS matters for a Go service (section 1) and the mental model (section 2).
+- Then how it works: HTTP/2 via ALPN, h2c, reloadable certificates, mTLS, termination topologies, redirects/HSTS and client-side TLS (section 3).
+- Then a full Go worked example and a comparison of certificate sources (sections 4-5).
+- Finally the SDE-3 deep dive: trade-offs, production rotation and handshake internals (sections 6-8).
+
+> [!tip] Remember
+> One `tls.Config` gives HTTPS, HTTP/2 via ALPN, and hot-reloadable certificates through `GetCertificate`.
 
 ### Whiteboard version
 
@@ -53,7 +98,9 @@ Two things go wrong if a Go backend engineer treats TLS as "someone else's job" 
 
 ## 2. Mental model
 
-A `tls.Config` is a policy document the Go runtime consults at three moments: when choosing which certificate to show (`GetCertificate`, called fresh per handshake — never cached by Go itself), when deciding the lowest protocol version it will accept (`MinVersion`), and when agreeing with the client on an application protocol (`NextProtos`, via ALPN). None of these are "set once and the runtime remembers" — they are read live on every new TLS handshake, which is exactly what makes hot reload possible: swap what `GetCertificate` returns, and the *next* handshake sees the new certificate, with existing connections on the old one left alone until they naturally close.
+A `tls.Config` is a policy document the Go runtime consults at three moments: when choosing which certificate to show (`GetCertificate`, called fresh per handshake — never cached by Go itself), when deciding the lowest protocol version it will accept (`MinVersion`), and when agreeing with the client on an application protocol (`NextProtos`, via ALPN).
+
+None of these are "set once and the runtime remembers" — they are read live on every new TLS handshake, which is exactly what makes hot reload possible: swap what `GetCertificate` returns, and the *next* handshake sees the new certificate, with existing connections on the old one left alone until they naturally close.
 
 ## 3. How it works
 
@@ -73,13 +120,19 @@ Disabling HTTP/2 deliberately (rare — usually only to debug a transport-layer 
 
 ### Cleartext HTTP/2 (h2c)
 
-HTTP/2 without TLS exists for internal traffic where the TLS handshake cost isn't worth paying (a load balancer that already terminated TLS, talking to the backend over a private network). Since Go 1.24, `http.Protocols` and `Server.Protocols.SetUnencryptedHTTP2(true)` enable it directly in the stdlib; before 1.24, the same thing needed `golang.org/x/net/http2/h2c` as a handler wrapper. gRPC over h2c between internal services is the most common place this shows up (link [[gRPC Services in Go]]).
+HTTP/2 without TLS exists for internal traffic where the TLS handshake cost isn't worth paying (a load balancer that already terminated TLS, talking to the backend over a private network).
+
+Since Go 1.24, `http.Protocols` and `Server.Protocols.SetUnencryptedHTTP2(true)` enable it directly in the stdlib; before 1.24, the same thing needed `golang.org/x/net/http2/h2c` as a handler wrapper. gRPC over h2c between internal services is the most common place this shows up (link [[gRPC Services in Go]]).
 
 ### Certificate sources: a hot-reloadable store
 
 `ListenAndServeTLS(certFile, keyFile)` only ever reads those two files once, at startup. Anything that needs to change the certificate later — ACME renewal, a secret manager rotating a cert, blue-green cutover to a new CA — needs `tls.Config.GetCertificate` instead: a function called on every handshake, which can read from a `sync.RWMutex`-guarded store, a channel-fed cache, or `autocert.Manager.GetCertificate` for Let's Encrypt.
 
-A `tls.Certificate` built from a PEM file (or `tls.X509KeyPair`) expects the leaf certificate first, followed by any intermediates in order up to (but not including) a CA the client already trusts — a chain with the order reversed, or a missing intermediate, is the single most common "works on my machine, fails for real clients" certificate bug, because browsers and curl often cache or ship the intermediate separately while a bare Go `tls.Dial` does not. The leaf's `DNSNames` (and `IPAddresses` for an IP-addressed backend) are its Subject Alternative Names, the field TLS clients actually check the hostname against; a `CommonName` alone is not trusted by modern clients. For local development, `mkcert` creates a local CA, installs it in the OS/browser trust store, and issues leaf certificates against it, so the same code path that will run against a real CA in production also runs correctly on a laptop with no "accept the warning" step.
+A `tls.Certificate` built from a PEM file (or `tls.X509KeyPair`) expects the leaf certificate first, followed by any intermediates in order up to (but not including) a CA the client already trusts — a chain with the order reversed, or a missing intermediate, is the single most common "works on my machine, fails for real clients" certificate bug, because browsers and curl often cache or ship the intermediate separately while a bare Go `tls.Dial` does not.
+
+The leaf's `DNSNames` (and `IPAddresses` for an IP-addressed backend) are its Subject Alternative Names, the field TLS clients actually check the hostname against; a `CommonName` alone is not trusted by modern clients.
+
+For local development, `mkcert` creates a local CA, installs it in the OS/browser trust store, and issues leaf certificates against it, so the same code path that will run against a real CA in production also runs correctly on a laptop with no "accept the warning" step.
 
 ```mermaid
 stateDiagram-v2
@@ -96,7 +149,9 @@ stateDiagram-v2
 
 ### mTLS: the Go-generic service-to-service pattern
 
-Requiring and verifying a client certificate is `ClientAuth: tls.RequireAndVerifyClientCert` plus a `ClientCAs` pool containing whatever CA signed the calling services' certificates. The verified chain is available on the connection as `r.TLS.VerifiedChains`, and the client's certificate subject (often a SPIFFE ID in `URIs`, or a `CommonName`) becomes the caller's identity — the same job an API key or JWT does for external clients, but anchored in the TLS handshake itself rather than an application-layer header that a handler could forget to check.
+Requiring and verifying a client certificate is `ClientAuth: tls.RequireAndVerifyClientCert` plus a `ClientCAs` pool containing whatever CA signed the calling services' certificates.
+
+The verified chain is available on the connection as `r.TLS.VerifiedChains`, and the client's certificate subject (often a SPIFFE ID in `URIs`, or a `CommonName`) becomes the caller's identity — the same job an API key or JWT does for external clients, but anchored in the TLS handshake itself rather than an application-layer header that a handler could forget to check.
 
 ### Termination topologies
 
@@ -108,11 +163,21 @@ Requiring and verifying a client certificate is `ClientAuth: tls.RequireAndVerif
 
 ### Redirecting plain HTTP to HTTPS, and HSTS
 
-A Go service that accepts HTTP at all (rather than relying entirely on the load balancer to refuse it) needs a second, plain `http.Server` listening on `:80` whose only handler redirects every request to the `https://` equivalent with `http.StatusMovedPermanently` or `http.StatusPermanentRedirect`. That redirect alone does not stop a downgrade attack on the *next* visit, because the browser has to be redirected once before it learns HTTPS is required — `Strict-Transport-Security` (HSTS) closes that gap: a response header such as `Strict-Transport-Security: max-age=63072000; includeSubDomains`, set on the HTTPS handler, tells the browser to refuse plain HTTP to this host entirely for the next two years, without a server round trip. Set it only on responses actually served over HTTPS, and only once the certificate chain is trusted in production — an HSTS header sent during testing against a self-signed cert can lock a browser out of the real host later.
+A Go service that accepts HTTP at all (rather than relying entirely on the load balancer to refuse it) needs a second, plain `http.Server` listening on `:80` whose only handler redirects every request to the `https://` equivalent with `http.StatusMovedPermanently` or `http.StatusPermanentRedirect`.
+
+That redirect alone does not stop a downgrade attack on the *next* visit, because the browser has to be redirected once before it learns HTTPS is required — `Strict-Transport-Security` (HSTS) closes that gap: a response header such as `Strict-Transport-Security: max-age=63072000; includeSubDomains`, set on the HTTPS handler, tells the browser to refuse plain HTTP to this host entirely for the next two years, without a server round trip.
+
+Set it only on responses actually served over HTTPS, and only once the certificate chain is trusted in production — an HSTS header sent during testing against a self-signed cert can lock a browser out of the real host later.
 
 ### Client-side TLS: the mistake that defeats the whole chapter
 
-Everything above protects a Go process acting as a **server**. A Go process calling another service over HTTPS has its own `tls.Config`, and one setting undoes every certificate check this note describes: `InsecureSkipVerify: true` accepts any certificate from any host, silently turning off the verification that makes TLS meaningful at all — it belongs only in a throwaway local test, never in code that reaches a real network. The correct knob for "I need to trust a private or internal CA" is `RootCAs`, a `*x509.CertPool` built from that CA's certificate, left on an otherwise default `tls.Config`. For debugging a handshake that is failing for reasons that are not obvious from the error alone, `tls.Config.KeyLogWriter` (pointed at a file via the `SSLKEYLOGFILE` convention) lets Wireshark decrypt a capture of the same connection — a diagnostic tool, never something left wired up in a binary that ships.
+Everything above protects a Go process acting as a **server**.
+
+A Go process calling another service over HTTPS has its own `tls.Config`, and one setting undoes every certificate check this note describes: `InsecureSkipVerify: true` accepts any certificate from any host, silently turning off the verification that makes TLS meaningful at all — it belongs only in a throwaway local test, never in code that reaches a real network.
+
+The correct knob for "I need to trust a private or internal CA" is `RootCAs`, a `*x509.CertPool` built from that CA's certificate, left on an otherwise default `tls.Config`.
+
+For debugging a handshake that is failing for reasons that are not obvious from the error alone, `tls.Config.KeyLogWriter` (pointed at a file via the `SSLKEYLOGFILE` convention) lets Wireshark decrypt a capture of the same connection — a diagnostic tool, never something left wired up in a binary that ships.
 
 ## 4. Worked example
 
@@ -342,8 +407,16 @@ func TestMTLSRejectsClientWithoutCert(t *testing.T) {
 The test harness (`newTLSHarness`, `client`) drives `httptest.Server` with our own `tls.Config` instead of its built-in certificate. Getting this right surfaced three sharp edges in `crypto/tls`, `net/http` and `net/http/httptest` worth knowing even outside a test:
 
 - `httptest.Server.StartTLS` always seeds `TLS.Certificates` with its own built-in localhost certificate when the caller's list is empty, purely so it has something to parse for `Server.Certificate()`. It does not remove a configured `GetCertificate`.
-- `crypto/tls`'s internal `getCertificate` only calls a configured `GetCertificate` when `len(Certificates) == 0` **or** the `ClientHello` carries SNI. A client dialing a bare IP address (exactly what `httptest` listens on) sends no SNI by default, so without an explicit `ServerName` on the client's `tls.Config`, the server silently falls back to `Certificates[0]` and `GetCertificate` is never consulted — a reload bug that only shows up when a client connects by IP instead of hostname. The harness sets `ServerName: "localhost"` on every test client specifically to avoid this.
-- Listing `"h2"` in `NextProtos` is not enough to actually serve HTTP/2 through `httptest.Server`: `StartTLS` wraps the listener and calls the plain `Serve`, not `ServeTLS`, so the automatic HTTP/2 wiring that `ServeTLS`/`ListenAndServeTLS` normally does for you never runs — the harness has to call `http2.ConfigureServer(srv.Config, &http2.Server{})` itself (`golang.org/x/net/http2`) before `StartTLS`. The client side has the identical trap in reverse: a `*http.Transport` with a non-nil `TLSClientConfig` does not get HTTP/2 wired up automatically either (the stdlib only does that when `TLSClientConfig`, `Dial` and `DialContext` are all left nil), so the harness also calls `http2.ConfigureTransport` on every test client. Skip either call and `TestALPNNegotiatesHTTP2` fails with `ProtoMajor == 1`, with nothing else in the config or the error log pointing at why: the handshake succeeds, the response comes back, it is just plain HTTP/1.1 over TLS instead of HTTP/2.
+- `crypto/tls`'s internal `getCertificate` only calls a configured `GetCertificate` when `len(Certificates) == 0` **or** the `ClientHello` carries SNI.
+
+  A client dialing a bare IP address (exactly what `httptest` listens on) sends no SNI by default, so without an explicit `ServerName` on the client's `tls.Config`, the server silently falls back to `Certificates[0]` and `GetCertificate` is never consulted — a reload bug that only shows up when a client connects by IP instead of hostname.
+
+  The harness sets `ServerName: "localhost"` on every test client specifically to avoid this.
+- Listing `"h2"` in `NextProtos` is not enough to actually serve HTTP/2 through `httptest.Server`: `StartTLS` wraps the listener and calls the plain `Serve`, not `ServeTLS`, so the automatic HTTP/2 wiring that `ServeTLS`/`ListenAndServeTLS` normally does for you never runs — the harness has to call `http2.ConfigureServer(srv.Config, &http2.Server{})` itself (`golang.org/x/net/http2`) before `StartTLS`.
+
+  The client side has the identical trap in reverse: a `*http.Transport` with a non-nil `TLSClientConfig` does not get HTTP/2 wired up automatically either (the stdlib only does that when `TLSClientConfig`, `Dial` and `DialContext` are all left nil), so the harness also calls `http2.ConfigureTransport` on every test client.
+
+  Skip either call and `TestALPNNegotiatesHTTP2` fails with `ProtoMajor == 1`, with nothing else in the config or the error log pointing at why: the handshake succeeds, the response comes back, it is just plain HTTP/1.1 over TLS instead of HTTP/2.
 
 **Measured:** all three tests in this package pass under `go test -race` on Go 1.24.4, darwin/arm64, 2026-11-07.
 
@@ -377,31 +450,51 @@ The test harness (`newTLSHarness`, `client`) drives `httptest.Server` with our o
 
 ## 8. Deep dive
 
-- **Why SNI changes which code path runs.** `crypto/tls`'s `Config.getCertificate` (unexported, but documented behaviourally) only calls a configured `GetCertificate` when `len(c.Certificates) == 0` **or** the `ClientHello`'s `ServerName` is non-empty. A server with both a static fallback certificate *and* a `GetCertificate` hook will skip the hook entirely for any client that connects without sending SNI — which includes clients that dial a bare IP address rather than a hostname, and some older or minimal TLS clients. This is not a hypothetical: it is the exact bug this note's own test harness had to work around (see the Worked Example) to make `TestHotCertReload` actually exercise the reload path instead of silently passing against a cached default.
-- **Go's TLS version floor.** Since Go 1.22, a server's default minimum TLS version is 1.2 (verified via the `tls10server` GODEBUG knob existing specifically to let operators opt back into the old 1.0 floor during a migration, which confirms 1.2 is the new default). TLS 1.3's cipher suites are not configurable at all in `crypto/tls` — Go picks them, by design, to avoid the historical mistake of letting operators disable AEAD ciphers into a worse configuration.
-- **Session resumption and reload interaction.** Go's client-side `tls.Config.ClientSessionCache`, when set, can resume a previous TLS session without re-presenting or re-verifying the server's certificate at all. A reload test (or a production rollout) that doesn't account for this can appear to show stale certificates "still working" past their rotation — not because the server served the old cert, but because the client's resumed session never asked it to prove its identity again. The worked example above has no `ClientSessionCache` configured on its test clients specifically so every connection performs a full handshake.
+- **Why SNI changes which code path runs.** `crypto/tls`'s `Config.getCertificate` (unexported, but documented behaviourally) only calls a configured `GetCertificate` when `len(c.Certificates) == 0` **or** the `ClientHello`'s `ServerName` is non-empty.
+
+  A server with both a static fallback certificate *and* a `GetCertificate` hook will skip the hook entirely for any client that connects without sending SNI — which includes clients that dial a bare IP address rather than a hostname, and some older or minimal TLS clients.
+
+  This is not a hypothetical: it is the exact bug this note's own test harness had to work around (see the Worked Example) to make `TestHotCertReload` actually exercise the reload path instead of silently passing against a cached default.
+- **Go's TLS version floor.** Since Go 1.22, a server's default minimum TLS version is 1.2 (verified via the `tls10server` GODEBUG knob existing specifically to let operators opt back into the old 1.0 floor during a migration, which confirms 1.2 is the new default).
+
+  TLS 1.3's cipher suites are not configurable at all in `crypto/tls` — Go picks them, by design, to avoid the historical mistake of letting operators disable AEAD ciphers into a worse configuration.
+- **Session resumption and reload interaction.** Go's client-side `tls.Config.ClientSessionCache`, when set, can resume a previous TLS session without re-presenting or re-verifying the server's certificate at all.
+
+  A reload test (or a production rollout) that doesn't account for this can appear to show stale certificates "still working" past their rotation — not because the server served the old cert, but because the client's resumed session never asked it to prove its identity again.
+
+  The worked example above has no `ClientSessionCache` configured on its test clients specifically so every connection performs a full handshake.
 - **Post-quantum key exchange.** Since Go 1.24, the TLS 1.3 client and server negotiate a hybrid X25519MLKEM768 key exchange by default when both peers support it, alongside classical X25519 — a server-side config change is not required to benefit from this, but any code that pins an exact cipher/group list should verify it doesn't accidentally exclude the hybrid group.
 - **mTLS identity extraction.** After a successful mTLS handshake, `r.TLS.VerifiedChains[0][0]` is the leaf certificate Go already verified against `ClientCAs`; pulling a caller's identity from its `Subject.CommonName` or a SPIFFE URI in `URIs` is a server-side decision, not something `crypto/tls` does for you — the middleware that stores this identity in `r.Context()` for handlers to read is the same shape as [[Authentication and Authorization in Go]]'s token-based middleware, just fed by the TLS layer instead of a header.
 
 ## 9. Interview questions
 
 > [!question]- How does a Go server decide between HTTP/1.1 and HTTP/2 for an incoming TLS connection?
-> Through ALPN, during the TLS handshake itself: the client lists protocols it supports in its `ClientHello`, the server's `tls.Config.NextProtos` lists what it is willing to speak, and whichever protocol appears in both — in our config, `"h2"` is listed first — gets selected before a single HTTP byte is exchanged. No separate HTTP/2 server or handler code is involved; the same `http.Server` and handler serve both.
+> Through ALPN, during the TLS handshake itself: the client lists protocols it supports in its `ClientHello`, the server's `tls.Config.NextProtos` lists what it is willing to speak, and whichever protocol appears in both — in our config, `"h2"` is listed first — gets selected before a single HTTP byte is exchanged.
+>
+> No separate HTTP/2 server or handler code is involved; the same `http.Server` and handler serve both.
 
 > [!question]- Why use `GetCertificate` instead of just setting `Certificates` directly?
-> `Certificates` is read once, at the moment a handshake needs it, from whatever static value it holds — rotating the certificate means mutating that field in a way every in-flight and future handshake sees safely, which `GetCertificate` (a function, naturally callable behind a mutex) makes straightforward and `Certificates` does not. It is also the only option when the certificate source is dynamic in the first place, like `autocert.Manager` fetching from Let's Encrypt.
+> `Certificates` is read once, at the moment a handshake needs it, from whatever static value it holds — rotating the certificate means mutating that field in a way every in-flight and future handshake sees safely, which `GetCertificate` (a function, naturally callable behind a mutex) makes straightforward and `Certificates` does not.
+>
+> It is also the only option when the certificate source is dynamic in the first place, like `autocert.Manager` fetching from Let's Encrypt.
 
 > [!question]- A certificate reload doesn't seem to take effect, but only for clients connecting by raw IP address. What's the likely cause?
 > SNI. `crypto/tls` only calls a configured `GetCertificate` when there are zero static `Certificates` configured, or the client's `ClientHello` carries a non-empty `ServerName`. A client connecting by bare IP typically sends no SNI, so if any static fallback certificate is also configured, the server silently serves that stale one instead of calling `GetCertificate` at all.
 
 > [!question]- What is the actual difference between mTLS and a service presenting an API key over HTTPS?
-> With HTTPS alone, only the server proves its identity to the client; the client's identity (if any) is asserted by it, through a bearer token the server must trust was transmitted and stored safely. With mTLS, the client also presents a certificate during the handshake itself, which the server cryptographically verifies against a trusted CA before a single request is processed — identity is proven at the transport layer, not asserted in an application-layer header that a handler could simply forget to check.
+> With HTTPS alone, only the server proves its identity to the client; the client's identity (if any) is asserted by it, through a bearer token the server must trust was transmitted and stored safely.
+>
+> With mTLS, the client also presents a certificate during the handshake itself, which the server cryptographically verifies against a trusted CA before a single request is processed — identity is proven at the transport layer, not asserted in an application-layer header that a handler could simply forget to check.
 
 > [!question]- Trap: does terminating TLS at a load balancer mean a Go backend engineer never needs to think about `tls.Config`?
-> No. Even with edge termination, internal re-encryption hops, mTLS between services, and any passthrough deployment (some cloud TCP load balancers, or a service mesh sidecar expecting the backend to terminate TLS itself) still put a real `tls.Config` in the Go service's own code — "someone else terminates it" is true for some topologies and false for others, and assuming it without checking the actual deployment is the trap.
+> No.
+>
+> Even with edge termination, internal re-encryption hops, mTLS between services, and any passthrough deployment (some cloud TCP load balancers, or a service mesh sidecar expecting the backend to terminate TLS itself) still put a real `tls.Config` in the Go service's own code — "someone else terminates it" is true for some topologies and false for others, and assuming it without checking the actual deployment is the trap.
 
 > [!question]- Why does `h2c` exist, and why is it dangerous to use carelessly?
-> It lets two peers speak HTTP/2's multiplexed, binary framing without paying for a TLS handshake, which matters for internal traffic where a proxy already terminated TLS once. It is dangerous used carelessly because it provides zero confidentiality or integrity — anyone who can observe or tamper with that network segment can read or alter every request, so it belongs only behind a boundary already trusted for plaintext traffic, never across anything resembling the public internet.
+> It lets two peers speak HTTP/2's multiplexed, binary framing without paying for a TLS handshake, which matters for internal traffic where a proxy already terminated TLS once.
+>
+> It is dangerous used carelessly because it provides zero confidentiality or integrity — anyone who can observe or tamper with that network segment can read or alter every request, so it belongs only behind a boundary already trusted for plaintext traffic, never across anything resembling the public internet.
 
 > [!question]- Your test calls `GetCertificate` directly and gets back a certificate, so you assume the live TLS handshake is using it too. What could make that assumption wrong?
 > A static `Certificates` list still configured alongside it, combined with a client connecting without SNI — in that specific combination `crypto/tls` serves `Certificates[0]` and never calls `GetCertificate` for that handshake at all, even though calling the function directly in a test always invokes it correctly.
@@ -426,3 +519,8 @@ The test harness (`newTLSHarness`, `client`) drives `httptest.Server` with our o
 - **Before this:** [[HTTP Server Fundamentals (net-http)]], [[TLS and HTTPS]], [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]
 - **Next:** [[gRPC Services in Go]], [[Secure Coding for Go Services]]
 - **Compare with:** [[Load Balancing]] (where TLS terminates relative to this server), [[Graceful Shutdown and Health Checks]] (draining the same server this config secures)
+
+### Watch on YouTube
+
+- [Golang basic HTTP2 demo in 5 min (Hello world)](https://www.youtube.com/watch?v=kty6QMQFqSM) · Shenouda Fawzy · 5-min visual intro to HTTP/2 in a Go server
+- [Setup HTTPS with SSL and Golang](https://www.youtube.com/watch?v=ELvFy_vIYHU) · Juan Nadal · practical TLS/HTTPS setup for a Go http.Server

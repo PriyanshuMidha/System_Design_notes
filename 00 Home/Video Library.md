@@ -1,0 +1,1264 @@
+---
+tags: [home]
+type: reference
+level: basic
+prereqs: []
+related: ["[[Study Index]]", "[[Home]]"]
+status: reviewed
+sources: ["YouTube; every link verified via YouTube oEmbed on 2026-11-11"]
+updated: 2026-11-11
+---
+
+# Video Library
+
+> [!summary] One or more YouTube videos for every topic, grouped by folder
+> Every link was checked against YouTube and is a real video; the title and channel come from YouTube itself.
+> Use a video to get the big picture first, then read the note for depth. Trusted channels are preferred: ByteByteGo, Hello Interview, Gaurav Sen, Hussein Nasser, Jordan has no life, TechWorld with Nana and others.
+
+## 01 CS Fundamentals
+
+- **[[Arrays and Dynamic Arrays (Go Slices)]]**
+    - [Understand how to append slices in Golang](https://www.youtube.com/watch?v=zHBcLf7QY4s) · Ardan Labs · Go-specific walkthrough of slice headers and append/growth behavior from a reputable Go shop
+- **[[CPU Scheduling]]**
+    - [CPU Scheduling Algorithms – Round Robin & Multilevel Queue / Operating Systems / L-8](https://www.youtube.com/watch?v=SmDPOsvMdoc) · Concept Core · Clear walkthrough of round robin and multilevel queue scheduling with worked examples
+- **[[Complexity Analysis - Big-O and Amortized Cost]]**
+    - [Asymptotic Notations - Simplified](https://www.youtube.com/watch?v=ddsP7NecEBk) · Abdul Bari · Foundational, highly-regarded explanation of Big-O/Omega/Theta notation
+    - [What is Amortized Time Complexity? - Code a Dynamic Array](https://www.youtube.com/watch?v=EOjoQxdOBgU) · Gaurav Sen · Directly covers amortized cost using the dynamic-array/append example this note relies on
+- **[[Concurrency Primitives - Mutex, Semaphore, Atomics]]**
+    - [Mutex vs Semaphore Explained / Concurrency in a Nutshell](https://www.youtube.com/watch?v=iwJt6hqWfTE) · Nutshell · Short, clear comparison of mutex vs semaphore matching the note's core distinction
+- **[[Data Structures Overview and Big-O Cheat Sheet]]**
+    - [ALL Data Structures in 15MINS! Data Structures Revision, Data Structures Crash Course](https://www.youtube.com/watch?v=5seZMzTyNLA) · KnowledgeCatch · Fast top-level revision across arrays, lists, trees, heaps, hash tables, graphs — matches the note's map/cheat-sheet role
+- **[[Graphs and Graph Algorithms]]**
+    - [Top 5 Most Common Graph Algorithms for Coding Interviews](https://www.youtube.com/watch?v=utDu3Q7Flrw) · NeetCode · Interview-focused overview covering BFS/DFS/Dijkstra/topo-sort in one video
+    - [Network Delay Time - Dijkstra's algorithm - Leetcode 743](https://www.youtube.com/watch?v=EaphyqKU4PQ) · NeetCode · Worked Dijkstra implementation and interview walkthrough
+- **[[Hash Tables and Go Maps]]**
+    - [Hash Tables, Visualized (How O(1) Lookups Work)](https://www.youtube.com/watch?v=eUbSeqLMyHg) · Generalist Programmer · Visual walkthrough of hashing, buckets, collisions and resizing
+- **[[Heaps and Priority Queues]]**
+    - [Heaps Visually Explained (Priority Queues)](https://www.youtube.com/watch?v=XycnarZEBvQ) · ByteQuest · Visual intro to the heap property and push/pop sift operations
+    - [Heap Explained - Algorithms & Data Structures #20](https://www.youtube.com/watch?v=rbXO3B5Ib1U) · NeuralNine · Deeper implementation-level walkthrough of binary heaps as arrays
+- **[[How a Computer Runs a Program]]**
+    - [Editor, Compiler, Assembler, Linker, and Loader: Understanding Their Roles and Functions](https://www.youtube.com/watch?v=g-wYLY-li9g) · Engineering Funda · Walks through the compile-assemble-link-load pipeline this note covers
+    - [Fetch Decode Execute Cycle in more detail](https://www.youtube.com/watch?v=jFDMZpkUWCw) · Computer Science Lessons · Covers the CPU's fetch-decode-execute loop and register usage in detail
+- **[[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]**
+    - [How io_uring Actually Works — The Async I/O Interface Replacing epoll](https://www.youtube.com/watch?v=Yw-O5QWkhsQ) · State & Flow · Deep dive on io_uring's ring-buffer model and how it differs from epoll's readiness model
+    - [All About Epoll - Scalable I/O Syscalls in Linux!](https://www.youtube.com/watch?v=WuwUk7Mk80E) · hoff._world · Focused explainer on epoll's O(ready) readiness notification model vs select/poll
+- **[[Latency Numbers Every Engineer Should Know]]**
+    - [Latency Numbers Programmer Should Know: Crash Course System Design #1](https://www.youtube.com/watch?v=FqR5vESuKe0) · ByteByteGo · short visual walkthrough of the latency ladder from CPU cycle to cross-region call
+    - [The numbers EVERY ENGINEER should know (napkin math)](https://www.youtube.com/watch?v=PFEBo7SMX3M) · Ben Dicken · practical napkin-math framing for estimating system latency before building
+- **[[Linked Lists]]**
+    - [Linked List Data Structure explained with animations / Common Operations / Study Algorithms](https://www.youtube.com/watch?v=lrXpTVEAXCM) · Nikhil Lohia · animated walkthrough of node/pointer structure and core operations
+- **[[Memory Hierarchy and CPU Caches]]**
+    - [L1, L2, L3 Cache: CPU Cache Hierarchy Finally Explained! (Bonus: TLBs, MMU, Page Tables)](https://www.youtube.com/watch?v=tSAcFKW9lM8) · Tech Fairy · covers the cache hierarchy end to end, plus related TLB/paging context
+    - [Every CPU Cache Level Explained in Detail](https://www.youtube.com/watch?v=-YL9s9nBeN0) · Tech in a Teacup · deeper dive on why each cache level exists and how it's built
+- **[[Number Representation and Text Encoding]]**
+    - [How computers store decimal numbers - IEEE754 Explained](https://www.youtube.com/watch?v=bR8OT6dpGps) · NCOT Technology · clear explanation of float bit layout and why 0.1 isn't exact
+    - [IEEE 754: Introduction to Floating Point Format](https://www.youtube.com/watch?v=owtK58XiPGo) · Creel · step-by-step intro to sign/exponent/mantissa encoding
+- **[[Page Cache, File Systems and fsync]]**
+    - [The Secret Behind Database Durability: Write-Ahead Logging (WAL)](https://www.youtube.com/watch?v=VP00nqv6txY) · Shubh Patel · shows why databases fsync their WAL on commit for durability
+    - [Write-Ahead Logging Explained: Database Durability & Recovery](https://www.youtube.com/watch?v=ZyGF-ag0p68) · CodeLucky · complements the fsync/durability angle with crash-recovery mechanics
+- **[[Process Memory Layout - Stack vs Heap]]**
+    - [Stack vs Heap / Simply Explained](https://www.youtube.com/watch?v=wP8_Dci6EQc) · TechPrep · quick, clear intro to stack vs heap allocation and lifetime
+    - [Stack vs Heap Memory](https://www.youtube.com/watch?v=9loizVWAk1M) · The Coding Gopher · Go-flavored walkthrough matching the note's Go runtime angle
+- **[[Processes, Threads and Context Switching]]**
+    - [Process vs Threads Explained / PCB, Context Switching, Pthreads & Thread Types](https://www.youtube.com/watch?v=wsNpZ4YMen8) · StudyPalz · covers process/thread distinction and context-switch cost together
+- **[[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]**
+    - [SRAM vs DRAM vs HBM vs GDDR: What's the Difference? / All Major Types of AI Memory Explained](https://www.youtube.com/watch?v=Xe22fsiGQXA) · Learn with Whiteboard · direct comparison of exactly the memory types this note covers
+- **[[ROM, Flash, Firmware and the Boot Process]]**
+    - [BIOS vs UEFI Explained: How Your Computer Really Starts](https://www.youtube.com/watch?v=R1EOEEbE_dQ) · Turtle Code · walks through firmware/boot handoff from power-on to OS
+- **[[Sorting, Searching and Interview Patterns]]**
+    - [Sorting Algorithms, Visualized (O(n log n) vs O(n²))](https://www.youtube.com/watch?v=7RlWhw8D-9A) · Generalist Programmer · visual comparison of why n log n sorts beat n² ones
+    - [Quick Sort Algorithm Explained Visually – Step-by-Step Animation!](https://www.youtube.com/watch?v=sULZKjc_XRg) · Visual Algorithm · step-by-step pivot/partition animation, relevant to Go's pdqsort basis
+    - [Binary Search Patterns Explained 🔥 / Complete Roadmap for Interviews](https://www.youtube.com/watch?v=RdIolKon3FM) · RisingBrain · interview walkthrough of binary-search-on-the-answer patterns
+- **[[Stacks, Queues and Deques]]**
+    - [Monotonic Stack Explained: Solve Tricky Coding Problems Easily!](https://www.youtube.com/watch?v=15OuNilu0r0) · CodeLucky · clear intro to the monotonic stack pattern (next-greater/smaller) that the note calls out
+    - [Monotonic stack - Trapping rain water explained with animation](https://www.youtube.com/watch?v=UMFKP9cTDtI) · InvolveInInnovation · animated walkthrough of the classic monotonic-stack interview problem
+- **[[Storage Devices - HDD, SSD, NVMe]]**
+    - [How Does A SSD Work](https://www.youtube.com/watch?v=v-HF7FLKFBw) · How-Does-It · short visual explainer of SSD/NAND internals vs HDD
+    - [How Does Flash Memory Work? (SSD)](https://www.youtube.com/watch?v=r2KaVfSH884) · BLITZ · deeper look at NAND flash cells and write amplification
+- **[[System Calls and User vs Kernel Mode]]**
+    - [How Operating Systems ACTUALLY work (kernel mode vs. user mode)](https://www.youtube.com/watch?v=2beOYY4S0B8) · Ben Dicken · visual intro to the user/kernel mode boundary and trap instruction
+    - [Syscalls, Kernel vs. User Mode and Linux Kernel Source Code - bin 0x09](https://www.youtube.com/watch?v=fLS99zJDHOc) · LiveOverflow · deep dive tracing an actual syscall through Linux kernel source
+- **[[Trees, BSTs and Balanced Trees]]**
+    - [Balanced BSTs Explained: AVL & Red-Black Trees for Beginners!](https://www.youtube.com/watch?v=Hazb9VMDrdk) · CodeLucky · beginner-friendly comparison of AVL vs red-black balancing
+    - [Red-Black Trees: Self-Balancing Strategies & Insertion Explained / Data Structures Tutorial](https://www.youtube.com/watch?v=sp7m4uWDi-M) · Amitabha Dey · deep dive on red-black tree rotation/insertion rules
+- **[[Tries, Suffix Trees and Suffix Arrays]]**
+    - [Implement Trie (Prefix Tree) Neetcode150 Series (61 of 150) Leetcode - Second Run](https://www.youtube.com/watch?v=FvXQcwYEr7U) · Raymond Chen · interview-style walkthrough of building a trie from scratch
+- **[[Union-Find and Skip Lists]]**
+    - [Disjoint Sets & Union Find Algorithm Simply Explained](https://www.youtube.com/watch?v=z3X7Zt_zWSM) · Maaneth De Silva · simple visual intro to union-find, path compression and union by rank
+    - [Skip List Explained / Advanced Data Structure / What is Skip List Data Structure / Coding Interview](https://www.youtube.com/watch?v=ol-FaNLXlR0) · SoftwareDude · covers the probabilistic express-lane idea behind skip lists (used in Redis ZSET)
+- **[[Virtual Memory, Paging and the TLB]]**
+    - [Virtual Memory Explained (including Paging)](https://www.youtube.com/watch?v=fGP6VHxqkIM) · BitLemon · 15-min visual intro to virtual addresses, page tables and paging
+    - [Virtual Memory - 03 : Implementation of Page Table and Associative memory (TLB)](https://www.youtube.com/watch?v=49INMdDm1CU) · Learn with Maitrik Shah · deep dive specifically on TLB/page-table implementation and hit/miss cost
+
+## 02 Networking & Web
+
+- **[[CDN and Edge]]**
+    - [What is a CDN (Content Delivery Network)?](https://www.youtube.com/watch?v=b4_6thkYZXs) · Gaurav Sen · system-design-style explainer on PoPs, origin and caching at the edge
+    - [Is Your Website Slow? Here's What a CDN Actually Does](https://www.youtube.com/watch?v=kzbVb3PQt0k) · WebFX · accessible explainer tying CDN hit/miss and latency together
+- **[[DNS - Resolution, Records and Caching]]**
+    - [How DNS Works — Explained for Beginners (Full Deep Dive)](https://www.youtube.com/watch?v=hjSX9ah4z18) · Bit Byte Talks · full walkthrough of the DNS resolution hierarchy (root, TLD, authoritative) and record types
+- **[[Forward and Reverse Proxies - L4 vs L7]]**
+    - [Layer 4 vs Layer 7 Proxying In Details Explained with Examples](https://www.youtube.com/watch?v=ylkAc9wmKhc) · Hussein Nasser · deep dive on L4 vs L7 proxying distinction the note is built around
+    - [Proxy vs Reverse Proxy vs Load Balancer / Simply Explained](https://www.youtube.com/watch?v=xo5V9g9joFs) · TechWorld with Nana · clear visual comparison of forward proxy vs reverse proxy roles
+- **[[HTTP Caching - Cache-Control, ETag, Conditional Requests]]**
+    - [HTTP Caching with E-Tags -  (Explained by Example)](https://www.youtube.com/watch?v=TgZnpp5wJWU) · Hussein Nasser · concise, example-driven walkthrough of ETag/If-None-Match conditional caching
+    - [Everything you need to know about HTTP Caching](https://www.youtube.com/watch?v=HiBDZgTNpXY) · the roadmap · broader overview tying Cache-Control, freshness and validation together
+- **[[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]**
+    - [How websites and HTTP work? Web Basics Crash Course](https://www.youtube.com/watch?v=iD2fgC74ZtA) · Mehul Mohan · covers methods, status codes, headers and cookies together in one crash course
+    - [HTTP Fundamentals in 10 Minutes](https://www.youtube.com/watch?v=qv5-5hhsKpE) · The Cyber Mentors · fast 10-minute recap good for pre-interview review
+- **[[HTTP-1.1 vs HTTP-2 vs HTTP-3]]**
+    - [Limitation Of HTTP/2 That Led To HTTP/3: Explained with Example](https://www.youtube.com/watch?v=AIDkSTiknLg) · CodingX · clear example-based explanation of the HTTP/2 head-of-line blocking problem HTTP/3 solves
+    - [System design: HTTP/2 Multiplexing fixes sequential lag](https://www.youtube.com/watch?v=q6hc6qBJzTc) · programmerCave · focused explainer on HTTP/2 multiplexing vs HTTP/1.1 sequential requests
+- **[[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]**
+    - [TCP/IP vs. OSI: How the Internet *Actually* Works](https://www.youtube.com/watch?v=VmTT2USqAZA) · Beaird IT · direct compare of the 7-layer OSI teaching model vs the 4-layer TCP/IP model actually used
+    - [TCP/IP Model Explained (4 Layers, OSI vs TCP/IP & Real-World Data Flow) (CCNA)](https://www.youtube.com/watch?v=IjIZGyMwUdI) · StudyPalz · walks through real-world packet/data flow across the layers
+- **[[IP Addressing, Subnets, NAT and VPC Basics]]**
+    - [Subnetting Made Easy: CIDR and VLSM Explained for Beginners!](https://www.youtube.com/watch?v=VTp_Jb8baag) · CodeLucky · beginner-friendly CIDR/subnetting math walkthrough
+    - [AWS VPC Explained: How to Design Secure Cloud Networks in 2026](https://www.youtube.com/watch?v=zHarvgAdHe0) · LearnITGuide Tutorials · covers VPC subnets, routing and NAT gateway design end-to-end
+    - [AWS VPC NAT Gateway In-depth intuition](https://www.youtube.com/watch?v=2OrZd4p6EfI) · Knowledge Amplifier · deep dive specifically on how NAT/PAT works for a private subnet
+- **[[Network Debugging Toolkit - dig, curl, ss, tcpdump]]**
+    - [Wiresharking CURL - How a single GET request translates to 10 TCP Packets](https://www.youtube.com/watch?v=gOEiBliwMUA) · Hussein Nasser · shows curl + packet capture together, ties the tools to what's really on the wire
+    - [ss command - use Socket statistics to investigate your Linux network. Alternative to Netstat](https://www.youtube.com/watch?v=92-RCkdoKDw) · dolastack devops · focused walkthrough of ss for inspecting socket/connection state
+    - [Learn Tcpdump - Tutorial with Examples](https://www.youtube.com/watch?v=xyFLY1saDh0) · Hack eXPlorer · hands-on tcpdump filtering and packet capture examples
+- **[[Nginx]]**
+    - [Nginx as a reverse proxy  - A closer look at Nginx worker processes and worker connections](https://www.youtube.com/watch?v=ODxw1QWpdEM) · Alternative Degree · goes into the worker-process/event-loop internals the note covers, not just setup steps
+- **[[TCP - Handshake, Reliability, Flow and Congestion Control]]**
+    - [TCP 3-Way Handshake Explained / SYN, SYN-ACK, ACK + Practical Wireshark Lab](https://www.youtube.com/watch?v=V9wj1NiErUY) · Singh IT Concepts · visual + packet-capture walkthrough of the 3-way handshake and 4-way close
+    - [TCP Flow Control & Connection Mgmt - Transport Layer / Computer Networks Ep. 3.5.5 / Kurose & Ross](https://www.youtube.com/watch?v=iPXaMBu_OLk) · Epic Networks Lab · explains the receiver-window flow control piece in depth
+    - [TCP Congestion Control](https://www.youtube.com/watch?v=kRS4J-m5n04) · Anand Seetharam · dedicated deep dive on cwnd/congestion control distinct from flow control
+- **[[TLS and HTTPS]]**
+    - [TLS 1.3 Handshake Explained In Details (with Math)](https://www.youtube.com/watch?v=IE0QLCcOr0I) · Hussein Nasser · deep dive on the key-exchange math and 1-RTT handshake the note describes
+- **[[UDP and QUIC]]**
+    - [Learn in 5 Minutes: HTTP/3 (QUIC)](https://www.youtube.com/watch?v=aJZeI8w5kAs) · SoftwareEngenius · short visual intro to QUIC/HTTP-3 basics
+    - [HOW QUIC WORKS - Intro to the QUIC Transport Protocol](https://www.youtube.com/watch?v=HnDsMehSSY4) · Chris Greer · deeper look at QUIC's per-stream reliability and independence from TCP's head-of-line blocking
+- **[[What Happens When You Type a URL]]**
+    - [90% Fail This Interview Question: What Happens When You Type google.com?](https://www.youtube.com/watch?v=8fR9E2iXB44) · Abisheik M · interview-style walkthrough of the full DNS/TCP/TLS/HTTP chain
+    - [what happens when you type a URL into your browser? all 6 Steps Explained](https://www.youtube.com/watch?v=-ynxNpYqcYI) · Gbemisola Oladetoun · quick 6-step visual overview of the same request lifecycle
+
+## 03 Frontend
+
+- **[[CSS Fundamentals - Cascade, Selectors, Box Model]]**
+    - [Learn CSS Specificity and Cascade In 10 Minutes](https://www.youtube.com/watch?v=cPBT86_cLv4) · Raj Saha Online · fast, focused drill on cascade and specificity rules
+    - [HTML & CSS for Beginners Part 12: The CSS Box Model - Margin, Borders & Padding explained](https://www.youtube.com/watch?v=M6coJNLFBWI) · Kevin Powell · clear visual breakdown of the content/padding/border/margin box model
+- **[[CSS Layout - Position, Flexbox, Grid]]**
+    - [Learn flexbox the easy way](https://www.youtube.com/watch?v=u044iM9xsWU) · Kevin Powell · beginner-friendly intro to the flex main/cross axis model
+    - [Kevin Powell - Flexbox vs. Grid](https://www.youtube.com/watch?v=ESAXStllfcw) · 9elements · when to reach for flexbox vs grid, straight from Kevin Powell
+- **[[DOM, Events and Timers]]**
+    - [Web Development with JavaScript #4 - Event Bubbling, Capturing & Delegation](https://www.youtube.com/watch?v=1DXDizP7COQ) · A Coder's Journey · covers capture/bubble phases and delegation together with examples
+    - [Event Delegation in JavaScript, Simplified](https://www.youtube.com/watch?v=aZ3JWv0ofuA) · Deeecode · short, simplified reinforcement of the delegation pattern
+- **[[How Browsers Load and Render a Page]]**
+    - [How Browsers Render HTML — The Full Rendering Pipeline (Zero to Pro)](https://www.youtube.com/watch?v=fwVcbzFSnEw) · Code with Pushpa · full DOM/CSSOM/render-tree/layout/paint pipeline walkthrough
+    - [How Browsers Render Web Pages Explained / Critical Rendering Path Tutorial](https://www.youtube.com/watch?v=De7Go0qErrY) · freeplacementcourse  · interview-oriented recap of the critical rendering path
+- **[[JavaScript Async - Event Loop, Promises, async-await]]**
+    - [How does the Event Loop work?](https://www.youtube.com/watch?v=WNrHrwm1wkU) · Boot dev · clean conceptual explanation of call stack, queues, and event loop
+    - [Async in Javascript : Promise & Microtask Queue in Browser & Node](https://www.youtube.com/watch?v=PI_dwjy-KAk) · Eulier Gonzalez · deep dive on microtask vs macrotask ordering with Promises
+- **[[JavaScript Core - Types, Scope, Hoisting, Closures, this]]**
+    - [Closures in JS 🔥 / Namaste JavaScript Episode 10](https://www.youtube.com/watch?v=qikxEIxsXco) · Akshay Saini · widely-used deep dive on closures and lexical scope for interviews
+    - [Javascript Hoisting Explained](https://www.youtube.com/watch?v=aT1WFBmHstw) · DevSage · focused explanation of var/let/const hoisting and the TDZ
+    - [Javascript this keyword explained / in Gloable Scope, Object, Function, Prototype, Method, Class](https://www.youtube.com/watch?v=NV9sHLX-jZU) · techsith · covers all five binding rules for `this` with examples
+- **[[JavaScript Objects, Arrays and Iteration]]**
+    - [map, filter & reduce 🙏 Namaste JavaScript Ep. 19 🔥](https://www.youtube.com/watch?v=zdp0zrpKzIE) · Akshay Saini · interview-style deep dive on the three core higher-order array methods
+    - [Map, Filter & Reduce EXPLAINED in JavaScript - It's EASY!](https://www.youtube.com/watch?v=8MoElay6dWU) · dcode · short, example-driven reinforcement of map/filter/reduce
+- **[[React Fundamentals - Components, JSX, Props, State]]**
+    - [⚛️ React Components Explained! Props, State, useEffect & Composition (2025 Crash Course)](https://www.youtube.com/watch?v=qPtVIKgWzek) · Learn Web Dev with Norbert · up-to-date crash course on components, JSX, props and state
+    - [05 - Understanding React Components - What are States - What are Props - State vs. Props - Reactjs](https://www.youtube.com/watch?v=GgurJ_3y0Jg) · tapaScript by Tapas Adhikary · focused state-vs-props comparison, a common point of confusion
+- **[[React Hooks]]**
+    - [Basic React Hooks Crash Course (useState, useEffect, useMemo, useCallback) / WebDevSimplified](https://www.youtube.com/watch?v=qRkSWHbGkEU) · MasterDotDev · covers useState/useEffect plus useMemo/useCallback caching together
+    - [Intro to React Hooks with useState and useEffect](https://www.youtube.com/watch?v=P5p3vMeJ6LQ) · Steve Griffith - Prof3ssorSt3v3 · gentle intro to the two most-used hooks for beginners
+- **[[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]**
+    - [Virtual DOM, Reconciliation and Diffing Algorithm in React / The Complete React Course / Ep.53](https://www.youtube.com/watch?v=jiziEC8dPSE) · Anurag Singh ProCodrr · full walkthrough of virtual DOM + diffing algorithm
+    - [Reconciliation Explained: React Interview Questions](https://www.youtube.com/watch?v=xC8mmhiZ2P8) · Konstantyn's coding · short interview-style recap of reconciliation
+- **[[React Routing and Rendering Strategies - CSR, SSR, SSG]]**
+    - [NextJS Rendering Methods - Explained (CSR vs SSR vs SSG vs ISR)](https://www.youtube.com/watch?v=XwswPqIXYoI) · basarat · side-by-side comparison of all four rendering strategies
+    - [CSR / SSR / SSG / ISR with Next.js – Explained!](https://www.youtube.com/watch?v=eMwTEo6AjDc) · leerob · concise explainer from a Next.js core team member
+- **[[React State Management - Props, Context, Redux]]**
+    - [React State Management: Redux vs Zustand vs Context API vs MobX (Beginner's Guide)](https://www.youtube.com/watch?v=6yhmDOrjA-w) · CodeLucky · compares Context vs Redux and when to reach for each
+    - [🔴 React Context API Crash Course / Context API vs Redux 🚀](https://www.youtube.com/watch?v=HcMlkGD9dlA) · Milon27 · hands-on crash course contrasting Context with Redux
+
+## 04 Go Language
+
+- **[[Arrays, Slices and Maps (with internals)]]**
+    - [8. Go Programming Language : Slices & Slice Internals](https://www.youtube.com/watch?v=5K4ezviqYaU) · Kishore · covers slice header, growth and internals
+    - [Internals of Maps in Golang](https://www.youtube.com/watch?v=ACQs6mdylxo) · Sreekanth · deep dive on Go map hash table internals
+- **[[Benchmarks, Profiling and Tracing]]**
+    - [Go Profiling Tutorial: Find Performance Bottlenecks with pprof (Complete Guide 2025)](https://www.youtube.com/watch?v=ZEWtoJsiAgs) · CodeLucky · complete modern walkthrough of pprof CPU/heap profiling
+- **[[Context Package]]**
+    - [Understanding Go Context - Everything You Need to Know](https://www.youtube.com/watch?v=_zKkEp6edYI) · Matthew Sanabria · thorough single-video coverage of cancellation, deadlines and values
+    - [Go Context Package: Cancellation, Timeouts & Concurrent Programming](https://www.youtube.com/watch?v=ljiLd2QsEvA) · CodeLucky · focused tutorial on context with concurrency examples
+- **[[Error Handling]]**
+    - [GopherCon 2020: Working with Errors - Jonathan Amsterdam](https://www.youtube.com/watch?v=IKoSsJFdRtI) · Gopher Academy · authoritative deep dive on Go 1.13 error wrapping, errors.Is/As, by the Go error design author
+- **[[Functions, Closures, Defer, Panic and Recover]]**
+    - [Using defer + recover to handle panics in Go](https://www.youtube.com/watch?v=3TyOYqujg1U) · Ardan Labs · reputable Go trainer's walkthrough of defer/panic/recover pattern
+    - [Go Defer, Panic and Recover in 3 Minutes](https://www.youtube.com/watch?v=nWMJvLpeSTU) · The Coding Gopher · fast visual recap for quick review
+- **[[Generics and Iterators]]**
+    - [Go Generics Complete Tutorial Master Type Parameters Constraints in Go 1.18+](https://www.youtube.com/watch?v=EBE8Z2pxH7g) · CodeLucky · full tutorial on type parameters and constraints
+- **[[Go Toolchain, Tooling and Debugging]]**
+    - [Go (Golang) Debugging with Delve](https://www.youtube.com/watch?v=a1SneuI65O0) · Golang Cafe · practical intro to debugging Go programs with Delve
+    - [Hands on debugging with Delve](https://www.youtube.com/watch?v=iQZHMic9dWk) · source{d} · hands-on demo of real Delve debugging sessions
+- **[[Goroutines and Channels]]**
+    - [Master Go Channels in 15 Minutes: Goroutines & Concurrency Made Simple for Beginners](https://www.youtube.com/watch?v=WGxJmhGBpuU) · JA Asuquo · 15-min visual intro to goroutines + channels
+    - [Go Class: 23 CSP, Goroutines, and Channels](https://www.youtube.com/watch?v=zJd7Dvg3XCk) · Matt KØDVB · deeper dive into CSP theory behind Go's concurrency model
+- **[[Interfaces]]**
+    - [Go Tutorial (Golang) 28 - Interfaces in Golang](https://www.youtube.com/watch?v=VBWdxvauGWU) · ProgrammingKnowledge · clear walkthrough of implicit interface satisfaction basics
+    - [interfaces advanced - go tutorial for beginners - part 13](https://www.youtube.com/watch?v=RsCV0d56w70) · Thomas Langhorst · covers interface values and type assertions beyond the basics
+- **[[Memory Model and Data Races]]**
+    - [""go test -race" Under the Hood" by Kavya Joshi](https://www.youtube.com/watch?v=5erqWdlhQLA) · Strange Loop Conference · deep dive into how the race detector proves happens-before violations
+    - [Go Data Races: Why Your Tests Pass and Production Doesn't](https://www.youtube.com/watch?v=qJR_m1JMWRc) · Compiled Curiosity · practical intro to why unsynchronized access is undefined behavior
+- **[[Modern Go Feature Timeline (1.18-1.25)]]**
+    - [Going through the Go 1.24 Release Notes](https://www.youtube.com/watch?v=h5Sxe-gcS_I) · Code With Cypert · walkthrough of the newest release's language/runtime/tooling changes
+    - [Golang 1.23 What is new?](https://www.youtube.com/watch?v=EL4hg73mT2A) · Mario Carrion · covers range-over-func iterators and other 1.23 additions
+- **[[Packages, Modules and Dependency Management]]**
+    - [Go (Golang) Modules Tutorial](https://www.youtube.com/watch?v=AJxKKmzRTUY) · Golang Cafe · practical go.mod/go.sum and dependency management walkthrough
+    - [Go Modules Explained / Mastering Dependency Management in Go](https://www.youtube.com/watch?v=-qh4qi4_Vpg) · Code & Learn · explainer on module versioning and dependency resolution
+- **[[Pointers, Values and Escape Analysis]]**
+    - [Understanding Allocations: the Stack and the Heap - GopherCon SG 2019](https://www.youtube.com/watch?v=ZMZpH4yT7M0) · Singapore Gophers · conference-level deep dive on stack vs heap and escape analysis
+    - [Escape Analysis in Go — Stack vs Heap & How the Compiler Decides](https://www.youtube.com/watch?v=Ff2qB4XySOk) · nihonsensei · focused explainer on how the compiler decides stack vs heap
+- **[[Reflection and unsafe]]**
+    - [Go Class: 33 Reflection](https://www.youtube.com/watch?v=T2fqLam1iuk) · Matt KØDVB · thorough walkthrough of reflect.Type/reflect.Value mechanics
+    - [Go Unsafe Package: Unleash Low-Level Power (But Beware!) ⚠️](https://www.youtube.com/watch?v=1WG2zyOWTkQ) · CodeLucky · intro to unsafe.Pointer and its risks
+- **[[Runtime - Goroutine Scheduler (GMP)]]**
+    - [GopherCon 2018: The Scheduler Saga - Kavya Joshi](https://www.youtube.com/watch?v=YHRO5WQGh0k) · Gopher Academy · deep dive on internals of the G-M-P scheduler
+    - [Why Go Needs a Scheduler & GMP Model](https://www.youtube.com/watch?v=RUJt0HZa_5c) · programmerCave · concise explainer of the GMP model and why it exists
+- **[[Runtime - Memory Allocator and Garbage Collector]]**
+    - [GopherCon 2015: Go GC: Solving the Latency Problem - Rick Hudson](https://www.youtube.com/watch?v=aiv1JOfMjm0) · Gopher Academy · foundational talk on the design of Go's concurrent GC
+    - [GopherCon 2022: Control Theory and Concurrent Garbage Collection Deep Dive - Madhav Jivrajani](https://www.youtube.com/watch?v=We-8RSk4eZA) · Gopher Academy · deep dive on GC pacing and GOGC/GOMEMLIMIT tuning
+- **[[Standard Library Essentials (time, io, files, encoding)]]**
+    - [Go (golang) Tutorials - Buffered File I/O](https://www.youtube.com/watch?v=9BGfjOMeLEc) · Ambasoft Java · practical walkthrough of buffered file reading/writing
+- **[[Strings, Bytes, Runes and Unicode]]**
+    - [Runes, Bytes, and Strings in Go](https://www.youtube.com/watch?v=OKshtT6g0_k) · Gary Clarke · Clear walkthrough of how Go strings/bytes/runes relate and why len() counts bytes
+    - [Characters do not exist in Go: Everything about runes!](https://www.youtube.com/watch?v=1pOfYd0y6_4) · Flo Woelki · Deep dive on runes vs grapheme clusters, directly covers the note's 'character' nuance
+- **[[Structs, Methods and Embedding]]**
+    - [Embedded Structs in Go](https://www.youtube.com/watch?v=j3d89BBVBcY) · Gary Clarke · Focused explainer on struct embedding and method/field promotion
+    - [Mastering Embedding (Composition) and Promotion in Go with Code Examples](https://www.youtube.com/watch?v=SY34nId4qQA) · Code & Learn · Code-example-driven walkthrough of composition over inheritance via embedding
+- **[[Syntax, Types and Control Flow]]**
+    - [Go Basics: Syntax, Variables, and Control Structures - Beginner’s Guide](https://www.youtube.com/watch?v=o_Z80ZQ_2g0) · Michael Tyiska · Beginner-friendly tour of Go's var/:=, types, and if/for/switch control flow
+- **[[Testing in Go]]**
+    - [Master Table-Driven Tests in Go: Clean Code & Better Coverage!](https://www.youtube.com/watch?v=3e3i5ulspoM) · CodeLucky · Practical guide to writing table-driven tests, the note's idiomatic pattern
+    - [Go Table Driven Tests](https://www.youtube.com/watch?v=w-nZp39_UPk) · Leetware · Short, focused walkthrough of the table-driven test + t.Run pattern
+- **[[select and Concurrency Patterns]]**
+    - [Google I/O 2012 - Go Concurrency Patterns](https://www.youtube.com/watch?v=f6kdp27TYZs) · Google for Developers · Canonical Rob Pike talk on select, pipelines, fan-in/fan-out concurrency patterns
+- **[[sync Primitives and Atomics]]**
+    - [2.3 Concurrency Primitives: Mutex, Atomics & WaitGroups / Goroutines, Channels, and the CSP Model](https://www.youtube.com/watch?v=HW1unwaqxbI) · Adsorp AI · Covers Mutex, atomics, and WaitGroup together, matching the note's toolbox framing
+
+## 05 APIs
+
+- **[[API Contract Design and OpenAPI]]**
+    - [28. OpenAPI: The universal contract between clients and servers](https://www.youtube.com/watch?v=CwKsU84jIWs) · Sriniously · Explains OpenAPI as the machine-readable contract, matching the note's framing
+- **[[API Error Handling]]**
+    - [Handling HTTP API Errors with Problem Details](https://www.youtube.com/watch?v=uvTT_0hqhyY) · CodeOpinion · Practical explainer on Problem Details (RFC 9457) as the standard error body
+    - [RFC 9457 Problem Details for HTTP APIs](https://www.youtube.com/watch?v=5vC-IZFkwkg) · Bruce Hartpence - Learning Networks  · Walks through the RFC itself: type/title/status/detail/instance fields
+- **[[API Gateway and BFF]]**
+    - [Using The BFF Architectural Pattern Instead of API Gateway](https://www.youtube.com/watch?v=b8wPnMtL_xU) · bulama io  · Directly compares BFF vs API gateway, the note's core distinction
+- **[[API Versioning and Backward Compatibility]]**
+    - [Versioning & Backward Compatibility in APIs / Low-Level Design - Tabspace](https://www.youtube.com/watch?v=paSXDTcdfww) · Tabspace · Interview-style walkthrough of versioning strategies and backward compatibility
+- **[[Choosing an API Style]]**
+    - [REST API vs GraphQL vs gRPC - The Complete Guide (1/38)](https://www.youtube.com/watch?v=NFxOuylU9S8) · Memi Lavi - The Software Architect · full comparison series covering when to pick each API style
+    - [REST vs gRPC vs GraphQL - 90% of Developers Choose Wrong!](https://www.youtube.com/watch?v=ygM1VwtPF_k) · Code with tkssharma · quick decision-framework style overview of the main API styles
+- **[[File Upload Architecture]]**
+    - [Why should you use S3 presigned URLs? (A full demo included)](https://www.youtube.com/watch?v=ctnD5Uzx65w) · Enlear Academy · full demo of the presigned-URL upload flow this note describes
+    - [A Guide to S3 Pre-Signed URLs: What They Are and How They Work](https://www.youtube.com/watch?v=ITSFLfqWy8o) · Forward Networks · concept-level explainer of how presigned URLs work and why they're used
+- **[[GraphQL]]**
+    - [GraphQL Explained in 100 Seconds](https://www.youtube.com/watch?v=eIQh02xuVw4) · Fireship · fast visual intro to schemas, queries and resolvers
+    - [Introduction To GraphQL](https://www.youtube.com/watch?v=anW5Qpuh5kI) · dotnet · slightly deeper walkthrough of GraphQL concepts beyond the 100-second intro
+- **[[Idempotency and Idempotency Keys]]**
+    - [What Is Idempotency? Idempotency Keys, Deduplication & Retries Explained](https://www.youtube.com/watch?v=jfHBrweuKRA) · The Right Trade-off · covers idempotency keys, dedup and retries together, matching the note's scope
+    - [What is API Idempotency and Why Is It Important?](https://www.youtube.com/watch?v=I08syTslan8) · Be A Better Dev · basic intro on why idempotency matters for retried writes
+- **[[Pagination, Filtering and Sorting]]**
+    - [API Pagination - Why OFFSET Breaks and Cursors Don't](https://www.youtube.com/watch?v=AMszC3yAbbw) · LearnThatStack · directly explains why keyset/cursor pagination beats OFFSET, the note's core idea
+    - [Pagination Optimization: Keyset vs Offset](https://www.youtube.com/watch?v=XHQ8QhslXS0) · ByteDistrict · performance-focused comparison of keyset vs offset pagination
+- **[[Protocol Buffers and Schema Evolution]]**
+    - [Protocol Buffers Crash Course](https://www.youtube.com/watch?v=46O73On0gyI) · Hussein Nasser · reputable deep-dive crash course on protobuf internals and wire format
+    - [The Need for Protocol Buffers](https://www.youtube.com/watch?v=BywIOD_Y3CE) · Stephane Maarek · short intro on why protobuf exists versus JSON/XML
+- **[[REST and HTTP API Design]]**
+    - [REST API Best Practices: How to Use the Right HTTP Methods and Status Codes](https://www.youtube.com/watch?v=XLQxfpDmqbM) · Coding with Nam · covers resource naming, HTTP methods and status codes as the note does
+    - [HTTP Status Codes Explained for REST APIs (200, 400, 404, 500)](https://www.youtube.com/watch?v=x2d59rJ7vgo) · Topictrick · focused reference on the status-code side of REST design
+- **[[Real-time APIs - WebSocket, SSE and Long Polling]]**
+    - [Long Polling vs SSE vs WebSockets vs QUIC / Simply Explained](https://www.youtube.com/watch?v=3Ud6Ds2abO8) · TechPrep · side-by-side comparison matching exactly the note's three (plus QUIC) mechanisms
+    - [WebSockets vs Polling vs Server Sent Events](https://www.youtube.com/watch?v=WS352jTTkPU) · Piyush Garg · practical walkthrough of when to use each real-time transport
+- **[[SOAP and WSDL (Legacy Integrations)]]**
+    - [What is web service ? SOAP vs Rest](https://www.youtube.com/watch?v=DRTp6mT1cTc) · Specialize Automation (Aditya Roy) · basic intro to SOAP envelopes/WSDL versus REST
+    - [REST Vs SOAP Web Services / Comparison of SOAP  & RESTful Web Services / SOAP & REST Differences](https://www.youtube.com/watch?v=1SgVa7Jed9I) · Tutorials Pedia · structured comparison table style explainer for interview recall
+- **[[Webhooks - Sending and Receiving]]**
+    - [What is a Webhook? / Webhooks Explained with Azure Functions & GitHub (Real Demo)](https://www.youtube.com/watch?v=kYadEaoK-SY) · TechnoAarambh · real demo of registering and receiving a webhook callback
+    - [Webhooks for Beginners – From Polling to Real‑Time Events](https://www.youtube.com/watch?v=bXY7899m6M8) · Ctrl Alt Explain · frames webhooks vs polling, matching the note's sender/receiver model
+- **[[gRPC]]**
+    - [gRPC: The Tutorial I Wish I Had (Golang)](https://www.youtube.com/watch?v=6Ol6zeocR28) · HuseyinCodes · deep dive on gRPC + protobuf fundamentals in Go
+    - [(Backend #40) Define gRPC API and generate Go code with protobuf](https://www.youtube.com/watch?v=mVWgEmyAhvM) · TECH SCHOOL · hands-on .proto + codegen walkthrough from a well-known Go backend course
+
+## 06 Backend Engineering in Go
+
+- **[[Authentication and Authorization in Go]]**
+    - [#36 Golang - Mastering JWT Authentication](https://www.youtube.com/watch?v=XFxm6NEWakQ) · codeHeim · full JWT auth implementation walkthrough in Go
+    - [JWT Role-Based Authorization in Golang / Secure APIs with Gin Middleware](https://www.youtube.com/watch?v=Sh3i2BUDr-g) · The Exception Handler · covers the RBAC/authorization half specifically
+- **[[Backend Request Lifecycle and Layering]]**
+    - [10. What are controllers, services, repositories, middlewares and request context?](https://www.youtube.com/watch?v=hyc-7w3pee8) · Sriniously · clear explainer of the handler/service/repository split and request context
+- **[[Background Workers and Job Queues]]**
+    - [(Backend #54) Implement background worker in Go with Redis and asynq](https://www.youtube.com/watch?v=XOXdYs8mKkI) · TECH SCHOOL · practical asynq + Redis worker implementation in Go
+- **[[Building REST Endpoints]]**
+    - [Building RESTful APIs with Golang 1.22's ServeMux](https://www.youtube.com/watch?v=cs1wlUb2Zq0) · Donutloop · shows the Go 1.22 stdlib-only routing this note is built around
+    - [Go (Golang) REST API Example (Without Framework)](https://www.youtube.com/watch?v=8S30eoBSojU) · Golang Cafe · full endpoint build without a framework, decode-validate-respond flow
+- **[[Calling External APIs]]**
+    - [Retries, Timeouts and Circuit Breakers: How Retries Turn 1 Request Into 243](https://www.youtube.com/watch?v=wj0IJf27LV4) · José Cruz (IT Architect) · explains why naive retries amplify outages, the core risk this note guards against
+    - [Retry Storms Explained: How Exponential Backoff with Jitter Prevents System Meltdowns](https://www.youtube.com/watch?v=WjEmM1Jy79M) · SystemDR - Scalable System Design  · focused visual explainer on backoff + full jitter
+- **[[Capstone - InvoiceOps]]**
+    - [Production-Grade Webhook System That Never Loses Events](https://www.youtube.com/watch?v=B6PWwIwXnmA) · Madme Codes · maps closely to the capstone's payment-webhook-to-ledger flow
+    - [Design a Payment System - System Design Interview](https://www.youtube.com/watch?v=olfaBgJrUBI) · Code with Lucian · interview-style system design walkthrough for the payments domain
+- **[[Configuration and Secrets]]**
+    - [27. The Twelve-Factor App](https://www.youtube.com/watch?v=2_fcv3-XfN4) · Sriniously · covers the 12-factor Config principle this note's precedence rules are based on
+- **[[Containerizing Go Services]]**
+    - [The Real Reason Your Kubernetes Pods Get OOMKilled](https://www.youtube.com/watch?v=PgRBnEphSa4) · Techi Nik · explains the cgroup memory/CPU limit mismatch this note's GOMAXPROCS/GOMEMLIMIT fix addresses
+- **[[Database Access (database-sql, pgx, sqlc)]]**
+    - [The Secret to Clean Go Database Code (SQLC Tutorial)](https://www.youtube.com/watch?v=iYFxgZkechE) · Andi Wibowo · sqlc typed-query generation walkthrough on top of pgx/database-sql
+- **[[File Uploads and Object Storage]]**
+    - [#76 Golang - Upload Files to S3 & Serve with Presigned URLs](https://www.youtube.com/watch?v=1p86t2RSHuU) · codeHeim · Go-specific walkthrough of streaming uploads and presigned URLs
+    - [A Guide to S3 Pre-Signed URLs: What They Are and How They Work](https://www.youtube.com/watch?v=ITSFLfqWy8o) · Forward Networks · short conceptual explainer of presigned URL mechanics
+- **[[Graceful Shutdown and Health Checks]]**
+    - [Golang Microservices: Graceful Shutdown](https://www.youtube.com/watch?v=VXxe7-b5euo) · Mario Carrion · covers Go HTTP shutdown plus Kubernetes/deployment context
+    - [HTTP Server Graceful Shutdown with Error Groups](https://www.youtube.com/watch?v=S6QFZfCLMyo) · Code & Learn · hands-on code pattern for draining a server on signal
+- **[[HTTP Server Fundamentals (net-http)]]**
+    - [Request Routing with ServeMux (Go 1.22) - Code Examples](https://www.youtube.com/watch?v=tcJYTk7bU7U) · Code & Learn · code walkthrough of the new method/path wildcard routing
+    - [GopherCon Europe 2024: Jonathan Amsterdam - HTTP Routing Enhancements](https://www.youtube.com/watch?v=4VSyrJI09K0) · GopherCon Europe · deep dive on the ServeMux routing design from the Go team
+- **[[Middleware]]**
+    - [Go Middleware Explained: Patterns for Request Processing in Go (Golang)](https://www.youtube.com/watch?v=E0B-65LuJIE) · CodeLucky · overview of the func(Handler) Handler chaining pattern
+    - [#43 Golang - Web Development: Adding Middleware to HTTP Server](https://www.youtube.com/watch?v=irSUU1K1qtU) · codeHeim · practical net/http middleware implementation
+- **[[Observability in Go Services]]**
+    - [Go's Built-in Package for Better Logging (using slog)](https://www.youtube.com/watch?v=_mqB7LLgwgs) · Better Stack · focused intro to structured logging with log/slog
+    - [Observability made painless: Go, Otel & LGTM stack - Haseeb Majid](https://www.youtube.com/watch?v=t3Xz-IrxNwk) · GopherCon UK · conference talk tying logs, metrics and traces together in Go
+- **[[OpenAPI-First Development in Go]]**
+    - [Codegen a Go Fiber app with OpenAPI](https://www.youtube.com/watch?v=WkarI2eOzK4) · Duane Bester · shows spec-first codegen with oapi-codegen in practice
+    - [Practical OpenAPI in Go](https://www.youtube.com/watch?v=87au30fl5e4) · package main · broader walkthrough of designing and consuming an OpenAPI spec in Go
+- **[[Receiving Webhooks Idempotently]]**
+    - [Implementing Signature Verification for Webhooks (GitHub HMAC verification)](https://www.youtube.com/watch?v=I2ZYUulreI4) · Hookdeck · walkthrough of HMAC signature verification for inbound webhooks
+    - [Handling Webhook Requests - Advanced Integration](https://www.youtube.com/watch?v=reTc0t0rnTo) · Prismatic · covers idempotency/dedup handling alongside signature checks
+- **[[Redis in Go]]**
+    - [Beginner's Guide to Redis with Go!](https://www.youtube.com/watch?v=1C3Ym_JjkMw) · TutorialEdge · intro to connecting and using go-redis client
+    - [Building a REST API in Go – Part 7: Redis for Caching](https://www.youtube.com/watch?v=CnamhxiYtGo) · DrSimple · wiring a shared redis client into a real Go service for caching
+- **[[Request Decoding, Validation and DTOs]]**
+    - [Go Programming - JSON Encoding & Decoding in Golang](https://www.youtube.com/watch?v=Vr63uGL7NrU) · BugBytes · covers DisallowUnknownFields and strict JSON decoding into DTOs
+    - [JSON in Go: Encoding, Decoding & Struct Tags for Beginners](https://www.youtube.com/watch?v=fdOtbSaHkPs) · CodeLucky · basics of struct tags and encoding/json behavior for request bodies
+- **[[Scheduled Jobs]]**
+    - [How to build a Distributed Task Scheduler with Go, Postgres, and gRPC](https://www.youtube.com/watch?v=bBp5AOTkJcg) · Jyotinder Singh · builds a replica-safe scheduled job system with Go and Postgres locking
+    - [Distributed Locking Explained / Redis + Spring Boot + Jedis Demo](https://www.youtube.com/watch?v=Sr0FoVwz0zs) · codingX krishna · general distributed-lock concept (SET NX-style) behind single-winner-per-tick scheduling
+- **[[Schema Migrations in Go Services]]**
+    - [How to create database migrations using golang-migrate](https://www.youtube.com/watch?v=N6aozCr4kr0) · Muzafar Ali · hands-on golang-migrate CLI + library walkthrough
+    - [Go Database Migrations with Goose and PostgreSQL](https://www.youtube.com/watch?v=fA8QK69zwlw) · BugBytes · goose-based migrations tutorial, the note's other library
+- **[[Secure Coding for Go Services]]**
+    - [GopherCon 2022: Secure Coding in Go: Avoiding Common Vulnerabilities - Benji Vesterby](https://www.youtube.com/watch?v=com5l5DKvqQ) · Gopher Academy · conference deep dive on Go-specific OWASP-style vulnerabilities
+    - [8 Best Practices for Writing Secure Go Code](https://www.youtube.com/watch?v=SN8fRR5TiTA) · HashiCorp, an IBM Company · quick practical checklist for secure Go coding
+- **[[Service Project Layout and Wiring]]**
+    - [How to structure your Go projects](https://www.youtube.com/watch?v=WNI8uKBE-zs) · sigfault · focused explainer on internal/ layout and import direction
+- **[[Serving REST and gRPC Together]]**
+    - [GopherCon UK 2019: Johan Brandhorst - Writing REST Services for the gRPC curious](https://www.youtube.com/watch?v=Pq1paKC-fXk) · GopherCon UK · conference talk on grpc-gateway from its core contributor
+    - [(Backend #43) gRPC gateway: write code once, serve both gRPC & HTTP requests](https://www.youtube.com/watch?v=3FfDH3d0aHs) · TECH SCHOOL · step-by-step grpc-gateway implementation walkthrough
+- **[[TLS, HTTPS and HTTP2 in Go Servers]]**
+    - [Golang basic HTTP2 demo in 5 min (Hello world)](https://www.youtube.com/watch?v=kty6QMQFqSM) · Shenouda Fawzy · 5-min visual intro to HTTP/2 in a Go server
+    - [Setup HTTPS with SSL and Golang](https://www.youtube.com/watch?v=ELvFy_vIYHU) · Juan Nadal · practical TLS/HTTPS setup for a Go http.Server
+- **[[Testing Go Services]]**
+    - [Getting Started with Testcontainers for Go](https://www.youtube.com/watch?v=PbV31aE-asU) · AtomicJar · official intro to real-Postgres repository tests via testcontainers-go
+    - [#53 Golang - API Testing in Go with net/http/httptest](https://www.youtube.com/watch?v=Wpv2-GpTeQE) · codeHeim · handler testing with httptest, no network/db
+- **[[Transactions and the Repository Pattern]]**
+    - [Learning Golang: Relational Databases - Transactions with PostgreSQL](https://www.youtube.com/watch?v=BLr2V6zB5k4) · Mario Carrion · deep dive on database/sql transactions with Postgres
+    - [Repository Pattern in Golang: Step-by-Step Tutorial (Demystified!)](https://www.youtube.com/watch?v=MOEgAq_RXog) · AM Channel · step-by-step repository pattern implementation
+- **[[WebSockets and SSE in Go]]**
+    - [Build a Golang Chat Application Using Websockets](https://www.youtube.com/watch?v=y036l6pvVEs) · Esoteric Tech · hands-on hub/broadcast pattern via a chat app build
+    - [Understanding websockets in Go by building a simple chat app](https://www.youtube.com/watch?v=t2hZULLsWfw) · Go code snippets · simple, focused walkthrough of Go websocket fundamentals
+- **[[gRPC Services in Go]]**
+    - [Build a gRPC server with Go - Step by step tutorial](https://www.youtube.com/watch?v=gbrPMv_GuQY) · Maximilien Andile · step-by-step: proto, codegen, server wiring
+    - [gRPC: The Tutorial I Wish I Had (Golang)](https://www.youtube.com/watch?v=6Ol6zeocR28) · HuseyinCodes · clear conceptual + practical overview of gRPC in Go
+- **[[gRPC Streaming in Go]]**
+    - [Building a gRPC Service in Golang: Server Streaming RPC (Tutorial)](https://www.youtube.com/watch?v=l_74x_qQZB8) · Mario Carrion · server-streaming RPC implementation walkthrough
+    - [(gRPC #13.1) Implement bidirectional-streaming gRPC - Golang](https://www.youtube.com/watch?v=hjTI35iKMyQ) · TECH SCHOOL · bidirectional streaming implementation, the hardest of the three shapes
+
+## 07 Databases
+
+- **[[Backup, PITR and Disaster Recovery]]**
+    - [Never lose data again with Postgres point-in-time recovery (PITR) & Kamal](https://www.youtube.com/watch?v=5AMLVUPrL0w) · Sam's Notes · practical PITR walkthrough with a real restore scenario
+    - [PG-03: Point-in-Time Recovery (PITR) in PostgreSQL with pgBackRest using Timestamp](https://www.youtube.com/watch?v=RkESdFnXo8I) · mynoteoracledba · hands-on PITR to a timestamp using pgBackRest
+- **[[Connection Pooling]]**
+    - [Connection pooling, routing, and queuing with PgBouncer](https://www.youtube.com/watch?v=CAKI_eZiRAU) · Postgres Conference · conference deep dive on pool modes and sizing
+    - [PgBouncer Tutorial](https://www.youtube.com/watch?v=ddKm7a7xOpk) · Code with Lucian · step-by-step PgBouncer setup tutorial
+- **[[Consistent Hashing]]**
+    - [Consistent Hashing: Easy Explanation for System Design Interviews](https://www.youtube.com/watch?v=vccwdhfqIrI) · Hello Interview · clear visual intro aimed at interviews, matches TL;DR exactly
+- **[[Distributed SQL]]**
+    - [Google Spanner: TrueTime, Global Consistency & Distributed Databases Explained](https://www.youtube.com/watch?v=5NxPcafIy0Q) · Tech Papers Summary · explains TrueTime and Spanner's ordering guarantees
+    - [CockroachDB: A True Distributed SQL Database](https://www.youtube.com/watch?v=AeX5b89TJ2o) · CockroachDB · official vendor talk on ranges, Raft groups and distributed transactions
+- **[[Index Types and Index Design]]**
+    - [Database Internals, Part 2: Beyond B-trees: Hash, GIN, GiST, BRIN, LSM and Vector Indexes](https://www.youtube.com/watch?v=2c0y25g7-BM) · Johnny The Data Scientist · covers exactly GIN/GiST/BRIN beyond the basic B-tree
+    - [Lesson #8 - What is a BRIN Index? (Index Types) -  Deep Dive Into PostgreSQL Indexes Course](https://www.youtube.com/watch?v=1tAyyXbEdTQ) · Percona · focused deep dive on BRIN for huge time-ordered tables
+- **[[Indexing Fundamentals]]**
+    - [How Database Indexing Works in Real Life (B-Tree Explained Simply)](https://www.youtube.com/watch?v=pQQVpROjOgU) · Tech Pulse Labs · simple visual B-tree explanation for basics-level note
+- **[[Isolation Levels and MVCC]]**
+    - [(Backend #9) Understand isolation levels & read phenomena in MySQL & PostgreSQL via examples](https://www.youtube.com/watch?v=4EajrPgJAk0) · TECH SCHOOL · walks through anomalies with concrete query examples
+    - [Stop Locking Your Database: How MVCC Solves Concurrency / KaaS-6](https://www.youtube.com/watch?v=8f7cktxHPw8) · Last Mile Developer · focused explanation of MVCC snapshots and versioning
+- **[[Locking - Optimistic vs Pessimistic]]**
+    - [Optimistic Locking clearly explained / Java / SQL / System Design](https://www.youtube.com/watch?v=d41JuPT_Wls) · ByteMonk · clear explanation of version-column optimistic locking vs locking reads
+- **[[Materialized Views and Denormalization]]**
+    - [Materialized views explained](https://www.youtube.com/watch?v=-A3EtQgDn_0) · ClickHouse · official vendor explanation of materialized views as stored query results
+    - [Understanding Denormalization in Database Design](https://www.youtube.com/watch?v=NPGEDDr5MUo) · StructuredCS · covers the denormalization trade-off side of the note
+- **[[N+1 Query Problem]]**
+    - [Understanding the N+1 Select Problem in Database-Driven Applications](https://www.youtube.com/watch?v=kIUhMd2JeCY) · Asdf asdf1234 · explains the N+1 loop bug and batching fix
+- **[[NoSQL Data Modeling]]**
+    - [Designing a DynamoDB Table in 4 Steps: From Entities to Access Patterns](https://www.youtube.com/watch?v=JLZOI8patlw) · FooBar Serverless · walks through access-pattern-first modeling exactly as the note describes
+    - [DynamoDB Single Table Design: Simplify Your Code and Boost Performance with Table Design Strategies](https://www.youtube.com/watch?v=lWCch8GEK4E) · FooBar Serverless · single-table design with GSI1PK/SK overloading, matches note's core idea
+- **[[Partitioning and Sharding]]**
+    - [Database Sharding vs Partitioning (Explained)](https://www.youtube.com/watch?v=KWyVn0aC3kc) · Brendan Metcalfe · clarifies the partitioning-vs-sharding distinction the note opens with
+    - [How Billion-User Apps Actually Work: Database Sharding & Partitioning Explained](https://www.youtube.com/watch?v=Ra0amcm2s-w) · ThatNotesGuy · scale-driven walkthrough of sharding keys and hot-partition pitfalls
+- **[[Query Plans and EXPLAIN]]**
+    - [PGConf NYC 2022 Understanding PostgreSQL Query Plans (aka EXPLAIN) by Stephen Frost](https://www.youtube.com/watch?v=ymVGg6woUtc) · United States PostgreSQL Association · deep dive on planner internals and reading EXPLAIN output
+    - [Understand PostgreSQL query plan in 10 minutes](https://www.youtube.com/watch?v=Mll5SqR4RYk) · Lift And Shift Dev · quick practical intro to reading a query plan
+- **[[Relational Schema Design]]**
+    - [Database Design: ER Modeling & Normalization (1NF, 2NF, 3NF) Tutorial for Beginners](https://www.youtube.com/watch?v=bcU4f2RVjJU) · Tech with Monir · covers normalization and constraints that form the note's core idea
+- **[[Replication]]**
+    - [Database Replication Explained: Synchronous vs Asynchronous vs Semi-Synchronous](https://www.youtube.com/watch?v=gFch8qdL8GE) · ThatNotesGuy · covers sync/async replication trade-offs and lag
+    - [Database Replication in System Design Explained / Primary-Replica, Replication Lag & Failover](https://www.youtube.com/watch?v=Ii01aFJY9ns) · Errors overflow · primary-replica setup, replication lag and failover, matches note directly
+- **[[SQL Essentials]]**
+    - [Advanced SQL Tutorial 🔥 Learn JOIN, CTE, Window Functions & More in 15 Minutes](https://www.youtube.com/watch?v=Wu4ZNBlY5HY) · Hasu Tube · 15-min visual recap of joins, CTEs and window functions covered in the note
+- **[[SQL vs NoSQL]]**
+    - [SQL vs NoSQL Explained: Why Your Bank and Your Feed Differ](https://www.youtube.com/watch?v=auBGsfDdQyE) · 𝗦𝘁𝗮𝗿𝗖𝗼𝗱𝗲 𝗞𝗵 · covers ACID vs NoSQL families and CAP tradeoffs, matching note's framing
+    - [SQL Vs NoSQL — Choosing The Right Database](https://www.youtube.com/watch?v=2nPT2mv93pk) · Destination Engineer (Formally Destination FAANG) · interview-style walkthrough of choosing by access patterns and scale
+- **[[Search Engines and Inverted Indexes]]**
+    - [How Inverted Index Works in Elasticsearch ⚙️ / Explained in 60 Seconds](https://www.youtube.com/watch?v=b3Elk4bp-0M) · Himanshu Singal · super short visual intro to the term-to-postings-list mapping
+    - [A no nonsense intro to BM25](https://www.youtube.com/watch?v=TW9vHU1GpU4) · Abhishek Thakur · concise explanation of the BM25 ranking formula used in the note
+- **[[Storage Engines - B-tree vs LSM and WAL]]**
+    - [LSM Tree vs B-Tree / Database Internals Explained](https://www.youtube.com/watch?v=tLYgGaY1MYo) · AlgoSimplified · direct comparison of the two storage engine families the note covers
+- **[[Time-Series and Columnar Storage]]**
+    - [An intro to column-based storage](https://www.youtube.com/watch?v=a7rmLeGK1v8) · ClickHouse · official explainer on column pruning and compression, matching the note's core idea
+    - [What is ClickHouse Database in 2026? The Fastest Open-Source OLAP Explained!](https://www.youtube.com/watch?v=Tk3Xmayopy8) · Brendan Metcalfe · concrete example of a columnar OLAP engine applying these ideas
+- **[[Transactions and ACID]]**
+    - [Relational Database ACID Transactions (Explained by Example)](https://www.youtube.com/watch?v=pomxJOFVcQs) · Hussein Nasser · reputable channel, example-driven walkthrough of atomicity/consistency/isolation/durability
+    - [ACID Properties Explained: Database Transaction Fundamentals for Beginners](https://www.youtube.com/watch?v=RSPfC-KKZAQ) · CodeLucky · beginner-friendly intro covering all four ACID properties
+- **[[Wide-Column Stores and Cassandra]]**
+    - [Foundations of Cassandra Data Modeling - Session 1](https://www.youtube.com/watch?v=CivjlnV7lNc) · DataStax · deep dive on partition/clustering key data modeling from Cassandra's own vendor
+    - [Cassandra in 100 Seconds](https://www.youtube.com/watch?v=ziq7FUKpCS8) · Fireship · super short visual intro to what Cassandra is
+    - [Intro to NO SQL - Cassandra / Tutorial / Why the name Cassandra (Part 5) / Great Learning](https://www.youtube.com/watch?v=DtxXeCPcqNI) · Great Learning · broader NoSQL/wide-column-store context before diving into Cassandra specifics
+- **[[Zero-Downtime Schema Migrations]]**
+    - [Every engineer should know this.. (Expand-Contract Pattern)](https://www.youtube.com/watch?v=ONSCQWLD9d0) · Software Developer Diaries · short visual explainer of the expand-migrate-contract pattern used in the note
+    - [The safe way to run zero-downtime database migrations](https://www.youtube.com/watch?v=l_jjjgwNRI0) · programmerCave · practical walkthrough of safe migration steps and lock-timeout concerns
+
+## 08 Caching & Redis
+
+- **[[Cache Eviction Policies - LRU, LFU, TTL]]**
+    - [LRU Eviction Explained / Caching Fundamentals](https://www.youtube.com/watch?v=i5WMim1zc8o) · TheCodeAlchemist · focused explainer on LRU eviction mechanics
+    - [LFU Eviction Explained / Caching Fundamentals](https://www.youtube.com/watch?v=FZnd0Y8EBik) · TheCodeAlchemist · companion video on LFU eviction mechanics, pairs with the LRU one
+    - [Ep. 21: Cache Eviction Explained in Detail](https://www.youtube.com/watch?v=vAqFJp_eaGI) · Systemic Stack English · broader detailed overview of eviction policies in general
+- **[[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]**
+    - [Cache Stampede: How One Expired Key Crashes Your DB](https://www.youtube.com/watch?v=TAZGA-aScPA) · SystemDR - Scalable System Design  · focused explainer on the stampede/thundering-herd failure mode and fixes
+    - [Cache Stampede (Thundering Herd) Explained: 9 Concepts Every Software Engineer Must Know](https://www.youtube.com/watch?v=4t7Tev-wILI) · BSSR Learn · interview-oriented deep dive connecting stampede to related caching concepts
+- **[[Cache Invalidation, TTL and Consistency]]**
+    - [Caching Strategies: TTL, LRU - System Design Interview #cacheinvalidation #ttl #lru](https://www.youtube.com/watch?v=Lt3N5GLBoYo) · The Code Architect · interview-style walkthrough of TTL and invalidation tradeoffs
+- **[[Caching Fundamentals]]**
+    - [How does Caching on the Backend work? (System Design Fundamentals)](https://www.youtube.com/watch?v=bP4BeUjNkXc) · Software Developer Diaries · clear visual intro to why caching exists and the hit/miss/hit-ratio basics
+    - [🧠 System Design Fundamentals 11 ✅  Caching & CDN in System Design / Cache Strategies, TTL & Eviction](https://www.youtube.com/watch?v=mTHT3LmsNbw) · InterviewWithBunny · broader system-design framing covering cache layers, TTL and eviction together
+- **[[Caching Patterns]]**
+    - [Distributed Caching Strategies: Cache-Aside, Write-Through, Write-Behind](https://www.youtube.com/watch?v=V1oGVbxD8mk) · CodeLucky · directly covers cache-aside, write-through and write-behind patterns from the note
+    - [Caching For System Design: Redis, CDN, Cache Patterns Explained](https://www.youtube.com/watch?v=ETvLl-8bPbo) · System Design Lab · broader pass over caching patterns with Redis-specific framing
+- **[[Redis Data Structures and When to Use Each]]**
+    - [Redis Sorted Sets Explained](https://www.youtube.com/watch?v=MUKlxdBQZ7g) · Redis · official Redis channel explaining sorted sets, used for ranking/time-ordering per the note
+    - [Redis Hashes Explained](https://www.youtube.com/watch?v=-KdITaRkQ-U) · Redis · official Redis channel explaining hashes, used for object storage per the note
+- **[[Redis Fundamentals]]**
+    - [Redis Course - In-Memory Database Tutorial](https://www.youtube.com/watch?v=XCsS_NVAa1g) · freeCodeCamp.org · full-length reputable course covering Redis fundamentals end-to-end
+    - [Redis Explained - One Thread, Over a Million Ops a Second](https://www.youtube.com/watch?v=mvhI5ZPgErM) · Pattern Repetition · short deep-dive on why Redis's single-threaded model is fast and atomic
+- **[[Redis Hands-on Setup with Go]]**
+    - [Beginner's Guide to Redis with Go!](https://www.youtube.com/watch?v=1C3Ym_JjkMw) · TutorialEdge · concise intro to connecting to Redis from Go
+    - [Setup Redis & Go with Docker Compose ( Redis CLI setup included )](https://www.youtube.com/watch?v=nxubvWC0MNc) · Jason Cheung · hands-on local setup walkthrough with Docker Compose and redis-cli
+- **[[Redis Persistence - RDB and AOF]]**
+    - [Implementing AOF Persistence / Redis Internals](https://www.youtube.com/watch?v=5SnkVoatBpA) · Arpit Bhayani · 21 min · 4,248 views
+    - [Understanding Redis Persistence - AOF & RDB + Docker](https://www.youtube.com/watch?v=1pfvz24BAUs) · Coding with Raphael De Lio · 19 min · 11,393 views
+- **[[Redis Replication, Sentinel and Cluster]]**
+    - [Clustering in Redis](https://www.youtube.com/watch?v=3WOfXRjYnGA) · Redis · 8 min · 72,531 views
+    - [Redis Cluster Replication and Redis Sentinel Failover (HA) with Endpoint Route HAProxy](https://www.youtube.com/watch?v=J27AcaVuAPM) · Mahmudur Rahman · 9 min · 7,888 views
+- **[[Redis Use Cases]]**
+    - [Top 5 Redis Use Cases](https://www.youtube.com/watch?v=a4yX7RUgTxI) · ByteByteGo · 6 min · 273,898 views
+    - [Redis Crash Course - the What, Why and How to use Redis as your primary database](https://www.youtube.com/watch?v=OqCK95AS-YE) · TechWorld with Nana · 23 min · 590,386 views
+- **[[Redis in Production - Memory, Latency, Security]]**
+    - [How Redis Caps Its Memory Usage / Redis Internals](https://www.youtube.com/watch?v=xNfoeZuK3Mc) · Arpit Bhayani · 13 min · 2,584 views
+    - [Why Every System Uses Redis: In-Memory Architecture Explained](https://www.youtube.com/watch?v=qq-tLyedJsI) · SimplyExplained · 10 min · 1 views
+
+## 09 Messaging & Async
+
+- **[[AWS SQS, SNS and EventBridge]]**
+    - [AWS SQS vs SNS vs EventBridge - When to Use What?](https://www.youtube.com/watch?v=RoKAEzdcr7k) · Be A Better Dev · 22 min · 291,832 views
+    - [AWS SNS Vs SQS Vs EventBridge In 2024 / When To Use What?](https://www.youtube.com/watch?v=jXQhaJIxLnE) · Cloud With Raj · 16 min · 19,346 views
+- **[[Background Jobs and Worker Pools]]**
+    - [14. Task queues and background jobs](https://www.youtube.com/watch?v=r-nQsyguU1Y) · Sriniously · 55 min · 46,306 views
+    - [System Design: Background Job-Processing Workers!](https://www.youtube.com/watch?v=Hvm2hOFb6gM) · KodeKloud · 3 min · 5,728 views
+- **[[Backpressure and Flow Control]]**
+    - [Backpressure Handling: Flow Control in Distributed Streaming Systems Explained](https://www.youtube.com/watch?v=Vwb_rliN_2k) · CodeLucky · 4 min · 313 views
+    - [NSDI '22 - Backpressure Flow Control](https://www.youtube.com/watch?v=3q2IyEGKyNo) · USENIX · 16 min · 1,637 views
+- **[[Dead Letter Queues and Poison Messages]]**
+    - [Errors and Dead Letter Queues / Kafka Connect 101 (2023)](https://www.youtube.com/watch?v=GWBk9LIzy-A) · Confluent, an IBM Company · 4 min · 18,650 views
+    - [Dead-letter queues and poison messages: what happens after the message lands](https://www.youtube.com/watch?v=Yug4Xsf3L0I) · FDE Interviews · 3 min · 23 views
+- **[[Delivery Semantics and Exactly-Once]]**
+    - [Apache Kafka® Transactions: Message Delivery and Exactly-Once Semantics](https://www.youtube.com/watch?v=Ki2D2o9aVl8) · Confluent, an IBM Company · 14 min · 40,096 views
+    - [How Kafka Actually Achieves Exactly-Once Semantics](https://www.youtube.com/watch?v=iRhDCIzhm4A) · Arpit Bhayani · 18 min · 64,555 views
+- **[[Event Schemas and Schema Registry]]**
+    - [How to Evolve your Microservice Schemas / Designing Event-Driven Microservices](https://www.youtube.com/watch?v=XG-EVX6PEFo) · Confluent, an IBM Company · 6 min · 7,510 views
+    - [Apache Kafka 101: Schema Registry (2023)](https://www.youtube.com/watch?v=_x9RacHDQY0) · Confluent, an IBM Company · 6 min · 106,045 views
+- **[[Event-Driven Architecture Basics]]**
+    - [Event-Driven Architecture(EDA) vs. Request/Response (RR): System Design Explained](https://www.youtube.com/watch?v=7fkS-18KBlw) · Confluent, an IBM Company · 12 min · 311,560 views
+    - [What's an Event Driven System?](https://www.youtube.com/watch?v=rJHTK2TfZ1I) · Gaurav Sen · 14 min · 434,302 views
+- **[[Kafka and Event Streaming]]**
+    - [What is Event Streaming? / Apache Kafka for .NET Developers](https://www.youtube.com/watch?v=qzEnjyJPI1g) · Confluent, an IBM Company · 3 min · 21,939 views
+    - [Event Sourcing 101: Event Sourcing vs. Event Streaming](https://www.youtube.com/watch?v=I3Mlt7GCeIU) · Confluent, an IBM Company · 3 min · 20,258 views
+- **[[Message Ordering and Partition Keys]]**
+    - [Lesson 12 / Kafka Message Keys & Ordering Explained — How to Guarantee Event Order](https://www.youtube.com/watch?v=j9xAVG7I3Ew) · TechWithY · 8 min · 327 views
+    - [Does Kafka Guarantee Message Ordering? 🤔 Microservices Fix Inside !](https://www.youtube.com/watch?v=Jl-nauqEtEo) · Java Techie · 28 min · 23,777 views
+- **[[Queues vs Streams and Broker Comparison]]**
+    - [Ep. 11: Message Queues vs Streams Explained in About 14 Minutes](https://www.youtube.com/watch?v=3YI-kSUsH0Y) · Systemic Stack English · 13 min · 312 views
+    - [Message Queues vs Event Streams: The Ultimate Architecture Guide](https://www.youtube.com/watch?v=UxsahIgivYM) · Ground Truth — AI News for Engineers · 16 min · 113 views
+- **[[Redis as a Queue - Lists, Streams and Pub-Sub]]**
+    - [Redis Streams vs Pub/Sub: Performance](https://www.youtube.com/watch?v=F27loUSoIno) · Anton Putra · 4 min · 36,324 views
+    - [Redis Streams vs Pub/Sub: Stop Using Redis as a Broken Message Queue](https://www.youtube.com/watch?v=upr5Mn8thZM) · JM Tech Explain · 3 min · 21 views
+- **[[Scheduled Jobs - Cron to Durable Schedulers]]**
+    - [Scheduling Jobs with @Scheduled Annotation (Cron Expression) / Spring Scheduler Tutorial](https://www.youtube.com/watch?v=pFpi-Fm23DU) · Ram N Java · 4 min · 2,279 views
+    - [Moving Cron Jobs to the Cloud](https://www.youtube.com/watch?v=7Z1mgOxWTs8) · Google Cloud Tech · 3 min · 20,040 views
+- **[[Stream Processing Basics]]**
+    - [What's Stream Processing + When Do We Use It?  / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=7PjPhgCoT9c) · Jordan has no life · 13 min · 42,217 views
+    - [Intro to Stream Processing with Apache Flink / Apache Flink 101](https://www.youtube.com/watch?v=WajYe9iA2Uk) · Confluent, an IBM Company · 7 min · 81,525 views
+- **[[Transactional Outbox and CDC]]**
+    - [What is the Transactional Outbox Pattern? / Designing Event-Driven Microservices](https://www.youtube.com/watch?v=5YLpjPmsPCA) · Confluent, an IBM Company · 5 min · 67,138 views
+    - [The Outbox Pattern & CDC Explained — Stop Losing Events / System Design Interview](https://www.youtube.com/watch?v=uagUOImVvAg) · NodePrism · 6 min · 2,621 views
+- **[[Workflow Engines and Durable Execution]]**
+    - [Durable Execution (Temporal/Inngest) / Distributed Systems Deep Dives With Ex-Google SWE](https://www.youtube.com/watch?v=GT9k8OSjzX8) · Jordan has no life · 18 min · 38,177 views
+    - [What is Temporal? Durable Execution Explained](https://www.youtube.com/watch?v=PCZghg9ySrY) · The Data and AI Guy · 14 min · 14,990 views
+
+## 10 Distributed Systems & Resilience
+
+- **[[Bulkheads and Concurrency Limits]]**
+    - [Jai Desai - Little's Law: Why Service Concurrency Limits Matter - WTF is SRE 2023](https://www.youtube.com/watch?v=4N8-3mb-mzM) · Container Solutions · 17 min · 156 views
+- **[[CAP and PACELC]]**
+    - [System Design Interview Course • PACELC Theorem(enhanced CAP)](https://www.youtube.com/watch?v=X5izO4vZBhU) · Anubhav Sethi · 9 min · 2,925 views
+    - [CAP & PACELC theorems explained](https://www.youtube.com/watch?v=dWjiUqikRx0) · ThatNotesGuy · 6 min · 2,269 views
+- **[[CQRS]]**
+    - [CQRS is probably the cause of the Microservices madness](https://www.youtube.com/watch?v=DQ3D_mplIgY) · Hussein Nasser · 6 min · 76,431 views
+    - [Mastering CQRS in Just 5 Minutes](https://www.youtube.com/watch?v=SvjdJoNPcHs) · ByteMonk · 5 min · 68,166 views
+- **[[CRDTs and Conflict Resolution]]**
+    - [CRDTs - Stop Worrying About Write Conflicts / Systems Design 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=FG5Varj1Ows) · Jordan has no life · 16 min · 46,021 views
+    - [An introduction to Conflict-Free Replicated Data Types (CRDTs)](https://www.youtube.com/watch?v=gZP2VUmH05A) · Mycelial · 9 min · 14,583 views
+- **[[Circuit Breaker]]**
+    - [Circuit Breaker Explained / Working Principle](https://www.youtube.com/watch?v=SNBfppriDjc) · RealPars · 7 min · 184,624 views
+    - [Why Circuit Breakers DON'T Protect People (electric shocks)](https://www.youtube.com/watch?v=gqEu9t8HwW0) · The Engineering Mindset · 18 min · 2,972,093 views
+- **[[Clocks and Ordering]]**
+    - [Read a paper: Time, clocks, and the ordering of events in a distributed system](https://www.youtube.com/watch?v=ummQWQgkWOA) · Vivek Haldar · 15 min · 5,796 views
+    - [Time and Ordering in Distributed Systems: Logical vs. Vector Clocks Explained!](https://www.youtube.com/watch?v=TTv6bEFvIho) · CodeLucky · 5 min · 4,278 views
+- **[[Consensus - Raft and Paxos]]**
+    - [Distributed Consensus - Raft Leader Election / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=Al2JNJBGG30) · Jordan has no life · 8 min · 26,516 views
+    - [Consensus Algorithms Explained: Raft, Paxos & PBFT for Beginners](https://www.youtube.com/watch?v=-5ESi61Z7is) · CodeLucky · 4 min · 2,150 views
+- **[[Consistency Models]]**
+    - [L17: Consistency Models in Distributed Systems](https://www.youtube.com/watch?v=Fm8iUFM2iWU) · Distributed Systems Course · 18 min · 43,952 views
+    - [Consistency Models / System Design / Distributed Systems](https://www.youtube.com/watch?v=uAqIa-mtjJ4) · Knowledge Center · 10 min · 35,135 views
+- **[[Distributed Locks and Fencing Tokens]]**
+    - [Distributed Locks Explained: Why Yours Isn't Safe, and What Fencing Tokens Actually Fix](https://www.youtube.com/watch?v=OSZxn_tsj8U) · Elite Dev News · 18 min · 60 views
+    - [Distributed Locks in Go: Fencing Tokens & Safety Guide](https://www.youtube.com/watch?v=w3wGI40segM) · Lets learn with Ajay · 6 min · 4 views
+- **[[Distributed Systems Fundamentals]]**
+    - [System Design Primer ⭐️: How to start with distributed systems?](https://www.youtube.com/watch?v=SqcXvc3ZmRU) · Gaurav Sen · 9 min · 2,095,426 views
+    - [Data Consistency and Tradeoffs in Distributed Systems](https://www.youtube.com/watch?v=m4q7VkgDWrM) · Gaurav Sen · 25 min · 251,352 views
+- **[[Event Sourcing]]**
+    - [What is the Event Sourcing Pattern? / Designing Event-Driven Microservices](https://www.youtube.com/watch?v=wPwD9CQAGsk) · Confluent, an IBM Company · 5 min · 36,439 views
+    - [Event Sourcing 101: Event Sourcing vs. Event Streaming](https://www.youtube.com/watch?v=I3Mlt7GCeIU) · Confluent, an IBM Company · 3 min · 20,258 views
+- **[[Failure Detection, Gossip and Membership]]**
+    - [Jinal Parikh – Are you Dead or Alive? Using Gossip for Failure Detection / Øredev 2022](https://www.youtube.com/watch?v=wJPRtGfbPLE) · Øredev Conference · 42 min · 370 views
+    - [System Design / Design Key Value Store /  Pt8 / Failure Detection / Gossip Protocol](https://www.youtube.com/watch?v=4oLHS4eBo_M) · Software Interviews Prep · 11 min · 433 views
+- **[[High Availability and Failover]]**
+    - [Fail-over and High-Availability (Explained by Example)](https://www.youtube.com/watch?v=Zgy1miPsTNs) · Hussein Nasser · 19 min · 67,906 views
+    - [Design Patterns for High Availability: What gets you 99.999% uptime?](https://www.youtube.com/watch?v=LdvduBxZRLs) · Gaurav Sen · 13 min · 35,846 views
+- **[[Leader Election]]**
+    - [Distributed Consensus - Raft Leader Election / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=Al2JNJBGG30) · Jordan has no life · 8 min · 26,516 views
+    - [How Leader Election work in Distributed Systems / System Design Interview Basics](https://www.youtube.com/watch?v=TzwiGTbUSHg) · ByteMonk · 4 min · 22,179 views
+- **[[Load Shedding and Graceful Degradation]]**
+    - [Anthropic’s Claude Outage Explained / Rate Limiting, Autoscaling & Load Shedding](https://www.youtube.com/watch?v=0yEeqggdQ9w) · ByteMonk · 12 min · 27,733 views
+- **[[Multi-Region Architecture]]**
+    - [AWS re:Invent 2024 - Best practices for creating multi-Region architectures on AWS (ARC323)](https://www.youtube.com/watch?v=CbkqQznZS9Y) · AWS Events · 55 min · 9,968 views
+    - [AWS re:Invent 2025 - Building resilient multi-Region applications with Capital One (ARC404)](https://www.youtube.com/watch?v=PnWTWjmbNp0) · AWS Events · 50 min · 2,186 views
+- **[[Quorums and Leaderless Replication]]**
+    - [Quorums - Leaderless Replication Continued / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=DAONthD50g0) · Jordan has no life · 10 min · 18,847 views
+    - [Database Replication - Leaderless / Dynamo principles, Failover strategies, Quorums / System Design](https://www.youtube.com/watch?v=rPvpa2WujsI) · udaykiran․tech · 10 min · 341 views
+- **[[Saga Pattern]]**
+    - [Distributed Transactions Explained: 2 Phase Commit vs Saga Pattern](https://www.youtube.com/watch?v=DOFflggE_0Q) · Hello Interview · 14 min · 305,485 views
+    - [Saga Pattern / Distributed Transactions / Microservices](https://www.youtube.com/watch?v=d2z78guUR4g) · ByteMonk · 17 min · 140,357 views
+- **[[Timeouts, Retries and Backoff]]**
+    - [Timeouts / Retries / Backoff with Jitter / System Design / Distributed Systems](https://www.youtube.com/watch?v=HZdE1dNLX9s) · MsDeep Singh · 26 min · 1,339 views
+    - [What Happens When a Service Fails? / Timeouts, Retries & Circuit Breakers](https://www.youtube.com/watch?v=UR6uPCsObFk) · Jasmeen Kaur · 8 min · 1,192 views
+- **[[Two-Phase Commit]]**
+    - [Distributed Transactions are Hard (How Two-Phase Commit works)](https://www.youtube.com/watch?v=eltn4x788UM) · Hussein Nasser · 16 min · 40,219 views
+    - [Distributed Systems 7.1: Two-phase commit](https://www.youtube.com/watch?v=-_rdWB9hN1c) · Martin Kleppmann · 18 min · 87,979 views
+
+## 11 System Design
+
+- **[[Back-of-the-Envelope Estimation]]**
+    - [Back-Of-The-Envelope Estimation / Capacity Planning](https://www.youtube.com/watch?v=UC5xf8FbdJc) · ByteByteGo · 8 min · 136,493 views
+    - [Back-Of-The-Envelope-Estimation 🕵️📈📏📁](https://www.youtube.com/watch?v=juCeZCZgWZU) · codestorywithMIK · 9 min · 59,710 views
+- **[[Bloom Filters and Probabilistic Data Structures]]**
+    - [What are Probabilistic Data Structures: Bloom Filters](https://www.youtube.com/watch?v=-jiOPKt7avE) · LevelUp · 9 min · 36,611 views
+    - [Bloom Filters / Algorithms You Should Know #2 / Real-world Examples](https://www.youtube.com/watch?v=V3pzxngeLqw) · ByteByteGo · 5 min · 310,094 views
+- **[[Case Study - Ad Click Aggregation]]**
+    - [Designing a Scalable Ad Click Aggregation System / Using Kafka & Redis](https://www.youtube.com/watch?v=q-2eqgB9M8I) · Sanket Singh · 138 min · 4,059 views
+    - [Design Ad Click Event Aggregation: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=P82HuMr8kso) · TechPrep · 22 min · 4,859 views
+- **[[Case Study - Chat System]]**
+    - [WHATSAPP System Design: Chat Messaging Systems for Interviews](https://www.youtube.com/watch?v=vvhC64hQZMk) · Gaurav Sen · 25 min · 2,110,847 views
+    - [FAANG System Design Interview: Design A Chat System (WhatsApp, Facebook Messenger, Discord, Slack)](https://www.youtube.com/watch?v=okrR1KXNLtA) · ByteByteGo · 8 min · 102,951 views
+- **[[Case Study - Collaborative Document Editor]]**
+    - [✅ System Design 10: Design Real-time Collaborative Text Editor like Google Docs / Notion / HLD / LLD](https://www.youtube.com/watch?v=-eMtcFqj8vI) · InterviewWithBunny · 66 min · 22,823 views
+    - [Build Google Docs / A Real-World LLD Project / Document Editor LLD /](https://www.youtube.com/watch?v=MT9qZFGQXOU) · Coder Army · 45 min · 142,026 views
+- **[[Case Study - Digital Wallet and Ledger]]**
+    - [Digital Wallet Ledger Architecture  Building Scalable, Consistent, and Fraud Resistant Payment Syste](https://www.youtube.com/watch?v=37tEgwLcUrQ) · SystemDesignPrep · 7 min · 785 views
+    - [Digital Wallet System Design / Distributed transactions / SAGA pattern](https://www.youtube.com/watch?v=8ByEyCd-MEM) · System Design Pal · 13 min · 5,302 views
+- **[[Case Study - Distributed Cache]]**
+    - [What are Distributed CACHES and how do they manage DATA CONSISTENCY?](https://www.youtube.com/watch?v=U3RkDLtS7uY) · Gaurav Sen · 13 min · 1,056,898 views
+    - [System Design Interview - Distributed Cache](https://www.youtube.com/watch?v=iuqZvajTOyA) · System Design Interview · 34 min · 441,885 views
+- **[[Case Study - Distributed Counter (Likes and Views)]]**
+    - [Twitter Likes Count Design / Youtube Views Count Design / Near Realtime Counter System Design](https://www.youtube.com/watch?v=0V-Ns9vovzE) · Think Software · 16 min · 27,847 views
+    - [How Facebook & YouTube Handle BILLIONS of Likes & Views!](https://www.youtube.com/watch?v=LGOnP9Udffo) · ByteMonk · 8 min · 138,418 views
+- **[[Case Study - Distributed Job Scheduler]]**
+    - [20: Distributed Job Scheduler / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=pzDwYHRzEnk) · Jordan has no life · 30 min · 78,748 views
+    - [Distributed Job Scheduler Design Deep Dive with Google SWE! / Systems Design Interview Question 25](https://www.youtube.com/watch?v=WTxG5880EH8) · Jordan has no life · 19 min · 37,014 views
+- **[[Case Study - Distributed Message Queue]]**
+    - [Message Queues in System Design Interviews w/ Meta Staff Engineer](https://www.youtube.com/watch?v=1ISRd0bS714) · Hello Interview · 26 min · 271,936 views
+    - [What is a MESSAGE QUEUE and Where is it used?](https://www.youtube.com/watch?v=oUJbuFMyBDk) · Gaurav Sen · 9 min · 1,222,399 views
+- **[[Case Study - Email Service]]**
+    - [System Design Interviews - Distributed Email Service](https://www.youtube.com/watch?v=PTfIiDZZ_5k) · baozi8 包子吧 · 10 min · 114 views
+    - [Notification Service System Design(Email, SMS, Push) #systemdesigninterview #highleveldesign #hld](https://www.youtube.com/watch?v=vMx9-ZQW2m8) · TechDecoded · 7 min · 662 views
+- **[[Case Study - File Storage and Sync]]**
+    - [System Design: Dropbox File Storage & Sync Explained Visually](https://www.youtube.com/watch?v=LSeOMkd8R5o) · SeeItFlow · 19 min · 19 views
+- **[[Case Study - Flash Sale and E-commerce Checkout]]**
+    - [flashsale module system design in 6 minutes](https://www.youtube.com/watch?v=dlV7l_VqCXk) · Mike tech sharing · 5 min · 27,882 views
+    - [Flash Sale System: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=U2Acfwcah80) · TechPrep · 20 min · 8,555 views
+- **[[Case Study - Hotel Reservation]]**
+    - [Hotel Reservation: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=m67Mjbx6DMY) · TechPrep · 13 min · 99,688 views
+    - [Design a Hotel Reservation System like Expedia & Kayak / System Design](https://www.youtube.com/watch?v=gGzXvlmbtSI) · Irtiza Hafiz · 31 min · 31,637 views
+- **[[Case Study - Key-Value Store]]**
+    - [How Key value Stores Work (Redis, DynamoDB, Memcached)?](https://www.youtube.com/watch?v=Dwt8R0KPu7k) · ByteByteGo · 6 min · 60,020 views
+    - [Design a Key-Value Store - System Design Mock Interview (with Microsoft Software Engineer)](https://www.youtube.com/watch?v=6fOoXT1HYxk) · Aced (formerly Exponent) · 36 min · 97,938 views
+- **[[Case Study - Leaderboard and Top-K]]**
+    - [17: Top K Leaderboard / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=nQpkRONzEQI) · Jordan has no life · 32 min · 60,009 views
+    - [Top-K Leaderboard: System Design Interview (Stripe & Amazon Offers)](https://www.youtube.com/watch?v=D6FKzYYm0eo) · TechPrep · 18 min · 9,203 views
+- **[[Case Study - Live Comments and Reactions]]**
+    - [System Design Interview: Design Live Comments w/ a Ex-Meta Staff Engineer](https://www.youtube.com/watch?v=LjLx0fCd1k8) · Hello Interview · 56 min · 145,886 views
+    - [Design FB Live Comments: Hello Interview Mock](https://www.youtube.com/watch?v=tgSe27eoBG0) · Hello Interview · 59 min · 132,414 views
+- **[[Case Study - Maps and Navigation]]**
+    - [Design Navigation Systems like Google Maps, Uber & Doordash / System Design](https://www.youtube.com/watch?v=HC-3J8ycXFs) · Irtiza Hafiz · 13 min · 13,825 views
+- **[[Case Study - Metrics and Logging Platform]]**
+    - [14: Distributed Logging & Metrics Framework / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=p_q-n09B8KA) · Jordan has no life · 28 min · 80,020 views
+    - [Distributed Metrics/Logging Design Deep Dive with Google SWE! / Systems Design Interview Question 14](https://www.youtube.com/watch?v=_KoiMoZZ3C8) · Jordan has no life · 21 min · 29,655 views
+- **[[Case Study - News Feed]]**
+    - [Design FB News Feed System Design Interview w/ ex: Meta Senior Manager](https://www.youtube.com/watch?v=Qj4-GruzyDU) · Hello Interview · 26 min · 144,605 views
+    - [Designing INSTAGRAM: System Design of News Feed](https://www.youtube.com/watch?v=QmX2NPkJTKg) · Gaurav Sen · 24 min · 765,449 views
+- **[[Case Study - Notification System]]**
+    - [19: Notification Service / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=J-5JozlYIqI) · Jordan has no life · 21 min · 65,691 views
+    - [How Razorpay Designed and Scaled their Notification System](https://www.youtube.com/watch?v=DQwlmTvs6xA) · Arpit Bhayani · 17 min · 36,682 views
+- **[[Case Study - Online Judge]]**
+    - [System Design Interview: Design LeetCode (Online Judge) w/ a Ex-Meta Staff Engineer](https://www.youtube.com/watch?v=1xHADtekTNg) · Hello Interview · 63 min · 172,759 views
+    - [System Design: Online Judge for coding contests](https://www.youtube.com/watch?v=eg0nlYcbLpo) · Gaurav Sen · 8 min · 80,967 views
+- **[[Case Study - Payment System]]**
+    - [29: Amazon Payment Gateway / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=rT4sS4l51PY) · Jordan has no life · 26 min · 63,756 views
+    - [Design a Payment System - System Design Interview](https://www.youtube.com/watch?v=olfaBgJrUBI) · Code with Lucian · 31 min · 744,849 views
+- **[[Case Study - Photo Sharing (Instagram)]]**
+    - [Instagram System Design / Design Photo-Sharing Application / System Design Interview](https://www.youtube.com/watch?v=da7mdMz0g0g) · Tech Takshila · 20 min · 27,713 views
+    - [Design Photo Sharing Service / Instagram](https://www.youtube.com/watch?v=qP12SpInZOI) · Scribble Lab · 7 min · 29 views
+- **[[Case Study - Ride Sharing and Proximity]]**
+    - [Uber - System Design Interview Question (Ride Sharing Service)](https://www.youtube.com/watch?v=DGtalg5efCw) · TechPrep · 16 min · 109,856 views
+    - [✅ System Design 11: Design Ride Sharing Application like UBER / OLA / Rapido / Lyft / HLD / LLD](https://www.youtube.com/watch?v=twUz_hWw2T8) · InterviewWithBunny · 65 min · 25,533 views
+- **[[Case Study - Search Autocomplete]]**
+    - [System design : Design Autocomplete or Typeahead Suggestions for Google search](https://www.youtube.com/watch?v=us0qySiUsGU) · Tushar Roy - Coding Made Simple · 19 min · 333,065 views
+    - [System Design: Search Autocomplete / Typeahead Explained](https://www.youtube.com/watch?v=G_RE4PFly-o) · codingX krishna · 33 min · 2,579 views
+- **[[Case Study - Social Graph and Friend Recommendations]]**
+    - [System Design: Social Graph (with FAANG Senior Engineer)](https://www.youtube.com/watch?v=Jdj2OsGeiA8) · System Design Fight Club · 50 min · 4,187 views
+    - [Social Network Friend Recommendation System in JavaFX / JavaFx / JavaProject / DS](https://www.youtube.com/watch?v=czOP1uBvhP4) · CodingWorldHere · 7 min · 101 views
+- **[[Case Study - Stock Exchange]]**
+    - [27: High Throughput Stock Exchange / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=dGYfpO3WJ1o) · Jordan has no life · 20 min · 51,032 views
+    - [Low Latency Stock Exchange Design Deep Dive with Google SWE! / Systems Design Interview Question 15](https://www.youtube.com/watch?v=erusCJu6CQY) · Jordan has no life · 22 min · 40,211 views
+- **[[Case Study - Ticket Booking]]**
+    - [System Design of a Ticket Booking System: BookMyShow](https://www.youtube.com/watch?v=ohdu6TUoE5s) · Gaurav Sen · 77 min · 46,761 views
+    - [✅ System Design 2: Design Ticket Booking System like BookMyShow, District / HLD / LLD](https://www.youtube.com/watch?v=uamf0wRMx5o) · InterviewWithBunny · 46 min · 88,225 views
+- **[[Case Study - URL Shortener]]**
+    - [How Does a URL Shortener Work?](https://www.youtube.com/watch?v=HHUi8F_qAXM) · ByteByteGo · 6 min · 199,030 views
+    - [Design a URL Shortener (TinyURL, Bit.ly) / Systems Design Questions 3.0 With Ex-Google SWE](https://www.youtube.com/watch?v=xFeWVugaouk) · Jordan has no life · 17 min · 61,147 views
+- **[[Case Study - Video Streaming]]**
+    - [How Video Streaming Works on Scale - System Design ](https://www.youtube.com/watch?v=-JtjQ-OA7XE) · Piyush Garg · 30 min · 102,215 views
+    - [How Video Streaming works / System Design](https://www.youtube.com/watch?v=kCAXpAikMVc) · ByteMonk · 5 min · 140,692 views
+- **[[Case Study - Web Crawler]]**
+    - [Design a Web Crawler: FAANG Interview Question](https://www.youtube.com/watch?v=6u25GckPhLU) · ByteByteGo · 5 min · 53,099 views
+    - [Design a Web Crawler System Design Interview w/ a Ex-Meta Staff Engineer](https://www.youtube.com/watch?v=krsuaUp__pM) · Hello Interview · 65 min · 237,171 views
+- **[[Geospatial Indexing]]**
+    - [DB Indexing in System Design Interviews - B-tree, Geospatial, Inverted Index, and more!](https://www.youtube.com/watch?v=BHCSL_ZifI0) · Hello Interview · 14 min · 286,664 views
+    - [Geospatial Indexing Explained / Geohashing, Quadtrees & R-Trees](https://www.youtube.com/watch?v=cnKTS6THXO0) · Kartikeya Sharma · 9 min · 2,733 views
+- **[[Batch Processing and Data Pipelines]]**
+    - [The Hidden Cost of Batch Processing / Modern Data Engineering Pipelines](https://www.youtube.com/watch?v=rrOj9efHtMs) · Confluent Developer · 11 min · 1,252 views
+    - [What is Stream Processing? / Batch vs Stream Processing / Data Pipelines / Real-Time Data Processing](https://www.youtube.com/watch?v=ya4298V8Mqo) · BI Insights Inc · 6 min · 23,731 views
+- **[[Coordination and Configuration Services]]**
+    - [What is ZooKeeper? - Coordination Services / Systems Design Interview 0 to 1 with Ex-Google SWE](https://www.youtube.com/watch?v=F06tdYgcz_A) · Jordan has no life · 7 min · 40,552 views
+    - [Coordination Services / System Design / High Level Design](https://www.youtube.com/watch?v=6mX8pxmqA7w) · Reactify Labs · 20 min · 170 views
+- **[[Cost-Aware System Design]]**
+    - [8 Most Important System Design Concepts You Should Know](https://www.youtube.com/watch?v=BTjxUS_PylA) · ByteByteGo · 6 min · 612,191 views
+    - [Agentic AI System Design: Evals, Guardrails and Cost](https://www.youtube.com/watch?v=dDXgPTDpcis) · codebasics · 92 min · 38,810 views
+- **[[Fan-out on Write vs Fan-out on Read]]**
+    - [Fan-Out on Read vs Fan-Out on Write](https://www.youtube.com/watch?v=ktOoq3M9SBQ) · Kartikeya Sharma · 3 min · 2,378 views
+    - [Timeline Architecture / Fanout on Read vs Fanout on Write / System Design](https://www.youtube.com/watch?v=SeeKlGMxyBQ) · Kartikeya Sharma · 18 min · 1,120 views
+- **[[Multi-Tenancy and Cell-Based Architecture]]**
+    - [AWS re:Invent 2024 - SaaS meets cell-based architecture: A natural multi-tenant fit (SAS315)](https://www.youtube.com/watch?v=wYm_PJc2U8c) · AWS Events · 56 min · 4,530 views
+    - [Multitenancy Explained](https://www.youtube.com/watch?v=60ccSmOxpMw) · IBM Technology · 3 min · 121,078 views
+- **[[Security, Privacy and Compliance in HLD]]**
+    - [Security vs. Privacy](https://www.youtube.com/watch?v=x3rg8bttldg) · IBM Technology · 9 min · 33,732 views
+    - [VIDEO 1.14  Compliance and Privacy in Cybersecurity — Sensitive Data Explained](https://www.youtube.com/watch?v=Tcl2CgyRMW8) · DigitalUrim · 3 min · 24 views
+- **[[Batch vs Stream - Lambda vs Kappa - Decision Guide]]**
+    - [Lambda vs Kappa Architecture / Batch vs Stream Processing Explained](https://www.youtube.com/watch?v=Bnrk9Jz5ko0) · Arpit Vaish · 9 min · 704 views
+    - [Lambda vs Kappa Architecture: Stream vs Batch Processing in Big Data / Uplatz](https://www.youtube.com/watch?v=oj3QFdRr8xE) · Uplatz · 7 min · 59 views
+- **[[Choosing Compute, Scaling and Deployment - Decision Guide]]**
+    - [Choosing the Right Approach for Scaling Your Application](https://www.youtube.com/watch?v=Az74cD5q4u0) · Caploitte · 4 min · 348 views
+    - [Kubernetes Day 8 / Deployment Explained Step-by-Step / Rollout, Rollback, Scaling & CKA Practice](https://www.youtube.com/watch?v=W9ZnUexlXuU) · DevOpsFusion · 27 min · 349 views
+- **[[Choosing Consistency, Replication and Partitioning - Decision Guide]]**
+    - [Database Replication, Partitioning & Sharding — Explained in 25 Minutes 🚀](https://www.youtube.com/watch?v=FA2kVglR-ZQ) · Souradrita Sarkar · 25 min · 1,052 views
+    - [Replication in Distributed Systems: Modes, Consistency, and Architectures Explained](https://www.youtube.com/watch?v=TcxMMxhMJHs) · Byte Sized Tutorials · 5 min · 676 views
+- **[[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]]**
+    - [Istio & Service Mesh - simply explained in 15 mins](https://www.youtube.com/watch?v=16fgzklcF7Y) · TechWorld with Nana · 16 min · 829,846 views
+    - [Istio Service Mesh Explained](https://www.youtube.com/watch?v=6zDrLvpfCK4) · IBM Technology · 5 min · 217,723 views
+- **[[Choosing Storage for Files, Search and Analytics - Decision Guide]]**
+    - [Designing Data-Intensive Applications Ep06: Analytics Storage and Search](https://www.youtube.com/watch?v=kPMwr9E6Zd0) · The Simplified Architect · 17 min · 17 views
+- **[[Choosing a Caching Strategy - Decision Guide]]**
+    - [Every Caching Strategy Explained in 15 Minutes / System Design Interviews](https://www.youtube.com/watch?v=sW6wPHX-ij0) · Shubham Kulkarni / Coding and Interviews · 14 min · 630 views
+- **[[Choosing a Database - Decision Guide]]**
+    - [Choosing a Database for Systems Design: All you need to know in one video](https://www.youtube.com/watch?v=6GebEqt6Ynk) · Jordan has no life · 23 min · 85,343 views
+    - [Database Design Tips / Choosing the Best Database in a System Design Interview](https://www.youtube.com/watch?v=cODCpXtPHbQ) · codeKarle · 23 min · 616,842 views
+- **[[Choosing an API and Communication Style - Decision Guide]]**
+    - [Top 6 Most Popular API Architecture Styles](https://www.youtube.com/watch?v=4vLxWqE94l4) · ByteByteGo · 4 min · 1,183,838 views
+    - [Every Popular API Style Explained... Like You're 5](https://www.youtube.com/watch?v=xJFzPSAw4Fo) · Code Wrap · 8 min · 74,252 views
+- **[[HLD Round - Complete Step-by-Step Guide]]**
+    - [Complete System Design Roadmap 2026 / HLD & LLD by Shradha Ma'am](https://www.youtube.com/watch?v=CuQmQpvw04I) · Apna College · 20 min · 795,135 views
+    - [How to crack HLD ( High Level Design) round in an interview? / System Design Interviews](https://www.youtube.com/watch?v=EB4XAkcz2Zw) · Recro · 3 min · 765 views
+- **[[HLD Round - Full Worked Mock (Food Delivery App)]]**
+    - [✅ System Design 6: Design Food Delivery Application like Zomato / Swiggy / Uber Eats / HLD / LLD](https://www.youtube.com/watch?v=rZyAgZuuZiA) · InterviewWithBunny · 67 min · 47,803 views
+    - [How Food Delivery Apps Like Swiggy & Zomato Work – Full Backend Architecture Explained](https://www.youtube.com/watch?v=F9x686m-yYo) · FullStackDev · 6 min · 11,096 views
+- **[[HLD Trade-offs Master Cheat Sheet]]**
+    - [System Design Was HARD - Until You Knew the Trade-Offs](https://www.youtube.com/watch?v=1nENigGr-a0) · ByteByteGo · 5 min · 209,309 views
+    - [System Design Was HARD - Until You Knew the Trade-Offs, Part 2](https://www.youtube.com/watch?v=2g1G8Jr88xU) · ByteByteGo · 6 min · 64,310 views
+- **[[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]]**
+    - [Kafka vs. RabbitMQ vs. Messaging Middleware vs. Pulsar](https://www.youtube.com/watch?v=x4k1XEjNzYQ) · ByteByteGo · 4 min · 215,512 views
+    - [Kafka vs RabbitMQ](https://www.youtube.com/watch?v=1HOVtQ-_fcE) · Hello Interview · 10 min · 354,475 views
+- **[[Staff-Level HLD Signals and Company Rubrics]]**
+    - [Concurrency in Low-level Design Interviews w/ Staff Engineer](https://www.youtube.com/watch?v=d8rmosXttTE) · Hello Interview · 22 min · 205,429 views
+- **[[Hot Keys and Hot Partitions]]**
+    - [Video 4: Dynamo DB: Partition key, Sort Keys and Hot partitions](https://www.youtube.com/watch?v=v_kDZO1wE6Y) · NextGen Machines · 37 min · 2,053 views
+    - [How Kafka Scales: Partitions, Keys & the Hot Partition Problem Explained](https://www.youtube.com/watch?v=OFBQKouRglM) · Under The Hood Engineering · 8 min · 579 views
+- **[[Load Balancing]]**
+    - [What is LOAD BALANCING? ⚖️](https://www.youtube.com/watch?v=K0Ta65OqQkY) · Gaurav Sen · 13 min · 1,323,191 views
+    - [Top 6 Load Balancing Algorithms Every Developer Should Know](https://www.youtube.com/watch?v=dBmxNsS3BGE) · ByteByteGo · 5 min · 177,398 views
+- **[[Rate Limiting - Algorithms and Distributed Design]]**
+    - [Design a Distributed Rate Limiter w/ a Ex-Meta Staff Engineer: System Design Breakdown](https://www.youtube.com/watch?v=MIJFyUPG4Z4) · Hello Interview · 55 min · 326,544 views
+    - [Rate Limiter System Design: Token Bucket, Leaky Bucket, Scaling](https://www.youtube.com/watch?v=YXkOdWBwqaA) · ByteByteGo · 7 min · 99,414 views
+- **[[Scaling Basics]]**
+    - [What is Scaling: Horizontal Scaling vs Vertical Scaling / System Design Basics ](https://www.youtube.com/watch?v=pX-7v9nf8Wg) · designKarle - System Design By Shivam Tiwari · 15 min · 1,449 views
+    - [Database Scaling Basics Explained](https://www.youtube.com/watch?v=CXOZd2OkGGA) · Hayk Simonyan · 6 min · 6,445 views
+- **[[Scaling WebSockets]]**
+    - [Scaling Websockets with Redis, HAProxy and Node JS - High-availability Group Chat Application](https://www.youtube.com/watch?v=gzIcGhJC8hA) · Hussein Nasser · 20 min · 116,212 views
+    - [Scaling Websockets Horizontally / SocketIo / Redis Pub\Sub / HandsOn](https://www.youtube.com/watch?v=dcroxRr8uJc) · Irshit · 14 min · 3,098 views
+- **[[Service Discovery]]**
+    - [Service discovery and heartbeats in micro-services 👍📈](https://www.youtube.com/watch?v=lWE_UIbm8NA) · Gaurav Sen · 6 min · 120,843 views
+    - [Master Service Discovery in Microservices / Eureka and Java Spring Boot](https://www.youtube.com/watch?v=ecuEkmFs5Vk) · ByteMonk · 8 min · 55,096 views
+- **[[System Design Fundamentals]]**
+    - [20 System Design Concepts Explained in 10 Minutes](https://www.youtube.com/watch?v=i53Gi_K3o7I) · NeetCode · 11 min · 1,768,613 views
+    - [System Design Concepts Course and Interview Prep](https://www.youtube.com/watch?v=F2FmTdLtb_4) · freeCodeCamp.org · 53 min · 3,275,212 views
+- **[[System Design Interview Framework]]**
+    - [How to Answer Any System Design Interview (The Delivery Framework)](https://www.youtube.com/watch?v=FkLAEAcQXcc) · Hello Interview · 14 min · 15,978 views
+    - [System Design Interview: A Step-By-Step Guide](https://www.youtube.com/watch?v=i7twT3x5yv8) · ByteByteGo · 9 min · 1,133,256 views
+- **[[Unique ID Generation]]**
+    - [Twitter Snowflake ID Generator / Unique ID Generation / System Design](https://www.youtube.com/watch?v=XINLQ_jJsxM) · Kartikeya Sharma · 31 min · 401 views
+    - [Unique ID Generation in Distributed Systems Explained in Hindi / In Depth / Arvind Sir #trending](https://www.youtube.com/watch?v=_cVBVwSxlbc) · COMPILE KARO · 4 min · 60 views
+
+## 12 Security & Auth
+
+- **[[API Abuse and Bot Protection]]**
+    - [Stop Bots, API Abuse, and DDoS: How Cloud WAAP Protects Modern Apps](https://www.youtube.com/watch?v=mKQm-AiZFBM) · techtalk1024 · 7 min · 62 views
+    - [App and API Protector: What bot management options are available to me within the solution?](https://www.youtube.com/watch?v=ALu8wDnShxg) · Akamai Technologies · 4 min · 2,496 views
+- **[[Access and Refresh Tokens]]**
+    - [What are JWT Access token & Refresh token and why we need them? / Understanding JWT Tokens...](https://www.youtube.com/watch?v=ahDQI7msr0A) · Rahul Ahire · 9 min · 73,529 views
+    - [What is the difference between Access Tokens & Refresh Tokens? OAuth 2.0 & OIDC (OpenID Connect)](https://www.youtube.com/watch?v=PX90GNc7xo8) · Ubisecure · 3 min · 29,524 views
+- **[[Authentication vs Authorization]]**
+    - [8. Authentication and authorization for backend engineers](https://www.youtube.com/watch?v=A95rliroC8Q) · Sriniously · 95 min · 191,525 views
+    - [Authentication vs Authorization Explained](https://www.youtube.com/watch?v=7ijBiXddB7w) · xplodivity · 3 min · 43,758 views
+- **[[CORS and Same-Origin Policy]]**
+    - [CORS Explained Clearly / Same-Origin Policy, Preflight & Credentials](https://www.youtube.com/watch?v=ZQ_d3IadtyM) · BMR EDUCATION · 10 min · 934 views
+    - [Same-origin policy / CORS / Web Security model 🌍](https://www.youtube.com/watch?v=b1EFZUcYvb0) · Dev Academy · 9 min · 6,707 views
+- **[[CSRF, XSS and Security Headers]]**
+    - [API Security Explained: Rate Limiting, CORS, SQL Injection, CSRF, XSS & More](https://www.youtube.com/watch?v=FsB_nRGdeLs) · Hayk Simonyan · 8 min · 501,701 views
+    - [Why Your Token Storage Could Be Your Biggest Security Risk - XSS and CSRF Attack in Action](https://www.youtube.com/watch?v=vTroMvQy6K0) · LearnThatStack · 5 min · 18,388 views
+- **[[JWT - Structure, Validation and Pitfalls]]**
+    - [JWT Explained Simply 🔐 / JSON Web Token Architecture, Flow & Security Pitfalls](https://www.youtube.com/watch?v=etJ5IgtPY_Y) · EasyDev · 9 min · 6 views
+- **[[OAuth 2.0 and OpenID Connect]]**
+    - [OAuth 2.0 and OpenID Connect (in plain English)](https://www.youtube.com/watch?v=996OiexHze0) · OktaDev · 62 min · 2,051,848 views
+    - [An Illustrated Guide to OAuth and OpenID Connect](https://www.youtube.com/watch?v=t18YB3xDfXI) · OktaDev · 16 min · 828,851 views
+- **[[OWASP API Security Top 10]]**
+    - [OWASP API Security Top 10 Course – Secure Your Web Apps](https://www.youtube.com/watch?v=YYe0FdfdgDU) · freeCodeCamp.org · 87 min · 134,006 views
+    - [Top 12 Tips For API Security](https://www.youtube.com/watch?v=6WZ6S-qmtqY) · ByteByteGo · 9 min · 251,401 views
+- **[[Password Storage and Login Security]]**
+    - [Password Storage Tier List: encryption, hashing, salting, bcrypt, and beyond](https://www.youtube.com/watch?v=qgpsIBLvrGY) · Studying With Alex · 10 min · 339,130 views
+    - [🔐 Password Security for Beginners: Storage & Protection Explained!](https://www.youtube.com/watch?v=hXX91VlfbLw) · CodeLucky · 8 min · 77 views
+- **[[Secrets Management]]**
+    - [Secrets Management: Secure Credentials & Avoid Data Leaks](https://www.youtube.com/watch?v=BqekRTA6VCs) · IBM Technology · 9 min · 17,593 views
+    - [What is Secrets Management?](https://www.youtube.com/watch?v=iETENR5MEB8) · IBM Technology · 9 min · 23,822 views
+- **[[Security Incident Response - When Your Website Is Hacked]]**
+    - [8 Security Layers Explained - HTTPS Won’t Stop Your Website From Getting Hacked](https://www.youtube.com/watch?v=_ZY8SvgfuXE) · Webmind · 12 min · 140 views
+    - [Cybersecurity IDR: Incident Detection & Response / Google Cybersecurity Certificate](https://www.youtube.com/watch?v=MsGl6lX-YaI) · Grow with Google · 103 min · 248,536 views
+- **[[Service-to-Service Auth - API Keys, HMAC, mTLS]]**
+    - [API Authentication EXPLAINED! 🔐 OAuth vs JWT vs API Keys 🚀](https://www.youtube.com/watch?v=GcVtElYa17s) · SoftsWeb · 9 min · 682,551 views
+    - [OAuth vs JWT vs API Keys vs mTLS: Why One Request Uses Three](https://www.youtube.com/watch?v=XFIujZGk6tY) · The Control Plane · 5 min · 66 views
+- **[[Sessions and Cookies]]**
+    - [Web App Pentesting - HTTP Cookies & Sessions](https://www.youtube.com/watch?v=zHBpJA5XfDk) · HackerSploit · 34 min · 71,398 views
+    - [Cookies and Sessions / Differences / WT / Web Technology / Lec-43 / Bhanu Priya](https://www.youtube.com/watch?v=Ae3WBXMMlXA) · Education 4u · 5 min · 194,522 views
+- **[[Website Security Hardening Checklist]]**
+    - [Website Security Checklist](https://www.youtube.com/watch?v=p0aZL3nwC2I) · Verpex · 5 min · 359 views
+    - [Hardening Techniques - CompTIA Security+ SY0-701 - 2.5](https://www.youtube.com/watch?v=wXoC46Qr_9Q) · Professor Messer · 12 min · 212,552 views
+
+## 13 DevOps & Cloud
+
+- **[[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]]**
+    - [AWS Shared Responsibility Model for Beginners / Understanding Cloud Security (2025)](https://www.youtube.com/watch?v=WopTpel6DUY) · BeSA Cloud Academy · 7 min · 8,296 views
+    - [AWS Shared Responsibility Model Explained / AWS Best Practices / Tech Concept Hub](https://www.youtube.com/watch?v=a25ZkQ00oFQ) · TECH CONCEPT HUB · 5 min · 937 views
+- **[[AWS 02 - IAM]]**
+    - [AWS IAM Core Concepts You NEED to Know](https://www.youtube.com/watch?v=_ZCTvmaPgao) · Be A Better Dev · 21 min · 348,776 views
+- **[[AWS 03 - VPC Networking]]**
+    - [AWS VPC Beginner to Pro - Virtual Private Cloud Tutorial](https://www.youtube.com/watch?v=g2JOHLHh4rI) · freeCodeCamp.org · 131 min · 800,279 views
+- **[[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]]**
+    - [AWS Compute Services: EC2, Lambda, ECS, EKS, Fargate, Beanstalk Explained (CLF-C02)](https://www.youtube.com/watch?v=13Yv1LTjebg) · BiteSizedCerts · 4 min · 94 views
+    - [AWS Compute Explained: EC2, Lambda, ECS, EKS and Fargate / Ch.5](https://www.youtube.com/watch?v=PWzvP3O_yuw) · PM Techhub · 9 min · 1 views
+- **[[AWS 05 - ECS, Fargate and ECR]]**
+    - [Containers on AWS Overview: ECS / EKS / Fargate / ECR](https://www.youtube.com/watch?v=AYAh6YDXuho) · TechWorld with Nana · 25 min · 645,626 views
+    - [AWS ECS Fargate / Deploy ECR custom docker image into ECS Fargate / Amazon ECS Fargate / JMSTechHome](https://www.youtube.com/watch?v=_WVIAv1ryJI) · YB Madhu Sudhan Reddy · 31 min · 6,216 views
+- **[[AWS 06 - Load Balancing (ALB vs NLB)]]**
+    - [AWS Elastic Load Balancing Explained / ALB vs NLB vs GLB Features & Use Cases / Uplatz](https://www.youtube.com/watch?v=k_COzzYvxYU) · Uplatz · 5 min · 180 views
+- **[[AWS 07 - S3]]**
+    - [AWS re:Invent 2025 - How Netflix uses Amazon S3 Storage Lens to track exabytes of data (STG214)](https://www.youtube.com/watch?v=Q2YoHfhFuI8) · AWS Events · 51 min · 1,231 views
+    - [AWS re:Invent 2025 - Deep dive on Amazon S3 (STG407)](https://www.youtube.com/watch?v=S4swTRi1i0w) · AWS Events · 39 min · 4,944 views
+- **[[AWS 08 - RDS and Aurora]]**
+    - [Create/Setup AWS RDS Aurora for MySQL 8 and Connect from MySQL Workbench in 10 minutes /2025 Updated](https://www.youtube.com/watch?v=XDpj7JNZlk8) · a2gdevops · 10 min · 640 views
+    - [AWS RDS Aurora Tutorial](https://www.youtube.com/watch?v=wzXcatDH7MI) · Cloud Guru Amit · 9 min · 7,120 views
+- **[[AWS 09 - Route 53 and ACM]]**
+    - [(ACM) AWS Certificate Manager Course / Route 53 / Load Balancer - Part 16](https://www.youtube.com/watch?v=_bEPuvrjB5Y) · Rahul Wagh · 39 min · 71,139 views
+    - [AWS Route53 - Domain and SSL Certificate using Hosted Zones and ACM](https://www.youtube.com/watch?v=ookzXuMr8eY) · Endre Synnes · 7 min · 51,314 views
+- **[[AWS 10 - CloudWatch]]**
+    - [Basics of Amazon CloudWatch and CloudWatch Metrics / AWS Tutorials for Beginners](https://www.youtube.com/watch?v=Yxl7e88cTAQ) · Tiny Technical Tutorials · 11 min · 98,188 views
+    - [AWS CloudWatch Tutorial for Beginners / Metrics, Alarms, Dashboards & Logs Explained](https://www.youtube.com/watch?v=dQPXBohP0hw) · DheerajTechInsight · 39 min · 16,656 views
+- **[[Deploying a Go API on AWS (Reference Architecture)]]**
+    - [Go and AWS - Code and Deploy a Serverless API](https://www.youtube.com/watch?v=zHcef4eHOc8) · freeCodeCamp.org · 104 min · 93,187 views
+    - [Deploying Fleet on AWS using our Terraform reference architecture](https://www.youtube.com/watch?v=vMcP0tM6g_o) · Fleet · 11 min · 1,167 views
+- **[[Infrastructure as Code with Terraform]]**
+    - [What is Infrastructure as Code? Difference of Infrastructure as Code Tools](https://www.youtube.com/watch?v=POPP2WTJ8es) · TechWorld with Nana · 8 min · 241,093 views
+    - [What is Infrastructure as Code?](https://www.youtube.com/watch?v=zWw2wuiKd5o) · IBM Technology · 8 min · 187,470 views
+- **[[Cloud Computing Basics]]**
+    - [What is Cloud Computing ?](https://www.youtube.com/watch?v=8C_kHJ5YEiA) · Apna College · 5 min · 2,896,003 views
+    - [Cloud Computing In 6 Minutes / What Is Cloud Computing? / Cloud Computing Explained / Simplilearn](https://www.youtube.com/watch?v=M988_fsOSWo) · Simplilearn · 6 min · 3,159,544 views
+- **[[Cloud Native and the 12-Factor App]]**
+    - [Cloud Native vs Cloud Ready / 12 Factor App](https://www.youtube.com/watch?v=CpzCHHc3nVw) · Telusko · 17 min · 52,513 views
+    - [12 Factors App / MicroServices Architecture / Cloud Native Best Practices](https://www.youtube.com/watch?v=N45VJ20wvCw) · Byte Programming · 18 min · 37,725 views
+- **[[Autoscaling]]**
+    - [Day 17/40 - Kubernetes Autoscaling Explained/ HPA Vs VPA](https://www.youtube.com/watch?v=afUL5jGoLx0) · Tech Tutorials with Piyush · 25 min · 31,305 views
+    - [Kubernetes Autoscaling: HPA vs. VPA vs. Keda vs. CA vs. Karpenter vs. Fargate](https://www.youtube.com/watch?v=hsJ2qtwoWZw) · Anton Putra · 14 min · 64,659 views
+- **[[CI-CD Pipelines (GitHub Actions for Go)]]**
+    - [GitHub Actions Tutorial - Basic Concepts and CI/CD Pipeline with Docker](https://www.youtube.com/watch?v=R8_veQiYBjI) · TechWorld with Nana · 32 min · 2,378,185 views
+    - [CI/CD Tutorial using GitHub Actions - Automated Testing & Automated Deployments](https://www.youtube.com/watch?v=YLtlz88zrLg) · Tom Shaw · 6 min · 486,435 views
+- **[[Deployment Strategies - Rolling, Blue-Green, Canary]]**
+    - [Kubernetes Deployment Strategies with Demos / Canary / Blue Green / Rolling Update](https://www.youtube.com/watch?v=0QhUhrWGB9k) · Abhishek.Veeramalla · 51 min · 84,892 views
+    - [Deployment Strategies Explained: Blue-Green vs. Canary vs. Rolling](https://www.youtube.com/watch?v=H5z70EBtEow) · CodeLucky · 4 min · 4,962 views
+- **[[Feature Flags]]**
+    - [How To Build Feature Flags Like A Senior Dev In 20 Minutes](https://www.youtube.com/watch?v=VBCYqp8l3Lc) · Web Dev Simplified · 20 min · 186,678 views
+    - [What are Feature Flags?](https://www.youtube.com/watch?v=AJa2B-twtG4) · IBM Technology · 6 min · 73,954 views
+- **[[Rollback and Safe Migrations]]**
+    - [The safe way to run zero-downtime database migrations](https://www.youtube.com/watch?v=l_jjjgwNRI0) · programmerCave · 8 min · 219 views
+    - [Flyway Tutorial: Database Schema Migrations in a Live MySQL Project / Safe Deployment #BVRK](https://www.youtube.com/watch?v=XRgB2XhSpNk) · BVRK Tech Tutorial · 12 min · 13 views
+- **[[Docker 01 - Why Containers]]**
+    - [Docker Tutorial 1- Why and What is Docker, Dockers Containers, Virtualization In Machine Learning](https://www.youtube.com/watch?v=hTacGMfL8lc) · Krish Naik · 18 min · 144,448 views
+    - [What is Docker? / Containerization Explained! / Why use Docker Container? (In Hindi)](https://www.youtube.com/watch?v=qN1CzLdCq5g) · CodeWithHarry · 8 min · 482,135 views
+- **[[Docker 02 - Images, Layers and Containers]]**
+    - [Docker Images & Containers Explained / Layers, Registries & Pulling Images](https://www.youtube.com/watch?v=QQkgHJp2C3M) · TechOps Tutorials · 30 min · 258 views
+    - [#578 Containers Explained: Docker Images, Containers and Layers](https://www.youtube.com/watch?v=LeGlK6VyE_Y) · LetsLearn AI · 8 min · 2 views
+- **[[Docker 03 - CLI Essentials]]**
+    - [Ep-4: Docker CLI Essentials + Understanding Docker Images/ @DockerInc #docker](https://www.youtube.com/watch?v=hEQUHKNnSCo) · DevOps Codex · 22 min · 47 views
+    - [Docker CLI Explained / run, exec, logs & inspect (Daily Docker Commands) / Cloud & Devops](https://www.youtube.com/watch?v=pry-Vs4Ew6Y) · DheerajTechInsight · 31 min · 1,482 views
+- **[[Docker 04 - Writing a Production Dockerfile for Go]]**
+    - [Dockerfile Tutorial - Docker in Practice // Docker Tutorial 10](https://www.youtube.com/watch?v=WmcdMiyqfZs) · TechWorld with Nana · 24 min · 278,884 views
+    - [My Production Dockerfile Rules: How I Build Docker Images](https://www.youtube.com/watch?v=ueTe-VQaD7c) · DevOps & AI Toolkit · 17 min · 19,568 views
+- **[[Docker 05 - Networking and Port Publishing]]**
+    - [Free Docker Fundamentals Course - Docker networking - modes and port exposure](https://www.youtube.com/watch?v=zJD7QYQtiKc) · LearnCantrill · 5 min · 38,517 views
+    - [Docker port mapping in hindi / exposing and publishing port / docker networking deep dive - part 4](https://www.youtube.com/watch?v=oiUztkraZao) · PK Nara / RPN Services · 6 min · 835 views
+- **[[Docker 06 - Volumes and Bind Mounts]]**
+    - [Docker Volumes explained in 6 minutes](https://www.youtube.com/watch?v=p2PH_YPCsis) · TechWorld with Nana · 6 min · 351,473 views
+- **[[Docker 07 - Docker Compose for Local Development]]**
+    - [How To Use Docker To Make Local Development A Breeze](https://www.youtube.com/watch?v=zkMRWDQV4Tg) · ArjanCodes · 21 min · 376,345 views
+    - [Docker Up and Running 13: Docker Compose for Local Development](https://www.youtube.com/watch?v=4mCye01GE54) · Syndri Training · 5 min · 588 views
+- **[[Docker 08 - How Docker Works Under the Hood]]**
+    - [How Docker Works Under the Hood: A Container Is Just a Process](https://www.youtube.com/watch?v=6_bq2iT3riA) · Beneath the Abstraction · 4 min · 8 views
+    - [How Docker REALLY Works Under the Hood (Containers Explained)  #docker #devops #programming](https://www.youtube.com/watch?v=DaBxnaCwJ2s) · DevOps Corner · 8 min · 148 views
+- **[[Docker 09 - Container Security and Hardening]]**
+    - [Docker Container Security in 30 Minutes / Trivy Vulnerability Scanning & Hardening / Hands-On Projec](https://www.youtube.com/watch?v=wh9c9peM1sk) · The Cloud Threat Defender · 32 min · 304 views
+    - [Container Security Explained](https://www.youtube.com/watch?v=b_euX_M82uI) · IBM Technology · 6 min · 86,273 views
+
+## 14 Observability & SRE
+
+- **[[Alerting and On-Call]]**
+    - [DevOps Alerting and On-Call: Reduce Noise and Respond Faster](https://www.youtube.com/watch?v=orG2ybDD2dU) · Joshua Moses / Cybertrace Foundation · 8 min · 11 views
+    - [Humane On Call  Alerting doesn't have to be painful by Mario Fernandez](https://www.youtube.com/watch?v=X59Sfaey5N4) · Devoxx · 43 min · 1,631 views
+- **[[Debugging Database Performance]]**
+    - [Performance Debugging in YugabyteDB / YugabyteDB Friday Tech Talks / Episode 63](https://www.youtube.com/watch?v=byHWkarjhJw) · Yugabyte · 41 min · 354 views
+    - [SAP debugging  and Performance analysis](https://www.youtube.com/watch?v=izhx2HNwchY) · Rohini Kumar · 14 min · 67 views
+- **[[Debugging Memory Leaks and OOMs in Go]]**
+    - [Understanding and Debugging Memory Leaks in Your Node.js Applications (I)](https://www.youtube.com/watch?v=hliOMEQRqf8) · node.js · 30 min · 79,378 views
+    - [How To Detect Memory Leaks In Your Web App (2025)](https://www.youtube.com/watch?v=6IlTjqU_Tc0) · Decoded Frontend · 20 min · 42,167 views
+- **[[Distributed Tracing with OpenTelemetry]]**
+    - [Distributed tracing with OpenTelemetry and Cloud Trace](https://www.youtube.com/watch?v=NQeK8Kbu6UM) · Google Cloud Tech · 4 min · 16,941 views
+    - [Distributed Tracing Integration with OpenTelemetry and Knative - Daniel Oh & James Falkner, Red Hat](https://www.youtube.com/watch?v=48uWe9Y3CwQ) · CNCF (Cloud Native Computing Foundation) · 33 min · 568 views
+- **[[Playbook - Bad Deploy and Rollback]]**
+    - [Deployment in Kubernetes: A Comprehensive Guide to Rollout, Update, and Rollback](https://www.youtube.com/watch?v=-uO400iEuKo) · DevOps Pro · 8 min · 13,710 views
+    - [Rollback A Deployments in Kubernetes Using ArgoCD](https://www.youtube.com/watch?v=f40Dl1_V6lE) · Valaxy Technologies · 11 min · 1,259 views
+- **[[Playbook - CPU Saturation]]**
+    - [USE: CPU Saturation](https://www.youtube.com/watch?v=_HEiug2msx4) · Ostsee-Pinguin · 33 min · 211 views
+- **[[Playbook - Cache Outage and Stampede]]**
+    - [Why One Cache Expiry Can Crash Your System / Cache Stampede Explained](https://www.youtube.com/watch?v=GVyOZo__F70) · Tech Is Easy Actually · 6 min · 873 views
+    - [Major Caching Strategies Explained for Beginners in 5 Minutes / LRU, LFU, TTL, Cache Stampede & More](https://www.youtube.com/watch?v=Mx8tR03NVQc) · Learn with Whiteboard · 5 min · 1,155 views
+- **[[Playbook - Data Inconsistency and Duplicate Processing]]**
+    - [Lessons Learned From Etcd the Data Inconsistency Issues - Marek Siarkowicz & Benjamin Wang](https://www.youtube.com/watch?v=_nSJ_vozyqk) · CNCF (Cloud Native Computing Foundation) · 35 min · 493 views
+    - [Data Redundancy & Data Inconsistency // DBMS // Lecture In Urdu/Hindi](https://www.youtube.com/watch?v=r0z9_pmS0qM) · THE FACT SCHOOL · 3 min · 53,013 views
+- **[[Playbook - Database Overload and Connection Exhaustion]]**
+    - [Database Connection Pool Sizing - Demystified! by Jasmin Fluri](https://www.youtube.com/watch?v=Cp-aFYHLiCw) · Devoxx · 38 min · 4,628 views
+    - [Database Connection Pooling: Why It Matters? Essential OS-Level Insights](https://www.youtube.com/watch?v=Vq34xPYZwXg) · Denis Magda · 5 min · 16,899 views
+- **[[Playbook - Disk Full and Log Floods]]**
+    - [Linux Disk Full After Deleting Files? lsof +L1 Simply Explained](https://www.youtube.com/watch?v=xnfOynjv3SM) · DevOps Made Simple · 10 min · 33 views
+- **[[Playbook - Error Rate Spike (5xx)]]**
+    - [Familywise error rate (FWER) - explained](https://www.youtube.com/watch?v=8CuFKY45UXQ) · TileStats · 12 min · 16,746 views
+    - [Bit Error Rate - BER - explained (01-04-05)](https://www.youtube.com/watch?v=Xtb1EuAszHU) · HUBER+SUHNER  · 4 min · 7,195 views
+- **[[Playbook - High Latency]]**
+    - [19 Milliseconds That Decide Wall Street / High-Frequency Trading & Latency Explained ](https://www.youtube.com/watch?v=dxlqEGGw3ns) · Axiom Explained · 9 min · 1,600 views
+- **[[Playbook - Memory Leak and OOMKilled]]**
+    - [Fixing OOMKilled Pods in Kubernetes / Troubleshooting Memory Leaks Like a Pro 🚀](https://www.youtube.com/watch?v=Yh6tjHktLKU) · Platform Engineering hacks · 5 min · 556 views
+    - [What is memory leak?](https://www.youtube.com/watch?v=eu_kTGv61WQ) · codebasics · 3 min · 110,597 views
+- **[[Playbook - Queue and Kafka Consumer Lag]]**
+    - [Queueing Theory in Kafka / Consumer Lag, Partitions & Concurrency Explained](https://www.youtube.com/watch?v=YEWXkulUX50) · Industry Ready Coder · 4 min · 50 views
+    - [Apache Kafka Consumer Lag Analysis in-depth intuition](https://www.youtube.com/watch?v=-Dwb6RhNDNU) · Knowledge Amplifier · 14 min · 14,573 views
+- **[[Playbook - TLS Certificate and DNS Failures]]**
+    - [What are SSL/TLS Certificates? Why do we Need them? and How do they Work?](https://www.youtube.com/watch?v=r1nJT63BFQ0) · Hussein Nasser · 14 min · 219,511 views
+    - [HTTPS, SSL, TLS & Certificate Authority Explained](https://www.youtube.com/watch?v=EnY6fSng3Ew) · Laiture · 43 min · 372,273 views
+- **[[Playbook - Third-Party Dependency Outage]]**
+    - [A Real Production Incident Every SRE Should Learn From Third-Party Dependency Failure](https://www.youtube.com/watch?v=AaEej0_CQGU) · Tech Apricate · 14 min · 2,865 views
+    - [Unveiling Third-Party Risks: Key Lessons from the AWS Outage Breakdown](https://www.youtube.com/watch?v=Dz6j-cHdPKQ) · Resilient Foundations · 16 min · 17 views
+- **[[Playbook - Traffic Spike and DDoS]]**
+    - [How Modern Infrastructure Handles Traffic Spikes & DDoS Attacks](https://www.youtube.com/watch?v=k_lajv4pe18) · Intrilogi Optima Solusi · 72 min · 138 views
+- **[[Incident Response]]**
+    - [SOC Stories / Real-World Scenarios / Suspicious PowerShell Alert / Incident Response for SOC Analyst](https://www.youtube.com/watch?v=LNI8SnlJv0s) · Rajneesh Gupta · 16 min · 9,889 views
+    - [Introduction to Cybersecurity Incident Response](https://www.youtube.com/watch?v=YZSM3YPn998) · Struggle Security · 7 min · 21,220 views
+- **[[Latency, Percentiles and Bottleneck Analysis]]**
+    - [What is Bottleneck Analysis in Lean manufacturing ? / Bottleneck Analysis in explained with ✅𝐄𝐗𝐀𝐌𝐏𝐋𝐄](https://www.youtube.com/watch?v=ZjlQeBpVk70) · Digital E-Learning · 8 min · 80,400 views
+    - [GPU Performance Engineering Explained: Latency, Throughput, and Bottlenecks Explained](https://www.youtube.com/watch?v=MSIhAMHbmn0) · ZeroEntropy · 8 min · 391 views
+- **[[Metrics and Prometheus]]**
+    - [Metrics SIMPLIFIED with OpenTelemetry & Prometheus](https://www.youtube.com/watch?v=tLSS2t7Md3w) · That DevOps Guy · 16 min · 9,397 views
+    - [How Prometheus Works - How to Collect Metrics](https://www.youtube.com/watch?v=q4fr0p-6JO0) · That DevOps Guy · 30 min · 19,344 views
+- **[[Observability Fundamentals]]**
+    - [Day-1 / Fundamentals of Observability / Observability Zero to Hero Course](https://www.youtube.com/watch?v=otY2_M_pTmU) · Abhishek.Veeramalla · 35 min · 179,945 views
+    - [Datadog Fundamentals in 1 Hour  Complete Observability Tutorial 2026](https://www.youtube.com/watch?v=0rSftRQEkGQ) · AiOps School · 104 min · 496 views
+- **[[Performance Engineering and Capacity Planning]]**
+    - [Back-Of-The-Envelope Estimation / Capacity Planning](https://www.youtube.com/watch?v=UC5xf8FbdJc) · ByteByteGo · 8 min · 136,493 views
+    - [Capacity Modeling  The next milestone in Performance Engineering](https://www.youtube.com/watch?v=V7VR1a8p7Bk) · TechGig · 61 min · 2,953 views
+- **[[Postmortems and Root Cause Analysis]]**
+    - [What is Root Cause Analysis (RCA)?](https://www.youtube.com/watch?v=7t3lTYEd_PM) · IBM Technology · 8 min · 150,219 views
+    - [5 Root Cause Analysis Tools / RCA Tools](https://www.youtube.com/watch?v=K2yHOYeZsSQ) · Pharmaguideline · 3 min · 99,364 views
+- **[[Production Debugging Playbook]]**
+    - [Advanced Techniques for Production Debugging](https://www.youtube.com/watch?v=eghHZvffilA) · Ozcode · 60 min · 1,553 views
+    - [Guide to Debugging Production Issues 2026 / Debug Production Related Issues / SCALER](https://www.youtube.com/watch?v=1gqUbq5j9JU) · SCALER · 193 min · 4,210 views
+- **[[Production Readiness Review]]**
+    - [What is Production Readiness Review ? ( With PRR Template )](https://www.youtube.com/watch?v=k4_gLceV4Vc) · CodeWithPrabesh · 4 min · 5,959 views
+    - [Service Meshes: The Production Readiness Checklist for the Rest... - Zachary Arnold & Austin Adams](https://www.youtube.com/watch?v=Ym095HaTkIo) · CNCF (Cloud Native Computing Foundation) · 40 min · 580 views
+- **[[SLIs, SLOs, SLAs and Error Budgets]]**
+    - [SRE Fundamentals - Understanding SLIs, SLOs, SLAs & Error Budgets](https://www.youtube.com/watch?v=nsqHxEbNVcY) · MattOps / DevOps & SRE · 35 min · 565 views
+    - [SLOs, SLIs & Error Budgets Explained: The Framework Senior Engineers Actually Use](https://www.youtube.com/watch?v=2GVNfWcljkk) · Shubham Sahoo · 18 min · 171 views
+- **[[Structured Logging]]**
+    - [Stripe's Smarter Approach to Structured Logging - Canonical Log Lines](https://www.youtube.com/watch?v=9XJtEzmzG3g) · Arpit Bhayani · 7 min · 38,159 views
+
+## 15 Testing
+
+- **[[Chaos Engineering]]**
+    - [AWS re:Invent 2024 - Chaos engineering: A proactive approach to system resilience (ARC326)](https://www.youtube.com/watch?v=MjPRd_UWCS0) · AWS Events · 58 min · 4,339 views
+    - [AWS re:Invent 2022 - The evolution of chaos engineering at Netflix (NFX303)](https://www.youtube.com/watch?v=Xbn65E-BQhA) · AWS Events · 47 min · 21,185 views
+- **[[Contract Testing]]**
+    - [What is Contract Testing](https://www.youtube.com/watch?v=rHgOA_D_DRs) · Automation Step by Step · 3 min · 32,511 views
+    - [What is Contract Testing in API automation + Demo (EA Weekly)](https://www.youtube.com/watch?v=KPu5VK8AP4E) · Execute Automation · 27 min · 42,786 views
+- **[[Fuzz and Property-Based Testing]]**
+    - [Property-Based Testing In Python: Hypothesis is AWESOME](https://www.youtube.com/watch?v=mkgd9iOiICc) · ArjanCodes · 21 min · 56,298 views
+    - [Property-Based Testing in about 3 minutes](https://www.youtube.com/watch?v=qmA9qhaECcE) · Harrison Goldstein · 3 min · 8,228 views
+- **[[Load and Performance Testing]]**
+    - [Performance Testing Interview Questions And Answers - Load Testing Interview Questions-Load Testing](https://www.youtube.com/watch?v=oPgxXSpb4o4) · Software and Testing Training · 16 min · 68,910 views
+    - [Types of Performance Testing Explained / Load, Stress, Spike & More](https://www.youtube.com/watch?v=k2zpZvqUWi4) · Develop with Aakash · 8 min · 421 views
+- **[[Test Data Strategy]]**
+    - [Develop your Data Strategy](https://www.youtube.com/watch?v=ktnQb5yX93E) · IBM Technology · 7 min · 50,241 views
+    - [The Six Pillars of a Data Strategy / Data and Analytics Guide](https://www.youtube.com/watch?v=AZMBtRgmRJA) · Cynozure · 3 min · 56,831 views
+- **[[Test Doubles and Mocking in Go]]**
+    - [Unit Tests and Test Doubles like Mocks, Stubs & Fakes](https://www.youtube.com/watch?v=NPp2pvhGbkM) · AI Build Trek · 17 min · 149,571 views
+    - [What Are The Different Kinds of Test Doubles](https://www.youtube.com/watch?v=ndv-Zuphr6I) · Jov Mit · 13 min · 1,300 views
+- **[[Testing Async and Event-Driven Systems]]**
+    - [Event-Driven Architecture(EDA) vs. Request/Response (RR): System Design Explained](https://www.youtube.com/watch?v=7fkS-18KBlw) · Confluent, an IBM Company · 12 min · 311,560 views
+    - [Messaging, Event-Driven Architecture, and Backpressure Explained / Building Reliable Async Systems](https://www.youtube.com/watch?v=XWX8jOqtPpk) · Ultimate System Design · 6 min · 267 views
+- **[[Testing Strategy and the Test Pyramid]]**
+    - [Modern Mobile App Testing Strategy, Agile team & Testing pyramid](https://www.youtube.com/watch?v=kgTzWLOI4Qs) · Software Testing with Ozan Ilhan / NomadTester · 6 min · 521 views
+    - [ISTQB Agile Tester #42 - What is Test Pyramid / The Testing Pyramid](https://www.youtube.com/watch?v=JQVA3xIrwEo) · Software Testing Mentor · 3 min · 9,392 views
+- **[[Testing in CI-CD, Flaky Tests and Testing in Production]]**
+    - [Series 2:How to Handle Flaky Tests in Production / Automation Framework Best Practices](https://www.youtube.com/watch?v=4ovVYJ44Pos) · Komal Tech Simplified · 18 min · 76 views
+    - [Avoid flaky end-to-end tests due to poorly hydrated Frontends with Playwright's toPass()](https://www.youtube.com/watch?v=8g7FvoRToGo) · Checkly · 7 min · 23,332 views
+- **[[Unit, Integration and E2E Tests]]**
+    - [JavaScript Testing Introduction Tutorial - Unit Tests, Integration Tests & e2e Tests](https://www.youtube.com/watch?v=r9HdJ8P6GQI) · Academind · 39 min · 401,631 views
+    - [Static, Unit, Integration, and End-to-End Tests Explained - Software Testing Series #1](https://www.youtube.com/watch?v=TLccnKIMggA) · Lucas Paganini · 13 min · 63,214 views
+
+## 16 Software Architecture
+
+- **[[Architecture Decision Records]]**
+    - [Architecture Decision Records (ADR) as a LOG that answers "WHY?"](https://www.youtube.com/watch?v=6H6zfCNeqek) · CodeOpinion · 10 min · 27,311 views
+    - [Lesson 55 - Architecture Decision Records](https://www.youtube.com/watch?v=LMBqGPLvonU) · Software Architecture Monday · 10 min · 17,777 views
+- **[[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]**
+    - [Cohesion and Coupling: Write BETTER PYTHON CODE Part 1](https://www.youtube.com/watch?v=eiDyK_ofPPM) · ArjanCodes · 26 min · 231,837 views
+    - [Cohesion and Coupling in Software Engineering](https://www.youtube.com/watch?v=NweTzHYBgYU) · Gate Smashers · 12 min · 722,394 views
+- **[[Clean Architecture]]**
+    - [Understand Clean Architecture in 7 Minutes](https://www.youtube.com/watch?v=1OLSE6tX71Y) · Amichai Mantinband · 7 min · 227,606 views
+    - [The Clean Architecture / Simply Explained / .NET Core](https://www.youtube.com/watch?v=_1cJ0JOLe8Y) · The Code Switch · 6 min · 55,726 views
+- **[[Documenting Architecture - C4 Diagrams and Fitness Functions]]**
+    - [C4 Model Tutorial / Software Architecture Diagrams / Context, Container, Component & Code Explained](https://www.youtube.com/watch?v=PFzWJ-uVeHY) · Engineer Akina · 29 min · 3,597 views
+    - [Create meaningful architecture diagrams using the C4 model](https://www.youtube.com/watch?v=MFvGVNEc8XI) · Tech Leaders Academy · 57 min · 2,808 views
+- **[[Domain-Driven Design - Strategic Design]]**
+    - [Strategic Domain-Driven Design by Nick Tune #AgileIndia2019](https://www.youtube.com/watch?v=hNW8bdTw_IU) · ConfEngine · 45 min · 6,734 views
+    - [Domain Driven Design: What You Need To Know](https://www.youtube.com/watch?v=4rhzdZIDX_k) · Alex Hyett · 8 min · 297,098 views
+- **[[Domain-Driven Design - Tactical Patterns in Go]]**
+    - [Domain Driven Design: Tactical Patterns](https://www.youtube.com/watch?v=nU7VripqFyc) · Trendyol Tech · 126 min · 8,442 views
+    - [Domain Driven Design: What You Need To Know](https://www.youtube.com/watch?v=4rhzdZIDX_k) · Alex Hyett · 8 min · 297,098 views
+- **[[Hexagonal Architecture (Ports and Adapters)]]**
+    - [The HEXAGONAL Architecture Explained / Ports and Adapters Pattern](https://www.youtube.com/watch?v=92eWCQrcsvQ) · Marco Lenzo · 11 min · 19,071 views
+    - [How Ports and Adapters aka Hexagonal Architecture Can Benefit Your Node.js Application?](https://www.youtube.com/watch?v=JF_IJnkIAPw) · Alex Rusin · 12 min · 3,577 views
+- **[[Inversion of Control - Library vs Framework]]**
+    - [Library vs. Framework Explained Simply: The Inversion of Control Secret](https://www.youtube.com/watch?v=EjSrK3DM_CU) · Stack Crate · 5 min · 41 views
+    - [Framework vs Library 🤔 / Who Controls Your Code?](https://www.youtube.com/watch?v=phnWCsUMWrg) · The Coding Driver · 4 min · 90 views
+- **[[Layered Architecture]]**
+    - [Understanding Layered Architecture in Spring Boot / Best Practices and Implementation](https://www.youtube.com/watch?v=Kzrm-BdLckE) · CodeSnippet by Chetan · 21 min · 76,591 views
+    - [Layered Architecture Explained: Best Practices & Design Patterns / layered architecture tutorial](https://www.youtube.com/watch?v=atyNGAf2Ss0) · Topictrick · 14 min · 13,883 views
+- **[[Modular Monolith]]**
+    - [Modular Monoliths • Simon Brown • GOTO 2018](https://www.youtube.com/watch?v=5OjqD-ow8GE) · GOTO Conferences · 46 min · 111,731 views
+    - [Introduction to Spring Modulith - Modular Monoliths in Spring Boot](https://www.youtube.com/watch?v=xHlDyKVyvig) · Dan Vega · 37 min · 25,634 views
+- **[[Monolith vs Microservices]]**
+    - [Moving from MONOLITHS to MICROSERVICES 🎂 → 🍰🍰🍰](https://www.youtube.com/watch?v=rckfN7xFig0) · Gaurav Sen · 19 min · 244,851 views
+    - [What are MicroServices? When & Why is it used? / Monolithic vs Microservices Architecture](https://www.youtube.com/watch?v=7IFJb-uLEaI) · Apna College · 9 min · 805,293 views
+- **[[Strangler Fig Pattern and Legacy Migration]]**
+    - [Microservice Design Patterns / Strangler Fig in Action and Real Migration Story](https://www.youtube.com/watch?v=0nKCfZgUhNA) · Krish Dinesh · 46 min · 2,602 views
+    - [Strangling the dragon: modernizing legacy systems with the Strangler Fig pattern   by Daniel Ranela](https://www.youtube.com/watch?v=AmL_OCs5F4E) · Devoxx · 35 min · 1,656 views
+
+## 17 LLD
+
+- **[[Concurrency for LLD]]**
+    - [Logger System LLD in Java / UML, Concurrency & Design Patterns Explained 📝](https://www.youtube.com/watch?v=hOzH7ecc8vg) · Shubh Patel · 26 min · 17,212 views
+    - [Watch This Before Your Next LLD Interview (Concurrency Cheatsheet)](https://www.youtube.com/watch?v=Qa6ePZYmTEU) · bhavika pawani · 21 min · 2,193 views
+- **[[Design Patterns Overview and Chooser]]**
+    - [10 Design Patterns Explained in 10 Minutes](https://www.youtube.com/watch?v=tv-_1er1mWI) · Fireship · 11 min · 2,904,915 views
+    - [Java Design Patterns Overview / Creational, Structural & Behavioral](https://www.youtube.com/watch?v=WycvzYFRF6U) · The Curious Coder · 4 min · 29,502 views
+- **[[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]**
+    - [Design Principles / SOLID / DRY / KISS / YAGNI 🔥](https://www.youtube.com/watch?v=uxe_0RFgT7A) · codeWithAryan · 55 min · 72,302 views
+    - [Software Design Principles Explained / DRY, KISS & YAGNI in Low Level Design](https://www.youtube.com/watch?v=eNnFThA60yw) · Yash Jain · 19 min · 1,135 views
+- **[[LLD Interview Method]]**
+    - [10 LLD Interview Tips you should follow!!](https://www.youtube.com/watch?v=paNwoBzpYto) · Keerti Purswani · 13 min · 77,199 views
+    - [Low Level Design of a Fitness App and Mock LLD interview with Intuit SWE @Keerti Purswani](https://www.youtube.com/watch?v=7-A5NgGrJqY) · sudoCODE · 52 min · 81,864 views
+- **[[LLD Problem Cheat Sheet]]**
+    - [Watch This Before Your Next LLD Interview (Concurrency Cheatsheet)](https://www.youtube.com/watch?v=Qa6ePZYmTEU) · bhavika pawani · 21 min · 2,193 views
+    - [Low Level Design 102 /What is LLD(Low Level Design)? Simplified steps to learn and break LLD problem](https://www.youtube.com/watch?v=5Tz9EUMHOGI) · sudoCODE · 7 min · 105,776 views
+- **[[OOP in Go - Structs, Interfaces, Embedding]]**
+    - [The Power Of Struct Embedding And Interfaces In Golang](https://www.youtube.com/watch?v=fXZJu_JuH0A) · Anthony GG · 15 min · 22,688 views
+- **[[Adapter]]**
+    - [The Adapter Pattern Explained and Implemented in Java / Structural Design Patterns / Geekific](https://www.youtube.com/watch?v=wA3keqCeKtM) · Geekific · 5 min · 105,363 views
+    - [Adapter Pattern – Design Patterns (ep 8)](https://www.youtube.com/watch?v=2PKQtcJjYvc) · Christopher Okhravi · 26 min · 268,904 views
+- **[[Builder and Functional Options]]**
+    - [Go (Golang) Functional Options Pattern](https://www.youtube.com/watch?v=5ZZwmMI897c) · Golang Cafe · 12 min · 8,490 views
+- **[[Chain of Responsibility and Pipelines]]**
+    - [The Chain of Responsibility Pattern Explained & Implemented / Behavioral Design Patterns / Geekific](https://www.youtube.com/watch?v=FafNcoBvVQo) · Geekific · 7 min · 83,714 views
+    - [Chain of Responsibility Pattern / Build Cash Dispenser(UML & Code) / System Design](https://www.youtube.com/watch?v=LXVKB6deQMo) · Coder Army · 29 min · 20,848 views
+- **[[Command, Undo and Memento]]**
+    - [How Undo & Redo Actually Work (Ctrl+Z Explained) / Stacks, Command & Memento Pattern](https://www.youtube.com/watch?v=2-ayxAs3kR4) · Anand Sharma · 4 min · 7 views
+    - [Undo changes with Memento pattern / Design patterns you must know](https://www.youtube.com/watch?v=Pwm-jrG2ZVA) · Krish Dinesh · 18 min · 3,682 views
+- **[[Composite]]**
+    - [The Incredible Properties of Composite Materials](https://www.youtube.com/watch?v=04K0bLwCDdM) · The Efficient Engineer · 23 min · 593,910 views
+    - [What are Composite Numbers? / Math with Mr. J](https://www.youtube.com/watch?v=R1CM-W8FMRA) · Math with Mr. J · 4 min · 349,087 views
+- **[[Decorator and Middleware]]**
+    - [Django Middleware vs Decorator / Which One Should You Use? / Django mostly asked interview questions](https://www.youtube.com/watch?v=MWJfFd9hq-0) · Code With Hafiz Ammad · 9 min · 39 views
+- **[[Factory and Abstract Factory]]**
+    - [Factory Design Pattern / Simple, Factory Method & Abstract Factory with Real-Life Examples](https://www.youtube.com/watch?v=dMK4TbG29fk) · Coder Army · 32 min · 122,226 views
+    - [Factory, Abstract Factory, Factory Method - Design Pattern (C#)](https://www.youtube.com/watch?v=xN7EFHU_rXA) · Raw Coding · 9 min · 137,653 views
+- **[[Iterator and range-over-func]]**
+    - [GopherCon 2024: Range Over Function Types - Ian Lance Taylor](https://www.youtube.com/watch?v=i9zwUT9dlVc) · Gopher Academy · 23 min · 4,531 views
+    - [Function iterators aren't as bad as I thought...](https://www.youtube.com/watch?v=xEmgcGHs3cA) · Dreams of Code · 4 min · 25,707 views
+- **[[Observer and Event Bus]]**
+    - [Observer Pattern Tutorial: I NEVER Knew Events Were THIS Powerful 🚀](https://www.youtube.com/watch?v=oNalXg67XEE) · ArjanCodes · 15 min · 221,063 views
+    - [EventBus and Observer Pattern - Android App Development](https://www.youtube.com/watch?v=WnzSkRinnuc) · Electronic Armory · 15 min · 22,324 views
+- **[[Proxy]]**
+    - [Proxy vs Reverse Proxy (Real-world Examples)](https://www.youtube.com/watch?v=4NB0NDtOwIQ) · ByteByteGo · 5 min · 852,873 views
+    - [Proxy vs Reverse Proxy vs Load Balancer / Simply Explained](https://www.youtube.com/watch?v=xo5V9g9joFs) · TechWorld with Nana · 13 min · 756,017 views
+- **[[Rare GoF Patterns in Go]]**
+    - [Software Design Patterns (GoF): explained without jargon + real-world examples](https://www.youtube.com/watch?v=FyYLZ1xygNw) · C# straight to the point · 7 min · 739 views
+    - [All 23 GoF Design Patterns Explained with Real C# Code (.NET 8 eCommerce API)](https://www.youtube.com/watch?v=jKh1qg21tUQ) · Real World Devs · 45 min · 185 views
+- **[[Repository and Unit of Work]]**
+    - [The Unit of Work Design Pattern Explained](https://www.youtube.com/watch?v=HX6vkP-QD7U) · ArjanCodes · 12 min · 36,996 views
+    - [Unit of Work Pattern in .NET 7 - Repository Pattern Guide](https://www.youtube.com/watch?v=NNT0-6moCJM) · Tech Yatra(Nishant Gupta) · 17 min · 6,946 views
+- **[[Singleton and sync.Once]]**
+    - [sync.Once in Go](https://www.youtube.com/watch?v=61kvPbwzXi4) · The Coding Gopher · 5 min · 3,056 views
+- **[[State Machines in Go]]**
+    - [Lecture 4: State Machines](https://www.youtube.com/watch?v=gVdrFsnOo_s) · MIT OpenCourseWare · 81 min · 42,752 views
+    - [Finite State Machines in Godot 4 in Under 10 Minutes](https://www.youtube.com/watch?v=ow_Lum-Agbs) · Bitlytic · 7 min · 580,467 views
+- **[[Strategy and Template Method]]**
+    - [The Strategy and Template Method Patterns and Section Summary](https://www.youtube.com/watch?v=AmcA8wWCHQQ) · Douglas Schmidt · 33 min · 6,415 views
+    - [The Template Method Pattern Explained Implemented in Java / Behavioral Design Patterns / Geekific](https://www.youtube.com/watch?v=cGoVDzHvD4A) · Geekific · 6 min · 59,011 views
+- **[[ATM]]**
+    - [Design ATM Machine (LLD) / Cash Withdrawal Flow / State + COR Pattern](https://www.youtube.com/watch?v=GSuaqBR0Wpc) · Shubh Patel · 30 min · 15,110 views
+    - [Low level design of an ATM machine / Understand State design pattern](https://www.youtube.com/watch?v=JEi7i7poflM) · Sanket Singh · 64 min · 8,838 views
+- **[[Circuit Breaker]]**
+    - [Software Architecture in Golang: Circuit Breaker Cloud Design Pattern for Reliability](https://www.youtube.com/watch?v=UnL2iGcD7vE) · Mario Carrion · 12 min · 4,200 views
+    - [Go (Golang) Circuit Breaker Example Implementation Tutorial](https://www.youtube.com/watch?v=hyasWpxP32c) · Satyajit Das · 12 min · 5,802 views
+- **[[Digital Wallet and Ledger]]**
+    - [Digital Wallet Ledger Architecture  Building Scalable, Consistent, and Fraud Resistant Payment Syste](https://www.youtube.com/watch?v=37tEgwLcUrQ) · SystemDesignPrep · 7 min · 785 views
+    - [An Interoperable and Secure E-Wallet  based on Digital Ledger Technology using Blockchain](https://www.youtube.com/watch?v=5o7wxGHDzk0) · karan singh · 5 min · 28 views
+- **[[Elevator System]]**
+    - [Elevator System / Google SWE Teaches Low Level Design Episode 3](https://www.youtube.com/watch?v=4OjHA-BcJhw) · Jordan has no life · 21 min · 28,894 views
+    - [🧠 Elevator System Low-Level Design (LLD) – OOP, UML & Best Practices 📊](https://www.youtube.com/watch?v=gV4NeR4Ms9Y) · codeWithAryan · 68 min · 27,208 views
+- **[[File Search (Unix find)]]**
+    - [Amazon LLD Python: Design Unix "find" Command for File Search](https://www.youtube.com/watch?v=KxQpZ_aIseE) · System Design and Gossip · 22 min · 270 views
+    - [Amazon LLD: Design Unix "find" Command for File Search in Java](https://www.youtube.com/watch?v=bBqkk9yfjCs) · System Design and Gossip · 22 min · 413 views
+- **[[Food Ordering System]]**
+    - [Low Level Designing (LLD -4) - Food Ordering System / Low Level Design / LLD / Zomato / Swiggy  #lld](https://www.youtube.com/watch?v=Zo_YfDmkZSQ) · InterviewWithBunny · 30 min · 26,771 views
+    - [System Design: Food Ordering Platform / Swiggy & Zomato Architecture / Food Ordering Platform Design](https://www.youtube.com/watch?v=_0EtmcREJ1Q) · System Design Decoded · 37 min · 849 views
+- **[[Hotel Booking]]**
+    - [✅ System Design 5: Design Hotel Booking App like AirBnb / Booking.com / Proximity / HLD / LLD](https://www.youtube.com/watch?v=mH2Ye3_vErw) · InterviewWithBunny · 64 min · 30,488 views
+    - [Low Level Designing (LLD-3): Hotel Booking System / Booking.com / AirBnB / MakeMyTrip #lld #lowlevel](https://www.youtube.com/watch?v=6zZALeDMFew) · InterviewWithBunny · 21 min · 16,231 views
+- **[[In-memory KV Store with TTL and Transactions]]**
+    - [Low Level System design of Redis-Like In-Memory Key-Value Store / Full code / Easy & Detailed](https://www.youtube.com/watch?v=izakW9x89Sc) · Lavakumar Techie · 52 min · 3,217 views
+    - [KV Store Nested Transactions](https://www.youtube.com/watch?v=QgG5y31BqHw) · Algoforgeeks · 10 min · 8 views
+- **[[Inventory Order Assignment (Dark Store)]]**
+    - [Low Level Design of an Order and Inventory System in a Multi-Threaded environment + Machine  Coding](https://www.youtube.com/watch?v=VtBL_NNa7hs) · System Design and Gossip · 18 min · 1,878 views
+    - [Blinkit (Zepto) Low-Level Design with Code & UML / Order Management System & Inventory / #lld #easy](https://www.youtube.com/watch?v=_7b5qL_deio) · Mrunmai Dahare · 57 min · 7,726 views
+- **[[LRU Cache with TTL]]**
+    - [LRU Cache - Twitch Interview Question - Leetcode 146](https://www.youtube.com/watch?v=7ABFKPK2hD4) · NeetCode · 17 min · 565,626 views
+    - [L18. Implement LRU Cache](https://www.youtube.com/watch?v=z9bJUPxzFOw) · take U forward · 24 min · 390,857 views
+- **[[Library Management]]**
+    - [Google Interview Question Solved / Low Level Design of Library Management System - Part 1](https://www.youtube.com/watch?v=71W8QTdFWw8) · Soumyajit Bhattacharyay · 8 min · 48,963 views
+    - [Library Management System LLD - Low Level Design](https://www.youtube.com/watch?v=fVqv4B8sG1s) · Reactify Labs · 21 min · 7,270 views
+- **[[Logging Library]]**
+    - [Design Logging library like log4j - LLDcoding.com](https://www.youtube.com/watch?v=FHYEUcDW9UU) · Subhahu Jain · 9 min · 28,514 views
+- **[[Meeting Room Scheduler]]**
+    - [Mock Low Level System Design Interview with Qualcomm Sr. Engineer - Design Meeting Scheduler](https://www.youtube.com/watch?v=MRx40JVmmF4) · Concept && Coding - by Shrayansh · 37 min · 135,768 views
+    - [Salesforce machine coding round: Meeting Room Reservation System (Prevent Overlap & Double Booking)](https://www.youtube.com/watch?v=0_GxR3yQZLg) · Code design by Naman · 56 min · 4,022 views
+- **[[Movie Ticket Booking]]**
+    - [System Design of a Ticket Booking System: BookMyShow](https://www.youtube.com/watch?v=ohdu6TUoE5s) · Gaurav Sen · 77 min · 46,761 views
+    - [BookMyShow Low level design with code & Concurrency / Movie Ticket Booking System Design #lld #easy](https://www.youtube.com/watch?v=t2FiaSThCw8) · Mrunmai Dahare · 33 min · 26,007 views
+- **[[Notification Service]]**
+    - [Designing Notifications Service for Instagram](https://www.youtube.com/watch?v=kIP8L-CSl2Y) · Arpit Bhayani · 37 min · 112,344 views
+    - [19: Notification Service / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=J-5JozlYIqI) · Jordan has no life · 21 min · 65,691 views
+- **[[Order Book Matching Engine]]**
+    - [Stock Trading System Design / Matching Engine, Order Book & Low-Latency Architecture](https://www.youtube.com/watch?v=ckIABmFFiRY) · Arpit Vaish · 22 min · 3,275 views
+    - [Design A Limit Order Book / Google SWE Teaches Low Level Design Episode 5](https://www.youtube.com/watch?v=nmYx6tQxtSs) · Jordan has no life · 22 min · 20,770 views
+- **[[Parking Lot]]**
+    - [Parking Lot Design / Grokking The Object Oriented Design Interview Question](https://www.youtube.com/watch?v=tVRyb4HaHgw) · Think Software · 27 min · 421,214 views
+    - [🚗  Parking Lot Design / System Design + LLD + Full Code Implementation](https://www.youtube.com/watch?v=NU16qSPUmus) · codeWithAryan · 44 min · 71,679 views
+- **[[Pub-Sub Message Queue]]**
+    - [Message Queues in System Design Interviews w/ Meta Staff Engineer](https://www.youtube.com/watch?v=1ISRd0bS714) · Hello Interview · 26 min · 271,936 views
+    - [Message Queues vs Pub/Sub / System Design](https://www.youtube.com/watch?v=XvnppkWqJbs) · System Design School · 8 min · 28,079 views
+- **[[Rate Limiter]]**
+    - [Rate Limiter System Design: Token Bucket, Leaky Bucket, Scaling](https://www.youtube.com/watch?v=YXkOdWBwqaA) · ByteByteGo · 7 min · 99,414 views
+    - [Design a Distributed Rate Limiter w/ a Ex-Meta Staff Engineer: System Design Breakdown](https://www.youtube.com/watch?v=MIJFyUPG4Z4) · Hello Interview · 55 min · 326,544 views
+- **[[Ride Sharing]]**
+    - [✅ System Design 11: Design Ride Sharing Application like UBER / OLA / Rapido / Lyft / HLD / LLD](https://www.youtube.com/watch?v=twUz_hWw2T8) · InterviewWithBunny · 65 min · 25,533 views
+    - [Uber - System Design Interview Question (Ride Sharing Service)](https://www.youtube.com/watch?v=DGtalg5efCw) · TechPrep · 16 min · 109,856 views
+- **[[Splitwise Expense Sharing]]**
+    - [Splitwise LLD: UML + Code (FREE) / Build Expense Sharing App Step-by-Step! low level design / #easy](https://www.youtube.com/watch?v=syH7axOpqhA) · Mrunmai Dahare · 31 min · 12,936 views
+    - [Splitwise lld / Hindi /Expense Sharing System LLD Explained with SOLID #lld](https://www.youtube.com/watch?v=SRIjfCuExxg) · Khauf se coder - System Design Interviews · 60 min · 285 views
+- **[[Task Scheduler (delayed and recurring jobs)]]**
+    - [How to build a Distributed Task Scheduler with Go, Postgres, and gRPC](https://www.youtube.com/watch?v=bBp5AOTkJcg) · Jyotinder Singh · 34 min · 13,462 views
+    - [Machine Coding: Design Concurrent Task Scheduler (Amazon, D. E. Shaw, Oracle)](https://www.youtube.com/watch?v=ohv-XUKBnB0) · Code design by Naman · 59 min · 3,314 views
+- **[[Tic-Tac-Toe and Snake and Ladder]]**
+    - [Design Tic Tac Toe: Low Level Design Coding Interview Question](https://www.youtube.com/watch?v=gktZsX9Z8Kw) · Gaurav Sen · 15 min · 360,589 views
+    - [TicTacToe / Google Gigachad SWE Teaches Low Level Design Episode 1](https://www.youtube.com/watch?v=Mw0fHf7d-38) · Jordan has no life · 12 min · 44,058 views
+- **[[Vending Machine]]**
+    - [Design a Vending Machine / LLD  / State Design Patterns / OOPS  / Java](https://www.youtube.com/watch?v=8CcB3xAt9p4) · Riddhi Dutta · 26 min · 31,484 views
+    - [Vending Machine - Low Level Design Interview Question / System Design Class 12](https://www.youtube.com/watch?v=qJOYokhfhCM) · Genie Ashwani · 18 min · 4,274 views
+- **[[SOLID in Go]]**
+    - [KISS, SOLID, CAP, BASE: Important Terms You Might Not Know!](https://www.youtube.com/watch?v=cTyZ_hbmbDw) · ByteByteGo · 6 min · 67,187 views
+    - [Golang UK Conference 2016 - Dave Cheney - SOLID Go Design](https://www.youtube.com/watch?v=zzAdEt3xZ1M) · GopherCon UK · 27 min · 117,651 views
+- **[[Testing LLD Code]]**
+    - [Flipkart Machine Coding Round: FlipMed / LLD + Code Walkthrough](https://www.youtube.com/watch?v=eh4e1VJ05Gc) · Shubh Patel · 29 min · 6,557 views
+- **[[UML for LLD]]**
+    - [Basics of LLD / UML Diagram in detail / Association Vs Aggregation Vs Composition / VERY imp!!](https://www.youtube.com/watch?v=j84w5VM9GT8) · Keerti Purswani · 28 min · 158,613 views
+    - [UML Class Diagram for Beginners / Must-Know LLD Concepts / Basics of low level design with Notes](https://www.youtube.com/watch?v=VDdxfgZVOSQ) · Mrunmai Dahare · 6 min · 2,176 views
+
+## 18 AI Engineering
+
+- **[[AI Agents and Agentic Workflows]]**
+    - [Agentic AI: Workflows vs. agents](https://www.youtube.com/watch?v=Qd6anWv0mv0) · Google Cloud Tech · 5 min · 138,453 views
+    - [Agentic AI Frameworks Explained: Workflows, Multi-Agent, & Production](https://www.youtube.com/watch?v=ZVPlLaehjLk) · IBM Technology · 11 min · 140,322 views
+- **[[Advanced RAG Patterns]]**
+    - [Going Meta - Ep 23: Advanced RAG patterns with Knowledge Graphs](https://www.youtube.com/watch?v=E_JO4-2D5Xs) · Neo4j · 64 min · 9,047 views
+    - [AWS re:Invent 2025 - Advanced RAG Architectures: From Basic Retrieval to Agentic RAG  (NTA403)](https://www.youtube.com/watch?v=ADrUp2cEdKg) · AWS Events · 52 min · 5,125 views
+- **[[Calling LLM APIs from Go]]**
+    - [AI Tool Calling via Natural Language: LLMs, APIs & Docker in Action](https://www.youtube.com/watch?v=gosZ_vqXkMI) · IBM Technology · 4 min · 17,071 views
+    - [What is Tool Calling? Connecting LLMs to Your Data](https://www.youtube.com/watch?v=h8gMhXYAv1k) · IBM Technology · 4 min · 66,153 views
+- **[[Document Ingestion and Chunking]]**
+    - [Document Ingestion and Chunking Explained / RAG for ML #03](https://www.youtube.com/watch?v=nWCArEOtIPQ) · Debug with Asish · 4 min · 50 views
+    - [RAG Mastery Playbook / Section 3: Document Ingestion, Chunking, Embeddings & Semantic Search](https://www.youtube.com/watch?v=Xu48sjpWxdM) · EdgeTalks · 17 min · 103 views
+- **[[Embeddings]]**
+    - [What are Word Embeddings?](https://www.youtube.com/watch?v=wgfSDrqYMJ4) · IBM Technology · 8 min · 306,149 views
+    - [Vectoring Words (Word Embeddings) - Computerphile](https://www.youtube.com/watch?v=gQddtTdmG_8) · Computerphile · 16 min · 337,173 views
+- **[[Guardrails and LLM Security]]**
+    - [AI Security with LLM Guardrails / Prakash Senapati / Naresh IT](https://www.youtube.com/watch?v=2YV6-csi2zo) · Naresh i Technologies · 123 min · 11,705 views
+- **[[Keyword, Semantic and Hybrid Search]]**
+    - [RAG Explained for Beginners: Keyword vs Semantic vs Hybrid Search](https://www.youtube.com/watch?v=wr0SwuPDT0g) · TechTrapture · 21 min · 1,965 views
+    - [Elasticsearch BM25 vs Vector Search / Hybrid Search Explained / Keyword vs Semantic Search](https://www.youtube.com/watch?v=A4Ekj4O_r3c) · 8Bit System Tech · 14 min · 81 views
+- **[[LLM Cost, Latency and Caching]]**
+    - [Cut Your LLM Costs and Latency up to 86% with Semantic Caching / Databases for AI](https://www.youtube.com/watch?v=vIgF4GP2n9w) · AWS Events · 60 min · 2,777 views
+    - [What is Prompt Caching? Optimize LLM Latency with AI Transformers](https://www.youtube.com/watch?v=u57EnkQaUTY) · IBM Technology · 9 min · 128,186 views
+- **[[LLM Evals in Production]]**
+    - [How to Systematically Setup LLM Evals (Metrics, Unit Tests, LLM-as-a-Judge)](https://www.youtube.com/watch?v=a3SMraZWNNs) · Dave Ebbelaar · 55 min · 133,758 views
+    - [What are LLM Evals ?](https://www.youtube.com/watch?v=FdqrP7jvZEo) · New Machina · 4 min · 13,032 views
+- **[[LLM Fundamentals]]**
+    - [LLM Fundamentals Crash Course For Beginners 2026 (Tokens, Prompting, APIs & Tool Calls)](https://www.youtube.com/watch?v=YHNi88FaGug) · Harish Neel / AI · 73 min · 39,897 views
+    - [LLM Fundamentals Crash Course (& Why Every Dev Should Learn It!)](https://www.youtube.com/watch?v=Kaigs9LNoO0) · Philipp Lackner · 18 min · 1,154 views
+- **[[LLM Observability]]**
+    - [Opik LLM Observability & Evaluation](https://www.youtube.com/watch?v=ze8I9VUG2qU) · Opik by Comet · 3 min · 2,667,813 views
+    - [LLM Observability Explained: Why do you need LLM Observability?](https://www.youtube.com/watch?v=o76xU3RQ47Q) · Agenta AI · 3 min · 4,680 views
+- **[[LangChain and LangGraph]]**
+    - [LangChain vs LangGraph: A Tale of Two Frameworks](https://www.youtube.com/watch?v=qAF1NjEVHhY) · IBM Technology · 9 min · 699,973 views
+    - [LangChain vs LangGraph vs LangSmith](https://www.youtube.com/watch?v=vJOGC8QJZJQ) · codebasics · 10 min · 324,596 views
+- **[[Model Context Protocol (MCP)]]**
+    - [Model Context Protocol (MCP) Explained for Beginners: AI Flight Booking Demo!](https://www.youtube.com/watch?v=E2DEHOEbzks) · KodeKloud · 24 min · 1,376,834 views
+    - [Model Context Protocol Clearly Explained / MCP Beyond the Hype](https://www.youtube.com/watch?v=tzrwxLNHtRY) · codebasics · 15 min · 648,211 views
+- **[[Production AI Checklist]]**
+    - [Is Your AI Agent Production Ready? The Reliability Checklist.](https://www.youtube.com/watch?v=PiaCRgH5vAY) · Eldon Conceicao / AI Operations Journal · 21 min · 1,350 views
+    - [AI System Design for Production: The Checklist Most Engineers Skip](https://www.youtube.com/watch?v=3nYoe4mcJCw) · AI in Production · 21 min · 229 views
+- **[[Prompt Engineering]]**
+    - [Context Engineering vs. Prompt Engineering: Smarter AI with RAG & Agents](https://www.youtube.com/watch?v=vD0E3EUb8-8) · IBM Technology · 7 min · 269,302 views
+    - [4 Methods of Prompt Engineering](https://www.youtube.com/watch?v=1c9iyoVIwDs) · IBM Technology · 12 min · 281,223 views
+- **[[RAG Evaluation]]**
+    - [Mastering LLM Chatbots And RAG Evaluation Crash Course](https://www.youtube.com/watch?v=NebOSOTp-zA) · Krish Naik · 66 min · 81,769 views
+    - [RAG Evaluation: Precision, Recall, Faithfulness, RAGAS Explained Clearly](https://www.youtube.com/watch?v=7_LTU0LA374) · Logical Lenses · 12 min · 41,377 views
+- **[[Structured Outputs and Tool Calling]]**
+    - [What is Tool Calling? Connecting LLMs to Your Data](https://www.youtube.com/watch?v=h8gMhXYAv1k) · IBM Technology · 4 min · 66,153 views
+    - [LLM Function Calling Explained / Tool Integration & Structured Outputs / AI/ML Class 10](https://www.youtube.com/watch?v=9DThnOIue4I) · Fusionpact · 3 min · 86 views
+- **[[Vector Databases and ANN Indexes]]**
+    - [Vector Databases Explained for System Design Interviews](https://www.youtube.com/watch?v=Fq73E8DQprc) · Hello Interview · 24 min · 74,374 views
+    - [Vector Databases simply explained! (Embeddings & Indexes)](https://www.youtube.com/watch?v=dN0lsF2cvm4) · AssemblyAI · 4 min · 699,855 views
+
+## 19 Interview & Career
+
+- **[[Backend Roadmap and Tech Landscape]]**
+    - [Backend SDE Roadmap 2026-27 / Techs, Skills, Tools for Industry / Learn in Order for Interviews](https://www.youtube.com/watch?v=Kx-4Sc57NM0) · Dev. Shivansh Vasu · 43 min · 8,331 views
+    - [The Complete Backend Developer Roadmap](https://www.youtube.com/watch?v=OeEHJgzqS1k) · Programming with Mosh · 8 min · 991,104 views
+- **[[Zepto-style Product LLD Round]]**
+    - [Zepto Hiring GenAI, Analyst, Product Engineer + more  / Job Description + Interview Rounds Explained](https://www.youtube.com/watch?v=zC9KndQNBFM) · Upasana Chaudhuri · 3 min · 636 views
+- **[[Go Interview Questions and Traps]]**
+    - [Top 30 Go Interview Questions And Answers / Best Golang Interview Questions (Updated 2025)](https://www.youtube.com/watch?v=7CXE1MODF1Q) · MindMajix · 20 min · 52,527 views
+    - [Go Programming Interview Questions - Complete Guide](https://www.youtube.com/watch?v=CfCeJPEPpm8) · Learn To Code · 11 min · 19,542 views
+- **[[LLD Round Playbook]]**
+    - [LLD RoadMap / What to study for Low Level System Design Interviews / Object Oriented Design Round 🫣](https://www.youtube.com/watch?v=9_7jDlmexME) · Keerti Purswani · 9 min · 160,033 views
+    - [Crack ZOHO LLD round Easily / Recently asked Question / Full Explanation / Tamil / English Subtitle](https://www.youtube.com/watch?v=gY3taMFlY8E) · Karthik Info Vlogs · 16 min · 5,374 views
+- **[[Learning Resources]]**
+    - [Learning Resources : Meaning, Types and Function /BEd 3rd Semester Notes/ Teaching of Life Sciences](https://www.youtube.com/watch?v=h4Mnuw0SEns) · The Vani Classes · 12 min · 112,010 views
+    - [Meaning, Significance and Types of Learning Resources in EVS](https://www.youtube.com/watch?v=yrE6Tzgx-5E) · NIOS Senior Secondary Courses · 28 min · 17,868 views
+- **[[SDE-3 Readiness Checklist]]**
+    - [The Ultimate PLG Readiness Checklist: 27 Steps to Success](https://www.youtube.com/watch?v=w4Gt26RnzpY) · SaaS CMO Pro · 45 min · 2,953 views
+    - [Literacy Performance Assessment Planning Readiness Checklist](https://www.youtube.com/watch?v=KeTwp7JvzOE) · TPA Café (CalTPA and LPA Support Channel)   · 10 min · 152 views
+
+## Links
+
+- [[Study Index]] · [[Home]]

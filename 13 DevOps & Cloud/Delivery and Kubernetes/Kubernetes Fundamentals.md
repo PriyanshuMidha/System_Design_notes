@@ -8,7 +8,7 @@ sources:
   - "Kubernetes docs, Concepts (Workloads, Services, Networking, Configuration)"
   - "Kubernetes docs, Pod Lifecycle and Termination of Pods"
   - "Kubernetes docs, Gateway API"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Kubernetes Fundamentals
@@ -23,9 +23,56 @@ updated: 2026-11-07
 > - Probes (liveness, readiness, startup) decide whether a Pod gets traffic and whether it gets restarted — they are not the same check.
 > - ConfigMaps and Secrets inject configuration; Secrets are base64-encoded, not encrypted, unless you add encryption at rest or a secrets operator.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your Go API runs in one container on one server.
+At 2 a.m. the server dies, and nobody is awake to restart it.
+Next week traffic doubles and you need five copies, not one.
+Kubernetes is the robot that keeps the right number of copies running, on whatever machines are healthy.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Container | A packaged app plus everything it needs to run | Your Go binary in a Docker image |
+| Cluster | A group of machines managed as one | 3 control-plane nodes + 10 worker nodes |
+| Node | One machine (VM or physical) in the cluster | An EC2 instance running kubelet |
+| Pod | The smallest unit Kubernetes runs: one or more containers together | One pod = your API container |
+| Desired state | What you *want* running, written in YAML | `replicas: 3` |
+| Controller | A loop that compares desired vs actual state and fixes the gap | Deployment controller starting a missing pod |
+| Service | A stable name and IP in front of changing pods | `orders.default.svc.cluster.local` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["You: kubectl apply<br/>(replicas: 3)"] --> API["API server"]
+    API --> E[("etcd:<br/>desired state")]
+    API --> C["Controllers +<br/>scheduler"]
+    C --> N1["Node 1: pod"]
+    C --> N2["Node 2: pod"]
+    C --> N3["Node 3: pod"]
+```
+
+**Analogy.** A thermostat: you set 21°C, and it keeps switching the heater on and off until the room matches.
+Where it breaks: a thermostat controls one number; Kubernetes reconciles thousands of objects at once, and it can only fix what it can observe (a pod that is "running" but serving errors looks healthy unless you add probes).
+
+**How the rest of this note builds up**
+
+- First, why an orchestrator exists (section 1) and the "declare desired state, controllers reconcile" mental model (section 2).
+- Then the machinery: control plane and nodes, what happens on `kubectl apply`, Deployment → ReplicaSet → Pod (section 3).
+- Then how traffic reaches pods (Services, DNS, Ingress/Gateway API), plus config, probes, resources and graceful shutdown.
+- Finally the SDE-3 material: worked example, trade-offs, production failure modes and the deep dive.
+
+> [!tip] Remember
+> You write down what you want; Kubernetes controllers keep nudging reality until it matches.
+
 ## 1. Why it exists
 
-Running a Go API as a single process on a single VM works until that VM reboots, runs out of memory, or needs a second instance for load. Someone then has to notice the process died, SSH in, restart it, and manually keep a load balancer's target list in sync with which VMs are healthy. At ten services and fifty VMs, that's no longer a person's job — it has to be automated.
+Running a Go API as a single process on a single VM works until that VM reboots, runs out of memory, or needs a second instance for load.
+
+Someone then has to notice the process died, SSH in, restart it, and manually keep a load balancer's target list in sync with which VMs are healthy. At ten services and fifty VMs, that's no longer a person's job — it has to be automated.
 
 Kubernetes automates four things that used to be manual ops work:
 
@@ -38,7 +85,9 @@ A single dropped node used to mean manually finding out which services were on i
 
 ## 2. Mental model
 
-Kubernetes is a **reconciliation loop**, not a command executor. You never tell it "start 3 more Pods." You tell it "I want 5 Pods of this spec to exist," and a controller keeps comparing that desired count against the actual count, forever, correcting the difference whenever it appears — a Pod crashes, a node dies, you edit the desired count — the same loop handles all of it.
+Kubernetes is a **reconciliation loop**, not a command executor.
+
+You never tell it "start 3 more Pods." You tell it "I want 5 Pods of this spec to exist," and a controller keeps comparing that desired count against the actual count, forever, correcting the difference whenever it appears — a Pod crashes, a node dies, you edit the desired count — the same loop handles all of it.
 
 A useful analogy: a thermostat doesn't execute "turn on the heater now" as a one-off action. It continuously compares the room's actual temperature to the set point and acts whenever they differ. Every Kubernetes controller (Deployment, ReplicaSet, HPA, and others) is a thermostat for some piece of desired state.
 
@@ -113,7 +162,11 @@ The gap between "container running" and "receiving traffic" is the readiness pro
 
 ### The object chain: Deployment → ReplicaSet → Pod
 
-A **Deployment never manages Pods directly.** It manages a ReplicaSet, which manages Pods. This indirection is what makes rolling updates and rollback possible: a new Deployment revision creates a *new* ReplicaSet (scaled up) while the old ReplicaSet (scaled down to zero but not deleted) is kept in history, so `kubectl rollout undo` just scales the old ReplicaSet back up. See [[Rollback and Safe Migrations]] for the rollback mechanics this enables.
+A **Deployment never manages Pods directly.** It manages a ReplicaSet, which manages Pods.
+
+This indirection is what makes rolling updates and rollback possible: a new Deployment revision creates a *new* ReplicaSet (scaled up) while the old ReplicaSet (scaled down to zero but not deleted) is kept in history, so `kubectl rollout undo` just scales the old ReplicaSet back up.
+
+See [[Rollback and Safe Migrations]] for the rollback mechanics this enables.
 
 - **Pod:** the smallest deployable unit — one or more containers that share a network namespace (one IP) and can share volumes. Almost always one container per Pod for a stateless Go service; a sidecar (a log shipper, a service-mesh proxy) is the common exception.
 - **ReplicaSet:** keeps exactly N Pods matching a label selector running. You rarely create one directly.
@@ -166,7 +219,13 @@ flowchart LR
     E -- no --> G["SIGKILL"]
 ```
 
-Steps B and D happen **concurrently**, not in sequence — the Pod can still have in-flight connections from before it left Endpoints when SIGTERM arrives. That's the classic race: a request lands just before removal from Endpoints propagates, and the app receives SIGTERM before that request finishes. A `preStop` hook that sleeps a few seconds before SIGTERM, combined with the application finishing in-flight requests on SIGTERM instead of exiting immediately, closes this gap. The application side of this (signal handling, connection draining, the exact Go pattern) is covered in [[Graceful Shutdown and Health Checks]] — this note only covers what Kubernetes does around it.
+Steps B and D happen **concurrently**, not in sequence — the Pod can still have in-flight connections from before it left Endpoints when SIGTERM arrives.
+
+That's the classic race: a request lands just before removal from Endpoints propagates, and the app receives SIGTERM before that request finishes.
+
+A `preStop` hook that sleeps a few seconds before SIGTERM, combined with the application finishing in-flight requests on SIGTERM instead of exiting immediately, closes this gap.
+
+The application side of this (signal handling, connection draining, the exact Go pattern) is covered in [[Graceful Shutdown and Health Checks]] — this note only covers what Kubernetes does around it.
 
 ## 4. Worked example
 
@@ -293,7 +352,11 @@ spec:
               service: { name: api, port: { number: 80 } }
 ```
 
-Walking the choices: `maxUnavailable: 0` with `maxSurge: 1` means the rollout never drops below 3 ready Pods — it adds a 4th before removing an old one, trading a brief extra Pod's resource cost for zero capacity dip. The `startupProbe` gives up to 60 seconds (30 × 2s) before liveness/readiness even start being evaluated, covering a slow first boot without that showing up as a liveness failure. `requests` equal roughly half of `limits`, landing this Pod in the `Burstable` QoS class — guaranteed its request, able to burst to its limit, evicted before nothing (`Guaranteed`) but after `BestEffort` Pods if the node is starved.
+Walking the choices: `maxUnavailable: 0` with `maxSurge: 1` means the rollout never drops below 3 ready Pods — it adds a 4th before removing an old one, trading a brief extra Pod's resource cost for zero capacity dip.
+
+The `startupProbe` gives up to 60 seconds (30 × 2s) before liveness/readiness even start being evaluated, covering a slow first boot without that showing up as a liveness failure.
+
+`requests` equal roughly half of `limits`, landing this Pod in the `Burstable` QoS class — guaranteed its request, able to burst to its limit, evicted before nothing (`Guaranteed`) but after `BestEffort` Pods if the node is starved.
 
 ### Representative output: `kubectl get pods` during a rollout
 

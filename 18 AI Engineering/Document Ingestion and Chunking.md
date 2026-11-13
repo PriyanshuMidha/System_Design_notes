@@ -8,7 +8,7 @@ sources:
   - "LangChain Python docs, Recursive Character Text Splitter"
   - "Anthropic docs, Contextual Retrieval (2024)"
 status: reviewed
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Document Ingestion and Chunking
@@ -23,9 +23,56 @@ updated: 2026-11-07
 > - Tables, scanned pages, and multi-column layouts break naive "extract all text" parsers and need format-specific handling.
 > - The pipeline runs asynchronously, behind a queue, because parsing and embedding are slow and must survive retries.
 
+## Start here: the basics
+
+**The problem in one story.**
+Your team has a 40-page PDF manual and wants a bot to answer questions from it.
+You cannot paste all 40 pages into every question; it is costly and the answer gets lost.
+So you cut the manual into small labelled pieces and fetch only the right ones.
+This note is about cutting well and labelling well.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Token | A small piece of text a model counts | About 4 characters of English |
+| Context window | The most text a model can read at once | 128k tokens |
+| Parse | Pull plain text out of a file format | PDF to text |
+| Chunk | One small piece of a document | 500 tokens from page 3 |
+| Overlap | Text repeated at the edge of neighbour chunks | Last 50 tokens repeated |
+| Metadata | Labels stored with a chunk | `source=manual.pdf, page=3` |
+| Embedding | Numbers that capture a chunk's meaning | A 1,536-number vector |
+| Upsert | Insert, or update if it already exists | Re-index a changed page |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    F["Raw file"] --> P["Parse + clean"]
+    P --> S["Split into chunks"]
+    S --> M["Add metadata"]
+    M --> E["Embed"]
+    E --> V["Store (upsert)"]
+```
+
+**Analogy.** It is like turning a textbook into index cards: one idea per card, with the book and page written on the corner.
+Where it breaks: cards are cut by a human who understands the text; a chunker cuts by size and rules, so it can split an idea in half.
+
+**How the rest of this note builds up**
+
+- First, why ingestion is needed (section 1) and the pipeline mental model (section 2).
+- Then each stage: loading, parsing, cleaning, chunking strategies, metadata, embedding and upsert (section 3).
+- Then a Go worked example (section 4) and a comparison of chunking strategies (sections 5-6).
+- Finally production concerns like queues and re-indexing, the SDE-3 deep dive and interview questions (sections 7-9).
+
+> [!tip] Remember
+> One idea per chunk, a size the retriever likes, and enough metadata to cite or delete it later.
+
 ## 1. Why it exists
 
-A support team uploads a 40-page PDF manual and expects a chatbot to answer "how do I reset the device?" An [[LLM Fundamentals|LLM]] can only read what fits in its context window, and feeding it the whole PDF on every question wastes tokens and often buries the one relevant paragraph in the middle, where models pay less attention to it ("lost in the middle", see [[LLM Fundamentals]]).
+A support team uploads a 40-page PDF manual and expects a chatbot to answer "how do I reset the device?"
+
+An [[LLM Fundamentals|LLM]] can only read what fits in its context window, and feeding it the whole PDF on every question wastes tokens and often buries the one relevant paragraph in the middle, where models pay less attention to it ("lost in the middle", see [[LLM Fundamentals]]).
 
 Ingestion solves this by doing the expensive work once, offline: turn the PDF into a few hundred small, searchable pieces, each tagged with where it came from. A question then only needs the handful of pieces that are actually relevant — the retrieval step covered in [[RAG Pipeline]].
 
@@ -33,7 +80,9 @@ Get chunking wrong and the symptoms show up downstream, not in this pipeline: re
 
 ## 2. Mental model
 
-Think of a cookbook. You would not photocopy the whole book and hand it to someone asking "how long do I boil an egg?" You would tear out the one relevant paragraph, but you would tear along the recipe boundaries (soft-boiled vs. hard-boiled), not mid-sentence, and you would staple a sticky note to it saying which book and page it came from.
+Think of a cookbook.
+
+You would not photocopy the whole book and hand it to someone asking "how long do I boil an egg?" You would tear out the one relevant paragraph, but you would tear along the recipe boundaries (soft-boiled vs. hard-boiled), not mid-sentence, and you would staple a sticky note to it saying which book and page it came from.
 
 Document ingestion is that tearing-and-labelling process, done automatically: split along natural boundaries (paragraphs, sections) first, fall back to harder cuts only when a piece is still too big, and always attach a label (metadata) before filing it away.
 
@@ -397,3 +446,8 @@ Re-running ingestion on an updated document should not re-embed every chunk: has
 - **Before this:** [[LLM Fundamentals]], [[Embeddings]]
 - **Next:** [[RAG Pipeline]]
 - **Compare with:** [[Vector Databases and ANN Indexes]] (what the chunks are stored and searched in), [[Background Jobs and Worker Pools]] (the general async-pipeline pattern this ingestion pipeline builds on)
+
+### Watch on YouTube
+
+- [Document Ingestion and Chunking Explained / RAG for ML #03](https://www.youtube.com/watch?v=nWCArEOtIPQ) · Debug with Asish · 4 min · 50 views
+- [RAG Mastery Playbook / Section 3: Document Ingestion, Chunking, Embeddings & Semantic Search](https://www.youtube.com/watch?v=Xu48sjpWxdM) · EdgeTalks · 17 min · 103 views

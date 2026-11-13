@@ -14,7 +14,7 @@ sources:
   - "Go standard library docs, database/sql: DB.BeginTx, Tx.Commit, Tx.Rollback, TxOptions"
   - "Härder and Reuter, Principles of Transaction-Oriented Database Recovery (ACM Computing Surveys, 1983)"
   - "Kleppmann, Designing Data-Intensive Applications, chapter 7"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Transactions and ACID
@@ -28,6 +28,52 @@ updated: 2026-11-07
 > - Consistency is mostly your job: constraints (`CHECK`, `UNIQUE`, foreign keys) plus correct transaction boundaries.
 > - Isolation is level-dependent. At the default READ COMMITTED level, "read stock, then write stock" still oversells; use a conditional `UPDATE`, `SELECT … FOR UPDATE` or a constraint.
 > - In Go: `BeginTx`, `defer tx.Rollback()`, `Commit()`, keep the transaction short, and never make HTTP calls inside it.
+
+## Start here: the basics
+
+**The problem in one story.**
+You pay for concert tickets: money leaves your account, then the ticket is reserved.
+If the server crashes between those two steps, you have paid for nothing.
+If two people buy the last ticket at the same moment, both might "win".
+A transaction makes a group of steps all happen or none happen, and keeps parallel buyers from tripping over each other.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Transaction | A group of database statements treated as one unit | `BEGIN; debit; credit; COMMIT;` |
+| Commit | Make all the changes in the group permanent and visible | `COMMIT` |
+| Rollback | Throw away every change in the group | `ROLLBACK` after an error |
+| Constraint | A rule the database enforces on data | `CHECK (stock >= 0)` |
+| Concurrency | Several requests running at the same time | Two users clicking "buy" together |
+| Lock | A marker that makes others wait before touching a row | `SELECT … FOR UPDATE` |
+| WAL (write-ahead log) | A file where changes are recorded before the tables | Replayed after a crash |
+| Isolation level | How much one transaction can see of others' unfinished work | READ COMMITTED (PostgreSQL default) |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    B["BEGIN"] --> S1["Step 1: take payment"]
+    S1 --> S2["Step 2: reserve ticket"]
+    S2 -- "all ok" --> C["COMMIT:<br/>both stick"]
+    S1 -- "error / crash" --> R["ROLLBACK:<br/>neither happened"]
+    S2 -- "error / crash" --> R
+```
+
+**Analogy.** A transaction is a shopping cart at checkout: either everything in the cart is bought, or you walk away with nothing.
+Where it breaks: two shoppers can both see "1 left" on the shelf at once; a cart alone does not stop that, which is why isolation and locks matter.
+
+**How the rest of this note builds up**
+
+- First, the two problems transactions solve: crashes halfway and concurrency (section 1), and what A, C, I, D mean in plain words (section 2).
+- Then the lifecycle of a transaction, WAL durability, constraints, autocommit, savepoints and retries (section 3).
+- Then the "last unit of stock" worked example with four correct fixes (section 4).
+- Then variants, trade-offs and production habits in Go (sections 5-7).
+- Finally the SDE-3 deep dive and interview traps.
+
+> [!tip] Remember
+> All or nothing, durable after COMMIT; but "read then write" can still race, so use a conditional `UPDATE`, a row lock or a constraint.
 
 ## 1. Why it exists
 
@@ -159,11 +205,15 @@ flowchart TD
     L -- "committed" --> V2
 ```
 
-Example numbers: transaction 9001 updates invoice 501 from `paid_minor = 0` to `50000`. While 9001 is open, every other session reads version A. If 9001 rolls back, version B is dead and version A is still the answer; nothing was copied back. InnoDB works the other way: it writes old values to an **undo log** and copies them back on rollback, so rolling back a large transaction in MySQL does real work and can take a long time.
+Example numbers: transaction 9001 updates invoice 501 from `paid_minor = 0` to `50000`. While 9001 is open, every other session reads version A. If 9001 rolls back, version B is dead and version A is still the answer; nothing was copied back.
+
+InnoDB works the other way: it writes old values to an **undo log** and copies them back on rollback, so rolling back a large transaction in MySQL does real work and can take a long time.
 
 ### Durability: the write-ahead log
 
-The **WAL** (write-ahead log) is an append-only file of change records. The rule is "log first, data pages later": before `COMMIT` returns, PostgreSQL flushes the WAL up to the commit record with `fsync` (a system call that forces data out of the OS cache onto the disk). The changed data pages can stay in memory; after a crash, PostgreSQL replays the WAL to rebuild them. Details live in [[Storage Engines - B-tree vs LSM and WAL]].
+The **WAL** (write-ahead log) is an append-only file of change records. The rule is "log first, data pages later": before `COMMIT` returns, PostgreSQL flushes the WAL up to the commit record with `fsync` (a system call that forces data out of the OS cache onto the disk).
+
+The changed data pages can stay in memory; after a crash, PostgreSQL replays the WAL to rebuild them. Details live in [[Storage Engines - B-tree vs LSM and WAL]].
 
 ```mermaid
 sequenceDiagram
@@ -270,7 +320,9 @@ Example: attempt 1 hits `40001`, waits 10 ms, attempt 2 hits `40001`, waits 20 m
 
 ## 4. Worked example: the last unit of stock
 
-The task: InvoiceOps sells add-on products (for example, 100 printed cheque books) with a limited `stock`. Two customers try to buy the **last unit** at the same moment. Exactly one must succeed. The table has `stock int NOT NULL CHECK (stock >= 0)` as a safety net so stock can never go negative, and product 1 has `stock = 1` and `price_minor = 25000`.
+The task: InvoiceOps sells add-on products (for example, 100 printed cheque books) with a limited `stock`. Two customers try to buy the **last unit** at the same moment. Exactly one must succeed.
+
+The table has `stock int NOT NULL CHECK (stock >= 0)` as a safety net so stock can never go negative, and product 1 has `stock = 1` and `price_minor = 25000`.
 
 ### The bare idea in SQL
 
@@ -375,7 +427,9 @@ flowchart LR
     D -. "0 rows: already processed" .-> OUT["ROLLBACK, return 200"]
 ```
 
-Sending the "payment received" email is **not** inside this transaction. An SMTP call can take seconds, the transaction would hold the invoice row lock and a pooled connection the whole time, and if the commit then failed the email would already be sent. Instead, insert an outbox row in the same transaction and let a worker send the email: see [[Transactional Outbox and CDC]]. Why the dedupe step matters is covered in [[Idempotency and Idempotency Keys]].
+Sending the "payment received" email is **not** inside this transaction. An SMTP call can take seconds, the transaction would hold the invoice row lock and a pooled connection the whole time, and if the commit then failed the email would already be sent.
+
+Instead, insert an outbox row in the same transaction and let a worker send the email: see [[Transactional Outbox and CDC]]. Why the dedupe step matters is covered in [[Idempotency and Idempotency Keys]].
 
 ## 5. Variants and comparison
 
@@ -486,10 +540,14 @@ flowchart LR
 ## 9. Interview questions
 
 > [!question]- What does each letter of ACID guarantee, and how does PostgreSQL provide it?
-> Atomicity: all or nothing; row versions of an aborted transaction are never visible. Consistency: constraints and your invariants hold after commit; mostly the application's job, enforced with `CHECK`, `UNIQUE` and foreign keys. Isolation: concurrent transactions do not interfere, to the degree of the isolation level (MVCC snapshots plus row locks). Durability: commit returns only after the WAL record is flushed to disk.
+> Atomicity: all or nothing; row versions of an aborted transaction are never visible. Consistency: constraints and your invariants hold after commit; mostly the application's job, enforced with `CHECK`, `UNIQUE` and foreign keys.
+>
+> Isolation: concurrent transactions do not interfere, to the degree of the isolation level (MVCC snapshots plus row locks). Durability: commit returns only after the WAL record is flushed to disk.
 
 > [!question]- Trap: two users buy the last ticket inside transactions. Does the transaction stop overselling?
-> Not by itself. At READ COMMITTED (the PostgreSQL default), both can `SELECT stock` and see 1, then both write. Put the check inside the write (`UPDATE … WHERE stock > 0` and check rows affected), lock the row with `SELECT … FOR UPDATE`, use a unique constraint per seat, or run SERIALIZABLE and retry on `40001`. A `CHECK (stock >= 0)` constraint is a good safety net.
+> Not by itself. At READ COMMITTED (the PostgreSQL default), both can `SELECT stock` and see 1, then both write. Put the check inside the write (`UPDATE … WHERE stock > 0` and check rows affected), lock the row with `SELECT … FOR UPDATE`, use a unique constraint per seat, or run SERIALIZABLE and retry on `40001`.
+>
+> A `CHECK (stock >= 0)` constraint is a good safety net.
 
 > [!question]- Why must you not call `db.Exec("BEGIN")` in Go?
 > `*sql.DB` is a pool. Each call may use a different connection, so the `BEGIN` and the following statements can land on different sessions, leaving an open transaction on one connection and autocommitting on another. `db.BeginTx` pins one connection to the returned `*sql.Tx` until `Commit` or `Rollback`.
@@ -526,3 +584,8 @@ flowchart LR
 - **Before this:** [[SQL Essentials]], [[Relational Schema Design]]
 - **Next:** [[Isolation Levels and MVCC]], [[Locking - Optimistic vs Pessimistic]], [[Transactions and the Repository Pattern]], [[Storage Engines - B-tree vs LSM and WAL]]
 - **Compare with:** [[Transactional Outbox and CDC]] and [[Saga Pattern]] (consistency across services without ACID), [[Two-Phase Commit]] (atomic commit across databases)
+
+### Watch on YouTube
+
+- [Relational Database ACID Transactions (Explained by Example)](https://www.youtube.com/watch?v=pomxJOFVcQs) · Hussein Nasser · reputable channel, example-driven walkthrough of atomicity/consistency/isolation/durability
+- [ACID Properties Explained: Database Transaction Fundamentals for Beginners](https://www.youtube.com/watch?v=RSPfC-KKZAQ) · CodeLucky · beginner-friendly intro covering all four ACID properties

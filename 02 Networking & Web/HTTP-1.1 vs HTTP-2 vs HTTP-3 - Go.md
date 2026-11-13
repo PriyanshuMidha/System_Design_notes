@@ -12,13 +12,22 @@ sources:
   - "RFC 7541, HPACK"
   - "RFC 9204, QPACK"
   - "RFC 9000, QUIC"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # HTTP-1.1 vs HTTP-2 vs HTTP-3 - Go
 
 > [!summary] TL;DR
 > This code proves, on one machine, the single claim the theory note makes about multiplexing: six requests through **one** HTTP/1.1 connection run serially, while six requests through **one** HTTP/2 connection run almost fully in parallel. See [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] for why that gap exists.
+
+## Before the code
+
+- **Goroutines** (`go func() {...}()`): lightweight concurrent functions; here, one per request so all 6 fire at once.
+- **`sync.WaitGroup`**: a counter that lets the test wait until every goroutine has finished.
+- **`net/http` client and `http.Transport`**: the client sends requests; the transport owns the connection pool, and `MaxConnsPerHost` caps it.
+- **`net/http/httptest`**: spins up a real local server inside a test; `EnableHTTP2` + `StartTLS` makes it speak HTTP/2.
+- **`testing` helpers** (`t.Helper`, `t.Logf`, `t.Fatalf`): mark helpers, log measurements, fail the test.
+- **What to run:** `go vet ./...` then `go test -race -v ./...` inside the module.
 
 ## What this code shows
 
@@ -68,7 +77,11 @@ import (
 
 ### Step 1: a helper that fires N concurrent requests and times the batch
 
-**Concept.** The theory note's claim is about wall-clock time for a *batch* of requests, not any single request. This helper implements "fire N GETs at this client/URL at the same time, wait for all of them, return the elapsed time" so both the HTTP/1.1 and HTTP/2 cases can reuse the exact same measurement logic — the only thing that should differ between the two calls is the `*http.Client` passed in. Reusing one helper for both protocols, instead of writing the loop twice, is what makes this a fair, apples-to-apples comparison rather than two different benchmarks that happen to look similar.
+**Concept.** The theory note's claim is about wall-clock time for a *batch* of requests, not any single request.
+
+This helper implements "fire N GETs at this client/URL at the same time, wait for all of them, return the elapsed time". Both the HTTP/1.1 and HTTP/2 cases reuse the exact same measurement logic — the only thing that should differ between the two calls is the `*http.Client` passed in.
+
+Reusing one helper for both protocols, instead of writing the loop twice, is what makes this a fair, apples-to-apples comparison rather than two different benchmarks that happen to look similar.
 
 ```go
 // measureConcurrency fires n concurrent GETs through client at server and
@@ -105,7 +118,11 @@ func measureConcurrency(t *testing.T, client *http.Client, url string, n int, de
 
 ### Step 2: set up one handler, two servers, two clients
 
-**Concept.** This implements [[HTTP-1.1 vs HTTP-2 vs HTTP-3#2. Mental model]]'s "one room, one entrance" picture directly: the *same* handler (sleep 50ms, reply) is served two ways — once through an HTTP/1.1 client capped to one connection (`MaxConnsPerHost: 1`), once through an HTTP/2 server negotiated over TLS. The handler is deliberately identical in both cases, so the only variable is the protocol and connection count; any timing difference can only come from multiplexing, not from the handler doing different work.
+**Concept.** This implements [[HTTP-1.1 vs HTTP-2 vs HTTP-3#2. Mental model]]'s "one room, one entrance" picture directly.
+
+The *same* handler (sleep 50ms, reply) is served two ways: once through an HTTP/1.1 client capped to one connection (`MaxConnsPerHost: 1`), once through an HTTP/2 server negotiated over TLS.
+
+The handler is deliberately identical in both cases, so the only variable is the protocol and connection count; any timing difference can only come from multiplexing, not from the handler doing different work.
 
 ```go
 func TestH1SingleConnVsH2Multiplexing(t *testing.T) {
@@ -137,7 +154,8 @@ func TestH1SingleConnVsH2Multiplexing(t *testing.T) {
 
 1. `httptest.NewUnstartedServer` + `EnableHTTP2 = true` + `StartTLS()` is the specific sequence `net/http/httptest` needs to negotiate real HTTP/2 over ALPN without a hand-rolled certificate — `httptest` generates one for you. `h2srv.Client()` returns a client already configured to trust that certificate and prefer `h2`.
 2. `httptest.NewServer(handler)` (not `StartTLS`) gives a plain HTTP/1.1 server — no TLS, no ALPN negotiation, so there is no way for it to upgrade to HTTP/2.
-3. `&http.Transport{MaxConnsPerHost: 1}` is the one line doing the real work on the HTTP/1.1 side: it forces every one of the 6 concurrent `Get` calls onto the *same* single TCP connection instead of Go's default behavior of opening more connections for concurrency. Without this cap, Go's default `http.Transport` would open several HTTP/1.1 connections itself and partially hide the effect this test exists to show.
+3. `&http.Transport{MaxConnsPerHost: 1}` is the one line doing the real work on the HTTP/1.1 side: it forces every one of the 6 concurrent `Get` calls onto the *same* single TCP connection instead of Go's default behavior of opening more connections for concurrency.
+   Without this cap, Go's default `http.Transport` would open several HTTP/1.1 connections itself and partially hide the effect this test exists to show.
 
 ### Step 3: measure both batches and assert the gap
 
@@ -216,7 +234,12 @@ PASS
 ok  	roll10/http2demo	1.85s
 ```
 
-Reading it line by line: `go vet` printed nothing, meaning no suspicious constructs (unused results, wrong `Printf` verbs). The two `t.Logf` lines are the actual measurement: 312.98ms for HTTP/1.1 is within a few percent of the 300ms serial ideal (6 × 50ms), confirming the single connection really did serialize all 6 requests. 67.81ms for HTTP/2 is close to the 50ms parallel ideal, with the extra ~18ms accounting for TLS/ALPN negotiation and goroutine scheduling overhead rather than any serialization. `PASS` and the final `ok` line confirm both threshold assertions held and `-race` found no data race in the concurrent `Get` calls or the shared `*testing.T`.
+Reading it line by line:
+
+- `go vet` printed nothing, meaning no suspicious constructs (unused results, wrong `Printf` verbs).
+- The two `t.Logf` lines are the actual measurement. 312.98ms for HTTP/1.1 is within a few percent of the 300ms serial ideal (6 × 50ms), confirming the single connection really did serialize all 6 requests.
+- 67.81ms for HTTP/2 is close to the 50ms parallel ideal, with the extra ~18ms accounting for TLS/ALPN negotiation and goroutine scheduling overhead rather than any serialization.
+- `PASS` and the final `ok` line confirm both threshold assertions held and `-race` found no data race in the concurrent `Get` calls or the shared `*testing.T`.
 
 ## Pitfalls in the code
 

@@ -8,7 +8,7 @@ sources:
   - "Kubernetes docs, Deployments (rolling update strategy, maxSurge/maxUnavailable)"
   - "AWS docs, Amazon ECS deployment types (rolling update, blue/green with CodeDeploy)"
   - "Argo Rollouts docs, Canary and BlueGreen strategies"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Deployment Strategies - Rolling, Blue-Green, Canary
@@ -22,6 +22,51 @@ updated: 2026-11-07
 > - **Canary:** send a small, growing slice of traffic to the new version and watch its metrics before committing further; smallest blast radius, but needs automated analysis to be fast and safe.
 > - All three assume the new and old versions can run side by side against the same database — see [[Rollback and Safe Migrations]] for how schema changes stay compatible with both.
 > - Deploying new code and releasing it to users are two different decisions; see [[Feature Flags]] for separating them.
+
+## Start here: the basics
+
+**The problem in one story.**
+You have version 1 of your app running for all users, and version 2 is ready.
+If you swap everyone to version 2 at once and it has a bug, every user hits the bug.
+If you swap slowly, you limit the damage but the rollout takes longer.
+A deployment strategy is the plan for moving users from the old version to the new one.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Version | One build of the app | v1 (old) and v2 (new) |
+| Instance / pod | One running copy of the app | 10 pods serve traffic |
+| Load balancer | Spreads incoming requests across copies | AWS ALB sends 90% to v1, 10% to v2 |
+| Traffic | The stream of user requests | 1,000 requests per second |
+| Blast radius | How many users a bad release can hurt | 5% of users vs 100% |
+| Rollback | Going back to the old version | Point traffic back to v1 |
+| Error rate | Share of requests that fail | 2 failures per 100 = 2% |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    Users["Users"] --> LB["Load balancer"]
+    LB -->|"95%"| Old["v1 (old)"]
+    LB -->|"5% canary"| New["v2 (new)"]
+    New --> Check{"Metrics OK?"}
+    Check -->|"yes"| More["Send more traffic to v2"]
+    Check -->|"no"| Back["Roll back to v1"]
+```
+
+**Analogy.** A restaurant testing a new dish first serves it to a few tables (canary), or swaps the whole menu overnight while keeping the old one ready (blue-green), or changes it table by table (rolling).
+Where it breaks: diners can tell you the dish is bad; software needs automated metrics to notice.
+
+**How the rest of this note builds up**
+
+- First, why strategies exist (section 1) and the mental model (section 2).
+- Then how rolling, blue-green and canary each move traffic (section 3).
+- Then a Kubernetes rolling-update YAML and a canary analysis in Go (section 4), plus comparisons (section 5).
+- Finally the SDE-3 deep dive: trade-offs, production practice, and database compatibility during rollout (sections 6-8).
+
+> [!tip] Remember
+> Every strategy trades blast radius, rollback speed and cost; canary limits damage best but needs automated analysis.
 
 ## 1. Why it exists
 
@@ -142,7 +187,9 @@ Kubernetes only routes traffic to a pod once its readiness probe passes, so a ne
 
 ### Canary analysis, in Go
 
-The decision at each canary step, as a pure, testable function: compare the canary's error rate and p95 latency against the baseline (not just an absolute number, since a baseline of 0.5% errors behaves differently from one at 0.01%), and require a minimum sample size before trusting the comparison at all. This is the kind of check a progressive-delivery controller (Argo Rollouts, Flagger) runs automatically between ramp steps. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+The decision at each canary step, as a pure, testable function: compare the canary's error rate and p95 latency against the baseline (not just an absolute number, since a baseline of 0.5% errors behaves differently from one at 0.01%), and require a minimum sample size before trusting the comparison at all.
+
+This is the kind of check a progressive-delivery controller (Argo Rollouts, Flagger) runs automatically between ramp steps. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 // Package rollout implements the canary-analysis decision used during a
@@ -310,22 +357,30 @@ func TestAnalyze(t *testing.T) {
 ## 9. Interview questions
 
 > [!question]- When would you pick blue-green over canary?
-> When instant, total rollback matters more than gradual exposure — for example a release you are not confident enough to leave partially rolled out for any length of time, or a monolith that cannot easily run two versions side by side under partial traffic. The cost is doubled capacity during the overlap and all-or-nothing exposure instead of limiting the blast radius.
+> When instant, total rollback matters more than gradual exposure — for example a release you are not confident enough to leave partially rolled out for any length of time, or a monolith that cannot easily run two versions side by side under partial traffic.
+>
+> The cost is doubled capacity during the overlap and all-or-nothing exposure instead of limiting the blast radius.
 
 > [!question]- Why does `maxSurge`/`maxUnavailable` matter, and what do they trade off?
-> `maxSurge` is how many extra pods can run above the desired replica count during rollout (controls cost and how fast new pods roll in); `maxUnavailable` is how many pods can be missing at once (controls how much capacity — and blast radius if the new version is bad — disappears during the rollout). Setting both to 0 and a positive surge gives a fully surge-based rollout with zero capacity loss but temporarily higher cost; the reverse trades cost for capacity risk.
+> `maxSurge` is how many extra pods can run above the desired replica count during rollout (controls cost and how fast new pods roll in); `maxUnavailable` is how many pods can be missing at once (controls how much capacity — and blast radius if the new version is bad — disappears during the rollout).
+>
+> Setting both to 0 and a positive surge gives a fully surge-based rollout with zero capacity loss but temporarily higher cost; the reverse trades cost for capacity risk.
 
 > [!question]- A canary step looks healthy after 10 requests. Do you promote it?
 > No — this is the sample-size trap. Ten requests cannot distinguish a 0.5% error rate from a 10% error rate with any confidence; a canary analysis needs a `minSamples` floor before the error-rate and latency comparison means anything, otherwise you are promoting on noise.
 
 > [!question]- How do feature flags relate to these deployment strategies?
-> They're orthogonal and complementary: a deployment strategy controls which *version of the binary* serves a request; a feature flag controls which *code path inside that binary* runs. You can deploy a risky feature to 100% of instances behind a flag that is off, then ramp the flag's percentage independently of any deploy — see [[Feature Flags]].
+> They're orthogonal and complementary: a deployment strategy controls which *version of the binary* serves a request; a feature flag controls which *code path inside that binary* runs.
+>
+> You can deploy a risky feature to 100% of instances behind a flag that is off, then ramp the flag's percentage independently of any deploy — see [[Feature Flags]].
 
 > [!question]- What has to be true about the database for any of these strategies to work safely?
 > The schema must be compatible with both the old and new application version for the entire overlap window — true for rolling (old and new definitely run concurrently), for canary (by design), and for blue-green (so the instant switch-back stays instant). This is the expand/contract discipline in [[Rollback and Safe Migrations]], not a deployment-strategy detail.
 
 > [!question]- Your rollback took the old pods back, but requests are still failing. Why?
-> Likely causes: the "rollback" only reverted code, not a non-additive schema change it depended on (data is now incompatible with the old code too); or a config/feature-flag change shipped alongside the code was not reverted; or clients cached a response shape from the new version and haven't retried. Rollback must cover code, config, flags and (via expand/contract) schema compatibility together, not just the container image.
+> Likely causes: the "rollback" only reverted code, not a non-additive schema change it depended on (data is now incompatible with the old code too); or a config/feature-flag change shipped alongside the code was not reverted; or clients cached a response shape from the new version and haven't retried.
+>
+> Rollback must cover code, config, flags and (via expand/contract) schema compatibility together, not just the container image.
 
 ## 10. Cheat sheet
 
@@ -343,3 +398,8 @@ func TestAnalyze(t *testing.T) {
 - **Before this:** [[CI-CD Pipelines (GitHub Actions for Go)]], [[Load Balancing]]
 - **Next:** [[Feature Flags]], [[Rollback and Safe Migrations]]
 - **Compare with:** [[Kubernetes Fundamentals]], [[Autoscaling]], [[SLIs, SLOs, SLAs and Error Budgets]] (the error budget a canary analysis is really protecting)
+
+### Watch on YouTube
+
+- [Kubernetes Deployment Strategies with Demos / Canary / Blue Green / Rolling Update](https://www.youtube.com/watch?v=0QhUhrWGB9k) · Abhishek.Veeramalla · 51 min · 84,892 views
+- [Deployment Strategies Explained: Blue-Green vs. Canary vs. Rolling](https://www.youtube.com/watch?v=H5z70EBtEow) · CodeLucky · 4 min · 4,962 views

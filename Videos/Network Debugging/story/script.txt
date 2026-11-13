@@ -1,0 +1,115 @@
+# Network Debugging story: "The Case of the Vanishing One Percent". id | SPEAKER | tone | text. Source: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]
+# Cast: DANA = on-call detective (the engineer). RIO = her rookie. DEX = dig, the phone book clerk. NELL = nc and ss, the gate guard. TESS = openssl, the passport inspector. CURT = curl, the courier with a stopwatch. MEL = traceroute and mtr, the road surveyor. TAD = tcpdump, the eavesdropper in the tower. BO = the suspect, a backend service written in Go.
+== s1 The alarm
+l1 | N | hook | Packet City, three in the morning. An alarm rings in the detective's office. After tonight's deploy, one percent of requests are failing, with five oh two, bad gateway. Not all of them. Just one in a hundred. The worst kind of crime. Because it comes and goes.
+l2 | DANA | normal | I am Dana, the on call detective. Rio, my rookie, wake up. We have a case.
+l3 | RIO | question | The app says, something went wrong. Which part broke, Dana? The phone book lookup? The road? The security check? The server?
+l4 | DANA | punch | That is exactly the problem, Rio. Guessing wastes hours. But every step of a request has its own witness, with its own logbook. We question them one at a time, and find the broken step in five minutes.
+l5 | N | normal | Rio needs the words first. D N S is the internet's phone book, a name goes in, an I P address comes out. An I P address identifies a machine. A port is a numbered door on that machine, four forty three for H T T P S. A T C P connection is a reliable two way pipe, opened with a handshake. T L S is encryption and a certificate check on top. A socket is the operating system's handle for one connection. A packet is one small chunk of data. And a flag is an option you pass to a command, like curl dash v.
+l6 | DANA | normal | Think of a lost parcel. Was the address right? Did the truck leave? Did the gate guard let it in? Did the receiver sign? Each check has its own logbook. Our witnesses are the tools.
+== s2 The rules of the investigation
+l7 | N | normal | Why do we need separate witnesses? Because an error message only tells you roughly which layer broke, not why. Curl error seven, failed to connect, or curl error thirty five, S S L connect error, name a layer. But the why needs a tool that inspects that layer alone, instead of re running the whole request and guessing.
+l8 | DANA | normal | Our case. A deploy goes out, and a service returns five oh two, for one percent of requests. The error alone cannot tell us if D N S is flapping, a backend is unreachable, T L S to the backend is failing, or a backend is just slow.
+l9 | N | normal | The mental model. A stack of layers, one witness fixed to each. D N S, witness Dex, with dig. T C P reachability, witness Nell, with nc and ss, and Mel with traceroute and mtr. T L S, witness Tess, with open S S L s client. H T T P, witness Curt, with curl dash v and curl dash w. And the wire itself, witness Tad, with tcpdump.
+l10 | DANA | punch | The rule. Work top down. D N S first, because it is cheapest to check. Then T C P, then T L S, then H T T P. And call Tad, the eavesdropper, only when a witness's own report does not explain what we see.
+l11 | N | normal | And Dana's wall map shows where to start. Does the request time out? Then ask Nell, does the port even accept T C P? If it times out, or no route, check routing, that is a firewall or a dead route. If refused, nothing is listening. If open, but curl still hangs, the app accepted the connection, and never answers.
+l12 | N | normal | If instead there is an H T T P status. A name that does not resolve, N X domain, goes to Dex, with dig plus trace. A five oh two or five oh four from a proxy, goes to Curt, straight to the backend, bypassing the proxy. A certificate error goes to Tess. A two hundred that is slow goes to Curt's stopwatch. And anything still unclear goes to Tad.
+== s3 Suspect one: the phone book
+l13 | N | normal | Suspect one, the phone book. Dana and Rio walk to Dex's office.
+l14 | DEX | normal | Dex, the phone book clerk. Ask me a name, and I will tell you what I know. Dig, example dot com, type A.
+l15 | N | normal | The answer comes back. Status, no error, and an answer section. That means the name resolved. The number beside each address, a hundred ninety six, is the remaining T T L, in seconds, how much longer this answer stays cached. And the query time, thirty milliseconds, tells how fast the resolver answered.
+l16 | DEX | normal | Two addresses, a hundred seventy two dot sixty six dot one forty seven dot two forty three, and a hundred four dot twenty dot twenty three dot one fifty four. I answered from the server at a hundred dot sixty four dot zero dot one, port fifty three.
+l17 | DANA | question | And if the name does not exist, Dex?
+l18 | DEX | normal | Then there is no answer section, and an authority section carrying the zone's S O A record. That is the signature of N X domain. This exact name does not exist. A timeout, with neither, means the resolver itself never answered. Not the same thing.
+l19 | N | normal | Dex shows a C name too. Dig, www dot github dot com, C name, short, answers, github dot com. That is how most sites point a subdomain at a C D N or a load balancer. And for a quick manual check, ns lookup gives the same information in a friendlier form. But dig is preferred for scripting, because it shows the T T L and the flags.
+l20 | DEX | normal | The flags tell a story. Q R, this is a response. R D, recursion was requested. R A, the server supports recursion. And A D, the answer was validated with D N S sec. A missing A D on a zone that should be signed is itself a finding.
+l21 | DEX | punch | And my best trick. Dig plus trace. I ask the root, who handles dot com. Then the dot com servers, who handles example dot com. Then example dot com's own servers for the address. Your normal resolver never gets to serve a cached answer. So it catches a stale cache, or a bad delegation.
+l22 | DANA | normal | Our D N S answers are fine. Fast, correct, and not expired. Dex is cleared. Suspect one, innocent.
+== s4 Suspect two: the road and the gate
+l23 | N | normal | Suspect two, the road, and the gate. Dana walks on to the road surveyor, Mel.
+l24 | MEL | normal | Mel, road surveyor. Traceroute, five hops. Each row is one more hop, whose time to live ran out, and who sent back a message, time exceeded. Hop two, fourteen milliseconds. Hop three, sixteen. Hop four, fifty six. Hop five, eighty seven.
+l25 | RIO | question | Hop one shows only a star. Is that a broken road?
+l26 | MEL | normal | Not necessarily. A star means that hop did not reply. Often a router that drops these messages, not a failure. Only a trend of timeouts at the same hop, across repeated runs, means a real problem. And a clean road does not rule out an application problem. I measure the path, not the app.
+l27 | N | normal | Mel's longer tool, M T R, runs the same idea continuously, and adds a live loss percentage and jitter per hop. That separates one slow hop from a hop that drops twenty percent of packets.
+l28 | DANA | normal | Good. Now the gate. Nell, can I even open a connection to this host and port?
+l29 | NELL | normal | Nell, gate guard. Netcat, dash v z, example dot com, port four forty three. Connection succeeded. And to a closed door, port one on the same machine. Connection refused.
+l30 | N | normal | Refused means a packet reached the host, and the operating system answered, nobody is listening on that port. The road works, but the service or the port is wrong. Timed out means no reply came back at all, usually a firewall dropping the packet, or a dead route.
+l31 | DANA | normal | Nell says the gate is open. So the road and the gate are cleared. Suspect two, innocent.
+== s5 Suspect three: the passport inspector
+l32 | N | normal | Suspect three. The security check. Tess inspects passports.
+l33 | TESS | normal | Tess. Open S S L s client, connect to example dot com, four forty three, with servername example dot com. I read the certificate chain. The certificate, issued by an intermediate, issued by a root. And three facts decide everything.
+l34 | TESS | normal | One. The servername must match what the certificate covers. A wrong common name, or a subject alternative name missing your host, means a hostname mismatch. Two. Verify return code zero, okay, means the chain validated against your trust store. A non zero code, like twenty, unable to get local issuer certificate, means an incomplete chain, or an untrusted authority. And three. The validity dates. A date check catches an expired certificate immediately.
+l35 | TESS | warn | And always pass the servername. Without it, S N I based routing may hand you a different certificate than a browser sees. A missing servername is a very common script bug. It makes T L S work in a browser, and fail in a script.
+l36 | DANA | normal | Verify code zero. Names match. Dates valid. Tess is cleared. Suspect three, innocent. But Rio, three suspects cleared, and the failures continue.
+== s6 Suspect four: the courier with a stopwatch
+l37 | N | normal | Suspect four. The H T T P request itself. Curt is a courier, who walks the route with a stopwatch.
+l38 | CURT | normal | Curt. Curl dash v. I narrate three kinds of lines. A star is my own commentary, the host resolved, trying the address, connected, the T L S version, the protocol negotiated, H T T P two. A greater than sign is what I sent. A less than sign is what I received. The status, and the headers.
+l39 | CURT | normal | A connection failure shows up in the star lines, before any H T T P happens. The star lines come from my own logic, not from the wire. For ground truth, ask Tess or Tad.
+l40 | CURT | normal | Now my stopwatch. Curl dash w. D N S, two and a half milliseconds. Connect, three. T L S, a hundred eighty. First byte, two hundred thirty two. Total, two hundred thirty two.
+l41 | N | warn | Careful. These numbers are cumulative from the start, not per phase. Subtract consecutive fields to get each phase's own cost. T L S alone is a hundred eighty minus three, about a hundred seventy seven milliseconds. The server's think time is about fifty one. Read as a timeline, the dominant cost, T L S here, jumps out.
+l42 | CURT | normal | And my favourite. Curl dash dash resolve. I force one specific address, without touching system D N S. The standard way to test, does the new server work, before changing a record. Or to test one node behind a load balancer directly.
+l43 | DANA | punch | That is it, Curt. Go straight to each backend, bypassing the proxy. Isolate the proxy from the backend.
+l44 | CURT | normal | Backend one, two hundred, fast. Backend two, two hundred, fast. Backend three. Hanging. Sometimes it takes a second. Sometimes it resets the connection.
+l45 | RIO | punch | Backend three! A slow backend, under load, can fail like that, even when the proxy's own health check still passes it.
+== s7 The lead: the gate guard and the sockets
+l46 | DANA | normal | Nell, you check the sockets on backend three. S S dash t a n.
+l47 | NELL | warn | Hundreds of sockets in close dash wait, all to the same peers. Dana, that is the state machine talking.
+l48 | N | normal | S S and netstat report a socket's state from the T C P state machine. Reading the state tells you which side is stuck. A socket stuck in S Y N sent means the first packet, or its reply, never arrived, a routing or firewall problem. A large number in time wait after a load test is normal cleanup, not a bug.
+l49 | NELL | warn | But close wait is different. It means the peer sent a close, a fin, and my application accepted it, but never called close itself. The socket sits, waiting for the local side to finish. That is a resource leak.
+l50 | N | normal | Nell reads the listening row too. If the receive queue climbs toward the backlog limit, connections arrive faster than the program accepts them. Once the limit is reached, the kernel drops or refuses new connections. And on a Mac, there is no S S, so use netstat dash a n, with equivalent columns.
+l51 | DANA | normal | A leak, in the application, not the network. But I want proof from the wire itself. Tad. Come down from the tower.
+== s8 The eavesdropper
+l52 | TAD | normal | Tad, the eavesdropper. I need power, root, to open a raw socket. And I will only listen to one conversation, so I use a tight filter. Tcpdump, host, and port four forty three.
+l53 | N | normal | Tad reads the flags. A capital S is a sin, the first packet. S dot is the sin ack. A bare dot is an ack. And P dot is a push, carrying data. The first three lines are the three way handshake. The fourth is the T L S client hello leaving, and the hundred eighty one millisecond gap before the fifth is the T L S handshake and the first byte, the same number curl's stopwatch showed.
+l54 | TAD | normal | The filter is Berkeley packet filter syntax. A small language, not free text. To count only connection attempts, I filter for packets with the sin flag set. To follow one conversation on a busy link, host a and host b. Narrow it, or the interface drowns you.
+l55 | TAD | warn | And a warning. I can capture sensitive payloads. Never run me without a tight filter. For anything beyond one line, write to a file, dash w capture dot p cap, and open it in Wireshark. Reading me live is slow.
+l56 | TAD | punch | In my capture from backend three, I see it, Dana. The peer's fin arrives, I send the ack, and then nothing. The application never closes its side. Retransmissions, resets, they are the footprints of network loss. Here there is no loss at all. This is not the network.
+== s9 The culprit
+l57 | N | normal | A close wait leak traces back to code, not to the network. The local process received a fin from the peer, but its code never called close. In Go, it is almost always a missing defer conn dot close, or a response body that was read, but never closed. Resp dot body dot close.
+l58 | DANA | normal | Bo, the backend written in Go. Show me your code.
+l59 | BO | normal | I call another service. I read the response. And then I return.
+l60 | DANA | punch | You never closed the response body, Bo. Every call leaves a connection waiting. Under load, they pile up, until a new connection finally fails, and the proxy reports five oh two, for one percent of requests.
+l61 | BO | normal | I did not know. I thought that reading the body was enough.
+l62 | DANA | normal | One line. Defer, resp dot body dot close, right after the error check. Case closed.
+== s10 The health probe
+l63 | N | normal | Dana does not stop at the fix. She writes the same check as a Go health probe, so the city never needs a human to run netcat again. Netcat dash z v is a manual, one shot version of the T C P check a load balancer runs continuously.
+l64 | N | normal | The probe dials an address, with a timeout, and classifies the answer into the same buckets a human reads off nc, ss, and tcpdump. No error means open. A net error where timeout is true means a timeout, a firewall drop, or a dead route. An error that is connection refused means nothing is listening. Anything else is other error.
+l65 | N | normal | Refused is the kernel answering a sin with a reset. Timeout is a sin that got no reply at all. A program that reports these buckets, instead of a bare, up or down, lets an on call dashboard say, this looks like a firewall problem, before a human runs a single command.
+l66 | N | normal | The tests prove all four outcomes, with the race detector on.
+== s11 The case file
+l67 | DANA | normal | The case file, Rio. Symptoms and witnesses. A name that will not resolve, Dex, dig, dig plus trace. A connect that hangs for a long time, a firewall dropping packets, Nell and Mel, nc, traceroute. Connection refused at once, nothing listening, Nell, nc and ss.
+l68 | DANA | normal | Certificate errors, Tess, open S S L s client, read the verify code and the dates. Five oh two or five oh four through a proxy, Curt, straight to the backend. A two hundred that is slow, Curt's stopwatch. And everything fine, but behaviour still wrong, Tad, the wire.
+l69 | N | warn | Know the limits. Dig, curl and open S S L are read only, and safe to run against production. Tcpdump needs elevated privileges, and can capture sensitive data. Traceroute and mtr measure the path, not the application, and TCP often recovers from loss invisibly. Curl dash dash resolve and D N S overrides are for testing, never a permanent fix, or you hide the problem from everyone else.
+l70 | N | normal | Production failures. A resolver returns stale addresses after a D N S change. Check the record's T T L with dig, because clients keep the old answer until it expires. An intermittent five oh two. Curl each backend directly. A backend that is slow or crash looping shows up as a hang, or a reset, even when the proxy's health check passes it.
+l71 | N | normal | T L S works in a browser but fails from a script. Check the trust store, and whether the servername is sent at all. And a host that sometimes does not respond. Capture with tcpdump during a failure window, and look for retransmissions or resets. Those point at network loss, rather than application logic.
+l72 | N | normal | And what to monitor. D N S query latency, and the N X domain rate. T C P connect failures, split into refused and timeout, because they mean different things. T L S handshake failures, and days to certificate expiry. And H T T P errors broken down by phase timing, so a dashboard can already say, this is slow in T L S.
+l73 | DANA | normal | And two more tricks for your notebook. Mtr's loss on a middle hop is noisy. Many routers rate limit those replies, so thirty percent loss at one hop, with zero after it, is that router's policy. Only loss at the last hop is actionable. And a close wait leak in Go is a missing defer close, or an unclosed response body.
+== s12 The rookie's exam
+q0 | N | hook | Back at the office, Dana tests Rio. Seven questions you will really get.
+q1 | RIO | question | A request times out with no error at all. What is my first command?
+q2 | DANA | normal | Nc dash z v, with the host and port. It answers the cheapest question first. Does T C P even connect? If it hangs, it is routing or a firewall, so trace the route. If it succeeds at once, the problem is above T C P.
+q3 | RIO | question | Curl says error thirty five, S S L connect error.
+q4 | DANA | normal | Open S S L s client, with the servername. Read the verify code, the names, and the dates. The usual causes are an expired certificate, a hostname mismatch, or a missing intermediate.
+q5 | RIO | question | Trace route shows stars at hop six, but the destination answers at hop ten. A problem at hop six?
+q6 | DANA | normal | Not necessarily. Many routers drop those replies without affecting the real traffic. One silent hop with good connectivity on both sides is usually ICMP policy.
+q7 | RIO | question | Hundreds of sockets in close wait, for one process. Where is the bug?
+q8 | DANA | normal | In the application. The peer closed, and the process never called close. In Go, a missing response body close, or a connection handler without a defer close.
+q9 | RIO | question | When would I trust tcpdump over curl's own narration?
+q10 | DANA | normal | When the explanation does not match the behaviour. Curl says connected, yet the request stalls, or two tools disagree about reachability. Tcpdump shows the literal bytes and flags on the wire.
+q11 | RIO | question | The T T L is thirty six hundred, and I changed the address. My dig shows the new one, but users see the old one an hour later. Why?
+q12 | DANA | normal | Resolvers cache independently. Yours may not have cached the old answer, while their ISP resolver did, and will not ask again until that entry expires. Query the same resolver they use, and check the remaining T T L.
+q13 | RIO | question | And refused versus timed out?
+q14 | DANA | normal | Refused, a packet reached the host, and the O S answered with a reset. Nothing is listening, so check the service and the port. Timed out, no reply at all. Usually a firewall dropping the packet, or a dead route. It tells you whether to look at the service, or the network.
+== s13 Case closed: the summary
+s0 | N | calm | Case closed. Let us put it all together.
+s1a | N | normal | One. Match the symptom to one layer, then run the one tool that inspects that layer. The order of attack. D N S with dig. T C P with nc and ss. T L S with open S S L. H T T P with curl. And raw packets with tcpdump, only if the rest do not explain it.
+s1b | N | normal | Two. Dig. No answer section, with an S O A in the authority section, means N X domain. A timeout with neither means the resolver is unreachable. Plus trace walks root, dot com, authoritative.
+s1c | N | normal | Three. Curl dash w timings are cumulative. Subtract consecutive fields for each phase's cost. Curl dash dash resolve tests one address without touching D N S.
+s1d | N | normal | Four. Open S S L s client, always with servername. Read the verify code, the names, and the dates.
+s1e | N | normal | Five. Nc, refused means nothing is listening. Timeout means no reply, a firewall or a dead route. S S, a growing listen backlog means the app is too slow to accept. Many close wait rows mean the app leaks unclosed connections.
+s1f | N | normal | Six. Tcpdump needs a tight filter and root, and a capture file for anything beyond a line. Traceroute and mtr measure the path, not the app, and a lossy middle hop is usually that router's policy.
+s1g | N | calm | And the one line to keep. Match the symptom to one layer, then run the one tool that inspects that layer.
+== s14 Where to go next
+rn1 | N | calm | To go deeper, open the network debugging note, and its Go note, in your vault. Before it, read what happens when you type a U R L, then D N S, T C P, and T L S. After it, forward and reverse proxies. Compare it with I O models, and H T T P fundamentals.
+e1 | RIO | hook | Dana, you solved it in five minutes.
+e2 | DANA | punch | Next case.

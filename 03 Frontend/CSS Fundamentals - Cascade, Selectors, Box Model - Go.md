@@ -8,13 +8,22 @@ sources:
   - "MDN, CSS Cascade and Inheritance"
   - "W3C Selectors Level 4, Calculating a selector's specificity"
 status: draft
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # CSS Fundamentals - Cascade, Selectors, Box Model - Go
 
 > [!summary] TL;DR
 > This code is a small specificity calculator: it parses a CSS compound selector string (like `#nav .item a`) into the `(IDs, classes, types)` triple described in [[CSS Fundamentals - Cascade, Selectors, Box Model]], and compares two triples the same way a browser's cascade does — left-to-right, never summed.
+
+## Before the code
+
+- **Structs** (`type Triple struct{ A, B, C int }`): a named group of fields, here the three specificity counters.
+- **Methods with a value receiver** (`func (t Triple) Less(...)`): a function attached to a type, called as `x.Less(y)`.
+- **`switch` with no value** (`switch { case ...: }`): a tidy chain of `if / else if` checks, top to bottom.
+- **`strings` package** (`Fields`, `HasPrefix`, `NewReplacer`): split on spaces, check how a string starts, and swap characters.
+- **Table-driven tests**: one test loops over a list of input/expected pairs, the usual Go testing style.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or generics are needed here.
 
 ## What this code shows
 
@@ -35,7 +44,9 @@ updated: 2026-11-09
 
 ### The specificity type and its comparison rule
 
-**Concept.** The theory note's whole point is that specificity is three separate counters compared in order, never added together. `Triple` is that triple, and `Less` is the comparison rule, written exactly as the "compare `a`, then `b`, then `c`" rule reads in prose. An alternative design would pack all three counts into one integer (e.g. `a*1000 + b*100 + c`), but that silently breaks the moment any counter reaches double digits — encoding each counter as its own field makes that bug impossible to write by accident.
+**Concept.** The theory note's whole point is that specificity is three separate counters compared in order, never added together. `Triple` is that triple, and `Less` is the comparison rule, written exactly as the "compare `a`, then `b`, then `c`" rule reads in prose.
+
+An alternative design would pack all three counts into one integer (e.g. `a*1000 + b*100 + c`), but that silently breaks the moment any counter reaches double digits — encoding each counter as its own field makes that bug impossible to write by accident.
 
 ```go
 package specificity
@@ -66,7 +77,9 @@ func (t Triple) Less(other Triple) bool {
 
 ### Parsing a selector into a triple
 
-**Concept.** `Of` is the piece that turns a raw selector string into a `Triple`, by walking each compound (the part between combinators) and classifying each token inside it. The design choice here is a simple character-prefix classifier rather than a full CSS selector grammar parser — a real browser engine's selector parser is considerably more complete (handling escaped characters, nested functional pseudo-classes like `:not()`'s argument, and more), but a prefix classifier is enough to demonstrate the specificity rule itself, which is this note's only goal.
+**Concept.** `Of` is the piece that turns a raw selector string into a `Triple`, by walking each compound (the part between combinators) and classifying each token inside it.
+
+The design choice here is a simple character-prefix classifier rather than a full CSS selector grammar parser — a real browser engine's selector parser is considerably more complete (handling escaped characters, nested functional pseudo-classes like `:not()`'s argument, and more), but a prefix classifier is enough to demonstrate the specificity rule itself, which is this note's only goal.
 
 ```go
 // Of parses one compound selector like "#nav .item a" or "div.card:hover::before"
@@ -211,7 +224,9 @@ func splitCompound(s string) []string {
 
 ### `TestOf`
 
-**What it proves and why it matters.** That six representative selector shapes — a bare type, a class, an ID-plus-class-plus-type compound, a class-plus-pseudo-class-plus-pseudo-element compound, the universal selector, and a `:not()` compound — each parse to the triple the specificity table in the theory note claims. This is the test that would catch a classification bug (e.g. counting `::before` as a pseudo-class instead of a pseudo-element).
+**What it proves and why it matters.** That six representative selector shapes — a bare type, a class, an ID-plus-class-plus-type compound, a class-plus-pseudo-class-plus-pseudo-element compound, the universal selector, and a `:not()` compound — each parse to the triple the specificity table in the theory note claims.
+
+This is the test that would catch a classification bug (e.g. counting `::before` as a pseudo-class instead of a pseudo-element).
 
 | Input selector | Expected triple |
 | --- | --- |
@@ -247,13 +262,17 @@ func TestOf(t *testing.T) {
 }
 ```
 
-The `a:not(.disabled)` case is deliberately documented as a known simplification: this parser counts both the `:not` token and its `.disabled` argument as separate class-weight tokens, giving `(0, 2, 1)`, while a real browser engine scores only `:not()`'s argument and ignores the pseudo-class wrapper itself, giving `(0, 1, 1)`. A failure on this row with any *other* triple would mean the classifier regressed; the `(0, 2, 1)` it currently asserts is this package's known, intentional gap, not the spec-correct answer.
+The `a:not(.disabled)` case is deliberately documented as a known simplification: this parser counts both the `:not` token and its `.disabled` argument as separate class-weight tokens, giving `(0, 2, 1)`, while a real browser engine scores only `:not()`'s argument and ignores the pseudo-class wrapper itself, giving `(0, 1, 1)`.
+
+A failure on this row with any *other* triple would mean the classifier regressed; the `(0, 2, 1)` it currently asserts is this package's known, intentional gap, not the spec-correct answer.
 
 **What a failure would mean.** Any mismatch here means the token classifier (in `Of` or `splitCompound`) mis-sorted at least one token into the wrong counter — for example, if `::before` got classified as a pseudo-class, the `div.card:hover::before` case would report `(0, 3, 1)` instead of `(0, 2, 2)`.
 
 ### `TestLessOrdersByIDFirst`
 
-**What it proves and why it matters.** The single most important intuition in the whole theory note: six chained classes still lose to one ID, because the comparison never reaches the class counter while the ID counters still differ. This is the test that would catch a regression to "add all three counters together" — a summed comparison (`0+6+0=6` vs `1+0+0=1`) would wrongly rank the six classes as more specific.
+**What it proves and why it matters.** The single most important intuition in the whole theory note: six chained classes still lose to one ID, because the comparison never reaches the class counter while the ID counters still differ.
+
+This is the test that would catch a regression to "add all three counters together" — a summed comparison (`0+6+0=6` vs `1+0+0=1`) would wrongly rank the six classes as more specific.
 
 | Input | IDs | Classes | `Less` result |
 | --- | --- | --- | --- |
@@ -290,7 +309,9 @@ PASS
 ok  	csssplit/specificity	1.425s
 ```
 
-Reading it line by line: `go vet` printed nothing, meaning it found no suspicious constructs (unreachable code, bad format verbs, and so on). Both `RUN`/`PASS` pairs confirm each test function executed and its assertions held. The final `ok` line with a duration confirms the whole package built and ran clean under the race detector — meaningful here because, while this particular package does no concurrent work, running `-race` on every package is the project-wide habit that catches accidental concurrency bugs early rather than only when they first appear in production.
+Reading it line by line: `go vet` printed nothing, meaning it found no suspicious constructs (unreachable code, bad format verbs, and so on). Both `RUN`/`PASS` pairs confirm each test function executed and its assertions held.
+
+The final `ok` line with a duration confirms the whole package built and ran clean under the race detector — meaningful here because, while this particular package does no concurrent work, running `-race` on every package is the project-wide habit that catches accidental concurrency bugs early rather than only when they first appear in production.
 
 ## Pitfalls in the code
 

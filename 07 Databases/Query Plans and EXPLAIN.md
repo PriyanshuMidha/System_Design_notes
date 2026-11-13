@@ -13,13 +13,15 @@ sources:
   - "PostgreSQL 17 docs, pg_stat_statements and auto_explain modules; log_min_duration_statement"
   - "PostgreSQL 18 release notes (BUFFERS included by default with EXPLAIN ANALYZE)"
   - "MySQL 8.0 Reference Manual, EXPLAIN Output Format; EXPLAIN ANALYZE (8.0.18) and FORMAT=TREE (8.0.16)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Query Plans and EXPLAIN
 
 > [!summary] TL;DR
-> SQL says *what* rows you want, not *how* to fetch them. The database's **planner** picks the how: which index to use, in which order to join tables, how to sort. That choice is the **query plan**, and `EXPLAIN` prints it. `EXPLAIN ANALYZE` also runs the query and shows what really happened, so you can see where the time went and why.
+> SQL says *what* rows you want, not *how* to fetch them. The database's **planner** picks the how: which index to use, in which order to join tables, how to sort. That choice is the **query plan**, and `EXPLAIN` prints it.
+>
+> `EXPLAIN ANALYZE` also runs the query and shows what really happened, so you can see where the time went and why.
 
 > [!abstract] Core idea
 > - A plan is a tree of steps (nodes); rows flow from the leaves (table scans) up to the root (your result).
@@ -27,6 +29,54 @@ updated: 2026-11-07
 > - Most slow queries are a bad guess: compare the estimated `rows` with the actual `rows` on every node.
 > - `EXPLAIN (ANALYZE, BUFFERS)` shows real time, real rows and how many 8 kB pages were read; it really executes the statement.
 > - Find which queries to fix first with `pg_stat_statements`, then read their plans.
+
+## Start here: the basics
+
+**The problem in one story.**
+You ask a librarian for "every book by this author from 2020".
+She can walk every shelf, or open the author card catalogue and jump straight to the right shelf.
+Both give the same books, but one takes an hour and the other a minute.
+A database makes this same choice for every query, and `EXPLAIN` lets you see which way it chose.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Query | A SQL request for rows | `SELECT * FROM invoices WHERE client_id = 7` |
+| Planner (optimizer) | The part of the database that decides *how* to run a query | Picks "use the index" or "read the whole table" |
+| Plan | The chosen recipe, shaped as a tree of steps | Index Scan → Sort → Limit |
+| Index | A sorted lookup structure that points to rows | Like the index at the back of a book |
+| Sequential scan | Reading every row of a table in order | Walking every shelf in the library |
+| Statistics | Summary facts the database keeps about each column | "About 2% of invoices are `overdue`" |
+| Cost | The planner's made-up price for a plan, in abstract units | `cost=0.43..61.12` |
+| Page | The fixed-size block the database reads from disk (8 kB in PostgreSQL) | One table may span thousands of pages |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  A[SQL text] --> B[Planner]
+  S[(Statistics)] --> B
+  B --> C[Candidate plans priced by cost]
+  C --> D[Cheapest plan]
+  D --> E[Executor runs it]
+  E --> F[Rows back to you]
+  D -.EXPLAIN shows this.-> G[You]
+```
+
+**Analogy.**
+A sat-nav picks a route from its map and traffic data, and `EXPLAIN` shows you the route before you drive.
+Where it breaks: a sat-nav updates traffic live, while the planner trusts statistics that can be stale until `ANALYZE` refreshes them.
+
+**How the rest of this note builds up**
+
+- First, why a planner exists and a simple mental model of a plan as a tree.
+- Then how it works: statistics, the cost model, and how to read each line of a plan.
+- Then a worked example that takes a slow plan, fixes it with an index, and spots a bad estimate.
+- Finally, join algorithms, production tooling (`pg_stat_statements`, `auto_explain`) and the SDE-3 deep dive.
+
+> [!tip] Remember
+> When a query is slow, compare the planner's estimated rows with the actual rows: a big gap is usually the bug.
 
 ## 1. Why it exists
 
@@ -40,7 +90,11 @@ SELECT id, number, total_minor, due_date
  LIMIT 50;
 ```
 
-On a staging copy with 1.2 million invoices and only a primary-key index, this takes about 1.2 seconds, and the page makes three similar queries. The SQL is correct and short. Nothing in the SQL text tells you why it is slow: the reason is the plan, which here reads every one of the 1.2 million rows to keep 4,870 of them. `EXPLAIN` is how you see that, and how you confirm that a fix (here, an index) actually changed the plan rather than hoping it did.
+On a staging copy with 1.2 million invoices and only a primary-key index, this takes about 1.2 seconds, and the page makes three similar queries. The SQL is correct and short.
+
+Nothing in the SQL text tells you why it is slow: the reason is the plan, which here reads every one of the 1.2 million rows to keep 4,870 of them.
+
+`EXPLAIN` is how you see that, and how you confirm that a fix (here, an index) actually changed the plan rather than hoping it did.
 
 Throughout this note, plan output is **representative output (PostgreSQL 17)**, written to be internally consistent (costs, row counts, buffer counts) but not captured from a live server. Timings are illustrative.
 
@@ -82,7 +136,11 @@ flowchart LR
 | `histogram_bounds` | boundaries splitting the other values into equal-count buckets | ranges such as `due_date < '2026-10-01'` |
 | `correlation` | how closely physical row order follows the column's sort order | cost of index scans |
 
-**Selectivity** is the fraction of rows a condition keeps (0.01 = 1%). **Cardinality** here means the estimated row count: table rows × selectivity. For `status = 'overdue'`, the planner looks up `'overdue'` in `most_common_vals`; if its frequency is 0.04, it expects 1,200,000 × 0.04 = 48,000 rows. For two conditions joined with `AND`, it multiplies the selectivities, which assumes the columns are **independent**. That assumption is the single most common source of bad estimates (section 4 shows one).
+**Selectivity** is the fraction of rows a condition keeps (0.01 = 1%). **Cardinality** here means the estimated row count: table rows × selectivity.
+
+For `status = 'overdue'`, the planner looks up `'overdue'` in `most_common_vals`; if its frequency is 0.04, it expects 1,200,000 × 0.04 = 48,000 rows. For two conditions joined with `AND`, it multiplies the selectivities, which assumes the columns are **independent**.
+
+That assumption is the single most common source of bad estimates (section 4 shows one).
 
 ```sql
 SELECT attname, n_distinct, most_common_vals, most_common_freqs
@@ -99,7 +157,9 @@ flowchart LR
     MUL --> E["estimated rows =<br/>table rows x combined selectivity"]
 ```
 
-**Example with numbers.** `status = 'overdue'` has frequency 0.04 in `most_common_freqs`, so on 1,200,000 rows the estimate is 1,200,000 x 0.04 = 48,000 rows. Add a second condition with selectivity 0.01 and the combined estimate becomes 48,000 x 0.01 = 480 rows. If the two columns are really correlated, the true number can be far from 480; that is the cause of Plan 3 below.
+**Example with numbers.** `status = 'overdue'` has frequency 0.04 in `most_common_freqs`, so on 1,200,000 rows the estimate is 1,200,000 x 0.04 = 48,000 rows. Add a second condition with selectivity 0.01 and the combined estimate becomes 48,000 x 0.01 = 480 rows.
+
+If the two columns are really correlated, the true number can be far from 480; that is the cause of Plan 3 below.
 
 ### 3.3 The cost model
 
@@ -280,7 +340,11 @@ Planning Time: 0.240 ms
 Execution Time: 415.882 ms
 ```
 
-The planner expected **12** invoices and got **48,211**, about 4,000 times more. Where 12 came from: the statistics were gathered before workspace 77 imported its history, so `workspace_id = 77` was estimated at 1 in ~1,000 workspaces (1,200 rows), and `currency = 'INR'` at 1% of rows. Multiplying, as if the columns were independent, gives 1,200 × 0.01 = 12. In reality workspace 77 is a large Indian customer, so every one of its invoices is INR.
+The planner expected **12** invoices and got **48,211**, about 4,000 times more.
+
+Where 12 came from: the statistics were gathered before workspace 77 imported its history, so `workspace_id = 77` was estimated at 1 in ~1,000 workspaces (1,200 rows), and `currency = 'INR'` at 1% of rows.
+
+Multiplying, as if the columns were independent, gives 1,200 × 0.01 = 12. In reality workspace 77 is a large Indian customer, so every one of its invoices is INR.
 
 ```mermaid
 flowchart LR
@@ -326,7 +390,9 @@ Estimate 47,900 vs actual 48,211: within 1%. The planner now reads the table pag
 
 ### Finding misestimates mechanically
 
-For large plans, scanning by eye is error prone. `EXPLAIN (ANALYZE, FORMAT JSON)` returns the same tree as JSON, and a small program can walk it and flag every node whose estimate is off by 10x or more. Both sides are compared per loop, exactly as PostgreSQL reports them, and a value of 0 is treated as 1 to avoid dividing by zero. The factor is `max(planned / actual, actual / planned)`, so over- and under-estimates count the same.
+For large plans, scanning by eye is error prone. `EXPLAIN (ANALYZE, FORMAT JSON)` returns the same tree as JSON, and a small program can walk it and flag every node whose estimate is off by 10x or more.
+
+Both sides are compared per loop, exactly as PostgreSQL reports them, and a value of 0 is treated as 1 to avoid dividing by zero. The factor is `max(planned / actual, actual / planned)`, so over- and under-estimates count the same.
 
 ```mermaid
 flowchart TD
@@ -458,15 +524,27 @@ flowchart TD
 
 ## 8. Deep dive
 
-**How the planner searches.** For each table, it builds candidate access paths (sequential, each usable index, bitmap combinations). For joins it uses dynamic programming over join orders: best plan for every pair of tables, then every triple, keeping the cheapest path for each set and for each useful sort order. The number of orders grows factorially, so above `join_collapse_limit` / `from_collapse_limit` (8 by default) it keeps your written join order for the extra tables, and above `geqo_threshold` (12 FROM items by default) it switches to a genetic search that is fast but not guaranteed optimal. Queries joining 15 tables can therefore get odd plans that change between runs.
+**How the planner searches.** For each table, it builds candidate access paths (sequential, each usable index, bitmap combinations).
 
-**Why errors compound.** Each join's estimate multiplies its inputs' estimates. If each of three joins is off by 10×, the top estimate can be off by 1,000×, and the planner makes its join-method choice (nested loop vs hash) at every level using those numbers. This is why estimate errors near the leaves matter most, and why the Go helper reports all nodes, not just the root.
+For joins it uses dynamic programming over join orders: best plan for every pair of tables, then every triple, keeping the cheapest path for each set and for each useful sort order.
 
-**Startup cost and `LIMIT`.** With a `LIMIT`, the planner charges only the fraction of a child's total cost needed to produce the limited rows. A plan with startup cost 0.43 and a large total can beat one with startup 48,000, as in Plan 2. The flip side is the `ORDER BY … LIMIT` trap: if the matching rows are not evenly spread, as the cost model assumes, "stop early" never happens.
+The number of orders grows factorially, so above `join_collapse_limit` / `from_collapse_limit` (8 by default) it keeps your written join order for the extra tables, and above `geqo_threshold` (12 FROM items by default) it switches to a genetic search that is fast but not guaranteed optimal.
+
+Queries joining 15 tables can therefore get odd plans that change between runs.
+
+**Why errors compound.** Each join's estimate multiplies its inputs' estimates. If each of three joins is off by 10×, the top estimate can be off by 1,000×, and the planner makes its join-method choice (nested loop vs hash) at every level using those numbers.
+
+This is why estimate errors near the leaves matter most, and why the Go helper reports all nodes, not just the root.
+
+**Startup cost and `LIMIT`.** With a `LIMIT`, the planner charges only the fraction of a child's total cost needed to produce the limited rows. A plan with startup cost 0.43 and a large total can beat one with startup 48,000, as in Plan 2.
+
+The flip side is the `ORDER BY … LIMIT` trap: if the matching rows are not evenly spread, as the cost model assumes, "stop early" never happens.
 
 **`Rows` per loop and parallel plans.** `actual rows` is averaged over loops and rounded, so a node with `rows=0 loops=1000` may have returned up to a few hundred rows in total. In parallel plans, each worker's node counts as a loop; the leader's line shows per-worker averages, so multiply by `loops` to get table totals.
 
-**What `EXPLAIN ANALYZE` cannot see.** Time spent sending rows to the client, network latency, and lock waits before the executor starts are mostly invisible (`SERIALIZE` in PostgreSQL 17 adds the output-conversion part). If `Execution Time` is 3 ms and the app sees 300 ms, look at the pool wait, the network and row locks ([[Locking - Optimistic vs Pessimistic]]), not the plan.
+**What `EXPLAIN ANALYZE` cannot see.** Time spent sending rows to the client, network latency, and lock waits before the executor starts are mostly invisible (`SERIALIZE` in PostgreSQL 17 adds the output-conversion part).
+
+If `Execution Time` is 3 ms and the app sees 300 ms, look at the pool wait, the network and row locks ([[Locking - Optimistic vs Pessimistic]]), not the plan.
 
 **JIT.** For expensive queries (total cost above `jit_above_cost`, 100,000 by default) PostgreSQL may compile expressions with LLVM; the plan then ends with a `JIT:` block showing compile time. On short OLTP queries that cross the threshold because of a bad estimate, JIT compile time of tens of milliseconds can exceed the query time itself.
 
@@ -510,3 +588,8 @@ flowchart TD
 - **Next:** [[Index Types and Index Design]], [[Debugging Database Performance]], [[Locking - Optimistic vs Pessimistic]]
 - **Compare with:** [[N+1 Query Problem]], [[Pagination, Filtering and Sorting]], [[Connection Pooling]]
 - **Go implementation:** [[Query Plans and EXPLAIN - Go]]
+
+### Watch on YouTube
+
+- [PGConf NYC 2022 Understanding PostgreSQL Query Plans (aka EXPLAIN) by Stephen Frost](https://www.youtube.com/watch?v=ymVGg6woUtc) · United States PostgreSQL Association · deep dive on planner internals and reading EXPLAIN output
+- [Understand PostgreSQL query plan in 10 minutes](https://www.youtube.com/watch?v=Mll5SqR4RYk) · Lift And Shift Dev · quick practical intro to reading a query plan

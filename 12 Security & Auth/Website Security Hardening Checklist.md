@@ -10,7 +10,7 @@ sources:
   - "MDN Web Docs: Strict-Transport-Security, Content-Security-Policy, Set-Cookie (SameSite, __Host- prefix)"
   - "AWS documentation: IAM best practices, S3 Block Public Access, EC2 IMDSv2"
   - "NIST SP 800-61 Rev. 2, Computer Security Incident Handling Guide"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Website Security Hardening Checklist
@@ -24,9 +24,56 @@ updated: 2026-11-09
 > - A control you have never tested is a guess. Restore a backup, trigger an alert, and try to log in with a revoked key before you call the item done.
 > - Hardening is a loop, not a launch task. Dependencies, people and cloud settings change every week.
 
+## Start here: the basics
+
+**The problem in one story.**
+You launch a website and it works.
+Within hours, bots start scanning it for open admin pages, old software and weak passwords.
+Hardening is going through a checklist that closes the easy doors before they find one.
+No single item makes you safe; together they make you a hard target.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Attack surface | Everything an attacker can reach and poke at | Public ports, URLs, forms |
+| Hardening | Reducing that surface and tightening defaults | Closing unused ports |
+| TLS / HTTPS | Encryption between browser and server | The padlock in the address bar |
+| Security headers | Response headers telling the browser to be strict | `Content-Security-Policy` |
+| Least privilege | Give each thing only the access it needs | DB user can't drop tables |
+| Patching | Installing security fixes for software you run | Upgrading a vulnerable library |
+| WAF | Web Application Firewall: filters bad requests | Blocking obvious SQL injection |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Internet"] --> E["Edge: TLS, WAF,<br/>rate limits"]
+    E --> A["App: headers, auth,<br/>input checks"]
+    A --> D["Data: least privilege,<br/>encryption, backups"]
+    O["Ops: patching,<br/>logging, alerts"] -.-> E
+    O -.-> A
+    O -.-> D
+```
+
+**Analogy.** Locking up a house: door locks, window latches, an alarm, a safe for valuables, and checking them regularly. Each layer stops a different kind of burglar.
+Where it breaks: a house is attacked occasionally by people; a website is attacked constantly by automated bots, so checks must be automated too.
+
+**How the rest of this note builds up**
+
+- First, why it exists (section 1) and the mental model (section 2).
+- Then the checklist layer by layer (section 3) and a worked hardening pass (section 4).
+- Then how priorities change by site type (section 5).
+- Finally the SDE-3 deep dive: prioritizing under limited time, monitoring and keeping the checklist true over time (sections 6-8), then interview questions and a cheat sheet.
+
+> [!tip] Remember
+> Layer the defenses, close what you don't use, patch what you do, and watch the logs.
+
 ## 1. Why it exists
 
-Picture a small online shop launched on a Friday. By Monday its owner sees a defaced home page and a customer email saying "I got a strange login alert." The investigation finds three facts. The admin panel used the password `admin123`. The site ran a plugin with a known, published vulnerability that had been fixed four months earlier. The database was reachable from the public internet on port 5432.
+Picture a small online shop launched on a Friday. By Monday its owner sees a defaced home page and a customer email saying "I got a strange login alert." The investigation finds three facts. The admin panel used the password `admin123`.
+
+The site ran a plugin with a known, published vulnerability that had been fixed four months earlier. The database was reachable from the public internet on port 5432.
 
 None of these needed a skilled attacker. Automated scanners probe every public IP address continuously, looking for exactly these mistakes. A new server on a public address typically receives probes within minutes (this is an observation common in security write-ups, not a precise figure).
 
@@ -529,7 +576,9 @@ Failure modes:
 
 ### 8.1 Why HSTS needs a first visit, and how preload helps
 
-HSTS tells the browser "only use HTTPS for this domain for the next N seconds." On the very first visit the browser has not seen the header yet, so a network attacker could strip the redirect to HTTPS. The browser preload list ships a built-in list of domains, so even the first visit is HTTPS. The cost is that removal from the list takes a long time, which is why you must be sure first.
+HSTS tells the browser "only use HTTPS for this domain for the next N seconds." On the very first visit the browser has not seen the header yet, so a network attacker could strip the redirect to HTTPS.
+
+The browser preload list ships a built-in list of domains, so even the first visit is HTTPS. The cost is that removal from the list takes a long time, which is why you must be sure first.
 
 ### 8.2 SameSite and CSRF
 
@@ -537,11 +586,15 @@ HSTS tells the browser "only use HTTPS for this domain for the next N seconds." 
 
 ### 8.3 Why parameterized queries work
 
-With a parameterized query, the SQL text and the values travel separately: the database parses the SQL structure first, then plugs in values as data. A quote character in a value is just a quote character, never a way to end the string and add a new command. This is a structural fix. Escaping functions try to patch each special character and are easy to get wrong.
+With a parameterized query, the SQL text and the values travel separately: the database parses the SQL structure first, then plugs in values as data. A quote character in a value is just a quote character, never a way to end the string and add a new command.
+
+This is a structural fix. Escaping functions try to patch each special character and are easy to get wrong.
 
 ### 8.4 SSRF and cloud metadata
 
-SSRF makes your server fetch a URL chosen by the attacker. If the attacker asks for `http://169.254.169.254/latest/meta-data/iam/security-credentials/`, a vulnerable server may return its cloud credentials. IMDSv2 requires a session token obtained by a `PUT` request with a header, and it limits hop count by default, which blocks most simple SSRF paths. Defense is layered: allow-list outbound hosts, block link-local ranges in the HTTP client, require IMDSv2, and give the instance role minimal permissions.
+SSRF makes your server fetch a URL chosen by the attacker. If the attacker asks for `http://169.254.169.254/latest/meta-data/iam/security-credentials/`, a vulnerable server may return its cloud credentials. IMDSv2 requires a session token obtained by a `PUT` request with a header, and it limits hop count by default, which blocks most simple SSRF paths.
+
+Defense is layered: allow-list outbound hosts, block link-local ranges in the HTTP client, require IMDSv2, and give the instance role minimal permissions.
 
 ### 8.5 Supply chain risk
 
@@ -593,3 +646,8 @@ Pick measurable indicators: percent of services behind the WAF, median time to p
 - **Next:** [[Security Incident Response - When Your Website Is Hacked]], [[Incident Response]]
 - **Go deeper:** [[TLS and HTTPS]], [[CSRF, XSS and Security Headers]], [[Sessions and Cookies]], [[Password Storage and Login Security]], [[JWT - Structure, Validation and Pitfalls]], [[Secrets Management]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[API Abuse and Bot Protection]], [[CORS and Same-Origin Policy]]
 - **Related:** [[AWS 02 - IAM]], [[Docker 09 - Container Security and Hardening]], [[CDN and Edge]], [[Backup, PITR and Disaster Recovery]], [[Structured Logging]], [[Alerting and On-Call]], [[Rate Limiting - Algorithms and Distributed Design]]
+
+### Watch on YouTube
+
+- [Website Security Checklist](https://www.youtube.com/watch?v=p0aZL3nwC2I) · Verpex · 5 min · 359 views
+- [Hardening Techniques - CompTIA Security+ SY0-701 - 2.5](https://www.youtube.com/watch?v=wXoC46Qr_9Q) · Professor Messer · 12 min · 212,552 views

@@ -15,13 +15,22 @@ sources:
   - "RFC 9110, HTTP Semantics: If-Match and 412 Precondition Failed; RFC 6585: 428 Precondition Required"
   - "AWS DynamoDB Developer Guide, Condition expressions; Redis docs, Transactions (WATCH)"
   - "pkg.go.dev, github.com/jackc/pgx/v5 (BeginFunc, pgconn.PgError)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Locking - Optimistic vs Pessimistic - Go
 
 > [!summary] TL;DR
 > Runnable Go for [[Locking - Optimistic vs Pessimistic]]: an optimistic `RecordPayment` loop that re-reads and retries when the version check fails, an in-memory store that behaves like the SQL `UPDATE … WHERE id = $1 AND version = $2`, a PostgreSQL store, the pessimistic alternative with `FOR NO KEY UPDATE` and `lock_timeout`, a lock-ordering helper, an error classifier, and the `SKIP LOCKED` job-queue SQL. The optimistic logic and its 50-goroutine race test run without a database.
+
+## Before the code
+
+- **Interfaces**: `Store` has only `Get` and `UpdateIfVersion`, so the same `RecordPayment` works with memory or PostgreSQL.
+- **Sentinel errors**: `ErrConflict` and `ErrOverpay` are compared with `errors.Is` to decide "retry" or "stop".
+- **`sync.Mutex`**: the in-memory store guards its map so the version check and write are one atomic step.
+- **Goroutines and `sync.WaitGroup`**: the race test fires 50 payments at once and waits for all.
+- **`context.Context`**: every database call can be cancelled; `pgx` transactions use it too.
+- **Run**: `go mod tidy && go vet ./... && go test -race -v ./...` (no database needed).
 
 ## What this code shows
 
@@ -66,7 +75,13 @@ go test -race -v ./...
 
 ### Step 1: the optimistic loop
 
-**Concept.** Optimistic locking assumes conflicts are rare: read the row with its `version`, compute the change, and write only if the version is unchanged ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]). If another writer got there first the write matches zero rows, and the caller re-reads and tries again. The pessimistic alternative holds a lock from the read to the commit and is covered in step 3. The optimistic form was chosen for the main loop because no lock is held while the application thinks, and it works across several requests (a form that was open for minutes). The loop depends only on a two-method `Store`, so it can be tested with an in-memory store. Business-rule failures (`ErrOverpay`) are returned at once; only `ErrConflict` is retried.
+**Concept.** Optimistic locking assumes conflicts are rare: read the row with its `version`, compute the change, and write only if the version is unchanged ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]).
+
+If another writer got there first the write matches zero rows, and the caller re-reads and tries again.
+
+The pessimistic alternative holds a lock from the read to the commit and is covered in step 3. The optimistic form was chosen for the main loop because no lock is held while the application thinks, and it works across several requests (a form that was open for minutes).
+
+The loop depends only on a two-method `Store`, so it can be tested with an in-memory store. Business-rule failures (`ErrOverpay`) are returned at once; only `ErrConflict` is retried.
 
 The sentinel errors and the row type:
 
@@ -190,7 +205,11 @@ The second half writes with the version check. Success returns the new invoice, 
 
 ### Step 2: an in-memory store with the same semantics as the SQL
 
-**Concept.** The version check is simple enough to reproduce exactly in memory: compare under a mutex, then write. This gives a test double with the same contract as `UPDATE … WHERE id = $1 AND version = $2` evaluated under a row lock ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]). A mock library that returns scripted answers would be an alternative, but it cannot produce real interleavings; a store with real semantics lets 50 goroutines race and still be checked by the final state. The mutex plays the role of the row lock.
+**Concept.** The version check is simple enough to reproduce exactly in memory: compare under a mutex, then write.
+
+This gives a test double with the same contract as `UPDATE … WHERE id = $1 AND version = $2` evaluated under a row lock ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]).
+
+A mock library that returns scripted answers would be an alternative, but it cannot produce real interleavings; a store with real semantics lets 50 goroutines race and still be checked by the final state. The mutex plays the role of the row lock.
 
 The constructor and the type, with a `Conflicts` counter for the tests:
 
@@ -352,7 +371,11 @@ sequenceDiagram
     G->>PG: COMMIT (lock released)
 ```
 
-**Concept.** `SELECT ... FOR NO KEY UPDATE` takes a row lock that blocks other writers but still lets foreign-key checks on the row proceed ([[Locking - Optimistic vs Pessimistic#3.1 Pessimistic: row locks in PostgreSQL]]), which makes it the right default over `FOR UPDATE`. Whoever holds the lock decides on data nobody else can change, so no retry loop is needed. The price is that the lock is held until commit, so `lock_timeout` bounds how long a request waits. Pessimistic locking is chosen when conflicts are frequent or when the work cannot be repeated; optimistic when they are rare.
+**Concept.** `SELECT ... FOR NO KEY UPDATE` takes a row lock that blocks other writers but still lets foreign-key checks on the row proceed ([[Locking - Optimistic vs Pessimistic#3.1 Pessimistic: row locks in PostgreSQL]]), which makes it the right default over `FOR UPDATE`.
+
+Whoever holds the lock decides on data nobody else can change, so no retry loop is needed. The price is that the lock is held until commit, so `lock_timeout` bounds how long a request waits.
+
+Pessimistic locking is chosen when conflicts are frequent or when the work cannot be repeated; optimistic when they are rare.
 
 The first half runs in one transaction: set a lock timeout, lock the row with `FOR NO KEY UPDATE` and read the amounts:
 
@@ -441,7 +464,13 @@ Note that the pessimistic version still bumps `version`. Mixing styles is fine a
 
 ### Step 4: the SKIP LOCKED job queue in SQL
 
-**Concept.** A job table with many workers is a contention hot spot if every worker waits for the same first row. `FOR UPDATE SKIP LOCKED` makes each worker skip rows another worker has locked, so workers take disjoint batches without waiting ([[Locking - Optimistic vs Pessimistic#The SKIP LOCKED job queue]]). Worker 1 locks the first 10 due rows; worker 2, running the same query a millisecond later, skips those 10 and gets the next 10. If a worker crashes while this statement's transaction is still open, the transaction rolls back and the rows become claimable again. Once the claim has committed, the rows stay `running`, so a reaper must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling belong to [[Background Workers and Job Queues]].
+**Concept.** A job table with many workers is a contention hot spot if every worker waits for the same first row.
+
+`FOR UPDATE SKIP LOCKED` makes each worker skip rows another worker has locked, so workers take disjoint batches without waiting ([[Locking - Optimistic vs Pessimistic#The SKIP LOCKED job queue]]).
+
+Worker 1 locks the first 10 due rows; worker 2, running the same query a millisecond later, skips those 10 and gets the next 10. If a worker crashes while this statement's transaction is still open, the transaction rolls back and the rows become claimable again.
+
+Once the claim has committed, the rows stay `running`, so a reaper must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling belong to [[Background Workers and Job Queues]].
 
 ```sql
 WITH next AS (
@@ -599,7 +628,11 @@ After `wg.Wait()` every goroutine has finished, so the channel can be closed and
 }
 ```
 
-The version must equal 50 because each of the 50 successful writes bumps it exactly once, however many conflicts happened on the way. A `PaidMinor` below 100,000 means a lost update; an error from a goroutine means the attempt budget or the retry path is broken; a race report means the shared state is not protected. The conflict count is only logged, because it varies from run to run.
+The version must equal 50 because each of the 50 successful writes bumps it exactly once, however many conflicts happened on the way.
+
+A `PaidMinor` below 100,000 means a lost update; an error from a goroutine means the attempt budget or the retry path is broken; a race report means the shared state is not protected.
+
+The conflict count is only logged, because it varies from run to run.
 
 ### TestOverpayNotRetried
 

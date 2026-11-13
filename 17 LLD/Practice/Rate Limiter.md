@@ -15,19 +15,67 @@ sources:
   - "ITU-T Recommendation I.371 (Generic Cell Rate Algorithm); go-redis/redis_rate README (GCRA in a Lua script, based on rwz/redis-gcra)"
   - "NGINX docs, ngx_http_limit_req_module (the leaky bucket method, burst, nodelay)"
   - "Redis docs: INCR (rate limiter pattern), EVAL (scripts run atomically)"
-updated: 2026-11-02
+updated: 2026-11-13
 ---
 
 # Rate Limiter
 
 > [!summary] TL;DR
-> A rate limiter allows at most N requests per key (user, IP or API key) per unit of time and answers the rest with HTTP 429. Each algorithm (token bucket, GCRA, fixed window, sliding log, sliding counter) is a strategy behind one `Allow(ctx, key)` that returns a decision: allowed or not, how many requests remain, and **when to retry**. Per-key state lives in a map under a mutex, a janitor deletes idle keys so the map cannot grow forever, and with many app instances the state moves to Redis behind one atomic Lua script.
+> A rate limiter allows at most N requests per key (user, IP or API key) per unit of time and answers the rest with HTTP 429.
+> 
+> Each algorithm (token bucket, GCRA, fixed window, sliding log, sliding counter) is a strategy behind one `Allow(ctx, key)` that returns a decision: allowed or not, how many requests remain, and **when to retry**.
+> 
+> Per-key state lives in a map under a mutex, a janitor deletes idle keys so the map cannot grow forever, and with many app instances the state moves to Redis behind one atomic Lua script.
 
 > [!abstract] Core idea
 > - Each key keeps a little state (tokens and a timestamp). `Allow` reads it, refills by the time that passed, decides, and writes it back, all in one atomic step.
 > - Token bucket: refill `rate` tokens per second up to `capacity`; a request spends one token. GCRA (generic cell rate algorithm) gets the same result while storing only one timestamp per key, the theoretical arrival time (TAT).
 > - Always tell the client **when** to retry (`Retry-After`), and delete idle keys so memory stays bounded.
 > - Classic mistakes: `INCR` then `EXPIRE` as two Redis calls (a crash between them leaves a key that never expires), and a fixed window that lets 2N requests through around the window edge.
+
+## Start here: the basics
+
+**The problem in one story.** A ticket site opens sales for a big concert.
+One script sends 5,000 requests a second while real fans send one or two.
+Without a limit, the script fills the servers and fans see errors.
+A rate limiter says "you get 10 tries a second; the rest wait" and tells each caller when to try again.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Key | Who is being counted | A user ID, an IP address or an API key |
+| Rate | How many requests are allowed per time unit | 5 per second |
+| Burst / capacity | How many may arrive at once after a quiet period | A bucket that holds 10 tokens |
+| HTTP 429 | The "Too Many Requests" status code | Sent when the limit is hit |
+| `Retry-After` | Header telling the client how long to wait | `Retry-After: 2` means wait 2 seconds |
+| Mutex | A lock so only one goroutine changes shared data at a time | Two requests for the same key update one counter safely |
+| Atomic | Done as one step nobody can interrupt halfway | Read, refill, check and write a bucket together |
+| Redis | A shared in-memory store many servers can use | All app instances count in one place |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    C[Client request] --> M[Middleware]
+    M --> L{Limiter: token left for this key?}
+    L -- yes --> H[Handler runs]
+    L -- no --> R[429 + Retry-After]
+    T[Time passes] -. refills tokens .-> L
+```
+
+**Analogy.** A token bucket is a coffee-shop punch card that gets one free stamp every minute and holds at most 10 stamps; each order uses a stamp.
+It breaks down because real stamps are physical, while here "refill" is just arithmetic on the time that passed since the last request.
+
+**How the rest of this note builds up**
+
+- First the problem statement and requirements (Steps 1-2): what is limited, per which key, and what the client sees.
+- Then entities, relationships and APIs (Steps 3-5): the rule versus the per-key state, and one `Allow(ctx, key)` method.
+- Then storage and patterns (Steps 6-7): SQL for rules, memory or Redis for state, Strategy for algorithms.
+- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): token bucket, GCRA, sliding windows, the janitor, Redis Lua scripts, and fail-open versus fail-closed.
+
+> [!tip] Remember
+> Each request does one atomic "refill, check, spend" on its key's state, and every "no" tells the client when to retry.
 
 ## Problem statement
 
@@ -48,7 +96,9 @@ explain how it works across many app instances and what happens when Redis is do
 6. Discuss other algorithms, Redis with one Lua script, and fail-open versus fail-closed.
 7. Test with a fake clock: burst, refill, concurrency, sweep.
 
-What it really tests: algorithm choice, the Strategy pattern, an atomic read-refill-check-decrement under a lock, testable time through an injected clock, and production judgment: headers, memory, multi-instance limits and fail-open versus fail-closed. Three details interviewers probe: a janitor that really deletes idle keys (otherwise per-IP keys leak memory), a `Retry-After` computed by the algorithm instead of hard-coded, and an honest answer about lock granularity (this code uses one mutex per limiter).
+What it really tests: algorithm choice, the Strategy pattern, an atomic read-refill-check-decrement under a lock, testable time through an injected clock, and production judgment: headers, memory, multi-instance limits and fail-open versus fail-closed.
+
+Three details interviewers probe: a janitor that really deletes idle keys (otherwise per-IP keys leak memory), a `Retry-After` computed by the algorithm instead of hard-coded, and an honest answer about lock granularity (this code uses one mutex per limiter).
 
 ## Step 1: Clarify requirements
 
@@ -93,7 +143,11 @@ The use case to code: `Allow(ctx, key)` under concurrency, where refill or windo
 | `SlidingWindowCounter` | limit, size; prev, curr per key | Two counters, weighted estimate, no edge burst |
 | `Clock` (interface) | `Now()` | Tests move time by hand |
 
-Modelling insight: the **rule** (limit, window, fail mode) and the **state** (per-key bucket or counter) are different things. One policy has millions of per-key states, so the rule lives in SQL and the state in memory or Redis, never counters in SQL. The second insight: state is **deletable when it equals a fresh key** (a full bucket, a past window), and that is exactly the janitor's rule.
+Modelling insight: the **rule** (limit, window, fail mode) and the **state** (per-key bucket or counter) are different things.
+
+One policy has millions of per-key states, so the rule lives in SQL and the state in memory or Redis, never counters in SQL.
+
+The second insight: state is **deletable when it equals a fresh key** (a full bucket, a past window), and that is exactly the janitor's rule.
 
 ## Step 4: Relationships
 
@@ -157,7 +211,13 @@ GET /rate-limits/{policy}      admin
 PUT /rate-limits/{policy}      {"algorithm": "gcra", "burst": 10, "per_sec": 5, "fail_mode": "closed"}
 ```
 
-`429` comes from RFC 6585 and `Retry-After` (whole seconds here) from RFC 9110. The quota headers come from an IETF draft whose field names changed between versions. The code below sends the three fields of the IETF draft `draft-ietf-httpapi-ratelimit-headers` up to version -06: `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`, where `Reset` is seconds from now. From -07 the draft replaces those three with a single structured `RateLimit` field next to `RateLimit-Policy`, so a server that follows -07 or a later version sends different names. Many public APIs use their own `X-RateLimit-*` set instead; GitHub, for example, sends `x-ratelimit-reset` as a Unix timestamp, not as seconds from now. Write down which form you send, because clients parse names and units literally.
+`429` comes from RFC 6585 and `Retry-After` (whole seconds here) from RFC 9110.
+
+The quota headers come from an IETF draft whose field names changed between versions. The code below sends the three fields of the IETF draft `draft-ietf-httpapi-ratelimit-headers` up to version -06: `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`, where `Reset` is seconds from now.
+
+From -07 the draft replaces those three with a single structured `RateLimit` field next to `RateLimit-Policy`, so a server that follows -07 or a later version sends different names.
+
+Many public APIs use their own `X-RateLimit-*` set instead; GitHub, for example, sends `x-ratelimit-reset` as a Unix timestamp, not as seconds from now. Write down which form you send, because clients parse names and units literally.
 
 | Function | Contract |
 | --- | --- |
@@ -217,7 +277,11 @@ sequenceDiagram
   Note over R: from 10:01 requests use a new key, and this one expires 60 s after its first INCR, so no janitor is needed
 ```
 
-The other algorithms map the same way: a token bucket is a hash `{tokens, last}` updated by one script (`HMGET`, refill by elapsed time, check, decrement, `HSET`, `PEXPIRE`); a sliding log is a sorted set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `PEXPIRE`); GCRA is one string holding the TAT, and it is the algorithm `go-redis/redis_rate` implements. Every Redis key gets a TTL, so Redis needs no janitor. The Go side of this (go-redis setup, `redis.Nil`, scripts) is in [[Redis in Go]].
+The other algorithms map the same way: a token bucket is a hash `{tokens, last}` updated by one script (`HMGET`, refill by elapsed time, check, decrement, `HSET`, `PEXPIRE`); a sliding log is a sorted set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `PEXPIRE`); GCRA is one string holding the TAT, and it is the algorithm `go-redis/redis_rate` implements.
+
+Every Redis key gets a TTL, so Redis needs no janitor.
+
+The Go side of this (go-redis setup, `redis.Nil`, scripts) is in [[Redis in Go]].
 
 A `PolicyRepository` reads the policy rows once, caches them in memory and refreshes them on change, so the hot path never touches SQL. The ports, compiled with the package below:
 
@@ -731,11 +795,15 @@ func ceilSeconds(d time.Duration) string {
 
 Walkthrough:
 
-1. **Token bucket.** Under the lock: create a full bucket for a new key, refill `min(capacity, tokens + elapsed × rate)` (skipped if the clock went backwards), then take a token or compute the wait for the missing fraction. Capacity 2 at 1/s: two requests pass at once, the third waits 1 s, and after 0.5 s it still waits 0.5 s.
+1. **Token bucket.** Under the lock: create a full bucket for a new key, refill `min(capacity, tokens + elapsed × rate)` (skipped if the clock went backwards), then take a token or compute the wait for the missing fraction.
+
+   Capacity 2 at 1/s: two requests pass at once, the third waits 1 s, and after 0.5 s it still waits 0.5 s.
 2. **GCRA.** One time per key, the theoretical arrival time (TAT). Allow if `now ≥ TAT − tolerance`, then `TAT = max(TAT, now) + interval`. With `tolerance = (burst − 1) × interval` it admits exactly the token bucket's traffic; the test runs both through the same steps.
 3. **Fixed window.** `now.Truncate(size)` names the window; a new window resets the counter. Weak spot: limit 2/min allows 2 at 0:50 and 2 more at 1:00, four in ten seconds.
 4. **Sliding log.** Drop timestamps at or before `now − window`, allow if fewer than `limit` remain. Exact, but it stores `limit` timestamps per key.
-5. **Sliding counter.** Keep `prev` and `curr` for two fixed windows and estimate `prev × (1 − elapsed/size) + curr`. With 10/min, 10 requests last minute and 30 s into this one, the estimate is 5, so 5 more fit; the next one waits until the previous window's weight drops: `10 × (1 − e/60) + 5 ≤ 9` at `e = 36 s`, a wait of 6 s.
+5. **Sliding counter.** Keep `prev` and `curr` for two fixed windows and estimate `prev × (1 − elapsed/size) + curr`.
+
+   With 10/min, 10 requests last minute and 30 s into this one, the estimate is 5, so 5 more fit; the next one waits until the previous window's weight drops: `10 × (1 − e/60) + 5 ≤ 9` at `e = 36 s`, a wait of 6 s.
 6. **Middleware.** An empty key is a 400 (a key function bug must not bypass the limit); a store error is 503 on fail-closed routes and a pass on fail-open ones; otherwise it sets the draft -06 `RateLimit-*` fields and, when denied, `Retry-After` and 429.
 
 ```mermaid
@@ -1063,7 +1131,9 @@ See [[Rate Limiting - Algorithms and Distributed Design]] for the system-level v
 
 ![[Rate Limiter LLD Drawing.excalidraw]]
 
-The drawing shows the `Limiter` interface with its algorithms and the `Clock`, a token bucket with capacity 10 refilling 5 tokens per second, the client → middleware → limiter → handler flow with the 429 and Redis-down branches, and the policy table (config) beside the Redis keys (state). Redraw it from memory, then add what it predates: GCRA, the sliding counter, the janitor and the computed `Retry-After`.
+The drawing shows the `Limiter` interface with its algorithms and the `Clock`, a token bucket with capacity 10 refilling 5 tokens per second, the client → middleware → limiter → handler flow with the 429 and Redis-down branches, and the policy table (config) beside the Redis keys (state).
+
+Redraw it from memory, then add what it predates: GCRA, the sliding counter, the janitor and the computed `Retry-After`.
 
 - [ ] The `Limiter` interface with its implementations, all using `Clock`
 - [ ] The token bucket: capacity, refill rate, allowed and denied arrows
@@ -1109,3 +1179,8 @@ The drawing shows the `Limiter` interface with its algorithms and the `Clock`, a
 - **Before this:** [[Strategy and Template Method]], [[Decorator and Middleware]], [[Notification Service]]
 - **Next:** [[Logging Library]], [[Circuit Breaker]]
 - **Compare with:** [[Rate Limiting - Algorithms and Distributed Design]], [[Redis in Go]], [[API Gateway and BFF]]
+
+### Watch on YouTube
+
+- [Rate Limiter System Design: Token Bucket, Leaky Bucket, Scaling](https://www.youtube.com/watch?v=YXkOdWBwqaA) · ByteByteGo · 7 min · 99,414 views
+- [Design a Distributed Rate Limiter w/ a Ex-Meta Staff Engineer: System Design Breakdown](https://www.youtube.com/watch?v=MIJFyUPG4Z4) · Hello Interview · 55 min · 326,544 views

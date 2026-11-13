@@ -7,7 +7,7 @@ related: ["[[Service Project Layout and Wiring]]", "[[Backend Request Lifecycle 
 sources:
   - "Martin Fowler, Inversion of Control Containers and the Dependency Injection pattern (martinfowler.com, 2004)"
   - "Go blog, net/http package documentation (pkg.go.dev/net/http)"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Inversion of Control - Library vs Framework
@@ -22,6 +22,51 @@ updated: 2026-11-07
 > - Go's standard library has both shapes at once: `encoding/json` is a library you call; `net/http`'s `*http.Server` is a small framework that calls your `http.Handler` when a request arrives.
 > - Choosing a framework is choosing to hand over control flow in exchange for a convention you no longer have to invent yourself — and the lock-in that comes with it.
 
+## Start here: the basics
+
+**The problem in one story.**
+You write a function `sayHello` and call it yourself on line 10: you are in charge.
+Then you use a web server: you hand it `sayHello`, and it calls it whenever a visitor arrives.
+You never write the line that calls it.
+That flip, from "I call it" to "it calls me", is inversion of control.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Control flow | The order in which code runs | `main` calls `load`, then `save` |
+| Library | Code you call when you choose | `json.Marshal(v)` |
+| Framework | A skeleton that calls your code when it chooses | `net/http` calling your handler |
+| Callback | A function you hand over so someone else can call it later | `mux.HandleFunc("/", h)` |
+| Interface | A set of methods a type promises to have | `http.Handler` needs `ServeHTTP` |
+| Dependency | Something a piece of code needs to do its job | A service needs a database |
+| Dependency injection | Handing a type its dependencies from outside | `NewService(repo)` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    subgraph Library
+      Y1["Your code"] -->|calls| L["json.Marshal"]
+    end
+    subgraph Framework
+      F["http.Server"] -->|calls| Y2["Your handler"]
+    end
+```
+
+**Analogy.** Library: you are the chef and pick up a knife when you want. Framework: you are a line cook, and the expediter calls out orders that you answer.
+Where it breaks: a line cook can refuse or be slow, but your handler cannot change when the framework calls it; it can run many times at once.
+
+**How the rest of this note builds up**
+
+- First, why the distinction matters (section 1) and the "who calls whom" test (section 2).
+- Then how the inversion works, including callbacks and dependency injection (section 3), with a Go worked example (section 4).
+- Then variants and trade-offs, including framework lock-in (sections 5-6).
+- Finally the SDE-3 deep dive: production pitfalls, concurrency of framework-called code, interview questions (sections 7-9).
+
+> [!tip] Remember
+> You call a library; a framework calls you.
+
 ## 1. Why it exists
 
 A new engineer on InvoiceOps is asked to add structured logging and gets two different answers depending on which part of the codebase they touch.
@@ -34,7 +79,9 @@ Mixing up the two is a common, costly mistake: expecting a registered handler to
 
 ## 2. Mental model
 
-Picture two kitchens. In the first, you are the chef: you decide which knife to pick up and when (a library — you call it). In the second, you are a line cook working a shift: an expediter calls out orders, and you only ever respond to a call that arrives on someone else's schedule, in the order they choose (a framework — it calls you).
+Picture two kitchens. In the first, you are the chef: you decide which knife to pick up and when (a library — you call it).
+
+In the second, you are a line cook working a shift: an expediter calls out orders, and you only ever respond to a call that arrives on someone else's schedule, in the order they choose (a framework — it calls you).
 
 **Simple test:** stare at the call site. If *your* code's line number is where the function starts running, it is a library. If your code is sitting inside a slot (a registered handler, a callback, an interface method) and you cannot point to the line in your codebase that calls it, it is a framework calling you.
 
@@ -87,7 +134,9 @@ flowchart LR
     MW1 -- "return" --> Caller["App (owns Dispatch)"]
 ```
 
-Each middleware is handed `next`, a callable it chooses to invoke (or not — an auth middleware can refuse to call `next` at all and reject the request itself). The app that owns `Dispatch` decides the order the middlewares were composed in; no middleware calls itself. This is the same Hollywood principle at the scale of a single request, and it is why middleware chains, plugin systems and event-hook registries ("on save", "before commit") all count as inversion of control even without a capital-F Framework in sight.
+Each middleware is handed `next`, a callable it chooses to invoke (or not — an auth middleware can refuse to call `next` at all and reject the request itself). The app that owns `Dispatch` decides the order the middlewares were composed in; no middleware calls itself.
+
+This is the same Hollywood principle at the scale of a single request, and it is why middleware chains, plugin systems and event-hook registries ("on save", "before commit") all count as inversion of control even without a capital-F Framework in sight.
 
 ### Dependency injection: IoC applied to construction
 
@@ -104,7 +153,9 @@ store := postgres.NewStore(dsn)                 // built elsewhere (a compositio
 service := domain.NewService(store, notifier)   // handed in, not constructed inside
 ```
 
-`Service` no longer decides how its `Store` is built, or even what kind it is — control over that decision moved to whatever calls `NewService`. In Go this is usually done by hand in a `main` composition root (see [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]); `google/wire` generates that wiring code at compile time, and `uber-go/fx` builds and calls it at runtime from a dependency graph, but both are automating the same manual pattern, not doing something different in kind.
+`Service` no longer decides how its `Store` is built, or even what kind it is — control over that decision moved to whatever calls `NewService`.
+
+In Go this is usually done by hand in a `main` composition root (see [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]); `google/wire` generates that wiring code at compile time, and `uber-go/fx` builds and calls it at runtime from a dependency graph, but both are automating the same manual pattern, not doing something different in kind.
 
 ## 4. Worked example
 
@@ -339,7 +390,9 @@ ok  	note2/validate	1.436s
 
 ### `net/http` is the real-world version of `miniframework`
 
-`mux.HandleFunc("POST /invoices", createInvoice)` is exactly `app.Register` above: you hand the server a slot-filler, and from that point on `(*http.Server).Serve` decides when `createInvoice` runs, on which goroutine, and what happens to the connection afterward. `http.Handler` middleware (logging, recovery, auth) wraps a handler the same way `Middleware` does here — this is why the pattern in `net/http` code and in this note's toy framework look identical: it is the same inversion of control, at production scale.
+`mux.HandleFunc("POST /invoices", createInvoice)` is exactly `app.Register` above: you hand the server a slot-filler, and from that point on `(*http.Server).Serve` decides when `createInvoice` runs, on which goroutine, and what happens to the connection afterward.
+
+`http.Handler` middleware (logging, recovery, auth) wraps a handler the same way `Middleware` does here — this is why the pattern in `net/http` code and in this note's toy framework look identical: it is the same inversion of control, at production scale.
 
 ## 5. Variants and comparison
 
@@ -369,11 +422,21 @@ ok  	note2/validate	1.436s
 
 ## 8. Deep dive
 
-**The Hollywood principle's older name.** "Don't call us, we'll call you" is older film-industry slang for a casting rejection, reused in software to describe exactly this call-you relationship; "inversion of control" is the more general, later term that also covers DI containers. Fowler's 2004 article (cited above) is about naming and taxonomizing *IoC containers and dependency injection*, not about the Hollywood principle's own history — this note does not have a verified primary source for exactly when the phrase first entered framework literature, so treat its first software use as unconfirmed rather than dated to a specific decade. The core idea (control over *when* code runs moves to the framework) is the same one whether the vocabulary is a GUI event loop, a servlet container, or a modern HTTP framework.
+**The Hollywood principle's older name.** "Don't call us, we'll call you" is older film-industry slang for a casting rejection, reused in software to describe exactly this call-you relationship; "inversion of control" is the more general, later term that also covers DI containers.
 
-**Why `net/http` is only a small framework, not a large one.** It inverts control for exactly one thing — when your handler runs — and otherwise stays out of the way: no required base type, no mandated project layout, no opinion on your database access. Larger frameworks (Rails, Django, Spring, NestJS) additionally invert control over routing conventions, request validation, ORM lifecycle and dependency wiring, which is why switching frameworks in those ecosystems costs far more than switching HTTP routers in Go typically does.
+Fowler's 2004 article (cited above) is about naming and taxonomizing *IoC containers and dependency injection*, not about the Hollywood principle's own history — this note does not have a verified primary source for exactly when the phrase first entered framework literature, so treat its first software use as unconfirmed rather than dated to a specific decade.
 
-**Dependency injection without a container, and when one earns its cost.** Go's standard idiom is passing dependencies as constructor arguments by hand; this scales fine up to a modest number of services. `wire` generates the exact same hand-written wiring code at compile time from a declarative set of "providers", so a misconfigured graph is still a compile error. `fx` instead resolves the graph at runtime via reflection and manages component lifecycles (start/stop order) for you, trading compile-time checking for less boilerplate on large graphs — reach for it once the number of services and their startup/shutdown ordering becomes hard to track by hand, not as a default.
+The core idea (control over *when* code runs moves to the framework) is the same one whether the vocabulary is a GUI event loop, a servlet container, or a modern HTTP framework.
+
+**Why `net/http` is only a small framework, not a large one.** It inverts control for exactly one thing — when your handler runs — and otherwise stays out of the way: no required base type, no mandated project layout, no opinion on your database access.
+
+Larger frameworks (Rails, Django, Spring, NestJS) additionally invert control over routing conventions, request validation, ORM lifecycle and dependency wiring, which is why switching frameworks in those ecosystems costs far more than switching HTTP routers in Go typically does.
+
+**Dependency injection without a container, and when one earns its cost.** Go's standard idiom is passing dependencies as constructor arguments by hand; this scales fine up to a modest number of services.
+
+`wire` generates the exact same hand-written wiring code at compile time from a declarative set of "providers", so a misconfigured graph is still a compile error.
+
+`fx` instead resolves the graph at runtime via reflection and manages component lifecycles (start/stop order) for you, trading compile-time checking for less boilerplate on large graphs — reach for it once the number of services and their startup/shutdown ordering becomes hard to track by hand, not as a default.
 
 ## 9. Interview questions
 
@@ -413,3 +476,8 @@ ok  	note2/validate	1.436s
 - **Before this:** [[Interfaces]], [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Hexagonal Architecture (Ports and Adapters)]], [[Monolith vs Microservices]]
 - **Compare with:** [[Service Project Layout and Wiring]] (where a composition root lives in a Go repo), [[Backend Request Lifecycle and Layering]] (the request lifecycle `net/http` calls your code inside)
+
+### Watch on YouTube
+
+- [Library vs. Framework Explained Simply: The Inversion of Control Secret](https://www.youtube.com/watch?v=EjSrK3DM_CU) · Stack Crate · 5 min · 41 views
+- [Framework vs Library 🤔 / Who Controls Your Code?](https://www.youtube.com/watch?v=phnWCsUMWrg) · The Coding Driver · 4 min · 90 views

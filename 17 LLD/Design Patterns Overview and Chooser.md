@@ -10,7 +10,7 @@ sources:
   - "Go release notes: Go 1.21 (sync.OnceFunc/OnceValue/OnceValues, slices, log/slog), Go 1.23 (range-over-func, iter package, unique package)"
   - "Go standard library docs: io, bufio, compress/gzip, net/http (Handler, HandlerFunc, TimeoutHandler), net/http/httputil (ReverseProxy), database/sql and database/sql/driver (Register, Open), log/slog (Logger, Handler), sort, slices, go/ast (Walk, Visitor), text/template, strings.Builder, io.MultiWriter, unique"
   - "Martin Fowler, Patterns of Enterprise Application Architecture (2002): Repository, Unit of Work"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Design Patterns Overview and Chooser
@@ -24,6 +24,51 @@ updated: 2026-11-04
 > - In Go, Strategy is a `func`, Iterator is `iter.Seq`, Singleton is `sync.OnceValue`, and Decorator is `func(http.Handler) http.Handler`.
 > - Several pairs look alike and differ only in intent: Strategy and State, Decorator, Proxy and Adapter, Facade and Mediator.
 > - A pattern that hides the failure path or adds a layer nobody varies is making the design worse.
+
+## Start here: the basics
+
+**The problem in one story.**
+You build a food app that charges a delivery fee.
+Next month the fee depends on the city, then on rain, then on a festival offer.
+Each time you edit the same big `if` block and something else breaks.
+Design patterns are known shapes that keep the changing part in its own box.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Interface | A list of methods a type promises to have | `type Pricer interface { Price(o Order) int64 }` |
+| Function value | A function stored in a variable and passed around | `rule := func(x int) int { return x * 2 }` |
+| Struct | A Go record of named fields, used like a class | `type Order struct { ID string }` |
+| Composition | Building a type out of other types instead of inheriting | A `Logger` field inside a `Service` |
+| Polymorphism | One call, different behaviour depending on the value | `p.Price(o)` for flat or surge pricing |
+| GoF | The 1994 "Gang of Four" book listing 23 patterns | Strategy, Observer, Decorator |
+| Wrapper | Something that sits around another thing and adds a step | Middleware that logs every request |
+
+**Picture it**
+
+```mermaid
+flowchart TD
+    Q["What varies here?"] --> C["How objects are built<br/>(creational)"]
+    Q --> S["How they are wrapped<br/>or combined (structural)"]
+    Q --> B["Who decides and<br/>who reacts (behavioural)"]
+    C --> E1["Factory, Builder"]
+    S --> E2["Decorator, Adapter"]
+    B --> E3["Strategy, Observer, State"]
+```
+
+**Analogy.** Patterns are like named recipes in a cookbook: "risotto" tells another cook the whole method in one word.
+Where it breaks: a cook does not need a recipe to boil water, and many patterns in Go are one line (a function value), so naming them can add ceremony instead of clarity.
+
+**How the rest of this note builds up**
+
+- First, why patterns exist (section 1) and the "what varies?" mental model (section 2).
+- Then the catalogue, the chooser, the problem-to-pattern table and patterns already inside the Go standard library (section 3).
+- Then a worked, tested example that picks patterns for one problem (section 4).
+- Finally the SDE-3 view: Go idioms that replace patterns, confusable pairs, trade-offs and production use (sections 5-8).
+
+> [!tip] Remember
+> Start from what changes, then pick the smallest Go construct that isolates it.
 
 ## 1. Why it exists
 
@@ -379,7 +424,9 @@ Seven patterns, and none was chosen for its name: each answers one "what varies"
 | Factory Method | No constructors to override | `NewX(kind string) (Interface, error)` or a `map[string]func() Interface` |
 | Abstract Factory | Interfaces satisfied implicitly | A struct of related interfaces per provider |
 
-Patterns rarely needed in Go (all in [[Rare GoF Patterns in Go]] unless noted): Visitor (a type switch over a closed set is usually enough), Interpreter (only for real rule languages), Flyweight (`unique.Make` covers interning), Prototype (copy a struct value; deep-copy only slices and maps), Bridge (two interfaces already give two independent axes), Mediator (an orchestrating service usually suffices, see [[Facade (vs Mediator)]]), and Memento (a snapshot struct, see [[Command, Undo and Memento]]).
+Patterns rarely needed in Go (all in [[Rare GoF Patterns in Go]] unless noted):
+
+Visitor (a type switch over a closed set is usually enough), Interpreter (only for real rule languages), Flyweight (`unique.Make` covers interning), Prototype (copy a struct value; deep-copy only slices and maps), Bridge (two interfaces already give two independent axes), Mediator (an orchestrating service usually suffices, see [[Facade (vs Mediator)]]), and Memento (a snapshot struct, see [[Command, Undo and Memento]]).
 
 ### Confusable pairs
 
@@ -476,3 +523,8 @@ flowchart LR
 - **Before this:** [[SOLID in Go]], [[UML for LLD]], [[OOP in Go - Structs, Interfaces, Embedding]]
 - **Next:** [[Strategy and Template Method]], then the pattern notes in catalogue order, ending with [[Rare GoF Patterns in Go]]
 - **Compare with:** [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]], [[LLD Interview Method]], [[Concurrency for LLD]]
+
+### Watch on YouTube
+
+- [10 Design Patterns Explained in 10 Minutes](https://www.youtube.com/watch?v=tv-_1er1mWI) · Fireship · 11 min · 2,904,915 views
+- [Java Design Patterns Overview / Creational, Structural & Behavioral](https://www.youtube.com/watch?v=WycvzYFRF6U) · The Curious Coder · 4 min · 29,502 views

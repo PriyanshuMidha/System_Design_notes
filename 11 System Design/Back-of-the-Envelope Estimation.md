@@ -8,7 +8,7 @@ sources:
   - "Jeff Dean, Numbers Everyone Should Know (Stanford CS295 talk, 2009)"
   - "Colin Scott, Latency Numbers Every Programmer Should Know (interactive, updated by year)"
   - "PostgreSQL 17 docs, max_connections default (100)"
-updated: 2026-11-04
+updated: 2026-11-13
 ---
 
 # Back-of-the-Envelope Estimation
@@ -23,15 +23,72 @@ updated: 2026-11-04
 > - Servers = peak QPS ÷ (load-tested QPS per node × 60-70% utilisation).
 > - Estimate only what changes a decision, write units on every number, and sanity-check the result.
 
+## Start here: the basics
+
+**The problem in one story.**
+You are asked to build a photo app. Should you buy one server or a hundred?
+Nobody knows exact numbers yet, but you can guess users, photos per user and photo size.
+Ten minutes of rough multiplication tells you "about 50 TB a year", which already rules out one laptop disk.
+That rough multiplication is back-of-the-envelope estimation.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| QPS | Queries (requests) per second | 1,000 page loads every second |
+| DAU | Daily active users: people who use the app on a given day | 10 million people open it today |
+| Peak vs average | The busiest moment vs the typical moment | Lunch rush vs 3 a.m. |
+| Order of magnitude | Rough size as a power of 10 | 1,000 vs 10,000 vs 100,000 |
+| Throughput | How much work a machine finishes per second | One server handles 5,000 requests/s |
+| Bandwidth | Bytes moved over the network per second | 100 MB/s of images out |
+| Replica / copy | Extra copy of data kept for safety | 3 copies of every file |
+| Utilisation | How busy a machine is, as a % of its max | Running at 70% CPU |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    U["Users per day"] --> R["Requests per day"]
+    R --> Q["÷ 86,400 = average QPS"]
+    Q --> P["× 2-10 = peak QPS"]
+    P --> S["÷ per-server QPS = servers"]
+    R --> ST["× bytes × days × copies = storage"]
+```
+
+**Analogy.** Planning food for a party: guests × plates each × days, rounded, is enough to decide how much to buy.
+Where it breaks: a party has one obvious peak; real systems have hidden spikes (a viral post, a retry storm) that the averages hide.
+
+**How the rest of this note builds up**
+
+- First, why estimation exists (section 1) and a mental model (section 2).
+- Then the formulas for QPS, storage, bandwidth and servers (section 3).
+- Then a full worked example for a URL shortener (section 4), and variants (section 5).
+- Finally the SDE-3 view: trade-offs, production capacity planning and the deep dive (sections 6-8), then interview questions.
+
+> [!tip] Remember
+> Round hard, write units on every number, and only estimate what changes a design decision.
+
 ## 1. Why it exists
 
-Two candidates design a URL shortener. One draws Kafka, Cassandra and twelve microservices. The other spends three minutes on arithmetic, finds 1,200 writes per second and 116,000 reads per second, and concludes: writes fit one relational primary, reads need a cache, and five years of data (about 91 TB per copy) will not fit on one node, so the store must be partitioned. Same problem; the second design is justified by numbers and the first is guesswork.
+Two candidates design a URL shortener. One draws Kafka, Cassandra and twelve microservices.
+
+The other spends three minutes on arithmetic, finds 1,200 writes per second and 116,000 reads per second, and concludes:
+
+1. Writes fit one relational primary.
+2. Reads need a cache.
+3. Five years of data (about 91 TB per copy) will not fit on one node, so the store must be partitioned.
+
+Same problem; the second design is justified by numbers and the first is guesswork.
 
 Estimation is how you decide whether a component is needed at all, and how large it must be.
 
 ## 2. Mental model
 
-It is like planning a wedding dinner. You do not count every grain of rice; you estimate guests (300), plates per guest (1.2), kitchen throughput (60 plates per cook per hour) and get "6 cooks for a 1-hour service". If the answer were "0.1 cooks" or "500 cooks", you would know your inputs were wrong. The precision is low; the decision ("hire 6 cooks, not 1 and not 50") is solid.
+It is like planning a wedding dinner. You do not count every grain of rice.
+
+You estimate guests (300), plates per guest (1.2), kitchen throughput (60 plates per cook per hour) and get "6 cooks for a 1-hour service".
+
+If the answer were "0.1 cooks" or "500 cooks", you would know your inputs were wrong. The precision is low; the decision ("hire 6 cooks, not 1 and not 50") is solid.
 
 ## 3. How it works
 
@@ -136,7 +193,13 @@ Assumptions (all estimates, stated out loud in an interview): 100 M new short li
 | App servers | ⌈231,481 ÷ (10,000 × 0.7)⌉ | 34 |
 | Key space | 7 base-62 characters = 62⁷ | ≈ 3.5 × 10¹² keys vs 1.8 × 10¹¹ needed in 5 years |
 
-**What the numbers decided:** about 1,200 writes/s (2,300/s at peak) fits one well-indexed relational primary comfortably (an estimate; benchmark your hardware). 91 TB per copy does not fit one node comfortably, so the data store must be partitioned (see [[Partitioning and Sharding]]) or be a key-value store built for it. 231k reads/s is far above what the database should serve, but the 10 GB hot set fits in one Redis node, so a cache absorbs most reads. Seven characters are enough keys. The full design is in [[Case Study - URL Shortener]].
+**What the numbers decided:** about 1,200 writes/s (2,300/s at peak) fits one well-indexed relational primary comfortably (an estimate; benchmark your hardware).
+
+91 TB per copy does not fit one node comfortably, so the data store must be partitioned (see [[Partitioning and Sharding]]) or be a key-value store built for it.
+
+231k reads/s is far above what the database should serve, but the 10 GB hot set fits in one Redis node, so a cache absorbs most reads.
+
+Seven characters are enough keys. The full design is in [[Case Study - URL Shortener]].
 
 ### Example 3: chat
 
@@ -270,7 +333,9 @@ func TestChat(t *testing.T) {
 - **Little's law** links three numbers you estimate: `concurrency = arrival rate × time in system`. 2,000 RPS at 50 ms average latency means about 100 requests in flight at once, which sizes worker pools, DB connection pools and goroutine counts. At 500 ms latency the same load needs 1,000 in flight.
 - **Hot sets are skewed.** Request popularity often follows a power law, so a cache of 1-20% of items can serve most reads. The exact share depends on the workload; measure the hit-rate curve with real keys.
 - **IOPS, not just bytes.** A disk that stores 10 TB may still not keep up with 50,000 random reads/s. Estimate operations per second against the volume's IOPS limit as well as capacity.
-- **When one PostgreSQL stops being enough.** Rules of thumb (estimates that depend heavily on hardware and query shape): a few thousand to a few tens of thousands of simple writes per second on one primary, and data up to a few TB per node before backups, restores and index rebuilds become slow. Crossing either is the signal to look at partitioning; below both, one primary plus a replica is usually the right answer.
+- **When one PostgreSQL stops being enough.** Rules of thumb (estimates that depend heavily on hardware and query shape): a few thousand to a few tens of thousands of simple writes per second on one primary, and data up to a few TB per node before backups, restores and index rebuilds become slow.
+
+  Crossing either is the signal to look at partitioning; below both, one primary plus a replica is usually the right answer.
 - **Turning numbers into decisions.** The thresholds below are the estimates from the previous bullet, so treat them as prompts to benchmark, not limits:
 
 ```mermaid
@@ -322,3 +387,8 @@ flowchart TD
 - **Before this:** [[System Design Fundamentals]], [[Latency Numbers Every Engineer Should Know]]
 - **Next:** [[Load Balancing]], [[System Design Interview Framework]], [[Case Study - URL Shortener]], [[Case Study - Chat System]]
 - **Compare with:** [[Performance Engineering and Capacity Planning]] (measured capacity planning in production), [[Scaling Basics]] (what to do once the numbers say you must scale)
+
+### Watch on YouTube
+
+- [Back-Of-The-Envelope Estimation / Capacity Planning](https://www.youtube.com/watch?v=UC5xf8FbdJc) · ByteByteGo · 8 min · 136,493 views
+- [Back-Of-The-Envelope-Estimation 🕵️📈📏📁](https://www.youtube.com/watch?v=juCeZCZgWZU) · codestorywithMIK · 9 min · 59,710 views

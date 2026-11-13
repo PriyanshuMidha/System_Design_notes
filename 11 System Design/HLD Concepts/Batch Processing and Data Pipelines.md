@@ -12,7 +12,7 @@ sources:
   - "Armbrust et al., Lakehouse: A New Generation of Open Platforms (CIDR 2021); Delta Lake, Apache Iceberg and Apache Hudi table format documentation"
   - "Kleppmann, Designing Data-Intensive Applications, ch. 10 (batch) and ch. 11 (stream), including the lambda architecture discussion"
   - "Apache Parquet format documentation: columnar layout, row groups, column chunks, predicate pushdown"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Batch Processing and Data Pipelines
@@ -26,6 +26,55 @@ updated: 2026-11-09
 > - Every job must be **idempotent**: running it twice for the same input gives the same output. That one rule makes retries and reprocessing safe.
 > - Data lands in a **lake** (cheap files), a **warehouse** (fast SQL) or a **lakehouse** (files with table features). **CDC** moves changes from your production database without loading it.
 > - Interview trap: reaching for streaming when "yesterday's numbers by 6 a.m." is the real requirement. Batch is cheaper and simpler.
+
+## Start here: the basics
+
+**The problem in one story**
+
+A shop wants a report every morning: yesterday's sales per city.
+Yesterday's data is 5 TB spread over many files.
+One computer would take all day to read it.
+So the work is split across many machines, run overnight, and the report is ready by 6 a.m.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+|---|---|---|
+| Batch job | A program that processes a big, fixed chunk of data at once | Nightly sales total |
+| Partition | One slice of the data that one worker handles | Files for `date=2026-11-12` |
+| Shuffle | Moving records between machines so equal keys meet | All `city=Pune` rows go to one worker |
+| DAG | Steps with arrows showing order, and no loops | extract -> clean -> aggregate |
+| Scheduler | A tool that runs the DAG on time and retries failures | Airflow |
+| Idempotent | Running it twice gives the same result as once | Overwrite a day's partition, do not append |
+| Backfill | Re-running a job for old dates | Recompute last month after a bug fix |
+| CDC | Change data capture: copy DB changes as they happen | Read the MySQL binlog |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+  S[Source DB / logs] --> E[Extract]
+  E --> L[Lake files]
+  L --> M[Map in parallel]
+  M --> SH[Shuffle by key]
+  SH --> R[Reduce / aggregate]
+  R --> W[Warehouse table]
+```
+
+**Analogy**
+
+Counting votes in an election: many counting centres count their own boxes in parallel, then send tallies per candidate to one place to add up.
+Where it breaks: vote counting runs once, while pipelines rerun daily and must survive a centre crashing halfway (retries, idempotency).
+
+**How the rest of this note builds up**
+
+- First why batch exists and the mental model of partitions and DAGs (sections 1-2).
+- Then how MapReduce, Spark, shuffles, schedulers and storage layers work (section 3).
+- Then a worked example pipeline (section 4).
+- Finally variants (lake, warehouse, lakehouse, CDC), trade-offs, production practice and the SDE-3 deep dive on exactly-once and event time (sections 5-8).
+
+> [!tip] Remember
+> Split the data, process the parts in parallel, shuffle to group by key, and make every step safe to rerun.
 
 ## 1. Why it exists
 
@@ -441,19 +490,27 @@ flowchart TD
 
 ### 8.1 Why shuffle is the bottleneck
 
-Every wide step does the following: each map task partitions its output by key into R buckets, writes them to local disk, and each of R reduce tasks pulls its bucket from every one of M map tasks. That is **M × R small transfers**. With M = 5,000 and R = 5,000 that is 25 million fetches. Real engines reduce this with sort-based shuffle (one file per map task with an index), push-based or external shuffle services, and by coalescing partitions. Fewer and larger partitions reduce the count, but too few lose parallelism.
+Every wide step does the following: each map task partitions its output by key into R buckets, writes them to local disk, and each of R reduce tasks pulls its bucket from every one of M map tasks.
+
+That is **M × R small transfers**. With M = 5,000 and R = 5,000 that is 25 million fetches. Real engines reduce this with sort-based shuffle (one file per map task with an index), push-based or external shuffle services, and by coalescing partitions. Fewer and larger partitions reduce the count, but too few lose parallelism.
 
 ### 8.2 Fault tolerance without replication of results
 
-Batch frameworks recover by **recomputation**. Because tasks are deterministic and inputs are immutable, a lost output is rebuilt from lineage. Long lineage chains are cut by **checkpointing** (write to durable storage). This is why non-deterministic code (random numbers, `now()`, calling an external API) is dangerous in tasks: a retry gives different output. Seed randomness, pass the run time as a parameter, and treat API calls as a separate ingestion step.
+Batch frameworks recover by **recomputation**. Because tasks are deterministic and inputs are immutable, a lost output is rebuilt from lineage. Long lineage chains are cut by **checkpointing** (write to durable storage). This is why non-deterministic code (random numbers, `now()`, calling an external API) is dangerous in tasks: a retry gives different output.
+
+Seed randomness, pass the run time as a parameter, and treat API calls as a separate ingestion step.
 
 ### 8.3 Exactly-once output
 
-True exactly-once in a distributed job is built from at-least-once execution plus an idempotent or atomic commit. Spark and similar engines write task outputs to a temporary location and the driver commits the job by renaming or by writing table-format metadata in one atomic step. Table formats (Delta, Iceberg, Hudi) make this safer on object storage, where rename is not atomic, by using a transaction log or manifest pointer. Say: "at-least-once compute, atomic commit, idempotent keys."
+True exactly-once in a distributed job is built from at-least-once execution plus an idempotent or atomic commit. Spark and similar engines write task outputs to a temporary location and the driver commits the job by renaming or by writing table-format metadata in one atomic step.
+
+Table formats (Delta, Iceberg, Hudi) make this safer on object storage, where rename is not atomic, by using a transaction log or manifest pointer. Say: "at-least-once compute, atomic commit, idempotent keys."
 
 ### 8.4 Event time vs processing time
 
-A record carries two clocks: when it happened (**event time**) and when you processed it (**processing time**). Reports must group by event time, but data arrives late (mobile app offline for 2 hours). Batch handles this by reprocessing a trailing window; streaming handles it with watermarks and allowed lateness. Define the lateness you accept (for example 7 days) and what happens after it (drop, or write a correction).
+A record carries two clocks: when it happened (**event time**) and when you processed it (**processing time**). Reports must group by event time, but data arrives late (mobile app offline for 2 hours). Batch handles this by reprocessing a trailing window; streaming handles it with watermarks and allowed lateness.
+
+Define the lateness you accept (for example 7 days) and what happens after it (drop, or write a correction).
 
 ### 8.5 Slowly changing dimensions
 
@@ -533,3 +590,8 @@ sequenceDiagram
 - **Next:** [[Transactional Outbox and CDC]], [[Case Study - Ad Click Aggregation]], [[Case Study - Metrics and Logging Platform]]
 - **Decide:** [[Choosing Storage for Files, Search and Analytics - Decision Guide]]
 - **Related:** [[Idempotency and Idempotency Keys]], [[Scheduled Jobs - Cron to Durable Schedulers]], [[Workflow Engines and Durable Execution]], [[Event Schemas and Schema Registry]], [[Hot Keys and Hot Partitions]], [[Kafka and Event Streaming]], [[Storage Engines - B-tree vs LSM and WAL]]
+
+### Watch on YouTube
+
+- [The Hidden Cost of Batch Processing / Modern Data Engineering Pipelines](https://www.youtube.com/watch?v=rrOj9efHtMs) · Confluent Developer · 11 min · 1,252 views
+- [What is Stream Processing? / Batch vs Stream Processing / Data Pipelines / Real-Time Data Processing](https://www.youtube.com/watch?v=ya4298V8Mqo) · BI Insights Inc · 6 min · 23,731 views

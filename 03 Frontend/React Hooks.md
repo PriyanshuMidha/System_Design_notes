@@ -8,7 +8,7 @@ sources:
   - "react.dev, Reusing Logic with Custom Hooks"
   - "react.dev, Rules of Hooks"
   - "react.dev, React 19 release notes"
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # React Hooks
@@ -23,13 +23,62 @@ updated: 2026-11-09
 > - `useRef` holds a mutable value, or a DOM node reference, that survives renders without ever causing one itself.
 > - Custom hooks are just functions that call other hooks, letting you extract and reuse logic across components.
 
+## Start here: the basics
+
+**The problem in one story.**
+A product page shows a price fetched from a server.
+A plain function forgets everything when it finishes, so it cannot remember the price between renders.
+It also needs to start the fetch after the page shows, and stop it if the user leaves.
+Hooks are small `use...` functions that give a component memory and a place for such "after render" work.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Component | A function that returns UI | `function Price() { ... }` |
+| Render | React calling your component to get its UI | typing in a box re-runs it |
+| State | Memory React keeps for a component | `useState(0)` |
+| Side effect | Work that reaches outside the render: network, timers, DOM | `fetch('/price')` |
+| Commit | The moment React writes changes to the real page | the new price text appears |
+| Cleanup | Code that undoes an effect | `clearInterval(id)` |
+| Closure | A function that remembers variables from where it was created | a callback still seeing an old `productId` |
+| Dependency array | List of values that decide when an effect re-runs | `useEffect(fn, [productId])` |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Render:<br/>call component"] --> H["Hooks read their slots<br/>(by call order)"]
+    H --> C["Commit to page"]
+    C --> E["useEffect runs"]
+    E -- "setState" --> R
+    E -. "before next run<br/>or unmount" .-> CL["cleanup"]
+```
+
+**Analogy.** Hooks are numbered lockers React keeps for each component: the first `use...` call opens locker 1, the second opens locker 2, every render.
+Where it breaks: real lockers have names; hooks only have positions, which is why you must never call them inside an `if`.
+
+**How the rest of this note builds up**
+
+- First, why hooks replaced classes (section 1) and the "slots by call order" model (section 2).
+- Then the rules of hooks, `useState`, `useEffect` with cleanup, and `useLayoutEffect` (section 3).
+- Then a real fetch race traced and fixed, `useMemo`/`useCallback`, `useRef` and a custom hook (section 4).
+- Finally the SDE-3 deep dive: variants, trade-offs, production pitfalls and internals (sections 5-8).
+
+> [!tip] Remember
+> Hooks give a function memory and effects, matched by call order, so call them the same way every render.
+
 ## 1. Why it exists
 
 A function component is, each render, just a function call: its local variables are thrown away when it returns. Before hooks (pre-React 16.8, 2019), the only way to keep data across renders was to convert the component to a **class**, with `this.state`, `this.setState`, and lifecycle methods like `componentDidMount`.
 
-That had a real cost. Two unrelated concerns — say, a data subscription and a window-resize listener — ended up interleaved inside the same `componentDidMount`/`componentWillUnmount` pair, because a class only has one of each lifecycle method, not one per concern. Splitting them apart meant extracting a whole higher-order component or render-prop wrapper, both of which added a layer of indirection just to share logic.
+That had a real cost. Two unrelated concerns — say, a data subscription and a window-resize listener — ended up interleaved inside the same `componentDidMount`/`componentWillUnmount` pair, because a class only has one of each lifecycle method, not one per concern.
 
-Hooks solve this by giving a *function* component access to React's internal per-component storage, without a class. `useState` hands you a slot of memory. `useEffect` hands you a slot for "run this after commit, clean up before the next one." Because they're just function calls, you can group one concern's state and effect together in one place, and extract repeated logic into your own function — a custom hook — instead of threading it through class inheritance.
+Splitting them apart meant extracting a whole higher-order component or render-prop wrapper, both of which added a layer of indirection just to share logic.
+
+Hooks solve this by giving a *function* component access to React's internal per-component storage, without a class. `useState` hands you a slot of memory.
+
+`useEffect` hands you a slot for "run this after commit, clean up before the next one." Because they're just function calls, you can group one concern's state and effect together in one place, and extract repeated logic into your own function — a custom hook — instead of threading it through class inheritance.
 
 > [!tip] Remember
 > Hooks exist to give a plain function the one thing it was missing: memory across calls, without the ceremony of a class.
@@ -46,7 +95,11 @@ flowchart TD
     L3 --> Done["Same order, every render, so slots keep matching their hook calls"]
 ```
 
-**An analogy:** this is like a coat-check counter that hands you back your coat by the *ticket number* you were given, not by your name or your face. If you hand in your coat first, then your bag, you must always collect coat-then-bag in that same order — if one visit you suddenly collect bag-then-coat, the counter can't tell and hands you the wrong item for that slot. The analogy breaks down because a real coat-check has one ticket per item; React's "tickets" are just positions in a list, re-derived fresh from the order your code calls hooks in.
+**An analogy:** this is like a coat-check counter that hands you back your coat by the *ticket number* you were given, not by your name or your face.
+
+If you hand in your coat first, then your bag, you must always collect coat-then-bag in that same order — if one visit you suddenly collect bag-then-coat, the counter can't tell and hands you the wrong item for that slot.
+
+The analogy breaks down because a real coat-check has one ticket per item; React's "tickets" are just positions in a list, re-derived fresh from the order your code calls hooks in.
 
 **Why it matters:** this is also why **hooks can't be called conditionally**. If an `if` sometimes skips a `useState` call, the second hook's data would land in the first hook's slot on the next render, silently corrupting unrelated state.
 
@@ -85,7 +138,9 @@ items.push(newItem); setItems(items);
 setItems((prev) => [...prev, newItem]);
 ```
 
-**What happens if** you call `items.push(newItem)` and then `setItems(items)`? `items` is still the exact same array reference as before the push — React's `Object.is(oldState, newState)` check sees two identical references and concludes nothing changed, so it skips the re-render entirely. The array *is* mutated in memory, but the screen never updates to show it, because React was never told a change happened.
+**What happens if** you call `items.push(newItem)` and then `setItems(items)`? `items` is still the exact same array reference as before the push — React's `Object.is(oldState, newState)` check sees two identical references and concludes nothing changed, so it skips the re-render entirely.
+
+The array *is* mutated in memory, but the screen never updates to show it, because React was never told a change happened.
 
 **Why it matters:** this is the single most common "my state update did nothing" bug, and it's invisible in a debugger print of `items` (which does show the new item) — only the un-rendered UI gives it away.
 
@@ -146,7 +201,11 @@ useEffect(() => {
 }, []);
 ```
 
-**Example:** trace Fix 1 by hand. On the render where `count = 0`, the effect's closure captures `count = 0`. One second later, `setCount(0 + 1)` fires, `count` becomes `1`, and because `count` changed, the dependency array `[count]` tells React to clean up the old interval and start a new effect — whose closure now captures `count = 1`. Each tick, a brand-new interval is created with the current `count` baked in; this works, but restarts the timer on every tick, which is wasteful for something this simple.
+**Example:** trace Fix 1 by hand. On the render where `count = 0`, the effect's closure captures `count = 0`.
+
+One second later, `setCount(0 + 1)` fires, `count` becomes `1`, and because `count` changed, the dependency array `[count]` tells React to clean up the old interval and start a new effect — whose closure now captures `count = 1`.
+
+Each tick, a brand-new interval is created with the current `count` baked in; this works, but restarts the timer on every tick, which is wasteful for something this simple.
 
 **Picture it:** the buggy version's closure never changes, so every tick adds to the same frozen number; the fixed version either gets a fresh closure each time (Fix 1) or never needs to read the stale variable at all (Fix 2):
 
@@ -221,7 +280,9 @@ function Price({ productId }) {
 }
 ```
 
-Replaying the same six steps with this fix: at step 3, the cleanup function from the *old* effect runs first and sets that closure's own `ignore` to `true`. At step 6, when product-1's late response arrives, its callback checks `ignore` — which is now `true` for that closure — and skips the `setPrice` call entirely. `AbortController` is the stronger version of the same fix: it also cancels the in-flight network request, not just its effect on state.
+Replaying the same six steps with this fix: at step 3, the cleanup function from the *old* effect runs first and sets that closure's own `ignore` to `true`. At step 6, when product-1's late response arrives, its callback checks `ignore` — which is now `true` for that closure — and skips the `setPrice` call entirely.
+
+`AbortController` is the stronger version of the same fix: it also cancels the in-flight network request, not just its effect on state.
 
 > [!tip] Remember
 > Any effect that sets state from an async result needs a way to tell a *stale* result "you're too late" — an `ignore` flag or an `AbortController`.
@@ -430,3 +491,8 @@ flowchart TD
 - **Before this:** [[React Fundamentals - Components, JSX, Props, State]], [[JavaScript Async - Event Loop, Promises, async-await]]
 - **Next:** [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]], [[React State Management - Props, Context, Redux]]
 - **Compare with:** [[React State Management - Props, Context, Redux]] (`useContext` vs a dedicated store for cross-cutting state)
+
+### Watch on YouTube
+
+- [Basic React Hooks Crash Course (useState, useEffect, useMemo, useCallback) / WebDevSimplified](https://www.youtube.com/watch?v=qRkSWHbGkEU) · MasterDotDev · covers useState/useEffect plus useMemo/useCallback caching together
+- [Intro to React Hooks with useState and useEffect](https://www.youtube.com/watch?v=P5p3vMeJ6LQ) · Steve Griffith - Prof3ssorSt3v3 · gentle intro to the two most-used hooks for beginners

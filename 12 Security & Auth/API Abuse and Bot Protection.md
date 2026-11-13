@@ -8,7 +8,7 @@ sources:
   - "OWASP API Security Top 10 (2023)"
   - "OWASP Automated Threats to Web Applications (OAT-001..OAT-021)"
   - "OWASP Credential Stuffing Prevention Cheat Sheet"
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # API Abuse and Bot Protection
@@ -23,11 +23,62 @@ updated: 2026-11-07
 > - Login and OTP endpoints need stricter, separate limits from the rest of the API, because they are the ones attackers hit hardest.
 > - Classic mistake: blocking the first suspicious signal outright. That both creates false positives against real users and teaches the attacker exactly which signal tripped the alarm.
 
+## Start here: the basics
+
+**The problem in one story.**
+A concert sells tickets at 10:00 AM.
+Real fans click "buy" by hand; a bot script clicks 1,000 times a second from many computers.
+Every bot request looks normal on its own: right password, right form, right format.
+The site must spot the *pattern* of bot traffic and slow it down without annoying real fans.
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Bot | A program that uses a website automatically, pretending to be a person | A script that buys 40 tickets in 3 seconds |
+| IP address | The network address a request comes from | `203.0.113.7` |
+| Rate limit | A cap on how many requests one key may make per time window | 5 login attempts per minute per account |
+| Credential stuffing | Trying leaked username/password pairs from another site's breach | 2 million pairs replayed against `/login` |
+| CAPTCHA | A small test that is easy for humans and costly for bots | "Click every traffic light" |
+| Risk score | A number built from several signals saying how suspicious a request is | New device + bad IP = high risk |
+| HTTP 429 | The status code for "too many requests, slow down" | Returned once a limit is hit |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    R["Request"] --> L{"Under rate<br/>limits?"}
+    L -- "no" --> S["429 slow down"]
+    L -- "yes" --> K{"Risk score?"}
+    K -- "low" --> A["Allow"]
+    K -- "medium" --> C["Challenge<br/>(CAPTCHA)"]
+    K -- "high" --> B["Block"]
+```
+
+**Analogy.** A nightclub door: ID check, a headcount cap, and a bouncer watching for groups acting oddly. No single check catches everyone; together they do.
+Where it breaks: a bouncer sees faces, but a server only sees signals that bots can fake or rotate (IPs, devices, accounts).
+
+**How the rest of this note builds up**
+
+- First, why valid-looking traffic can still be abuse (section 1) and the nightclub mental model (section 2).
+- Then the layers: edge WAF, multi-dimension rate limits, risk engine, progressive challenges and detection signals (section 3).
+- Then a Go risk-engine decision with tests (section 4) and a comparison of defense layers (section 5).
+- Finally the SDE-3 deep dive: trade-offs, false positives, production failure modes, timing leaks, shadow-banning and OTP pumping (sections 6-8).
+
+> [!tip] Remember
+> Abuse requests look valid one at a time; you catch them by combining signals across many requests and responding in steps, not with one hard block.
+
 ## 1. Why it exists
 
-A ticketing platform opens sales for a popular concert at 10:00 AM. Within seconds, bots using thousands of residential proxy IPs have bought most of the floor section, reselling tickets at a markup minutes later. Separately, that same week, an attacker runs a list of 2 million leaked username/password pairs from an unrelated breach against the platform's login endpoint — a **credential stuffing** attack. Security vendors who publish credential-stuffing statistics (Akamai, Imperva) commonly report hit rates of roughly 0.1–2% of attempted pairs succeeding, depending on how much the target's user base overlaps with the breached source — an estimate, not a figure measured on this platform. Even at the low end, a two-million-pair list yields thousands of compromised accounts.
+A ticketing platform opens sales for a popular concert at 10:00 AM. Within seconds, bots using thousands of residential proxy IPs have bought most of the floor section, reselling tickets at a markup minutes later.
 
-Both attacks used perfectly valid requests: correct JSON, a real (if automated) browser, a syntactically fine password. Nothing in request validation rejects them. The only way to tell them apart from legitimate traffic is behavior over time and across many requests: one IP hitting the login endpoint 500 times in a minute, one device buying 40 tickets in three seconds, one account's password matching a known breach dump. That is what this note is about — the layer above "is this request well-formed," which [[OWASP API Security Top 10]]-style validation already handles.
+Separately, that same week, an attacker runs a list of 2 million leaked username/password pairs from an unrelated breach against the platform's login endpoint — a **credential stuffing** attack. Security vendors who publish credential-stuffing statistics (Akamai, Imperva) commonly report hit rates of roughly 0.1–2% of attempted pairs succeeding, depending on how much the target's user base overlaps with the breached source — an estimate, not a figure measured on this platform.
+
+Even at the low end, a two-million-pair list yields thousands of compromised accounts.
+
+Both attacks used perfectly valid requests: correct JSON, a real (if automated) browser, a syntactically fine password. Nothing in request validation rejects them. The only way to tell them apart from legitimate traffic is behavior over time and across many requests: one IP hitting the login endpoint 500 times in a minute, one device buying 40 tickets in three seconds, one account's password matching a known breach dump.
+
+That is what this note is about — the layer above "is this request well-formed," which [[OWASP API Security Top 10]]-style validation already handles.
 
 ## 2. Mental model
 
@@ -50,7 +101,9 @@ flowchart LR
     API --> Audit["Audit log + anomaly dashboard"]
 ```
 
-Each layer catches what the one before it missed. The WAF filters obviously automated traffic before it costs a database query. Gateway rate limits (the algorithms themselves — token bucket, sliding window, distributed counters — are covered in [[Rate Limiting - Algorithms and Distributed Design]]) cap how much any one dimension can do per window. The risk engine combines signals the first two layers do not see individually. Only requests that make it through all of that reach the application, and even successful ones are logged for later anomaly detection.
+Each layer catches what the one before it missed. The WAF filters obviously automated traffic before it costs a database query. Gateway rate limits (the algorithms themselves — token bucket, sliding window, distributed counters — are covered in [[Rate Limiting - Algorithms and Distributed Design]]) cap how much any one dimension can do per window.
+
+The risk engine combines signals the first two layers do not see individually. Only requests that make it through all of that reach the application, and even successful ones are logged for later anomaly detection.
 
 ### The threat catalog
 
@@ -143,7 +196,9 @@ func decide(s Signals) string {
 }
 ```
 
-The full version below adds the per-account dimension, a new-device case, a honeypot check, and an enumeration-resistant login response — and is exactly what the tests exercise. It compiles and passes `go vet` and `go test -race` on Go 1.24. The rate-limiting algorithm these counters would run on (token bucket, sliding window) is not reimplemented here; see [[Rate Limiting - Algorithms and Distributed Design]] for that.
+The full version below adds the per-account dimension, a new-device case, a honeypot check, and an enumeration-resistant login response — and is exactly what the tests exercise. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+
+The rate-limiting algorithm these counters would run on (token bucket, sliding window) is not reimplemented here; see [[Rate Limiting - Algorithms and Distributed Design]] for that.
 
 ```go
 // Package abuse implements the abuse-detection decision layer: combining
@@ -352,3 +407,8 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
 - **Before this:** [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[OWASP API Security Top 10]]
 - **Next:** [[13 DevOps & Cloud MOC]] (the next folder); revisit [[Password Storage and Login Security]] for breached-password checks and MFA
 - **Compare with:** [[Rate Limiting - Algorithms and Distributed Design]] (the counting algorithms this note's limits run on), [[CORS and Same-Origin Policy]] (a different cross-origin threat model), [[Service-to-Service Auth - API Keys, HMAC, mTLS]] (abuse defenses for machine callers, not users)
+
+### Watch on YouTube
+
+- [Stop Bots, API Abuse, and DDoS: How Cloud WAAP Protects Modern Apps](https://www.youtube.com/watch?v=mKQm-AiZFBM) · techtalk1024 · 7 min · 62 views
+- [App and API Protector: What bot management options are available to me within the solution?](https://www.youtube.com/watch?v=ALu8wDnShxg) · Akamai Technologies · 4 min · 2,496 views

@@ -9,7 +9,7 @@ sources:
   - "PostgreSQL 17 documentation, Reliability and the Write-Ahead Log"
   - "Go 1.24 standard library documentation, os.File.Sync"
 status: reviewed
-updated: 2026-11-09
+updated: 2026-11-13
 ---
 
 # Page Cache, File Systems and fsync
@@ -24,16 +24,67 @@ updated: 2026-11-09
 > - A crash before `fsync` can lose data that `write()` already "succeeded" on — this is the single most common cause of "but I thought I saved it".
 > - Databases fsync their write-ahead log on every commit for exactly this reason: it is the only durability guarantee the OS gives you.
 
+## Start here: the basics
+
+**The problem in one story.**
+You type a long essay and press Save. The app says "Saved!" instantly.
+A second later the power goes out.
+When the laptop comes back, the last paragraph is missing.
+"Saved" meant "handed to the operating system", not "written onto the disk".
+
+**Words you need first**
+
+| Word | Plain meaning | Tiny example |
+| --- | --- | --- |
+| Disk / SSD | Slow storage that keeps data when power is off | Your laptop's NVMe drive |
+| RAM | Fast memory that is wiped when power is off | 16 GB of memory |
+| Kernel | The core of the OS that talks to hardware | Linux handling every file write |
+| System call | A program asking the kernel to do something | `write()`, `read()`, `fsync()` |
+| Page | A fixed-size chunk of memory or file, handled as one unit | 4 KB = 4096 bytes |
+| Cache | A fast copy of data kept close by | Second read of a file comes from RAM |
+| Dirty page | A cached page changed in RAM but not yet on disk | A file you wrote 2 seconds ago |
+| Durable | Will survive a crash or power cut | Data after `fsync` returns |
+
+**Picture it**
+
+```mermaid
+flowchart LR
+    App["Program calls write()"] --> PC["Page cache in RAM<br/>(page marked dirty)"]
+    PC -- "returns at once" --> App
+    PC -- "later, in background" --> Disk["Disk"]
+    F["Program calls fsync()"] --> PC
+    PC -- "flush now, then return" --> Disk
+```
+
+**Analogy.** The page cache is an outbox tray on your desk. Dropping a letter in the tray is instant; the mail clerk empties the tray every so often. `fsync` is walking the letter to the post office yourself and waiting for the receipt.
+Where it breaks: a real tray does not vanish in a fire before pickup without anyone knowing, but a power cut silently wipes every un-flushed page.
+
+**How the rest of this note builds up**
+
+- First, why writes go to RAM first (section 1) and a mental model of the page cache (section 2).
+- Then the full write path, `fsync` vs `fdatasync` vs `O_DIRECT`, inodes and journaling (section 3).
+- Then why databases fsync the WAL, fsync cost per storage tier, and a Go worked example (sections 3-4).
+- Finally the SDE-3 deep dive: trade-offs, production failure modes, `mmap`, write amplification and `dirty_ratio` stalls (sections 5-8).
+
+> [!tip] Remember
+> `write()` puts your data in RAM; only `fsync()` puts it safely on disk.
+
 ## 1. Why it exists
 
 Say a Go service calls `file.Write([]byte("order #4471 confirmed"))` and the call returns with no error. Did that data reach the disk?
 
-No. `write(2)` only promises the bytes are now visible to every process that reads the file — which the kernel can guarantee far more cheaply by keeping them in RAM. An SSD write (see [[Storage Devices - HDD, SSD, NVMe]]) costs tens to hundreds of microseconds; a RAM write costs single-digit nanoseconds. If every `write()` had to wait for the physical device, every program doing file I/O would run thousands of times slower.
+No. `write(2)` only promises the bytes are now visible to every process that reads the file — which the kernel can guarantee far more cheaply by keeping them in RAM.
+
+An SSD write (see [[Storage Devices - HDD, SSD, NVMe]]) costs tens to hundreds of microseconds; a RAM write costs single-digit nanoseconds.
+
+If every `write()` had to wait for the physical device, every program doing file I/O would run thousands of times slower.
 
 > [!warning] Common mistake
 > Treating a successful `write()` call as proof the data is safe. It proves the data is *visible* to other readers, not that it has survived a crash. Those are different guarantees, and conflating them is the single most common cause of "but I thought I saved it" incidents.
 
-So the kernel copies your bytes into a page of RAM called the **page cache**, marks that page **dirty**, and returns. A background kernel thread (`kworker` on Linux, via `pdflush`'s modern replacement, the per-device flusher thread) writes dirty pages to disk later — usually within about 30 seconds, sooner if the fraction of dirty memory crosses a threshold (`vm.dirty_ratio` / `vm.dirty_background_ratio`).
+So the kernel copies your bytes into a page of RAM called the **page cache**, marks that page **dirty**, and returns.
+
+A background kernel thread (`kworker` on Linux, via `pdflush`'s modern replacement, the per-device flusher thread) writes dirty pages to disk later — usually within about 30 seconds, sooner if the fraction of dirty memory crosses a threshold (`vm.dirty_ratio` / `vm.dirty_background_ratio`).
 
 That is a reasonable trade for most files. It is not acceptable for a bank's ledger: if the machine loses power 10 seconds after `write()` returns, that dirty page is gone, and the write that "succeeded" never happened. This is why durability-sensitive software calls `fsync` (or `fdatasync`) before telling its own caller "done".
 
@@ -49,7 +100,11 @@ Think of the page cache as RAM standing in front of every file on the system, th
 - **Write a file:** your buffer → page cache, marked dirty. Returns immediately. The disk write is the kernel's problem, later.
 - **`fsync`:** "stop treating this as the kernel's problem — write the dirty pages for this file to the device, and the device's own cache too, and don't return until it's really there."
 
-Unlike a CPU cache, the page cache has no fixed size dedicated to it: Linux uses whatever RAM isn't claimed by processes to cache file pages, and reclaims it instantly under memory pressure. The analogy to a CPU cache breaks down here — a CPU cache has a hard capacity limit set by the hardware, while the page cache happily grows to fill all otherwise-idle RAM and shrinks the instant something else needs it. `free -h`'s "available" column already accounts for this — a high "used" number that is mostly page cache is not a sign your machine is low on memory.
+Unlike a CPU cache, the page cache has no fixed size dedicated to it: Linux uses whatever RAM isn't claimed by processes to cache file pages, and reclaims it instantly under memory pressure.
+
+The analogy to a CPU cache breaks down here — a CPU cache has a hard capacity limit set by the hardware, while the page cache happily grows to fill all otherwise-idle RAM and shrinks the instant something else needs it.
+
+`free -h`'s "available" column already accounts for this — a high "used" number that is mostly page cache is not a sign your machine is low on memory.
 
 ## 3. How it works
 
@@ -99,7 +154,9 @@ sequenceDiagram
     VFS-->>App: return (now it is actually durable)
 ```
 
-**Example with numbers.** Say `write()` returns in under 1 microsecond (a RAM copy) and the background flusher normally runs every 30 seconds. If the machine crashes 10 seconds after a `write()` that was never `fsync`'d, that write is gone — the "30 second window" is not a guarantee, it's an average, and any crash inside it loses data that the caller believes already succeeded.
+**Example with numbers.** Say `write()` returns in under 1 microsecond (a RAM copy) and the background flusher normally runs every 30 seconds.
+
+If the machine crashes 10 seconds after a `write()` that was never `fsync`'d, that write is gone — the "30 second window" is not a guarantee, it's an average, and any crash inside it loses data that the caller believes already succeeded.
 
 > [!tip] Remember
 > `write()` only ever talks to the page cache. The disk only gets involved later (the flusher) or on demand (`fsync`) — never as part of the `write()` call itself.
@@ -114,9 +171,17 @@ In plain words: there are three different knobs for controlling how a write inte
 | `fdatasync(fd)` | File data and only the metadata needed to read it back (e.g. file size if it grew) | Timestamp-only metadata updates, which don't matter for reading the data back |
 | `O_DIRECT` (open flag) | Every read/write bypasses the page cache entirely | The page cache's buffering and read-ahead — the app does its own, usually with aligned buffers |
 
-**Example.** Writing 1,000 WAL records with `fsync` after each one does 1,000 full metadata-plus-data flushes; the same workload with `fdatasync` skips re-writing the file's access/modify timestamps each time (since they don't affect reading the data back), saving one write per call. Most databases (PostgreSQL, MySQL/InnoDB) default to `fdatasync` for this reason; the difference matters at high commit rates, not for occasional writes.
+**Example.** Writing 1,000 WAL records with `fsync` after each one does 1,000 full metadata-plus-data flushes.
 
-`O_DIRECT` is a different tool entirely: it is for processes that manage their own cache better than the kernel can guess — a database's buffer pool already caches hot pages, so caching the same bytes again in the page cache just wastes RAM and adds a copy. Linux exposes `O_DIRECT` via `open(2)`; Go's `os` package has no portable flag for it, so Go programs that want it open the file with `syscall.Open(path, syscall.O_RDWR|syscall.O_DIRECT, 0644)` on Linux (there is no equivalent flag on Darwin, which uses `fcntl(F_NOCACHE)` instead) and then must issue reads/writes in sector-aligned buffers, because the device no longer has the page cache smoothing out unaligned access.
+The same workload with `fdatasync` skips re-writing the file's access/modify timestamps each time (since they don't affect reading the data back), saving one write per call.
+
+Most databases (PostgreSQL, MySQL/InnoDB) default to `fdatasync` for this reason; the difference matters at high commit rates, not for occasional writes.
+
+`O_DIRECT` is a different tool entirely: it is for processes that manage their own cache better than the kernel can guess — a database's buffer pool already caches hot pages, so caching the same bytes again in the page cache just wastes RAM and adds a copy.
+
+Linux exposes `O_DIRECT` via `open(2)`; Go's `os` package has no portable flag for it, so Go programs that want it open the file with `syscall.Open(path, syscall.O_RDWR|syscall.O_DIRECT, 0644)` on Linux (there is no equivalent flag on Darwin, which uses `fcntl(F_NOCACHE)` instead).
+
+Those programs then must issue reads/writes in sector-aligned buffers, because the device no longer has the page cache smoothing out unaligned access.
 
 > [!warning] Common mistake
 > Reaching for `O_DIRECT` to "skip the slow page cache" on an ordinary sequential log writer. Without your own replacement cache, `O_DIRECT` just removes a free layer of buffering and read-ahead for no benefit — it only pays off once you have something better to put in its place.
@@ -128,9 +193,15 @@ In plain words: there are three different knobs for controlling how a write inte
 
 In plain words: a file's data and a file's bookkeeping (size, permissions, where its blocks live) are stored separately, and a crash in the middle of updating both can leave them disagreeing — journaling is how the filesystem recovers from that without a full disk scan.
 
-A file's data lives in data blocks; a separate structure called the **inode** holds everything about the file except its name: size, permissions, timestamps, and the block pointers that say where its data blocks are. (The name-to-inode mapping lives in the parent directory's own data, which is why renaming a file doesn't touch the inode at all.) The kernel keeps a cache of recently used inodes (the inode cache) and of recently resolved directory-entry lookups (the dentry cache), the same way it caches file data pages — this is what "inode cache" and "dentry cache" in `slabtop` output refer to.
+A file's data lives in data blocks; a separate structure called the **inode** holds everything about the file except its name: size, permissions, timestamps, and the block pointers that say where its data blocks are. (The name-to-inode mapping lives in the parent directory's own data, which is why renaming a file doesn't touch the inode at all.)
 
-A crash mid-write can leave a file system with data blocks written but their inode's pointers not updated, or vice versa — a torn, inconsistent state. ext4 avoids this with **journaling**: before changing the real metadata (or, in the strictest mode, data too), it writes a description of the intended change to a circular log (the journal) and marks it committed; only then does it apply the change in place. After a crash, replaying the journal from the last commit brings the file system back to a consistent state in seconds, instead of needing a full `fsck` scan of the whole disk.
+The kernel keeps a cache of recently used inodes (the inode cache) and of recently resolved directory-entry lookups (the dentry cache), the same way it caches file data pages — this is what "inode cache" and "dentry cache" in `slabtop` output refer to.
+
+A crash mid-write can leave a file system with data blocks written but their inode's pointers not updated, or vice versa — a torn, inconsistent state.
+
+ext4 avoids this with **journaling**: before changing the real metadata (or, in the strictest mode, data too), it writes a description of the intended change to a circular log (the journal) and marks it committed; only then does it apply the change in place.
+
+After a crash, replaying the journal from the last commit brings the file system back to a consistent state in seconds, instead of needing a full `fsck` scan of the whole disk.
 
 ```mermaid
 flowchart LR
@@ -156,7 +227,11 @@ ext4 offers three journal modes, trading safety for speed:
 
 In plain words: fsyncing every table page a transaction touched would be slow and random; instead, a database writes one small sequential record describing the change and fsyncs only that, then applies the real change to its data pages lazily, later.
 
-A database like PostgreSQL never fsyncs its main table files on every write — that would be far too slow. Instead it appends every change to a small, sequential **write-ahead log (WAL)** file and fsyncs *that* on commit (`synchronous_commit = on`, PostgreSQL 17 default). The actual table and index pages are modified in RAM (in the database's own buffer pool, a page cache it manages itself) and written out lazily by a background checkpoint process.
+A database like PostgreSQL never fsyncs its main table files on every write — that would be far too slow.
+
+Instead it appends every change to a small, sequential **write-ahead log (WAL)** file and fsyncs *that* on commit (`synchronous_commit = on`, PostgreSQL 17 default).
+
+The actual table and index pages are modified in RAM (in the database's own buffer pool, a page cache it manages itself) and written out lazily by a background checkpoint process.
 
 This works because the WAL alone is enough to recover: after a crash, PostgreSQL replays every WAL record after the last checkpoint, redoing the committed-but-not-yet-checkpointed changes. The cost of durability is one small, sequential, append-only fsync per commit, not a random-write fsync across however many pages the transaction touched.
 
@@ -168,7 +243,9 @@ flowchart LR
 
 **Example.** A transaction that updates 50 scattered index and table pages would need 50 random-write fsyncs if each page were flushed directly. Instead, it costs exactly one sequential fsync of a small WAL record — often a thousand times fewer physical seeks, which is the entire reason WAL-based durability is fast enough to use on every commit.
 
-If `fsync()` itself lies — some disk write caches and, notoriously, some early Linux/ext4 + consumer SSD combinations acknowledged a flush before data was physically on platters — no amount of application-level care helps; this is why production databases run on storage with power-loss protection (server SSDs have capacitors that finish in-flight writes on power loss) and why cloud block storage (EBS, Persistent Disk) documents its own durability guarantees separately from what `fsync` promises.
+If `fsync()` itself lies — some disk write caches and, notoriously, some early Linux/ext4 + consumer SSD combinations acknowledged a flush before data was physically on platters — no amount of application-level care helps.
+
+This is why production databases run on storage with power-loss protection (server SSDs have capacitors that finish in-flight writes on power loss) and why cloud block storage (EBS, Persistent Disk) documents its own durability guarantees separately from what `fsync` promises.
 
 > [!tip] Remember
 > A database doesn't fsync every page a transaction touches — it fsyncs one small, sequential WAL record per commit and replays that log after a crash to redo everything else.
@@ -200,7 +277,9 @@ flowchart LR
 
 ### Whiteboard version
 
-Trace a single durable append through the write path: `WriteAppendSync` opens the file, writes the record into the page cache (step 1 of the sequence diagram above), then calls `Sync()`, which performs the `fsync(2)` syscall — forcing that specific file's dirty pages and journal metadata to disk before the function returns. This is the same shape as a database's WAL append: open for append, write the record, sync before telling the caller it is safe to proceed.
+Trace a single durable append through the write path: `WriteAppendSync` opens the file, writes the record into the page cache (step 1 of the sequence diagram above), then calls `Sync()`, which performs the `fsync(2)` syscall — forcing that specific file's dirty pages and journal metadata to disk before the function returns.
+
+This is the same shape as a database's WAL append: open for append, write the record, sync before telling the caller it is safe to proceed.
 
 **Step by step:**
 1. `os.OpenFile` with `O_APPEND|O_CREATE|O_WRONLY` opens (or creates) the file positioned to append at the end.
@@ -210,9 +289,15 @@ Trace a single durable append through the write path: `WriteAppendSync` opens th
 
 Runnable Go version: [[Page Cache, File Systems and fsync - Go]].
 
-**Tested:** `go vet` and `go test -race` both pass on Go 1.24.4, darwin/arm64 (2026-11-06). The test only proves the bytes are readable back; it cannot prove durability across a real power loss from inside a test — that would need to kill the machine mid-write, which is exactly why `fsync` has to be taken on documented faith (the kernel's), not measured in a unit test.
+**Tested:** `go vet` and `go test -race` both pass on Go 1.24.4, darwin/arm64 (2026-11-06).
 
-**Representative timing (estimate, not measured here):** on a cloud NVMe volume, an `fsync` of a small WAL record typically costs **0.1–1 ms**; on a consumer SATA SSD without power-loss protection it can be similar or occasionally worse if the device has to actually flush its own write cache. A `write()` with no `fsync` costs **under 1 µs** — it's a `memcpy` into RAM. That three-to-four-orders-of-magnitude gap is why `synchronous_commit = off` (deferring the fsync) is sometimes used in PostgreSQL for throughput, accepting that the last fraction of a second of commits can be lost on a crash.
+The test only proves the bytes are readable back; it cannot prove durability across a real power loss from inside a test — that would need to kill the machine mid-write, which is exactly why `fsync` has to be taken on documented faith (the kernel's), not measured in a unit test.
+
+**Representative timing (estimate, not measured here):** on a cloud NVMe volume, an `fsync` of a small WAL record typically costs **0.1–1 ms**; on a consumer SATA SSD without power-loss protection it can be similar or occasionally worse if the device has to actually flush its own write cache.
+
+A `write()` with no `fsync` costs **under 1 µs** — it's a `memcpy` into RAM.
+
+That three-to-four-orders-of-magnitude gap is why `synchronous_commit = off` (deferring the fsync) is sometimes used in PostgreSQL for throughput, accepting that the last fraction of a second of commits can be lost on a crash.
 
 ## 5. Variants and comparison
 
@@ -233,7 +318,9 @@ Runnable Go version: [[Page Cache, File Systems and fsync - Go]].
 
 ## 7. In production
 
-- **Real systems:** PostgreSQL and MySQL/InnoDB `fsync`/`fdatasync` their WAL/redo log on commit; Kafka relies on the OS page cache for its hot read/write path and only optionally forces flushes (`flush.messages`), leaning on replication for durability instead; etcd and most Raft logs `fsync` every appended entry before acknowledging it, because an un-fsynced "committed" entry that a crash erases can violate the consensus safety property.
+- **Real systems:** PostgreSQL and MySQL/InnoDB `fsync`/`fdatasync` their WAL/redo log on commit.
+	- Kafka relies on the OS page cache for its hot read/write path and only optionally forces flushes (`flush.messages`), leaning on replication for durability instead.
+	- etcd and most Raft logs `fsync` every appended entry before acknowledging it, because an un-fsynced "committed" entry that a crash erases can violate the consensus safety property.
 - **Failure modes → fixes:**
 	- "I wrote the file and it's gone after a power cut" → missing `fsync`; add it on the durability-critical path only.
 	- Latency spikes under load with many small writers → batch/group commits instead of one `fsync` per writer.
@@ -289,3 +376,8 @@ Runnable Go version: [[Page Cache, File Systems and fsync - Go]].
 - **Next:** [[CPU Scheduling]], [[System Calls and User vs Kernel Mode]]
 - **Compare with:** [[Memory Hierarchy and CPU Caches]] (write-back caching at the hardware level), [[Consistent Hashing]] (another "quality bar" note on durability and real systems)
 - **Go code:** [[Page Cache, File Systems and fsync - Go]]
+
+### Watch on YouTube
+
+- [The Secret Behind Database Durability: Write-Ahead Logging (WAL)](https://www.youtube.com/watch?v=VP00nqv6txY) · Shubh Patel · shows why databases fsync their WAL on commit for durability
+- [Write-Ahead Logging Explained: Database Durability & Recovery](https://www.youtube.com/watch?v=ZyGF-ag0p68) · CodeLucky · complements the fsync/durability angle with crash-recovery mechanics
