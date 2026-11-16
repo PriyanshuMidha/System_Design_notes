@@ -23,7 +23,38 @@ updated: 2026-11-13
 > - DRAM: a 1-transistor-1-capacitor cell that must be refreshed roughly every 64 ms as the capacitor leaks charge — denser and cheaper, used as main memory.
 > - DDR, GDDR and HBM are all DRAM; they differ in the interface and packaging used to get data on and off the chip, trading latency for bandwidth differently for different workloads.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+"RAM" is not one thing. There are two basic ways to build a memory cell, and everything else is packaging.
+
+**SRAM** stores a bit with 6 transistors: fast, power-hungry, expensive — so it is used in tiny amounts, as the CPU's caches. **DRAM** stores a bit as charge in 1 tiny capacitor: slow-ish and it leaks, so it must be refreshed thousands of times a second — but it is cheap, so your 16 GB of "RAM" is DRAM.
+
+```mermaid
+flowchart LR
+    S["SRAM: 6 transistors<br/>fast, costly, tiny"] --> U1["used as CPU caches"]
+    D["DRAM: 1 capacitor<br/>cheap, leaks, refreshed"] --> U2["used as main memory"]
+```
+
+DDR, GDDR and HBM are all just DRAM wired up differently for different jobs:
+
+```mermaid
+flowchart TD
+    D["DRAM cell"] --> DDR["DDR: general purpose,<br/>low latency, your laptop"]
+    D --> G["GDDR: graphics cards,<br/>huge bandwidth"]
+    D --> H["HBM: stacked chips,<br/>extreme bandwidth, AI chips"]
+```
+
+The rest of this note is just three questions:
+1. How do the SRAM and DRAM cells actually work?
+2. What do DDR, GDDR and HBM each optimize for?
+3. Which numbers (latency vs bandwidth) matter for which workload?
 
 **The problem in one story.**
 Your laptop opens a big spreadsheet in a second, but loading it from disk took longer.
@@ -69,7 +100,7 @@ Where it breaks: the re-writing (refresh) happens on a fixed timer in hardware, 
 > [!tip] Remember
 > SRAM is fast and small (caches); DRAM is dense and cheap but must be refreshed (main memory, GPU memory, HBM).
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Picture a single cell of memory as a light switch. It needs to hold one bit — on or off — and let the rest of the system read or set that bit quickly.
 
@@ -84,7 +115,7 @@ That single trade-off — SRAM's speed and area cost versus DRAM's density and r
 > [!tip] Remember
 > SRAM trades area and cost for speed and no refresh; DRAM trades refresh overhead for six times the density. Neither technology wins outright, which is why real systems use both, in different places.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **In plain words:** SRAM is a notepad on your desk — instantly available, but you only have room for a few pages, and the paper is expensive.
 
@@ -111,7 +142,7 @@ flowchart LR
 > [!warning] Common mistake
 > Thinking DRAM's refresh is something a program can avoid by "not touching" that memory. Every DRAM row must be refreshed on a schedule regardless of whether software is reading it — refresh is a property of the *hardware cell*, not of access patterns.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The SRAM cell: 6 transistors, no refresh
 
@@ -245,7 +276,7 @@ flowchart LR
 > [!tip] Remember
 > GDDR and HBM both sacrifice single-access latency for aggregate bandwidth. That trade only pays off for workloads with enough parallelism to hide the latency — GPUs and AI accelerators, not general-purpose CPU workloads.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -287,7 +318,7 @@ ok  	cs1scratch/memlimit	1.224s
 
 Runnable Go version, including input validation, the full table-driven test suite, and the `go vet`/`go test -race` output: [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Technology | Cell / mechanism | Optimized for | Typical use |
 |---|---|---|---|
@@ -297,14 +328,14 @@ Runnable Go version, including input validation, the full table-driven test suit
 | GDDR6/6X/7 | Same cell family, wide per-chip bus, PAM4/PAM3 signaling | Raw bandwidth over latency | GPU video memory (VRAM) |
 | HBM3 | 3D-stacked dies, TSVs, 1024-bit bus per stack | Maximum total bandwidth | AI accelerators (training/inference) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - SRAM's speed costs area and money, so it's never used for gigabyte-scale main memory — only for the kilobytes-to-tens-of-megabytes that sit directly in the CPU's cache hierarchy.
 - DRAM's refresh cycles are pure overhead: they use bus bandwidth and power for data nobody is reading right now, which is the price paid for 6x the density of SRAM per unit area.
 - GDDR and HBM both sacrifice single-access latency for bandwidth; a workload dominated by latency-sensitive, low-parallelism memory access (most general-purpose CPU workloads) gains little or nothing from them, which is why servers run system DDR, not GDDR, for their CPUs.
 - ECC RAM costs more and (on some platforms) is slightly slower due to the extra check-bit overhead; for a short-lived process or a non-critical workload, the probability of an uncorrected bit flip mattering in its lifetime is low enough that plain DDR is the common choice.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
   - Cloud instance families advertise their DRAM technology and bandwidth explicitly (e.g. AWS/GCP/Azure memory-optimized instance types built on DDR5 platforms).
@@ -319,7 +350,7 @@ Runnable Go version, including input validation, the full table-driven test suit
   - ECC correctable-error counts (a rising rate signals failing DIMMs before they cause an uncorrectable error).
   - Container memory usage against both `GOGC`-driven heap size and `GOMEMLIMIT`.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why "random access" is the defining property.** A magnetic tape must be read sequentially from wherever the read head currently sits — reaching byte 1,000,000 after byte 0 costs time proportional to the distance.
   RAM (SRAM or DRAM) is built so that, modulo row-buffer effects within DRAM banks, any address costs about the same as any other — the property the name describes, and the reason RAM can serve as a CPU's general-purpose working memory rather than only as a streaming buffer.
@@ -331,7 +362,7 @@ Runnable Go version, including input validation, the full table-driven test suit
   But a single outstanding request to either typically takes longer to come back than a DDR5 request — acceptable for a GPU with thousands of threads able to hide that latency behind other work, and a poor fit for a CPU core executing a single serial instruction stream.
 - **Where this connects back.** The density/speed/cost trade-off at the cell level (SRAM vs. DRAM) is the same trade-off that shapes the entire memory hierarchy in [[Memory Hierarchy and CPU Caches]]; the controller-and-bank mechanics here are also what the OS and hardware coordinate around for virtual memory and paging, covered in [[Virtual Memory, Paging and the TLB]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does "random access" actually mean, and what is it contrasted with?
 > Any address can be read or written in about the same amount of time, regardless of which address was accessed previously — unlike sequential-access media (magnetic tape, and to a lesser degree spinning disks), where reaching a far-away address costs time proportional to the distance from the current position.
@@ -351,7 +382,7 @@ Runnable Go version, including input validation, the full table-driven test suit
 > [!question]- Why would a backend engineer set `GOMEMLIMIT` instead of only tuning `GOGC`?
 > `GOGC` paces collection relative to live-heap growth, with no notion of an absolute ceiling, so a process can still be killed by the kernel's OOM killer in a memory-constrained container even while `GOGC`'s pacing looks fine. `GOMEMLIMIT` (Go 1.19+) gives the runtime an actual soft cap tied to the container's real memory limit, so GC runs more aggressively as usage approaches that cap instead of waiting to be killed.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - RAM = constant-time access to any address, unlike sequential media; it is volatile, so every bit is lost on power loss (ROM/flash is the non-volatile counterpart).
 - SRAM: 6T latch, no refresh, fast, expensive, low density — used for caches and register files.

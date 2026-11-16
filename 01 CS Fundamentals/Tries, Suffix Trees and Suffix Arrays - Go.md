@@ -15,7 +15,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Tries, Suffix Trees and Suffix Arrays]]: a lowercase-ASCII trie with insert, search and autocomplete, plus Go's standard-library suffix array (`index/suffixarray`) confirmed against the text `"banana"`.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Tries, Suffix Trees and Suffix Arrays]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Tries, Suffix Trees and Suffix Arrays]]. It builds a working trie (insert, lookup, prefix search — the autocomplete core) and a simple suffix array with substring search, both tested. Read each step's notes before the code.
+
+## Before the code 🟢
 
 - **Structs and pointers** (`*node`): each trie node is a struct; children are pointers, and `nil` means "no child here".
 - **Fixed-size arrays** (`[26]*node`): one slot per lowercase letter, indexed by `byte - 'a'`.
@@ -24,7 +31,7 @@ updated: 2026-11-13
 - **Standard library `index/suffixarray`**: a ready-made suffix array; `New` builds it, `Lookup` finds offsets.
 - **What to run**: `go vet ./... && go test -race -v ./...` in the module folder.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -38,13 +45,13 @@ flowchart LR
     ST["suffixarray_test.go"] --> SA["stdlib index/suffixarray:<br/>New, Lookup"]
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. `index/suffixarray` is standard library; no external dependencies anywhere in this module.
 - Layout: a module `trie` with `trie.go` (the trie), `trie_test.go`, and `suffixarray_test.go` (exercises the standard-library suffix array directly — there is no hand-rolled suffix array or suffix tree here, since the theory note's point is that production Go code reaches for the standard library instead).
 - Run it with `go vet ./... && go test -race -v ./...`.
 
-## Code
+## Code 🟡
 
 ### Step 1: the node shape
 
@@ -184,7 +191,7 @@ func (t *Trie) Autocomplete(prefix string) []string {
 2. `append(path, 'a'+c)` inside the recursive call looks safe but is a classic Go slice-aliasing trap if `path` ever had spare capacity shared across sibling calls; it works correctly here only because each call either appends within its own stack frame's slice header or the underlying array is small enough that growth reallocates — see "Pitfalls in the code" below for the general rule.
 3. The traversal order is pre-order over indices `0..25`, so results come back alphabetically by the *suffix after the prefix*, not globally sorted — worth stating explicitly if an interviewer expects sorted output.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -193,7 +200,7 @@ func (t *Trie) Autocomplete(prefix string) []string {
 | Recursive `dfs` closure in `Autocomplete` | An explicit stack-based iterative traversal | Shorter, easier to read, at the cost of one stack frame per trie level (bounded by the longest word, so not a real risk here) |
 | Standard-library `index/suffixarray` for substring search | A hand-rolled suffix array or suffix tree | Production-grade, tested code with zero extra code to maintain, at the cost of not controlling the internal construction algorithm directly |
 
-## Tests
+## Tests 🟡
 
 ### Test 1: insert, search and prefix check
 
@@ -300,7 +307,7 @@ Running the equivalent of this snippet directly (Go 1.24.4, darwin/arm64, 2026-1
 
 `FindAllIndex(re, n)` is the sibling method to reach for if a test ever needs a sorted, non-overlapping list instead.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`word[i] - 'a'` assumes lowercase ASCII input.** A byte outside `'a'..'z'` (uppercase, digits, punctuation, any non-ASCII rune) underflows or overflows the `0..25` range and indexes `children` out of bounds, which panics.
   This implementation deliberately does not validate input — callers must pre-normalize (lowercase, strip non-letters) before calling `Insert` or `Search`.
@@ -309,7 +316,7 @@ Running the equivalent of this snippet directly (Go 1.24.4, darwin/arm64, 2026-1
   Always allocate a copy before fanning out to more than one goroutine or storing a sliced reference past the current call.
 - **`index/suffixarray.Lookup`'s result is unsorted by design**, per its own doc comment — a caller that assumes the returned offsets come back in text order will get intermittently "wrong" answers whenever the suffix sort order and the physical text order disagree, which is most of the time.
 
-## Exercises
+## Exercises 🔴
 
 1. Insert `"go"`, `"goa"`, `"gob"` (three single-letter-longer siblings) and call `Autocomplete("go")`. Predict the exact slice order `dfs` returns, then verify by printing it.
 2. Add a `Delete(word string) bool` method that unmarks `end` for an exact match (without removing now-orphaned nodes). Write a test where deleting `"go"` leaves `"gopher"` fully searchable.

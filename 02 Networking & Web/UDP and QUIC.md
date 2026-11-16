@@ -24,7 +24,39 @@ updated: 2026-11-13
 > - Because QUIC's streams are independent, one dropped packet only stalls the one stream it belonged to — not the whole connection, unlike HTTP/2 over TCP.
 > - Classic mistake: assuming QUIC is "unreliable like UDP." QUIC is reliable and ordered per stream; only the *transport it rides on* (UDP) is unreliable.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how QUIC works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Apps on the internet send data in small chunks called **packets**.
+Most apps use TCP, which sets up a careful two-way conversation first and resends anything that gets lost.
+That care costs time.
+
+```mermaid
+flowchart LR
+    A[App using TCP] -- "hello? yes? ok, NOW send" --> B[Server]
+```
+
+**UDP** skips all of that. It just throws one packet at the address and hopes. No setup, no resend, no promises. Great for tiny or time-critical things like a DNS lookup or a game move.
+
+```mermaid
+flowchart LR
+    A[App using UDP] -- "here, catch!" --> B[Server]
+    B -. "maybe a reply, maybe not" .-> A
+```
+
+**QUIC** is the modern middle path: it is built on top of UDP but adds back the safety (resends, order, encryption), and does it smarter than TCP — each download inside the connection is its own lane, so one lost packet only stalls its own lane.
+
+That is it. The rest of this note is just these 3 questions:
+1. When is "send and hope" (UDP) actually the right choice?
+2. How does QUIC add reliability back without TCP's slowdowns?
+3. What new tricks does QUIC get that TCP cannot do (like surviving a Wi-Fi-to-cellular switch)?
+
 
 **The problem in one story.** You ask a friend a one-word question across a noisy room.
 Shaking hands first, then asking, then waiting for "got it" would be silly; you just shout.
@@ -67,7 +99,7 @@ Where it breaks: a real courier can't keep your parcel's identity when you move 
 > [!tip] Remember
 > UDP = send and hope. QUIC = reliable, encrypted, independent streams built on top of UDP.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Every guarantee TCP gives costs a round trip or a byte of bookkeeping somewhere.
 
@@ -112,7 +144,7 @@ sequenceDiagram
 > [!tip] Remember
 > UDP isn't "broken TCP" — it's TCP with every optional guarantee removed, so an application that doesn't need those guarantees doesn't pay for them.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 UDP is a postcard: you write an address and a message, drop it in the mailbox, and have no idea if it arrived, arrived twice, or arrived before a postcard you sent earlier. There's no "UDP connection" to speak of — `net.DialUDP` in Go just remembers a destination address locally; it sends nothing to set that up.
 
@@ -122,7 +154,7 @@ QUIC is what happens if you decide postcards aren't enough, but instead of switc
 
 QUIC can: a phone switching from Wi-Fi to cellular keeps the same "envelope identity" (its Connection ID) even though the return address (its IP) changed underneath it. No postal analogy captures that part cleanly — it's closer to a courier recognizing your voice on a new phone number than to anything physical mail can do.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### UDP: a datagram, nothing more
 
@@ -280,9 +312,11 @@ sequenceDiagram
 > [!question]- What happens if the path validation fails?
 > The server treats it as it would any unrecognized packet — the migration attempt is rejected, and from the application's point of view the connection behaves as if it had to start over, the same outcome TCP would have had with no migration support at all.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** before the detail, here is the whole idea as one tiny picture — two downloads share one connection, one hits a pothole, the other keeps moving.
 
 One client, one connection, two streams, drawn as the fewest boxes that still show the point:
 
@@ -300,6 +334,8 @@ Stream 1's loss and retransmit never stop stream 2's bytes from reaching the app
 
 ### Tracing a QUIC exchange step by step
 
+**In plain words:** this is a play-by-play of one real test run — think of it as watching the courier van make its deliveries, step by step.
+
 A UDP echo exchange, and a QUIC connection carrying two independent streams over loopback, trace like this:
 
 1. The client sends a UDP datagram carrying a small query; there is no setup step before this.
@@ -313,7 +349,7 @@ A UDP echo exchange, and a QUIC connection carrying two independent streams over
 
 Runnable Go version: [[UDP and QUIC - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -322,7 +358,7 @@ Runnable Go version: [[UDP and QUIC - Go]].
 | QUIC | Many reliable, ordered streams multiplexed over UDP, TLS 1.3 built in | Modern web transport (HTTP/3), anything wanting independent streams plus connection migration | Userspace implementation costs more CPU per byte than kernel TCP; some middleboxes still rate-limit or block UDP |
 | RTP/WebRTC over UDP | Application-managed loss tolerance, jitter buffers, adaptive bitrate | Real-time audio/video where late data is worse than lost data | No delivery guarantee at all; entirely the application's problem |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - QUIC moves TCP's work from the kernel (one implementation, shared, hardware-offload-friendly) into every application's userspace process, which costs more CPU per byte transferred — a real operational cost at very high throughput.
 - Some corporate and ISP middleboxes still rate-limit, deprioritize, or outright block UDP traffic (historically abused for amplification DDoS attacks), which can make QUIC fall back to HTTP/2 over TCP in practice; a client must always be prepared for that fallback.
@@ -332,7 +368,7 @@ Runnable Go version: [[UDP and QUIC - Go]].
 > [!tip] Remember
 > Every trade-off here is the same shape: QUIC trades kernel-shared CPU efficiency and universal middlebox support for flexibility, speed, and per-stream independence.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** HTTP/3 (QUIC) is served by Google, Cloudflare, Facebook/Meta, and most major CDNs as the default negotiated protocol for supporting browsers (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]); DNS runs over UDP/53 by default with TCP fallback for large or truncated responses; WebRTC (video calls) and most multiplayer game networking run their own protocols over UDP.
 - **Failure modes → fixes:**
@@ -341,7 +377,7 @@ Runnable Go version: [[UDP and QUIC - Go]].
 	- A QUIC connection's migration path validation fails (a NAT or firewall doesn't let the new path's probe through) → the connection falls back to treating it as a new connection, same as TCP would have.
 - **What to monitor:** UDP packet loss and retransmit rate per stream, 0-RTT accept/reject counts, connection migration events and their success rate, and the fallback rate from HTTP/3 to HTTP/2 (a rising fallback rate usually means a network path is newly blocking UDP).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why QUIC can't just be "TCP but faster."** TCP's state machine, congestion control and retransmission all live in kernel code that changes on OS-release timescales. QUIC deliberately lives in userspace specifically so it can evolve as fast as application code ships — a new congestion controller or a bug fix deploys with the next binary release, not the next OS kernel update across billions of devices.
 - **Packet numbers vs TCP sequence numbers.** TCP sequence numbers describe bytes in the stream, so a retransmission reuses the *same* sequence number as the original — which creates the "retransmission ambiguity problem": an ACK for that sequence number can't tell the sender whether it acknowledges the original or the retransmit, which matters for RTT estimation.
@@ -369,7 +405,7 @@ Runnable Go version: [[UDP and QUIC - Go]].
 
   QUIC earns its keep most clearly when many logical exchanges share one connection, which is HTTP's situation, not a single DNS lookup's.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly does UDP guarantee, and what does it not?
 > It guarantees almost nothing beyond "here is a datagram with a checksum, addressed to this port." No connection setup, no ordering between datagrams, no retransmission of a lost one, and no notification to the sender that it was lost. Any of that must be built by the application.
@@ -392,7 +428,7 @@ Runnable Go version: [[UDP and QUIC - Go]].
 > [!question]- Why does QUIC give every packet, even a retransmission, a unique packet number instead of reusing TCP's sequence-number style?
 > Because reusing the same identifier for a retransmission (as TCP does with sequence numbers) makes an ACK for that identifier ambiguous — it could be acknowledging the original packet or the retransmit, which corrupts RTT measurement. A strictly increasing packet number per attempt makes every ACK unambiguous about which specific transmission it covers.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - UDP: one datagram, no connection, no ordering, no retransmission, no congestion control — the application builds whatever it needs.
 - QUIC: reliable, ordered, congestion-controlled streams multiplexed over UDP, with TLS 1.3 structurally part of the handshake.

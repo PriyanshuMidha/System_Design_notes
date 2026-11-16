@@ -37,7 +37,38 @@ updated: 2026-11-13
 > - Document or key-value: data laid out to match a few known queries, scaled by partition key; new questions need new copies of the data.
 > - Classic mistake: writing two stores from one request (a dual write). Keep one source of truth and copy changes out with an outbox or CDC.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An app needs a place to keep its data. That place is a database.
+
+The classic kind is a **relational database** (also called SQL): data lives in neat tables with fixed columns, like spreadsheets that can be combined. You can ask it almost any question later.
+
+```mermaid
+flowchart LR
+    T1[("clients table")] --- J["combine (join)<br/>at read time"]
+    T2[("invoices table")] --- J
+    J --> A["answer to almost<br/>any question"]
+```
+
+The other kind is **NoSQL**: a family of stores that skip the neat tables. Instead they keep data pre-packed in the exact shape one known question needs, so that one question is very fast, even with billions of records.
+
+```mermaid
+flowchart LR
+    K["ask by key:<br/>invoice 42"] --> B["one pre-packed record:<br/>invoice + client + items"]
+    B --> F["answer in one fast read"]
+```
+
+Neither is "better". Tables answer any question but need assembling; pre-packed records are instant but only for the questions you planned. The rest of this note is just these 3 questions:
+1. When do neat tables (SQL) win, and when do pre-packed records (NoSQL) win?
+2. What do you give up on each side (flexible questions, easy scaling, safety rules)?
+3. How do real companies mix both without the copies drifting apart?
 
 **The problem in one story.**
 You can keep your kitchen in labelled jars on shelves, or pack a ready-made lunchbox for each day.
@@ -82,7 +113,7 @@ Where it breaks: real systems often use both, with one store as the source of tr
 > [!tip] Remember
 > Choose a store from your access patterns, not from the SQL or NoSQL label.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Relational databases were built for one server, strong consistency and flexible queries. In the 2000s, web companies outgrew single machines.
 
@@ -94,16 +125,18 @@ InvoiceOps shows why the choice is per access pattern, not per company:
 - **Recording a payment** must insert the payment, raise the invoice's paid amount and write an audit row together. Finance also asks new questions every month ("revenue by client country, by quarter"). That is relational work.
 - **An invoice activity timeline** (sent, opened, reminder, viewed) is append-only and read newest-first per invoice. At an estimated 1M invoices a month × 20 events, that is 20M rows a month: easy for a partitioned Postgres table. At 1,000 times that volume, a wide-column store partitioned by invoice becomes the natural home.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Relational:** model the *data* (entities and relationships), normalize it, then ask any question later. The schema protects the truth; queries adapt to it.
 - **Most NoSQL:** model the *queries*, then store the data in the shape each query reads, often more than once. A new query may need a new copy of the data.
 
 **Analogy:** a library with one copy of every book and catalogues by author, title and subject answers any question, but you walk the shelves. Meal kits are packed per recipe: you grab one box and cook, but a new recipe needs new boxes, and when an ingredient changes every box containing it must be repacked.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The families
+
+**In plain words:** there is no one "NoSQL database"; it is a shelf of different tools, each built to be great at one shape of question, like different knives in a kitchen.
 
 | Family           | Data model                                       | Example                    | Reads well                                         | Struggles with                                                 |
 | ---------------- | ------------------------------------------------ | -------------------------- | -------------------------------------------------- | -------------------------------------------------------------- |
@@ -119,6 +152,8 @@ InvoiceOps shows why the choice is per access pattern, not per company:
 Deeper notes: [[NoSQL Data Modeling]], [[Wide-Column Stores and Cassandra]], [[Search Engines and Inverted Indexes]], [[Time-Series and Columnar Storage]], [[Vector Databases and ANN Indexes]], [[Redis Fundamentals]].
 
 ### Schema-on-write vs schema-on-read
+
+**In plain words:** either the database checks the shape of your data when you save it (like a bouncer at the door), or it lets anything in and every reader has to cope with whatever is inside.
 
 - **Schema-on-write** (Postgres): the database rejects a row with a missing column or a wrong type at insert time. Changing the shape takes a migration ([[Zero-Downtime Schema Migrations]]).
 - **Schema-on-read** (MongoDB, DynamoDB): the store accepts any document, and every reader must handle every shape ever written: v1 invoices without `currency`, v2 with it. The schema still exists; it moved into your code and your tests. MongoDB can enforce one with optional `$jsonSchema` validation.
@@ -139,6 +174,8 @@ flowchart LR
 Example with numbers: if 2 million v1 invoices exist and v2 adds `currency`, a relational migration touches 2 million rows once (see [[Zero-Downtime Schema Migrations]]). A document store touches none, but every reader has to handle both shapes for as long as v1 documents exist.
 
 ### Normalized joins vs denormalized aggregates
+
+**In plain words:** store each fact once and assemble answers on the fly, or store ready-made bundles that read fast but must all be rewritten when a shared fact changes.
 
 ```mermaid
 flowchart LR
@@ -161,6 +198,8 @@ flowchart LR
 The document wins the read; the relational model wins the update and every query nobody planned for ("all unpaid items mentioning 'logo' across clients"). One subtlety: an issued invoice *should* keep the billing address it was issued with, so copying it into the invoice is the correct model in both worlds, not a denormalization. See [[Relational Schema Design]].
 
 ### ACID vs BASE
+
+**In plain words:** ACID means your changes land together and everyone sees them at once; BASE means copies catch up a moment later, like a scoreboard that updates a second behind the game.
 
 ```mermaid
 sequenceDiagram
@@ -192,6 +231,8 @@ In practice both are per-operation settings, not product properties:
 
 ### Scaling paths
 
+**In plain words:** SQL grows step by step as you need it (bigger box, then copies, then splitting); partitioned NoSQL spreads over many boxes from day one, but every fast question must say which box to look in.
+
 ```mermaid
 flowchart TB
     subgraph sql["Relational path: add steps when you need them"]
@@ -214,6 +255,8 @@ A partitioned store scales writes from the start, but every hot query must carry
 
 ### Choosing
 
+**In plain words:** write down your real questions and their sizes first, then walk this flowchart; the label on the box matters far less than the questions you will ask it.
+
 ```mermaid
 flowchart TD
     A["List access patterns:<br/>queries, writes, rates, growth"] --> B{"Multi-row invariants, joins,<br/>or ad-hoc reporting?"}
@@ -235,9 +278,11 @@ flowchart TD
 
 The question "does it need transactions?" no longer separates the two sides: MongoDB (multi-document since 4.0) and DynamoDB (`TransactWriteItems`) both offer them.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** here is the exact same question answered both ways, so you can see the trade with your own eyes: SQL assembles the answer, the document store had it pre-assembled.
 
 The same read, two ways. Relational stores each fact once and joins on read; a document store keeps a copy shaped for this one query.
 
@@ -314,7 +359,7 @@ flowchart TD
 
 **The same app on MongoDB** would also work: embed items and payments in the invoice document (single-document writes are atomic) or use a multi-document transaction. You would then rebuild in code what Postgres gave you: cross-client reports through aggregation pipelines, uniqueness of payment references, and the referential checks between clients and invoices.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Choosing by workload:
 
@@ -329,7 +374,7 @@ Choosing by workload:
 | Embeddings            | nearest-neighbour by vector, with filters               | pgvector until it hurts, then a dedicated vector DB                     | keeps filters and joins in SQL                                                         |
 | Global, strongly consistent OLTP | serializable transactions across regions     | Distributed SQL ([[Distributed SQL]])                                   | consensus replication with SQL on top                                                  |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 **Reach for a NoSQL store when:**
 - The access patterns are few, known and keyed, and the data is read and written as one aggregate.
@@ -349,6 +394,8 @@ Choosing by workload:
 - *"NoSQL is faster."* Speed comes from data laid out for the query. A key lookup is fast in any engine that is built for that key.
 
 ### Dual write versus outbox
+
+**In plain words:** never send the same update to two stores yourself, because one send can fail and the stores drift apart; save it once in the main store and let a relay copy it out until it sticks.
 
 ```mermaid
 sequenceDiagram
@@ -374,7 +421,7 @@ sequenceDiagram
 
 Use an outbox (a table written in the same transaction as the change, which a relay then publishes) or CDC (change data capture: streaming changes out of the database log), and run a reconciliation job.
 
-## 7. In production
+## 7. In production 🔴
 
 ```mermaid
 timeline
@@ -404,7 +451,7 @@ timeline
 	- Replication lag, and mismatches found by reconciliation jobs between stores.
 	- Size of the largest partition or document, and growth per tenant.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **CAP and PACELC defaults.** Dynamo-style stores choose availability during a partition and low latency otherwise; Spanner and CockroachDB choose consistency in both cases and pay in latency. That choice, more than the data model, decides how a store behaves under failure: [[CAP and PACELC]], [[Consistency Models]].
 - **What "scales horizontally" really requires.** A partition key in every hot query, partitions small enough to move, and keys spread evenly. Cross-partition joins and transactions are either unavailable or slow, whether the store says NoSQL or SQL.
@@ -422,7 +469,7 @@ flowchart LR
 - **Inside `jsonb`.** Postgres stores it in a parsed binary form, so reads do not re-parse text. A GIN index makes `@>` and key-existence queries fast; `jsonb_path_ops` is smaller but supports only containment and jsonpath operators. Updating one key writes a new version of the whole row; once a row passes about 2 KB its large values are compressed or moved out of line (TOAST), and rewriting them costs more; and the planner has no per-key statistics, so estimates on `jsonb` predicates are rough. Promote a key to a real column once you filter, join or constrain on it.
 - **The models converged.** Postgres has `jsonb`; MongoDB has transactions and schema validation; DynamoDB has transactions and PartiQL, a SQL-compatible query language. The labels now describe defaults and strengths, not capabilities.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: "If we need transactions we use SQL, otherwise NoSQL." Agree?
 > No. MongoDB has multi-document transactions since 4.0, DynamoDB has `TransactWriteItems`, and Cassandra has lightweight transactions for single-partition compare-and-set. Decide by access patterns, relationships and ad-hoc querying needs, consistency requirements per operation, and the scale you can actually forecast.
@@ -445,7 +492,7 @@ flowchart LR
 > [!question]- You keep invoices in Postgres and a search index in OpenSearch. How do you keep them consistent?
 > Do not write both from the request handler: one write can fail after the other succeeded. Make Postgres the source of truth, capture changes with a transactional outbox or CDC (Debezium reading the WAL), apply them idempotently to the index, and run a periodic reconciliation that compares counts or checksums.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Choose by access patterns, relationships, consistency and scale, never by the label.
 - Relational: model the data, query freely, enforce invariants. NoSQL: model the queries, copy data per query.

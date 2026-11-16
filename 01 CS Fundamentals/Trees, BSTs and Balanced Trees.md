@@ -22,7 +22,39 @@ updated: 2026-11-13
 > - Self-balancing trees (AVL, red-black) do extra work on insert/delete to keep height at O(log n) always.
 > - B-trees and B+trees are a different balancing strategy, shaped around disk/page reads rather than in-memory pointer chasing.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (11). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5, 6 and 8.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **tree** is data arranged like a family tree: one node at the top (the root), each node pointing to children below it. Folders inside folders is a tree you already use daily.
+
+A **binary search tree (BST)** adds one rule: smaller values go left, bigger go right. That rule turns the tree into the "higher or lower" guessing game — each step throws away half the remaining values.
+
+```mermaid
+flowchart TD
+    R["8"] --> L["3<br/>(everything here < 8)"]
+    R --> G["10<br/>(everything here > 8)"]
+    L --> L1["1"]
+    L --> L2["6"]
+```
+
+The catch: insert sorted data into a naive BST and it degrades into a straight line — the guessing game is gone. **Balanced** trees (AVL, red-black) reshuffle themselves as you insert, so the tree stays short and lookups stay fast.
+
+```mermaid
+flowchart LR
+    A["insert 1,2,3,4,5<br/>into naive BST"] --> B["a sad straight line<br/>(slow, like a list)"]
+    A2["same inserts into<br/>a balanced tree"] --> C["stays short and bushy<br/>(fast, O(log n))"]
+```
+
+The rest of this note is just three questions:
+1. How do search, insert and delete work in a BST?
+2. How do balanced trees keep themselves short (rotations)?
+3. Where do trees run the real world (databases, filesystems), and which interview patterns matter?
 
 **The problem in one story.**
 You keep a phone book of 1 million contacts that changes all day.
@@ -67,7 +99,7 @@ Where it breaks: the game assumes you always guess the middle; a BST built from 
 > [!tip] Remember
 > A BST halves the search at every node only while it stays balanced; balanced trees and B-trees exist to guarantee that.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Picture a service that stores a million user records and repeatedly has to answer three kinds of question: "is user ID 482913 present?", "give me the next ID after 482913", and "insert ID 619000." Each existing structure you might reach for falls short in its own way.
 
@@ -84,7 +116,7 @@ That "as long as" is the whole story of this note: a BST's worst case is as bad 
 > [!tip] Remember
 > A BST is the structure that tries to give you binary search's speed and a linked list's cheap inserts at the same time — but only while its shape stays balanced.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### Guess-the-number, with pointers instead of an array
 
@@ -113,7 +145,7 @@ flowchart TD
 >
 > A tree can look locally sorted at every parent-child pair and still violate this globally (see the "validate BST" problem in the Deep dive).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Terms, defined before they're used
 
@@ -188,7 +220,7 @@ flowchart LR
 
 **Why it matters:** This is not a rare edge case to shrug off — sorted or near-sorted input is common in practice (timestamps, auto-incrementing IDs, already-sorted log files), and it is the exact failure mode every balanced tree in this note exists to prevent.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -238,7 +270,7 @@ sequenceDiagram
 
 Runnable Go version: [[Trees, BSTs and Balanced Trees - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Structure | How it balances | Height | Use when |
 |---|---|---|---|
@@ -280,14 +312,14 @@ flowchart TB
 > [!warning] Interview trap
 > "Heap" and "BST" are both trees, but a heap is **not** a BST: a heap only guarantees a parent is ≤ (or ≥) its children, not that left < node < right. You cannot do an ordered in-order traversal of a heap and expect sorted output.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A plain BST is only as good as its insert order; never use one on data that might arrive sorted (log files, sequential IDs) without balancing.
 - Balanced trees pay rotation cost on every insert/delete to keep height bounded — if your workload is read-only after a one-time bulk load, build a balanced structure once (or just use a sorted slice with binary search) rather than paying ongoing rebalancing cost.
 - Go has **no ordered map in the standard library.** If you need sorted iteration or range queries over a map, either keep a separate sorted slice of keys, use a third-party ordered tree (`github.com/google/btree`), or reach for a sorted slice + `slices.BinarySearch` directly if mutation is infrequent.
 - Pointer-chasing trees (AVL, red-black) are cache-unfriendly in memory: each node is a separate heap allocation. For in-memory data that fits comfortably, a sorted slice often outperforms a pointer-based tree because of cache locality (see [[Memory Hierarchy and CPU Caches]]).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Linux's completely fair scheduler keeps runnable tasks in a red-black tree ordered by virtual runtime, so "pick the next task to run" is "find the leftmost node," `O(log n)`.
@@ -302,7 +334,7 @@ flowchart TB
 	- A tree's rotations under heavy concurrent writes serialize all writers → batch writes, or move to a structure built for concurrent access (e.g., a B-tree variant with latch-crabbing, as in production database engines).
 - **What to monitor:** tree height (or a cheap proxy like node count vs. log of node count) if you maintain one yourself; for a database, index bloat and the planner's chosen scan type for the query patterns you actually run.
 
-## 8. Whiteboard version
+## 8. Whiteboard version 🟡
 
 The three-case delete, drawn as a decision you'd make at a whiteboard:
 
@@ -316,7 +348,7 @@ flowchart TD
     C4 --> C5["Delete the successor node\n(falls into leaf or one-child case)"]
 ```
 
-## 9. Deep dive
+## 9. Deep dive 🔴
 
 ### AVL vs. red-black, precisely
 
@@ -350,7 +382,7 @@ This is a deliberate minimalism choice, not an oversight — it is one of the fe
 - **Serialize/deserialize a binary tree:** pre-order traversal with explicit null markers reconstructs the exact shape.
 - **Kth smallest in a BST:** in-order traversal, stopping at the kth value visited, `O(h + k)`.
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- What is the worst-case height of a BST, and when does it happen?
 > `O(n)` — a straight chain, one child per node. It happens when keys are inserted in sorted (or reverse-sorted) order with no rebalancing, so every new key becomes the sole child of the previous largest (or smallest) node.
@@ -373,7 +405,7 @@ This is a deliberate minimalism choice, not an oversight — it is one of the fe
 > [!question]- What does Go give you instead of a built-in balanced tree?
 > Nothing directly ordered in the standard library — Go ships `map` (hash table, unordered) instead. For sorted iteration or range queries, use a sorted slice with `slices.BinarySearch`, or a third-party tree package like `github.com/google/btree`.
 
-## 11. Cheat sheet
+## 11. Cheat sheet 🟢
 
 - BST invariant: left subtree < node < right subtree. Search/insert/delete are all `O(h)`.
 - Worst case height is `O(n)` (sorted insert order, no balancing) — the reason balanced trees exist.

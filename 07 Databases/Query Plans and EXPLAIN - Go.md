@@ -22,7 +22,18 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This note parses `EXPLAIN (ANALYZE, FORMAT JSON)` output in Go and flags every plan node whose row estimate is off by a chosen factor, which is the mechanical version of the "compare estimated rows with actual rows" step from [[Query Plans and EXPLAIN]]. It uses only the standard library and needs no database.
 
-## Before the code
+## Start here 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add "Setup", the three code steps and "Design decisions".
+> - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls in the code" and the exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on half of [[Query Plans and EXPLAIN]]. That note says: when a query is slow, compare the rows the database *expected* with the rows it *actually got*. Doing that by eye on a big plan is painful. So here we write a small Go program that reads the plan as JSON, walks every step of it, and prints the steps where the guess was way off (say, 10 times or more). It uses only Go's standard library and no database. Read it top to bottom: concepts first, then the code in three small steps, then the tests that prove it works.
+
+## Before the code 🟢
 
 - **Structs with JSON tags**: `json:"Node Type"` tells `encoding/json` which JSON key fills which Go field.
 - **Recursive types**: a `Node` holds a slice of child `Node`s, matching the plan tree.
@@ -31,7 +42,7 @@ updated: 2026-11-13
 - **Table-free tests with `testing`**: each `TestXxx` feeds a small JSON plan and checks the findings.
 - **Run**: `go vet ./... && go test -race -v ./...` inside the `plans` module; no database needed.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where explained |
 | --- | --- | --- |
@@ -49,7 +60,7 @@ flowchart LR
     W --> W
 ```
 
-## Setup
+## Setup 🟡
 
 - Go 1.24, standard library only (`encoding/json`, `fmt`, `testing`). The built-in `max` needs Go 1.21 or later.
 - Module layout: one package `plans` with two files.
@@ -64,7 +75,7 @@ plans/
 - Run: `go vet ./... && go test -race -v ./...`
 - To feed it a real plan, run `EXPLAIN (ANALYZE, FORMAT JSON) <query>` in `psql` and pass the output bytes to `Misestimates`.
 
-## Code
+## Code 🟡
 
 The program has one job: read a JSON plan tree and list the nodes whose estimates were wrong. It is built in three pieces, in one file `plans.go`: the data model, the entry point that decodes JSON, and the recursive walk.
 
@@ -85,6 +96,8 @@ sequenceDiagram
 ```
 
 ### Step 1: model the JSON and the result
+
+**In plain words: before any logic, we describe the shape of the JSON as Go structs — one struct for a plan step, one for a reported problem.**
 
 **Concept.** The theory note teaches reading a plan as a tree of nodes, each with an estimate and an actual count ([[Query Plans and EXPLAIN#3.4 Reading a plan]]).
 
@@ -150,6 +163,8 @@ func (f Finding) String() string {
 
 ### Step 2: decode the document
 
+**In plain words: turn the raw JSON text into those structs, and refuse politely (an error, not a crash) when the text is broken or empty.**
+
 **Concept.** `EXPLAIN (FORMAT JSON)` returns an array with one element per statement, and each element wraps the tree under a `"Plan"` key. This is the first half of the "Finding misestimates mechanically" procedure ([[Query Plans and EXPLAIN#Finding misestimates mechanically]]): get the tree into memory.
 
 The function takes raw bytes and returns an error rather than panicking, because the input comes from outside the program. A streaming decoder or `json.RawMessage` would save memory on huge plans, but plan JSON is small, so a plain `Unmarshal` is clearer.
@@ -179,6 +194,8 @@ func Misestimates(explainJSON []byte, minFactor float64) ([]Finding, error) {
 4. `out` starts as `nil`. Returning a nil slice with a nil error means "no findings", which the caller can range over safely.
 
 ### Step 3: walk the tree and score every node
+
+**In plain words: visit every step of the plan like walking a family tree, and for each one ask 'how many times off was the guess?' — keep the ones past the threshold.**
 
 **Concept.** The mechanical check from the theory note is to compare `Plan Rows` with `Actual Rows` on every node ([[Query Plans and EXPLAIN#Plan 3: a bad estimate]]).
 
@@ -224,7 +241,7 @@ Scoring of the three nodes in the sample (all `loops` ignored, since the numbers
 | Index Scan on invoices | 12 | 48,211 | 4,017.6 | yes |
 | Index Scan on clients | 1 | 1 | 1 | no |
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -236,11 +253,13 @@ Scoring of the three nodes in the sample (all `loops` ignored, since the numbers
 | Return `([]Finding, error)` | Panic on bad input | The caller decides what to do with bad input, at the cost of an error check |
 | Takes `[]byte` | Takes `io.Reader` or runs the query | Easy to test with string constants and needs no database, but the caller must read the whole output first |
 
-## Tests
+## Tests 🔴
 
 Three tests cover the main path, the boundary arithmetic and the error paths. The first sample is trimmed from the representative Plan 3 output (PostgreSQL 17) in the theory note.
 
 ### TestMisestimates: a join with a 4,018x error
+
+**In plain words: feed the program the bad join from the theory note and check it flags exactly the two guilty steps, in order.**
 
 **Property.** The nested loop and its outer scan are flagged, the correctly estimated inner scan is not, and findings come back in tree order. This matters because the whole point of the helper is to point at the node where the estimate first went wrong.
 
@@ -282,6 +301,8 @@ func TestMisestimates(t *testing.T) {
 
 ### TestUnderestimateAndZero: the boundary arithmetic
 
+**In plain words: check the edge case — the database expected 5,000 rows and got none — and make sure we do not divide by zero.**
+
 **Property.** A node estimated at 5,000 rows that returned 0 is flagged with factor exactly 5,000. This proves both the symmetric factor (an overestimate, `p/a`) and the zero clamp (0 becomes 1, no division by zero).
 
 | Input | `minFactor` | Expected |
@@ -303,6 +324,8 @@ func TestUnderestimateAndZero(t *testing.T) {
 
 ### TestBadInput: errors instead of panics
 
+**In plain words: feed it garbage and an empty result, and check it returns an error instead of crashing.**
+
 **Property.** Empty and malformed input produce errors. This matters because the bytes come from outside the program.
 
 | Input | Expected |
@@ -323,7 +346,7 @@ func TestBadInput(t *testing.T) {
 
 **What a failure means.** A panic with `index out of range` on the `[]` case means the `len(doc) == 0` guard is gone. A passing `{` case with no error would mean decode errors are being swallowed.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -351,7 +374,7 @@ Reading the output line by line:
 
 To feed it a real plan, run `EXPLAIN (ANALYZE, FORMAT JSON) <query>` in `psql` and pass the output bytes to `Misestimates`.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `Actual Rows` is an average per loop in the JSON, rounded by PostgreSQL. A node with 0 reported rows and 1,000 loops may still have returned some rows.
 - The struct tags must match PostgreSQL's key names exactly, including the spaces (`"Node Type"`, `"Plan Rows"`). A typo decodes silently to zero.
@@ -360,13 +383,13 @@ To feed it a real plan, run `EXPLAIN (ANALYZE, FORMAT JSON) <query>` in `psql` a
 - The helper flags nodes but does not say which one is the root cause; errors compound upward, so start with the deepest flagged node.
 - `Misestimates` returns the findings in tree order (parent before child), which the first test relies on when it reads `got[1]`.
 
-## Exercises
+## Exercises 🔴
 
 1. Add a `Loops`-weighted total (`ActualRows * ActualLoops`) to `Finding` and print it. Predict the total for the `clients` node in the sample before running it.
 2. Raise `minFactor` in `TestMisestimates` from 10 to 5,000. Predict how many findings remain and what that says about the sample's 4,018x error.
 3. Add a node with `Plan Rows: 1` and `Actual Rows: 100` to the sample and predict whether it is flagged at `minFactor` 10.
 
-## Links
+## Links 🟢
 
 - Theory: [[Query Plans and EXPLAIN]]
 - Before this: [[Index Types and Index Design - Go]]

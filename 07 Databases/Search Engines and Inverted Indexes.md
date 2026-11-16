@@ -31,7 +31,38 @@ updated: 2026-11-13
 > - Start with Postgres full-text search; add a search engine when relevance, fuzziness, facets or load demand it, and feed it through an outbox or CDC.
 
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You have a million emails and want every one that mentions "refund".
+
+The slow way is to open each email and look. A computer doing that re-reads all the text on every single search.
+
+```mermaid
+flowchart LR
+    Q["search: refund"] --> S["open and read<br/>1,000,000 emails"] --> R["minutes later: results"]
+```
+
+The fast way is to prepare a list once, up front: for every word, which emails contain it. That prepared list is called an **inverted index**, like the index at the back of a textbook.
+
+```mermaid
+flowchart LR
+    Q["search: refund"] --> L["look up one word<br/>in the index"] --> R["instantly: emails 3, 7, 19"]
+```
+
+Two more words and you know the whole field. An **analyzer** is the cleanup step that turns messy text into plain lookup words ("Refunds!" becomes `refund`), and **BM25** is the formula that puts the best match first instead of just any match.
+
+That is the whole trick. The rest of this note is just these 4 questions:
+1. How does text get cleaned into lookup words, and why must the search text be cleaned the same way?
+2. How is the index stored and searched (AND, OR, phrases)?
+3. How does the engine decide which match is the best?
+4. How do you keep this index as a fresh copy of your real database?
 
 **The problem in one story.**
 You want to find every email that mentions "refund" among a million emails.
@@ -79,7 +110,7 @@ Where it breaks: a book index is written once, while a search engine must keep u
 > [!tip] Remember
 > Run the same analyzer at index time and query time, and treat the search index as a copy fed from your source of truth.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps users want to type `acme overdue` and find invoices whose notes, client name or line items mention those words. The obvious SQL is:
 
@@ -96,7 +127,7 @@ A B-tree index cannot help a pattern that starts with `%`, so Postgres reads eve
 
 A search engine fixes all three: it indexes terms once at write time, normalizes them, and ranks results.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the index at the back of a textbook. You do not read the whole book to find "photosynthesis"; you look the word up and get page numbers. An inverted index is that back-of-book index for every word of every document, with page numbers replaced by document ids.
 
@@ -119,9 +150,11 @@ Terms used below:
 - **Relevance score:** a number that orders matching documents.
 
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Analysis: text to terms
+
+**In plain words:** before text goes in the index it gets washed: split into words, lowercased, filler words dropped, endings trimmed. The search box text must go through the same wash, or "Invoices" will never find "invoice".
 
 ```mermaid
 flowchart LR
@@ -145,6 +178,8 @@ Field types decide whether analysis happens:
 A common Elasticsearch mapping uses both: `client_name` as `text` plus a `client_name.raw` sub-field as `keyword`.
 
 ### 3.2 The inverted index
+
+**In plain words:** the index is a sorted word list where each word points to the documents that contain it, with the exact spots inside each document noted so the engine can check word order for quoted phrases.
 
 ```mermaid
 flowchart LR
@@ -178,6 +213,8 @@ flowchart LR
 
 ### 3.3 Query execution: AND, OR and phrases
 
+**In plain words:** once the engine has each word's document list, AND keeps only the documents on every list, OR keeps documents on any list, and a quoted phrase also checks the words sit side by side.
+
 Looking up the terms is only the first step. The engine then combines the postings lists according to the query operator.
 
 | Operator | What the engine does | Cost grows with |
@@ -203,6 +240,8 @@ sequenceDiagram
 Example with numbers: in the three-document collection above, `overdue AND invoice` returns docs 1 and 3 (2 results). The phrase `"overdue invoice"` also returns docs 1 and 3, because in both documents `invoice` sits exactly one position after `overdue`. The reversed phrase `"invoice overdue"` returns nothing.
 
 ### 3.4 Relevance: TF-IDF to BM25
+
+**In plain words:** the best match is the document that uses your words often, uses rare words (rare words carry more meaning), and is not just long for the sake of it. BM25 is the formula that balances those three.
 
 Two intuitions:
 - **TF (term frequency):** a document that says `acme` five times is probably more about Acme than one that says it once.
@@ -258,6 +297,8 @@ The curve flattens toward `k1 + 1 = 2.2`, so ten mentions of `acme` score less t
 
 ### 3.5 Elasticsearch and OpenSearch architecture
 
+**In plain words:** one big index is cut into slices (shards) spread over machines, each slice has a backup copy on another machine, and a search asks every slice and merges the best answers.
+
 ```mermaid
 flowchart TB
     subgraph cluster["Cluster: 3 data nodes"]
@@ -312,6 +353,8 @@ With `from = 0, size = 10` and 3 shards the coordinator merges 30 candidates. Wi
 
 ### 3.6 Segments, refresh, flush and merge
 
+**In plain words:** new documents pile up in small write-once files (segments), become searchable about a second after saving, and a background job keeps gluing small files into bigger ones, like tidying receipts into folders.
+
 ```mermaid
 sequenceDiagram
     participant App as Indexer
@@ -346,11 +389,13 @@ At `t <= 1 s` the next refresh writes it into a small new segment and the same s
 
 If `inv_812` is updated at `t = 60 s`, the old copy is only marked deleted in its segment's live docs, and the new version goes into another segment; the old bytes disappear at the next merge that rewrites that segment.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 This section traces the engine by hand on four tiny documents. No code is needed to follow it.
 
 ### 4.1 Index four documents and run a query
+
+**In plain words:** we do the engine's whole job by hand on four tiny documents, so every number in the next table has a reason you can follow.
 
 The four documents and what the analyzer produces (stop words dropped, plural `s` stripped):
 
@@ -381,6 +426,8 @@ sequenceDiagram
 
 ### 4.2 The scores, measured
 
+**In plain words:** these are real computed scores; they show shorter documents winning ties and rare words beating common ones by a lot.
+
 Running the Go implementation on these four documents (measured with a temporary `t.Logf` in the test, printed to 4 decimals):
 
 | Query | Doc | Doc length (terms) | Score |
@@ -397,6 +444,8 @@ What the numbers show:
 - `invoice` appears in 3 of 4 documents, so its IDF is `ln(1 + 1.5/3.5) ≈ 0.357`. `globex` appears in 1 of 4: `ln(1 + 3.5/1.5) ≈ 1.204`. One rare match beats one common match by more than 3×.
 
 ### 4.3 Postgres full-text search: the "good enough" option
+
+**In plain words:** your normal database can already do decent text search on its own; try that first and only bring in a separate search engine when it stops being enough.
 
 Before running a search cluster, try Postgres. It has an analyzer (text search configurations such as `english`), an inverted index (GIN; the index type itself is covered in [[Index Types and Index Design]]) and ranking.
 
@@ -427,6 +476,8 @@ ORDER BY rank DESC LIMIT 20;
 Limits: `ts_rank` uses term frequency and proximity but **no IDF**, so it is not BM25; there are no built-in facets, fuzzy matching beyond `pg_trgm`, or per-field analyzers at scale; and every search runs on the database you also write to. The full DDL, index creation and a representative `EXPLAIN ANALYZE` output (PostgreSQL 17) are in the Go note.
 
 ### 4.4 Keeping the search index in sync
+
+**In plain words:** the search index is a copy, never the original. Do not write to both places yourself; save once in the database and let a pipeline carry every change into the index, in order, with retries.
 
 The database is the source of truth. **Dual writes** (the API writes Postgres, then writes Elasticsearch) are unsafe: if the second write fails or the process crashes between them, the index silently disagrees with the database, and two concurrent updates can reach the index in the opposite order.
 
@@ -472,6 +523,8 @@ sequenceDiagram
 
 ### 4.5 Zero-downtime reindex with aliases
 
+**In plain words:** you cannot remodel the index while people search it, so you build a new one next door, fill it, check it, then flip a signpost (the alias) so searches walk into the new one, all in one move.
+
 Changing an analyzer or a field type requires a new index. Applications query an **alias** (`invoices`) instead of a concrete index:
 
 1. Create `invoices_v4` with the new mapping.
@@ -497,7 +550,7 @@ Because the alias move is one atomic request, searches see either the old index 
 
 Runnable Go version: [[Search Engines and Inverted Indexes - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -520,7 +573,7 @@ Which tool fits which kind of search:
 | semantic search | similar meaning | vector index |
 | hybrid search | keyword + semantic | search engine + vector index |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 **When database search is enough:** filters are simple, data volume is moderate, search is exact, prefix or simple full text, and ranking is not complex.
 
@@ -554,7 +607,7 @@ Common mistakes:
 - No reindex strategy.
 - No way to explain a ranking (use the `_explain` API).
 
-## 7. In production
+## 7. In production 🔴
 
 **Search result security.** The engine is separate from the database, so authorization must be designed into it:
 - Index `workspace_id` and access fields as `keyword` fields.
@@ -586,6 +639,8 @@ For deep or exported result sets use `search_after` (the sort values of the last
 
 ### Whiteboard version
 
+**In plain words:** strip away everything and a search engine is just a map from word to list of document ids; ten lines of code show it.
+
 The whole idea in a few lines of Go: an inverted index is a map from term to a list of document ids.
 
 ```go
@@ -600,7 +655,7 @@ fmt.Println(index["acme"])    // [1 3]
 fmt.Println(index["invoice"]) // [1 2]
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Postings compression and skipping.** Lucene stores postings in blocks of 128 document ids as deltas from the previous id, bit-packed.
 
@@ -629,7 +684,7 @@ flowchart LR
 ```
 
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is an inverted index and why is it fast?
 > It maps each term to a sorted postings list of the documents containing it, optionally with term frequencies and positions. A query looks up a few terms in a sorted dictionary and intersects or merges their lists, so its cost depends on the lengths of those lists, not on the number of documents. Positions allow phrase queries.
@@ -655,7 +710,7 @@ flowchart LR
 > [!question]- How do you stop tenant A from seeing tenant B's invoices in search?
 > Index `workspace_id` as a keyword field and add it as a mandatory filter clause on every query in the backend, ideally through one query-building function or server-side document-level security. Re-check permissions on the returned records and re-index or delete when access changes.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Inverted index: term → sorted postings (doc ids, frequencies, positions); analysis must match at index and query time.
 - `text` is analyzed for matching; `keyword` is exact, for filters, sorts and facets.

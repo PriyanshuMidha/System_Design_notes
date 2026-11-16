@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code mirrors the one-shot-vs-repeating distinction between JavaScript's `setTimeout`/`setInterval` using Go's `time.Timer`/`time.Ticker`, the comparison described in [[DOM, Events and Timers#Go comparison: time.Timer vs time.Ticker]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the "Code" walkthrough and the "Tests" section.
+> - 🔴 **Interview / SDE-3 prep?** Add "Design decisions", "Pitfalls" and the "Exercises". Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of the DOM, Events and Timers note. In plain words: JavaScript has two kinds of alarm clocks — `setTimeout` rings once, `setInterval` keeps ringing until you turn it off. Go has the same pair: `time.After` rings once, `time.NewTicker` keeps ringing until you call `Stop()`. The code here builds both, and the tests prove the two rules that matter: a timer's delay is a minimum (it can ring late, never early), and a ticker really repeats. Read "Before the code" for the Go bits, then walk the two small functions. All code stays runnable as-is.
+
+## Before the code 🟢
 
 - **Channels** (`<-chan time.Time`): a pipe between goroutines. `<-ch` waits until a value arrives, so reading one is how the code "waits for the timer".
 - **`time.After` / `time.NewTicker`**: the standard library's one-shot timer and repeating ticker, the Go cousins of `setTimeout` and `setInterval`.
@@ -24,7 +33,7 @@ updated: 2026-11-13
 - **Slices with capacity** (`make([]time.Time, 0, n)`): a growable list with room for `n` items reserved up front.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No interfaces or generics are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept it implements | Theory section |
 | --- | --- | --- |
@@ -33,15 +42,17 @@ updated: 2026-11-13
 | `TestAfterOnceFiresAtLeastOnce` | "a timer's delay is a floor, not a guarantee" | same section |
 | `TestRepeatingTicksFiresMultipleTimes` | "`setInterval` does not run once — it keeps firing" | same section |
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only (`time`, `testing`) — no external dependencies.
 - Module layout: a single package, `timers`, with `timers.go` and `timers_test.go` side by side.
 - Run it: `go vet ./...` then `go test -race ./...` from the module root.
 
-## Code
+## Code 🟡
 
 ### A one-shot timer: `AfterOnce`
+
+**In plain words:** this is the alarm that rings once. You ask for "at least 10ms", and you get a channel that delivers one value when the time is up — maybe a bit late, never early.
 
 **Concept.** The theory note's whole point about `setTimeout` is that its delay is a minimum, never a guarantee — the callback can run later than asked, but never earlier.
 
@@ -69,6 +80,8 @@ func AfterOnce(d time.Duration) <-chan time.Time {
 3. Because `time.After` returns immediately (the waiting happens in the background, like `setTimeout` returning an id right away), calling `AfterOnce` never blocks the caller — only reading from its returned channel does.
 
 ### A repeating timer: `RepeatingTicks`
+
+**In plain words:** this is the alarm that keeps ringing. It collects a fixed number of rings into a list so a test can check them, and `defer t.Stop()` is the "turn the alarm off" step you must never forget.
 
 **Concept.** `setInterval` keeps firing until `clearInterval` is called; the Go equivalent is `time.NewTicker`, which keeps sending values on its channel every `d` until `.Stop()` is called.
 
@@ -125,7 +138,7 @@ func RepeatingTicks(d time.Duration, n int) []time.Time {
 > }
 > ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice made | Alternative | Trade-off |
 | --- | --- | --- |
@@ -133,7 +146,7 @@ func RepeatingTicks(d time.Duration, n int) []time.Time {
 | `RepeatingTicks` takes a fixed `n` and returns a slice | Take a `done <-chan struct{}` or `context.Context` and run until told to stop | The fixed-`n` version is fully deterministic for a test (no goroutine leak risk, no need to synchronize a stop signal); a production poller would need the context-based version instead. |
 | `defer t.Stop()` immediately after creating the ticker | Call `Stop()` manually at the end of the function | `defer` guarantees cleanup even if the function panics or returns early from a future code change — the standard Go idiom for "this resource must always be released." |
 
-## Tests
+## Tests 🟡
 
 ### `TestAfterOnceFiresAtLeastOnce`
 
@@ -179,7 +192,7 @@ func TestRepeatingTicksFiresMultipleTimes(t *testing.T) {
 
 **What a failure would mean.** A wrong length means the loop or the ticker stopped early or produced too many ticks; a timestamp that isn't strictly after the previous one would mean two ticks were read out of order or the same tick was read twice.
 
-## Running it
+## Running it 🟢
 
 ```sh
 $ go vet ./...
@@ -201,18 +214,18 @@ Reading it line by line: `go vet` printed nothing, meaning it found no suspiciou
 
 The final `ok` line under the race detector confirms no data race was detected across the goroutines `time.After` and `time.NewTicker` start internally — meaningful here because a ticker's internal delivery goroutine is exactly the kind of concurrent code `-race` is meant to catch problems in.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `RepeatingTicks` blocks forever if `n` is larger than the number of ticks that will ever arrive in practice (it has no timeout) — fine for a bounded test, not safe to call with an unbounded `n` in production code without an escape hatch.
 - Forgetting the `defer t.Stop()` line would leak the ticker's internal goroutine for the lifetime of the program, the direct Go analog of forgetting `clearInterval` in JavaScript — the browser eventually garbage-collects an abandoned interval only when the page itself unloads, and Go's ticker never stops on its own either.
 - `AfterOnce` has no way to cancel the wait once started (no equivalent of `clearTimeout`) — a caller that no longer cares about the result still has to let the full delay elapse before the channel is read or garbage collected.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change this:** add a `Cancel func()` return value to `AfterOnce` by switching its implementation to `time.NewTimer(d)` and returning `t.Stop` alongside the channel. Predict what happens to callers that destructure only the channel from the old single-return signature.
 2. **Change this:** modify `RepeatingTicks` to accept a `context.Context` and stop early if the context is cancelled before `n` ticks arrive. Predict what the function should return in that case — a shorter slice, an error, or both?
 3. **Predict the result:** without running it, what does `TestRepeatingTicksFiresMultipleTimes` report if you change `RepeatingTicks(5*time.Millisecond, 3)` to `RepeatingTicks(5*time.Millisecond, 0)`? Then run it and check.
 
-## Links
+## Links 🟢
 - **Theory:** [[DOM, Events and Timers]]
 - **Related:** [[JavaScript Objects, Arrays and Iteration]], [[How Browsers Load and Render a Page]]

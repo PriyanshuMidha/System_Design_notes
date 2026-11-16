@@ -27,7 +27,34 @@ updated: 2026-11-13
 > - Most interview problems are one of a handful of patterns in disguise — recognizing the pattern is most of the work.
 > - Classic mistake: reaching for a sort (`O(n log n)`) when a hash set or two pointers would solve the same problem in `O(n)`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Sorting means putting things in order. Searching means finding a thing. The two are best friends: once data is sorted, searching becomes dramatically faster.
+
+Looking through an unsorted pile means checking every item — a **linear search**. In a sorted pile you can play the "higher or lower" guessing game, halving the pile each guess — a **binary search**. A million items takes about 20 guesses instead of a million checks.
+
+```mermaid
+flowchart LR
+    U["Unsorted pile,<br/>1,000,000 items"] -- "check one by one" --> A["up to 1,000,000 looks"]
+    S["Sorted pile,<br/>1,000,000 items"] -- "halve each time" --> B["about 20 looks"]
+```
+
+```mermaid
+flowchart LR
+    D["messy data"] -- "sort once, O(n log n)" --> O["ordered data"] -- "search many times, O(log n)" --> F["answers, fast"]
+```
+
+The rest of this note is just three questions:
+1. How do the main sorting algorithms work, and which does Go use?
+2. How does binary search work, and where does it hide in disguise?
+3. Which interview patterns (two pointers, sliding window, etc.) fall out of sorted data?
 
 **The problem in one story.**
 You have a pile of 1,000 exam papers and need to find the one for "Priya".
@@ -70,7 +97,7 @@ Where it breaks: a real dictionary never changes, while program data keeps chang
 > [!tip] Remember
 > Sort once so you can halve the search space forever; but if a hash set or two pointers solves it in `O(n)`, skip the sort.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you're given 10 million unsorted log-timestamp records and asked "how many requests happened between 14:00 and 14:05?" Scanning linearly costs `O(n)` **per query**.
 
@@ -83,7 +110,7 @@ Most coding-interview problems are really asking "do you recognize which of thes
 > [!tip] Remember
 > Sorting and most interview patterns are the same trade: pay a little more work up front (or recognize the right shape) so that every query or step afterward gets dramatically cheaper.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of sorting as the one-time cost of **organizing a library** so that later, finding any book by title is a quick jump to a shelf instead of scanning every book.
 
@@ -110,7 +137,7 @@ flowchart TD
 > [!warning] Common mistake
 > Treating this flowchart as exhaustive. It covers the handful of patterns this note details; many problems combine two patterns (e.g. sort, then two pointers) or need a structure not listed here (a heap, a trie). Use it to narrow the search, not to replace reading the problem.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### In plain words: comparison sorts and the `O(n log n)` floor
 
@@ -226,7 +253,7 @@ Backtracking's tree branches into every possibility and prunes dead ends; DP nev
 > [!tip] Remember
 > "How many ways" or "minimum cost" usually means DP (subproblems overlap and get cached); "list every valid configuration" usually means backtracking (every branch must actually be visited).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -251,7 +278,7 @@ func firstGE(nums []int, target int) int {
 
 Runnable Go version (all six interview patterns, tested): [[Sorting, Searching and Interview Patterns - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Pattern / algorithm | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -269,7 +296,7 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 > [!warning] Interview trap
 > "Just sort it" is sometimes the slow answer. If you only need "does a pair sum to `k`" over unsorted data, a hash set gets there in `O(n)`; sorting first costs `O(n log n)` for no benefit unless the problem also needs the data in order afterward.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - pdqsort's speed comes at the cost of stability — never assume `slices.Sort` preserves tie order; if a test or a user-visible ordering depends on it, that's a bug waiting to happen.
 - Binary search requires the data to already be sorted (or the predicate to already be monotonic); sorting first costs `O(n log n)`, which can erase the benefit if you only search once.
@@ -277,7 +304,7 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 - DP trades time for memory (the table of subproblem answers); for very large state spaces, memory becomes the real bottleneck, and techniques like rolling arrays (keeping only the last row or two) help.
 - Two pointers and sliding window only work cleanly when the data has the right structure (sorted, or a window condition that changes monotonically as the window grows/shrinks) — forcing them onto data that doesn't fit usually produces a subtly wrong answer, not a slow one.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Database query planners choose a sort-merge join (sort both sides, then a two-pointer-style merge) versus a hash join depending on whether the inputs are already sorted or indexed — see [[Query Plans and EXPLAIN]].
@@ -293,7 +320,7 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 	- Sort/search hot paths: whether an `O(n log n)` sort runs once and is reused, versus accidentally re-sorting on every request.
 	- Backtracking/DP solvers used in request paths: wall-clock time or an iteration cap, since worst-case inputs can regress badly without a bound.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `O(n log n)` is a hard floor for comparison sorts.** There are `n!` possible orderings of `n` elements, and a decision tree where each internal node is one comparison (two outcomes) needs at least `log₂(n!)` levels to distinguish all `n!` outcomes. By Stirling's approximation, `log₂(n!) = Θ(n log n)`. Non-comparison sorts (counting sort, radix sort) can beat this floor only because they exploit structure in the keys (small integer range, fixed-width keys) instead of comparing elements pairwise.
 - **How pdqsort avoids quicksort's `O(n²)` worst case.** Plain quicksort degrades to `O(n²)` on adversarial or already-sorted input with a naive pivot choice. pdqsort (the algorithm behind `sort.Sort`/`sort.Slice` since Go 1.19, and `slices.Sort` since the `slices` package's introduction in Go 1.21) picks pivots more carefully (median-of-three or median-of-medians on recursion), detects patterns like many equal elements or already-sorted runs and switches strategy, and falls back to heapsort entirely if it detects it's making bad progress (too many bad partitions) — guaranteeing `O(n log n)` worst case while staying fast on the common case.
@@ -301,7 +328,7 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 - **DP state design is the real skill.** The hard part of dynamic programming is rarely the transition (`dp[a] = min(dp[a], dp[a-c]+1)`) — it's identifying what the state needs to capture so that the "optimal substructure" property holds (the optimal answer to a subproblem can be built purely from optimal answers to smaller subproblems, without needing to know how you got there). Getting the state definition wrong is the most common reason a DP solution produces a wrong answer that still "looks" like DP.
 - **Backtracking vs DP on the same problem.** Both explore a space of choices, but backtracking enumerates all valid configurations (and prunes dead branches), while DP collapses overlapping subproblems into a cache so the same sub-answer is never recomputed. A problem asking "how many ways" or "the minimum cost" is usually DP; a problem asking "list all valid configurations" is usually backtracking — recognizing which is being asked is often the actual interview signal.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is Go's `slices.Sort` stable? What do you use if you need stability?
 > No — `slices.Sort` is pdqsort (the `sort` package switched to pdqsort in Go 1.19; `slices.Sort` has used it since the `slices` package arrived in Go 1.21), which does not preserve the relative order of equal elements. Use `slices.SortStableFunc` or the older `sort.SliceStable` when tie order matters, at the same `O(n log n)` cost.
@@ -330,7 +357,7 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 > [!question]- Given a recursive solution that's correct but too slow, how do you tell if memoization will help?
 > Check whether the same subproblem (the same arguments) is computed more than once across the recursion tree — if so, it's exhibiting overlapping subproblems, and memoization (caching results keyed by the arguments) turns the exponential blowup into one computation per distinct subproblem. If subproblems never repeat, memoization won't help and the exponential cost is likely inherent (e.g., enumerating all subsets).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Comparison sorts have a hard floor of `O(n log n)`; `slices.Sort` (pdqsort — in `sort` since Go 1.19, in `slices` since Go 1.21) hits it but is not stable — use `SortStableFunc`/`SliceStable` when ties must keep their order.
 - Binary search needs sorted data or a monotonic predicate; `sort.Search(n, f)` generalizes it, including "binary search on the answer."

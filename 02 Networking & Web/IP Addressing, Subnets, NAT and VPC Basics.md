@@ -26,7 +26,41 @@ updated: 2026-11-13
 > - A VPC "public subnet" is just a subnet whose route table sends `0.0.0.0/0` to an internet gateway; a "private subnet" sends it to a NAT gateway instead, or nowhere.
 > - This note builds directly on [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] and goes into AWS-specific subnet reservation details, which is why it is tagged intermediate rather than basic.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every device on a network needs its own number so messages can find it. That number is its **IP address**, like `192.168.1.5`.
+
+Your home has many devices, but your internet company gives you only **one** public number. Your Wi-Fi router shares that one number with everyone in the house. That sharing trick is called **NAT**.
+
+```mermaid
+flowchart LR
+    L["Laptop"] --> R["Router<br/>(one public number)"]
+    P["Phone"] --> R
+    T["TV"] --> R
+    R --> I["Internet"]
+```
+
+Big companies have the opposite problem: they get a huge block of numbers and must split it into smaller blocks for different teams. That splitting is called **subnetting**.
+
+```mermaid
+flowchart TB
+    B["One big block<br/>65,536 numbers"] --> S1["Block for web servers"]
+    B --> S2["Block for databases"]
+    B --> S3["Spare blocks"]
+```
+
+The rest of this note is just these 3 questions:
+1. How are addresses numbered and split into blocks?
+2. How does NAT let many devices share one public address?
+3. How does AWS use all of this inside a VPC?
+
 
 **The problem in one story.**
 Your home has a laptop, two phones and a TV, but your internet provider gives you just one public address.
@@ -69,7 +103,7 @@ Where it breaks: a real street cannot be resized, but a CIDR block can be split 
 > [!tip] Remember
 > `/N` fixes the first N bits; NAT lets many private devices share one public IP.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 **In plain words, the problem first.** IPv4 addresses are 32-bit numbers, so there can only ever be 2³² ≈ 4.3 billion of them. By the 1990s it was clear the internet would run out if every device got a globally unique one — there are more phones than that on the planet today.
 
@@ -100,7 +134,7 @@ flowchart LR
 > [!tip] Remember
 > CIDR solved address *allocation waste*; NAT solved address *scarcity* by letting many devices share one public address.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **Analogy — a street address split into neighborhood and house number.** An IPv4 address plus a prefix length (`10.0.1.17/24`) works like a postal address split in two parts:
 
@@ -117,7 +151,7 @@ Mail addressed to the building's front desk (the public IP) gets routed to the r
 
 Where this analogy breaks down: a front desk forwards *existing* expected mail; NAT also handles brand-new *outbound* mail from any apartment, assigning it a tracking number (a port) on the fly so the reply knows where to come back to — more like a building that also hands out its own temporary return-address stickers for outgoing letters.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### CIDR notation and prefix math
 
@@ -304,9 +338,11 @@ The five highlighted addresses are reserved before any instance can use one; eve
 > [!tip] Remember
 > A plain `/24` reserves 2 addresses; an AWS VPC subnet reserves 5: network, router (`.1`), DNS (`.2`), AWS-reserved (`.3`), and broadcast-equivalent (last address).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** to split a block into subnets, treat the address as one big number, keep adding the subnet size to it, and each sum is where the next subnet starts.
 
 The core of all CIDR math is converting an address to a 32-bit integer, adding a step size, and converting back:
 
@@ -326,7 +362,9 @@ func nextSubnet(base net.IP, prefix int) net.IP {
 
 Runnable Go version, including the full subnet-splitting function, the AWS reserved-address check, and all of the tests: [[IP Addressing, Subnets, NAT and VPC Basics - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** there is more than one way to hand out and share addresses. This table compares them: when each one fits, and what it costs you.
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -336,14 +374,14 @@ Runnable Go version, including the full subnet-splitting function, the AWS reser
 | IPv6, no NAT | Every host gets a globally unique address | Greenfield networks, mobile carriers, growing IoT fleets | Needs dual-stack support during a long IPv4 transition |
 | VPC peering / Transit Gateway | Route between VPCs without NAT | Multiple VPCs that must talk privately | CIDR ranges must not overlap between peered VPCs |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - NAT breaks the "every host has one address" assumption some protocols need (incoming connections, certain VoIP/P2P setups), requiring workarounds like STUN/TURN or hairpin NAT.
 - Over-sized subnets waste address space (a `/16` subnet for 10 hosts wastes 65,000+ addresses); over-small subnets force a painful re-IP when you outgrow them — plan subnet sizes for projected growth, not current headcount, and remember AWS's 5 reserved addresses per subnet when sizing the smallest ones.
 - A private subnet with a NAT gateway still costs money per hour and per GB processed in AWS; for truly air-gapped workloads, an isolated subnet with no route to `0.0.0.0/0` is cheaper and more secure.
 - Overlapping CIDR ranges between VPCs you'll eventually need to peer or merge (e.g., after an acquisition) are expensive to fix later — pick non-overlapping private ranges company-wide up front.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every AWS/GCP/Azure VPC or VNet; home and office routers running PAT; mobile carrier networks using Carrier-Grade NAT (CGNAT) to share IPv4 addresses across subscribers.
 - **Failure modes → fixes:**
@@ -353,7 +391,7 @@ Runnable Go version, including the full subnet-splitting function, the AWS reser
 	- **Private subnet with no NAT gateway route**: instances can't pull container images or call external APIs → confirm the route table actually points `0.0.0.0/0` at a NAT gateway, not left blank.
 - **What to monitor:** NAT gateway bandwidth and connection count (it has throughput limits per gateway), subnet IP exhaustion (free addresses remaining per subnet), and unexpected cross-AZ or cross-region data transfer costs from misrouted traffic.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why PAT's limit is ~64K, not unlimited:** the NAT table's key on the public side is (public IP, public port), and TCP/UDP ports are 16 bits, so one public IP can track at most 65,536 simultaneous outbound connections to *distinct* destinations before it must reuse a port.
 
@@ -363,11 +401,20 @@ Runnable Go version, including the full subnet-splitting function, the AWS reser
   CIDR let allocators hand out exactly `/23` (510 usable) instead, which is also why routing tables shrank: CIDR enabled **route aggregation**, where an ISP advertises one summarized prefix for many customer blocks instead of one route per customer.
 - **VPC route table precedence:** AWS route tables use **longest prefix match**, same as internet routers — a route for `10.0.1.0/24` wins over a route for `10.0.0.0/16` for a destination inside the smaller block, regardless of the order the routes were added.
 
+  In plain words: the most specific rule wins, like a letter addressed to a full flat number beating one addressed just to the street.
+
+  ```mermaid
+  flowchart LR
+      PKT["Packet to 10.0.1.5"] --> RT{"Route table"}
+      RT -- "10.0.1.0/24 (more specific) wins" --> PEER["Peering connection"]
+      RT -. "0.0.0.0/0 (catch-all) loses" .-> NAT["NAT gateway"]
+  ```
+
   This is how a VPC can route most traffic to a NAT gateway (`0.0.0.0/0`) while sending traffic to a specific peered VPC's CIDR (`10.1.0.0/16`) directly across the peering connection instead.
 - **Dual-stack and 6to4 transition realities:** most cloud providers now default new VPCs to dual-stack (IPv4 + IPv6) capable, but a huge share of enterprise internal tooling still assumes IPv4-only, so NAT and RFC 1918 planning remain a day-one decision even in 2026, not a legacy relic.
 - **The "isolated subnet" tier most tutorials skip:** databases and internal caches often sit in a subnet with *no* default route at all (not even to a NAT gateway), reachable only from the app-tier security group — an extra layer beyond "public vs private" that materially reduces blast radius if an app server is compromised.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does `/24` mean, and how many usable hosts does it have?
 > It means the first 24 of the 32 bits are the fixed network prefix, leaving 8 bits (256 addresses) for hosts. Two of those are reserved (the network address and the broadcast address), leaving 254 usable host addresses in a plain `/24` — though an AWS VPC subnet reserves 5 instead of 2, leaving 251.
@@ -390,7 +437,7 @@ Runnable Go version, including the full subnet-splitting function, the AWS reser
 > [!question]- Exactly which 5 addresses does AWS reserve in a VPC subnet, and why 5 instead of the usual 2?
 > Given `10.0.0.0/24`: `10.0.0.0` (network address), `10.0.0.1` (VPC router), `10.0.0.2` (AWS DNS resolver), `10.0.0.3` (reserved for future AWS use), and `10.0.0.255` (broadcast-equivalent, even though AWS doesn't support broadcast). A plain `/24` only reserves the first and last of these; AWS adds the middle three because its own virtual networking layer needs fixed addresses for the router and DNS resolver in every subnet it creates.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `/N` → first N bits fixed; `2^(32-N)` addresses in the block; usable hosts = that minus 2 (except /31, /32).
 - RFC 1918 private ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
@@ -401,7 +448,7 @@ Runnable Go version, including the full subnet-splitting function, the AWS reser
 - Pick non-overlapping CIDR ranges across your whole org before you ever need to peer VPCs.
 - IPv6's 128-bit space removes the scarcity that made NAT necessary, but private "unique local" ranges still exist.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]
 - **Next:** [[DNS - Resolution, Records and Caching]], [[TCP - Handshake, Reliability, Flow and Congestion Control]]

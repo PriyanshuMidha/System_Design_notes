@@ -20,7 +20,43 @@ updated: 2026-11-13
 > - A plain slice is a *bad* queue: `s = s[1:]` never frees the dropped prefix's memory. A ring buffer (circular array) or a buffered channel fixes this.
 > - A monotonic stack or deque keeps its elements in sorted order as a side effect of its push/pop rule, turning an `O(n²)` brute force into `O(n)`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **stack** and a **queue** are just lists with house rules about which end you may touch.
+
+A stack is a pile of plates: you add on top, you take from the top. Last one in is the first one out (LIFO). That is how "undo" works, and how function calls work.
+
+A queue is a line at a counter: you join at the back, you are served from the front. First in, first out (FIFO). That is how print jobs and task queues work.
+
+```mermaid
+flowchart TD
+    subgraph Stack["Stack (plates)"]
+        direction TB
+        S1["push and pop<br/>at the TOP only"]
+    end
+    subgraph Queue["Queue (line of people)"]
+        direction TB
+        Q1["join at BACK,<br/>leave from FRONT"]
+    end
+```
+
+```mermaid
+flowchart LR
+    A["add 1, 2, 3"] --> ST["stack gives back: 3, 2, 1"]
+    A --> QU["queue gives back: 1, 2, 3"]
+```
+
+A **deque** (double-ended queue) just allows both ends. The rest of this note is just three questions:
+1. How do you build each one so adding and removing is instant?
+2. Where do they show up in real systems and in Go?
+3. Which interview problems are secretly a stack or a queue?
 
 **The problem in one story.**
 You are writing a text editor and the user presses Ctrl+Z.
@@ -67,7 +103,7 @@ Where it breaks: nobody in a bank line gets dropped for memory reasons, but a Go
 > [!tip] Remember
 > Stack = most recent first; queue = oldest first; in Go, a slice is a fine stack but a ring buffer is the right queue.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you're parsing a document for balanced brackets, `{[()]}`. You need to know, at the moment you see a closing bracket, "what was the most recent unmatched opening bracket?" — not the first one, not all of them, just the *last* one still open.
 
@@ -82,7 +118,7 @@ Both are the same underlying idea — a linear sequence with disciplined access 
 > [!tip] Remember
 > Stack and queue are the same structure (a sequence) with opposite removal rules. Memorize the rule, not the structure: LIFO removes what you added most recently, FIFO removes what you added first.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A stack is a **pile of plates**: you can only take the top one off, and you can only put a new one on top. The plate on the bottom was the first one placed and the last one you'll ever reach.
 
@@ -92,7 +128,7 @@ A deque is a line where people can also join or leave from the *front* — usefu
 
 This analogy breaks down for the monotonic patterns below: a real queue never lets someone cut in based on how "useful" they are, but a monotonic stack/deque actively *removes* earlier entries that can never matter again.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### In plain words: a stack is a slice used LIFO
 
@@ -213,9 +249,11 @@ A buffered channel *is* a FIFO queue with built-in concurrency safety: `ch := ma
 > [!warning] Common mistake
 > Reading channel capacity as a hard ceiling on total throughput ever processed. It only bounds how many sends can complete without a matching receive — items keep flowing through continuously as long as receives keep pace with sends.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** this is the shortest honest version you could write on a whiteboard — a slice used as a stack, and the smallest ring buffer that works.
 
 ```go
 // LIFO: a slice used as a stack
@@ -244,7 +282,7 @@ flowchart LR
 
 Runnable Go version: [[Stacks, Queues and Deques - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -255,27 +293,27 @@ Runnable Go version: [[Stacks, Queues and Deques - Go]]
 | Monotonic stack/deque | Pushes maintain a sort order by popping dominated elements first | "Next greater/smaller," sliding-window max/min | `O(n)` total across the whole pass |
 | Durable message queue (Kafka, Redis Streams) | Persisted, acknowledged, replayable | Cross-process/cross-service queueing that must survive a crash | Network + disk I/O; see [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Kafka and Event Streaming]] |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **`q = q[1:]` is not a real queue.** It drops the logical front element but keeps the whole backing array alive and growing on every `append`, because `cap` never shrinks; for a long-running queue this is an unbounded memory leak disguised as working code. Use a ring buffer, or compact periodically with `copy(q, q[1:])` if you insist on staying slice-based.
 - **An in-memory queue is not a durable one.** A ring buffer or channel disappears with the process; if a job must survive a crash or be retried by a different process, that's a message broker's job (Kafka, Redis Streams), not this structure's.
 - **A stack only answers "what's most recent."** If you need "what's oldest" or "what's largest so far," that's a queue or a heap respectively, not a stack — don't force LIFO access onto a FIFO problem.
 - **A monotonic stack/deque only helps when the question is about the *nearest* dominating element.** For "the k largest elements overall" (not nearest), a heap is the right tool — see [[Heaps and Priority Queues]].
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** the JavaScript/Go/most-languages call stack is a stack (literally — stack overflow is this structure overflowing); goroutine scheduling and most thread pools use a work queue; a web server's accept queue for incoming connections is FIFO; browser back/forward history is two stacks; a sliding-window rate limiter can be implemented with a monotonic deque of request timestamps.
 - **Failure modes → fixes:** an unbounded in-memory queue causing OOM under a traffic spike → bound it (ring buffer with backpressure, or a buffered channel) and shed load once full, rather than growing without limit; a goroutine leak from a channel that's never closed, leaving a receiver blocked forever → always have a clear owner that closes the channel when production is done; a stack-based recursive algorithm hitting Go's growable-but-still-finite goroutine stack on pathological input → convert to an explicit stack-based iterative version (see Deep dive) for unbounded depth.
 - **What to monitor:** queue depth (how full the buffer is) as the leading indicator of a consumer falling behind; for a channel-based pipeline, how often sends block (a proxy for backpressure actually kicking in).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Goroutine stacks vs OS thread stacks.** A goroutine's stack starts at 2 KB and grows (by copying to a bigger segment) and shrinks as needed; an OS thread's stack is typically a fixed ~8 MB reservation. This is one reason Go programs can run hundreds of thousands of concurrent goroutines where an equivalent number of OS threads would exhaust memory on stack reservations alone — each goroutine's stack is sized for what it actually uses, not a worst-case guess.
 - **Recursion is an implicit stack.** Every recursive call pushes a new stack frame (return address, local variables, saved registers); deep enough recursion exhausts the stack (a stack overflow) exactly the way pushing too much data onto an explicit stack type would exhaust memory, just automated by the compiler and runtime. Converting a recursive algorithm (like DFS) to use an explicit heap-allocated stack trades the implicit, limited call stack for an explicit one bounded only by available memory.
 - **Why monotonic structures are O(n) despite the nested-looking loop.** In the "next greater element" and sliding-window-max patterns, the inner loop that pops looks like it could make the whole thing `O(n²)`, but each index is pushed exactly once and popped at most once across the *entire* run — so total pop operations across all iterations are bounded by `n`, making the amortised cost per index `O(1)` and the whole pass `O(n)`.
 - **Channels as queues have scheduler-level cost a slice doesn't.** A channel send/receive that blocks parks the goroutine and involves the Go scheduler; for single-goroutine, non-concurrent queueing, a ring buffer is strictly cheaper. Reach for a channel specifically when the concurrency and backpressure are the point.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is `q = q[1:]` a bug in a long-running queue, even though it compiles and "works"?
 > It never reclaims the backing array's dropped prefix: `cap` stays the same (or grows further via `append`) while the logical queue shrinks, so a queue that processes millions of items over its lifetime can pin megabytes of unreachable-looking memory. A ring buffer (or periodic `copy`-based compaction) avoids this.
@@ -298,7 +336,7 @@ Runnable Go version: [[Stacks, Queues and Deques - Go]]
 > [!question]- What does backpressure mean for a buffered channel, and why is it useful?
 > A send blocks once the channel's buffer is full, which forces the producer to slow down to the consumer's actual processing rate instead of queueing unboundedly; this converts "the consumer falls behind and memory grows forever" into "the producer naturally slows down," which is usually the safer failure mode.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Stack = LIFO; a Go slice is a stack for free via `append`/reslice.
 - Queue = FIFO; never use `q = q[1:]` long-term — use a ring buffer or a buffered channel.

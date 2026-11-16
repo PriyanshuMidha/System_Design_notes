@@ -26,7 +26,37 @@ updated: 2026-11-13
 > - Single-table design stores several entity types in one table and overloads generic index attributes (`GSI1PK`, `GSI1SK`) to serve many patterns.
 > - Both stores support multi-item transactions, but they cost more and are capped, so the model should make most writes touch one item or document.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (comparison and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Think of a normal database (SQL) as a big, tidy filing cabinet. You can ask it almost any question later, and it will dig out the answer.
+
+A NoSQL store like DynamoDB or MongoDB works the other way. It is extremely fast, but only at the questions you prepared for. Ask something it was not built for and it has to read everything.
+
+So the trick is simple: before you store anything, write down every question the app will ask. Each one is called an **access pattern** (one exact read or write, like "show this client's invoices"). Then you shape the data so each question is one direct grab, found by its **key** (the label the store uses to find data instantly).
+
+```mermaid
+flowchart LR
+    A["SQL: store neatly"] --> B["ask anything later"]
+    C["NoSQL: write down the questions first"] --> D["shape data so each<br/>question is one grab"]
+```
+
+```mermaid
+flowchart LR
+    Q["'Show client c_1's invoices'"] --> K["key: CLIENT#c_1"] --> R["all its invoices,<br/>already sitting together"]
+```
+
+The rest of this note is just these 4 questions:
+1. Why plan the questions first instead of the data?
+2. In MongoDB, when do you put related data inside one document and when do you keep it separate?
+3. In DynamoDB, how do keys and indexes make each question one cheap read?
+4. What goes wrong at scale (hot keys, too-big documents) and how do you avoid it?
 
 **The problem in one story.**
 In SQL you store data neatly and can ask almost any question later.
@@ -70,7 +100,7 @@ Where it breaks: a real librarian can still walk every shelf; a full table scan 
 > [!tip] Remember
 > In NoSQL, the access patterns come first; every pattern must be one key lookup or one range query.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps runs on PostgreSQL. Suppose a team moves its invoice reads to DynamoDB and copies the relational schema one-to-one: tables `workspaces`, `clients`, `invoices`, `invoice_items`, `payments`.
 
@@ -99,7 +129,7 @@ sequenceDiagram
 
 The data model did not fail because NoSQL is slow. It failed because it was designed for a database that can answer any query, and DynamoDB answers only the queries its keys were designed for. NoSQL data modeling is the discipline of designing those keys.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **Relational:** model the *data* (entities, relationships, normal forms), then any query works, with indexes added for speed.
 
@@ -130,9 +160,11 @@ Key terms used below:
 - **GSI / LSI:** global and local secondary indexes, copies of items keyed differently (explained in section 3.4).
 - **RCU / WCU:** read and write capacity units; 1 WCU is one write per second of an item up to 1 KB, and 1 RCU is one strongly consistent read per second of up to 4 KB (or two eventually consistent reads).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Step 1: list the access patterns
+
+**In plain words: before building anything, write a shopping list of every question the app will ask and how often, like planning a kitchen around the dishes you actually cook.**
 
 The first design step is a table of every read and write, with its rate. For InvoiceOps (rates are estimates for a mid-sized deployment):
 
@@ -151,6 +183,8 @@ Anything not on this list (for example "revenue by country across all tenants") 
 Example with numbers: the read patterns add up to 300 + 80 + 40 + 20 + 200 = 640 reads per second and the writes to 30 + 20 = 50 writes per second. AP1 is nearly half of all traffic, so it deserves the cheapest possible shape: one key lookup.
 
 ### 3.2 MongoDB: embed or reference
+
+**In plain words: "embed" means stapling related pages into one folder so you grab them together; "reference" means writing "see folder 42" instead, for things that are big, shared, or never stop growing.**
 
 The relational schema maps onto documents like this:
 
@@ -192,6 +226,8 @@ Example with numbers: an invoice with 3 lines of 200 bytes is about 1 KB, so emb
 
 ### 3.3 MongoDB design patterns
 
+**In plain words: these are six ready-made tricks, each one a fix for a common document problem, like a cookbook of repairs (too many small items? bucket them; sums too slow? store the total).**
+
 MongoDB's documented design patterns each fix one specific problem:
 
 | Pattern | Idea | InvoiceOps example |
@@ -219,6 +255,8 @@ flowchart TB
 Bucketing caps each document at one day of events, so appends touch only the open bucket.
 
 ### 3.4 DynamoDB: partition key, sort key and indexes
+
+**In plain words: the partition key is the street address (which building your data lives in) and the sort key is the order of files inside that building; an index (GSI) is a second copy of the files, sorted a different way for a different question.**
 
 ```mermaid
 flowchart LR
@@ -251,6 +289,8 @@ flowchart LR
 Example with numbers: sort keys `INV#2026-10#inv_700`, `INV#2026-11#inv_811`, `INV#2026-11#inv_812` are stored in that byte order inside partition `WS#acme`. `begins_with(SK, "INV#2026-11")` reads the last two as one contiguous range and never touches the first.
 
 ### 3.5 Single-table design
+
+**In plain words: instead of one table per thing (users, clients, invoices), you throw every kind of item into one big table and use clever key labels, so one read fetches everything a page needs — like one drawer organised so each request grabs a pre-packed bundle.**
 
 Single-table design puts every entity type in one table, with generic key names (`PK`, `SK`, `GSI1PK`, `GSI1SK`), so that related items share a partition and come back from one `Query`.
 
@@ -306,6 +346,8 @@ The sparse index above is this lifecycle: membership in `GSI2` is controlled by 
 
 ### 3.6 Transactions in both stores
 
+**In plain words: a transaction is an "all or nothing" bundle of writes; both stores offer it, but it costs roughly double, so good designs keep most writes to one document or one item.**
+
 Both stores have them; neither makes them free.
 
 | | MongoDB | DynamoDB |
@@ -317,9 +359,11 @@ Both stores have them; neither makes them free.
 
 Transaction theory (atomicity, isolation) lives in [[Transactions and ACID]] and [[Isolation Levels and MVCC]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words: this is the whole design in four lines — each question becomes one lookup on one key, built from simple prefixes like `WS#` and `INV#`.**
 
 Every access pattern is one `Query` on one partition key, with keys built from entity prefixes:
 
@@ -332,6 +376,8 @@ fmt.Println("AP3 Query GSI1PK =", "CLIENT#"+client)
 ```
 
 ### 4.1 The same invoice in MongoDB
+
+**In plain words: in MongoDB the whole invoice — its lines, payments and a small copy of the client's name — lives in one document, so reading it is one grab and recording a payment is one safe update.**
 
 The invoice is one document: embedded `items` and `payments`, an extended reference `client: {_id, name}`, computed `total_minor` (250000) and `paid_minor` (150000), and `schema_version: 2`. The full JSON is in [[NoSQL Data Modeling - Go]].
 
@@ -360,6 +406,8 @@ What the SQL version had and this one must rebuild: the uniqueness of `(provider
 
 ### 4.2 The same invoice in DynamoDB, with pagination
 
+**In plain words: DynamoDB hands back results a page at a time with a bookmark (`LastEvaluatedKey`); you keep sending the bookmark back until there is none left, like reading a book chapter by chapter.**
+
 A page of results ends at the item limit (or 1 MB), and the last sort key comes back as the cursor, `LastEvaluatedKey`. The caller sends it back as `ExclusiveStartKey` until it is absent.
 
 ```mermaid
@@ -376,6 +424,8 @@ sequenceDiagram
 The key builders, the in-memory `Query` (prefix, order, cursor), an overloaded GSI query and write sharding are implemented and tested in Go. Runnable Go version: [[NoSQL Data Modeling - Go]]
 
 ### 4.3 Capacity arithmetic
+
+**In plain words: quick back-of-envelope math to check the reads and writes fit under DynamoDB's per-partition limits — the danger is never the total, it is one key taking all the traffic.**
 
 - AP1 reads about 3 KB per invoice (meta, 3 lines, 1 payment): one eventually consistent `Query` costs 0.5 RCU (3 KB rounds up to 4 KB, halved). At 300 QPS that is 150 RCU per second, far below any limit.
 - AP6 writes a 0.5 KB payment and updates two 1 KB invoice copies in a transaction: 3 items × 1 WCU × 2 (transaction) = 6 WCU per payment, 180 WCU per second at 30 QPS.
@@ -394,7 +444,7 @@ flowchart LR
     SHARD -- "reader queries all 10 and merges" --> MERGE["up to 10,000 WCU/s"]
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -418,7 +468,7 @@ flowchart TD
     Q4 -- "no" --> DM["DynamoDB multi-table"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **New questions are expensive.** A pattern you did not plan for means a new index, a backfill or a `Scan`. If the product changes weekly, a relational model is cheaper.
 - **Duplication means fan-out.** Copying a client's name into 40,000 invoices makes the rename a 40,000-item background job, and readers see a mix during it.
@@ -426,7 +476,7 @@ flowchart TD
 - **Analytics do not fit.** Aggregations across all items are scans; export to an analytics store instead.
 - **When not to use:** the data is relational, the scale fits one Postgres primary (most applications), and the team values ad-hoc queries. [[SQL vs NoSQL]] has the full decision.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems.**
 - Amazon's own guidance and public talks (Rick Houlihan, re:Invent 2018) popularised single-table design with overloaded GSIs.
@@ -458,7 +508,7 @@ sequenceDiagram
 - DynamoDB: `ThrottledRequests`, `ReadThrottleEvents`/`WriteThrottleEvents` per table and GSI, consumed versus provisioned capacity, CloudWatch Contributor Insights for the most-accessed keys.
 - MongoDB: document size distribution, slow query log, `COLLSCAN` in query plans, transaction aborts and retries.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why a Query is cheap and a filter is not.** Inside a partition, DynamoDB stores items ordered by sort key, so a sort-key condition is a range read of contiguous items. A `FilterExpression` is applied after the items are read: you pay for every item read, including those dropped. Design keys so the filter becomes a key condition.
 
@@ -501,7 +551,7 @@ stateDiagram-v2
     AllV2 --> [*]: delete the v1 read path
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you start designing a DynamoDB or MongoDB schema?
 > List every access pattern with its expected rate and size, and whether it reads or writes. Then design keys (DynamoDB) or document boundaries (MongoDB) so each pattern is one key lookup or one range query. Patterns not on the list go to another store or wait for a new index.
@@ -524,7 +574,7 @@ stateDiagram-v2
 > [!question]- Why did my DynamoDB `Query` with `Limit = 20` return 3 items and a `LastEvaluatedKey`?
 > `Limit` caps the number of items read before the `FilterExpression` is applied, so 17 were read and filtered out. The page is not the end; keep paging until `LastEvaluatedKey` is absent, and move the filter into the key condition if possible.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Access patterns first, with QPS; every pattern is a key lookup or range query.
 - MongoDB: embed one-to-few, reference one-to-many, parent-reference one-to-squillions; 16 MB documents; no unbounded arrays.
@@ -535,7 +585,7 @@ stateDiagram-v2
 - Transactions exist in both (Mongo 4.0+/4.2+, DynamoDB 100 actions) but cost more; model so most writes touch one unit.
 - Paginate with `LastEvaluatedKey` → `ExclusiveStartKey`; `Limit` applies before filters.
 
-## Links
+## Links 🟢
 
 - **Runnable code:** [[NoSQL Data Modeling - Go]]
 - **Before this:** [[SQL vs NoSQL]], [[Relational Schema Design]], [[Partitioning and Sharding]]

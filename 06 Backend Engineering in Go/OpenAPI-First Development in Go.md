@@ -23,7 +23,30 @@ updated: 2026-11-13
 > - **Request/response validation middleware** (`kin-openapi`) rejects a request that violates the spec — a missing required field, a value outside an enum — before your handler code ever sees it, and validates the response your handler sent against the same spec in tests.
 > - This note is the Go implementation. [[API Contract Design and OpenAPI]] owns the contract concepts (what a good contract looks like, versioning, consumer-driven contracts); this note is what runs once you have one.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When your API and its documentation are written separately, they drift apart. **OpenAPI** fixes this by making the document come first.
+
+You describe every endpoint — paths, inputs, outputs — in one YAML file called the **spec**. Then a generator (`oapi-codegen`) turns that spec into Go types and server skeletons.
+
+```mermaid
+flowchart LR
+    S[openapi.yaml - the contract] --> G[oapi-codegen] --> T[Go types + server interface] --> H[You fill in the handlers]
+```
+
+Now the compiler is your contract checker: if your handler returns a shape the spec did not declare, the build fails. Docs cannot lie, because the code is generated from them.
+
+The rest of this note is just these 3 questions:
+1. What does a minimal spec file look like?
+2. How does the generated "strict server" force handlers to match it?
+3. How do you validate live requests against the spec at runtime?
 
 **The problem in one story.**
 The backend team and the frontend team agree on what `POST /invoices` sends and returns.
@@ -67,7 +90,7 @@ Where it breaks: a blueprint cannot check that the plumbing actually works; the 
 > [!tip] Remember
 > Write the contract first, generate the code from it, and let the compiler and tests catch any mismatch.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A team writes `POST /invoices`, documents it in a wiki page, and ships it.
 
@@ -82,7 +105,7 @@ Spec-first does not eliminate the risk of drift by itself — a handwritten hand
 
 Code-first (generating the spec from annotations on the Go code, like `swaggo`) can't catch either failure mode, because the spec it produces is defined as whatever the code already does — there is nothing independent left to disagree with.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat `openapi.yaml` the way you'd treat a database migration: it is checked into the repo, reviewed in the same PR as the handler that implements it, and nothing downstream (server code, client SDKs, docs site) is hand-maintained — all of it is generated from that one file.
 
@@ -101,7 +124,7 @@ flowchart LR
 
 Every box except `IMPL` (the business logic you actually write by hand) is either the spec itself or generated from it. The spec is upstream of the code, not the other way around.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### OpenAPI 3.0 vs 3.1
 
@@ -112,6 +135,8 @@ Most Go tooling (`oapi-codegen`, `kin-openapi`, Swagger UI) is most mature again
 Pick 3.1 only once your whole toolchain (codegen, linter, docs renderer) confirms 3.1 support; mixing a 3.1 spec with a 3.0-only tool produces confusing validation errors that look like a spec bug but are really a version mismatch.
 
 ### A minimal spec
+
+**In plain words:** a small YAML file that names one endpoint, what goes in and what comes out — read it top to bottom once and the format stops being scary.
 
 ```yaml
 openapi: 3.0.3
@@ -184,6 +209,8 @@ Every piece has a job:
 
 ### oapi-codegen: the strict server
 
+**In plain words:** the generator writes an interface where each endpoint's inputs and outputs are exact Go types, so the compiler rejects a handler that strays from the contract.
+
 Run as a `go:generate` directive against the spec above:
 
 ```go
@@ -249,6 +276,8 @@ The business value of this split: `StrictServerInterface.CreateInvoice` is a pla
 
 ### Request/response validation (kin-openapi)
 
+**In plain words:** a middleware that checks every live request against the spec, so a request the spec forbids never reaches your handler.
+
 Generated types stop a *handler* from returning the wrong shape; they do nothing about an incoming request that already violates the spec (a missing field, a value outside an enum) — that check runs as middleware, using `kin-openapi` to load the same spec and validate every request against it before the handler runs:
 
 ```mermaid
@@ -269,9 +298,11 @@ sequenceDiagram
     H-->>C: 201 Created
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** spec in, generated code out, one filled-in handler.
 
 The bare idea: load the spec, find the matching route, validate the request against it.
 
@@ -526,7 +557,7 @@ func TestSpecYAML_IsAValidOpenAPIDocument(t *testing.T) {
 
 **Measured:** `go test -race ./...` (Go 1.24.4, `github.com/getkin/kin-openapi v0.131.0`): 6 test functions, all passed — a valid body (201, with a generated ID), a missing bearer token (400), a missing required field (400, `application/problem+json`), an out-of-enum currency (400), the business-rule rejection path called directly against `InvoiceService` (bypassing HTTP entirely, to prove the rule holds for a non-HTTP caller too), and the spec's own self-validation.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Tool | Direction | How it works | Use when | Cost |
 | --- | --- | --- | --- | --- |
@@ -537,14 +568,14 @@ func TestSpecYAML_IsAValidOpenAPIDocument(t *testing.T) {
 | `oasdiff` | Spec-first, CI | Diffs two versions of a spec and classifies each change as breaking or not | A CI gate that fails a PR removing a field or narrowing an enum without a version bump | Needs both the old and new spec available in CI (usually the base branch and the PR branch) |
 | `schemathesis` | Spec-first, CI | Generates requests from the spec's schemas (property-based testing) and fires them at a running server, asserting every response matches the spec too | Contract testing that doesn't require hand-writing a case per field combination | A Python tool in a CI step, not a Go dependency — it drives the service as a black box over HTTP |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Spec-first adds a step: the handler author has to write or extend the spec before a line of handler code compiles against it. On a one-person prototype with an API that will be thrown away in a week, that ceremony is not worth it — code-first or even no spec at all is the right call until the API stabilizes.
 - Generated code is code you did not write and should not hand-edit — a manual tweak to `types.gen.go` disappears the next time someone regenerates it. Anything you need to customize belongs in a separate file (like `service.go` here) that imports the generated package, never inside the generated file itself.
 - `kin-openapi` validation is a runtime cost per request (parsing the schema tree, walking it against the body) — real but usually small next to a database round trip; profile before assuming it matters.
 - A spec that is reviewed but not actually generated from (the team edits `openapi.yaml` and the handler separately, by hand, "to match") gets every drift risk of a wiki page back, just in YAML instead of prose. The protection only exists if generation and validation are wired into the build, not optional steps a rushed PR can skip.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Stripe, GitHub and Twilio all publish a maintained OpenAPI spec as their primary API contract and generate SDKs from it in multiple languages — the same spec-first idea InvoiceOps applies to its own internal Go service. `oapi-codegen` is used widely across the Go ecosystem specifically for the strict-server pattern this note covers.
 - **Failure modes → fixes:**
@@ -554,14 +585,14 @@ func TestSpecYAML_IsAValidOpenAPIDocument(t *testing.T) {
   - Docs site (Swagger UI/Redoc/Scalar) goes stale because it's built from a copy of the spec checked in elsewhere → serve the docs site directly from the same `api/openapi.yaml` the server validates against, not a second copy.
 - **What to monitor:** validation-middleware rejection rate by operation (a spike after a client deploy usually means the client is sending a shape the spec no longer allows, or never allowed), and `oasdiff`/CI spec-lint failure rate over time (a team that keeps needing to force-merge past a breaking-change gate has a process problem, not a tooling problem).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the strict server is worth the extra generated boilerplate.** The non-strict `ServerInterface` oapi-codegen can also generate hands you a plain `func(w http.ResponseWriter, r *http.Request)` per operation — exactly as easy to misuse as a hand-written handler, because nothing stops you from writing `w.WriteHeader(599)` or forgetting to write anything at all. The strict server's `xxxResponseObject` interface is implemented only by the types generated from that operation's actual declared responses, so returning an undeclared status is a compile error, and the `Visit` method being the only way to write a response makes "forgot to respond" and "responded twice" both structurally harder to do by accident.
 - **Validating responses, not just requests.** `openapi3filter.ValidateResponse` exists alongside `ValidateRequest` and takes the same `Route`; the natural place for it is a test helper wrapped around `httptest.NewRecorder()`'s result, not production middleware — validating every outgoing response on the hot path doubles the per-request schema-validation cost for a guarantee the generated types already give you for free (a correctly-typed handler cannot produce a response shape the schema disagrees with, *except* for things schemas can express that Go's type system can't, like an `enum` or a numeric `minimum` — which is exactly the gap `ValidateResponse` in a test closes).
 - **`$ref` and schema reuse.** A spec of any real size extracts shared pieces (`Problem`, a `PageInfo` wrapper, a shared `AuditFields` object) into `components/schemas` and references them with `$ref` everywhere they're used, the same "one concept, one definition" discipline this vault applies to notes — a schema inlined in five places drifts the same way five copy-pasted paragraphs do.
 - **Generated TypeScript clients from the same spec.** `openapi-typescript` or `oapi-codegen`'s own TypeScript-generator ecosystem equivalent can consume the exact same `openapi.yaml` InvoiceOps's Go server validates against, so the frontend's request/response types come from the same source of truth as the backend's — the structural reason a frontend and a backend built against the same spec cannot silently disagree about a field's name or type the way two independently-maintained hand-written clients can.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Spec-first vs. code-first: what's the actual difference, and which prevents drift?
 > Spec-first writes `openapi.yaml` first and generates Go types/server code from it; code-first (like `swaggo`'s annotations) writes Go first and generates the spec from what the code already does. Only spec-first can catch "the code disagrees with the contract" as a distinct failure, because the spec is reviewed and versioned independently of the implementation. Code-first's spec is definitionally always in sync with the code, because it's derived from the code — it just can't tell you the code itself is wrong.
@@ -581,7 +612,7 @@ func TestSpecYAML_IsAValidOpenAPIDocument(t *testing.T) {
 > [!question]- Trap: if `oapi-codegen` generates types from the spec, do you still need a validation middleware?
 > Yes — and this is the distinction the strict server's safety is often mistaken for covering. Generated types guarantee your *handler's own output* matches a declared shape; they say nothing about an *incoming* request, which arrives as raw JSON over the wire and has to be checked against `required` fields, `enum` values and numeric bounds before it's even safe to decode into the typed struct. That check is exactly what the `kin-openapi` validation middleware does, and skipping it means a malformed request only fails once your handler's own (duplicated, hand-written) validation catches it — or doesn't.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Spec-first: write `openapi.yaml`, generate Go from it. Code-first: write Go, generate the spec. Only spec-first catches code-vs-contract drift.
 - 3.0 is still the most-supported version across Go tooling; 3.1 aligns with JSON Schema 2020-12 (`nullable: true` becomes `type: ["x", "null"]`).
@@ -592,7 +623,7 @@ func TestSpecYAML_IsAValidOpenAPIDocument(t *testing.T) {
 - `oasdiff` in CI blocks breaking spec changes (removed field, narrowed enum, new required field) before they ship.
 - Serve docs (Swagger UI/Redoc/Scalar) from the exact spec file the server validates against — never a separately maintained copy.
 
-## Links
+## Links 🟢
 - **Before this:** [[API Contract Design and OpenAPI]], [[Building REST Endpoints]], [[Request Decoding, Validation and DTOs]]
 - **Next:** [[Testing Go Services]], [[Middleware]]
 - **Compare with:** [[REST and HTTP API Design]] (the design decisions a spec encodes), [[gRPC]] (protobuf as the equivalent spec-first contract for RPC instead of REST)

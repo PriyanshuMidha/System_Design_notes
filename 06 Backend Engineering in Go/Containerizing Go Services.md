@@ -25,7 +25,32 @@ updated: 2026-11-13
 > - `ko` builds and pushes a container image straight from Go source with no Dockerfile at all, by exploiting the fact that a pure-Go binary needs nothing else in the image.
 > - Classic mistake: setting `GOMEMLIMIT` to the exact value of `memory.max`. Leave headroom — a limit with no margin still gets OOM-killed by any allocation spike the GC hasn't caught up with yet.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You put your Go service in a container and give it limits: "you may use 2 CPUs and 512 MB of memory". Here is the catch: the Go runtime does not look at those limits. It looks at the whole machine.
+
+On a 64-core machine, your 2-CPU container still thinks it has 64 cores, and schedules work like it. Result: the kernel keeps pausing it (**throttling**), and it can eat past its memory cap and get killed (**OOM kill**).
+
+```mermaid
+flowchart LR
+    H[Host: 64 cores, 256 GB] --> C[Container limit: 2 CPUs, 512 MB]
+    C --> G[Go runtime reads the HOST numbers]
+    G --> P[Throttling and OOM kills]
+```
+
+Two settings fix it: `GOMAXPROCS` (how many CPUs Go uses) and `GOMEMLIMIT` (where Go starts cleaning memory harder). This note is about setting both from the container's real limits.
+
+The rest of this note is just these 3 questions:
+1. How does the mismatch happen and how do you read the real limits?
+2. How do you set `GOMAXPROCS` and `GOMEMLIMIT` correctly?
+3. What does `ko` give you instead of a hand-written Dockerfile?
 
 **The problem in one story.**
 You pack your Go server into a container and give it 2 CPUs and 512 MB.
@@ -71,7 +96,7 @@ Where it breaks: real throttling lasts only until the next 100ms period, not an 
 > [!tip] Remember
 > Tell Go the container's real CPU and memory limits, and leave memory headroom below the hard limit.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps' API deployment requests `resources.requests.cpu: "500m"` and caps at `resources.limits.cpu: "2"`, `resources.limits.memory: "512Mi"`, scheduled onto a shared Kubernetes node with 64 physical cores and 256 GiB of RAM. Kubernetes enforces that limit with a cgroup: `cpu.max` for this pod reads `200000 100000` (200ms of CPU time per 100ms period — 2 CPU-equivalents), and `memory.max` reads `536870912` (512 MiB).
 
@@ -99,7 +124,7 @@ It sends `SIGKILL` to a process in a cgroup that exceeds its memory limit, with 
 
 `GOMEMLIMIT` makes the garbage collector responsive to an approaching ceiling instead of only to `GOGC`'s heap-doubling rule, buying real headroom against exactly this failure — not immunity from it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The host hands the container a lease that reads "64 rooms, unlimited power" — but the building's real wiring only ever ran 2 circuits to that unit, metered at 512 MiB.
 
@@ -107,9 +132,11 @@ A process that only ever reads the lease behaves as if it had 64 rooms until the
 
 Reading the actual meter — the cgroup files under `/sys/fs/cgroup` — and reconfiguring the runtime at startup is the only way the process behaves according to what it actually has, rather than what the host claims to have.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Reading the real limits and reconfiguring the runtime
+
+**In plain words:** the container's true CPU and memory caps sit in small files (cgroups); read them and tell Go about them at startup.
 
 ```mermaid
 flowchart TD
@@ -139,6 +166,8 @@ On Go 1.24 the same computation is done explicitly, by hand (shown below) or wit
 
 ### `ko`: building a Go container image without a Dockerfile
 
+**In plain words:** a build tool that knows how Go programs work, so it can build a tiny correct image with zero Dockerfile to maintain.
+
 A pure-Go, `CGO_ENABLED=0` binary needs nothing from an operating system image at all — no shell, no libc, no package manager — which is exactly what [[Docker 04 - Writing a Production Dockerfile for Go]]'s multi-stage Dockerfile already produces by hand.
 
 `ko` (`github.com/google/ko`) skips writing that Dockerfile. `ko build ./cmd/api`:
@@ -158,6 +187,8 @@ No local Docker daemon, no `docker build` layer cache, no Dockerfile to keep in 
 
 ### Untuned vs tuned, across one CFS accounting period
 
+**In plain words:** a before/after timeline of the same workload — untuned, the kernel keeps hitting pause on your service.
+
 ```mermaid
 sequenceDiagram
     participant CFS as Linux CFS scheduler<br/>(100ms accounting period)
@@ -176,9 +207,11 @@ sequenceDiagram
     Note over Tuned: no throttling. Latency reflects actual work, not scheduling.
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the few startup lines that make Go respect its container.
 
 The bare idea, with no error handling: read the two cgroup files, compute, apply.
 
@@ -500,7 +533,7 @@ The mechanics live in [[Docker 04 - Writing a Production Dockerfile for Go]] (mu
 - **Probes hit app endpoints** (`/healthz`, `/readyz`) over HTTP from the kubelet; distroless has no `curl` or shell for a `HEALTHCHECK`.
 - **Expect an image of roughly 10-20 MB** on `distroless/static` and a start-up time dominated by the service's own initialization, not the runtime.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach to sizing `GOMAXPROCS`/`GOMEMLIMIT` | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -512,14 +545,14 @@ The mechanics live in [[Docker 04 - Writing a Production Dockerfile for Go]] (mu
 > [!warning] Interview trap
 > Setting `GOMAXPROCS` higher than the cgroup's CPU quota does not make a CPU-bound Go service faster. It makes the CFS scheduler throttle it harder, because the runtime schedules more concurrent work than the quota allows per period — the fix is sizing `GOMAXPROCS` down to match the quota, not up.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `GOMEMLIMIT` trades a larger average heap for fewer, more predictable GC pauses when paired with `GOGC=off` — a service that is latency-sensitive on every request, not just at the tail, may prefer `GOGC`'s default pacing instead.
 - A soft `GOMEMLIMIT` very close to the hard `memory.max` (no headroom) can leave the GC "chasing" an allocation burst it cannot win — a bad allocation pattern (a single giant `[]byte` instead of streaming) will still OOM-kill the pod regardless of how the limit is tuned; `GOMEMLIMIT` mitigates slow accumulation, not one enormous allocation.
 - `automaxprocs` reads the cgroup once, at startup. If Kubernetes changes a pod's CPU limit through an in-place resize without a restart, the value goes stale; Go 1.25's runtime re-checks periodically and handles that case, the library does not (restart the pod, or use the runtime's behavior).
 - For a service that always runs with a fixed, generous resource allocation (a singleton batch job on its own dedicated node), this tuning adds code for no measurable benefit — the mismatch it fixes only matters when the container's limit is meaningfully smaller than the host.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Uber published `automaxprocs` after observing exactly the CFS-throttling pattern described above across their own Go fleet; it has since become close to a default dependency for Go services on Kubernetes. Go's own release notes for 1.19 (`GOMEMLIMIT`) and 1.25 (container-aware `GOMAXPROCS`) both cite container deployments as the motivating case.
 - **Failure modes → fixes:**
@@ -529,14 +562,14 @@ The mechanics live in [[Docker 04 - Writing a Production Dockerfile for Go]] (mu
   - Database migrations fail or run twice during a rolling deploy → migrations do not belong in the same container lifecycle as request-serving replicas at all; run them as a separate Kubernetes `Job` (see [[Kubernetes Fundamentals]]) gated ahead of the rollout, not from inside `main()` on every pod start.
 - **What to monitor:** `container_cpu_cfs_throttled_seconds_total` (CPU throttling), `go_memstats_heap_alloc_bytes` against the configured `GOMEMLIMIT` and the cgroup's `memory.max`, GC pause time (`go_gc_duration_seconds`), and container exit codes (`137` specifically). Supply-chain checks — `govulncheck`, `gosec`, SBOM generation, image signing — run in CI ahead of any of this; see [[CI-CD Pipelines (GitHub Actions for Go)]] for exactly where they sit in the pipeline and [[Secure Coding for Go Services]] for what `govulncheck` and `gosec` each catch.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **`GOMEMLIMIT` is a soft limit, not a hard one.** `debug.SetMemoryLimit` changes GC *pacing* — how aggressively the collector reacts as the live heap approaches the limit — but it cannot stop a single allocation from exceeding it between collections. It reduces OOM risk under gradual heap growth; it does not convert Go's garbage collector into a hard memory allocator with a ceiling it physically cannot cross. `debug.SetMemoryLimit(-1)` changes nothing and returns the current limit, which is how a service reads back its own setting; the default (no limit) is `math.MaxInt64`, so `debug.SetMemoryLimit(math.MaxInt64)` turns the limit off again.
 - **cgroup v1 vs v2.** Everything above assumes cgroup v2, the default on current Kubernetes and most modern Linux distributions, where the files are `memory.max` and the single `cpu.max` (quota and period together). cgroup v1 splits the same information across `memory.limit_in_bytes`, `cpu.cfs_quota_us`, and `cpu.cfs_period_us` as separate files, with `-1` meaning "unlimited" instead of the literal string `max`. `automaxprocs` and Go 1.25's native support both detect which version is mounted and parse accordingly; code written only against v2 paths silently reads nothing (and falls back to host defaults) on a v1 host. Also note that `/sys/fs/cgroup/cpu.max` is the container's own cgroup only when the container has its own cgroup namespace (the default under Docker and Kubernetes on cgroup v2); a hand-rolled reader on a host without one would read the wrong file.
 - **Why the GC mark workers scaling off `GOMAXPROCS` matters specifically.** The garbage collector dedicates up to 25% of `GOMAXPROCS` to background mark assist work during a collection. On an oversized `GOMAXPROCS`, that 25% is computed against the wrong (too large) number, so a GC cycle alone can be enough to saturate a small CPU quota even when the application's own request-handling goroutines are idle — which is why throttling can appear correlated with GC frequency rather than with request volume.
 - **Multi-arch and `ko`.** `ko` cross-compiles for every requested `GOOS`/`GOARCH` pair the same way `go build` does natively (no QEMU, no emulated compilation) and assembles a single multi-platform manifest list, functionally the same end state `buildx build --platform linux/amd64,linux/arm64` produces for a hand-written Dockerfile — the difference is entirely in how much of the image layout is explicit versus inferred.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does a pod capped at 2 CPUs still get `GOMAXPROCS=64` by default on a 64-core node?
 > `runtime.NumCPU()` reads the host's CPU count via the kernel, not the container's cgroup `cpu.max` limit. The Go runtime has no built-in awareness of cgroups before Go 1.25, so without explicit tuning (manual, `automaxprocs`, or 1.25's native support) `GOMAXPROCS` reflects the host, not the quota actually granted.
@@ -559,7 +592,7 @@ The mechanics live in [[Docker 04 - Writing a Production Dockerfile for Go]] (mu
 > [!question]- Why does `ExtractVersionInfo` take a `*debug.BuildInfo` parameter instead of calling `debug.ReadBuildInfo()` itself?
 > So the extraction logic — which fields to look for, how to parse `vcs.modified`'s string value into a bool — can be unit-tested with a hand-built `BuildInfo` struct, including the no-VCS-info case a shallow CI checkout produces, without needing a real git repository on the test runner.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `runtime.NumCPU()` reads the host, not the cgroup — always tune `GOMAXPROCS` explicitly for a CPU-limited container.
 - `GOMAXPROCS = ceil(quota_us / period_us)` from `cpu.max`, floored at 1.
@@ -570,7 +603,7 @@ The mechanics live in [[Docker 04 - Writing a Production Dockerfile for Go]] (mu
 - `runtime/debug.ReadBuildInfo()` exposes the VCS commit a binary was built from — complementary to, not a replacement for, `-ldflags -X` stamping.
 - Run database migrations as a separate Kubernetes `Job`, never from inside a replica's own startup path.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Docker 04 - Writing a Production Dockerfile for Go]], [[Graceful Shutdown and Health Checks]], [[Configuration and Secrets]]
 - **Next:** [[Secure Coding for Go Services]], [[CI-CD Pipelines (GitHub Actions for Go)]]

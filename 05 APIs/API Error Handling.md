@@ -29,7 +29,40 @@ updated: 2026-11-13
 > - Tell clients what is retryable (`429`, `503`) and what is not (`400`, `422`).
 > - Classic mistake: leaking stack traces or SQL errors, or making clients parse the message text.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You tap "Book" in an app and it fails. The server has to answer *something*. That answer is the error response.
+
+A good error answer serves three readers at once. The app needs a fixed **error code** (a short label like `SEAT_TAKEN`) it can check with an `if`. You need a sentence in plain language telling you what to do. The engineers need a **request ID** (a unique tag for this one call) to find it in their logs.
+
+```mermaid
+flowchart LR
+    E["One error response"] --> A["App: code SEAT_TAKEN"]
+    E --> U["User: 'Pick another seat'"]
+    E --> D["Devs: request_id req-7f3a"]
+```
+
+A bad error answer is either too vague ("something went wrong") or too honest (a database dump that helps attackers).
+
+```mermaid
+flowchart LR
+    X["Too vague"] --> B["User retries forever"]
+    Y["Too honest"] --> C["Attacker learns your insides"]
+    G["Just right: code + message + id"] --> OK["Everyone can act"]
+```
+
+The rest of this note is just three questions:
+1. What exactly goes in an error response (and the standard format for it)?
+2. Which status code fits which situation, and which errors may be retried?
+3. Where in the code do errors get turned into responses (one place, at the edge)?
+
 
 **The problem in one story.**
 You try to book seat A7 and the app just says "Something went wrong".
@@ -73,7 +106,7 @@ Where it breaks: a courier sticker is read by a person, while an API error must 
 > [!tip] Remember
 > Every error says what (code), how to fix (message) and where to look (request ID), and never leaks internals.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A booking API returns this when a seat is taken, when the database is down, and when the JSON is broken:
 
@@ -89,7 +122,7 @@ with status `200`. Three things go wrong at once:
 
 The opposite mistake is just as common: returning `pq: relation "payments" does not exist` or a stack trace in the body. That tells attackers your database, table names and library versions, and tells users nothing useful.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An API error is a **hospital discharge note**, written for three readers:
 
@@ -99,9 +132,11 @@ An API error is a **hospital discharge note**, written for three readers:
 
 The internal record (stack trace, SQL, hostnames) never leaves the hospital.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The Problem Details format (RFC 9457)
+
+**In plain words:** instead of every API inventing its own error JSON, there is one standard shape. Think of it as the standard accident-report form: same boxes every time, so everyone knows where to look.
 
 ```json
 {
@@ -128,11 +163,15 @@ The media type is `application/problem+json`. RFC 9457 replaced RFC 7807 in 2023
 
 ### Stable codes and human messages
 
+**In plain words:** the code is for machines and must never change its spelling; the message is for people and may be reworded any day. Keep those two jobs separate.
+
 - **The status code** groups the failure (`409` = conflict with current state). Generic HTTP tools act on it: proxies, retry libraries, dashboards.
 - **The error code** (`SEAT_TAKEN`, `CARD_EXPIRED`) is the precise reason. It is part of the contract: documented, `UPPER_SNAKE`, never renamed (see [[API Contract Design and OpenAPI]]). Clients branch on it.
 - **The message** (`title`, `detail`) is for humans. Clients must never parse it, so you can reword or translate it freely.
 
 ### Field-level validation errors
+
+**In plain words:** if a form has three mistakes, say all three at once. Nobody likes fixing one, resubmitting, and finding the next.
 
 Report **every** invalid field at once, each with a pointer into the request body, so a form can highlight all of them after one round trip:
 
@@ -146,6 +185,8 @@ Report **every** invalid field at once, each with a pointer into the request bod
 The pointer is a JSON Pointer (`#/seats/1` = the second seat), which is the style RFC 9457's own example uses.
 
 ### Status mapping
+
+**In plain words:** this table is the dictionary from "what actually happened" to "which 3-digit code to send". You do not memorise it; you keep it next to you.
 
 | Status | Domain situation | Example code | Client should retry? |
 | --- | --- | --- | --- |
@@ -166,6 +207,8 @@ The method-level meaning of each status is in [[REST and HTTP API Design]]; this
 
 ### Retryable vs non-retryable
 
+**In plain words:** some failures fix themselves if you wait (server busy); some never will (your input is wrong). The response must make clear which one this is, or clients will retry hopeless requests.
+
 Error handling is half of a retry policy. Clients need a rule they can apply without reading the message:
 
 ```mermaid
@@ -183,6 +226,8 @@ flowchart TD
 `Retry-After` is either seconds (`Retry-After: 5`) or an HTTP date. A `504` is the dangerous case: the server gave up waiting, but the work may still finish, so retrying a non-idempotent `POST` can do it twice (see [[Idempotency and Idempotency Keys]] and [[Timeouts, Retries and Backoff]]).
 
 ### One mapping layer
+
+**In plain words:** deep business code says "seat taken" in its own words; exactly one gatekeeper at the door translates that into HTTP. One translator means one consistent accent.
 
 Domain code returns **domain errors** and never imports `net/http`. One middleware at the edge maps them to responses and logs each failure once:
 
@@ -204,9 +249,11 @@ flowchart LR
 
 The repository translates driver errors it understands (a unique violation on the seat index means `ErrSeatTaken`) and wraps everything else unchanged. Anything the middleware does not recognise becomes a `500` whose body says nothing about the cause.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest possible translator: one function, one `if`, errors become a standard JSON body.
 
 One mapping function turns a domain error into Problem Details. The full version below adds the production concerns.
 
@@ -241,6 +288,8 @@ func WriteError(w http.ResponseWriter, err error) {
 ```
 
 ### Full version
+
+**In plain words:** the real thing: domain errors in one package, one middleware that maps, logs once, and never leaks database text to the client.
 
 Three files in Go 1.24: a domain package with sentinel and typed errors, an `api` package that is the only place errors become HTTP, and its tests. The mapping uses `errors.Is` for sentinels and `errors.As` for typed errors, so wrapping with `%w` at each layer keeps working. It passes `go vet` and `go test -race`.
 
@@ -565,7 +614,7 @@ The table name stays in the log line, linked by `request_id`; the client sees on
 
 While writing this example, the first version of `TestTypedNilBecomesA500` sent the typed-nil error through the full middleware and the test **panicked** inside `(*ValidationError).Error`, called by the log line. That is the trap described in the deep dive.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Format | Shape | Use when | Cost |
 | --- | --- | --- | --- |
@@ -611,7 +660,7 @@ sequenceDiagram
     G-->>C: 503 problem+json, code PAYMENT_UNAVAILABLE, Retry-After 5, request_id r2
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not invent a code per line of code.** 20 to 50 documented codes for a whole API is a manageable estimate; hundreds of codes become impossible for clients to handle. Group by what the client can do differently.
 - **Detail vs. security.** `404` for a booking the caller may not see hides its existence, but makes support harder. `409 SEAT_TAKEN` with the seat number helps the user; `409` naming *who* booked it leaks personal data.
@@ -619,7 +668,7 @@ sequenceDiagram
 - **Do not use `200` with an error body**, except where the protocol requires it (GraphQL partial results, batch endpoints with per-item results). Even then, document how clients detect failure.
 - **Localised messages belong to the client** when you can manage it: the server sends the stable code and parameters, the app renders the text in the user's language. Server-side localisation (`Accept-Language`) works but multiplies the messages you must maintain.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Stripe** returns an error object with `type` (such as `card_error`, `invalid_request_error`, `api_error`), `code`, `decline_code` for card declines, `param` naming the bad field, a `message` and a `doc_url`, and every response carries a `Request-Id` header.
@@ -639,7 +688,7 @@ sequenceDiagram
 	- Top error codes per route and per client version, as a metric label (`code="SEAT_TAKEN"`), not parsed from logs.
 	- `429` and `503` rates with the `Retry-After` values sent, and how many clients retry before it expires.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The typed-nil trap.** An `error` is an interface: a type and a value. Returning a nil `*ValidationError` as `error` yields an interface whose type is set, so `err != nil` is true.
 
@@ -655,7 +704,7 @@ sequenceDiagram
   Either way, also return the request ID in a response header such as `X-Request-Id` (some teams return the trace ID taken from the W3C `traceparent` request header instead) so clients can quote it even when the body is lost.
 - **Errors in streaming responses.** Once a `200` and part of an SSE stream or a chunked body have been sent, the status cannot change. Send an error event in the stream's own format; gRPC can do better because its status travels in trailers after the messages.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What should an API error response contain?
 > A correct HTTP status, a stable machine-readable error code, a human-readable message that helps fix the problem, field-level errors for validation failures, and a request ID that links to the full error in the logs. Never stack traces, SQL or hostnames. RFC 9457 Problem Details gives a standard shape for all of it.
@@ -678,7 +727,7 @@ sequenceDiagram
 > [!question]- How do gRPC errors carry the same information?
 > A gRPC status has a canonical code (`NOT_FOUND`, `INVALID_ARGUMENT`, `UNAVAILABLE`) and a message, plus typed details in `google.rpc.Status`: `BadRequest` for field violations, `ErrorInfo` for a stable reason, `RetryInfo` for when to retry. Transcoding gateways map the codes to HTTP statuses (`UNAVAILABLE` → `503`, `DEADLINE_EXCEEDED` → `504`).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Three readers: a status and stable code for programs, a message for humans, a request ID for you.
 - Use `application/problem+json` (RFC 9457): `type`, `title`, `status`, `detail`, `instance` + extensions.
@@ -689,7 +738,7 @@ sequenceDiagram
 - gRPC: canonical codes + `ErrorInfo`, `BadRequest`, `RetryInfo`; keep HTTP and gRPC mappings aligned.
 - Monitor 4xx vs 5xx per route and the top error codes; a 4xx spike after a deploy is a contract break.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[REST and HTTP API Design]], [[API Contract Design and OpenAPI]], [[Error Handling]] (Go errors: sentinel, typed, wrapping)
 - **Next:** [[Idempotency and Idempotency Keys]], [[Timeouts, Retries and Backoff]], [[Building REST Endpoints]]

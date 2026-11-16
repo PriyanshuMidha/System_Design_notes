@@ -24,7 +24,43 @@ updated: 2026-11-13
 > - The app tier is easy to scale; the database is the hard part.
 > - Measure first, keep headroom (run at 50-70% at peak), and scale the actual bottleneck.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You build a small website. It runs on one computer (one **server**).
+
+More people start using it. The one computer gets too busy, and pages load slowly.
+
+You have exactly two moves. Move one: buy a bigger computer. That is **vertical scaling**.
+
+```mermaid
+flowchart LR
+    A["1 small server<br/>(busy, slow)"] -->|"buy bigger"| B["1 big server<br/>(fast... for now)"]
+```
+
+Move two: buy more cheap computers and share the work between them. That is **horizontal scaling**.
+
+```mermaid
+flowchart LR
+    U["Users"] --> L["Traffic splitter<br/>(load balancer)"]
+    L --> S1["Server 1"]
+    L --> S2["Server 2"]
+    L --> S3["Server 3"]
+```
+
+Bigger computers run out: there is a largest machine you can buy. More computers does not run out, but only works if any server can handle any request.
+
+The rest of this note is just these 4 questions:
+1. When do you buy bigger, and when do you buy more?
+2. What must you change in your app so "more servers" works (being stateless)?
+3. Why is the database the hard part?
+4. Why does adding servers eventually stop helping?
 
 **The problem in one story.**
 A small bakery sells 100 cakes a day with one baker.
@@ -72,7 +108,7 @@ Where it breaks: adding lanes does not help if every cashier must call the same 
 > [!tip] Remember
 > Make servers stateless so you can add more of them, and remember the database is usually the real limit.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An invoice API runs on one 4-vCPU VM that serves about 800 requests per second (RPS) at 70% CPU (an estimate for this example; your number comes from a load test). Month-end billing brings 2,500 RPS for two hours.
 
@@ -81,7 +117,7 @@ An invoice API runs on one 4-vCPU VM that serves about 800 requests per second (
 
 Scaling is the set of moves that let capacity grow with demand, ideally by adding cheap, identical units.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A supermarket at rush hour.
 
@@ -89,9 +125,11 @@ A supermarket at rush hour.
 - **Horizontal:** open more checkout lanes. Customers must be able to use any lane, so no lane may keep a customer's half-finished basket (that would be state).
 - **The stockroom** is the database. Ten lanes all sending runners to one stockroom door just moves the queue to the door.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Vertical vs horizontal
+
+**In plain words:** vertical = one bigger machine, horizontal = many small machines. Like one super-cashier vs many normal cashiers.
 
 | | Vertical (scale up) | Horizontal (scale out) |
 | --- | --- | --- |
@@ -106,6 +144,8 @@ Do vertical first for the database (it is cheap and keeps one source of truth), 
 
 ### Making a service stateless
 
+**In plain words:** "stateless" means a server remembers nothing personal between requests, so any server can take any request. Everything it would remember gets moved to a shared place.
+
 A service is stateless when any instance can serve any request. Move each kind of local state out:
 
 | Local state | Where it goes |
@@ -118,6 +158,8 @@ A service is stateless when any instance can serve any request. Move each kind o
 | WebSocket connections | Allowed, but need a routing layer; see [[Scaling WebSockets]] |
 
 ### The scale cube (three axes)
+
+**In plain words:** there are only three ways to split work: make copies (X), split by job (Y), or split by data (Z). Like a restaurant adding more identical kitchens, or splitting into a bakery and a grill, or giving each kitchen half the customers.
 
 The three axes are independent: a system can clone (X), split by function (Y) and split by data (Z) at the same time, in any combination. X is usually the first move because it is cheapest.
 
@@ -144,6 +186,8 @@ flowchart TB
 
 ### Read path vs write path
 
+**In plain words:** reading data is easy to scale because you can hand out copies; writing is hard because every change must land in one true place.
+
 | Read scaling (cheapest first) | Write scaling (cheapest first) |
 | --- | --- |
 | 1. Fix the query and the index | 1. Fix the query and the index |
@@ -165,7 +209,7 @@ flowchart LR
 
 Each arrow is triggered by a measured bottleneck, not by a calendar.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -179,6 +223,14 @@ Rule: measure -> find the bottleneck -> cheapest fix on the right path (read or 
 ```
 
 ### Why more nodes stop helping: Amdahl and USL
+
+**In plain words:** adding workers only speeds up the part of the job they can do side by side. If some part must happen one at a time (a shared lock, one database), that part becomes the limit. And if the workers also spend time keeping each other in sync, too many workers actually makes things *slower*.
+
+```mermaid
+flowchart LR
+    A["Few nodes:<br/>throughput grows"] --> B["More nodes:<br/>growth flattens<br/>(waiting on shared stuff)"]
+    B --> C["Too many nodes:<br/>throughput FALLS<br/>(nodes busy syncing each other)"]
+```
 
 **Amdahl's law:** if a fraction `p` of the work can run in parallel and `1 − p` must run serially (one lock, one primary database, one leader), then with `N` workers the speed-up is `S(N) = 1 / ((1 − p) + p/N)`. It can never exceed `1 / (1 − p)`.
 
@@ -267,13 +319,15 @@ The lesson: before adding nodes, shrink the serial part (the shared lock, the si
 
 ### Sizing with headroom
 
+**In plain words:** never plan to run machines flat out. Buy enough so each one runs at about half to two-thirds busy at your worst hour; the spare room absorbs spikes and failures.
+
 Peak load 2,500 RPS. A load test shows one API pod handles 800 RPS before p99 breaks the SLO. Running at 60% utilisation at peak leaves room for a zone failure and a traffic spike:
 
 `pods = ⌈2,500 ÷ (800 × 0.6)⌉ = ⌈5.21⌉ = 6`, spread over 3 zones (2 per zone). Losing one zone leaves 4 pods × 800 = 3,200 RPS of raw capacity, still above the 2,500 peak.
 
 More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Technique | What it scales | How | Cost |
 | --- | --- | --- | --- |
@@ -286,7 +340,7 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 | Sharding (Z) | Writes and data size | Split data by key | Cross-shard queries, rebalancing, hot shards |
 | Autoscaling | Variable load | Add or remove instances on a signal | Lag of minutes; needs stateless instances |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - **Do not shard first.** Sharding is the most expensive move and hard to undo. Exhaust indexes, query fixes, a bigger primary, caching and replicas first.
 - **Caches and replicas add staleness.** A user who edits an invoice and reloads may read an old replica; see read-your-writes in [[Consistency Models]].
@@ -294,7 +348,7 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 - **Autoscaling is not instant.** New instances take one to several minutes to boot and warm up, so it handles slow ramps, not a spike that arrives in 10 seconds. Keep static headroom for spikes; see [[Autoscaling]].
 - **Microservices are not a scaling technique by default.** A Y-axis split adds latency and failure modes; do it for isolation and team ownership, not because traffic grew.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Typical web stacks run stateless app containers behind an ALB on ECS or Kubernetes with a Horizontal Pod Autoscaler on CPU or RPS, a managed PostgreSQL primary with read replicas, Redis in front, and SQS or Kafka for async work.
 - **Failure modes → fixes:**
@@ -304,7 +358,7 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 	- One hot key or hot shard caps throughput → see [[Hot Keys and Hot Partitions]].
 - **What to monitor:** utilisation and saturation per tier (CPU, connections, queue depth), p99 latency against load, the max/average ratio across instances, and DB replication lag.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Autoscaling signals.** CPU is easy but lags and misses I/O-bound services. RPS per instance tracks demand directly. Queue depth or queue age is the right signal for workers. Scale on the signal closest to the user-facing bottleneck, and set the target below the knee of the latency curve.
 - **Why run at 50-70%.** Queueing theory: for a simple single-server queue (M/M/1), average time in the system is `service time ÷ (1 − utilisation)`. At 50% it is 2× the service time, at 90% it is 10×, and it explodes near 100%. Headroom keeps latency flat and leaves capacity for a lost zone.
@@ -312,7 +366,7 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 - **Data gravity.** Compute can move to where data is; data cannot cheaply move. Plan partition keys early (tenant, user, region) even if you do not shard yet, so that a later Z-axis split follows an existing boundary.
 - **Measure first.** Profile before scaling: a missing index or an N+1 query often buys more than 10 extra pods; see [[N+1 Query Problem]] and [[Performance Engineering and Capacity Planning]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Vertical or horizontal scaling: which do you choose?
 > Horizontal for stateless app tiers because it has no ceiling and survives instance loss. Vertical first for the database because it keeps one source of truth with no code change; move to replicas and sharding only when a bigger box stops being enough or affordable.
@@ -332,7 +386,7 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 > [!question]- Why not run servers at 95% CPU to save money?
 > Queueing delay grows like `1/(1 − utilisation)`, so latency explodes near 100%, and there is no room for a lost zone or a spike while autoscaling catches up. Target 50-70% at peak.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Vertical: simple, ceiling, SPOF. Horizontal: stateless + LB, no ceiling.
 - Stateless = sessions, files, caches, locks, cron moved out of the instance.

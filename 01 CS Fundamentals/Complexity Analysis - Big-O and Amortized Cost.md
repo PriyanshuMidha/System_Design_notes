@@ -22,7 +22,38 @@ updated: 2026-11-13
 > - Space complexity matters as much as time complexity and is analyzed the same way.
 > - Constants matter in practice: an `O(n)` algorithm with a huge constant factor can be slower than an `O(n log n)` one for all realistic `n`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, 8 and the cheat sheet (11). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the formal bounds and the classes) and 4 (the measured worked example), plus 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code works on a list. Someday that list will be much bigger. Will the code still be fast?
+
+**Big-O** is the simple language for answering that. It does not ask "how fast is it now?" — it asks "if the list gets 10 times bigger, does the work get 10 times bigger, or 100 times, or barely change?"
+
+```mermaid
+flowchart LR
+    small["List of 100 items:<br/>everything feels fast"] --> big["List of 1,000,000 items:<br/>which code survives?"]
+```
+
+The shape of the growth is what matters. Code that does one pass over the list grows with the list ("O of n"). Code with a loop inside a loop grows with the list squared ("O of n squared") — that one dies first.
+
+```mermaid
+flowchart LR
+    n["n grows 10x"] --> a["one loop: 10x work, fine"]
+    n --> b["loop inside loop: 100x work, trouble"]
+```
+
+One more idea: **amortized** cost. Some operations are usually free but occasionally expensive. Spread the rare expensive one across all the cheap ones and the average stays tiny — like a yearly gym fee spread over daily visits.
+
+That is it. The rest of this note is just these 3 questions:
+1. How do I name a growth shape precisely? (sections 1-3)
+2. What does "amortized O(1)" really mean, with real measured numbers? (section 4)
+3. When does Big-O mislead you, and what do interviewers probe? (sections 6-10)
 
 ### The problem in one story
 
@@ -69,7 +100,7 @@ Where it breaks: for very short trips (small `n`), the "slow" option can actuall
 > [!tip] Remember
 > Big-O asks "what happens when `n` gets 10x bigger?", not "how fast is it right now?".
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 ### Predicting speed before running anything
 
@@ -94,7 +125,7 @@ Concretely: at `n = 1,000,000`, an `O(n)` algorithm doing one simple operation p
 > [!tip] Remember
 > Big-O predicts whether an algorithm survives scaling the input, which no amount of faster hardware can substitute for once `n` gets large enough.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### The errand-list analogy
 
@@ -139,7 +170,7 @@ flowchart LR
 > [!warning] Common mistake
 > Confusing "amortized `O(1)`" with "every single call is `O(1)`." They are different claims. A hard per-call latency SLA cares about the worst single call, which amortized analysis explicitly does not bound.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Formal definitions, informally
 
@@ -220,7 +251,7 @@ This is why interview questions probing "can you do better than the brute-force 
 > [!warning] Common mistake
 > Quoting an algorithm's average-case complexity as if it were a guarantee. Average case assumes a distribution of inputs (often "random"); a production system facing adversarial or pathological input (deliberately or by bad luck) can hit the worst case instead.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -240,6 +271,8 @@ stateDiagram-v2
 ```
 
 ### Measuring Go's actual slice growth
+
+**In plain words:** the table below is real measured proof — append a million items one by one, and the expensive "grow and copy" step happens only 38 times, so the average cost per append stays tiny and flat.
 
 **Measured** (this code, Go 1.24.4, darwin/arm64, 2026-11-09):
 
@@ -280,6 +313,8 @@ The absolute numbers bounce around more than the slice table (map insertion also
 
 ### Space complexity
 
+**In plain words:** the same growth question, but asked about memory instead of time — how much extra room does the code need as the input grows?
+
 Space complexity is analyzed with the same notation, counting memory instead of operations.
 
 - A function that builds a new slice of size `n` is `O(n)` space.
@@ -288,7 +323,7 @@ Space complexity is analyzed with the same notation, counting memory instead of 
 
 Runnable Go version (both measurements, plus the underlying tests): [[Complexity Analysis - Big-O and Amortized Cost - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Notation | Meaning | Typical use |
 | --- | --- | --- |
@@ -299,7 +334,15 @@ Runnable Go version (both measurements, plus the underlying tests): [[Complexity
 | Average case | Expected cost over a distribution of inputs | Useful when inputs really are close to random |
 | Amortized | Average cost per operation over a worst-case sequence | Data structures with occasional expensive rebalancing (dynamic arrays, hash table resizing) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
+
+**In plain words:** Big-O is about big inputs. For small inputs, the "slower" class can win, because Big-O throws away the fixed setup costs.
+
+```mermaid
+flowchart LR
+    small["small n"] --> win1["simple O(n²) code wins<br/>(tiny setup cost)"]
+    big["large n"] --> win2["O(n log n) code wins<br/>(better curve takes over)"]
+```
 
 - A better Big-O class is not automatically faster in practice: an `O(n)` algorithm with a large constant (e.g. heavy per-element work, poor cache locality) can lose to an `O(n log n)` algorithm with tiny constants and great cache behavior, for every `n` you'll actually encounter.
 	- This is why, for example, insertion sort (`O(n²)`) is often used for small sub-arrays inside production sort implementations (including Go's) — its constant factor is low enough to beat `O(n log n)` algorithms for small `n`.
@@ -310,7 +353,7 @@ Runnable Go version (both measurements, plus the underlying tests): [[Complexity
 > [!tip] Remember
 > Amortized bounds are about averages over sequences; they're the wrong tool for a single request's worst case, and Big-O comparisons within the same class are the wrong tool for picking between two real implementations.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Go's `append` uses amortized-`O(1)` growth (shown above).
 	- Dynamic arrays in essentially every language (Python lists, Java `ArrayList`, C++ `std::vector`) use the same doubling-capacity strategy for the same reason.
@@ -321,7 +364,7 @@ Runnable Go version (both measurements, plus the underlying tests): [[Complexity
 	- An algorithm with good average-case complexity (e.g. naive quicksort) hits its worst case in production due to adversarial or already-sorted input → use randomized pivot selection or a hybrid algorithm with a guaranteed worst-case bound (Go's `sort.Slice` uses introsort internally for exactly this reason).
 - **What to monitor:** for data-processing code, wall-clock time or operation counts as `n` grows in production (not just in a benchmark) — a function that looked fine at `n=1,000` in staging can reveal `O(n²)` behavior painfully at `n=1,000,000` in production.
 
-## 8. Whiteboard version
+## 8. Whiteboard version 🟢
 
 If someone asks you to explain amortized analysis at a whiteboard with no code:
 
@@ -333,7 +376,7 @@ If someone asks you to explain amortized analysis at a whiteboard with no code:
 
 That five-step picture, plus the banker's-method explanation in the deep dive below, is the entire argument; the measured tables above just put exact numbers on it.
 
-## 9. Deep dive
+## 9. Deep dive 🔴
 
 - **Why does Go's slice grow by roughly doubling, then taper off?** Doubling keeps the number of reallocations logarithmic in `n`, which is what bounds total copying work at `O(n)`.
 	- But doubling an already-huge slice over-allocates a lot of memory in absolute terms.
@@ -345,7 +388,7 @@ That five-step picture, plus the banker's-method explanation in the deep dive be
 - **Why `n!` shows up at all**: brute-force algorithms that try every permutation of `n` items (a naive traveling-salesman solver, for instance) are `O(n!)`, which grows so fast that `n=20` already exceeds what's computable in a human lifetime.
 	- This is exactly why such problems need heuristics, approximation algorithms, or fundamentally different approaches (dynamic programming, branch-and-bound) rather than brute force at any realistic scale.
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- What's the practical difference between Big-O, Big-Omega, and Big-Theta?
 > Big-O is an upper bound (grows no faster than), Big-Omega is a lower bound (grows at least as fast as), and Big-Theta is both at once — a tight bound meaning the algorithm genuinely grows at that rate. When people casually say "this is `O(n log n)`" about, say, merge sort, they usually mean the stronger `Θ(n log n)`, since merge sort's running time doesn't just have an upper bound there, it's tightly bound there.
@@ -376,7 +419,7 @@ That five-step picture, plus the banker's-method explanation in the deep dive be
 >
 > Production implementations (introsort, Timsort, and Go's internal sort) use a hybrid: quicksort-like partitioning for the common case, a guaranteed-`O(n log n)` fallback (heapsort) if recursion depth suggests the worst case is happening, and simple insertion sort for small sub-arrays where its low constant factor wins outright.
 
-## 11. Cheat sheet
+## 11. Cheat sheet 🟢
 
 - Big-O = upper bound, Big-Omega = lower bound, Big-Theta = tight bound; "Big-O" in casual speech usually means Big-Theta.
 - Growth order, fastest to slowest: `O(1) < O(log n) < O(n) < O(n log n) < O(n²) < O(2ⁿ) < O(n!)`.

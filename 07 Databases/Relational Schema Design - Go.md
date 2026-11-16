@@ -25,7 +25,18 @@ updated: 2026-11-13
 >
 > Each block is short, explained before and after, and tied to a section of the theory note.
 
-## Before the code
+## Start here 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add "Setup", the ten code steps and "Design decisions".
+> - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls in the code" and the exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on half of [[Relational Schema Design]]. That note explains the design choices; this one is the actual build. It has two halves. The SQL half (steps 1 to 8) creates every table of the invoicing app in order, with the rules baked in: tenant-safe keys, soft deletes, an audit log, gapless invoice numbers, a trigger and row-level security. The Go half (steps 9 and 10) is a tiny `money` package that counts money in whole paise, because floats slowly lose paise. Each step shows the idea first, then the code, then how it works line by line. Read it top to bottom alongside the theory note.
+
+## Before the code 🟢
 
 - **Named integer type**: `type Amount int64` gives money its own type so it cannot be mixed up with a plain count.
 - **Integer arithmetic**: amounts stay in paise or cents, so adding and splitting never drifts like `float64` does.
@@ -34,7 +45,7 @@ updated: 2026-11-13
 - **SQL blocks**: the DDL is plain PostgreSQL 17 and runs in `psql`, not in Go.
 - **Run**: `go vet ./... && go test -race ./...` inside the `money` module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -62,18 +73,20 @@ flowchart LR
 
 The left half is a dependency order: a table can be created only after the tables its foreign keys point at. The right half is independent of the database; it is the Go code that handles the values the `*_minor` columns hold.
 
-## Setup
+## Setup 🟡
 
 - Go 1.24, standard library only. The module is `money` with `money.go` and `money_test.go`.
 - Run it with `go vet ./... && go test -race ./...`.
 - The SQL targets PostgreSQL 17 and was not run against a live server in this vault; apply the statements in the order shown, because later tables reference earlier ones (create `workspaces` before `clients`, and `clients` before `invoices`).
 - The counter-row, reconciliation and trigger statements assume the tables below exist.
 
-## Code
+## Code 🟡
 
 The code has two halves: SQL (steps 1 to 8) and Go (steps 9 and 10). Design decisions behind the schema are explained in [[Relational Schema Design]]: `workspace_id` on every tenant-owned table, composite foreign keys, indexes on every referencing column, and `paid_minor` as a deliberate copy.
 
 ### Step 1: users, workspaces and membership
+
+**In plain words: three tables to say who exists, which teams exist, and who is in which team — the membership table is the 'who is in which' list, keyed by the pair.**
 
 **Concept.** A user can belong to many workspaces and a workspace has many users, so the relationship is many-to-many and needs its own table ([[Relational Schema Design#Step 2: entities and relationships]]).
 
@@ -124,6 +137,8 @@ erDiagram
 
 ### Step 2: clients
 
+**In plain words: every client row carries its workspace id, and links between rows must match on that id too — so one tenant's data can never point into another's, even if the code is buggy.**
+
 **Concept.** Every tenant-owned table carries `workspace_id`, and children reference the pair `(workspace_id, id)` rather than `id` alone, so a child row cannot point at a parent from another tenant ([[Relational Schema Design#Step 4: keys]]).
 
 For that, the parent needs `UNIQUE (workspace_id, id)` as a foreign-key target. The self-referencing `parent_id` uses the same pair. The alternative is checking tenancy in application code, which every new code path must remember; the composite key makes the database enforce it.
@@ -163,6 +178,8 @@ flowchart LR
 ```
 
 ### Step 3: invoices
+
+**In plain words: the invoice table writes the business rules into the schema — allowed statuses, no negative money, due date after issue date — so the database refuses impossible invoices.**
 
 **Concept.** An invoice belongs to one client in the same workspace, so it uses the same composite-key pattern ([[Relational Schema Design#Step 5: constraints are invariants]]).
 
@@ -205,6 +222,8 @@ CREATE INDEX invoices_ws_client_idx ON invoices (workspace_id, client_id);
 5. `invoices_ws_client_idx` indexes the foreign-key columns so "all invoices of a client" is not a table scan.
 
 ### Step 4: items, payments and webhook events
+
+**In plain words: line items die with their invoice, payments never do, and a unique key makes a retried payment notification harmless — the second insert simply bounces.**
 
 **Concept.** Line items are pure children of an invoice: they cascade. Payments are financial history and do not. Both reference `(workspace_id, id)` of the invoice.
 
@@ -272,6 +291,8 @@ sequenceDiagram
 
 ### Step 5: the audit log
 
+**In plain words: the audit log is a diary that must survive even when the thing it describes is deleted, so on purpose it has no links the database would enforce.**
+
 **Concept.** An audit log must outlive the rows it describes, so it deliberately has no foreign keys: a foreign key would block deleting a client with history, or cascade the history away.
 
 It refers to its subject with `entity_type` and `entity_id`, a polymorphic reference that the database cannot verify. That is acceptable here because the log is append-only and read for investigation, not joined in hot queries.
@@ -301,6 +322,8 @@ CREATE INDEX audit_logs_ws_created_idx ON audit_logs (workspace_id, created_at D
 5. The index `(workspace_id, created_at DESC)` serves "latest events of a workspace", the only access pattern the log needs.
 
 ### Step 6: gapless invoice numbers, the counter row
+
+**In plain words: tax rules want invoice numbers with no gaps, like a paper receipt book — so each workspace gets one counter row, and taking a number locks the row until the invoice is saved.**
 
 **Concept.** A database sequence can skip numbers (a rolled-back transaction still consumes one), but invoice numbers must be consecutive per tenant for tax reasons.
 
@@ -339,6 +362,8 @@ sequenceDiagram
 
 ### Step 7: the nightly reconciliation query
 
+**In plain words: we keep a running 'paid so far' copy on each invoice for speed, and this query is the nightly stock-take that checks the copy against the real payments.**
+
 **Concept.** `paid_minor` is a deliberate copy of `sum(payments.amount_minor)`, kept on the invoice so lists do not need a join ([[Materialized Views and Denormalization]]). Any copy can drift, so a scheduled query checks it.
 
 `LEFT JOIN` keeps invoices with no payments, and `coalesce` turns their NULL sum into 0 so they compare correctly. The alternative of trusting the copy forever is the usual way ledgers go wrong silently.
@@ -359,6 +384,8 @@ HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 4. Without `coalesce`, an unpaid invoice would compare `0 <> NULL`, which is NULL, and the row would be silently dropped. The query must return nothing on a healthy database; any row is a bug to investigate.
 
 ### Step 8: `updated_at` trigger and row-level security
+
+**In plain words: two guards that live inside the database — one stamps the edit time on every change, the other hides every row that does not belong to the current tenant.**
 
 **Concept.** Two protections live in the database so no code path can skip them. The trigger stamps `updated_at` on every update, because application code forgets.
 
@@ -409,6 +436,8 @@ sequenceDiagram
 ```
 
 ### Step 9: money in Go, the Amount type and Split
+
+**In plain words: money is counted in whole paise as an integer, and Split cuts an amount into near-equal parts that always add back exactly — no paisa appears or disappears.**
 
 **Concept.** The Go side must keep the same discipline as the `*_minor` columns ([[Relational Schema Design#Money in Go: integer minor units]]): integer minor units, never floats.
 
@@ -461,6 +490,8 @@ func Split(a Amount, n int) []Amount {
 
 ### Step 10: money in Go, Percent
 
+**In plain words: percentages (like 18% tax) are done with whole numbers too — multiply first, divide last, and round by one written-down rule.**
+
 **Concept.** Taxes and discounts multiply an amount by a rate. Using basis points (1 bp = 0.01%, so 1800 bps = 18%) keeps the rate an integer too.
 
 Multiplying before dividing keeps full precision, and then one explicit rounding rule is applied: half away from zero. Writing the rule once, in one function, is the fix for "every handler rounds differently".
@@ -500,7 +531,7 @@ flowchart LR
     R -->|"no"| K["q = 359"]
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -515,7 +546,7 @@ flowchart LR
 | Remainder spread over first parts | All remainder to the last part | Parts differ by at most one unit; the first parts are slightly larger |
 | Half away from zero | Half to even | Matches what readers expect on invoices; accumulates a tiny upward bias over huge batches |
 
-## Tests
+## Tests 🔴
 
 The tests live in `money_test.go`, which needs this header first:
 
@@ -529,6 +560,8 @@ import (
 ```
 
 ### Test 1: float drifts, integers do not
+
+**In plain words: this test proves the whole point — add ten 10-paise coins as a float and you get just under one rupee; add them as integers and you get exactly one.**
 
 **Property.** Ten payments of Rs 0.10 must equal Rs 1.00. In `float64` they do not, which is why money never uses floats.
 
@@ -555,6 +588,8 @@ func TestFloatDriftsIntegersDoNot(t *testing.T) {
 The test is unusual: it asserts that the float is wrong. If it fails, either the float happened to be exact (not on IEEE 754 hardware) or `Amount` arithmetic changed. `for range 10` is the Go 1.22 range-over-int form.
 
 ### Test 2: Split sums exactly
+
+**In plain words: whatever amount you split, into however many parts, the parts must add back to the exact total — this test tries dozens of combinations, including negative ones.**
 
 **Property.** For any amount and any n from 1 to 9, the parts add up to exactly the amount and differ by at most one unit, including negative credit notes and tiny amounts.
 
@@ -590,6 +625,8 @@ A failure means money was created or destroyed (`sum != a`) or the parts are une
 
 ### Test 3: Percent rounding
 
+**In plain words: check the one rounding rule holds, including the tricky halfway case and negatives — so a refund exactly reverses a charge.**
+
 **Property.** One rule: round half away from zero, symmetric for negatives.
 
 | Input | Expected | Why |
@@ -614,7 +651,7 @@ func TestPercentRounding(t *testing.T) {
 
 A failure on the third line means the code rounds half down or to even; a failure on the second means positive and negative amounts are handled differently, so a refund would not exactly reverse a charge.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -742,7 +779,7 @@ Ten payments of Rs 0.10 do not make Rs 1.00 in floating point. Pick one rounding
 > }
 > ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`Amount` is a plain `int64`.** Adding paise to rupees compiles; keep the unit in the type name or the currency beside the value.
 - **`Split` panics for `n <= 0`.** Validate the instalment count at the API boundary instead of recovering.
@@ -752,13 +789,13 @@ Ten payments of Rs 0.10 do not make Rs 1.00 in floating point. Pick one rounding
 - **`app.workspace_id` must be set with `is_local = true`.** A session-level setting survives on the pooled connection into the next request.
 - **Connect as a role that does not own the tables,** or add `FORCE ROW LEVEL SECURITY`, otherwise the owner bypasses the policy.
 
-## Exercises
+## Exercises 🔴
 
 1. Predict `Split(-100000, 3)` before running it, then confirm it with a test line. Which parts carry the extra unit?
 2. Change `Percent` to round half to even and predict which of the three rounding assertions fail.
 3. Remove `ON DELETE SET NULL (parent_id)` from `clients` and predict the error when you delete a parent client that has a subsidiary in the same workspace.
 
-## Links
+## Links 🟢
 
 - Theory: [[Relational Schema Design]]
 - Query side: [[SQL Essentials - Go]]

@@ -23,7 +23,35 @@ updated: 2026-11-13
 > - Firmware is software, stored in that flash, that runs on a device's own microcontroller before (or instead of) any general-purpose OS — the BIOS/UEFI on a PC's motherboard is one example among many (SSDs, NICs, baseboard management controllers all have their own firmware).
 > - The boot sequence is: power on → firmware runs POST and initializes hardware → firmware hands off to a bootloader → bootloader loads the OS kernel → kernel starts `init`/`systemd` → services start, including, eventually, your Go binary.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+RAM forgets everything when power goes off. So every computer needs some memory that survives power-off — that family is **ROM** and its modern cousin **flash** (the stuff inside SSDs and USB sticks).
+
+The first program a computer runs must live in that permanent memory, because at power-on the RAM is empty. That built-in first program is the **firmware** (on PCs: UEFI/BIOS).
+
+```mermaid
+flowchart LR
+    R["RAM: fast,<br/>forgets on power-off"] ~~~ F["ROM / flash: slower,<br/>remembers forever"]
+```
+
+Booting is just a relay race: each stage loads a bigger, smarter program and hands over.
+
+```mermaid
+flowchart LR
+    P["Power on"] --> FW["Firmware<br/>(in flash)"] --> BL["Bootloader<br/>(from disk)"] --> OS["Operating system"] --> U["Your programs"]
+```
+
+The rest of this note is just three questions:
+1. What are the kinds of ROM and how does flash store bits?
+2. What does firmware actually do before the OS exists?
+3. What happens, step by step, between the power button and your login screen?
 
 **The problem in one story.**
 You turn off your laptop and unplug it.
@@ -68,7 +96,7 @@ Where it breaks: relay runners are equals; here each stage is bigger and more ca
 > [!tip] Remember
 > RAM forgets when power goes; ROM and flash remember, and the firmware stored there is what starts the boot relay.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Power on a bare CPU and it starts fetching instructions from a fixed, hardwired address (the "reset vector") — but RAM is empty at that instant: DRAM holds nothing meaningful until something writes real data into it, and even if it did, DRAM is volatile and would have lost everything the moment power was off.
 
@@ -81,7 +109,7 @@ Everything this note describes — POST, the bootloader, the kernel handoff — 
 > [!tip] Remember
 > ROM exists for one reason: something must be readable, correct, and already there the instant power returns, before an operating system exists to load anything else.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of ROM/flash as a sealed instruction card taped to a vending machine, readable even if the machine's internal lights (RAM, which needs constant power) are off.
 
@@ -89,7 +117,7 @@ The boot process is reading that card step by step: first a short self-test ("ar
 
 This analogy breaks down in one place: a vending machine's card never changes. A motherboard's flash chip can be rewritten in place (a firmware update), something a sealed card can never do.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### In plain words: what makes memory "ROM" at all
 
@@ -238,7 +266,7 @@ AWS's Nitro System, for example, handles instance boot largely in dedicated hard
 
 This matters operationally: a cold-started container or Lambda-style function pays none of this boot cost (it starts inside an already-booted kernel), while a freshly launched VM instance does pay some version of it — one reason serverless cold starts and VM cold starts have very different latency profiles.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -274,7 +302,7 @@ stateDiagram-v2
 
 Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Firmware interface | Partition table | Boot limits | Security |
 |---|---|---|---|
@@ -289,13 +317,13 @@ Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
 | NOR flash | Yes | Block | Firmware (BIOS/UEFI, microcontroller firmware), execute-in-place |
 | NAND flash | Yes | Larger block | Bulk storage (SSDs) — see [[Storage Devices - HDD, SSD, NVMe]] |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Rewritable flash firmware is convenient (bugs and vulnerabilities can be patched without replacing hardware) but is itself an attack surface: a firmware rootkit that survives an OS reinstall is a documented, real threat class, which is exactly what Secure Boot and signed firmware updates (UEFI capsule updates, `fwupd` on Linux) exist to close off.
 - A botched firmware update can brick a device with no working fallback, which is why production fleets stage firmware updates carefully and why some hardware keeps a redundant, read-only fallback firmware image specifically for recovery.
 - None of this is something a backend engineer manages directly on cloud infrastructure — the cloud provider owns and secures firmware for the underlying physical hosts (e.g. AWS's Nitro System). It matters here because understanding why a VM boots the way it does, and why boot time is nonzero, explains real operational numbers (VM cold-start latency, why some instance types report faster boots than others).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every x86-64 server motherboard ships UEFI firmware in SPI NOR flash; `systemd` is the PID-1 init system on essentially all mainstream Linux server distributions as of 2025; AWS Nitro, GCP's equivalent custom silicon, and comparable hypervisor designs all handle the firmware/POST-equivalent layer for cloud VM instances outside the guest OS's visibility.
 - **Failure modes → fixes:**
@@ -304,14 +332,14 @@ Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
   - A fleet-wide firmware update goes out and some hosts fail to come back → firmware updates are high-blast-radius; staged rollouts with a tested rollback path exist specifically because firmware failures can require physical intervention to recover from.
 - **What to monitor:** boot time itself (a regression here can indicate failing hardware, a growing `initramfs`, or slow service dependency chains in `systemd`), and, for fleets managing firmware directly, firmware version drift across hosts.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Execute-in-place and why firmware uses NOR, not NAND.** Covered visually in section 3; the short version is that NOR's random-access reads let the CPU execute straight out of flash, which is mandatory for the first instructions after power-on, before any RAM initialization has happened.
 - **The trusted boot chain, precisely.** Secure Boot's guarantee is only as strong as its root of trust: the firmware itself must be protected (write-protected, or itself measured by a Trusted Platform Module) or an attacker who can rewrite firmware defeats every later signature check. Measured boot extends this further: each stage (firmware → bootloader → kernel) records a cryptographic hash of the next stage into the TPM before running it, producing an auditable, tamper-evident record of exactly what booted, which remote-attestation systems can check without trusting the booted OS itself to self-report honestly.
 - **PXE and network boot.** Servers often boot over the network instead of local storage: the firmware's NIC implements enough of DHCP and TFTP to fetch a bootloader and kernel image from the network before any local disk is touched — standard for provisioning bare-metal fleets and diskless nodes, and conceptually identical to the local-disk sequence above with the boot device replaced by a network target.
 - **BMC/IPMI, a boot sequence of its own.** A server's baseboard management controller runs its own firmware and its own lightweight OS, independent of and before the main CPU's boot sequence — it can power-cycle the main system, read POST codes, and provide remote console access even if the main OS has never successfully booted at all, which is precisely why it's the tool used to diagnose a host that won't POST.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does "non-volatile" mean, and why must the very first boot instructions live in non-volatile memory?
 > Non-volatile memory keeps its contents with no power applied at all, unlike RAM, which loses everything. The CPU's reset vector points at a fixed address the instant power returns, before any OS or bootloader has run — so whatever is at that address must already be intact from before power-on, which only non-volatile memory (ROM/flash) can guarantee.
@@ -334,7 +362,7 @@ Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
 > [!question]- Why does the kernel need `initramfs` at all, instead of just mounting the real root filesystem directly?
 > The kernel binary is kept generic and doesn't bundle every possible storage or disk-encryption driver. `initramfs` is a small, temporary, RAM-loaded filesystem carrying just enough drivers to locate and mount the real root; once mounted, `switch_root` pivots to it and discards `initramfs`, which was only ever a bridge.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - ROM = non-volatile; survives power loss. RAM does not.
 - Modern "ROM" is rewritable flash: NOR (execute-in-place, used for firmware) and NAND (block-addressed, used for bulk storage).

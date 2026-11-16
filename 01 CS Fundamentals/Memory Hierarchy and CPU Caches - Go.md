@@ -18,7 +18,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > A false-sharing experiment in Go: two counter layouts that compute identical results but one pads each counter onto its own 64-byte cache line. The tests prove both are correct; the benchmark measures the performance gap MESI invalidation traffic causes, as described in [[Memory Hierarchy and CPU Caches]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note [[Memory Hierarchy and CPU Caches]] first. Here, read "Before the code" and "What this code shows", then skim the two Code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run the benchmark yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is one small Go experiment. It builds two versions of the same counter array — one where counters sit squeezed together in memory, one where each counter gets its own 64-byte "room" (a cache line). Both give the right answer; the padded one is faster under concurrency because CPU cores stop fighting over the same line. Read it top to bottom: the code first, then the tests that prove it is correct, then the benchmark that shows the speed difference.
+
+## Before the code 🟢
 
 - **Structs and blank fields**: `_ [7]int64` reserves memory without a usable name; here it is padding.
 - **Slices**: `make([]T, n)` allocates `n` elements back to back in one block of memory.
@@ -27,7 +34,7 @@ updated: 2026-11-13
 - **`testing` benchmarks**: `func BenchmarkX(b *testing.B)` runs the body `b.N` times and reports time per iteration.
 - **What to run**: `go vet ./... && go test -race -v ./...`, then the benchmark command in Setup.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Memory Hierarchy and CPU Caches]] |
 | --- | --- |
@@ -57,13 +64,13 @@ classDiagram
 
 Both types expose the same two methods, `Incr` and `Get`, so the only difference between them is the memory layout underneath — which is exactly the point: identical behavior, different cache-line placement.
 
-## Setup
+## Setup 🟢
 
 - Module `falsesharing` with `falsesharing.go` and `falsesharing_test.go`.
 - Go 1.24, standard library only (`sync`, `testing`).
 - Run: `go vet ./... && go test -race -v ./... && go test -bench . -benchtime=50x -count=5 -cpu 8 ./...`
 
-## Code
+## Code 🟡
 
 ### Step 1: the packed layout
 
@@ -174,7 +181,7 @@ flowchart LR
     G1["goroutine 1 writes c[1].v"] -.-> l1
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -183,9 +190,11 @@ flowchart LR
 | Fixed 8 goroutines, 200,000 iterations | A configurable, flag-driven benchmark | Keeps the test and benchmark deterministic and comparable across runs; a real tuning exercise would sweep goroutine counts. |
 | Separate `TestCountersAreCorrect` before any benchmark | Trusting the benchmark alone | Proves correctness is identical between layouts before measuring performance, so a speed difference can't be mistaken for a correctness difference. |
 
-## Tests
+## Tests 🟡
 
 ### TestCountersAreCorrect
+
+**In plain words:** this test just checks that counting still counts right — 8 workers each add 200,000 to their own slot, and every slot must end at exactly 200,000, in both layouts.
 
 **Property.** Both layouts must independently compute the same final value per counter: `iters` (200,000) after `iters` increments from exactly one goroutine per index.
 
@@ -272,6 +281,8 @@ ok  	cs1scratch/falsesharing	1.488s
 
 ### BenchmarkUnpadded / BenchmarkPadded
 
+**In plain words:** the benchmarks are a stopwatch — run the exact same work with each layout and see which finishes sooner.
+
 **Property.** These measure wall-clock time for the same workload (8 goroutines × 200,000 increments) under each layout, to quantify the false-sharing cost described in the theory note — they do not assert anything, since the exact ratio is hardware- and noise-dependent.
 
 | Benchmark | What it runs |
@@ -319,7 +330,7 @@ func BenchmarkPadded(b *testing.B) {
 2. `-cpu 8` (passed on the command line, not hardcoded) pins the Go runtime to 8 OS threads, matching the 8 goroutines so each one gets its own core instead of time-slicing.
 3. A failure here isn't possible in the test-pass/fail sense — a "bad" result would simply be padded coming out *slower* or statistically indistinguishable from unpadded, which would mean the false-sharing effect didn't manifest on that run (noise, or hardware without the expected interconnect cost).
 
-## Running it
+## Running it 🟡
 
 ```text
 $ go test -bench . -benchtime=50x -count=5 -cpu 8 ./falsesharing/
@@ -338,14 +349,14 @@ Apple's performance cores share a large per-cluster L2 with fast core-to-core tr
 
 Treat the ~9% figure as one representative sample, not a precise constant.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`-cpu 8` matters.** Running this benchmark with the default `GOMAXPROCS` on a machine with fewer than 8 logical cores will time-slice goroutines onto the same core, hiding the inter-core invalidation cost entirely.
 - **Small sample counts hide the noise.** A single `-count=1` run can easily show padded *slower* than unpadded by chance; `-count=5` or more is the minimum to see the real spread described in the theory note.
 - **The padding constant is architecture-specific.** `[7]int64` assumes a 64-byte line; some ARM cores and all older or embedded chips may use a different line size, which would need a different padding constant to actually prevent sharing.
 - **Benchmark allocation cost is included.** `NewCounters`/`NewPaddedCounters` run inside the timed loop, so part of the measured time is allocation, not just increments — acceptable here since both layouts pay the same allocation cost.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `goroutines` from 8 to 2 and re-run the benchmark with `-cpu 2`. Predict whether the padded/unpadded gap grows, shrinks, or stays about the same, then measure it.
 2. Change the padding from `[7]int64` to `[3]int64` (32 bytes total per counter, so two counters now share a 64-byte line). Predict what happens to the benchmark gap, then run it.

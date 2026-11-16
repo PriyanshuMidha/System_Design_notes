@@ -17,7 +17,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code implements a plain binary search tree in Go — insert, search, delete (all three cases), height, four traversals, and the single/double rotations balanced trees build on — and tests that delete and rotation both preserve the BST property. See [[Trees, BSTs and Balanced Trees]] for the theory.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Trees, BSTs and Balanced Trees]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Trees, BSTs and Balanced Trees]]. It builds a plain binary search tree in Go — insert, search, delete, traversals — plus the rotations that balanced trees are made of, with tests proving the BST rule survives every operation. Read each step's notes before the code.
+
+## Before the code 🟢
 
 - **Pointer-linked structs** (`type Node struct { Left, Right *Node }`): each node points to its children; `nil` means "no child".
 - **Recursion** (`Insert`, `Delete`, `Height`, `InOrder`): each function handles one node and calls itself on a subtree.
@@ -26,7 +33,7 @@ updated: 2026-11-13
 - **A slice as a queue** (`LevelOrder`): breadth-first traversal appends children to the back and reads from the front.
 - **What to run:** `go vet ./... && go test -race ./...` inside the module; add `-v -run TestDeleteLeafOneChildTwoChildren` for one test.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept | Link |
 | --- | --- | --- |
@@ -36,7 +43,7 @@ updated: 2026-11-13
 | `InOrder`, `PreOrder`, `PostOrder`, `LevelOrder` | The four traversal orders and their uses | [[Trees, BSTs and Balanced Trees#Traversals four ways to walk the same tree]] |
 | `rotateLeft`, `rotateRight` | The rotation primitive every balanced tree builds on | [[Trees, BSTs and Balanced Trees#AVL vs red-black side by side]] |
 
-## Setup
+## Setup 🟢
 
 - Module: `bst`, Go 1.24.4, no external dependencies.
 - Layout:
@@ -53,7 +60,7 @@ updated: 2026-11-13
   go test -race -v ./... -run TestDeleteLeafOneChildTwoChildren
   ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the node and the BST invariant
 
@@ -412,7 +419,7 @@ func rotateRight(n *Node) *Node {
 > }
 > ```
 
-## Tests
+## Tests 🟡
 
 ### `TestDeleteLeafOneChildTwoChildren`
 
@@ -517,7 +524,7 @@ func TestRotationsPreserveBSTOrder(t *testing.T) {
 
 A failure here is the most serious possible bug for this code: it would mean the rotation primitive itself corrupts tree ordering, which would silently break every balanced tree built on top of it, not just this test.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -526,7 +533,7 @@ A failure here is the most serious possible bug for this code: it would mean the
 | `visit func(int)` callback for traversals | Returning a `[]int` directly from each traversal function | A callback lets callers avoid allocating a slice when they only need to, say, sum the keys or stop early; returning a slice is more convenient for the common case but forces an allocation even when unneeded |
 | Separate `rotateLeft`/`rotateRight`, unexported | A single parameterized `rotate(n *Node, dir int) *Node` | Two small, mirror-image functions are easier to read and reason about independently; a single parameterized version would be more compact but requires an extra conditional inside the hot path of every rotation |
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go test -race -v ./...
@@ -544,13 +551,13 @@ ok  	bst	1.461s
 
 Reading this output line by line: all four tests pass silently, meaning (in order) the three delete cases produce the correct sorted contents, `Height` reports `2` for the balanced tree and `4` for the degenerate chain exactly as the theory note's worked example claims, `Search` correctly distinguishes present from absent keys, and both rotation directions leave the tree's sorted order unchanged. `-race` reports no data races, as expected for single-goroutine, non-concurrent code — included here for consistency with this vault's other Go notes.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `Delete`'s two-children case calls `min(n.Right)` and then recursively calls `Delete(n.Right, succ.Key)` — a second full traversal down to the successor. This is simple and correct but not maximally efficient; a version that returned the successor's node directly from the same walk that found it would save one traversal, at the cost of more complex code.
 - `rotateLeft` and `rotateRight` assume the node being rotated actually has the required child (`n.Right` for `rotateLeft`, `n.Left` for `rotateRight`) — calling `rotateLeft` on a node with no right child panics on nil-pointer dereference. A production balancing algorithm must check this before rotating; this toy relies on its tests only calling rotations where the required child is known to exist.
 - `LevelOrder`'s `queue = queue[1:]` re-slicing never reclaims the dropped front elements' backing array space until the whole slice is garbage collected — harmless at this note's scale, but a long-running breadth-first traversal over a very large tree would do better with a proper ring buffer or a slice that's periodically compacted.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change this, predict the result:** call `Delete` on a key that doesn't exist in the tree. Predict what `Delete` returns and whether it panics, then verify against the code — does the "not found" case need special handling, or does the existing logic already cover it correctly?
 2. **Change this, predict the result:** in `TestHeightDegenerateVsBalanced`, change the degenerate chain to insert `{5, 4, 3, 2, 1}` (descending instead of ascending) instead of `{1, 2, 3, 4, 5}`. Predict the resulting height before running it, and explain which child pointer (`Left` or `Right`) chains this time.

@@ -28,7 +28,42 @@ updated: 2026-11-13
 > - Rule: every call carries a deadline, and servers pass the remaining deadline on to the calls they make.
 > - Classic mistake: no deadline (calls hang forever) or retrying non-idempotent calls on every error code.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Inside a backend, services call each other constantly. **gRPC** makes such a call feel like calling an ordinary function: `GetUser(42)` — except the function runs on another machine.
+
+The trick is a shared contract file (the `.proto` file). Both sides generate their code from it, so they can never disagree about field names or types.
+
+```mermaid
+flowchart LR
+    P["user.proto<br/>(shared contract)"] --> C["generated client"]
+    P --> S["generated server"]
+    C -- "tiny binary messages<br/>over HTTP/2" --> S
+```
+
+The data travels as **protobuf**: compact binary, often 5-10x smaller than JSON. And the transport is HTTP/2, which carries hundreds of calls at once over one connection, including live **streams** in either direction.
+
+```mermaid
+flowchart LR
+    A["Unary: 1 ask, 1 answer"] --- B["Server stream: 1 ask,<br/>many answers (ticker)"]
+    B --- D["Client stream / bidi:<br/>both sides send"]
+```
+
+One golden habit: every call carries a **deadline** ("give up after 300 ms"), passed along to every service down the chain.
+
+The rest of this note is just four questions:
+1. How does a `.proto` contract turn into working code?
+2. What actually travels on the wire?
+3. What are the four call types for?
+4. What bites in production (deadlines, retries, load balancing)?
+
 
 **The problem in one story.**
 An Orders service needs a user's name from a Users service, thousands of times a second.
@@ -71,7 +106,7 @@ Where it breaks: a phone call has no built-in timer, while every gRPC call shoul
 > [!tip] Remember
 > One `.proto` contract, generated code, protobuf over HTTP/2, and a deadline on every call.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An Orders service calls a Users service 2,000 times per second with JSON over HTTP/1.1 (an example load):
 
@@ -86,7 +121,7 @@ Deadlines, cancellation, status codes, metadata and retries are part of the fram
 
 Google built it from its internal RPC system, Stubby, and open-sourced it in 2015.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **A remote procedure call (RPC) is a function call that happens to cross the network.** The generated client stub looks like a local method, `client.GetUser(ctx, req)`. Underneath, it encodes the request, sends it on an HTTP/2 stream, waits for the response or the deadline, and decodes the result or a status code.
 
@@ -96,9 +131,11 @@ gRPC ships one maintained client library per language (Go, Java, C++, Python, C#
 
 Browsers are a separate problem. JavaScript in a browser cannot control HTTP/2 framing or read trailers, so a browser cannot speak native gRPC. It needs gRPC-Web or Connect, usually through a proxy (section 5).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Define the service, then generate code
+
+**In plain words:** you write the menu of functions and message shapes once; a generator writes the boring networking code for every language your teams use.
 
 ```protobuf
 syntax = "proto3";
@@ -159,6 +196,8 @@ This file was compiled with `protocompile` v0.14.1 (a pure-Go protobuf compiler)
 
 ### From message to bytes
 
+**In plain words:** protobuf never sends field names, only field numbers packed into a byte or two. That is the whole reason `{"id":42}` shrinks from 9 bytes to 2.
+
 Protobuf writes each field as a **tag** followed by a value. The tag packs the field number and a 3-bit **wire type**: `tag = field_number << 3 | wire_type`. Integers use **varints**: 7 bits per byte, with the high bit meaning "more bytes follow", so small numbers take one byte.
 
 Field names never travel; numbers do. That is why protobuf is smaller than JSON.
@@ -176,12 +215,16 @@ flowchart LR
 
 ### On HTTP/2
 
+**In plain words:** each call rides its own lane (stream) inside one shared connection. The odd part: the real success/failure code arrives at the very end, in "trailers", and the HTTP status is 200 even for failures.
+
 - Each RPC is one **HTTP/2 stream**. Many streams share one TCP connection, interleaved as frames, so a slow call does not block a fast one at the HTTP layer. The basics of streams and multiplexing live in [[HTTP-1.1 vs HTTP-2 vs HTTP-3]].
 - Headers are compressed with **HPACK**. After the first call, repeated headers such as `:path` and `content-type` shrink to an index into a shared table.
 - **Request:** a HEADERS frame (`:method POST`, `:path`, `content-type: application/grpc`, `te: trailers`, optional `grpc-timeout` and custom metadata), then DATA frames holding length-prefixed messages.
 - **Response:** HEADERS (`:status 200`), DATA frames, then **trailers**: a final HEADERS frame carrying `grpc-status` and `grpc-message`. The HTTP status is 200 even when the call failed. The real outcome is `grpc-status`, which can only be known after the last message is sent.
 
 ### Four call types
+
+**In plain words:** one question one answer; one question many answers; many questions one answer; or an open two-way conversation. Pick the shape that matches the data flow.
 
 | Call type | Shape | Real examples | Not a good fit |
 | --- | --- | --- | --- |
@@ -230,9 +273,11 @@ sequenceDiagram
     Note over A,S: Both directions flow independently on one HTTP/2 stream
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** from the caller's seat, gRPC is just a typed method that takes a deadline and returns a result or an error.
 
 The bare idea from the caller's side: a generated method takes a `context` with a deadline and returns a typed result or a status error. The full version below shows the real bytes on the wire, the framing and the `grpc-timeout` header.
 
@@ -273,6 +318,8 @@ func main() {
 
 ### One unary call on the wire
 
+**In plain words:** here is one real call traced byte by byte: the headers, the 7-byte request, the reply, and the status in the trailers.
+
 `GetUser({id: 42})` with a 300 ms deadline, traced frame by frame. The bytes follow from the gRPC HTTP/2 spec and the protobuf encoding rules; the Go test below checks the request frame. The client sends the time left when the stream starts, so a real trace shows a `grpc-timeout` slightly below `300000u`.
 
 ```text
@@ -302,6 +349,8 @@ server -> client   HEADERS (stream 1, END_STREAM)   <- trailers
 If the user does not exist, the server answers with a single **Trailers-Only** HEADERS frame: `:status: 200`, `content-type: application/grpc`, `grpc-status: 5`, `grpc-message: user 42 not found`.
 
 ### The framing and the timeout header in Go
+
+**In plain words:** two wire details worth owning: every message is prefixed with a 5-byte "flag + length" header (check the length before allocating!), and the timeout travels as a relative duration so clocks need not agree.
 
 Two protocol details come up in design reviews: the 5-byte message prefix, and the `grpc-timeout` header. This standard-library code implements both. It compiles and passes `go vet` and `go test -race` on Go 1.24.4. Production code uses grpc-go, which does this internally (see [[gRPC Services in Go]]).
 
@@ -461,7 +510,7 @@ What the tests pin down:
 - A reader must check the length prefix against its limit **before** allocating. Otherwise one 5-byte header can make a server allocate gigabytes.
 - `grpc-timeout` is a **relative** duration, so client and server clocks never need to agree.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Topic | REST + JSON | gRPC |
 | --- | --- | --- |
@@ -502,7 +551,7 @@ flowchart LR
     end
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Public APIs for unknown clients:** use REST + JSON ([[REST and HTTP API Design]]). Everyone has `curl`; few partners want to install a protobuf toolchain.
 - **Browser-first products:** you will need gRPC-Web or Connect plus a proxy anyway. Consider REST, or [[GraphQL]] for flexible reads.
@@ -510,11 +559,13 @@ flowchart LR
 - **Push to millions of browsers or phones:** use WebSocket or SSE ([[Real-time APIs - WebSocket, SSE and Long Polling]]). gRPC streams fit service-to-service and native mobile apps.
 - **Costs you take on:** a codegen pipeline, binary payloads that need tools to read, HTTP/2 end to end (or translating proxies), and load-balancer changes (section 7).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** the Kubernetes container runtime interface (kubelet to containerd) is gRPC. The etcd v3 API is gRPC, and its `Watch` method is a bidirectional stream. Envoy usually receives its dynamic configuration over gRPC xDS streams (files and REST polling are the alternatives).
 
 ### Deadlines, propagation and cancellation
+
+**In plain words:** the time budget shrinks as the call passes through each service, and when it runs out, everyone downstream gets told to stop. The only rule: pass the same context along.
 
 - **Always set a deadline.** Without one, a call to a hung server waits forever and holds a goroutine, a stream and memory.
 - **Propagation:** the client sends the remaining time as `grpc-timeout`. The server's handler context gets that deadline. If the handler passes the **same context** to its downstream calls, grpc-go sends each of them the time still left.
@@ -523,6 +574,8 @@ flowchart LR
 - **`DEADLINE_EXCEEDED` does not mean "nothing happened".** The server may have committed the write just before the deadline. Retry only idempotent calls, or carry an idempotency key ([[Idempotency and Idempotency Keys]]).
 
 ### Status codes and retries
+
+**In plain words:** gRPC has 17 fixed error categories; only a few are safe to retry, and retries are declared in config with a budget, never hand-rolled loops.
 
 | Code (number) | Meaning | Client action |
 | --- | --- | --- |
@@ -568,11 +621,15 @@ Retries are configured per method in the **service config** (gRFC A6), not hand-
 
 ### Metadata and interceptors
 
+**In plain words:** metadata is gRPC's word for headers; interceptors are its middleware, wrapping every call for logging, auth and tracing.
+
 - **Metadata** is gRPC's name for headers: lowercase keys, string values. Keys ending in `-bin` carry binary values, base64-encoded on the wire. The `grpc-` prefix is reserved. A server can send **headers** (before the first message) and **trailers** (after the last one).
 - **Interceptors** are middleware around every call: unary and streaming variants, chained on both client and server. A typical server chain is recovery → tracing → logging → authentication → validation → handler. Client interceptors attach tokens and trace IDs. Go APIs are in [[gRPC Services in Go]].
 - Rich errors travel in the `grpc-status-details-bin` trailer as a serialized `google.rpc.Status` with typed details, for example `BadRequest` with one entry per invalid field.
 
 ### Load balancing
+
+**In plain words:** one long-lived connection means a connection-level balancer sends all your calls to one unlucky pod. You must balance per call: in the client, or with a smarter proxy.
 
 HTTP/2 connections are long-lived, and one connection carries every call. An **L4** balancer (AWS NLB, a Kubernetes ClusterIP Service) picks a backend once per connection, so one client pins all its calls to one pod (see the diagram in section 5). Fixes:
 
@@ -581,6 +638,8 @@ HTTP/2 connections are long-lived, and one connection carries every call. An **L
 3. **`MaxConnectionAge` on servers:** connections are closed after a set age, so clients reconnect and newly added pods get traffic. grpc-go re-resolves DNS only when a connection breaks, so this matters for headless DNS.
 
 ### Security and tooling
+
+**In plain words:** TLS by default, identity by mTLS or tokens, a standard health-check service, and `grpcurl` as your curl replacement for poking at services.
 
 - **TLS** is the default for anything leaving a host; gRPC negotiates HTTP/2 with ALPN `h2`. Service identity uses **mTLS** or per-RPC tokens in the `authorization` metadata. The mechanisms are in [[Service-to-Service Auth - API Keys, HMAC, mTLS]] and [[TLS and HTTPS]].
 - **Server reflection** lets tools list services and fetch descriptors at runtime. Enable it in development; on public endpoints it hands out your API map.
@@ -600,7 +659,7 @@ grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
 - Active streams per server, stream duration, and message sizes near the 4 MiB limit.
 - GOAWAY counts, reconnects and keepalive failures.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Keepalive:** clients can send HTTP/2 PING frames to detect dead connections behind NAT or load-balancer idle timeouts. grpc-go sends none unless you set `keepalive.ClientParameters`. Servers enforce a minimum ping interval: grpc-go's default `EnforcementPolicy.MinTime` is 5 minutes.
   - A client that pings more often gets `GOAWAY` with `ENHANCE_YOUR_CALM` and the debug data `too_many_pings`, and its connection closes.
@@ -612,7 +671,7 @@ grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
 - **Long-lived streams and deploys:** a stream that lives for hours pins a client to one pod, survives scale-out, and dies on every deploy. Design streams to resume from a sequence number (the `seq` field above) and reconnect with jittered backoff. Go patterns are in [[gRPC Streaming in Go]].
 - **Compatibility beyond fields:** adding a method or a service is safe. Renaming a method, changing a unary method to streaming, or moving a service to another package breaks the path or the call shape. Deprecate and add instead.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: you put gRPC services behind an L4 load balancer and one pod is at 100% CPU while the others idle. Why?
 > HTTP/2 multiplexes every call over one long-lived connection, and an L4 balancer picks a backend once per connection. Balance per call instead: client-side `round_robin` over a headless Service or xDS, or an L7 proxy such as Envoy. Add `MaxConnectionAge` so connections rotate and new pods receive traffic.
@@ -635,7 +694,7 @@ grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
 > [!question]- How do you change a `.proto` without breaking deployed clients?
 > Only add fields and methods. Never reuse or renumber a field; `reserved` removed numbers and names. Never rename packages, services or methods, because they form the HTTP/2 path. Run `buf breaking` in CI against the last released schema.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `.proto` = contract; codegen gives typed clients and servers; path `/<package>.<Service>/<Method>`.
 - Wire: tag `field << 3 | wire_type`, varints; frame = 1-byte flag + 4-byte length + message; 4 MiB default receive limit.
@@ -645,7 +704,7 @@ grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
 - L4 balancers pin connections: use client-side `round_robin`/xDS or an L7 proxy, plus `MaxConnectionAge`.
 - Browsers need gRPC-Web, Connect or grpc-gateway; use reflection and `grpcurl` in development, health service for probes.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[Choosing an API Style]], [[REST and HTTP API Design]]
 - **Next:** [[Protocol Buffers and Schema Evolution]], [[gRPC Services in Go]], [[gRPC Streaming in Go]], [[Serving REST and gRPC Together]]

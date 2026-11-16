@@ -32,7 +32,35 @@ updated: 2026-11-13
 > - Sender rule: write the event in the same transaction as the data change (an outbox), then retry with backoff from a queue.
 > - Classic mistake: doing slow work or calling other services before answering, which causes timeouts and duplicate retries.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Instead of your server constantly asking a provider "anything new?", the provider calls *you* when something happens. A **webhook** is that call: a normal web request (`POST`) sent to a URL you registered, carrying an **event** like "payment succeeded".
+
+```mermaid
+flowchart LR
+    P["Provider:<br/>payment succeeded"] -- "signed POST" --> U["Your URL"]
+    U -- "200 OK, got it" --> P
+```
+
+Sounds simple, but the doorbell has quirks: it may ring twice for the same parcel, ring late, ring out of order, or be pressed by an impostor. So the receiver's job is fixed: check the **signature** (a code proving who sent it), save the event, answer "got it" fast, and do the real work later in the background.
+
+```mermaid
+flowchart LR
+    E["Event arrives"] --> V["1 verify signature"] --> S["2 save it"] --> A["3 answer 200 fast"] --> W["4 worker processes later,<br/>skipping repeats"]
+```
+
+The rest of this note is just three questions:
+1. How does a receiver verify, store and process safely?
+2. How does a sender deliver reliably (queue, retries, give-up rules)?
+3. What goes wrong (duplicates, out-of-order, forgery, SSRF) and how do you defend?
+
 
 **The problem in one story.**
 You order food online and pay with a card.
@@ -76,7 +104,7 @@ Where it breaks: a doorbell rings once, but a webhook may ring twice, late, out 
 > [!tip] Remember
 > Verify the raw body, store the event, answer `2xx` fast, and make processing idempotent.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A marketplace has 20,000 open payments at a payment provider and needs to know when each one settles.
 
@@ -85,7 +113,7 @@ A marketplace has 20,000 open payments at a payment provider and needs to know w
 
 Webhooks turn "keep asking" into "get told". The price is that the provider now calls *you*, across the internet, with its own retry rules, so your endpoint becomes a public API with its own security and reliability problems.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A webhook is a **reverse API call**: the provider is the client and you are the server.
 
@@ -97,9 +125,11 @@ Think of a courier with a doorbell. You do not stand at the window all day; the 
 
 The rule that follows: **the webhook request only records the event; it never does the business work.**
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Receiving: verify, persist, acknowledge, process later
+
+**In plain words:** the receiver is a signing clerk, not a worker: check the badge, log the parcel, say "received", move on. Unpacking happens later, and a parcel logged twice is unpacked once.
 
 ```mermaid
 sequenceDiagram
@@ -136,6 +166,8 @@ sequenceDiagram
 
 ### Sending: outbox, dispatcher, retries, disable
 
+**In plain words:** the sender never fires the web request inside the same breath as the database change. It writes the event into an outbox table in the same transaction, and a separate dispatcher delivers, retries and eventually gives up per customer.
+
 ```mermaid
 flowchart LR
     A["Domain write<br/>(invoice paid)"] -->|same transaction| O[("outbox row")]
@@ -160,6 +192,8 @@ flowchart LR
 
 ### Delivery lifecycle on the sender
 
+**In plain words:** each delivery walks a small life: pending, in flight, delivered — or retrying, paused, dead with a resend button.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: fan-out from outbox
@@ -175,9 +209,11 @@ stateDiagram-v2
     Delivered --> [*]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest safe receiver: hash-check the raw bytes, remember the event id, answer 200.
 
 The bare receiver: verify the HMAC over the raw bytes, dedupe by event id, acknowledge. The full version below adds timestamps for replay protection, a durable inbox table, async workers and the sender side.
 
@@ -221,6 +257,8 @@ func main() { http.HandleFunc("/webhooks", handle); http.ListenAndServe(":8080",
 ```
 
 ### Full version
+
+**In plain words:** the real receiver adds timestamps against replays, two active secrets for rotation, a durable inbox table in Postgres, and a worker that applies events in one transaction with an out-of-order guard.
 
 **The bytes.** The provider signs `"<timestamp>.<raw body>"` with HMAC-SHA256 and sends:
 
@@ -474,7 +512,7 @@ COMMIT;
 
 **Replay tooling** is then one guarded statement behind an admin command, run after the bug is fixed: `UPDATE webhook_inbox SET status = 'pending', attempts = 0 WHERE status = 'dead' AND event_type = 'invoice.paid';`. Because the worker is idempotent and version-guarded, replaying an event that already took effect changes nothing.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **Getting change notifications:**
 
@@ -503,7 +541,7 @@ Stripe offers both: classic snapshot events and, in its newer event destinations
 | Razorpay | `X-Razorpay-Signature` | raw body, HMAC-SHA256, hex | Dedupe on `x-razorpay-event-id` |
 | Standard Webhooks (Svix and others) | `webhook-signature: v1,…` plus `webhook-id`, `webhook-timestamp` | `id + "." + timestamp + "." + body`, HMAC-SHA256, base64 | Signed timestamp and id; several space-separated signatures allow rotation |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **You must run a public endpoint.** Behind a firewall, or for a batch job that runs once a night, polling or a file drop is simpler.
 - **Delivery is at-least-once at best** ([[Delivery Semantics and Exactly-Once]]). Every receiver needs dedupe and ordering logic; a pure `GET` loop has neither problem.
@@ -511,7 +549,7 @@ Stripe offers both: classic snapshot events and, in its newer event destinations
 - **Within one company**, a broker gives replay, consumer groups and backpressure for free. Do not build HTTP callbacks between your own services when a queue would do.
 - **Senders take on real cost:** a delivery pipeline, per-customer logs, a replay UI, SSRF defence and support tickets from customers whose endpoints are broken.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Stripe** signs with a timestamp, retries for up to 3 days in live mode with exponential backoff, does not guarantee order and may send the same event twice.
@@ -532,7 +570,7 @@ Stripe offers both: classic snapshot events and, in its newer event destinations
 	- Receiver: signature failures per provider, inbox insert latency, duplicates per hour, oldest `pending` row age, `dead` count.
 	- Sender: delivery success rate and p99 latency per endpoint, retry queue depth, endpoints paused or disabled, DLQ size, time from domain event to first attempt.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Out-of-order events.** Providers retry independently per event, so a retry of an old event can arrive after a newer one. Three defences, from cheapest to strongest:
 
@@ -632,7 +670,7 @@ Deliveries for a disabled endpoint stay in the DLQ, so re-enabling plus "replay 
 
 For a breaking change, emit a new event type or let each endpoint pin a version. Stripe fixes a snapshot event's shape by the API version in force when the event is created, so a later account upgrade never rewrites old events.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why must a webhook handler return 2xx quickly instead of doing the work?
 > The provider has a timeout (GitHub: 10 s) and retries anything that is not a timely 2xx. Slow work therefore causes duplicate deliveries and retry storms. Verify, persist the raw event, return 2xx, and let a worker do the work with its own retries.
@@ -655,7 +693,7 @@ For a breaking change, emit a new event type or let each endpoint pin a version.
 > [!question]- How do you rotate a webhook secret without dropping events?
 > Keep two active secrets for an overlap window. The sender signs with both, and the receiver accepts a match with either. Once all receivers have the new secret, retire the old one.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Receiver: raw bytes → HMAC with constant-time compare → timestamp window → `INSERT … ON CONFLICT DO NOTHING` → `2xx` → async worker.
 - Acknowledge duplicates with `2xx`; dedupe on the provider's event id (`X-GitHub-Delivery`, Stripe `evt_…`, `x-razorpay-event-id`).
@@ -665,7 +703,7 @@ For a breaking change, emit a new event type or let each endpoint pin a version.
 - Customer URLs are SSRF input: check the IP at dial time, refuse redirects.
 - Webhooks can still be missed: run reconciliation against the provider's API.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Idempotency and Idempotency Keys]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]]
 - **Next:** [[Receiving Webhooks Idempotently]] (the Go service), [[Transactional Outbox and CDC]], [[Dead Letter Queues and Poison Messages]], [[Case Study - Payment System]], [[Case Study - Notification System]]

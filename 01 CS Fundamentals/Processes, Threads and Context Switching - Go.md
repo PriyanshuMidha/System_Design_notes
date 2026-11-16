@@ -17,7 +17,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Runnable code for [[Processes, Threads and Context Switching]]: a minimal process table modelling `fork`, `exec` and per-process threads, plus two context-switch benchmarks measured side by side on the same machine — one that lets the Go scheduler keep both goroutines on one OS thread, and one that pins each goroutine to its own OS thread with `runtime.LockOSThread`, forcing a real kernel context switch on every hand-off.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Processes, Threads and Context Switching]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Processes, Threads and Context Switching]]. It measures, in real numbers on your machine, how cheap goroutine switches are compared to OS thread/process operations. Read the code with its notes, then run the benchmarks and compare your numbers.
+
+## Before the code 🟢
 
 - **Goroutines (`go f()`)**: a function running concurrently, scheduled by the Go runtime rather than the OS.
 - **Unbuffered channels (`make(chan struct{})`)**: a send blocks until a receiver is ready, so each send is a forced hand-off between goroutines.
@@ -26,7 +33,7 @@ updated: 2026-11-13
 - **Maps and structs (`map[int]*PCB`)**: the in-memory process table is a plain map from PID to a struct pointer.
 - **What to run**: `go vet ./... && go test -race ./...` for correctness, then `go run ./cmd/pingpong` for the timing numbers.
 
-## What this code shows
+## What this code shows 🟢
 
 Every row below is a two-way link: the theory-note section names the *why*, and the code name is the *how*.
 
@@ -52,7 +59,7 @@ flowchart LR
     end
 ```
 
-## Why measure both sides instead of citing one number
+## Why measure both sides instead of citing one number 🟡
 
 The theory note's claim has two parts, and a single benchmark can only ever support one of them. "A goroutine handoff is cheap" is easy to show: time `PingPongLatency` and the number is small.
 
@@ -66,14 +73,14 @@ A 90x gap between two numbers that differ in exactly one respect is much stronge
 
 This is also why the pinned benchmark uses `runtime.LockOSThread` rather than, say, spawning real OS-level processes and measuring IPC between them: a process-to-process round trip would add syscall and IPC overhead on top of the context switch itself, muddying exactly the comparison this benchmark exists to make cleanly.
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. No external dependencies — standard library only (`fmt`, `runtime`, `time`).
 - Layout: one package, `procthreads`, holding the process-table model, both latency benchmarks, and their tests; a `cmd/pingpong` runnable prints five samples of each benchmark.
 - Run it with `go vet ./... && go test -race ./...`. The timing numbers are printed by `go run ./cmd/pingpong`.
 - Nothing here needs a database, a network connection, or any environment-specific setup beyond a working Go 1.24 toolchain — every number in this note was produced by running the commands above exactly as written, on the machine and date given in the frontmatter.
 
-## How to read this note
+## How to read this note 🟢
 
 This note has two halves that teach different things.
 
@@ -87,7 +94,7 @@ Each code step below follows the same shape: a **Concept** paragraph linking the
 
 Where a function was naturally longer than that, it is split across two blocks that continue each other, with a sentence marking the split.
 
-## Code
+## Code 🟡
 
 ### Step 1: a minimal process control block and table
 
@@ -362,7 +369,7 @@ The caller pins itself the same way, waits for the signal, then times the hand-o
 2. The hand-off logic itself (`<-ping`, `pong <- struct{}{}` and back) is identical to `PingPongLatency`; the **only** behavioural difference is that neither side can be the "same OS thread" the other runs on, because each is locked to a different one.
 3. `defer runtime.UnlockOSThread()` on both sides releases the pin once the function returns, so the dedicated OS threads can be reused by the Go runtime afterward instead of leaking.
 
-## Design decisions
+## Design decisions 🟡
 
 The table below records five choices made while writing this code, each with the alternative that was considered and rejected.
 
@@ -384,7 +391,7 @@ Second, the `ready` handshake is not cosmetic: `LockOSThread` itself has a small
 
 Both benchmarks pay that cost entirely before `start := time.Now()` runs.
 
-## Tests
+## Tests 🟡
 
 Four tests cover this code: three exercise the `ProcessTable` model's correctness (one per operation that could be confused with another — threading versus forking versus execing), and the fourth is a sanity check on the measurement harness itself rather than a performance assertion, for the reason explained in the recap at the end of this note.
 
@@ -507,7 +514,7 @@ func TestPingPongLatencyIsSmallAndPositive(t *testing.T) {
 
 **If it fails.** A zero or negative duration would indicate the timer wrapped or the loop never actually ran `rounds` iterations — a bug in the harness itself, not in the scheduler being measured.
 
-## Running it
+## Running it 🟡
 
 This section gives the exact commands, their exact output on this machine, and a line-by-line reading of that output — the same three-part shape used for every measurement in this note.
 
@@ -556,7 +563,7 @@ Both groups are also worth comparing against the theory note's lifecycle diagram
 
 Every handoff in the pinned group is the same pair of transitions, but now enforced by the kernel's scheduler across two OS threads, which is precisely why it pays the page-table and cache costs the theory note's third section describes.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 None of the four pitfalls below were found by `go vet` or the race detector — they are the kind of thing only a careful reading, or a deliberate experiment like the exercises below, would surface.
 
@@ -567,7 +574,7 @@ The pitfalls below are grouped from "silent but harmless if you know to watch fo
 - **Buffered channels would silently break both measurements.** A channel with even one slot of buffer lets a send succeed without the receiver being ready yet, which removes the forced hand-off the whole benchmark depends on — the code would still compile and run, but the numbers it printed would no longer mean "cost of one context switch."
 - **`ProcessTable` is not safe for concurrent use.** `procs` and `nextID` are read and written with no mutex; the tests only ever use one goroutine per table, but a real concurrent process table would need the synchronization covered in [[Concurrency Primitives - Mutex, Semaphore, Atomics]]. Calling `Fork` and `AddThread` from two goroutines on the same `ProcessTable` without a lock would race on `nextID` and could hand out duplicate IDs.
 
-## Exercises
+## Exercises 🔴
 
 The three exercises below move from cheapest-to-try to most instructive: the first only requires editing a literal in `main.go`, the second asks you to deliberately break a design decision from the table above and observe the consequence, and the third connects this code back to a detail of the theory note's lifecycle diagram that the existing tests don't check.
 
@@ -577,7 +584,7 @@ The three exercises below move from cheapest-to-try to most instructive: the fir
 
 Each exercise is deliberately a "predict first, then run" task rather than a "make this pass" task: the goal is to build an intuition for which parts of the measured numbers come from the Go runtime's own behaviour and which come from this harness's specific choices, so that a different, unfamiliar benchmark can be read with the same skepticism.
 
-## Recap: what each piece proves
+## Recap: what each piece proves 🟡
 
 Read this section as the answer to "so what did I actually just prove, and what didn't I prove" — a question worth asking of any benchmark you write or read, in an interview or otherwise, before quoting its numbers as if they were universal facts rather than one measurement on one machine.
 

@@ -26,7 +26,42 @@ updated: 2026-11-13
 > - Rule: batch child lookups with a DataLoader (collect keys, fetch once) or a list of N items causes N extra queries (N+1).
 > - Classic mistake: exposing the graph without depth/cost limits and per-field authorization.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+With a normal web API, the server decides what each URL returns. Often you get a big blob with 30 fields and use 1, or you need three requests to build one screen.
+
+GraphQL flips it: the server publishes a typed menu (the **schema**), and the client writes one order (the **query**) naming exactly the fields it wants, even across related things.
+
+```mermaid
+flowchart LR
+    A["App: 'game title +<br/>reviews + author names'"] -- "one request" --> S["GraphQL server"]
+    S -- "one reply,<br/>exactly that shape" --> A
+```
+
+On the server, each field has a small function called a **resolver** that fetches just that field. The server runs the needed resolvers and glues the results into one JSON answer.
+
+```mermaid
+flowchart LR
+    S2["Server"] --> R1["game resolver"] --> DB[("data")]
+    S2 --> R2["reviews resolver"] --> DB
+    S2 --> R3["author resolver"] --> DB
+```
+
+The catch: freedom for clients means the server must defend itself (limits on query size) and avoid doing one database query per list item (the N+1 problem).
+
+The rest of this note is just four questions:
+1. How do schema, query and resolvers fit together?
+2. How does one query actually execute?
+3. What is the N+1 problem and how does a DataLoader fix it?
+4. What does GraphQL cost you in production (errors, caching, abuse)?
+
 
 **The problem in one story.**
 A phone app shows a game, its reviews, and the name of each reviewer.
@@ -74,7 +109,7 @@ Where it breaks: a real waiter refuses an absurd order by common sense; a GraphQ
 > [!tip] Remember
 > One typed schema, one query naming exact fields, one resolver per field, and always batch child lookups.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A game page shows a game's title, its reviews, and each reviewer's name. The data forms a graph: Game → Reviews → Authors.
 
@@ -104,7 +139,7 @@ query GamePage {
 
 Facebook built GraphQL in 2012 for exactly this: many client screens, each needing a different slice of the same graph, over slow mobile networks. It was open-sourced in 2015.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - The **schema** is a typed menu of everything a client may ask for.
 - A **query** is an order written against that menu. The response mirrors the order's shape, field by field.
@@ -114,9 +149,11 @@ The client **never talks to the database**. It calls one GraphQL server endpoint
 
 **Analogy:** a restaurant waiter. You order one plate with exactly the items you want. The waiter (the GraphQL server) walks to the grill, the salad station and the bar (resolvers calling services), and brings back one plate laid out as you ordered.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The schema (SDL)
+
+**In plain words:** the schema is the printed menu: every type, every field, and what is allowed as input. If it is not on the menu, no client can order it.
 
 The Schema Definition Language describes types and the three root operation types.
 
@@ -183,6 +220,8 @@ type Subscription { invoicePaid(customerId: ID!): Invoice! }
 
 ### Operations, variables and fragments
 
+**In plain words:** a query is the order form; variables are the blanks you fill in so the form itself never changes; a fragment is a reusable block of fields you paste by name.
+
 ```graphql
 query Dashboard($first: Int!, $after: String) {
   dashboard {
@@ -221,6 +260,8 @@ Variables travel separately as JSON (`{"first": 10}`), so the query text stays c
 
 ### Execution: one resolver per field, parent before child
 
+**In plain words:** the server fills in the answer field by field, parents first, children after, like filling a family tree top-down.
+
 1. **Parse** the query text into an AST.
 2. **Validate** it against the schema: fields exist, argument types match, fragments fit. A failure here means nothing runs.
 3. **Execute**: start at the root type and call each selected field's resolver. Each resolver gets `(parent value, arguments, context)`. A child resolver runs only after its parent returns, and it receives the parent's value.
@@ -248,6 +289,8 @@ The over-fetching did not disappear; it moved to the server side of the network,
 
 ### The N+1 problem and DataLoader
 
+**In plain words:** ask for 10 invoices and their customers, and a naive server runs 1 query for the list plus 10 more, one per customer. A DataLoader waits a moment, collects all 10 customer IDs, and asks the database once.
+
 Resolvers are per field, so a naive `Invoice.customer` resolver runs one query per invoice. Ten invoices produce 1 + 10 SELECTs. A **DataLoader** collects every key requested during one short window (or one execution tick), then issues one batched query.
 
 ```mermaid
@@ -265,9 +308,11 @@ flowchart TB
 
 The loader must be **created per request**. Its memo cache would otherwise serve stale rows, and worse, serve one user's authorized data to another user.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the trick in 20 lines: gather the keys first, fetch them all in one go, then hand each item its answer.
 
 The bare idea behind a DataLoader: collect the keys requested while resolving a list, then fetch them in one batch query. The full version below adds per-request caching, a batching window, concurrency safety and tests.
 
@@ -305,6 +350,8 @@ func main() {
 ```
 
 ### Full version
+
+**In plain words:** a real, thread-safe DataLoader: a tiny waiting window, deduplicated keys, a per-request cache, and a test proving 10 lookups became 1 batch.
 
 A minimal, generic DataLoader in Go 1.24 using only the standard library. It shows the mechanism that `github.com/vikstrous/dataloadgen` (the loader gqlgen's docs use) implements with more features. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -461,7 +508,7 @@ func TestMissingKeyIsNotFound(t *testing.T) {
 
 **Wait window trade-off:** a 1–5 ms window adds that much latency to every level of the query that goes through a loader, and saves N − 1 round trips at that level. Production loaders also cap the batch size (for example 100 keys), so one huge list does not build a giant `ANY($1)` array.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -483,7 +530,7 @@ Side by side, topic by topic:
 | Errors | HTTP status codes | Usually HTTP 200 with an `errors` array |
 | Learning curve | Low | Higher: schema, resolvers, DataLoader, cost limits |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Server-to-server calls:** use [[gRPC]] or REST. A backend knows its exact needs, so client-chosen shapes add parsing and cost-analysis work for nothing.
 - **One client, a few screens:** a BFF or plain REST is simpler.
@@ -491,7 +538,7 @@ Side by side, topic by topic:
 - **File uploads and downloads:** GraphQL has no native binary type. Upload to object storage with a pre-signed URL ([[File Upload Architecture]]) and pass the object key in a mutation.
 - **Costs you take on:** a query can be arbitrarily expensive, the N+1 problem appears by default, every error looks like HTTP 200 to a load balancer, and rate limiting must count query cost instead of requests.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- GitHub's GraphQL API (once called v4) enforces cost limits (GitHub Docs):
@@ -503,6 +550,8 @@ Side by side, topic by topic:
 	- Netflix runs a federated graph whose subgraph services are built with its open-source DGS framework for Spring Boot.
 
 ### Errors and partial data
+
+**In plain words:** GraphQL often answers "here is most of what you asked, and here is a list of what failed" — all under HTTP 200. Your monitoring must read that list, not just the status code.
 
 By long-standing convention, a server that answers with `application/json` returns **HTTP 200** even when some fields failed. Failures go in a top-level `errors` array, and the rest of `data` is still returned.
 
@@ -533,6 +582,8 @@ By long-standing convention, a server that answers with `application/json` retur
 
 ### Authorization
 
+**In plain words:** there is only one URL, so you cannot protect data by protecting URLs. Permission checks move into the resolvers, next to the data itself.
+
 There is one endpoint, so URL-based rules cannot express "who may read `Customer.email`". Authorization happens in the resolver layer:
 
 - **Authentication** happens once, in HTTP middleware. It puts the caller (from a session cookie or a token, see [[JWT - Structure, Validation and Pitfalls]]) into the request context.
@@ -540,6 +591,8 @@ There is one endpoint, so URL-based rules cannot express "who may read `Customer
 - **Field-level checks** (only billing admins may see `email`) fit a schema directive such as `@auth`, enforced before the field resolver runs.
 
 ### Cost control
+
+**In plain words:** clients can write queries of any size, so the server needs a bouncer: depth limits, price-per-query scoring, and page caps, all checked before running anything.
 
 A single nested query can explode: `users(first: 100) { posts(first: 50) { comments(first: 20) { author { name } } } }` can return 100 × 50 × 20 = 100,000 comments.
 
@@ -554,6 +607,8 @@ A single nested query can explode: `users(first: 100) { posts(first: 50) { comme
 | Introspection off in production | Do not hand attackers the full schema map on public APIs |
 
 ### Caching
+
+**In plain words:** normal web caching keys on the URL, but every GraphQL call is a POST to the same URL, so CDNs see nothing cacheable. The fixes: send registered queries by hash as GET, and cache objects on the client by type + id.
 
 - **HTTP caches do not help by default.** Every query is a `POST /graphql` with a different body, and CDNs do not cache POST.
 - **Automatic persisted queries (APQ):** the client sends only a SHA-256 hash of the query in `extensions.persistedQuery`.
@@ -589,6 +644,8 @@ Composition and schema checks run in CI, so a conflicting or breaking change fai
 
 ### Implementing in Go with gqlgen
 
+**In plain words:** gqlgen reads your schema file and generates the Go plumbing; you fill in the resolver stubs. The bullets below are the setup choices that matter.
+
 gqlgen is schema-first: you write the SDL, and it generates the Go types and resolver interfaces.
 
 ```bash
@@ -623,7 +680,7 @@ sequenceDiagram
     R-->>G: completed values
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why DataLoader batching works at all:** sibling resolvers in a list all start before any of them gets an answer.
 	- graphql-js calls all ten `Invoice.customer` resolvers in the same tick, and each returns a promise; gqlgen runs them in parallel goroutines. Either way, their keys meet in one batch.
@@ -644,7 +701,7 @@ sequenceDiagram
 - **Query-plan caching:** parsing and validating the same query text on every request wastes CPU. Servers cache the parsed and validated document by query text or hash (gqlgen's query cache), and persisted queries make that cache hit almost every time.
 - **Introspection is not a secret store:** turning it off hides the map, but field names still leak through client bundles and suggestion messages ("Did you mean `email`?"). Real protection is authorization in resolvers plus trusted documents.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does GraphQL make N+1 queries likely, and how does DataLoader fix it?
 > Resolvers run per field, so a list of N parents calls the child resolver N times, giving 1 + N queries.
@@ -671,7 +728,7 @@ sequenceDiagram
 > [!question]- When would you pick REST or gRPC instead?
 > Choose gRPC for internal service-to-service calls and streaming, where both sides share a proto contract and speed matters. Choose REST for public, cacheable, resource-shaped APIs and simple CRUD with one client. GraphQL pays off when many different clients need different slices of the same connected data.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Schema (SDL) = typed menu; query = order; resolvers fetch one field each, parent before child.
 - `!` non-null, `[T!]!` non-null list of non-null items, `input` types for arguments, interfaces and unions for polymorphism.
@@ -682,7 +739,7 @@ sequenceDiagram
 - Cache with APQ + GET at the edge and normalized client caches; evolve with `@deprecated`, not versions.
 - Go: gqlgen schema-first, `handler.New` + explicit transports and extensions, dataloadgen, `client.New` in tests.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[REST and HTTP API Design]], [[Choosing an API Style]], [[N+1 Query Problem]]
 - **Next:** [[gRPC]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[API Gateway and BFF]]

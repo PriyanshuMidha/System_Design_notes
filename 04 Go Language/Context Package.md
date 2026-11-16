@@ -26,7 +26,41 @@ updated: 2026-11-13
 > - `defer cancel()` right after every `With...` call that returns one — skipping it leaks the context's internal timer or goroutine, and `go vet` has a dedicated check for exactly this.
 > - Classic mistake: stashing request data in `context.Value` that isn't actually request-scoped (a `*sql.DB`, a logger, a feature-flag service) — those are dependencies, and belong in a struct field, injected explicitly.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). That is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example with tests).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Imagine you order food, then cancel the order. If the kitchen never hears about the cancel, they cook a meal nobody will eat.
+
+A server has the same problem. A user asks for a page, the server starts slow work, the user leaves. Something must tell all that work "stop, nobody is waiting".
+
+In Go that something is a **context**: one small value you pass into every function that might take a while. It can say "stop now" (**cancellation**) or "give up after 2 seconds" (a **deadline**).
+
+```mermaid
+flowchart LR
+    U["User closes tab"] --> H["Handler's context: cancelled"]
+    H --> Q["DB query stops"]
+    H --> W["Worker stops"]
+```
+
+One rule makes it all work: contexts form a family tree, and the stop signal only travels downward, parent to children, never back up.
+
+```mermaid
+flowchart TD
+    P["Parent ctx"] -->|"cancel flows down"| C1["Child: DB call"]
+    P --> C2["Child: API call"]
+```
+
+The rest of this note is just these 4 questions:
+1. How do I make, pass and cancel a context (`WithCancel`, `WithTimeout`, `defer cancel()`)?
+2. How does the stop signal actually reach my code (`ctx.Done()`, `ctx.Err()`)?
+3. What belongs in `context.Value` and what never does?
+4. What are the newer helpers (`Cause`, `WithoutCancel`, `AfterFunc`) for?
 
 **The problem in one story.**
 A user opens a page, your server starts a slow database query, and the user closes the tab.
@@ -69,7 +103,7 @@ Where it breaks: a real team can choose to ignore the radio; in Go, work stops o
 > [!tip] Remember
 > Pass `ctx` first, call `defer cancel()`, check `ctx.Done()`; cancellation only flows down.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A handler for `GET /orders/{id}` calls a repository, which runs a query against Postgres, which the database driver sends over a TCP connection.
 
@@ -81,7 +115,7 @@ Without a shared cancellation signal, the handler goroutine, the repository call
 
 The same mechanism carries **deadlines** (stop this whole chain by 14:02:05.000, not just "when told to") and a small amount of **request-scoped metadata** (a request ID to put in every log line downstream) that needs to reach deeply nested calls without becoming a parameter on every function signature in between.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A `Context` is a **chain of walkie-talkies handed down a command chain**, not a bag of parameters.
 
@@ -93,9 +127,11 @@ If one unit's own radio battery dies (that unit's own deadline passes) or that u
 
 `context.Background()` is the master radio switched on with nothing yet attached: the context a `main()` or a top-level server loop starts with. `context.TODO()` is "I know this call should take a context, I have not wired it through yet" — a placeholder for code under construction, never a long-term choice.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The Context interface and immutability
+
+**In plain words:** a context is a tiny read-only object with four questions you can ask it — when is the deadline, has it ended, why did it end, and is there a value for this key. You never change one; you wrap it in a new child.
 
 ```go
 type Context interface {
@@ -113,6 +149,8 @@ type Context interface {
 `WithCancel`, `WithTimeout`, `WithDeadline`, and `WithValue` never change the `Context` they are given — each one builds and returns a brand-new child value that wraps the parent, which is why passing `ctx` around by value everywhere is safe: nobody downstream can retroactively change what an upstream caller sees.
 
 ### The cancellation tree
+
+**In plain words:** every `With...` call adds a branch under the old one, and the stop signal pours downward like water — never uphill, never sideways to siblings.
 
 ```mermaid
 flowchart TD
@@ -139,6 +177,8 @@ The reverse is never true: canceling `workCtx` on its own (say, because the fan-
 A child's own deadline passing (`dbCtx`'s 2s elapsing before `requestCtx`'s 5s) only ends `dbCtx` and whatever is under it — `requestCtx` is untouched and keeps running on its own budget.
 
 ### A deadline flowing through a request
+
+**In plain words:** one disconnect at the top ends the handler, the DB query and the outbound call all at once — follow the arrows top to bottom.
 
 ```mermaid
 sequenceDiagram
@@ -170,6 +210,8 @@ On the client side, the equivalent is `http.NewRequestWithContext(ctx, ...)`: th
 
 ### Constructors
 
+**In plain words:** there is one constructor per kind of stop condition — manual cancel, timeout, fixed clock time, or a value tag — and every one that hands you a `cancel` function expects you to call it.
+
 | Constructor | Ends when | Typical use |
 | ----------- | --------- | ----------- |
 | `WithCancel(parent)` | `cancel()` is called | Fan-out you want to stop early, e.g. on the first error |
@@ -183,7 +225,7 @@ Every constructor that returns a `cancel` function (`WithCancel`, `WithTimeout`,
 
 `go vet`'s `lostcancel` analyzer is built specifically to catch "a cancel function from `context.With...` is not called on some path" — this note's own Go code had to satisfy it (see "Worked example").
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -223,6 +265,8 @@ The sections below build out the rest of the note's "must cover" list, each with
 
 ### Typed context keys and values
 
+**In plain words:** use a private key type and a small accessor function, so two packages can never trip over each other's keys and callers never type-assert by hand.
+
 ```go
 // ctxKey is an unexported type: it cannot collide with a key another
 // package defines, even if both packages pick the same underlying string.
@@ -249,6 +293,8 @@ func RequestIDFromContext(ctx context.Context) (string, bool) {
 Never for a dependency such as a `*sql.DB` or a logger, which should be a constructor parameter or a struct field so its absence is a compile error, not a runtime nil-assertion panic.
 
 ### The cancellation tree, proven by test
+
+**In plain words:** these tests pin down the two rules — cancel the root and everything below dies; cancel a child and the parent does not notice.
 
 ```go
 type RequestTree struct {
@@ -334,6 +380,8 @@ func SumUntilCancelled(ctx context.Context, n int) (sum int64, err error) {
 
 ### WithCancelCause and context.Cause
 
+**In plain words:** a plain cancel only says 'stopped'; `WithCancelCause` lets you also record *why*, and `context.Cause` reads that reason back.
+
 ```go
 var ErrRateLimited = errors.New("upstream: rate limited, backing off")
 
@@ -385,6 +433,8 @@ func TestFanOutWithCauseReportsTheRealError(t *testing.T) {
 
 ### AfterFunc and WithoutCancel
 
+**In plain words:** `AfterFunc` is 'run this when the context ends'; `WithoutCancel` is 'keep the request's tags but ignore its stop signal' — for work that must outlive the request.
+
 ```go
 // WatchForCancel registers f to run in its own goroutine the moment ctx
 // is canceled or its deadline passes (context.AfterFunc, Go 1.21). The
@@ -433,7 +483,7 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
 
 **Measured:** `go test -race -v ./...` in the scratch module (Go 1.24.4, 2026-11-07) — 13 tests across `whiteboard_test.go`, `tree_test.go`, `worker_test.go`, `cause_test.go`, and `afterfunc_test.go`: 13/13 PASS, 0 race warnings, `go vet ./...` clean (including `lostcancel`).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Constructor | Signals | Carries a value? | Typical caller |
 | ----------- | ------- | ----------------- | --------------- |
@@ -445,14 +495,14 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
 | `WithoutCancel` | Never (detached) | Inherits the parent's values | Work that must outlive the request |
 | `t.Context()` (testing, Go 1.24) | Canceled when the test ends | No | Tests that need a ctx without building one by hand |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `context.Value` is not a dependency-injection container. Reading `db := ctx.Value(dbKey).(*sql.DB)` hides a real dependency behind a runtime type assertion that can panic, and makes the function's actual requirements invisible from its signature. Pass dependencies explicitly.
 - A context's deadline is a *budget*, not a retry mechanism — `DeadlineExceeded` just means stop; any retry policy sits above this, with its own understanding of whether the operation is safe to retry.
 - Storing a `context.Context` in a struct field (instead of passing it as the first parameter of every method) hides which operations are cancellable and makes it easy to reuse a stale or already-canceled context across calls that should each get a fresh one.
 - For a CPU-bound loop with no I/O at all, checking `ctx.Done()` adds real overhead; checking every iteration on a tight loop can dominate the loop's own cost, hence checking periodically (shown above) rather than on every step.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every `net/http` handler is handed a request-scoped context via `r.Context()`; `database/sql`'s `*Context` methods and every maintained Postgres/MySQL driver honor it; gRPC propagates a context's deadline across the wire as the `grpc-timeout` header and enforces it server-side; Kubernetes' own controllers and client-go thread a context through every API call for clean shutdown.
 - **Failure modes → fixes:**
@@ -462,7 +512,7 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
   - A background job started with `context.Background()` deep inside a request-handling call never respects the request's own cancellation → it should have derived from the request's `ctx` (or explicitly `WithoutCancel(ctx)` if it must survive the request, with its own bound).
 - **What to monitor:** rate of `context.DeadlineExceeded` vs `context.Canceled` in error logs, broken down by dependency — a rising `DeadlineExceeded` rate against one dependency is a latency regression, not a client-cancellation trend; goroutines started with `WithoutCancel` should have their own metrics (count in flight, age) since nothing else will time them out for you.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **What `ctx.Err()` actually encodes.** `Err()` returns exactly one of three states: `nil` (context still open), `context.Canceled` (something called this context's own `cancel`, or an ancestor's), or `context.DeadlineExceeded` (this context's own deadline, or an ancestor's shorter one, passed).
 
@@ -480,7 +530,7 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
 
   Tests that specifically exercise cancellation behavior (like every test in this note's worked example) still build their own `WithCancel`/`WithTimeout` contexts explicitly, since the behavior under test is the cancellation itself.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What three things does a Context carry, and what should never go in it?
 > A cancellation signal (`Done()`/`Err()`), a deadline, and a small number of request-scoped values (request ID, principal, trace ID). Ordinary parameters and real dependencies (a `*sql.DB`, a logger, a config struct) should never be smuggled in through `Value` — they belong in the function signature or a struct field.
@@ -505,7 +555,7 @@ The audit write keeps its request ID (a value) but is immune to the parent's can
 > [!question]- You store `*sql.DB` in the context so every layer can "just grab it from ctx". What's wrong with this?
 > It hides a real dependency behind `ctx.Value(key).(*sql.DB)`, which can panic at runtime if the key is ever missing, and makes every function's actual requirements invisible from its signature — a reviewer (or `go doc`) cannot tell what a function needs without reading its body. Pass the `*sql.DB` explicitly, as a parameter or a struct field built once in `main`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `ctx` is always the first parameter, never a struct field; `context.Context` is immutable, every `With...` call returns a new child.
 - Cancellation only flows down the tree a `With...` call built: parent cancels children, never the reverse.

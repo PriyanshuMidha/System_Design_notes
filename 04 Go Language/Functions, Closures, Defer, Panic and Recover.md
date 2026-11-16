@@ -26,7 +26,42 @@ updated: 2026-11-13
 > - `recover()` only has an effect when called directly inside a deferred function in the **same goroutine** that panicked; a panic in a goroutine you spawned cannot be recovered by anyone else and kills the whole process.
 > - `os.Exit` and `log.Fatal` end the process immediately and skip every pending deferred call — they are not a controlled return.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). That is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A function is a named block of work. In Go, functions are also values: you can store one in a variable and hand it around like a number.
+
+A **closure** is a function that remembers variables from where it was born. Call it twice and it still sees the same remembered variables.
+
+**`defer`** means "run this when the current function finishes, no matter how it finishes". You write the cleanup right next to the setup, and Go runs it on the way out.
+
+```mermaid
+flowchart LR
+    O["open file"] --> D["defer close"] --> W["do work"] --> X["function ends"] --> C["close runs"]
+```
+
+When several defers pile up, the newest one runs first — like a stack of plates.
+
+Finally, **panic** is Go's emergency stop for real bugs (not for expected failures), and `recover` is the one way to catch it on the way out.
+
+```mermaid
+flowchart TD
+    B["bug → panic"] --> U["stack unwinds,<br/>defers run"] --> R{"a defer calls recover?"}
+    R -- yes --> OK["turn it into an error"]
+    R -- no --> X["process crashes"]
+```
+
+The rest of this note is just these 4 questions:
+1. How do function values, closures and variadics really behave?
+2. What two rules govern `defer` (reverse order, arguments frozen early)?
+3. When is `panic` right, and where exactly does `recover` work?
+4. What skips your defers entirely (`os.Exit`, `log.Fatal`)?
 
 **The problem in one story.**
 You open a file, read it, and must close it, even if reading fails halfway.
@@ -72,7 +107,7 @@ Where it breaks: `os.Exit` is like leaving through the window; the notes are nev
 > [!tip] Remember
 > `defer` runs at return in reverse order with arguments fixed early; `recover` works only in a deferred call in the same goroutine.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A payment handler opens a file, needs to make sure it closes no matter how the function exits, and needs to tell a genuine write failure apart from a failure to close:
 
@@ -111,7 +146,7 @@ func writeReceipt(path string, data []byte) (err error) {
 
 This is also where `panic` and `recover` earn their place: a bug deep in a request handler (a nil pointer dereference, say) must not take down every other in-flight request on the same server. `net/http` recovers panics per-request for exactly this reason — see [[Error Handling]] for where panic fits next to ordinary error values.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A function value is a box you can hand around like any other value — an `int` or a `string` — except that calling it runs code.
 
@@ -127,9 +162,11 @@ A `panic` always unwinds the current goroutine's stack, running every deferred c
 
 There is no "catch nearby and keep going from the same line" — once a function has panicked, that function is already on its way out.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Functions as values, multiple and named results
+
+**In plain words:** a Go function can return several things at once, and you can even name the results so a `defer` can adjust them before the caller sees them.
 
 ```go
 func divmod(a, b int) (q, r int) { // named results: q and r start at their zero values, 0 and 0
@@ -144,6 +181,8 @@ Named results exist for two reasons: self-documentation (`divmod`'s signature te
 
 ### Variadics alias the caller's slice
 
+**In plain words:** `f(s...)` does not copy your slice — the function is working on your actual data, so writes inside it show up outside.
+
 ```go
 func Sum(nums ...int) int { ... }
 
@@ -155,6 +194,8 @@ Sum(1, 2, 3)       // this form allocates a fresh backing array for the variadic
 `f(s...)` passes the slice header itself; `f(1, 2, 3)` builds a new slice. A function that writes through a variadic parameter received via `s...` is writing into the caller's memory — the same aliasing rule as any other slice (see [[Arrays, Slices and Maps (with internals)]]).
 
 ### Closures capture variables, not values
+
+**In plain words:** a closure keeps a live link to the variable itself, not a snapshot — change the variable and every closure sharing it sees the change.
 
 ```mermaid
 flowchart LR
@@ -200,6 +241,8 @@ See [[Generics and Iterators]] for how the standard library's `iter.Seq` and `it
 
 ### Recursion has no tail-call optimisation
 
+**In plain words:** every recursive call stacks another plate; Go never flattens recursion into a loop for you, so unbounded depth can run out of memory.
+
 ```go
 func Factorial(n int) int {
 	if n <= 1 {
@@ -214,6 +257,8 @@ Go does not perform tail-call optimisation, so every recursive call keeps its ow
 A goroutine's stack starts small and grows automatically (see [[Process Memory Layout - Stack vs Heap]]), so deep-but-finite recursion usually just works, but recursion with no bound that scales with untrusted input is a real way to exhaust memory; rewrite it as an explicit loop with a stack/slice if the depth is attacker-influenced.
 
 ### defer: LIFO order, and argument evaluation time
+
+**In plain words:** defers run newest-first, and whatever arguments you gave them were frozen at the moment you wrote `defer`, not later.
 
 ```mermaid
 flowchart TD
@@ -255,6 +300,8 @@ func DeferArgEvalTime(record func(int)) int {
 ```
 
 ### defer inside a loop holds resources open
+
+**In plain words:** a `defer` in a loop does not fire per loop turn — it waits for the whole function to end, so files pile up open. Give each turn its own small function.
 
 ```go
 // Anti-pattern: every file stays open until processAll itself returns,
@@ -298,6 +345,8 @@ func processOne(p string) error {
 ```
 
 ### Runtime panics vs explicit panics, and recover's one rule
+
+**In plain words:** some panics come from the runtime (nil pointer, bad index), some you raise on purpose; either way, only a `recover()` written directly inside a deferred function can stop one.
 
 ```mermaid
 flowchart TD
@@ -353,6 +402,8 @@ Custom recover middleware should check `errors.Is(err, http.ErrAbortHandler)` (w
 
 ### recover cannot cross a goroutine boundary
 
+**In plain words:** each goroutine is its own building — a fire alarm in yours cannot stop a fire in the one next door. Every spawned goroutine needs its own recover.
+
 ```mermaid
 sequenceDiagram
     participant Main as main goroutine
@@ -400,6 +451,8 @@ This is why every goroutine a server spawns per request (background work, fan-ou
 
 ### init(), os.Exit and log.Fatal skip defers
 
+**In plain words:** `os.Exit` leaves through the window — none of the sticky-note defers get read on the way out.
+
 ```go
 func init() {
 	// runs before main(), in file-name order within a package, after all
@@ -421,7 +474,7 @@ func main() {
 
 There is also `runtime.Goexit`, which terminates only the calling goroutine — running its deferred calls as it goes, like a panic that is never printed and never recovered — without taking down the rest of the process; `t.FailNow()` in the `testing` package is implemented with it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -535,7 +588,7 @@ func TestSafeDivideRecoversFromPanic(t *testing.T) {
 
 The goroutine-panic and `os.Exit` behaviours from section 3 are process-level effects (a crash, a specific exit code) rather than assertions a `go test` run can make, so they were checked separately by building and running the two small helper programs shown there, not by `go test`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Mechanism | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -546,14 +599,14 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
 | `runtime.Goexit` | Unwinds and runs defers for the current goroutine only, without a panic value | Stopping one goroutine early while still running its cleanup (`testing.T.FailNow`) | Rarely used directly outside the `testing` package |
 | `os.Exit` / `log.Fatal` | Ends the process immediately | A command-line tool reporting a fatal, unrecoverable startup error | Skips every deferred call — no cleanup, no running `TestMain` teardown, no flushed buffers |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `panic`/`recover` is not a general control-flow tool. Using it to return a value from deep in a call stack (instead of threading an `error` or a result through normal returns) makes the code harder to follow and easy to get wrong across goroutines.
 - A deferred closure allocates (historically; open-coded defers since Go 1.14 remove this cost for simple, non-loop defers in a function with at most 8 defer sites). A `defer` inside a hot loop that runs millions of times is still worth measuring with a benchmark before assuming it is free — see [[Go Toolchain, Tooling and Debugging]] for `pprof`.
 - `defer` runs at function-return time, not at the end of a block. `defer` inside a `for` loop or inside an `if` that is entered many times accumulates work (and holds resources, as in the file-descriptor example above) until the whole function returns — extract a helper function when a resource must be released per-iteration.
 - Named results used only to avoid typing a type twice (not for a deferred mutation or documentation value) make a signature harder to read at a glance; use them when a defer needs to touch the result, not as a default style.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `net/http`'s `Server` recovers a panicking handler per request by default (so one broken handler returns a 500-with-dropped-connection to that one client, not a crashed process).
 
@@ -567,7 +620,7 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
 	- A library function calls `log.Fatal` on a recoverable error → it can never be recovered or tested by its caller, because the process exits before any caller's `defer` or `recover` runs; library code should return an `error` and let `main` decide whether a failure is fatal.
 - **What to monitor:** a panic-recovery counter and the recovered value/stack logged at `error` level per occurrence; a sudden rise points at a code path hitting a runtime fault (nil deref, index out of range) that `error` returns were not built to catch.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Open-coded defers (Go 1.14+).** For a function with at most 8 `defer` statements, none of them inside a loop, the compiler inlines the deferred calls directly into the function's exit paths instead of pushing them onto a runtime-managed defer linked list.
 
@@ -589,7 +642,7 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
 
   A test suite or server that depends on side effects happening in a specific cross-file order is relying on an ordering the spec does not fully pin down — move that logic into an explicit, ordered setup function instead.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly does `defer f(x)` guarantee, and what does it not guarantee?
 > It guarantees `f` runs when the surrounding function returns (normally or via panic), using the value `x` had at the moment the `defer` statement executed. It does not guarantee anything about *when* during a panic's unwind other code outside this function's own defers runs, and it does not delay the evaluation of `x` — only the call to `f`.
@@ -620,7 +673,7 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
 > [!question]- A function that receives a slice via a variadic parameter (`f(s...)`) modifies element 0. Does the caller see the change?
 > Yes. `f(s...)` passes the slice header itself, which still points at the caller's backing array — the same aliasing as passing a slice directly. Only the literal multi-argument form (`f(1, 2, 3)`) builds a fresh backing array for the variadic parameter.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Functions are values: assign them, pass them, return them. A closure is a function value with variables from its birthplace attached by reference.
 - `f(s...)` aliases the caller's slice; `f(1, 2, 3)` does not.

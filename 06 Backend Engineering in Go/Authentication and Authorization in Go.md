@@ -30,6 +30,8 @@ This note is the Go implementation that sits behind those concepts: the middlewa
 
 ### Whiteboard version
 
+**In plain words:** this is the whole idea in 12 lines of code — a gatekeeper function that checks the caller before letting the real handler run.
+
 The shape of every request that needs auth, before any of the hardening below:
 
 ```go
@@ -48,7 +50,37 @@ func RequireAuth(next http.Handler) http.Handler {
 
 Everything below is what `verify` and the context key actually need to be safe in production: a real claims type, an algorithm allowlist, a typed unexported context key, and a role check layered on top.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You walk into an office building. The front desk checks your ID card. That check is **authentication**: proving who you are.
+
+Then you walk to a meeting room. The card reader on the door decides if your card may open it. That is **authorization**: deciding what you may do.
+
+A backend does the same two checks on every request. First: is this token or login real? Second: is this user allowed to touch this exact thing?
+
+```mermaid
+flowchart LR
+    A[Request arrives] --> B{Who are you?}
+    B -- "can't prove it" --> X[401: go log in]
+    B -- proven --> C{Allowed to do this?}
+    C -- no --> Y[403: not for you]
+    C -- yes --> D[Do the work]
+```
+
+Passwords are never saved as-is. The server saves a **hash**: a one-way scramble that cannot be turned back into the password.
+
+The rest of this note is just these 4 questions:
+1. How does the server prove who is calling (sessions vs JWTs)?
+2. How does that check run before every handler (middleware)?
+3. How do we check what the caller may touch (role + workspace)?
+4. How do we take access away again (expiry, rotation, revocation)?
 
 **The problem in one story.** An office building has a front desk and many locked rooms.
 The desk checks your ID card to know who you are.
@@ -93,7 +125,7 @@ Where it breaks: a JWT is more like a signed letter you carry around; the desk c
 > [!tip] Remember
 > First prove who they are (401 if not), then check what they may touch (403 if not).
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps has workspaces, each with its own invoices, and three roles: `owner`, `admin`, `viewer`. Without authentication, `GET /v1/invoices/{id}` cannot know who is asking. Without authorization, a correctly authenticated viewer in workspace A could pass workspace B's invoice ID and read it — an IDOR (insecure direct object reference) that authentication alone never catches, because the caller really is who they say they are.
 
@@ -102,7 +134,7 @@ Two failure modes drive most of this note's design:
 - **A stolen access token.** If access tokens live for 24 hours and carry no revocation check, a token copied from a compromised laptop keeps working for up to 24 hours after the user logs out. Short-lived tokens (5–15 minutes) plus a refresh token shrink that window to the access-token TTL.
 - **A forged token.** `jwt-go`'s historical API let a caller pass `alg: none` or substitute an RSA public key as an HMAC secret (the RS256→HS256 confusion attack) if the verifier didn't pin the expected algorithm. golang-jwt v5's `WithValidMethods` closes this, but only if every call site uses it — a single unguarded `Parse` call anywhere in the service reopens the hole.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of three layers, each answering a different question, run strictly in order:
 
@@ -112,7 +144,7 @@ Think of three layers, each answering a different question, run strictly in orde
 
 A `Principal` extracted once in middleware and threaded through `context.Context` means every layer below it operates on data it can trust, not on a header it re-parses.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 sequenceDiagram
@@ -147,6 +179,8 @@ sequenceDiagram
 
 ### The middleware chain
 
+**In plain words:** picture airport security — one queue, several checkpoints in a fixed order, and you only board if you pass them all.
+
 ```mermaid
 flowchart LR
     R[Request] --> A{Authorization header<br/>present and well-formed?}
@@ -164,7 +198,7 @@ Two things only show up once this is code, not a diagram:
 - **The context key must be an unexported type**, never a bare string, so another package's `context.WithValue(ctx, "userID", ...)` cannot collide with or spoof this one.
 - **401 vs 403 vs 404** encode different information to an attacker. No token or a bad token is 401. A valid caller whose role is wrong for the route is 403. A valid caller asking for another workspace's resource by ID should be 404, not 403 — 403 confirms the resource exists; 404 does not.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The full tested code (hashing, token issue/verify, and the middleware chain) is in the whiteboard section's companion module. Here is the piece most notes skip: the algorithm-confusion defence and its test.
 
@@ -264,7 +298,7 @@ for _, cost := range []int{10, 12, 14} {
 
 Pick the cost that lands near 150–300ms on your actual production hardware, then re-measure after any hardware change — bcrypt's cost is deliberately hardware-relative, so a number copied from a blog post says nothing about your servers.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -275,14 +309,14 @@ Pick the cost that lands near 150–300ms on your actual production hardware, th
 
 Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flows is in [[Sessions and Cookies]], [[JWT - Structure, Validation and Pitfalls]], [[Access and Refresh Tokens]] and [[OAuth 2.0 and OpenID Connect]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A pure-session design doesn't scale verification across many independent services without a shared, fast store; a pure-JWT design doesn't revoke instantly without extra state, which erases the "stateless" selling point anyway.
 - Rotating a refresh token on every use adds a write to the hot path of every token refresh; skip rotation only for low-risk, short-lived internal tools, never for anything handling money or PII.
 - RBAC with two roles is adequate for InvoiceOps; a system with many fine-grained permissions (per-resource, per-action) usually needs a policy engine (e.g. OPA) instead of a role string, because an `if role == "admin"` ladder stops scaling past a handful of roles.
 - `http.CrossOriginProtection` (Go 1.25) and `SameSite` cookies solve CSRF for cookie-based auth; a bearer-token API that never sets cookies has no CSRF surface to defend in the first place — don't add CSRF tokens to a pure API client.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Auth0, AWS Cognito and Okta all implement this exact short-lived-access / rotated-refresh pattern behind a managed API; Stripe's dashboard uses session cookies for humans and API keys for server integrations — two different auth mechanisms for two different callers, not one mechanism stretched to fit both.
 - **Failure modes → fixes:**
@@ -292,7 +326,7 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
   - A compromised signing secret used to forge admin tokens → key rotation with `kid` in the JWT header and a JWKS endpoint so old tokens signed with a retired key are rejected immediately, not after a redeploy.
 - **What to monitor:** failed-login rate per account and per IP, refresh-token reuse events (each one is a likely compromise), token-verification latency, and the age distribution of active sessions/refresh tokens. Emit an audit event (user ID, IP, timestamp, outcome) for every login, logout, role change and refresh-token reuse detection — these are the records a security investigation needs after the fact, and they must outlive the session/token rows themselves, which get deleted or expire.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why bcrypt still has a 72-byte limit.** bcrypt's underlying Blowfish-based schedule only mixes in the first 72 bytes of the input; `golang.org/x/crypto/bcrypt` returns `ErrPasswordTooLong` above that (verified against the module source) rather than silently truncating, so always check the error instead of assuming any password hashes. Argon2id has no such limit and is the OWASP-recommended default for new systems; the algorithm trade-offs and parameter tuning (`m`, `t`, `p`) are owned by [[Password Storage and Login Security]].
 - **Choosing HS256 vs RS256/EdDSA.** HS256 is symmetric: one shared secret both signs and verifies, so every service that needs to verify a token must also be trusted with the ability to forge one — fine for a single-service InvoiceOps backend, wrong once other teams' services need to verify your tokens independently. RS256 (RSA) and EdDSA (Ed25519) are asymmetric: the auth service holds the private key and signs, every other service holds only the public key and can verify but never forge. EdDSA is the modern default when you control both ends (smaller keys and signatures, faster verification than RSA); RS256 remains common because more identity providers and libraries support it first.
@@ -301,7 +335,7 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 - **Object-level authorization (BOLA/IDOR) is a query concern, not a middleware concern.** Middleware can confirm "this caller belongs to workspace ws-1"; it cannot know which specific invoice rows belong to ws-1 without asking the database, so every repository method must take the authenticated `WorkspaceID` as a mandatory parameter and bake it into the `WHERE` clause — never trust an ID from the URL alone to imply its own ownership.
 - **PKCE even for confidential clients.** Originally PKCE (Proof Key for Code Exchange) existed for public clients (mobile/SPA) that cannot hold a secret safely. Current OAuth guidance recommends it for all clients, confidential or not, because it also defends against authorization-code interception regardless of client type.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is pinning the JWT algorithm necessary, and what attack does it stop?
 > Without `WithValidMethods`, a verifier that reads the algorithm from the token's own header can be tricked into accepting `alg: none` (no signature at all) or into using an RSA public key as an HMAC secret (`RS256`→`HS256` confusion), because the public key is, bit for bit, a valid HMAC key.
@@ -328,7 +362,7 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 >
 > See [[Redis in Go]] for the token-bucket/Lua implementation; the policy itself (thresholds, lockout duration) is a security decision, not just a Go-code one.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Hash passwords with bcrypt (cost tuned to ~150–300ms on prod hardware) or Argon2id; never compare plaintext, never log a password or a token.
 - `jwt.ParseWithClaims` always with `WithValidMethods`, `WithIssuer`, `WithAudience` — an unpinned algorithm is a forgeable token.
@@ -339,7 +373,7 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 - Object-level authorization is enforced in the query (`WHERE workspace_id = $1`), not by trusting an ID from the URL.
 - Rate limit login per IP *and* per account; return identical errors and timing for "wrong password" and "unknown account".
 
-## Links
+## Links 🟢
 - **Before this:** [[Building REST Endpoints]], [[Middleware]], [[Context Package]]
 - **Next:** [[Redis in Go]] (login rate limiting), [[Calling External APIs]] (an OAuth-protected provider call)
 - **Compare with:** [[Password Storage and Login Security]], [[JWT - Structure, Validation and Pitfalls]], [[Access and Refresh Tokens]], [[Sessions and Cookies]], [[OAuth 2.0 and OpenID Connect]]

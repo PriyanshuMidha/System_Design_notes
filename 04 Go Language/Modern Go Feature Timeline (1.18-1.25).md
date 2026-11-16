@@ -23,7 +23,33 @@ updated: 2026-11-13
 > - `GOTOOLCHAIN` (since 1.21) lets `go build` auto-download the exact toolchain a module asks for, so a team can pin a newer language version without every machine upgrading by hand.
 > - A feature behind `GOEXPERIMENT` (PGO before 1.21, `json/v2` and the Green Tea GC as they shipped in 1.25) is not the default and can still change shape before it ships; do not depend on it in production code. Green Tea GC has since become the 1.26 default - see the note on `GOEXPERIMENT` items in section 3.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the release-by-release list) and 4 (tested code) and 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Go, the language, gets a new numbered **release** twice a year (1.22, 1.23, ...).
+
+Old code never breaks: each release only adds things on top.
+
+Your project has a file called `go.mod` with a line like `go 1.24`. That line decides which new features your code is allowed to use.
+
+```mermaid
+flowchart LR
+    A["go.mod says<br/>go 1.24"] --> B["compiler allows features<br/>from 1.24 and older"]
+    B --> C["features from 1.25<br/>= compile error"]
+```
+
+A few features ship as an **experiment**: built in but switched off, and still allowed to change. Never rely on those in real services.
+
+This whole note is just three questions:
+1. What useful thing arrived in each release since 1.18?
+2. How does `go.mod` pick which Go version builds my code?
+3. Which things are stable, and which are still experiments?
 
 **The problem in one story.**
 You open a Go codebase and see `for i := range 5` and a `tool` line in `go.mod`.
@@ -67,7 +93,7 @@ Where it breaks: rock layers never change once laid, but experiments can still c
 > [!tip] Remember
 > The `go` line in `go.mod` decides which features and defaults you get; experiments are never something to ship on.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Go has released on a fixed six-month cadence since 1.18 (February and August each year, documented in the release history).
 
@@ -80,7 +106,7 @@ The practical cost shows up in two places:
 
 This note is the map: what shipped in each release since 1.18, so you can read unfamiliar code, choose features deliberately, and know what a `go.mod` version line actually buys you. It does not re-teach any feature in depth - each item links to the 04 or 06 note that owns it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture Go's standard library and language as **strata**: each six-month release adds a thin layer on top of the last one, and the layers below never get removed or broken.
 
@@ -88,9 +114,11 @@ The `go` directive in `go.mod` (for example `go 1.24`) is a line drawn through t
 
 A second idea sits next to the strata: **experiments**. A few features ship behind `GOEXPERIMENT=name` before they are the default - PGO was one in 1.20, `json/v2` and a new garbage collector ("Green Tea") are two in 1.25. They are real, built-in code, but off by default and not yet promised to stay the same shape.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Release-by-release, filtered for backend relevance
+
+**In plain words:** a shopping list per release — skim it, and jump to the linked note for anything you want to actually learn.
 
 Each release is tagged with the note that teaches the feature itself; this note only says what shipped and when.
 
@@ -172,6 +200,8 @@ Each release is tagged with the note that teaches the feature itself; this note 
 
 ### How `go.mod` picks a toolchain
 
+**In plain words:** your project can ask for a specific Go version, and the `go` command will download that exact version by itself, like it downloads any other dependency.
+
 Since the 1.21 toolchain directive, three things decide which `go` binary actually builds your code:
 
 ```mermaid
@@ -208,7 +238,7 @@ flowchart LR
     y2022 --> y2023 --> y2024 --> y2025
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -230,6 +260,8 @@ for i := 0; i < 3; i++ {
 The full test below proves the 1.22 behavior directly, by writing into a per-index slot from inside a goroutine with no manual `i := i` shadow, and checking that every slot was written exactly once.
 
 ### Tested features, Go 1.24
+
+**In plain words:** one runnable file that uses each headline feature once, plus the tests that prove they behave as described.
 
 The file below compiles and its tests pass under `go test -race` on Go 1.24.4. It groups the features most likely to show up in review or an interview: per-iteration loop variables, `range` over an int, the `min`/`max`/`clear` builtins, `errors.Join` plus multi-`%w`, a hand-written `iter.Seq` iterator, a generic type alias, a typed atomic, and `sync.OnceValue`.
 
@@ -504,7 +536,7 @@ ok  	timeline	1.435s
 BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Feature | Before | Since | What actually changed |
 | --- | --- | --- | --- |
@@ -517,7 +549,7 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 | Container-aware CPU limits | `uber-go/automaxprocs` read the cgroup quota and called `runtime.GOMAXPROCS` | 1.25 default | The runtime does this itself; the third-party package becomes redundant (safe to remove once on 1.25) |
 | Benchmark loop | `for i := 0; i < b.N; i++ { ... }`, manual `b.ResetTimer()` | 1.24 adds `b.Loop()` | The framework manages iteration count and timing; setup before the loop is never measured |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - **Do not ship on an experiment.** `GOEXPERIMENT=jsonv2` and `GOEXPERIMENT=greenteagc`, both introduced in 1.25, were real but not the default, not covered by the Go 1 compatibility promise the same way stable features are, and able to change behavior release to release.
 
@@ -526,7 +558,7 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 - **`GOTOOLCHAIN=auto` downloads code from the network at build time.** In an air-gapped or strict supply-chain environment, pin `GOTOOLCHAIN=local` and manage the installed `go` version explicitly instead.
 - **Newness is not a reason to adopt.** `sync.OnceValue` is strictly nicer than a hand-rolled `sync.Once` + variable, but a service that already has the old pattern everywhere does not need a mechanical rewrite; use the new form going forward.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** large Go codebases (the Go toolchain's own module proxy, Kubernetes, most cloud-native backend services) track feature releases roughly one or two versions behind the latest, pinned via CI's `go.mod` + `toolchain` line, with `govulncheck` and Renovate/Dependabot opening the upgrade PRs automatically.
 - **Failure modes → fixes:**
@@ -535,7 +567,7 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 	- A service silently depends on an experiment flag set locally by one developer (`GOEXPERIMENT=jsonv2`) but not in the production build → experiments must be set in the build pipeline, never only on a laptop; prefer not depending on them until GA.
 - **What to monitor:** the gap between the `go` line in `go.mod` and the toolchain actually running in production (a version-skew check in CI), and `govulncheck` results tied to the installed toolchain and dependency versions.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Language-version gating is per-module, not per-binary.** The `go` directive sets the language version the compiler accepts for that module's own source. A binary can link packages from modules declaring different `go` lines; each package is checked against its own module's directive, not the main module's.
 - **`GODEBUG` defaults move forward with the `go` line, not with the installed toolchain.** Go changes a runtime default (for example, TLS or `http2` behavior) by flipping a `GODEBUG` setting's default value, but it only takes effect for modules whose `go` line is new enough.
@@ -549,7 +581,7 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
   Read a release's own notes for which word it uses, rather than assuming "it's in the binary" means "it's safe to depend on."
 - `verify:` whether `encoding/json/v2` has left experimental status in a release after 1.26 (Green Tea GC already has, as of 1.26 - see section 3) - this note was written against the Go 1.25 release as shipped in August 2025, with a 1.26 status check added afterward.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly changed with loop variables in Go 1.22, and what bug does it fix?
 > Before 1.22, a `for` loop declared one variable and reused it every iteration, so a closure or goroutine created inside the loop without an explicit `i := i` copy could observe a later (often the final) value once the loop moved on.
@@ -585,7 +617,7 @@ BenchmarkCounterInc-10    	    1000	         2.750 ns/op
 >
 > `b.Loop()` has the framework own the iteration count and the timer window directly, and keeps each iteration's result alive long enough to prevent dead-code elimination, so a benchmark is correct by construction instead of by careful manual bookkeeping.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Go ships a feature release every six months (Go 1 compatibility: nothing old breaks).
 - The `go` line in `go.mod` gates which *language* features compile - not the same thing as the installed `go` binary's version.

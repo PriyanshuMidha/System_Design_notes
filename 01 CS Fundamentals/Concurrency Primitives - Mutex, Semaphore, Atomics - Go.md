@@ -18,7 +18,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Concurrency Primitives - Mutex, Semaphore, Atomics]]: a mutex-protected counter and its atomic/CAS twin, a channel-backed semaphore, a deadlock-free two-account transfer, and five tests that prove each primitive's guarantee under real concurrent load (including a hammered CAS loop and a 500-way concurrent transfer).
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Running it".
+> - 🟡 **Know the basics?** Work through the Code steps 1-4 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the runnable half of [[Concurrency Primitives - Mutex, Semaphore, Atomics]]. The theory note explains locks, semaphores and atomics with stories and pictures; this one builds each of them in real Go and then attacks them with hundreds of goroutines at once to prove they hold up. Read each "Step" top to bottom: a plain-words line, the code, then a numbered walk-through. The tests at the end are the proof — each one would fail (or hang) if the primitive above it were broken.
+
+## Before the code 🟢
 
 - **Goroutines** (`go func() { ... }()`): lightweight threads run by the Go runtime. The tests start hundreds at once to create real contention.
 - **`sync.Mutex`** (`Lock` / `Unlock`): a lock that lets one goroutine into a block of code at a time.
@@ -27,7 +36,7 @@ updated: 2026-11-13
 - **`defer` and `sync.WaitGroup`**: `defer` runs a call when the function returns (used for `Unlock`); `WaitGroup` waits until every started goroutine calls `Done`.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module. `-race` turns on the data race detector.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -52,16 +61,18 @@ flowchart LR
     ACT["accounts_test.go"] --> AC
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only — no third-party dependencies.
 - Layout: a module `concurrency` with `counter.go`, `atomic.go`, `semaphore.go`, `accounts.go`, and one test file per source file.
 - Run it with `go vet ./... && go test -race -v ./...`.
 - Everything here runs with no external services.
 
-## Code
+## Code 🟡
 
 ### Step 1: a mutex-protected counter
+
+**In plain words:** a counter that cannot lose increments — every goroutine must take the lock before touching the number, so updates happen one at a time.
 
 **Concept.** This is the baseline from [[Concurrency Primitives - Mutex, Semaphore, Atomics#Whiteboard version]]: `mu` turns the three-step read-modify-write (load, add, store) into one atomic-looking unit, because only the goroutine holding `mu` can run `c.n++`.
 
@@ -100,6 +111,8 @@ func (c *Counter) Value() int {
 3. `Value` takes the same lock as `Inc`, not a separate read path — without that, a reader could observe `n` mid-update on some architectures, even though a single `int` write looks atomic in source code.
 
 ### Step 2: the atomic twin and a manual CAS loop
+
+**In plain words:** the same counter with no lock at all — the CPU's own unbreakable add does the work, and the retry loop handles "increment only if still under the limit".
 
 **Concept.** `AtomicCounter` implements [[Concurrency Primitives - Mutex, Semaphore, Atomics#Atomics and compare-and-swap]]: `Add` and `Load` cover simple increments without a lock.
 
@@ -148,6 +161,8 @@ func (c *AtomicCounter) IncIfLessThan(limit int64) bool {
 
 ### Step 3: a channel-backed semaphore
 
+**In plain words:** a buffered channel is already a counting gate — sending takes a space, receiving frees one, and a full buffer makes newcomers wait. Three lines and the semaphore is done.
+
 **Concept.** This implements [[Concurrency Primitives - Mutex, Semaphore, Atomics#Semaphores]] using Go's own concurrency primitive instead of hand-rolling a counter and a condition variable.
 
 The alternative — `golang.org/x/sync/semaphore` — adds a weighted, context-cancellable `Acquire`, which this simple version doesn't need for a fixed-size pool.
@@ -176,6 +191,8 @@ func (s Semaphore) Release() { <-s }
 3. `Release` receives, freeing a buffer slot and, if another goroutine's `Acquire` was blocked, letting it proceed — the exact handoff drawn in the theory note's garage diagram.
 
 ### Step 4: a deadlock-free transfer
+
+**In plain words:** two locks, one iron rule — everybody always locks A before B, so two transfers can never end up each holding the lock the other needs.
 
 **Concept.** `AccountStore` is the worked example from [[Concurrency Primitives - Mutex, Semaphore, Atomics#Deadlock]]: two separate locks guard two balances, and the fix for the classic "A locks muA then muB, B locks muB then muA" deadlock is a single global lock order.
 
@@ -295,7 +312,7 @@ func (s *AccountStore) TransferConsistentOrder(amount int) {
 > }
 > ```
 
-## Tests
+## Tests 🟡
 
 ### `TestCounterConcurrentIncrements`
 
@@ -476,7 +493,7 @@ func TestTransferConsistentOrderNoDeadlock(t *testing.T) {
 }
 ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -485,7 +502,7 @@ func TestTransferConsistentOrderNoDeadlock(t *testing.T) {
 | Fixed lock order in `AccountStore` | Try-lock with backoff, or a single lock for both balances | A single shared lock is simpler and also deadlock-free, but serializes transfers that don't even touch the same pair of accounts; the fixed-order two-lock design keeps unrelated account pairs independent |
 | `atomic.Int64` wrapper type (not a plain `int64` with free functions) | `atomic.AddInt64(&n, 1)` style (pre-Go 1.19) | The wrapper type makes it a compile error to touch the field without going through an atomic method; the older free-function style compiles even if you forget and read the field directly |
 
-## Running it
+## Running it 🟢
 
 ```bash
 go vet ./...
@@ -513,7 +530,7 @@ Reading it: all five tests pass under `-race`.
 
 That means the race detector found zero unsynchronized concurrent accesses across 100+20+50+500 concurrently running goroutines combined. It is the strongest practical evidence that each primitive's guarantee actually holds, not just that the assertions happened to pass once.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `Counter` and `AtomicCounter` must always be used through a pointer (`*Counter`, not `Counter`) — copying either by value (e.g., passing one by value into a function) copies the mutex or the atomic value, creating a second independent lock or counter that no longer protects the same data.
 	- `go vet` catches this for `sync.Mutex` (`copylocks`), which is one reason this note runs `go vet` before every test run.
@@ -521,7 +538,7 @@ That means the race detector found zero unsynchronized concurrent accesses acros
 	- Production code typically pairs `Acquire`/`Release` with `defer` right after a successful acquire, as the tests above do, to make this class of bug harder to introduce.
 - `AccountStore.TransferConsistentOrder` only prevents deadlock if **every** code path that touches `muA` and `muB` goes through this same lock order — a single other function added later that locks `muB` before `muA` reintroduces the exact deadlock this design was built to avoid.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change it, predict the result:** remove the `defer` from `Counter.Inc` and call `c.mu.Unlock()` as the last line of the function instead. Does `TestCounterConcurrentIncrements` still pass? What changes if a future version of `Inc` gains an early `return` before that last line?
 2. **Change it, predict the result:** in `AccountStore`, write a second method `TransferReverseOrder` that locks `muB` before `muA`, and call it concurrently with `TransferConsistentOrder` in a test. Predict whether it deadlocks, then run it with a test timeout (`go test -timeout 3s`) to check.

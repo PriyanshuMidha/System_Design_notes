@@ -22,7 +22,36 @@ updated: 2026-11-13
 > - `append` only allocates a new backing array when `len == cap`; otherwise it writes in place. The growth factor is roughly 2x below 256 elements, decaying toward 1.25x above it.
 > - Two slices can alias the same backing array. Writing through one can silently change what the other sees, until an `append` on one of them grows past its capacity.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, 8 and the cheat sheet (11). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your program needs to keep a list of things. Say, today's orders.
+
+The simplest way: put them in memory side by side, like boxes in a row. That row of boxes is called an **array**. Because the boxes are in a row, finding box number 500 is instant — the computer just does one small math step.
+
+```mermaid
+flowchart LR
+    q["Give me item 500"] --> m["start address + 500 × size"] --> a["box 500, found instantly"]
+```
+
+One problem: the row has a fixed size. What if more orders arrive? Go's answer is the **slice**: a small note card that says "my row starts here, I'm using this many boxes, and this many exist". When the row fills up, Go quietly builds a bigger row, copies everything over, and updates the card.
+
+```mermaid
+flowchart LR
+    s["Slice card<br/>points at a full row"] -- "add one more" --> n["New bigger row,<br/>everything copied across"]
+```
+
+That is it. The rest of this note is just these 4 questions:
+1. Why are rows of boxes so fast? (sections 1-2)
+2. What exactly is on that note card, and how does growing work? (section 3)
+3. When do two cards secretly share one row, and why does that bite? (sections 3-4)
+4. What goes wrong in real code, and what do interviewers ask? (sections 6-10)
 
 **The problem in one story.**
 You keep a list of today's orders in your program.
@@ -65,7 +94,7 @@ Where it breaks: when the shelf fills, Go quietly builds a bigger shelf and move
 > [!tip] Remember
 > An array is values packed side by side; a slice is a small card (`ptr`, `len`, `cap`) pointing at one.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you're processing a day's worth of sensor readings, one `float64` per second: 86,400 values. You need somewhere to put them, and the two obvious choices behave very differently.
 
@@ -102,7 +131,7 @@ This structure of values packed next to each other is called an **array**. A **s
 > [!tip] Remember
 > Contiguous memory isn't just a storage detail — it's the reason sequential access over an array is dramatically faster than the same access pattern over a pointer-chasing structure.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### The parking-lot analogy
 
@@ -133,7 +162,7 @@ Copying the header is cheap (3 words) and happens on every function call; copyin
 > [!warning] Common mistake
 > Assuming that writing through one slice always shows up in another slice that shares its backing array. It does — until an `append` on either one exceeds capacity and allocates a new array. After that point the two slices have quietly stopped sharing memory, with no error or signal that it happened.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The slice header
 
@@ -237,7 +266,7 @@ flowchart LR
 > [!tip] Remember
 > Two slices over the same backing array only stay independent once one of them has reallocated (or you've deliberately capped capacity with `s[low:high:max]`).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A day's weather, as rows of `(date, high, low)`, is a concrete case where the choice between layouts matters.
 
@@ -279,7 +308,7 @@ tiny := huge[0:16]          // still references the whole 1 MiB backing array
 
 Runnable Go version: [[Arrays and Dynamic Arrays (Go Slices) - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -289,7 +318,7 @@ Runnable Go version: [[Arrays and Dynamic Arrays (Go Slices) - Go]].
 | Flat `[]T` + row-major index | One allocation, manual index math | A fixed-shape 2-D (or N-D) grid | `O(1)` access, best cache locality |
 | `slices` package (`sort`, `slices.Insert`, `slices.BinarySearch`) | Generic helpers over `[]T` | You'd otherwise hand-roll the same loop | Same cost as the hand-written version, less code |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Insert/delete in the middle is `O(n)` because everything after the index must shift. If your workload is insert/delete-heavy in the middle and never needs random access by index, a different structure wins — see [[Linked Lists]].
 - A slice you keep appending to in a loop without a size hint re-allocates its backing array `O(log n)` times total (still `O(n)` amortised), but each reallocation is a real allocation; pre-size with `make([]T, 0, n)` when `n` is known, to skip all of them.
@@ -299,16 +328,22 @@ Runnable Go version: [[Arrays and Dynamic Arrays (Go Slices) - Go]].
 > [!tip] Remember
 > The same contiguous layout that makes slices fast at reading and appending at the end makes them slow at inserting or deleting in the middle — pick the structure that matches your actual access pattern.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Go's own standard library leans on slices everywhere — `bytes.Buffer`, `strings.Builder`, `bufio.Reader` are all slice-backed; the `slices` package (stable since Go 1.21) wraps sort, search, and insert/delete over `[]T` with pdqsort under the hood.
 - **Failure modes → fixes:**
   - unbounded `append` in a hot loop causing GC pressure → pre-size with `make([]T, 0, n)`;
   - a sub-slice of a huge buffer kept around (e.g., `bytes.Split` results from a large file) pinning the whole buffer in memory → copy out only what you need;
   - concurrent `append` on a shared slice from multiple goroutines racing on the header's `len`/`cap` → guard with a mutex or give each goroutine its own slice and merge at the end.
+```mermaid
+flowchart TD
+    a["append in a hot loop,<br/>no size hint"] --> b["many reallocations"] --> c["GC pressure"]
+    f["fix: make([]T, 0, n)<br/>up front"] --> g["one allocation,<br/>GC stays quiet"]
+```
+
 - **What to monitor:** allocations per request (`go test -benchmem`, or `pprof`'s `alloc_objects`), and GC pause frequency if a service appends heavily without pre-sizing.
 
-## 8. Whiteboard version
+## 8. Whiteboard version 🟢
 
 If someone asks you to explain slices at a whiteboard with no code:
 
@@ -320,14 +355,14 @@ If someone asks you to explain slices at a whiteboard with no code:
 
 That five-step picture is the entire mental model; everything in section 3 is this diagram with precise numbers attached.
 
-## 9. Deep dive
+## 9. Deep dive 🔴
 
 - **Why 256 is the growth threshold.** Doubling forever would waste more and more memory per growth as capacity gets large (doubling a slice of 1,000,000 wastes up to 1,000,000 slots); decaying toward 1.25x bounds the wasted fraction while keeping the number of reallocations logarithmic in the final size.
 - **Size classes.** Go's allocator only hands out memory in a fixed set of size classes (8, 16, 24, 32, 48, … bytes per object), so a requested capacity is rounded up to whichever class fits. That's the gap between the growth formula's raw output (832) and the measured capacity (848) in the table above.
 - **Arrays vs slices at the type level.** `[N]T` is part of the type (`[5]int` and `[6]int` are different types, incompatible without conversion); `[]T` has no size in its type, which is exactly what lets a function accept a slice of any length. Passing an array to a function copies it; passing a slice copies only the 3-word header.
 - **Escape analysis decides where the backing array lives.** `make([]T, n)` with a small, compile-time-constant `n` that never escapes the function can be allocated on the stack instead of the heap, skipping GC entirely; this is the compiler's job, not something the slice header diagram shows directly — see [[Pointers, Values and Escape Analysis]] for the mechanics and how to check it with `go build -gcflags="-m"`.
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- What exactly is a Go slice, at the memory level?
 > A 3-word header: a pointer to the first element it can see, a length (how many elements are valid), and a capacity (how many elements fit in the backing array before a reallocation is needed). The header is copied by value; the backing array is shared.
@@ -354,7 +389,7 @@ That five-step picture is the entire mental model; everything in section 3 is th
 > [!question]- Why does cache locality make a slice beat a linked list for sequential iteration, even when both are O(n)?
 > The slice's elements sit in consecutive memory addresses, so after the first access the CPU's prefetcher loads the next cache line before the program asks for it. A linked list's next address isn't known until the current node is read, so each hop is a potential cache miss — on modern DRAM, roughly 100 ns (documented, typical figure) versus well under 1 ns for data already in L1 cache.
 
-## 11. Cheat sheet
+## 11. Cheat sheet 🟢
 
 - Slice = header (`ptr`, `len`, `cap`) over a shared backing array; copying the header doesn't copy the data.
 - `append` grows in place while `len < cap`; past that, it allocates a new array and copies, roughly 2x below 256 elements, ~1.25x above.

@@ -27,7 +27,33 @@ updated: 2026-11-13
 > - SSE needs none of this: it's one `http.Flusher`-driven response stream, auto-reconnecting `EventSource` on the client, and a `Last-Event-ID` header for resuming after a drop.
 > - Browsers cannot set an `Authorization` header on a WebSocket handshake or an `EventSource` request — auth goes through a cookie or a short-lived, single-use ticket fetched over a normal authenticated REST call first.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Normal HTTP is ask-then-answer: the server can never speak first. But a chat app or a live dashboard needs the server to push.
+
+A **WebSocket** is an HTTP request that upgrades into an open two-way phone line that stays connected. **SSE** (Server-Sent Events) is the simpler cousin: a one-way line where only the server talks, over plain HTTP.
+
+```mermaid
+flowchart LR
+    C1[Client A] <--> H[Hub in your Go service]
+    C2[Client B] <--> H
+    H -->|fan out one event to many| C1 & C2
+```
+
+In Go, each connection gets exactly two goroutines — one reading, one writing — and a **hub** in the middle decides which event goes to which connections, without letting one slow client jam everyone.
+
+The rest of this note is just these 4 questions:
+1. How does the upgrade work, and who may connect (origin checks)?
+2. Why one reader and one writer goroutine per connection?
+3. How does the hub fan out without blocking on slow clients?
+4. When is SSE the better, simpler answer?
 
 **The problem in one story.**
 You open a page showing an invoice as "pending".
@@ -73,7 +99,7 @@ Where it breaks: a phone call notices hang-ups, but a dead TCP connection can st
 > [!tip] Remember
 > WebSocket for two-way talk, SSE for one-way updates; one reader and one writer per connection, and pings to detect the dead.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps' billing dashboard shows an invoice's status live: `pending → paid` the moment a webhook confirms payment (see [[Receiving Webhooks Idempotently]]), with no page reload and no 2-second polling loop hammering the API.
 
@@ -83,7 +109,7 @@ A WebSocket (or SSE) connection flips this: the server pushes exactly one messag
 
 The cost is holding one long-lived connection open per client instead of reusing a connection pool for one request at a time — which is precisely the cost that makes a naive implementation fall over past a few thousand concurrent users if nothing manages the connections deliberately.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An HTTP request/response is a brief conversation: ask, answer, hang up. A WebSocket is a phone call that stays open: after the initial handshake, either side can speak at any time, and the line stays connected until someone hangs up.
 
@@ -96,6 +122,8 @@ If someone's line is tied up (their reader is slow, their network is bad), the o
 SSE is a one-way phone call where only the server talks: the browser's `EventSource` just keeps a line open and listens, and if the call drops, it calls back on its own.
 
 ### Whiteboard version
+
+**In plain words:** one upgraded connection with its two pumps, minimal.
 
 ```mermaid
 sequenceDiagram
@@ -111,7 +139,7 @@ sequenceDiagram
     Browser->>Server: close(1000, "tab closed")
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Handshake, upgrade and auth
 
@@ -133,6 +161,8 @@ Without an origin check, any page on any origin can run `new WebSocket("wss://ap
 
 ### readPump/writePump goroutines; the single-writer rule
 
+**In plain words:** two workers per phone line — one only listens, one only speaks — because the connection breaks if two goroutines write at once.
+
 Every WebSocket library — `coder/websocket` and `gorilla/websocket` alike — allows **exactly one goroutine to read and one to write at a time** per connection. Two goroutines calling `Write` concurrently corrupt the frame stream (interleaved bytes from two messages look like one malformed message to the other side). The standard shape is two goroutines per connection:
 
 ```mermaid
@@ -149,6 +179,8 @@ flowchart LR
 `readPump` exists even for a read-only client (InvoiceOps' dashboard never sends anything but close frames) because `Read` is also how you notice the client disconnected, and how the read deadline gets enforced.
 
 ### A buffered send channel per client; a slow-consumer policy
+
+**In plain words:** each client gets a small mailbox; if the mailbox is full the client is too slow, and you drop them rather than let them stall the hub.
 
 The hub never calls `conn.Write` itself — it hands an event to the client's buffered `chan Event`, and only that client's `writePump` goroutine reads from it and writes to the socket.
 
@@ -167,6 +199,8 @@ Also note that when the context passed to `Read` or `Write` expires, `coder/webs
 `conn.SetReadLimit(n)` caps a single message's size so one client can't force unbounded memory growth with a giant frame.
 
 ### Hub pattern (register/unregister/broadcast) vs a mutex-protected map
+
+**In plain words:** the hub is a switchboard goroutine that owns the client list, so joins, leaves and broadcasts never race.
 
 A `sync.Mutex`-guarded `map[string]*Client` works, but every register, unregister and broadcast then competes for the same lock, and it's easy to hold the lock while writing to a socket (blocking every other map access on a slow network write).
 
@@ -224,6 +258,8 @@ Raise the file-descriptor limit (`ulimit -n`, the container `nofile` limit) well
 
 ### SSE for one-way updates
 
+**In plain words:** when the server only pushes and never listens, a never-ending plain HTTP response does the job and the browser even reconnects by itself.
+
 SSE is `Content-Type: text/event-stream`, a response that's flushed after every event instead of ending, and a wire format the browser's `EventSource` parses itself:
 
 ```text
@@ -250,7 +286,7 @@ Send a comment line (`: keepalive`) every 15-30 seconds so proxies and load bala
 
 A connection that should have closed but didn't leaves its pump goroutines running; `go test -race` won't catch that on its own, so production test suites for this code typically add `goleak.VerifyNone(t)` at the end of each test (not shown below, to keep this module's only dependency `coder/websocket`) to fail loudly on a leaked pump goroutine.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -873,7 +909,7 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
 
 `go vet ./...` is clean.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -883,14 +919,14 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
 | Long polling | Client requests, server holds the request open until there's an update or a timeout, client immediately re-requests | Need to work through infrastructure that actively breaks long-lived connections | Highest latency and request overhead of the three; mostly legacy today |
 | gRPC server streaming | One RPC, server `Send`s repeatedly on the open stream | Client is already a gRPC/Connect consumer, not a browser | Not directly reachable from a browser without gRPC-Web or ConnectRPC (see [[Serving REST and gRPC Together]]) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A WebSocket needs a hub, ping/pong, origin checks and multi-instance fan-out just to be correct — real complexity, not boilerplate. If updates are one-way, SSE buys the same user-facing effect with a fraction of the code.
 - SSE's "browser connections per origin" limit on HTTP/1.1 (historically 6) can starve a page opening several SSE streams to the same origin; HTTP/2 multiplexes many streams over one connection and removes this limit, so serve SSE over HTTP/2 whenever it is in play.
 - Neither works well for data where losing an update is unacceptable and the client might be offline for a long time — reach for a durable queue and a sync-on-reconnect protocol instead of either.
 - A WebSocket connection pinned to one pod means that pod's death briefly drops every connection it held; the client's reconnect-with-backoff absorbs this, but it is a real, user-visible blip, unlike a stateless REST request that a load balancer can retry transparently.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Slack and Discord's real-time message delivery is WebSocket-based with a presence and fan-out layer much like the hub here, scaled out. Dashboards and status pages commonly use SSE for one-way status ticks because it is plain HTTP and passes through more corporate proxies than raw WebSockets do.
 - **Failure modes → fixes:**
@@ -901,7 +937,7 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
   - Reconnect storms (every client reconnects at the same instant after a deploy) → backoff with jitter on the client, and stagger pod restarts.
 - **What to monitor:** open connection count per pod, ping failures per minute (a leading indicator of network trouble before full disconnects), send-channel-full drops per minute (a signal of either an overloaded pod or an undersized buffer), and p99 time from event generated to event delivered.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why ctx-based deadlines (coder/websocket) instead of `SetReadDeadline`/`SetPongHandler` (gorilla/websocket).** gorilla's API predates Go's `context.Context` becoming the standard cancellation idiom; it sets a deadline directly on the underlying `net.Conn` and calls a registered callback when a pong frame arrives.
   - coder/websocket instead threads a `context.Context` through every blocking call, so a single `ctx` (the request's, or a `WithTimeout` wrapper) cancels a `Read` or `Write` the same way it would cancel a database query or an outbound HTTP call elsewhere in the same request — one cancellation idiom across the whole service instead of two.
@@ -912,7 +948,7 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
 - **Compression and WebSockets.** `permessage-deflate` (RFC 7692) compresses WebSocket frames, which libraries including coder/websocket support, but it reintroduces exactly the kind of state (a compression context carried across messages) that makes horizontal scaling and connection migration harder.
   - A CRIME/BREACH-style side channel exists in principle when compressing attacker-influenced and secret data on the same stream — treat it as an optimization to measure, not a default to flip on.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does a WebSocket handler need two goroutines, not one?
 > Reading detects the client disconnecting (and enforces the read deadline); writing sends pushed events and periodic pings. Both block independently, and every library in common use forbids concurrent writes from more than one goroutine — so one goroutine owns reads, a different one owns writes, coordinated by a shared cancellation signal.
@@ -935,7 +971,7 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
 > [!question]- How does a client resume an SSE stream after a dropped connection without missing events?
 > The server tags each event with an `id:` line; `EventSource` remembers the last one it saw and automatically resends it as the `Last-Event-ID` request header on reconnect. The handler looks that id up in a server-side event log and replays everything after it before resuming the live stream.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - One goroutine reads, one writes, per connection — no exceptions, in any WebSocket library.
 - Browsers can't set WebSocket handshake headers: auth via cookie or a short-lived, single-use ticket.
@@ -946,7 +982,7 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
 - SSE = `http.ResponseController.Flush()` per event, `id:` + `Last-Event-ID` for resumable replay, `EventSource` handles reconnection.
 - Multi-pod fan-out needs a shared bus (Redis Pub/Sub, NATS) — a hub only knows about its own pod's connections.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Server Fundamentals (net-http)]], [[Middleware]], [[Real-time APIs - WebSocket, SSE and Long Polling]]
 - **Next:** [[Observability in Go Services]], [[Graceful Shutdown and Health Checks]]

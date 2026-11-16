@@ -16,7 +16,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > One tested Go function per interview pattern from [[Sorting, Searching and Interview Patterns]]: two pointers, sliding window, prefix sums, BFS, DFS, backtracking, and bottom-up DP. Each function is the smallest correct version of its pattern, chosen to make the pattern itself legible rather than to handle every edge case a production system would need.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Sorting, Searching and Interview Patterns]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Sorting, Searching and Interview Patterns]]. It is one small, tested Go function per interview pattern — two pointers, sliding window, prefix sums, BFS, DFS, backtracking and bottom-up DP — each the smallest correct version of its pattern. Read a step, then try the matching exercise.
+
+## Before the code 🟢
 
 - **Slices** (`[]int`, `[][]byte`): Go's growable lists; every pattern here walks or indexes into them.
 - **Multiple return values** (`(int, int)`): `TwoSumSorted` returns both indices at once instead of a struct.
@@ -25,7 +32,7 @@ updated: 2026-11-13
 - **Standard sort helpers** (`slices.Sort`, `sort.Search`): library sorting (pdqsort) and binary search on a condition.
 - **What to run:** `go vet ./patterns/... && go test -race ./patterns/...` inside the module. No goroutines or interfaces are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 Each function below is deliberately the smallest version of its pattern that still demonstrates the real idea, rather than a production-hardened implementation — the goal is for the pattern itself to be legible in a single read, with every design choice explained rather than left implicit.
 
@@ -39,7 +46,7 @@ None of these functions depends on any other, so they can be read in any order, 
 | `NumIslands`, `ShortestPathBFS` | [[Sorting, Searching and Interview Patterns#Picture it BFS vs DFS exploration order\|DFS and BFS]] on a grid and a graph |
 | `Subsets`, `CoinChangeMinCoins` | [[Sorting, Searching and Interview Patterns#Picture it backtracking vs DP on overlapping subproblems\|Backtracking vs DP]] on the same kind of combinatorial problem |
 
-## Setup
+## Setup 🟢
 
 ### How the functions in this file relate to each other
 
@@ -73,7 +80,7 @@ go test -race ./patterns/...
 
 `go vet` catches structural mistakes (an unreachable `return`, a `%w` verb used where there's no wrapped error) before anything runs; `go test -race` additionally instruments every memory access, which matters here mainly for `TestStableSortByAgeIsStable` and the graph-traversal tests, none of which happen to be concurrent in this note but which are still worth running under the race detector as a habit.
 
-## Code
+## Code 🟡
 
 ### Step 1: two pointers — `TwoSumSorted`
 
@@ -317,7 +324,7 @@ func CoinChangeMinCoins(coins []int, amount int) int {
 3. The outer loop over `a` must run in increasing order — `dp[a-c]` is only correct if every smaller sub-amount has already been finalized, which is guaranteed by computing `a = 1, 2, 3, ...` in order rather than recursively.
 4. `dp[amount] == inf` at the end means no combination works; the explicit `-1` return keeps the function's contract separate from the internal sentinel.
 
-## Tests
+## Tests 🟡
 
 ### `TestCoinChangeMinCoins`
 
@@ -372,7 +379,7 @@ fmt.Println(nums) // [1 2 2 5 8] — correctly sorted; pdqsort gives no order
                    // guarantee among the two 2s
 ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 None of the pitfalls below are compile errors or immediate panics — each produces a plausible-looking wrong answer, or a performance regression that only shows up on inputs larger than a casual test would use. That's exactly what makes them worth naming explicitly rather than trusting that "it compiled and the obvious test passed" is sufficient.
 
@@ -381,7 +388,7 @@ None of the pitfalls below are compile errors or immediate panics — each produ
 - **BFS with `queue = queue[1:]`.** Fine for a small scratch example, but see [[Stacks, Queues and Deques]] for why this leaks memory in a long-running queue — a production BFS over a large graph should use a proper ring buffer or a `container/list`.
 - **Forgetting the increasing-order constraint in DP.** `CoinChangeMinCoins`'s outer loop must iterate `a` from `1` upward; iterating in any other order (or recursing without memoization) would read `dp[a-c]` before it's finalized, silently producing a wrong minimum instead of a crash — this is the single most common DP bug, and it never shows up as a panic.
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 |---|---|---|
@@ -390,7 +397,7 @@ None of the pitfalls below are compile errors or immediate panics — each produ
 | DFS as a closure (`NumIslands`) | A method on a small receiver struct | A closure keeps the example self-contained in one function; a struct would be preferable if the flood fill needed more shared state |
 | `Subsets` builds the full power set eagerly | A generator/iterator-style API (yielding one subset at a time) | Eager construction is simpler to test and reason about; an iterator would matter only if `2ⁿ` subsets were too many to hold in memory at once |
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go test -race -run TestNumIslands -v ./patterns/...
@@ -402,7 +409,7 @@ ok  	cs1scratch/patterns	0.098s
 
 Reading it line by line: `-run TestNumIslands` isolates the flood-fill test from the rest of the suite; `-race` instruments memory access even though this particular function is single-threaded, which costs nothing extra here but catches a regression immediately if a future edit introduces concurrency; `PASS` with no further output means the function returned the expected island count for every case the test checks.
 
-## Exercises
+## Exercises 🔴
 
 Each of these asks you to change one function and predict the result *before* running the tests — the point is to check your mental model of the pattern, not just to produce working code.
 

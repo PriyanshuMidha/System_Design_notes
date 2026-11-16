@@ -42,7 +42,35 @@ flowchart LR
 
 Everything below is what delays entry into, or progress through, this pipeline.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A web page arrives as three kinds of text files: HTML (what is on the page), CSS (how it looks), JavaScript (what it does). The browser cannot show text files — it has to turn them into pixels.
+
+To do that, it builds structures first. HTML becomes a tree of elements (the **DOM**); CSS becomes a tree of style rules (the **CSSOM**). Only when both exist can the browser work out sizes and positions (**layout**) and finally colour in the pixels (paint).
+
+```mermaid
+flowchart LR
+    F["3 text files<br/>HTML, CSS, JS"] --> B["Browser builds<br/>trees, does layout"] --> P["Pixels on<br/>your screen"]
+```
+
+One thing can jam the whole machine: a plain `<script>` tag makes the browser stop reading the HTML, download the script, run it, and only then continue.
+
+```mermaid
+flowchart LR
+    R["Reading HTML..."] --> SC["plain &lt;script&gt; tag"] --> ST["STOP: download + run"] --> R2["...resume reading"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are the exact steps from bytes to pixels?
+2. How do scripts block those steps, and what do `async`/`defer` change?
+3. What do I remove or reorder to make the first paint happen sooner?
 
 **The problem in one story.**
 You type a URL and press Enter. A blank white screen sits there for a moment, then the page appears.
@@ -88,7 +116,7 @@ Where it breaks: a carpenter can't start before the whole manual arrives; a brow
 > [!tip] Remember
 > HTML → DOM, CSS → CSSOM, then layout, paint, composite; anything that blocks those steps delays the first paint.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say a page's HTML references a 40 KB stylesheet and ends with a `<script src="analytics.js">` tag with no attributes, on a connection with 100 ms round-trip latency.
 
@@ -103,7 +131,7 @@ This is why `<script>` has `async` and `defer` attributes, and why the critical 
 > [!tip] Remember
 > A plain `<script>` tag is the one tag in HTML that can stop the parser dead in its tracks — everything else below exists to give you a way around that.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the browser as reading a recipe (HTML) out loud while a second person checks a binder of substitutions (CSS) at the same time.
 
@@ -117,7 +145,7 @@ A plain `<script>` tag is a recipe instruction that says "stop reading, go fetch
 
 This analogy breaks down in one place: a real recipe reader can glance ahead in the binder whenever they like, but the browser genuinely cannot show anything — not even the parts it has already read — until the binder (CSS) is fully checked. The withholding is total, not partial.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Parsing HTML into the DOM
 
@@ -139,6 +167,8 @@ flowchart LR
 **Why it matters:** this is why a slow backend response still lets users start reading the top of a long page instead of staring at a blank screen for the full 2 seconds.
 
 ### Building the CSSOM
+
+**In plain words:** the browser refuses to paint anything until it has read ALL the CSS — because the very last rule in the very last file could still change the first element's colour.
 
 Before naming it, here's the problem: the browser needs to know the final, computed style of an element — its color, size, visibility — before it can draw even one pixel of it.
 
@@ -261,7 +291,7 @@ A plain inline `<script>` with no attributes that runs before images finish stil
 > [!tip] Remember
 > `DOMContentLoaded` = "the page's structure and scripts are ready." `load` = "literally everything, including every image, is ready." Pick the earlier one unless you specifically need the later one.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 Trace a real page load: `index.html` (critical, 8 KB), `styles.css` (critical, 30 KB), `app.js` (needs the DOM, not critical to first paint, 50 KB), `analytics.js` (independent of everything, 20 KB). Round-trip time: 80 ms. Bandwidth is generous enough that transfer time is dominated by round trips, not bytes.
 
@@ -318,11 +348,13 @@ This feeds directly into **Core Web Vitals**: **LCP** (Largest Contentful Paint 
 
 ### What's on the backend side
 
+**In plain words:** none of the browser's work can start before the server sends the first byte — so server speed, compression and caching sit in front of everything in this note.
+
 Nothing above starts until the first HTML bytes exist: TTFB (time to first byte) from the server, response compression, and `Cache-Control`/`ETag` headers for static assets all shift when this whole pipeline gets to begin.
 
 HTTP/2 server push was an attempt to start sending CSS/JS before the browser asked for it; Chrome disabled it by default in 2022 (Chrome 106) and other Chromium browsers followed, because it over-pushed resources the browser already had cached more often than it helped — `preload` headers achieve the same goal with the browser still in control of what it actually needs.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Loading strategy | Downloads during parsing | Executes | Preserves order | Typical use |
 | --- | --- | --- | --- | --- |
@@ -332,19 +364,19 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 | `<script type="module" src="…">` | yes | after parsing (deferred by default); `async` can be added | yes, per the static import graph | ES modules, modern app entry points |
 | Inline `<script>` | n/a (already in the document) | immediately, in place | yes | small critical bootstrapping only |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `async` trades ordering for speed-to-execute; never use it for a script another script depends on.
 - `defer` is the right default for application code, but it still delays execution until parsing fully completes, so a tiny script that truly must run before anything else (feature detection that gates CSS) may need to stay inline instead.
 - Preloading too many resources competes for the same limited early bandwidth and can *delay* the thing that actually matters most — preload only what blocks the current page's first paint.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** bundlers (Vite, webpack) emit `type="module"` entry points by default, which already behave like `defer`; CDNs commonly load third-party widgets (chat, analytics) with `async` because the page must not depend on them.
 - **Failure modes → fixes:** a `defer` script that reads `document.currentScript` assuming it runs synchronously breaks — fix: don't rely on execution timing from inside a deferred script. A render-blocking web-font swap causing CLS — fix: `font-display: swap` with a matched fallback, or preload the font.
 - **What to monitor:** LCP, CLS and INP from Real User Monitoring (RUM), not just lab tools, since they vary with real users' devices and networks.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Preload scanner:** modern browsers run a separate, fast "speculative" HTML scanner ahead of the main parser specifically to discover `<script>`, `<link>` and `<img>` URLs early and start their network requests immediately, even though the main parser hasn't reached them yet — this is why download for a plain blocking script still often starts right away rather than only after the parser literally reaches the tag.
 
@@ -365,7 +397,7 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 - **Layout thrashing:** reading a layout-dependent property (`offsetHeight`) immediately after writing a style forces a synchronous layout recalculation ("forced reflow") instead of letting the browser batch it; doing this in a loop (read, write, read, write) is "layout thrashing," a common cause of jank that profilers show as repeated purple "Layout" blocks.
 - **Module scripts and the import graph:** a `type="module"` script and everything it statically `import`s are fetched in parallel (the module graph is resolved before execution), then executed in dependency order — a dynamic `import()` is a separate, lazy fetch that runs later, which is how route-based code splitting defers downloading a page nobody has navigated to yet.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the actual difference between `async` and `defer`, not just "both load without blocking"?
 > Both download in parallel with parsing. `async` executes the moment the download finishes, which can interrupt parsing mid-document and gives no ordering guarantee between scripts. `defer` always executes after parsing completes and always in document order. The difference is in execution timing and ordering, not in whether the network fetch blocks.
@@ -392,7 +424,7 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 > [!question]- Why did HTTP/2 server push get removed from major browsers if it could start sending CSS/JS before the browser asked?
 > In practice servers often pushed resources the browser already had cached or didn't need for this navigation, wasting bandwidth and sometimes slowing the page down. `Link: rel=preload` headers give the same "start this early" benefit while leaving the browser in control of what it actually fetches, which is why browsers moved to that instead.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Pipeline: HTML → DOM, CSS → CSSOM, both → render tree → layout → paint → composite.
 - CSS always blocks first paint; a plain `<script>` blocks parsing too.
@@ -404,7 +436,7 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 - LCP, CLS, INP are the Core Web Vitals this pipeline directly determines.
 - HTTP/2 push is dead; use `preload`/`preconnect`/`prefetch` instead.
 
-## Links
+## Links 🟢
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]
 - **Next:** [[CSS Fundamentals - Cascade, Selectors, Box Model]]
 - **Compare with:** [[JavaScript Async - Event Loop, Promises, async-await]]

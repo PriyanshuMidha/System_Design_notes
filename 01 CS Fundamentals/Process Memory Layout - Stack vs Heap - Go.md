@@ -17,7 +17,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Runnable code for [[Process Memory Layout - Stack vs Heap]]: two functions whose `-gcflags=-m` output proves the escape-analysis rule directly, a hand-built LIFO call stack that makes "push/pop is just a pointer move" concrete and testable, and a stack-growth harness that measures a real goroutine's stack doubling as recursion gets deeper.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Process Memory Layout - Stack vs Heap]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Process Memory Layout - Stack vs Heap]]. It is Go code that shows which variables stay on the stack and which escape to the heap, using Go's own escape-analysis output and benchmarks. Read each step's notes before the code; run the commands to see it live.
+
+## Before the code 🟢
 
 - **Packages**: three small packages (`escape`, `memlayout`, `cmd/stackdemo`) in one module; each folder is one package.
 - **Pointers and `&`**: `&Counter{...}` takes the address of a value; returning it is what makes a value escape to the heap.
@@ -26,7 +33,7 @@ updated: 2026-11-13
 - **`runtime.ReadMemStats`**: reads the runtime's memory counters, including `StackInuse` (bytes used by all goroutine stacks).
 - **What to run**: `go vet ./... && go test -race ./...`, then `go build -gcflags=-m ./escape/` and `go run ./cmd/stackdemo`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -46,13 +53,13 @@ flowchart LR
     end
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. No external dependencies — everything is the standard library (`fmt`, `runtime`).
 - Layout: a module with three packages — `escape` (the escape-analysis demo), `memlayout` (the call-stack model and the stack-growth harness and their tests), and a `cmd/stackdemo` runnable that prints the growth measurement.
 - Run it with `go vet ./... && go test -race ./...`. The stack-growth measurement itself is printed by `go run ./cmd/stackdemo`.
 
-## Code
+## Code 🟡
 
 ### Step 1: two functions the compiler treats differently
 
@@ -305,7 +312,7 @@ func GoroutineStackGrowth(depths []int) []uint64 {
 3. `out[i] = inUse` is written inside the spawned goroutine but only read after `<-done`, so there is no data race despite the closure capturing `out` and `i` — the channel receive happens-before the read.
 4. The function returns one `StackInuse` reading per requested depth, in order, ready to print or assert against.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -315,7 +322,7 @@ func GoroutineStackGrowth(depths []int) []uint64 {
 | `stackHog` sized at 4 KB (`[512]int64`) | A 1-byte local | Forces visible `morestack` events within a few hundred recursion levels instead of needing many thousands |
 | `done` channel to synchronize the measurement | `sync.WaitGroup` | Either works here; the channel also naturally models one goroutine handing a result back, consistent with the channel-based measurements elsewhere in this topic |
 
-## Tests
+## Tests 🟡
 
 ### Test 1: push/pop behaves as LIFO
 
@@ -413,7 +420,7 @@ func TestGoroutineStackGrowthIsNonDecreasing(t *testing.T) {
 
 **If it fails.** A decrease would mean either the measurement methodology is unsound (e.g. goroutines interfering with each other) or, far less likely, that the Go runtime version in use shrinks goroutine stacks mid-recursion, which would contradict the documented `morestack` behaviour this note relies on.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race ./...
@@ -445,14 +452,14 @@ depth=3000  runtime StackInuse=33849344 bytes
 3. From depth 50 onward each step shows a clear jump, not a smooth climb — each jump is one or more `morestack` doubling events for that one measured goroutine.
 4. By depth 3000 the total has grown over 100x from the depth-1 baseline, entirely attributable to one goroutine's stack having doubled repeatedly to hold that much recursion.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`StackInuse` is process-wide, not per-goroutine.** Reading it right after a measurement is "best effort": background goroutines (GC workers, the runtime's own housekeeping) add a baseline that makes depth 1 look larger than 2 KB.
 - **A fresh goroutine per depth is essential.** Reusing one goroutine across depths would let an earlier, deeper measurement's already-grown stack mask the next, shallower one's true starting size.
 - **`stackHog`'s size controls how quickly growth becomes visible.** A 1-byte local would need many thousands of recursion levels to force even one doubling; 4 KB forces several within a few hundred levels, which is why this harness can show the effect with modest, fast-to-run depths.
 - **`CallStack.Pop` does not zero the returned slot.** This mirrors a real stack (bytes are abandoned, not wiped) but means `s.frames[s.sp]` still holds stale data after a pop — reading past `Depth()` directly (instead of through `Pop`) would see leftover values, which is why nothing in this package exposes `frames` itself.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `stackHog` from `[512]int64` (4 KB) to `[64]int64` (512 B). Predict whether the doubling jumps in the printed table happen at the same depths, earlier, or later, then run `go run ./cmd/stackdemo` and check.
 2. In `TestOverflowIsReportedNotPanicked`, change `NewCallStack(2)` to `NewCallStack(0)`. Predict what the very first `Push` call returns, then run the test.

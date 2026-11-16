@@ -22,7 +22,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This note models the leaf level of a composite B-tree index `(workspace_id, status, due_date)` as a sorted Go slice, and shows with counted comparisons why the leftmost-prefix rule works. It also computes B+tree height from fan-out. The concepts are explained in [[Indexing Fundamentals]]; here each function is explained piece by piece.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read [[Indexing Fundamentals]] first. Then read "From zero" below, "Before the code" and "What this code shows". Stop there.
+> - 🟡 **Know the basics?** Walk through Code steps 1-4; each has an "In plain words" line and a step-by-step explanation.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Tests, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+This file teaches one idea with runnable Go code: a database index is just a sorted list, and sorted order is why some lookups are fast and others are not. It builds a fake index of 10,000 entries as a sorted Go slice, then runs two searches. The one that matches the sort order (workspace then status) touches 26 entries; the one that does not (status alone) must touch all 10,000. It also has a tiny function that computes how tall a real B-tree is. Read the theory note first, then follow the code top to bottom; every block is explained right after it.
+
+## Before the code 🟢
 
 - **Structs with several fields** (`Entry`): one index entry holding `workspace_id`, `status`, `due_date` and the row id.
 - **A three-way compare function** (`compare(a, b) int`): returns negative, zero or positive, the same contract `slices.SortFunc` uses.
@@ -31,7 +40,7 @@ updated: 2026-11-13
 - **Integer loops** (`Height`): repeated division by the fan-out gives the tree height.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where explained |
 | --- | --- | --- |
@@ -52,7 +61,7 @@ flowchart LR
 
 The test builds one sorted slice and asks it two questions: the same data answered through a prefix (26 comparisons) and through a non-prefix column (10,000). That gap is the whole lesson. `Height` is a separate small calculation.
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only (`cmp`, `slices`, `sort`, `fmt`, `testing`).
 - Module layout: one package `idx` with two files.
@@ -66,9 +75,11 @@ idx/
 
 - Run: `go vet ./... && go test -race -v ./...`
 
-## Code
+## Code 🟡
 
 ### Step 1: the index entry and the sorted slice
+
+**In plain words:** we build the "index": a struct for one entry, a rule for how entries sort, and a constructor that sorts a slice of them. Sorting is the entire trick.
 
 **Concept.** A B+tree index keeps its leaf level in sorted order, and a composite index sorts by the first column, then the second, then the third ([[Indexing Fundamentals#Why column order matters: the leftmost-prefix rule]]).
 
@@ -142,6 +153,8 @@ Notice that after sorting, all entries of workspace 1 are adjacent, and within t
 
 ### Step 2: seek by prefix
 
+**In plain words:** because matching entries sit next to each other in the sorted list, we find the start and end of that run with two binary searches, about 13 probes each, instead of reading everything.
+
 **Concept.** Because the data is sorted by `(workspace, status, ...)`, all entries with one `(workspace, status)` pair form a single contiguous run. Finding a run needs only two binary searches: the first position at or after the key, and the first position after it.
 
 This is how a B-tree answers `WHERE workspace_id = ? AND status = ?` in logarithmic time ([[Indexing Fundamentals#Why column order matters: the leftmost-prefix rule]]). The code counts how many entries the comparison function touched, so the test can prove the claim with a number.
@@ -187,6 +200,8 @@ The arithmetic: log2(10,000) is about 13.3, so each search needs about 13 compar
 
 ### Step 3: scan by non-prefix
 
+**In plain words:** searching on a column that is not first in the sort order is like looking for a first name in a phone book: the matches are scattered, so you must read every entry.
+
 **Concept.** Status alone is not a leftmost prefix. In the sorted order, entries with `status = 'overdue'` are scattered across every workspace, one small run per workspace.
 
 There is no single contiguous run to binary-search, so the only correct method is to look at every entry. This is the code version of "an index on `(workspace_id, status)` does not help a query on `status` alone" ([[Indexing Fundamentals#When the planner ignores your index]]).
@@ -221,6 +236,8 @@ func (c *Composite) ScanStatus(st string) (ids []int64, examined int) {
 
 ### Step 4: tree height from fan-out
 
+**In plain words:** a tiny loop that answers "how many levels tall is the tree?" by multiplying the fan-out until it covers the row count.
+
 **Concept.** A B+tree page holds hundreds of entries, so each level multiplies capacity by the fan-out. The height is the number of levels, which is the number of page reads to find one entry ([[Indexing Fundamentals#Fan-out and tree height, step by step]]).
 
 The smallest height `h` with `fanout^h >= rows` is the answer; the loop multiplies until capacity covers the rows. A closed form with logarithms exists, but floating-point `math.Log` can be off by one at exact powers, so an integer loop is safer.
@@ -251,7 +268,7 @@ flowchart LR
     L4 --> OK["covers 100,000,000 rows"]
 ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -263,11 +280,13 @@ flowchart LR
 | Integer loop in `Height` | `math.Ceil(math.Log(...))` | Exact at powers of the fan-out; slower for huge heights, which are never more than about 10 |
 | `Clone` before sorting | Sort the caller's slice in place | The caller's data is untouched; one extra allocation |
 
-## Tests
+## Tests 🔴
 
 The test data has 10,000 entries (100 workspaces times 100 invoices, 4 statuses), so each `(workspace, status)` pair has 25 entries and each status has 2,500 entries overall.
 
 ### Test data: `sample`
+
+**In plain words:** the test data is generated by a fixed formula, so the test can assert exact counts like "25 rows" and "10,000 examined".
 
 **Concept.** The data generator is deterministic so that counts are exact: for each workspace, invoice `i` gets status `i % 4`, so every workspace has 25 of each status, and due dates cycle through months and days.
 
@@ -373,7 +392,7 @@ func TestHeight(t *testing.T) {
 
 This is a table-driven test: one loop, one failure message per bad case (`t.Errorf` keeps going, so all failing rows are reported). A failure at 300 or 90,000 means the comparison is `<=` where it should be `<`, an off-by-one at the boundary. The last two rows show that a wider page saves a whole level on 100 million rows.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -541,7 +560,7 @@ The leftmost-prefix lookup examined **26 of 10,000** entries; the status-only qu
 > }
 > ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `examined` is captured by the closure `key`, so it counts comparisons made by both `sort.Search` calls. Calling `SeekPrefix` twice on the same `Composite` starts a fresh count because the variable is a named result.
 - `DueDate` is a string. `YYYY-MM-DD` sorts correctly as text, but a format such as `D/M/YYYY` would not.
@@ -549,7 +568,7 @@ The leftmost-prefix lookup examined **26 of 10,000** entries; the status-only qu
 - The slice models the order of a B-tree leaf level, not its page structure. It has no fan-out, no page splits and no concurrency.
 - `Height` assumes every page is full. Real pages are about 70-90% full, so real trees can be one level taller near a boundary.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `SeekPrefix` so it also takes a due-date lower bound and seeks on all three columns. Predict how many entries it examines compared with the two-column version, then run it.
 2. Change `compare` to sort by `(status, workspace_id, due_date, row_id)` but leave `SeekPrefix` unchanged. Predict whether `SeekPrefix(42, "overdue")` still returns 25 rows, and why `sort.Search` needs its predicate to be monotonic.

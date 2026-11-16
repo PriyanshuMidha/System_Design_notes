@@ -23,7 +23,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This note implements a small checker for B-tree index design: given an index key and a query shape, `Analyze` reports how many leading columns the query can seek on and whether the index already returns rows in `ORDER BY` order, and `ESR` proposes a key using the equality–sort–range rule. The concepts are explained in [[Index Types and Index Design]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read [[Index Types and Index Design]] first. Then read "From zero" below, "Before the code" and "What this code shows". Stop there.
+> - 🟡 **Know the basics?** Walk through Code steps 1-4; each has an "In plain words" line and a step-by-step explanation.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Tests, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+This file turns the index-design rules from the theory note into a tiny Go tool you could run in code review. You describe a query as plain data (which columns it matches exactly, which one it ranges over, what it sorts by). One function, `ESR`, proposes the best column order for an index. Another, `Analyze`, judges any index against the query: how many columns can it seek on, and is the sort free? The tests then prove the classic rules with exact answers, like "a gap in the prefix blocks the range column". Read the theory note first, then follow the four code steps top to bottom.
+
+## Before the code 🟢
 
 - **Structs and slices** (`Col`, `Query`, `[]Col`): an index is just an ordered list of columns with a sort direction.
 - **Maps as sets** (`map[string]bool`): track which columns are fixed by equality filters.
@@ -32,7 +41,7 @@ updated: 2026-11-13
 - **`reflect.DeepEqual`**: compares whole slices and structs in the tests.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the `idx` module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where explained |
 | --- | --- | --- |
@@ -51,7 +60,7 @@ flowchart LR
     SM --> U
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only (`reflect` and `testing` in the tests).
 - Module layout: one package `idx` with two files.
@@ -65,7 +74,7 @@ idx/
 
 - Run: `go vet ./... && go test -race -v ./...`
 
-## Code
+## Code 🟡
 
 The code is one package of three small ideas: a vocabulary for describing a query, a function that proposes a key, and a function that judges a key. Each is shown in its own piece below. The pieces are one file, `idx.go`, in the order shown.
 
@@ -78,6 +87,8 @@ flowchart TD
 ```
 
 ### Step 1: describe the query and the index
+
+**In plain words:** before any logic, we need words: a `Query` is three facts about a query (exact matches, one range, the sort), and an index is just a list of columns in order.
 
 **Concept.** The theory note reduces any hot query to three facts: which columns are compared with `=`, which one column carries a range, and what `ORDER BY` asks for ([[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]).
 
@@ -124,6 +135,8 @@ Before and after for the running example, the invoice list API `WHERE workspace_
 | `ORDER BY due_date DESC, id DESC` | `Sort` | `[{due_date, true}, {id, true}]` |
 
 ### Step 2: propose a key with ESR
+
+**In plain words:** this function writes the index for you: it lays down the exact-match columns, then the sort columns, then the range column, skipping duplicates.
 
 **Concept.** This implements the equality, sort, range ordering from [[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]. Equality columns go first so the matching entries form one contiguous run. Sort columns go next so that run is already in `ORDER BY` order.
 
@@ -173,6 +186,8 @@ Trace for equality `workspace_id, status`, range `amount_minor`, sort `due_date 
 
 ### Step 3: count the seek columns
 
+**In plain words:** this function grades an index: walk its columns from the left and count how far the query can "jump" before it has to start filtering row by row.
+
 **Concept.** `Analyze` implements the leftmost-prefix rule ([[Index Types and Index Design#4.1 Column order against three queries]]): a B-tree can only seek on a prefix of its key.
 
 The walk stops at the first index column that is not in the equality set, and one more column counts if it is the range column.
@@ -219,6 +234,8 @@ flowchart LR
 ```
 
 ### Step 4: decide whether the sort is free
+
+**In plain words:** the index can hand back rows already in order only if its remaining columns match the ORDER BY, read all forwards or all backwards. One mixed direction and the database must sort again.
 
 **Concept.** The theory note says a forward or a fully backward scan of the index serves `ORDER BY`, but mixed directions do not ([[Index Types and Index Design#3.2 Multicolumn B-tree: the ESR rule]]). `sortMatches` encodes that.
 
@@ -271,7 +288,7 @@ State of the two flags for three sorts against the index tail `due_date DESC, id
 | `due_date, id` | same=false, flipped=true | same=false, flipped=true | true (backward scan) |
 | `due_date, id DESC` | same=false, flipped=true | same=false, flipped=false | false (mixed) |
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -282,11 +299,13 @@ State of the two flags for three sorts against the index tail `due_date DESC, id
 | Direction check uses two booleans | Compare against a computed scan direction | Two flags are simple and show the mixed case clearly, but need a short explanation |
 | Early `return false` on a name mismatch | Keep scanning and report all mismatches | Fast and simple, but the caller gets no reason |
 
-## Tests
+## Tests 🔴
 
 Two tests cover the two exported functions. `listIdx` is the index `(workspace_id, status, due_date DESC, id DESC)` from the invoice list API.
 
 ### TestAnalyze: the leftmost-prefix and sort rules
+
+**In plain words:** seven tiny queries, each built to prove one rule, run against the same index; the expected numbers are worked out by hand first.
 
 **Property.** `Analyze` returns the right `SeekCols` and `SortOK` for seven query shapes that each isolate one rule. This matters because a wrong answer here would approve a migration that leaves a hot query doing a full scan or an extra Sort.
 
@@ -347,6 +366,8 @@ The remaining four cases and the loop that runs them:
 
 ### TestESR: the proposal round-trips
 
+**In plain words:** the key that `ESR` proposes should pass its own exam: feed it back to `Analyze` and check it seeks and sorts as promised.
+
 **Property.** The key proposed by `ESR` for a query is accepted by `Analyze` for that same query. The two functions are written separately, so this test proves they agree.
 
 | Input query | Expected key | Expected `Analyze` result |
@@ -373,7 +394,7 @@ func TestESR(t *testing.T) {
 
 Note that `SeekCols` is 2, not 3: the range column sits after `due_date`, so the sort column breaks the prefix, which is the intended price of serving the sort.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -397,7 +418,7 @@ Reading the output line by line:
 3. `(0.00s)` is normal: the code does a handful of map and slice operations.
 4. `PASS` is the package summary, and `ok idx 1.481s` includes compile and `-race` start-up, which is why it is far larger than the test times. `go vet` printed nothing, which means it found no problems.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - The "gap in prefix" case is the classic mistake: `Equal: workspace_id` with `Range: due_date` on `(workspace_id, status, due_date)` seeks on one column only, because `status` sits between them.
 - `Analyze` models the leftmost-prefix rule without skip scan, so it reports `SeekCols: 0` for a query that PostgreSQL 18 or MySQL 8.0.13+ could skip scan.
@@ -406,7 +427,7 @@ Reading the output line by line:
 - `sortMatches` returns true for an empty `ORDER BY`, so "no sort needed" and "sort served by the index" look the same.
 - `ESR` returns an empty key when the query has no columns, and the code does not check column names against a real schema.
 
-## Exercises
+## Exercises 🔴
 
 1. Add the case `Query{Equal: workspace_id, status; Range: amount_minor}` with no sort and run `Analyze` against the ESR key for it. Predict `SeekCols` before running.
 2. Change `listIdx` to `(status, workspace_id, due_date DESC, id DESC)` and rerun `TestAnalyze`. Predict which cases change and explain why from the leftmost-prefix rule.

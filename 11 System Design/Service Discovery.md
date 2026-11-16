@@ -26,7 +26,42 @@ updated: 2026-11-13
 > - **Client-side discovery:** the caller fetches the list and load-balances itself. **Server-side discovery:** the caller hits one stable address and a proxy picks the instance.
 > - Every answer is slightly stale. Design callers to survive a dead address: timeouts, retries on another instance, and graceful deregistration on shutdown.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Big apps are made of many small programs (**services**) that call each other. Checkout calls payments, payments calls the bank, and so on.
+
+Each service runs as several copies, and the copies keep moving: they restart, crash, get added, get removed. Every copy has a network address, and the addresses change all the time.
+
+So how does checkout know where payments lives *right now*? It asks a shared, always-updated phone book. That phone book is the **registry**, and the whole idea is called **service discovery**.
+
+```mermaid
+flowchart LR
+    P["payments copies"] -- "I'm alive, here's my address" --> R[("Registry<br/>(phone book)")]
+    C["checkout"] -- "where is payments?" --> R
+    R -- "current addresses" --> C
+```
+
+Each copy must keep saying "I'm still alive" (a **heartbeat**). If it goes quiet, the phone book drops it after a few seconds.
+
+```mermaid
+flowchart LR
+    A["Copy sends heartbeat<br/>every 3 s"] --> B["Entry stays in the book"]
+    A2["Copy crashes,<br/>heartbeats stop"] --> B2["Entry expires after 10 s<br/>and is removed"]
+```
+
+The rest of this note is just these 4 questions:
+1. How does a copy get into the phone book, and how does it fall out?
+2. Who looks up the book: the caller itself, or a middleman?
+3. What happens in the few seconds when the book is out of date?
+4. How does Kubernetes do all of this for you?
+
 
 **The problem in one story.**
 You want to call a friend, but they change phone numbers every few hours.
@@ -70,7 +105,7 @@ Where it breaks: the board can be a few seconds out of date, so you may still wa
 > [!tip] Remember
 > Look addresses up at runtime from a registry kept fresh by heartbeats, and assume every answer is a little stale.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The checkout service calls the payments service. In 2015 you might have written `PAYMENTS_URL=http://10.0.1.5:8080` in a config file. Today payments runs as 12 containers in Kubernetes:
 
@@ -82,7 +117,7 @@ On a busy day the set of payments addresses might change dozens of times. A hard
 
 Service discovery replaces the hard-coded list with a lookup: "give me the healthy instances of `payments` right now".
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a company's internal phone directory that updates itself.
 
@@ -92,9 +127,11 @@ Think of a company's internal phone directory that updates itself.
 
 The directory is only as fresh as the last check-in. Someone may have left a minute ago and still be listed, which is why you need to hang up and try someone else when nobody answers.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The four jobs
+
+**In plain words:** a registry entry has a life: get added, keep proving you are alive, get looked up, get removed. Like signing in at a reception desk and signing out when you leave.
 
 1. **Register:** an instance tells the registry "service `payments`, instance `p-7`, at `10.0.1.5:8080`". Either the instance does it itself (**self-registration**, as with Eureka clients) or the platform does it for it (**third-party registration**, as when Kubernetes adds a ready pod to the Service's EndpointSlices).
 2. **Stay healthy:** the entry stays only while it is proven alive. Either the instance renews a **lease** (heartbeat with a TTL), or the registry **actively probes** it (an HTTP `GET /ready`, a TCP connect).
@@ -102,6 +139,8 @@ The directory is only as fresh as the last check-in. Someone may have left a min
 4. **Deregister:** on graceful shutdown the instance removes itself first, so callers stop sending it traffic before it stops listening. If it crashes, the lease or failed probe removes it later.
 
 ### Client-side vs server-side discovery
+
+**In plain words:** either the caller reads the phone book itself and dials a copy directly (client-side), or the caller always dials one fixed number and a receptionist forwards the call (server-side).
 
 ```mermaid
 flowchart LR
@@ -126,6 +165,8 @@ flowchart LR
 | Examples | Eureka + Ribbon, gRPC with a resolver, Consul client libraries | Kubernetes Service (kube-proxy), AWS ALB with target groups, Envoy/service mesh |
 
 ### A lease-based registry, step by step
+
+**In plain words:** a **lease** is a short-term booking: "this address is valid for 10 more seconds." Every heartbeat extends the booking. The diagram below walks through a crash and shows the few seconds where callers still have the dead address.
 
 ```mermaid
 sequenceDiagram
@@ -153,6 +194,8 @@ The timeline shows the unavoidable window: between the crash (31 s) and the leas
 
 ### Kubernetes: discovery built into the platform
 
+**In plain words:** in Kubernetes you never build any of this yourself. The platform keeps the phone book (EndpointSlices), gives each service a fixed name and address, and quietly rewrites your connection to a healthy copy.
+
 ```mermaid
 flowchart TD
     D["Deployment payments<br/>(12 pods)"] --> P["Pods with label app=payments"]
@@ -172,7 +215,7 @@ flowchart TD
 
 See [[Kubernetes Fundamentals]] for Services and probes in more depth.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -206,6 +249,8 @@ func (r *Registry) Alive(now time.Time) []string {
 ```
 
 ### A registry and a client-side balancer in Go
+
+**In plain words:** the code below is a toy version of the real thing: a map of addresses with expiry times, plus a picker that goes round the healthy list in a circle.
 
 The full version adds service names, instance IDs, explicit deregistration (the graceful-shutdown path), a reaper that deletes expired entries, and a round-robin balancer that always reads the current healthy list. The clock is injected so the tests can move time.
 
@@ -422,6 +467,8 @@ func TestConcurrentAccess(t *testing.T) {
 
 ### Choosing TTL and heartbeat interval, with numbers
 
+**In plain words:** short expiry times spot crashes fast but panic over small hiccups; long ones are calm but slow to notice a death. The numbers below show the trade.
+
 Take a TTL of 10 s and a heartbeat every 3 s:
 
 - **Detection time for a crash:** up to 10 s after the last heartbeat. The average is about 10 − 3/2 = 8.5 s after the crash, since the crash happens at a random point between heartbeats.
@@ -439,7 +486,7 @@ Shorter TTLs detect failures faster but turn a 2-second GC pause or network blip
 
 Eureka's defaults (30 s renewals, 90 s expiry) sit at the slow and safe end; Kubernetes readiness probes default to every 10 s, with 3 failures before a pod is marked not ready.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Health | Consistency | Use when |
 | --- | --- | --- | --- | --- |
@@ -457,7 +504,7 @@ Eureka's defaults (30 s renewals, 90 s expiry) sit at the slow and safe end; Kub
 
 For discovery, slightly stale data is usually better than no data, because callers already retry on dead instances.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - **Client-side discovery puts logic in every client.** Balancing, retries and caching must be implemented (or a library maintained) for each language. Server-side discovery centralises that at the cost of a proxy layer and, without sidecars, an extra hop.
 - **DNS is a weak discovery protocol on its own.** Clients and libraries cache answers, some longer than the TTL, and DNS carries no health detail. It works when the name points to something stable (a ClusterIP or a load balancer) that handles changes behind it.
@@ -465,7 +512,7 @@ For discovery, slightly stale data is usually better than no data, because calle
 - **Health is not one bit.** "Process is up" (liveness) is not "ready for traffic" (readiness). An instance that is warming a cache or has lost its database should fail readiness and leave the pool without being restarted (see [[Graceful Shutdown and Health Checks]]).
 - **When not to use a separate registry:** inside Kubernetes, Services already give you discovery; adding Consul or Eureka on top duplicates it unless you also span VMs or clusters. For a monolith with one database, a load balancer's static target list is enough.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Kubernetes** is the most common discovery system today: Services, EndpointSlices (by default at most 100 endpoints per slice, so large services have many slices and updates touch only one), CoreDNS, and kube-proxy.
@@ -482,9 +529,18 @@ For discovery, slightly stale data is usually better than no data, because calle
 	- *DNS caching* → long client-side caching keeps sending traffic to old IPs; point DNS at stable virtual IPs or load balancers and keep TTLs short where names map to instances.
 - **What to monitor:** healthy instance count per service (against the desired count), registration and deregistration rate (a spike means flapping), heartbeat failures, endpoint propagation delay, connection errors and retries at callers by target instance, and the registry's own latency and leader changes.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### How fast does a removal propagate in Kubernetes?
+
+**In plain words:** when a pod is told to stop, the news travels to every node a moment later. For a second or two some nodes still send it traffic, so a pod must not die instantly; it should wave goodbye and serve a little longer.
+
+```mermaid
+flowchart LR
+    T["Pod gets SIGTERM"] --> W["Keep serving a few seconds<br/>(preStop sleep)"]
+    W --> D["Drain in-flight requests"] --> X["Exit"]
+    T -. "in parallel" .-> N["Removal spreads to<br/>every node's routing rules"]
+```
 
 A pod being deleted is removed from the EndpointSlices, and in parallel the kubelet sends SIGTERM to the container. The removal then travels: the API server → EndpointSlice watch → kube-proxy on every node → new iptables or IPVS rules, plus any ingress controllers or mesh proxies doing their own watching.
 
@@ -495,6 +551,8 @@ The usual fix is to keep accepting requests for a few seconds after SIGTERM (a `
 The right delay depends on your cluster size and proxies, so measure it rather than guessing.
 
 ### gRPC and connection-level balancing
+
+**In plain words:** gRPC opens one long phone call and sends everything over it, so a per-call balancer never gets a chance to spread the load. All traffic sticks to one pod unless you fix it.
 
 kube-proxy balances **connections**, not requests. An HTTP/1.1 client opens many short connections, so its requests spread across pods. A gRPC client opens one HTTP/2 connection per target and sends every request over it. If checkout connects to the `payments` ClusterIP once, every request goes to one pod, and the 8 pods the autoscaler adds never see traffic. Options:
 
@@ -507,17 +565,21 @@ See [[gRPC]] for the protocol background.
 
 ### Zone-aware routing
 
+**In plain words:** calling a copy in your own data-center zone is faster and cheaper than calling one across town; good routers prefer the local copy but fall back when it is unhealthy.
+
 With instances in three availability zones, sending every request to a random instance means two-thirds of calls cross zones, which adds latency and, in most clouds, data-transfer charges. Discovery systems can prefer same-zone endpoints (Kubernetes topology-aware routing, Envoy zone-aware balancing) and fall back to other zones when the local zone lacks healthy capacity.
 
 The risk is overloading a zone that has fewer instances, so these features only kick in when capacity is balanced.
 
 ### Health checking: active, passive and both
 
+**In plain words:** active = the system knocks on each door to check; passive = it watches real calls and ejects whoever keeps failing them. Use both.
+
 - **Active** checks probe each instance on a schedule. They catch dead instances even with no traffic, but they test the health endpoint, not real requests.
 - **Passive** checks (outlier detection) watch real traffic and eject an instance after, for example, 5 consecutive 5xx responses, for a cooldown period. They catch "up but broken" instances fast, but only with traffic.
 - Production systems use both, plus a cap on how many instances may be ejected at once, so a shared failure (the database is down, and all instances return 500) does not eject the whole fleet. A circuit breaker at the caller is the per-dependency version of the same idea (see [[Circuit Breaker]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Client-side vs server-side discovery: which would you pick?
 > Server-side (a Kubernetes Service, a load balancer or a mesh sidecar) when you have several languages or want balancing and retries in one place. Client-side when you need smart per-request balancing without an extra hop and control the client library, for example gRPC with `round_robin` or xDS. Inside Kubernetes, the default answer is server-side via Services.
@@ -539,7 +601,7 @@ The risk is overloading a zone that has fewer instances, so these features only 
 > [!question]- How do you avoid dropped requests during a rolling deploy?
 > On SIGTERM: fail readiness, keep serving for a few seconds while removal propagates (a `preStop` sleep in Kubernetes), stop accepting new connections, finish in-flight requests with a deadline, then exit. Set `terminationGracePeriodSeconds` longer than that whole sequence.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Registry = `service → healthy instances`; kept fresh by lease heartbeats (etcd, Eureka) or active probes (Consul agents, Kubernetes readiness).
 - Client-side: the caller looks up and balances. Server-side: the caller hits a stable address; a proxy picks.

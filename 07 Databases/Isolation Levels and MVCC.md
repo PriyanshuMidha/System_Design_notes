@@ -31,7 +31,41 @@ updated: 2026-11-13
 > - Classic mistake: assuming REPEATABLE READ stops every anomaly. Write skew still gets through; only SERIALIZABLE (with retries) or explicit locks stop it.
 > - Old versions stay until VACUUM; one long-open transaction blocks that cleanup everywhere.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, the whiteboard version and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (anomalies and how MVCC works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A database is used by many people at the same time. Each person's work is grouped into a **transaction**: a bundle of reads and writes that succeed or fail together.
+
+Two transactions can touch the same data at the same moment. That can create bugs: two cashiers both see "room for one more invoice" and both add one.
+
+```mermaid
+flowchart LR
+    A["Cashier A: sees 70,000 used"] --> W["Both add an invoice"]
+    B["Cashier B: sees 70,000 used"] --> W
+    W --> X["Limit 100,000 is broken: 115,000"]
+```
+
+An **isolation level** is the database's promise about how much of other people's unfinished work you can see. Stronger promises stop more bugs, but cost more.
+
+Most databases keep that promise with **MVCC**: instead of changing a row in place, a write makes a new copy, and every transaction reads from its own frozen view (a snapshot).
+
+```mermaid
+flowchart LR
+    U["UPDATE a row"] --> OLD["old copy stays<br/>(for older readers)"]
+    U --> NEW["new copy added<br/>(for newer readers)"]
+```
+
+So readers never wait for writers. The rest of this note is just these four questions:
+1. What bugs (anomalies) can happen, and which level stops which? (section 3)
+2. How does MVCC actually store and pick row versions? (section 3)
+3. How do you fix the bug that even strong levels miss, write skew? (sections 4-5)
+4. What goes wrong in production, like VACUUM and long transactions? (section 7)
 
 **The problem in one story.**
 Two cashiers check the same customer's credit limit at the same moment.
@@ -77,7 +111,7 @@ Where it breaks: a printout cannot tell you that someone else is acting on the s
 > [!tip] Remember
 > MVCC means readers never block writers, but only SERIALIZABLE (with retries) or explicit locks stop write skew.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps lets a customer run up an open balance only up to a credit limit. Customer 7 has `credit_limit_minor = 100000` and 70,000 open. Two staff members create invoices for customer 7 at the same moment:
 
@@ -106,7 +140,7 @@ The open balance is now 115,000. Neither session did anything wrong on its own, 
 
 Running transactions one at a time would have rejected B. Isolation levels define how close to "one at a time" the database gets for you, and what you must add yourself.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### Snapshots: your own printout
 
@@ -132,9 +166,11 @@ A snapshot shows you a consistent past, but your decision is applied to the pres
 
 Analogy: everyone works from their own printout of a shared spreadsheet. Printouts never change under you, but two people can each check "total < limit" on their printout and each add a row.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The six anomalies
+
+**In plain words:** these are the six named ways concurrent transactions can trip over each other, like six known pickpocket tricks; learn the trick and you know the defence.
 
 Each timeline runs top to bottom; statements outside `BEGIN … COMMIT` autocommit. A mapping from anomaly to the shortest fix:
 
@@ -249,6 +285,8 @@ flowchart LR
 
 ### What each level prevents
 
+**In plain words:** this table is the scorecard: pick a level in a column, read down to see which bugs it stops and which still get through.
+
 | Anomaly | PG READ COMMITTED (default) | PG REPEATABLE READ | PG SERIALIZABLE | MySQL InnoDB REPEATABLE READ (default) |
 | --- | --- | --- | --- | --- |
 | Dirty read | prevented | prevented | prevented | prevented |
@@ -278,6 +316,8 @@ The SQL standard defines four levels by which phenomena they rule out. What engi
 > The standard's phenomena were defined so loosely that snapshot isolation satisfies them and still allows write skew (Berenson et al., 1995). That is why Oracle's level called SERIALIZABLE, and PostgreSQL's before 9.1, are really snapshot isolation.
 
 ### MVCC in PostgreSQL: versions in the heap
+
+**In plain words:** PostgreSQL never edits a row in place; it keeps old and new copies side by side in the table, each stamped with who created it and who replaced it, like dated drafts in one folder.
 
 Every row version (tuple) carries hidden system columns:
 
@@ -314,6 +354,8 @@ flowchart LR
 
 ### Snapshots and the commit log
 
+**In plain words:** a snapshot is just a short note saying "these transactions were finished when I started"; a separate ledger (the commit log) says whether each finished one succeeded or was thrown away.
+
 A **snapshot** records which transactions count as finished. `SELECT pg_current_snapshot();` prints it as `xmin:xmax:xip_list`, for example `735:738:736`: every xid below 735 had finished, none at or above 738 had started, and 736 was still running.
 
 Whether a finished xid committed or aborted is kept in `pg_xact`, two bits per transaction.
@@ -328,6 +370,8 @@ flowchart LR
 ```
 
 ### The visibility rule
+
+**In plain words:** for each row copy the database asks two questions: "was its creator done before I started?" and "was its deleter done before I started?". Yes then no means you see it.
 
 ```mermaid
 flowchart TD
@@ -349,6 +393,8 @@ flowchart TD
 | C | 737 | 0 | 737 finished and committed | yes |
 
 ### READ COMMITTED vs REPEATABLE READ in PostgreSQL
+
+**In plain words:** the only difference is how often you take a fresh photo of the data: every statement (READ COMMITTED) or once for the whole transaction (REPEATABLE READ), plus what happens when your update hits a row someone else just changed.
 
 This is only a question of when the snapshot is taken, plus one rule for writes:
 
@@ -372,6 +418,8 @@ sequenceDiagram
 ```
 
 ### SERIALIZABLE in PostgreSQL: SSI
+
+**In plain words:** SERIALIZABLE keeps a diary of who read what, and when two transactions' reads and writes could form a loop that no one-at-a-time order explains, it cancels one of them and tells you to retry.
 
 Since 9.1, PostgreSQL's SERIALIZABLE runs transactions exactly like REPEATABLE READ and additionally tracks **read-write dependencies**. "T1 →rw T2" means T1 read something that the concurrent T2 then wrote: a row version, or a gap T2 inserted into.
 
@@ -414,6 +462,8 @@ sequenceDiagram
 At REPEATABLE READ the same two sessions both commit and the balance ends at 115,000.
 
 ### VACUUM, bloat and transaction ID wraparound
+
+**In plain words:** old row copies are litter; VACUUM is the cleaner. It may only sweep what no open transaction could still need, so one long-open transaction stops cleaning everywhere.
 
 Old versions stay in the table until VACUUM removes them, and VACUUM may only remove a version once no running snapshot could still need it. The oldest snapshot still in use (the **xmin horizon**) decides that.
 
@@ -469,6 +519,8 @@ flowchart LR
 
 ### MVCC in InnoDB: undo logs and two kinds of read
 
+**In plain words:** MySQL's InnoDB does MVCC the other way round: it edits the row in place and files the old value in a side notebook (the undo log), so readers who need the past walk back through that notebook.
+
 InnoDB updates the row in place in the clustered index and copies the old version into the **undo log**. Each row has hidden `DB_TRX_ID` (last writer) and `DB_ROLL_PTR` (pointer into undo) columns.
 
 ```mermaid
@@ -492,7 +544,7 @@ flowchart LR
 | Cleanup | VACUUM, and page pruning | purge threads |
 | Symptom of a long transaction | table and index bloat, stuck xmin horizon | growing history list length |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The task: decide, for InvoiceOps, how to stop the credit-limit write skew, and see what each level does with the same two sessions. Customer 7 has a limit of 100,000 and 70,000 open; session A adds 25,000 and session B adds 20,000.
 
@@ -511,6 +563,8 @@ finished_committed(xid) = xid below snapshot.xmax
 ```
 
 ### Trace: the same two sessions at each level
+
+**In plain words:** same two cashiers, same invoices, run four times, once per protection; watch which runs keep the credit limit.
 
 | Level | A inserts 25,000 | B inserts 20,000 | Final open balance | Rule kept? |
 | --- | --- | --- | --- | --- |
@@ -531,7 +585,7 @@ The retrying wrapper that makes the first option correct is in [[Isolation Level
 
 Runnable Go version: [[Isolation Levels and MVCC - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Ways to stop the anomalies that the default level allows:
 
@@ -565,7 +619,7 @@ flowchart TD
     Q3 -- "no" --> L1
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **READ COMMITTED is fine for most single-statement work**, provided you write conditional updates instead of read-then-write in application code.
 - **REPEATABLE READ** gives a stable view for reports and exports and turns lost updates into errors. A long-running REPEATABLE READ report also holds the xmin horizon for its whole duration.
@@ -579,7 +633,7 @@ flowchart TD
 | REPEATABLE READ | yes, on 40001 | no | yes | one long-lived snapshot |
 | SERIALIZABLE | yes, on 40001, including false positives | no | no | SIRead lock memory, wasted retries |
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** InvoiceOps-style services typically run READ COMMITTED with conditional updates and row locks, and use SERIALIZABLE for the few invariants that span rows (credit limits, ledger balances), wrapped in the retry helper in [[Isolation Levels and MVCC - Go]].
 - **Failure modes → fixes:**
@@ -607,7 +661,7 @@ flowchart TD
     C -- "prepared transaction" --> F4["COMMIT PREPARED or ROLLBACK PREPARED it"]
 ```
 
-## Whiteboard version
+## Whiteboard version 🟢
 
 ```text
 Level      snapshot       PostgreSQL gives            still possible
@@ -618,7 +672,7 @@ visible = xmin committed-before-snapshot AND NOT (xmax committed-before-snapshot
 Fix write skew: SERIALIZABLE + retry | lock parent row | constraint
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Snapshot timing.** In PostgreSQL the REPEATABLE READ snapshot is taken by the first statement after `BEGIN`, not by `BEGIN` itself. `pg_export_snapshot()` plus `SET TRANSACTION SNAPSHOT` lets several sessions share one snapshot; `pg_dump -j` uses it for consistent parallel dumps.
 - **Why SSI has false positives.** SIRead locks start on tuples. When a transaction holds too many, they are promoted to page and then relation locks (`max_pred_locks_per_transaction`, default 64, sizes the shared lock table). A coarser lock conflicts with writes that never touched the rows actually read.
@@ -641,7 +695,7 @@ flowchart LR
     A2 -. "VACUUM removes the index entry, then the line pointer" .-> V["slot reusable"]
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly does PostgreSQL's REPEATABLE READ give you?
 > Snapshot isolation: every statement sees one snapshot taken at the first statement, so no non-repeatable reads, phantoms or read skew. If you update a row someone else changed after your snapshot, you get 40001 and must retry. It still allows write skew.
@@ -664,7 +718,7 @@ flowchart LR
 > [!question]- Which isolation level would you run InvoiceOps at?
 > READ COMMITTED by default, with atomic conditional updates or row locks for single-invoice changes. SERIALIZABLE with a retry wrapper for multi-row invariants such as credit limits. `REPEATABLE READ READ ONLY` for monthly statements, so totals and line items come from one snapshot.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Anomalies: dirty read, non-repeatable read, phantom, read skew, lost update, write skew.
 - PostgreSQL: RU = RC (default, snapshot per statement); RR = snapshot isolation (40001 on concurrent update); SERIALIZABLE = SSI (40001 on dangerous structures). Retry the whole transaction.
@@ -674,7 +728,7 @@ flowchart LR
 - VACUUM removes versions behind the xmin horizon and freezes old xids; long transactions and stale slots block both.
 - Wraparound: 32-bit xids; forced autovacuum at 200 million; monitor `age(datfrozenxid)`.
 
-## Links
+## Links 🟢
 
 - **Implementation:** [[Isolation Levels and MVCC - Go]]
 - **Before this:** [[Transactions and ACID]], [[Storage Engines - B-tree vs LSM and WAL]]

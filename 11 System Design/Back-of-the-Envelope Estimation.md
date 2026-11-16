@@ -23,7 +23,41 @@ updated: 2026-11-13
 > - Servers = peak QPS ÷ (load-tested QPS per node × 60-70% utilisation).
 > - Estimate only what changes a decision, write units on every number, and sanity-check the result.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the formulas), 4 (worked examples) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and the interview questions (9). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You are told to build an app. First question: how big is "big"?
+
+You do not need exact numbers. You guess with round numbers and simple multiplication. "10 million people, 10 photos each, 1 MB per photo" is enough to see you need about 100 TB of disk.
+
+Two words do most of the work here. **QPS** means queries per second: how many requests hit your system every second. **Storage** is just how many bytes you must keep.
+
+```mermaid
+flowchart LR
+    A["Guess: users per day"] --> B["× actions each<br/>= requests per day"]
+    B --> C["÷ 86,400 seconds<br/>= requests per second"]
+```
+
+The answer only needs to be roughly right. "About 1,000 per second" and "about 100,000 per second" lead to very different designs; 1,000 vs 1,200 does not matter.
+
+```mermaid
+flowchart LR
+    N["Rough number"] --> D{"big or small?"}
+    D -->|small| S["one server + a backup"]
+    D -->|big| M["cache, shards,<br/>many servers"]
+```
+
+The rest of this note is just these 4 questions:
+1. How do I turn "users per day" into requests per second? (section 3)
+2. How much disk, network and how many servers does that mean? (sections 3-4)
+3. Which numbers are worth estimating at all? (section 5)
+4. What do the numbers decide in a real design? (sections 4, 8)
 
 **The problem in one story.**
 You are asked to build a photo app. Should you buy one server or a hundred?
@@ -68,7 +102,7 @@ Where it breaks: a party has one obvious peak; real systems have hidden spikes (
 > [!tip] Remember
 > Round hard, write units on every number, and only estimate what changes a design decision.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Two candidates design a URL shortener. One draws Kafka, Cassandra and twelve microservices.
 
@@ -82,7 +116,7 @@ Same problem; the second design is justified by numbers and the first is guesswo
 
 Estimation is how you decide whether a component is needed at all, and how large it must be.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 It is like planning a wedding dinner. You do not count every grain of rice.
 
@@ -90,7 +124,7 @@ You estimate guests (300), plates per guest (1.2), kitchen throughput (60 plates
 
 If the answer were "0.1 cooks" or "500 cooks", you would know your inputs were wrong. The precision is low; the decision ("hire 6 cooks, not 1 and not 50") is solid.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The pipeline
 
@@ -110,6 +144,8 @@ flowchart LR
 ```
 
 ### Units and powers of two
+**In plain words:** computers count in 1,024s but we round to 1,000s; the tiny error never changes the answer.
+
 
 | Power of 2 | Exact | Approx | Name |
 | --- | --- | --- | --- |
@@ -130,6 +166,8 @@ Handy sizes: an ASCII character is 1 byte; a UUID is 16 bytes binary (36 as text
 - 1 month ≈ 2.6 × 10⁶ s. 1 year ≈ 3.15 × 10⁷ s.
 
 ### Latency numbers (orders of magnitude)
+**In plain words:** this table says how long each kind of fetch takes, from "instant" (RAM) to "noticeably slow" (across an ocean). Memory is a desk drawer; another continent is a parcel in the post.
+
 
 These are approximate values from Jeff Dean's list and Colin Scott's updated version; the owning note is [[Latency Numbers Every Engineer Should Know]].
 
@@ -147,6 +185,8 @@ These are approximate values from Jeff Dean's list and Colin Scott's updated ver
 Consequences: a Redis `GET` across the data centre costs about one network round trip (sub-millisecond), so 20 sequential cache calls cost several milliseconds; a request that crosses an ocean twice cannot meet a 100 ms p99.
 
 ### The formulas
+**In plain words:** every row is just multiply-and-divide: how often, times how big, times how long you keep it.
+
 
 | Quantity | Formula | Remember |
 | --- | --- | --- |
@@ -158,9 +198,11 @@ Consequences: a Redis `GET` across the data centre costs about one network round
 | Servers | ⌈peak QPS ÷ (per-node QPS × target utilisation)⌉ | Per-node QPS comes from a load test, not a guess |
 | DB connections | app instances × pool size | Must stay under the DB limit (PostgreSQL 17 default `max_connections` = 100) |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+**In plain words:** this is what the whole estimate looks like scribbled on one whiteboard — seven lines, seven decisions.
+
 
 ```text
 100M new links/day      -> 100e6 / 86,400     ≈ 1.2k writes/s
@@ -216,6 +258,8 @@ Assumptions (estimates): 50 M DAU, 40 messages per user per day, 200 bytes per m
 **What the numbers decided:** the message store is write-heavy (69k writes/s at peak) and grows by 438 TB a year, which points to a partitioned, write-optimised store (see [[Wide-Column Stores and Cassandra]]) rather than one PostgreSQL primary. Ten million long-lived connections make the connection tier its own scaling problem: [[Scaling WebSockets]] and [[Case Study - Chat System]].
 
 ### Go code for the arithmetic
+**In plain words:** the same multiply-and-divide, written as three tiny Go functions with tests, so the numbers in the tables are machine-checked.
+
 
 This calculator and its tests pass `go vet` and `go test -race` on Go 1.24, so every number in the two tables above is checked.
 
@@ -292,7 +336,7 @@ func TestChat(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | What you estimate | When it changes the design | Skip it when |
 | --- | --- | --- |
@@ -310,14 +354,14 @@ func TestChat(t *testing.T) {
 | Single-country daily cycle | 3-5× | Food delivery at dinner time |
 | Event-driven spike | 10× or more | Concert ticket on-sale, sports final |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **False precision wastes time.** "1,157.4 writes/s" and "about 1,200" lead to the same design. Round aggressively; keep one or two significant figures.
 - **Do not estimate what does not matter.** If storage is 2 GB, say "small, fits anywhere" and move on.
 - **Estimates are not capacity plans.** Production sizing needs load tests, measured per-node throughput and real traffic curves; see [[Load and Performance Testing]] and [[Performance Engineering and Capacity Planning]].
 - **Per-node throughput is the most invented number.** A Go service can do 1,000 RPS or 50,000 RPS depending on what each request does. State it as an assumption.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Capacity planning at most companies follows the same arithmetic, fed with measured data: traffic forecasts from analytics, per-instance throughput from load tests, storage growth from database size metrics.
 - **Failure modes → fixes:**
@@ -328,7 +372,7 @@ func TestChat(t *testing.T) {
 	- Connection budget exceeded → 40 pods × 10 connections = 400 against `max_connections` = 100 in PostgreSQL 17; add a pooler.
 - **What to monitor:** actual vs estimated QPS, peak-to-average ratio, storage growth per day, per-instance throughput at the SLO, and egress cost.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Little's law** links three numbers you estimate: `concurrency = arrival rate × time in system`. 2,000 RPS at 50 ms average latency means about 100 requests in flight at once, which sizes worker pools, DB connection pools and goroutine counts. At 500 ms latency the same load needs 1,000 in flight.
 - **Hot sets are skewed.** Request popularity often follows a power law, so a cache of 1-20% of items can serve most reads. The exact share depends on the workload; measure the hit-rate curve with real keys.
@@ -351,7 +395,7 @@ flowchart TD
 
 - **Sanity checks.** Cross-check from a second angle: storage per user (`274 TB ÷ users`) should look plausible; bandwidth in Gbit/s should fit a few network cards, not a thousand; if a number implies more servers than the company could plausibly run, an input is wrong.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you go from DAU to peak QPS?
 > requests/day = DAU × actions per user; average QPS = requests/day ÷ 86,400 (≈ 10⁵); peak = average × 2-10 depending on how spiky the traffic is. Do it separately for reads and writes.
@@ -371,7 +415,7 @@ flowchart TD
 > [!question]- Which numbers would make you shard the database?
 > Sustained writes beyond what one primary can take on your hardware, or data per node beyond what you can back up and restore in your recovery time objective. If neither is crossed, one primary plus replicas and a cache is simpler.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `QPS = per day ÷ 86,400`; 1 day ≈ 10⁵ s; 1 M/day ≈ 12/s; 1 B/day ≈ 11.6k/s.
 - Peak = 2-10× average. Split reads and writes.

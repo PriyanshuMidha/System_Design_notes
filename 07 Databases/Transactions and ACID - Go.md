@@ -25,7 +25,16 @@ updated: 2026-11-13
 >
 > The retry and rollback logic is tested against a fake transaction, so no database is needed.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the "From zero" paragraph below, then "Before the code", "What this code shows" and "Setup". Stop there.
+> - 🟡 **Know the basics?** Work through the Code steps 1-4, then Design decisions and Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Transactions and ACID]]. It shows, in real Go code, how to sell the last unit of stock to exactly one buyer, and how to wrap any group of database writes so they all happen or none happen. The heart of it is a small helper called `InTx`: you hand it a function, and it opens the transaction, commits on success, rolls back on any error or crash, and quietly retries the whole thing when the database says "try again". Read the theory note first if words like commit, rollback or deadlock feel new. Then read this top to bottom: each code block comes with a plain explanation of every line that matters.
+
+## Before the code 🟢
 
 - **`database/sql`** (`*sql.DB`, `BeginTx`, `Commit`, `Rollback`): Go's standard database API; a driver such as pgx is plugged in at run time.
 - **`context.Context`**: carries a deadline or cancellation into every query, so a slow transaction can be stopped.
@@ -34,7 +43,7 @@ updated: 2026-11-13
 - **Error wrapping** (`errors.Is`, `errors.As`): look inside a wrapped error for the SQLSTATE code (40001, 40P01) that says "retry the whole transaction".
 - **What to run**: `go vet ./... && go test -race ./...`; no database is needed for the tests.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where it is explained |
 | --- | --- | --- |
@@ -59,7 +68,7 @@ flowchart TD
 
 Read the diagram from the top: `BuyOne` supplies a `begin` function and a callback, `InTx` owns the retry loop, and `runOnce` owns one transaction from `BEGIN` to `COMMIT` or `ROLLBACK`. Only the retry loop knows about SQLSTATE codes; the callback knows only business rules.
 
-## Setup
+## Setup 🟢
 
 - Module layout: one package `txn` with four files: `reserve.go`, `intx.go`, `buy.go` and `intx_test.go`.
 - Go 1.24 and the standard library only. `database/sql` needs a driver at run time (for example `github.com/jackc/pgx/v5/stdlib`), but nothing here imports one, so the package compiles and the tests run without a database.
@@ -82,9 +91,11 @@ CREATE TABLE products (
 INSERT INTO products VALUES (1, 'Cheque book (50 leaves)', 25000, 1);
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: reserve one unit with a conditional UPDATE
+
+**In plain words:** instead of looking at the stock and then writing, we tell the database "take one, but only if any are left" in a single move — so two buyers can never both grab the last one.
 
 **Concept.** The naive way to sell stock is "read the stock, check it is positive, write stock minus one", which lets two buyers both read `1` and both succeed ([[Transactions and ACID#Why the naive version oversells]]). The fix is to push the check into the `UPDATE` itself: `WHERE stock > 0` is evaluated by the database on the latest committed version of the row, after any concurrent writer has finished with it ([[Transactions and ACID#Why the conditional UPDATE is safe]]).
 
@@ -142,6 +153,8 @@ sequenceDiagram
 ```
 
 ### Step 2: a reusable transaction helper
+
+**In plain words:** every write needs the same wrapper — open, do the work, save or undo, maybe retry. We write that wrapper once so no function can ever forget the undo step.
 
 **Concept.** Every write path needs the same envelope: `BEGIN`, run the work, `COMMIT`, and `ROLLBACK` on every other exit, including panics ([[Transactions and ACID#The lifecycle of one transaction]]). Serialization failures and deadlocks add a second rule: the database has already rolled the transaction back, and the correct reaction is to run the whole function again ([[Transactions and ACID#Retrying: what to do on 40001 and 40P01]]).
 
@@ -280,6 +293,8 @@ stateDiagram-v2
 
 ### Step 3: call it with database/sql
 
+**In plain words:** here the helper is used for real — take one unit of stock and write the order line, as one package that saves together or not at all.
+
 **Concept.** The helper is useful only when the repository code sits on top of it. `BuyOne` is the smallest realistic use: two statements that must both happen or neither ([[Transactions and ACID#Autocommit]] explains why each statement alone would commit separately). `db.BeginTx` takes one connection from the pool and holds it until commit or rollback, so every statement must go through the returned `*sql.Tx`.
 
 The isolation level is named explicitly so the code documents what it depends on. READ COMMITTED is enough here because the conditional update carries its own safety.
@@ -318,6 +333,8 @@ func BuyOne(ctx context.Context, db *sql.DB, orderID, productID, priceMinor int6
 5. `3` is the attempt budget: enough to ride out a brief deadlock, small enough to give up when something is persistently wrong.
 
 ### Step 4: the payment-webhook transaction in SQL
+
+**In plain words:** a payment notice arrives and four tables must change together — note it, record the money, mark the invoice, log it. One transaction makes them one package, and a repeated notice is spotted and ignored.
 
 **Concept.** The boundary rule is one transaction per business fact that must be all-or-nothing, and nothing slow inside it ([[Transactions and ACID#Choosing the boundary: the payment webhook]]). A payment webhook touches four tables: a dedupe row, the payment, the invoice and an audit row. Here it is as plain SQL, because the Go version is simply `InTx` around four `ExecContext` calls on one `tx`.
 
@@ -361,7 +378,7 @@ Three Go rules this code follows:
 - **Pass `tx`, not `db`.** Every statement that belongs to the unit must go through the same `*sql.Tx`. A repository method that quietly uses `db` runs outside the transaction. How to structure this across repositories is the subject of [[Transactions and the Repository Pattern]].
 - **The context controls the transaction.** If `ctx` is cancelled before commit, `database/sql` rolls the transaction back.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -374,7 +391,9 @@ Three Go rules this code follows:
 | Deferred rollback that re-panics | `recover` and convert the panic to an error | The bug stays visible and the stack trace is kept; the transaction is still cleaned up |
 | Ignore the `Rollback` error | Log or join it with the original error | The original error is the useful one; a failed rollback usually means the connection is already dead |
 
-## Tests
+## Tests 🟡
+
+**In plain words:** we test the wrapper with a pretend transaction that just remembers whether "save" or "undo" was called — so the rules can be proven without any database running.
 
 The tests run against a fake transaction, so they need no database. Together they prove the helper's contract: exactly one of commit or rollback per attempt, retries only for the right errors, and the whole function re-runs.
 
@@ -581,7 +600,7 @@ ok  	example.com/acid
 
 The pgx v5 driver also ships `pgx.BeginFunc`, which handles commit and rollback the same way but does not retry. `ReserveUnit` and `BuyOne` need a real PostgreSQL to run; they were compiled and vetted here but not executed against a database.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`runOnce` ignores the `Rollback` error on purpose.** After a failed `Commit` or a dead connection the rollback may fail too; the original error is the one the caller needs.
 - **Retried callbacks must be idempotent outside the database.** `InTx` may call `fn` up to `attempts` times. An HTTP call or email inside `fn` repeats on every retry.
@@ -590,7 +609,7 @@ The pgx v5 driver also ships `pgx.BeginFunc`, which handles commit and rollback 
 - **The backoff here has no jitter.** Two workers that fail together retry together. Real services add jitter, as in [[Timeouts, Retries and Backoff]].
 - **Isolation level.** `BuyOne` asks for `LevelReadCommitted`; at that level the conditional `UPDATE` is safe. At REPEATABLE READ a concurrent change to the same row would raise `40001` and `InTx` would retry it.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `InTx` so the first backoff is 1 ms instead of 10 ms. Predict how the elapsed times of `TestInTxRetriesWholeTransaction` and `TestInTxGivesUp` change, then run them with `-v`.
 2. Remove `40P01` from `Retryable`. Which test fails, and what does `TestInTxGivesUp` report?

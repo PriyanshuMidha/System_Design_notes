@@ -23,7 +23,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > A small Go package that answers "if we had to restore to time T, which base backup and which WAL segments would we use, and is the chain unbroken?", plus a restore-time estimator. It implements the catalog check described in [[Backup, PITR and Disaster Recovery]] and is tested with `go test -race`.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" just below, then "Before the code" and "What this code shows". Skim the code steps without worrying about every line.
+> - 🟡 **Know the basics?** Read the Code steps 1-4 and Design decisions, then Running it.
+> - 🔴 **Interview / SDE-3 prep?** Add Tests, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero** 🟢 — This file is the hands-on twin of [[Backup, PITR and Disaster Recovery]]. It builds a tiny Go program that answers one question: "if we had to rewind the database to time T, do we have an unbroken set of backups and log files to do it?" Read the theory note first, then walk the code here top to bottom; each step is short and every test checks one rule.
+
+## Before the code 🟢
 
 - **Structs** (`BaseBackup`, `Segment`, `Plan`): plain records that stand in for the backup catalog; no database or S3 is touched.
 - **`time.Time` and `time.Duration`**: the recovery target is a moment in time, and the restore estimate is a duration.
@@ -32,7 +39,7 @@ updated: 2026-11-13
 - **Unit tests** with the `testing` package and `errors.Is`: each test builds a fixture and checks one rule.
 - **What to run:** `go vet ./... && go test -race ./...` inside the module. No goroutines, interfaces or generics are needed.
 
-## What this code shows
+## What this code shows 🟢
 
 A point-in-time restore is only as good as the backup catalog behind it. This package models that catalog as plain structs and checks, before any disaster, whether a target time can be reached. Nothing here touches PostgreSQL or S3: the interesting logic is the arithmetic on log sequence numbers (LSNs), and plain structs make it fast and deterministic to test.
 
@@ -56,7 +63,7 @@ flowchart TD
 
 The diagram is the whole algorithm. Everything in the Code section below is one box of it.
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only. No PostgreSQL or object storage is needed: backups and segments are plain structs, so the tests are fast and deterministic.
 - Module layout: package `pitr` with `pitr.go` and `pitr_test.go`.
@@ -68,9 +75,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the catalog types
+
+**In plain words:** first we define the records — what a backup is and what one log segment is — as plain Go structs.
 
 **Concept.** A physical backup is a copy of the data files taken while the database kept running, so on its own it is inconsistent.
 
@@ -126,6 +135,8 @@ flowchart LR
 ```
 
 ### Step 2: the planner
+
+**In plain words:** the planner picks the newest backup taken before the target time and asks "can I reach the target from here?"
 
 **Concept.** `PlanRestore` implements the selection rule from [[Backup, PITR and Disaster Recovery#4.3 Checking that PITR is possible]]: use the newest backup that finished before the target, because it needs the least WAL replay and so gives the shortest RTO. The twist is the fallback.
 
@@ -188,6 +199,8 @@ sequenceDiagram
 
 ### Step 3: walking the WAL chain
 
+**In plain words:** this walks the log segments one by one, checking each starts exactly where the last one ended — one gap and the restore is impossible.
+
 **Concept.** The chain check is the heart of [[Backup, PITR and Disaster Recovery#4.3 Checking that PITR is possible]]. Keep a cursor `next`, the next LSN byte we need.
 
 Skip segments that end at or before the cursor (already covered), fail if a segment starts after the cursor (a hole), otherwise take it and advance the cursor to its end.
@@ -237,6 +250,8 @@ Trace of the walk for the midday backup and a 14:41:59 target (segment `n` cover
 
 ### Step 4: the restore-time estimate
 
+**In plain words:** simple arithmetic — time to copy the backup plus time to replay the log — so you know your RTO before the bad day.
+
 **Concept.** RTO is not a promise, it is arithmetic you can do in advance ([[Backup, PITR and Disaster Recovery#4.2 Restore-time math]]). Restoring the database takes two phases: copying the base backup back onto disk, then replaying WAL on top.
 
 Copy speed is bounded by network or disk bandwidth, replay speed by how fast the server applies changes, and the two are usually very different.
@@ -265,7 +280,7 @@ flowchart LR
     A["copy 2 TB at 200 MB/s<br/>10,000 s"] --> B["replay 40 GB at 20 MB/s<br/>2,000 s"] --> C["total 12,000 s<br/>3 h 20 min"]
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -277,13 +292,15 @@ flowchart LR
 | `sort.Slice` in place | Copy then sort | No allocation, but the caller's slices are reordered (see Pitfalls) |
 | Rates as parameters | Constants | Honest about being estimates; the caller supplies drill measurements |
 
-## Tests
+## Tests 🟡
 
 The tests share one fixture: one WAL segment per hour from midnight (24 segments of 16 MB), and two backups, a nightly one finishing at 01:30 and a midday one finishing at 12:20.
 
 Five tests then cover the newest-backup choice, the fallback to the nightly backup, a lost segment, no backup, an archive that ends too early, and the restore-time arithmetic.
 
 ### The fixture
+
+**In plain words:** the fixture is a small fake catalog (two backups, a handful of segments) that every test reuses.
 
 **Concept.** `walHours(n)` builds `n` consecutive segments, each hour covering `[i*seg, (i+1)*seg)`, with `LastTime` 59 minutes after `FirstTime`. The two backups have `EndLSN` just past a segment boundary (`+ 100` bytes), so the planner must include the segment after the start segment, exactly like a real backup that ends mid-file.
 
@@ -443,7 +460,7 @@ func TestRestoreTime(t *testing.T) {
 
 **What a failure means.** A wrong value means a unit slip (bytes versus megabytes) or a swapped rate, which would make the RTO in the runbook wrong by a large factor.
 
-## Running it
+## Running it 🟢
 
 Measured: `go vet` is clean and `go test -race` passes with Go 1.24.4 (darwin/arm64).
 
@@ -465,7 +482,7 @@ Reading the output line by line:
 4. `PASS` is the overall package result.
 5. `ok  example.com/pitr  1.219s` is the package summary. The 1.2 s is mostly compiling with the race detector, not test time.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `PlanRestore` sorts the slices it receives, which reorders the caller's data. Pass copies if order matters to you.
 - The segment size here is 16 MB, as in PostgreSQL's default; real WAL files are named by timeline and segment number, and LSNs are 64-bit byte positions.
@@ -473,7 +490,7 @@ Reading the output line by line:
 - A backup that ended after the target is skipped even if its start LSN is earlier, because a base backup is consistent only after WAL past its end has been replayed.
 - The rates passed to `RestoreTime` are estimates. Measure them in a restore drill.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestGapFallsBackOrFails`, delete segment 13 instead of segment 5 and keep the 14:00 target. Predict whether any backup can serve the target.
 2. Change the 40 GB of WAL in `TestRestoreTime` to 48 GB (6 hours at 8 GB per hour). Predict the new duration.

@@ -23,7 +23,30 @@ updated: 2026-11-13
 > - Liveness, readiness and startup are three different questions; answering the wrong one gets a healthy pod killed or a broken pod sent traffic.
 > - Everything here is bounded by a deadline. A drain that can hang forever is worse than a hard kill.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Servers get restarted all the time — deploys, scaling, moving pods. A **graceful shutdown** means: when told to stop, finish the requests you are holding before you exit, instead of dropping them mid-way.
+
+The order matters. First tell the load balancer "stop sending me new work" (flip **readiness** off). Then wait a moment. Then finish what is in flight. Then exit.
+
+```mermaid
+flowchart LR
+    T[SIGTERM arrives] --> R[Readiness goes red] --> W[Wait for LB to notice] --> D[Drain in-flight requests] --> X[Exit clean]
+```
+
+**Health checks** are the questions Kubernetes keeps asking a pod: are you alive at all (liveness)? ready for traffic (readiness)? still booting (startup)? Answering them wrong causes restart loops or dropped traffic.
+
+The rest of this note is just these 3 questions:
+1. Which signal means what, and how does Go catch it?
+2. What is the exact shutdown order, and which ordering bug bites everyone?
+3. What should each of the three probes actually check?
 
 **The problem in one story.**
 You deploy a new version of your API.
@@ -70,6 +93,8 @@ Where it breaks: a shop can wait for slow customers, but a server has a hard dea
 
 ### Whiteboard version
 
+**In plain words:** the smallest server that shuts down clean.
+
 ```mermaid
 sequenceDiagram
     participant K as kubelet / endpoints controller
@@ -88,7 +113,7 @@ sequenceDiagram
 
 The rest of this note fills in why each of those five lines exists, what breaks if you skip one, and the Go code that implements them.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A rolling deploy replaces pods constantly. Without graceful shutdown, every deploy drops whatever requests and jobs were in flight at that instant.
 
@@ -102,7 +127,7 @@ If the process exits immediately on SIGTERM, every request that was in flight ge
 
 Graceful shutdown is the process cooperating with that race: stop taking new work immediately, keep doing old work for a bounded amount of time, then exit cleanly on its own before the kill signal arrives.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the pod as a restaurant closing for the night. Flipping the sign to "closed" (readiness → false) happens the instant the decision is made — no new customers are seated. Existing tables keep eating because they already ordered (in-flight requests drain).
 
@@ -112,9 +137,11 @@ Only once the last table pays the bill does staff lock the door and leave (proce
 
 The crash case is different: it is the building catching fire. There is no graceful anything — the staff and customers leave however they can, and the only thing that saves the night is that every order was already written on a ticket (idempotent, at-least-once processing), not held only in a chef's head.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Signals, and what each one means
+
+**In plain words:** signals are the operating system's knock on the door — one means 'please finish up', one means 'you are gone right now' and cannot be caught.
 
 | Signal | Who sends it | Catchable? | Meaning |
 | --- | --- | --- | --- |
@@ -127,6 +154,8 @@ The crash case is different: it is the building catching fire. There is no grace
 Surviving the third row is a different problem, solved by making every unit of work idempotent and safe to retry (link [[Idempotency and Idempotency Keys]]), not by code in this note.
 
 ### The shutdown sequence
+
+**In plain words:** the fixed checklist a pod walks through between 'please stop' and exiting, and why readiness flips first.
 
 ```mermaid
 stateDiagram-v2
@@ -149,6 +178,8 @@ Step by step, in the order it must happen:
 6. **Let `main` close shared resources last** — DB pool, Redis pool, any tracer — only after both the HTTP server and the workers have actually stopped using them.
 
 ### The ListenAndServe / Shutdown ordering bug
+
+**In plain words:** a tiny race: if you call stop before the server fully started listening, the stop does nothing — the fix is in how the two are ordered.
 
 The error that the old note's audit called out by name: `ListenAndServe` returns the instant `Shutdown` is called, with `http.ErrServerClosed`, not when the drain finishes. A `main` that does
 
@@ -176,7 +207,7 @@ Worked example](#4-worked-example) does exactly this: `ListenAndServe` runs in i
 
 A gRPC server has its own two-step version of the same idea: `GracefulStop()` stops accepting new RPCs and waits for existing ones to finish, with no deadline of its own — so wrap it in a `context.WithTimeout` and call the blunt `Stop()` if the deadline passes. (Full gRPC server setup is [[gRPC Services in Go]]'s job.)
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -534,7 +565,7 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 
 **Measured:** all four tests in this package (the three above plus a readiness-endpoint check) pass under `go test -race` on Go 1.24.4, darwin/arm64, 2026-11-07.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Probe | Question it answers | Must check dependencies? | Failure action |
 | --- | --- | --- | --- |
@@ -549,14 +580,14 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 | In-process worker drain (WaitGroup) | Close the job channel, wait with a deadline | Workers living in the same process as the API | Needs every worker loop to select on `ctx.Done()` too, or it never notices |
 | `GracefulStop()` (gRPC) | Stop accepting RPCs, wait for existing ones, no built-in deadline | gRPC servers | Must be wrapped in your own timeout + `Stop()` fallback |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A drain deadline that is too long just delays the inevitable `SIGKILL` once `terminationGracePeriodSeconds` passes — size `shutdownTimeout` comfortably under it (we used 25s against a 30s default above).
 - A drain deadline that is too short abandons real work; size it against your slowest realistic request or job, not the typical one.
 - `drainDelay` is pure latency added to every deploy and every restart. Too short and it does nothing useful; too long and rollouts get slower for no benefit. 1-5 seconds is typical; measure your own endpoint-propagation time rather than guessing.
 - None of this helps with a crash or OOM kill. If idempotency and safe retries aren't already in place, graceful shutdown is solving the easy 95% of the problem and leaving the dangerous 5% untouched.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every rolling Kubernetes deployment depends on this; Kubernetes' own docs explicitly describe the readiness-then-SIGTERM race this note's `drainDelay` closes. AWS ALB/ECS and Google Cloud Run have the equivalent "deregistration delay" / Cloud Run's own SIGTERM-then-grace-period contract.
 - **Failure modes → fixes:**
@@ -566,14 +597,14 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 	- Pod killed by SIGKILL every deploy despite graceful code → `terminationGracePeriodSeconds` is shorter than `drainDelay + shutdownTimeout`; raise the pod spec's grace period or shrink the budget.
 - **What to monitor:** time from SIGTERM to process exit (should sit comfortably under the grace period); count of requests that failed during a drain window; count of jobs abandoned by a deadline; readiness flips per deploy.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `main` must wait for `Shutdown`, concretely.** `http.Server.ListenAndServe` is documented to always return a non-nil error; the moment another goroutine calls `Shutdown`, the blocked `Accept` loop unblocks and `ListenAndServe` returns `http.ErrServerClosed` *immediately* — not once in-flight requests finish. The code above makes `errCh` carry that return value out, but the goroutine that decides the process is done is the one running `Run`, which explicitly calls `Shutdown` and only returns after `drainWorkers` too. If `main` instead did `go srv.ListenAndServe(); <-ctx.Done(); os.Exit(0)`, it would race itself: nothing stops `os.Exit` running before `Shutdown` is even called elsewhere, let alone before it finishes.
 - **`RegisterOnShutdown` and hijacked connections.** `Server.Shutdown`'s own documentation says it does not attempt to close hijacked connections (raw TCP handed off via `http.Hijacker`, which is how the stdlib's own WebSocket upgrade works before handing control to a library). `RegisterOnShutdown(f)` runs `f` in its own goroutine as soon as `Shutdown` is called, specifically so that code can signal those connections directly — send a close frame, close a channel the connection's goroutine selects on — while the rest of `Shutdown` handles ordinary HTTP connections in parallel.
 - **A second signal must escalate.** `signal.NotifyContext`'s context is cancelled only once — on the *first* matching signal — and after that it restores the default disposition for that signal number. In practice: the first `Ctrl-C` starts the graceful drain; a second one acts like no handler was ever installed and the process dies immediately. This matters operationally: an operator who sends one SIGTERM and watches nothing happen for 25 seconds has a working graceful shutdown, not a hang, but they can still force it if they need to.
 - **`os.Exit` and `log.Fatal` skip every deferred function.** A `defer cancel()` or `defer db.Close()` anywhere up the call stack never runs if something downstream calls `os.Exit` directly. The worked example above calls `os.Exit(1)` only in `main`, after `Run` has already returned and done everything it owns — never from inside a handler or worker.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why can't you catch `SIGKILL` and shut down gracefully anyway?
 > `SIGKILL` is delivered by the kernel and terminates the process unconditionally; no signal handler, deferred function or goroutine ever runs for it. The only defence against a SIGKILL or OOM kill is making every unit of work safe to abandon and retry (idempotency), not catching the signal.
@@ -596,7 +627,7 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 > [!question]- Trap: is "handle SIGTERM" the same thing as "graceful shutdown"?
 > No. Handling the signal (not dying immediately) is necessary but not sufficient — a handler that just logs and exits is not graceful. Graceful shutdown specifically means: stop new work, finish old work within a deadline, then exit; skipping the "finish old work" step is the single most common incomplete implementation.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)` catches the two signals that can be caught; `SIGKILL` and crashes cannot be.
 - Order: readiness=false → `drainDelay` → `Server.Shutdown(ctx)` → drain workers → exit.
@@ -606,7 +637,7 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 - gRPC: `GracefulStop()` has no deadline of its own; wrap it with your own timeout and a `Stop()` fallback.
 - Keep `shutdownTimeout` comfortably under the pod's `terminationGracePeriodSeconds`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Server Fundamentals (net-http)]], [[Context Package]]
 - **Next:** [[Background Workers and Job Queues]], [[Observability in Go Services]]

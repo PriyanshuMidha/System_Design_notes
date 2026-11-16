@@ -24,7 +24,39 @@ updated: 2026-11-13
 > - Flow control (the receiver's window) stops a fast sender from overrunning a slow receiver; congestion control (the sender's `cwnd`) stops the sender from overrunning the network itself.
 > - Classic mistake: treating TCP as if it sends "messages". It sends a byte stream — one `write()` can arrive as several reads, or several writes can arrive as one read.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+The internet moves data in small chunks called **packets**. The network makes no promises: a packet can get lost, arrive twice, or arrive out of order.
+
+```mermaid
+flowchart LR
+    A["Sender<br/>sends chunks 1,2,3,4"] -- "network drops 2,<br/>swaps 3 and 4" --> B["Receiver<br/>gets 1,4,3"]
+```
+
+That is useless for things like files and web pages, where every byte matters.
+
+**TCP** is the fix. It numbers every chunk, the receiver keeps saying "got everything up to here" (an **ACK**), and the sender resends anything not confirmed in time. The receiver puts the chunks back in order before your app sees them.
+
+```mermaid
+flowchart LR
+    A["Sender<br/>numbers chunks,<br/>resends missing ones"] --> B["Receiver<br/>reorders, confirms"]
+    B -. "ACK: got up to #3" .-> A
+```
+
+TCP also paces itself so it never floods the receiver or the network in between.
+
+The rest of this note is just these 4 questions:
+1. How do two machines agree to start and stop talking (handshake, close)?
+2. How does lost data get noticed and resent?
+3. How does the sender know how fast it may send (the two windows)?
+4. What does this cost, and when is TCP the wrong tool?
 
 **The problem in one story.**
 You send a friend a 50-page document, but the post office only takes postcards.
@@ -69,7 +101,7 @@ Where it breaks: a real speaker repeats a sentence once you ask; TCP never hears
 > [!tip] Remember
 > TCP numbers every byte, waits for ACKs, resends what is missing, and limits how much is in flight so neither the receiver nor the network gets flooded.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 IP alone promises nothing: a packet (an IP datagram) can be dropped, duplicated, or delivered out of order, and IP has no idea what "a connection" even is. An application that wants to send a file reliably over that would have to invent its own sequence numbers, timeouts, and retransmission from scratch.
 
@@ -81,7 +113,7 @@ A fourth mechanism, **congestion control**, isn't a guarantee to the application
 
 Concretely: a client opens a connection to port 443, the OS allocates a socket, and from then on `conn.Write([]byte("GET / HTTP/1.1..."))` either arrives at the other end byte-for-byte and in order, or the connection is torn down with an error. Everything below makes that promise hold over a network that reorders, drops, and duplicates packets.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of TCP as a conversation with a running tally, not a stack of labeled parcels.
 
@@ -97,9 +129,11 @@ The sender may only have `min(receive window, congestion window)` bytes unacknow
 > [!tip] Remember
 > Two separate limits gate every byte TCP sends: the **receive window** protects the listener's ears, the **congestion window** protects the shared room. The smaller of the two always wins.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Connection setup: the 3-way handshake
+
+**In plain words: before any data moves, both sides say hello and agree where their counting starts — like two accountants syncing their ledgers before trading.**
 
 Both sides pick a random **initial sequence number (ISN)** so sequence numbers aren't predictable across connections (an old security requirement, not just bookkeeping).
 
@@ -120,6 +154,8 @@ sequenceDiagram
 `ack=1001` means "I've received everything through byte 1000; send byte 1001 next." Each side's ISN only becomes `1001`-style numbers after the first SYN consumes one sequence number itself (SYNs and FINs each count as one byte for accounting purposes).
 
 ### Closing: the 4-way close and TIME_WAIT
+
+**In plain words: hanging up takes two separate goodbyes, one per direction, because each side may still have something left to say.**
 
 Either side can close independently, because TCP is full-duplex: closing lets a side say "I'm done sending" while it can still receive.
 
@@ -165,6 +201,8 @@ stateDiagram-v2
 
 ### Reliability: sequence numbers, ACKs and retransmission
 
+**In plain words: the receiver never says "I missed something"; the sender notices the silence (or the same confirmation repeating) and resends on its own.**
+
 Every byte sent has a sequence number; every ACK carries the next byte the receiver expects (a **cumulative** ACK — "I have everything up to here," not "I have this specific segment").
 
 Modern stacks also use **SACK** (selective acknowledgment, RFC 2018) so a receiver can report non-contiguous ranges it has ("I have 1000–1999 and 3000–3999, still missing 2000–2999"), letting the sender retransmit only the actual gap instead of everything after it.
@@ -185,6 +223,8 @@ If an ACK for a sent segment hasn't arrived within 80ms, the sender assumes it w
 
 ### Flow control: the sliding window
 
+**In plain words: the receiver keeps telling the sender how much free space is left in its inbox, and the sender never sends more than that.**
+
 The receiver advertises a **window size** in every ACK: how many more bytes past the ACKed point it can currently buffer. The sender may have at most that many unacknowledged bytes in flight.
 
 As the receiver's application reads data out of its buffer, the window grows back (a "window update"); if the receiver's buffer fills (a slow consumer), the window shrinks toward zero, and at zero the sender must stop and periodically probe with a 1-byte **zero-window probe** until room reopens.
@@ -200,6 +240,8 @@ flowchart LR
 ```
 
 ### Congestion control: cwnd, slow start, CUBIC and BBR
+
+**In plain words: the network itself can also choke, so the sender guesses how much the road can carry — start careful, speed up while it works, slam the brakes when packets go missing.**
 
 Flow control alone would let a sender on a fast LAN flood a congested link to a receiver with plenty of buffer space. Congestion control adds a second limit, the **congestion window (`cwnd`)**, that the sender estimates for itself from the network's behavior — nobody tells it directly.
 
@@ -236,6 +278,8 @@ flowchart LR
 
 ### Nagle's algorithm and `TCP_NODELAY`
 
+**In plain words: instead of mailing every tiny note separately, wait and put several in one envelope — great for postage, bad when the note is urgent.**
+
 Nagle's algorithm (RFC 896) batches small writes: if there's unacknowledged data already in flight, a new small write is held and coalesced with the next one instead of sent as its own tiny segment, trading a little latency for fewer, bigger packets.
 
 Combined with **delayed ACKs** (an ACK is held up to ~40–500ms hoping to piggyback on a reply) the two can stack to add real latency to small request/response exchanges — a known anti-pattern for latency-sensitive protocols.
@@ -256,7 +300,7 @@ TCP's ordering guarantee is also its cost: the receiving application cannot read
 
 One lost segment stalls *every* stream multiplexed on top of that one connection — this is exactly why HTTP/2, which multiplexes many requests over a single TCP connection, can have one slow request stall every other request behind a single lost packet (see [[UDP and QUIC]] for the fix QUIC applies by moving streams below TCP's single ordered byte stream).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -267,6 +311,8 @@ func (w *Window) CanSend() int // room = RecvWin - bytes-in-flight, clamped at 0
 ```
 
 ### Tracing a connection step by step
+
+**In plain words: one connection's whole life with real numbers — hello, speed up, lose a packet, recover.**
 
 Follow one connection from handshake through a lost segment and recovery, with concrete numbers:
 
@@ -311,7 +357,7 @@ ESTAB  0      0       10.0.4.7:51342       10.0.4.12:443
 
 Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segments (about 58KB at this `mss`) is currently allowed in flight, `ssthresh:28` shows a previous loss already happened (an ssthresh below the Reno default of ~2³¹ means a loss event set it), `rtt:3.4/1.1` is the smoothed RTT and its mean deviation in milliseconds, and `bytes_retrans:1448` shows exactly one segment was retransmitted so far.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Algorithm | How it decides to speed up / slow down | Use when | Cost |
 | --- | --- | --- | --- |
@@ -323,13 +369,13 @@ Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segmen
 > [!warning] Interview trap
 > Flow control and congestion control are two different windows solving two different problems. Flow control protects the **receiver's buffer**; congestion control protects the **network path**. The sender's effective send window is `min(cwnd, rwnd)` — a fast network with a slow receiving application is still throttled by `rwnd`, not `cwnd`.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - TCP's ordering guarantee is also a liability: one lost packet stalls everything behind it on that connection (head-of-line blocking), which matters a lot for latency-sensitive, parallel work — see [[UDP and QUIC]].
 - The handshake and slow start both cost time before a connection reaches full throughput: for a one-shot, latency-critical, loss-tolerant payload (a game position update, a live video frame), TCP's guarantees are pure overhead. UDP, or QUIC's 0-RTT resumption, fit that case better.
 - Congestion control is fair by design — it won't let one flow dominate a shared link — which is exactly wrong for a single operator's own private backbone where the goal is to use 100% of known-available capacity from day one (some CDNs and private WAN backbones run tuned or custom congestion control for this reason).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Linux defaults to CUBIC; Google uses BBR broadly (search, YouTube, and offers it as a GCP option); most consumer OSes and server kernels ship a loss-based algorithm with BBR as an increasingly common opt-in.
 - **Failure modes → fixes:**
@@ -339,7 +385,7 @@ Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segmen
 	- **Silent peer death behind a stateful NAT or firewall** → tuned keepalive (`net.Dialer.KeepAliveConfig` since Go 1.23) so a dead connection is detected and closed instead of hanging forever.
 - **What to monitor:** retransmission rate (`bytes_retrans`/`bytes_sent` from `ss -ti`), RTT and its variance, current `cwnd` and whether it's loss-limited, count of connections stuck in `TIME_WAIT`/`CLOSE_WAIT`, and SYN backlog drops on a listening socket under load.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `ack` is cumulative, not selective, by default.** A single number ("everything up to here") is cheap to generate and process, but it means one lost segment in the middle of a burst makes every later segment look "out of order" until the gap is filled, even if they all arrived fine.
 
@@ -355,7 +401,7 @@ Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segmen
   This is specifically a request/response latency problem, not a throughput one; bulk transfers are barely affected since Nagle only holds data when there's already unacknowledged data in flight.
 - **MSS and PMTU.** The maximum segment size is negotiated at handshake time from each side's MTU, but a smaller MTU somewhere mid-path (a VPN, a tunnel) isn't visible at handshake time; Path MTU Discovery (sending with the "don't fragment" bit and backing off on an ICMP "too big" reply) exists to catch that after the fact, and its absence from a network path is a classic silent cause of connections that hang on anything but tiny payloads.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why three segments for the handshake and four for the close?
 > The handshake only needs three because the second segment (SYN+ACK) combines "I acknowledge your SYN" with "here is my own SYN" into one segment. Closing can't combine the same way because TCP is full-duplex and either side may still have data to send after announcing it's done sending — so each direction's FIN/ACK is independent, giving up to four segments (though they can collapse to three if a FIN piggybacks on an ACK).
@@ -378,7 +424,7 @@ Reading it: `cubic` is the active congestion-control algorithm, `cwnd:40` segmen
 > [!question]- What does Nagle's algorithm trade off, and when should you disable it?
 > It trades a small added latency for fewer, larger packets by holding a new small write while earlier data is still unacknowledged. Disable it (`TCP_NODELAY`) for latency-sensitive request/response protocols sending small messages (RPC calls, interactive protocols) where you'd rather pay more packets than more latency; leave it on for bulk transfers where it rarely matters.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - 3-way handshake: SYN → SYN+ACK → ACK, exchanging initial sequence numbers.
 - 4-way close: FIN → ACK → FIN → ACK; the active closer waits in `TIME_WAIT` for 2×MSL.

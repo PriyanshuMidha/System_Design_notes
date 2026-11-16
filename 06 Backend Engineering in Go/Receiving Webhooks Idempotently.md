@@ -23,7 +23,35 @@ updated: 2026-11-13
 > - Acknowledge fast, process after: store the event and return `200` immediately, then apply the business effect from a worker, so a slow downstream call never causes the provider to time out and retry a delivery that actually succeeded.
 > - Classic mistake: treating "duplicate" and "invalid" the same way. A duplicate is success (ack, skip); a bad signature is a client error; your own failure to process is the only case that should make the provider retry.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **webhook** is a phone call in reverse: instead of you asking the payment provider "anything new?", the provider calls your server when something happens — "invoice 42 just got paid".
+
+Two problems come with that. Anyone on the internet can also call that URL, so you must check the message really came from the provider (a secret stamp called an **HMAC signature**). And providers re-send messages when they are unsure you got them, so the same event can arrive twice.
+
+```mermaid
+flowchart LR
+    P[Provider] --> V{Signature real?}
+    V -- no --> X[Reject]
+    V -- yes --> D{Seen this event ID before?}
+    D -- yes --> OK[Say OK, do nothing]
+    D -- no --> W[Record it, say OK, process later]
+```
+
+Handling the same message twice must change nothing. That property is called **idempotency**, and you get it by remembering every event ID in the database.
+
+The rest of this note is just these 4 questions:
+1. How do you verify the signature safely (raw bytes, constant time)?
+2. How do you deduplicate so a repeat delivery is a no-op?
+3. Why answer OK first and do the slow work after?
+4. What about events that arrive out of order?
 
 **The problem in one story.**
 A payment company tells your server "invoice 42 was paid" by calling your URL.
@@ -68,7 +96,7 @@ Where it breaks: a teller handles one cheque at a time, but two webhook retries 
 > [!tip] Remember
 > Verify the signature, record the event ID atomically, answer fast, and treat a duplicate as success.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps's payment provider calls `POST /webhooks/stripe` when an invoice is paid.
 
@@ -82,7 +110,7 @@ The handler has to tell "an event I have not seen" from "a retry of an event I h
 
 A second, unrelated failure mode: anyone who finds the endpoint URL can `POST` a forged "invoice.paid" body to it. Without a signature check, that forged request marks a real invoice paid. The fix for both problems is the same shape of code: verify first, then deduplicate, then process once.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat the handler as two phases that must not share a transaction or a timeout budget:
 
@@ -106,9 +134,11 @@ flowchart LR
 
 The provider only ever sees the fast phase's outcome. Everything in the slow phase happens on InvoiceOps's own clock, so a slow email provider or a Postgres hiccup there can never make the webhook delivery itself look like a failure to the sender.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Signature verification: raw bytes, constant time, a replay window
+
+**In plain words:** check the secret stamp on the exact bytes that arrived, using a comparison that takes the same time whether it matches or not, and reject stamps that are too old.
 
 ```go
 func verifySignatureWB(secret []byte, timestamp string, body []byte, sigHex string) bool {
@@ -201,6 +231,8 @@ The cap is set once, comfortably above the provider's real payload size, and it 
 
 ### Deduplicating atomically
 
+**In plain words:** let the database be the memory — a uniqueness rule on (provider, event ID) means the second insert of the same event simply fails, no race possible.
+
 ```sql
 CREATE UNIQUE INDEX webhook_events_provider_event_id_key
   ON webhook_events (provider, event_id);
@@ -235,6 +267,8 @@ sequenceDiagram
 ```
 
 ### Ack fast, then process
+
+**In plain words:** answer 'got it' within seconds and do the real work in the background — a slow answer makes the provider re-send, which creates the very duplicates you are defending against.
 
 The handler writes the `200` the instant the insert tells it this is a new event, and hands the actual business effect to a worker instead of running it inline:
 
@@ -277,6 +311,8 @@ A process crash now loses nothing: the outbox row is still sitting there, undisp
 An in-memory channel is an acceptable simplification for a demo or a single-instance service where "the handler process and the worker are the same process and never crash between insert and dispatch" is an assumption you have actually decided to accept — it is not a substitute for an outbox in anything that has to not lose a payment update.
 
 ### Out-of-order events
+
+**In plain words:** 'paid' can arrive before 'sent'; trust the state machine and the event's own timestamps, not the arrival order.
 
 At-least-once, unordered delivery means a late "payment.pending" can arrive *after* "payment.paid" already landed, if the pending notification was merely delayed in transit rather than actually happening later.
 
@@ -331,7 +367,7 @@ func ValidateAmount(invoiceTotalMinor, eventAmountMinor int64) error {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -470,7 +506,7 @@ func TestHandler_OutOfOrderPendingAfterPaidIsIgnored(t *testing.T) {
 
 All of the above pass, including a full concurrent-delivery test (`TestHandler_ConcurrentDuplicateDeliveriesProcessExactlyOnce`, 10 goroutines posting the same signed event) and a bad-signature rejection test under `go test -race`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Scheme | Replay protection | Dedupe key | Use when |
 | --- | --- | --- | --- |
@@ -479,14 +515,14 @@ All of the above pass, including a full concurrent-delivery test (`TestHandler_C
 | GitHub-style (`X-Hub-Signature-256`) | None; GitHub does not redeliver automatically on failure, so replay risk is mostly "someone replays a captured request" | `X-GitHub-Delivery` (unchanged across any manual redelivery) | A provider with no automatic retries, so dedupe mainly guards manual redelivery and testing |
 | Standard Webhooks spec (`webhook-id`, `webhook-timestamp`, `webhook-signature`) | Timestamp header, checked the same way as Stripe's | `webhook-id` | A provider implementing the open standard directly |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A unique-index dedupe table grows forever unless it is pruned; keep only as long as the provider's own retry window can plausibly still redeliver (a few days), then delete or partition old rows.
 - Processing on a worker after acking means a true processing failure is invisible to the provider — it already got its `200`. This has to be covered by your own retry mechanism (a dead-letter queue or a reconciliation job that polls the provider for events it believes it sent but your side never shows as applied), not by hoping the provider resends.
 - A replay-window check adds a hard requirement that the server's clock be reasonably correct (NTP-synced); a server with multi-minute clock drift will reject genuinely fresh events.
 - For an internal, trusted caller (not a public internet-facing webhook), full HMAC verification can be overkill compared to mTLS or a network-level allowlist — see [[Secure Coding for Go Services]] for the broader menu of service-to-service auth options.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Stripe, GitHub, Razorpay and the Standard Webhooks spec all converge on "HMAC over the raw body, event id for dedupe, ack fast" as the shape, differing mainly in header names and whether a timestamp is bound into the signature.
 - **Failure modes → fixes:**
@@ -496,14 +532,14 @@ All of the above pass, including a full concurrent-delivery test (`TestHandler_C
   - A forged request with a stolen-but-expired signature is replayed → the tolerance window rejects it once its timestamp ages out, even if the signature itself is otherwise valid for a secret that was never rotated.
 - **What to monitor:** signature-verification failure rate (a sudden spike can mean a secret rotation went wrong, or an attack); duplicate-event rate (expected to be nonzero — providers do retry — but a sustained spike means your "ack fast" path is too slow and the provider is timing out); time from receipt to processed; count of transitions rejected by the state-machine guard (a rising rate can mean the provider is sending more out-of-order than expected, or that your terminal-state logic is wrong).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the fast/slow split must not share a database transaction.** If the status update ran inside the same transaction as the `INSERT ... ON CONFLICT`, any slowness in that update (a lock wait on the invoice row, a slow trigger) delays the `COMMIT` the provider is implicitly waiting on for its response. Splitting them means the fast phase's transaction can commit (and the `200` go out) independently of how long the slow phase takes.
 - **Why reconciliation still matters even with perfect webhook handling.** A provider can simply fail to send an event (an outage on its side before it ever reaches you), and no amount of correct handling on the receiving end fixes an event that never arrived. Production systems pair webhooks with a periodic job (see [[Scheduled Jobs]]) that polls the provider's "list events since X" API and reconciles any gap — webhooks are the fast path, not the only path.
 - **Outbound webhooks are the mirror image, owned elsewhere.** Signing a payload to send, retrying with backoff, a per-endpoint dead-letter queue, and guarding against SSRF when the destination URL is customer-supplied are all sender-side concerns, covered in [[Webhooks - Sending and Receiving]]; this note only covers receiving.
 - **The amount guard is a narrow example of a wider rule.** Trusting a webhook's payload for anything beyond "something happened, go check" is risky: the safest handlers treat the event as a cue to re-fetch the authoritative state from the provider's API rather than trusting every field in the payload. InvoiceOps's amount check here is a middle ground, chosen because re-fetching on every event would undo most of the latency benefit webhooks exist for.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why `hmac.Equal` instead of `==` or `bytes.Equal` to compare a signature?
 > Both `==` and `bytes.Equal` return as soon as they find a mismatching byte, so the time taken to reject a guess leaks how many leading bytes were correct — an attacker can recover the signature byte by byte through timing. `hmac.Equal` always compares the full length, in constant time, regardless of where the first difference is.
@@ -526,7 +562,7 @@ All of the above pass, including a full concurrent-delivery test (`TestHandler_C
 > [!question]- Your secret rotation window has ended. What breaks if you remove the old secret too early?
 > Any delivery still in flight — or any retry of a delivery the provider queued before it switched to the new secret — fails signature verification and is rejected as a forged request, even though it is entirely legitimate. Remove an old secret only after confirming (via provider dashboard or logs) that no deliveries signed with it are still arriving.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Cap the body with `http.MaxBytesReader` before reading it; verify the signature over the **raw** bytes, before decoding JSON.
 - `hmac.Equal`, never `==`/`bytes.Equal`, for the comparison.
@@ -537,7 +573,7 @@ All of the above pass, including a full concurrent-delivery test (`TestHandler_C
 - Guard status transitions with a state machine, not with timestamps; make terminal states (`paid`, `failed`) reject any further transition.
 - Pair webhooks with a reconciliation job: a provider that never sends an event is a gap no amount of correct handling closes.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Webhooks - Sending and Receiving]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[File Uploads and Object Storage]], [[Observability in Go Services]]

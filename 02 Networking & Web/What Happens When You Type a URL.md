@@ -27,6 +27,8 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
+**In plain words:** the whole journey in one row of boxes — read it like a relay race, each box hands the baton to the next.
+
 Nine boxes, one request, read left to right:
 
 ```mermaid
@@ -44,7 +46,40 @@ flowchart LR
 
 Every box after this is one of those nine steps, with its own explanation below; this note's job is only the order, the timing, and the handoffs between them.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (each stage in order), 4 (real timings) and 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You type a web address and press Enter. The page does not come from the address you typed — that is just a name.
+First your computer turns the name into a number address using **DNS**, the internet's phone book.
+
+```mermaid
+flowchart LR
+    A["shop.example.com (a name)"] -- DNS --> B["93.184.215.14 (a number computers can call)"]
+```
+
+Then it opens a safe line to that number: one quick hello (TCP), then an agreement on a secret code so nobody can read along (TLS — the lock icon).
+Only now does it actually ask: "give me the cart page."
+A nearby helper server (a **CDN** edge) may answer from a saved copy; if not, the question travels to the real server and its database.
+
+```mermaid
+flowchart LR
+    U[You] --> N["Nearby helper (CDN)"]
+    N -- "has a copy: answer fast" --> U
+    N -. "no copy: ask the far-away real server" .-> O[Origin + database]
+```
+
+The answer comes back and the browser draws the page. Done.
+The rest of this note is just these 3 questions:
+1. In what exact order do these steps run, and how long does each take?
+2. Which steps can be skipped the second time (caching, kept-open connections)?
+3. When a page is slow, how do you tell which step is the slow one?
+
 
 **The problem in one story.** You type a shop's address and press Enter.
 Your computer doesn't know where that shop lives, so it asks for directions (DNS).
@@ -90,7 +125,7 @@ Where it breaks: a phone call is one conversation, but loading a page is several
 > [!tip] Remember
 > Loading a URL = find the address, connect securely, ask, and draw; every step can be skipped if something is already cached or kept open.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A single page load for a shopping cart touches a browser cache, a DNS resolver, a CDN, a reverse proxy, an application server and a database — six systems owned by different teams or companies.
 
@@ -109,7 +144,7 @@ Understanding the full chain is what separates "the page is slow" from "the TLS 
 > [!tip] Remember
 > Each layer's narrow contract is what lets six independently-owned systems cooperate without ever agreeing on a shared design — DNS, TCP, TLS, the CDN, the proxy and the app each only need to keep their own one promise.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the browser as a customer calling a company's switchboard:
 1. The customer checks their own notebook for the number (**browser cache**) and for who answers it (**DNS cache**).
@@ -144,7 +179,7 @@ The switchboard picture is useful for ordering, not for "it's all one call."
 > [!tip] Remember
 > If you can name which "call" in this chain is slow, you've already found the box to fix — the fix for a slow DNS call is never the same fix as a slow database call.
 
-## 3. How it works
+## 3. How it works 🟡
 
 The full request below is the Mumbai-to-`us-east-1`, CDN-miss scenario from section 1, broken into the stages the whiteboard flowchart named.
 
@@ -300,6 +335,8 @@ The full mechanism is covered in [[How Browsers Load and Render a Page]].
 
 ### Where the time actually goes
 
+**In plain words:** here is the bill — what each step of the journey costs in time, and why the slow rows are slow.
+
 All the numeric costs named above, gathered in one place for the same cold-cache, Mumbai-to-`us-east-1` scenario:
 
 | Phase | Typical cold-cache cost | Why |
@@ -317,9 +354,11 @@ A **warm** repeat visit (DNS cached, TCP+TLS connection kept alive, CDN cache hi
 > [!tip] Remember
 > Every row in this table is skippable by some form of caching or connection reuse except the app/DB row — that's the one phase that genuinely has to run on every single request.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### A real `curl` timing breakdown
+
+**In plain words:** you can watch all of this happen on your own machine with one `curl` command — it prints a stopwatch split for each phase.
 
 The same four phases the sequence diagrams above show — DNS, TCP connect, TLS, time to first byte — are exactly what `curl -w` exposes on a live request, and exactly what browser DevTools' "waterfall" panel is built on.
 
@@ -360,7 +399,7 @@ PASS
 
 Runnable Go version: [[What Happens When You Type a URL - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Scenario | What's skipped | Typical total (representative) |
 | --- | --- | --- |
@@ -371,7 +410,7 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
 | HTTP/3 (QUIC) on a lossy network | A second round trip HTTP/1.1/2 would need after a lost packet (QUIC fixes head-of-line blocking at the transport layer) | Fewer retransmission stalls; see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] |
 | Same-origin follow-up request (e.g. an XHR after the page loads) | DNS, TCP, TLS (connection already open); possibly the whole request if HTTP-cached | 1 RTT to the server actually handling it |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - This exact chain assumes a public internet page with a CDN in front of it. An internal service-to-service call inside one data center skips DNS-over-the-internet and CDN entirely and is dominated by the application and database time instead.
 - Pushing more into the CDN (more cacheable responses) trades freshness for speed — see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] for exactly which responses are safe to cache.
@@ -381,7 +420,7 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
 > [!tip] Remember
 > Every trade-off in this chain has the same shape: something is cached or kept warm to save a round trip, at the cost of memory, staleness risk, or (for 0-RTT) a real security trade-off.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** this exact chain is what `example.com`, `shop.*` SaaS storefronts, and any CDN-fronted web app (Cloudflare, Akamai, Fastly, CloudFront in front of an origin) do for every page view. Browser DevTools' Network tab and WebPageTest draw this chain as a waterfall per request.
 - **Failure modes → fixes:**
@@ -391,7 +430,7 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
   - CDN cache hit ratio near zero on a cacheable page → check `Cache-Control`/`Vary` headers are actually cacheable; see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] and [[CDN and Edge]].
 - **What to monitor:** per-phase timing percentiles (p50/p95/p99) from Real User Monitoring, CDN cache hit ratio, TLS handshake failure rate, and origin-reachable-from-edge latency.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why TCP+TLS cost "2 round trips" and not 3.** TLS 1.3's client sends its key share in the very first flight (the `ClientHello`), so the server can reply with everything needed to finish the handshake in its one response; the client's `Finished` message can carry the first HTTP request piggybacked on it.
 
@@ -417,7 +456,7 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
   That is a second request-response chain per subresource, each going through some or all of the same phases (often on the same warm connection via HTTP/2 multiplexing). The mechanism is covered in full in [[How Browsers Load and Render a Page]].
 - **Load balancing is invisible here on purpose.** Both the CDN's and the reverse proxy's "pick an upstream" step is a load-balancing decision; the algorithms (round robin, least connections, consistent hashing) live in [[Load Balancing]], and this note only shows that the decision happens.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk me through what happens between pressing Enter and the page starting to render.
 > Browser cache check, then DNS resolution (if not cached), a TCP handshake, a TLS 1.3 handshake, an HTTP request that a CDN may answer from cache or forward to a reverse proxy, which routes it to an application server that queries a database, then the response travels back and the browser parses and renders it. Each step is skippable if its own cache already has the answer.
@@ -440,7 +479,7 @@ Runnable Go version: [[What Happens When You Type a URL - Go]].
 > [!question]- Where exactly does load balancing happen in this chain?
 > Twice: the CDN edge picks which origin server (or which further edge) to forward a cache miss to, and the reverse proxy at the origin picks which application server instance handles the request. Both are load-balancing decisions; the algorithms behind them are covered in [[Load Balancing]], not here.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Order: browser cache → DNS → TCP handshake → TLS handshake → HTTP request → CDN (cache hit stops here) → reverse proxy → app → DB → response → render.
 - Cold path costs: DNS (1–2 RTT), TCP (1 RTT), TLS 1.3 (1 RTT, piggybacked with the first request) — all skippable on a warm connection.

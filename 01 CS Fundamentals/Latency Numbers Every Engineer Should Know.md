@@ -26,7 +26,37 @@ updated: 2026-11-13
 > - p50/p95/p99 latency, not the average, is what a backend engineer should actually budget and alert on — tails compound badly with fan-out.
 > - Little's Law (`L = λW`) connects arrival rate, time-in-system, and concurrent requests, without needing to know the distribution of either.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the ladder, percentiles, Little's Law) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every time a computer fetches something, it waits. How long it waits is the **latency**.
+
+The wait depends on where the thing is. Data already inside the CPU is basically instant. Data in memory takes a bit longer. Data on disk takes much longer. Data on another computer across the world takes the longest by far.
+
+```mermaid
+flowchart LR
+    A["Inside CPU<br/>instant"] --> B["Memory<br/>100x slower"] --> C["Disk<br/>1,000x slower again"] --> D["Across the world<br/>1,000x slower again"]
+```
+
+Each jump is huge — not "a bit slower" but 100x or 1,000x slower. So good design means asking "where does my data live, and how many trips am I making?"
+
+```mermaid
+flowchart LR
+    X["10 trips, one by one"] -->|"10 x 1 ms = 10 ms"| S["Slow page"]
+    Y["1 batched trip"] -->|"~1 ms"| F["Fast page"]
+```
+
+The rest of this note is just these 4 questions:
+1. How slow is each place data can live? (the latency ladder)
+2. Why does the average hide slow requests? (percentiles)
+3. How do I predict how many requests are in flight? (Little's Law)
+4. What breaks in production and what do interviewers ask?
 
 **The problem in one story.**
 You open an app and tap "load my orders".
@@ -70,7 +100,7 @@ Where it breaks: an SSD and a network call are both just "ask something else and
 > [!tip] Remember
 > Each step down the ladder (cache → RAM → disk → network → other continent) costs roughly 10–1,000× more than the one before.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A service that makes one network call per request has a latency floor set by that one round trip.
 
@@ -91,7 +121,7 @@ These *ratios*, more than any single absolute number, are what should guide a de
 > [!tip] Remember
 > You rarely need the exact nanosecond figures. You need the *ratios* between rungs of the ladder, because those ratios are what tell you whether a design choice costs 10× or 10,000×.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Imagine you need one fact. Where is it?
 
@@ -108,7 +138,7 @@ Each step is a different *kind* of operation, not just a slower version of the l
 >
 > The analogy's value is the order-of-magnitude intuition for *how long* each step takes, not a claim that each rung works nothing like the others.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The latency ladder
 
@@ -249,9 +279,11 @@ flowchart LR
 
 Undersizing that pool causes requests to queue, which raises `W`, which (by the same formula) raises `L` further — a feedback loop that gets worse, not better, on its own.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a latency budget is pocket money — your SLA gives you 100 ms to spend, and every call you make spends some of it.
 
 ```go
 func Percentile(samples []float64, p float64) float64
@@ -263,9 +295,15 @@ If it makes ten such calls *sequentially* instead of in parallel, that floor alo
 
 This is why an "N+1 query" bug is a latency problem, not just a database-load problem — see [[N+1 Query Problem]].
 
+```mermaid
+flowchart LR
+    SLA["Budget: 100 ms (p99 SLA)"] --> DB["10 sequential DB calls<br/>~10 ms gone"]
+    DB --> Rest["~90 ms left for logic,<br/>serialization, other calls"]
+```
+
 Runnable Go version: [[Latency Numbers Every Engineer Should Know - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Term | What it measures | Example |
 | --- | --- | --- |
@@ -279,7 +317,7 @@ A system can have high throughput and bad latency at the same time (lots of para
 
 The two are independent axes, and Little's Law is the formula that ties them together with concurrency.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Chasing average latency is often misleading — see "p50, p95, p99" above. A dashboard that only shows the mean can look healthy while 1% of users have a terrible experience.
 - Optimizing for lower latency per call sometimes trades off against throughput: disabling batching to respond faster per request means doing more total round trips. Know which one your SLA actually demands.
@@ -288,7 +326,7 @@ The two are independent axes, and Little's Law is the formula that ties them tog
 > [!warning] Common mistake
 > Quoting a ladder number as if it were measured on your own system. Every number in the table above is labelled documented or estimate for a reason — treat it as a planning tool, and measure your actual service before trusting a specific number in production.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** CDNs and edge caching exist specifically to turn a cross-continent round trip into an intra-region one for static content.
   - Database connection pooling and HTTP keep-alive exist to amortize the TCP/TLS handshake cost shown in the sequence diagram above across many requests instead of paying it per request.
@@ -298,7 +336,7 @@ The two are independent axes, and Little's Law is the formula that ties them tog
   - A "fast" average hides a bad tail caused by GC pauses, lock contention, or noisy-neighbor CPU steal → alert on p99/p999, not just mean or p50.
 - **What to monitor:** p50/p95/p99/p999 latency per endpoint and per downstream dependency; RTT between regions/AZs as a baseline; queue depth and in-flight request count (both of which Little's Law connects directly to observed latency).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why sequential I/O beats random I/O** at every layer of the ladder, for the same underlying reason each time: there is a fixed "getting there" cost (seek, RTT, cache-line fill) paid once per access, and sequential access amortizes it over more useful bytes per access, while random access pays it again and again for small amounts of data each time.
 - **Latency budgets per hop.** A well-designed system assigns each hop in a request's path (load balancer → service → cache → database) an explicit slice of the total SLA, so that no single hop can silently consume the whole budget. This is standard practice at large-scale systems, usually enforced via per-hop timeouts that sum to less than the end-to-end SLA.
@@ -307,7 +345,7 @@ The two are independent axes, and Little's Law is the formula that ties them tog
 - **Measuring latency in Go.** `time.Since(start)` around a call gives a single sample; collecting enough samples and feeding them to a histogram (or the `Percentile` function in the Go note) gives the distribution that actually matters.
   - `net/http/pprof` and `runtime/trace` let you see where wall-clock time goes inside a Go process without guessing — see [[Latency, Percentiles and Bottleneck Analysis]] for the full debugging workflow.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between latency, throughput, and bandwidth?
 > Latency is the time for one operation to complete. Throughput is how many operations complete per unit time. Bandwidth is the maximum data rate a channel can physically carry.
@@ -344,7 +382,7 @@ The two are independent axes, and Little's Law is the formula that ties them tog
 >
 > A round trip between two points separated by, say, 10,000 km therefore cannot be faster than about 100 ms no matter how good the network hardware or routing is — this is a genuine physical floor, which is why reducing cross-region latency requires moving the data or compute closer, not faster cables.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Full ladder: see "The latency ladder" table above — CPU cycle at the top, network round trips and disk-scale reads at the bottom, about 9 orders of magnitude apart.
 - Cold HTTPS request pays DNS (if uncached) + 1 RTT TCP + 1 RTT TLS 1.3 (2 for TLS 1.2) + 1 RTT HTTP before the first response byte.
@@ -354,7 +392,7 @@ The two are independent axes, and Little's Law is the formula that ties them tog
 - Cross-region latency has a real physical floor (speed of light in fiber); fix it by moving data/compute closer, not by better-engineering the link itself.
 - Label every latency number you quote as measured, documented, or an estimate — never state a number you can't back up one of those three ways.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Memory Hierarchy and CPU Caches]], [[Storage Devices - HDD, SSD, NVMe]]
 - **Next:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]], [[TLS and HTTPS]]

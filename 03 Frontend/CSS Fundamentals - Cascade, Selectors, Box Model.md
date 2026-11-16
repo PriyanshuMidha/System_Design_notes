@@ -29,6 +29,8 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
+**In plain words:** the whole note compressed into two rules fighting over one link.
+
 ```css
 #nav .item a { color: blue; }   /* specificity (1, 1, 1) */
 .item a.active { color: red; }  /* specificity (0, 2, 1) */
@@ -40,7 +42,39 @@ Both rules can match the same `<a>`.
 
 This is the entire cascade in miniature: compare the left-most number first, and only fall through to source order when every number ties.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A web page is built from boxes: every heading, button and paragraph is a box. CSS is the list of rules that says how each box looks. A rule has two parts: a **selector** ("which boxes?") and some settings ("make them blue").
+
+Sometimes two rules point at the same box and disagree. The browser never guesses. It runs a fixed tie-breaker called the **cascade**: the more precisely-aimed rule wins, and on a perfect tie the rule written later wins.
+
+```mermaid
+flowchart LR
+    A["Rule 1: p → blue"] --> E["Same paragraph"]
+    B["Rule 2: .intro → red"] --> E
+    E --> C{"Cascade<br/>tie-breaker"}
+    C --> W["One colour wins,<br/>same in every browser"]
+```
+
+How precise a selector is has a name: **specificity**. It is three counters — IDs, classes, tag names — compared left to right, never added up.
+
+```mermaid
+flowchart LR
+    X["#x → (1,0,0)"] --- Y[".a.b.c.d.e.f → (0,6,0)"]
+    X --> W2["#x wins: the first counter<br/>already differs, 1 beats 0"]
+```
+
+That is the whole game. The rest of this note is just these 3 questions:
+1. When rules clash, which one wins, exactly?
+2. How is a selector's score counted?
+3. How big is each box really (content, padding, border, margin)?
 
 **The problem in one story.**
 You write `p { color: blue; }` in one file and `.intro { color: red; }` in another.
@@ -85,7 +119,7 @@ Where it breaks: people negotiate; CSS never does — it follows the score mecha
 > [!tip] Remember
 > When rules clash, CSS checks importance, then specificity, then source order — and every box is content + padding + border + margin.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A page has a global stylesheet with `a { color: blue; }`, a component stylesheet with `.card a { color: green; }`, and a designer who adds `style="color: red"` directly on one special link for a promotion. Three rules, one element, three different colors requested.
 
@@ -96,7 +130,7 @@ The cascade is the fixed, documented procedure that makes the outcome the same i
 > [!tip] Remember
 > The cascade exists so three conflicting rules on one element always resolve the same way, in every browser, without you reading the whole stylesheet to find out which one wins.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 > [!quote] Analogy: a four-round tournament
 > Picture four judges, each only allowed to speak if every judge before them scored a tie. Judge 1 asks "where did this rule come from" (a browser default loses to your stylesheet, which loses to `!important` — see below).
@@ -117,9 +151,11 @@ flowchart TD
 > [!tip] Remember
 > Each round of the tournament only runs when the previous round was an exact tie — a rule never gets a second chance to win on a later round once it has already lost an earlier one.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Adding CSS and why the method matters
+
+**In plain words:** there are three places to put CSS — a separate file, a block inside the page, or right on one tag — like keeping recipes in a cookbook, on the fridge, or scribbled on the plate itself.
 
 | Method | Syntax | Scope | Notes |
 | --- | --- | --- | --- |
@@ -130,6 +166,8 @@ flowchart TD
 External CSS is render-blocking (see [[How Browsers Load and Render a Page]]): the browser cannot paint until the CSSOM from every linked stylesheet is built, so a large unnecessary stylesheet delays first paint even though it never touches JavaScript.
 
 ### The cascade, in order
+
+**In plain words:** this is the full tie-breaker, as a flowchart. Read it top to bottom: the first question with a clear answer ends the fight.
 
 ```mermaid
 flowchart TD
@@ -214,6 +252,8 @@ flowchart LR
 
 ### Selectors and combinators
 
+**In plain words:** selectors are the "which boxes?" aiming tools. Some aim at a tag name, some at a label (class or ID), and combinators aim at family relations like "child of" or "right after".
+
 | Selector | Matches | Example |
 | --- | --- | --- |
 | Type | every element of that tag | `p` |
@@ -238,6 +278,8 @@ On modern rendering engines this is rarely the actual bottleneck for typical sty
 
 ### Inheritance
 
+**In plain words:** some settings flow from a parent box into its children (mostly text settings, like a family surname), and some never do (like a parent's border — you do not want one on every child).
+
 Some properties inherit from parent to child by default; others don't:
 
 | Inherits by default | Does not inherit by default |
@@ -247,6 +289,8 @@ Some properties inherit from parent to child by default; others don't:
 The rule of thumb: text-related properties inherit (so you can set a font once on `body`), box and layout properties don't (so a child doesn't silently inherit its parent's border). `inherit`, `initial`, and `unset` as values force the behavior either way explicitly.
 
 ### The box model
+
+**In plain words:** every box is wrapped like a parcel — the item (content), bubble wrap (padding), the cardboard (border), and the empty space you leave around the parcel (margin).
 
 ```mermaid
 flowchart TD
@@ -264,6 +308,11 @@ Every element's rendered box is, from the inside out: **content** (sized by `wid
 > [!tip] Remember
 > Every box is four nested layers, always in the same order: content, then padding, then border, then margin. `box-sizing` only changes which layers count toward `width`; it never changes the order of the layers themselves.
 
+```mermaid
+flowchart LR
+    CB["content-box: width 200px<br/>+ padding + border<br/>= renders 250px"] --- BB["border-box: width 200px<br/>includes padding + border<br/>= renders exactly 200px"]
+```
+
 **`box-sizing`** decides what `width`/`height` measure:
 - `content-box` (the CSS default): `width` is the content box only; padding and border are added on top, so a `width: 200px; padding: 20px; border: 5px solid` box actually renders 250px wide.
 - `border-box`: `width` includes padding and border, so that same box renders exactly 200px wide, with the content area shrinking to fit. Nearly every CSS reset sets `*, *::before, *::after { box-sizing: border-box; }` because it makes widths predictable when you add padding or a border later without needing to recompute anything.
@@ -275,6 +324,8 @@ A `10px` bottom margin followed by a `15px` top margin produces `15px` of gap, n
 **Units:** `px` is an absolute pixel; `%` is relative to the parent's size for that property; `em` is relative to the current element's font size (and compounds through nested elements); `rem` is relative to the root (`html`) font size, which is why most codebases default to `rem` for spacing and font sizes — it doesn't compound unpredictably as you nest; `vw`/`vh` are 1% of the viewport width/height; `ch` is the width of the `0` character in the current font, useful for capping line length for readability.
 
 ### Typography, colors and backgrounds
+
+**In plain words:** these are the "make text and surfaces look right" settings — fonts with backups, colours written a few ways, and backgrounds that can be gradients or images.
 
 ```css
 body {
@@ -310,6 +361,8 @@ Custom properties (CSS variables) are declared with `--name: value` and read wit
 `clamp(min, preferred, max)` picks a single fluid value between two bounds (e.g. `font-size: clamp(1rem, 2vw + 0.5rem, 2rem)`) so a size scales smoothly with the viewport without a breakpoint for every step — one declaration instead of three media queries.
 
 ### Pseudo-classes and pseudo-elements
+
+**In plain words:** one colon means "the element in a mood" (hovered, focused, first child); two colons mean "an invented part of the element" that is not in your HTML at all.
 
 A **pseudo-class** (one colon, `:hover`) selects an element in a particular *state*; a **pseudo-element** (two colons, `::before`) selects a *part* of an element that isn't a real DOM node.
 
@@ -356,6 +409,8 @@ Pseudo-class specificity counts as a class, `(0, 1, 0)`, same weight as `.btn`.
 
 ### Shadows
 
+**In plain words:** shadows are painted on top of the layout and never push anything around — that is exactly what makes them useful for focus rings.
+
 ```css
 .card {
   box-shadow: 2px 4px 8px 0px rgba(0, 0, 0, 0.2); /* x y blur spread color */
@@ -382,6 +437,8 @@ Animating a shadow's blur/spread directly is expensive (it's a paint-affecting p
 
 ### Display and normal flow
 
+**In plain words:** by default boxes stack in two styles — big boxes that take the whole row (block) and small ones that sit inside a line of text (inline). `display` lets you change a box's style.
+
 Block elements (`div`, `p`, `section`, `h1`) take the full available width and start on a new line; inline elements (`span`, `a`, `strong`) take only the width their content needs and sit in the flow of text.
 
 Inline elements ignore `width`, `height`, and vertical `margin` entirely — setting `height` on a `<span>` has no effect.
@@ -400,7 +457,7 @@ Setting `display: flex`, `display: grid`, or `display: contents` changes the *ou
 
 A **block formatting context** (`display: flow-root`) contains floats and prevents margin collapsing across its boundary — it's the modern replacement for old float "clearfix" hacks.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Computing specificity, traced step by step
 
@@ -432,7 +489,7 @@ Each token only ever bumps exactly one counter, and the counters are never combi
 
 **Runnable Go version:** [[CSS Fundamentals - Cascade, Selectors, Box Model - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach to styling conflicts | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -442,26 +499,26 @@ Each token only ever bumps exactly one counter, and the counters are never combi
 | `@layer` cascade layers | explicit layer order overrides specificity order | mixing a reset, a design system, and page overrides without `!important` | needs modern browser support (fine since ~2022) and a bit of upfront planning |
 | CSS-in-JS / utility-first (Tailwind) | styles co-located with markup or generated from utility classes | component libraries, rapid prototyping | different mental model from the cascade above; Tailwind especially front-loads class lists in markup |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Specificity-chasing (adding more classes or nesting to "win") escalates into a specificity war; prefer flattening selectors (BEM-style) or cascade layers over stacking more qualifiers.
 - `!important` solves the immediate conflict but removes the normal escape hatch for the *next* person who needs to override that rule — reserve it for truly final over­rides (print styles, accessibility user stylesheets), not routine component styling.
 - `box-sizing: border-box` is close to a universal win; the only reason not to set it globally is working inside a legacy codebase that already assumes `content-box` everywhere and can't be touched.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every mainstream CSS reset (`modern-normalize`, Tailwind's preflight) starts with a universal `box-sizing: border-box` rule; component libraries like Material UI and shadcn/ui use cascade layers or CSS Modules specifically to avoid specificity conflicts with consumer apps.
 - **Failure modes → fixes:** a third-party widget's CSS overriding your button styles because its selector happens to be more specific → wrap your overrides in a layer declared after theirs, or raise specificity deliberately (`.my-app .btn`) rather than reaching for `!important`. A `:visited`/`:hover` link color flip-flopping → check LVHA order.
 - **What to monitor:** CLS from web-font swapping or images without a reserved box size; these are the box-model and rendering-path interactions this note and [[How Browsers Load and Render a Page]] both cover.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Specificity is not a single number.** A common beginner mistake is to add up `a+b+c` into one integer; that breaks down the moment `b` or `c` would need to exceed 9 in a naive base-10 sum. The correct comparison is lexicographic — compare `a`, then `b`, then `c` — which is exactly why ten classes can never outweigh one ID: the comparison never advances to `b` while `a` differs.
 - **`:is()` vs `:where()` vs `:not()` specificity.** `:where()` always contributes `(0,0,0)` regardless of its argument, which makes it the tool for "apply this everywhere, but let anything else override it trivially." `:is()` takes the specificity of its *most specific* matched argument. `:not()` is unique in that its own colon contributes nothing — only its argument's specificity counts, which is easy to get wrong by assuming it behaves like a normal pseudo-class.
 - **Cascade layers vs. source order.** Before `@layer`, "my override isn't applying" debugging meant computing specificity by hand or reordering `<link>` tags. Layers make precedence an explicit, readable list at the top of your CSS, independent of which file loads in which order, which scales much better across a large app's many stylesheets.
 - **Inheritance through the cascade, not around it.** An inherited value is itself subject to being overridden by a more specific rule on the child — inheritance is the *fallback* when no rule targets the child directly, not a separate channel that bypasses the cascade.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `#nav .item a { color: blue; }` beat `.item a.active.highlighted.special { color: red; }` even though the second rule has more classes?
 > Specificity compares the ID count first. The first rule has 1 ID (`(1,1,1)`); the second has 0 IDs and more classes (`(0,4,1)`). Since `a` (ID count) differs, the comparison stops there — `b` and `c` are never even examined. One ID always beats any number of classes.
@@ -488,7 +545,7 @@ Each token only ever bumps exactly one counter, and the counters are never combi
 >
 > Styling the focus ring with `:focus-visible` instead of `:focus` avoids an unwanted visible ring flashing on every mouse click while still showing it for keyboard users, who rely on it to know where they are.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Cascade order: origin + `!important` → specificity → source order. Each step runs only on a tie from the step before.
 - Specificity triple `(IDs, classes/attrs/pseudo-classes, type/pseudo-elements)`, compared left to right as separate digits, never summed.
@@ -499,7 +556,7 @@ Each token only ever bumps exactly one counter, and the counters are never combi
 - `:focus-visible` for an accessible focus ring; plain `:focus` fires on mouse clicks too.
 - `box-shadow` has an optional spread value; `text-shadow` does not.
 
-## Links
+## Links 🟢
 - **Before this:** [[How Browsers Load and Render a Page]]
 - **Next:** [[CSS Layout - Position, Flexbox, Grid]]
 - **Compare with:** [[React Fundamentals - Components, JSX, Props, State]]

@@ -26,7 +26,37 @@ updated: 2026-11-13
 > - Every one of these has a correct, narrow job. Using the wrong one — an atomic for a multi-field invariant, a `Cond` where a channel would do, a `sync.Map` for a frequently-updated map — compiles fine and is still a bug or a needless complication.
 > - Classic mistake: copying a value that embeds a `sync.Mutex` or `sync.WaitGroup`. `go vet`'s `copylocks` check catches this; it does not catch a forgotten `Unlock`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (each primitive, with code) and 4 (worked examples).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When two parts of a program run at the same time and both change the same variable, they can trample each other. Two goroutines each read 10, each write 11 — one +1 is lost. That trampling is called a **data race**.
+
+```mermaid
+flowchart LR
+    A["goroutine 1 reads 10"] --> C["both write 11"]
+    B["goroutine 2 reads 10"] --> C
+    C --> D["one increment<br/>silently lost"]
+```
+
+The fix is a **mutex**: a lock that only one goroutine can hold at a time. While you hold it, you alone may touch the shared data; everyone else queues.
+
+```mermaid
+flowchart LR
+    G1["goroutine 1"] --> K["the one key<br/>(mutex)"]
+    G2["goroutine 2 waits"] -.-> K
+    K --> R["touch shared data"] --> U["give key back"]
+```
+
+For one lone number there is a shortcut: an **atomic** — the CPU itself makes the update one uninterruptible step, no lock needed. The rest of this note is just these 3 questions:
+1. Mutex or atomic — how do you pick?
+2. What do the five helpers (WaitGroup, Once, Cond, Pool, Map) each solve?
+3. Which mistakes compile fine but break at runtime (copied locks, check-then-act, panicked Once)?
 
 **The problem in one story.**
 Two goroutines both add 1 to a shared counter at the same moment.
@@ -69,7 +99,7 @@ Where it breaks: a real queue is fair and orderly; Go's mutex lets newcomers bar
 > [!tip] Remember
 > Mutex for an invariant across fields, atomic for one word, and never copy a value that contains a lock.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service tracks "requests served" in a package-level `int` that every handler goroutine increments. Under `go test -race` with 200 concurrent handlers, the counter comes out wrong — not by a predictable amount, but differently on every run — because `count++` is three machine steps (load, add, store) and two goroutines can interleave between them, each overwriting the other's increment.
 
@@ -79,7 +109,7 @@ This is the generic shape of nearly every concurrency bug: two or more goroutine
 
 An atomic type does `count++` as one indivisible hardware instruction — no critical section, no waiting — but only because the whole operation fits in one machine word; the moment a "counter" needs a second field (say, a last-updated timestamp next to the count), one atomic word can no longer carry the invariant and a `Mutex` is the correct tool again.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A **`Mutex`** is a single key to one room: whoever holds the key can read and write everything inside; everyone else waits at the door, no matter how little of the room they needed to touch.
 
@@ -97,7 +127,7 @@ An **atomic** value is not a room at all — it is a single slot that the CPU it
 | `Pool` | "Reuse short-lived objects instead of letting the allocator and GC handle every one." |
 | `Map` | "A map for two specific access patterns, built to avoid the allocation and lock overhead a general map + mutex would need for them." |
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Choosing a primitive
 
@@ -121,6 +151,8 @@ flowchart TD
 ```
 
 ### Mutex: one critical section, no exceptions
+
+**In plain words:** a mutex is the single restroom key — simple, but with house rules: don't ask for the key while already holding it, don't take it on a long phone call (I/O), and always collect keys in the same order.
 
 ```mermaid
 stateDiagram-v2
@@ -182,7 +214,7 @@ The guarantee is "ran once", not "ran successfully": if `f` panics, `Do` still m
 
 The pattern itself, applied to building a single shared instance, is [[Singleton and sync.Once]]; this note is about the primitive's own mechanics.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -354,6 +386,8 @@ func TestLazyConfigErrCachesTheFailure(t *testing.T) {
 
 ### Cond: a bounded queue
 
+**In plain words:** `Cond` is a waiting room with a bell — goroutines doze until someone rings, then each one re-checks whether the thing it was waiting for is actually true before acting.
+
 `Cond` is shown here because interviewers ask about it, not because it is the first tool to reach for — a buffered channel does the same bounded-queue job with less code (see "Trade-offs").
 
 `Wait` must always sit in a `for` loop re-checking the condition, never an `if`: `Wait` can return because of a `Signal`/`Broadcast` meant for a different state change, or (rarely) a spurious wakeup, so the woken goroutine has to re-verify the condition itself before proceeding.
@@ -418,6 +452,8 @@ func (q *BoundedQueue) Close() {
 
 ### Pool: reusing buffers across requests
 
+**In plain words:** `sync.Pool` is a crate of returnable bottles — grab one instead of making a new one, but wash it first (`Reset`), because the last user may have left something inside.
+
 ```go
 var bufPool = sync.Pool{
     New: func() any { return new(bytes.Buffer) },
@@ -444,6 +480,8 @@ func EncodeWithPool(s string) []byte {
 `TestEncodeWithPoolIsCorrectUnderConcurrency` hammers `EncodeWithPool` from four goroutines, 1,000 calls each, and checks every result is correct — the point being that reuse must never leak one caller's bytes into another's output, which is why `Reset` before use and a fresh copy on the way out both matter.
 
 ### Atomics: a sharded counter and a CAS retry loop
+
+**In plain words:** two lock-free tricks — spread a hot counter across several slots so goroutines stop elbowing each other, and update a maximum with "try, and if someone beat me, re-read and try again" (that retry is CAS).
 
 ```go
 // ShardedCounter spreads increments across several atomic.Int64 shards to
@@ -511,6 +549,8 @@ This is the standard fix for a single hot map under heavy concurrent writes — 
 
 ### sync.Map: the two patterns it is actually for
 
+**In plain words:** `sync.Map` is a specialist, not a safer map — great when keys are written once and read forever, wrong when the same keys keep changing.
+
 ```go
 // MemoCache memoizes compute(key) using sync.Map. sync.Map is tuned for
 // (1) a key written once and read many times by many goroutines, and
@@ -543,7 +583,7 @@ func (c *MemoCache) Get(key int, compute func(int) int) int {
 
 `TestMemoCacheAllCallersGetTheWinningValue` fires 50 goroutines at the same missing key and asserts every one of them ends up with the same winning value, even though more than one of them may have called `compute`; `TestMemoCacheSecondCallDoesNotRecompute` checks the fast path never calls `compute` again once a value is stored.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | ------ | ------------ | -------- | ---- |
@@ -554,7 +594,7 @@ func (c *MemoCache) Get(key int, compute func(int) int) int {
 | `sync.Map` | Internally two maps: a lock-free read map and a mutex-guarded dirty map that read-misses fall back to | Mostly-read keys, or disjoint key sets per goroutine (per-connection caches, pub/sub registries) | No `len()`, no typed values (`any` + assertion), slower than `map`+`RWMutex` under frequent updates to the same keys |
 | `Cond` | Explicit wait/signal on an arbitrary predicate, under a `Mutex` | A condition more complex than "is the lock free" that several goroutines must wait on | More code and easier to get wrong than a channel; prefer a channel unless `Cond`'s broadcast-to-all-waiters shape is exactly what's needed |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `Cond` almost always has a simpler channel-based equivalent; reach for it mainly when a library's existing lock (not one you control) must be the thing goroutines wait on, or in an interview that explicitly asks for it.
 - `sync.Map` is a specialized tool, not a safer default `map`. For a cache with frequent updates to the same hot keys — the common backend shape — `map` + `RWMutex` is simpler, gives you `len()`, and is usually faster.
@@ -562,7 +602,7 @@ func (c *MemoCache) Get(key int, compute func(int) int) int {
 - `Pool` only pays off for objects expensive enough to allocate that reuse beats letting the garbage collector handle them (buffers, not small structs); pooling cheap objects can cost more in bookkeeping than it saves.
 - None of this matters if the data is never shared: confining state to one goroutine and communicating results over a channel sidesteps the whole category of bugs these primitives exist to prevent.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `net/http`'s `Transport` guards its idle-connection pool with a mutex; `database/sql`'s `*DB` pool does the same for its free-connection list; `log/slog`'s JSON handler and `encoding/json` both use `sync.Pool` buffers on the hot encode path to cut allocations per request; Prometheus's `client_golang` counters and histograms are built on `sync/atomic` so recording a metric never blocks a request goroutine; `golang.org/x/sync/singleflight` (used by many caching layers) is itself a `Mutex` plus a map of in-flight calls.
 - **Failure modes → fixes:**
@@ -572,7 +612,7 @@ func (c *MemoCache) Get(key int, compute func(int) int) int {
   - A struct with a `sync.Mutex` field gets passed by value into a function or stored in a slice by value → `go vet`'s `copylocks` flags it; the fix is a pointer receiver and pointer storage, never a value copy.
 - **What to monitor:** the mutex and block profiles (`SetMutexProfileFraction`, `SetBlockProfileRate`) for contention hotspots; `sync.Pool` get/put counts are not exposed by the runtime directly, so teams that care instrument their own pool wrapper; goroutine count alongside lock-wait time, since a rising wait time with a flat goroutine count usually means one lock, not a leak.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Mutex internals.** A `Mutex` is a 32-bit state word plus a wait queue coordinated through the runtime's internal futex-like primitive (`runtime.semacquire`/`semrelease` on most platforms). The fast path — an uncontended `Lock()` — is a single compare-and-swap with no syscall; only a contended `Lock()` parks the goroutine. This is why an uncontended mutex is cheap even though the type "supports" blocking: the blocking machinery is paid for only when it is actually needed.
 - **Why atomics outperform a mutex for one word.** An atomic operation is a single CPU instruction (on amd64, a `LOCK`-prefixed instruction; on arm64, exclusive-load/store pairs) with no possibility of the goroutine parking. A mutex, even on the uncontended fast path, does more bookkeeping (the CAS on the state word, plus the surrounding `Lock`/`Unlock` call overhead) and on the contended path parks a goroutine through the scheduler — a far more expensive operation than any single instruction. The measured numbers above are one concrete instance of this general shape.
@@ -581,7 +621,7 @@ func (c *MemoCache) Get(key int, compute func(int) int) int {
 - **`sync.Pool` and GC.** A `Pool`'s per-`P` private store avoids a lock on the fast path; the "victim cache" means an object can survive being dropped for exactly one extra GC cycle before it is really gone, which is a deliberate trade-off between memory held by idle pools and allocation cost on a traffic spike right after a GC.
 - **RWMutex writer starvation.** Go's `RWMutex` is written to prevent a continuous stream of new readers from starving a waiting writer forever: once a writer is queued, new readers queue behind it rather than jumping ahead indefinitely. This does not make `RWMutex` fair in the way `Mutex`'s starvation mode is; it only bounds the specific writer-starvation failure mode.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When would you reach for `atomic.Int64` instead of a `Mutex`-guarded `int`?
 > When the entire invariant is that one int64 — a counter, a flag, a single pointer swap — and nothing else must change atomically with it. The moment a second field has to stay consistent with the first, an atomic can no longer express the invariant and a `Mutex` is correct again.
@@ -613,7 +653,7 @@ func (c *MemoCache) Get(key int, compute func(int) int) int {
 >
 > Sharding earns its cost once contention on one cache line is the actual bottleneck, typically only visible on machines with many cores under heavy write load — profile before sharding.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `Mutex` protects an invariant across one or more fields; `atomic` protects exactly one word. Don't use the second to half-solve the first's job.
 - `Mutex`/`RWMutex`/`WaitGroup` zero values are ready to use; none of them may ever be copied after first use (`go vet`'s `copylocks`).
@@ -624,7 +664,7 @@ func (c *MemoCache) Get(key int, compute func(int) int) int {
 - `sync.Map` wins only for mostly-read or disjoint-key workloads; a frequently-updated map usually wants `map` + `RWMutex` instead.
 - `WaitGroup.Go` (Go 1.25) folds `Add`/`go`/`Done` into one call; on Go 1.24, `Add` must run before `go`, never inside the goroutine.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Goroutines and Channels]], [[Concurrency Primitives - Mutex, Semaphore, Atomics]]
 - **Next:** [[select and Concurrency Patterns]], [[Context Package]], [[Memory Model and Data Races]]

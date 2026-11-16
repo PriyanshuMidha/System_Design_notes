@@ -23,7 +23,33 @@ updated: 2026-11-13
 > - A secret is a special kind of config value: never commit it, never log it, and its storage and rotation are a different concern (link [[Secrets Management]]) from the typed-loading problem this note solves.
 > - Precedence, lowest to highest: built-in defaults → config file → environment variables → command-line flags.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your service runs in different places — your laptop, a test server, production. In each place the database address, the port and the passwords are different.
+
+**Configuration** is all those per-place values. The rule in Go: read them once, at startup, into one typed struct, and check them all before the service starts. Nothing else in the codebase ever calls `os.Getenv` directly.
+
+```mermaid
+flowchart LR
+    E[Env vars / files] --> L[Load once in main] --> V{All valid?}
+    V -- no --> X[Refuse to start, list every problem]
+    V -- yes --> C[One Config struct passed to everything]
+```
+
+A **secret** is a config value that must never be printed or committed: passwords, API keys. They load the same way but are stored and logged differently.
+
+The rest of this note is just these 4 questions:
+1. Where do values come from, and which source wins (resolution order)?
+2. How do you parse and validate them into one struct, failing fast?
+3. How are secrets stored and kept out of logs?
+4. Why are feature flags not the same thing as config?
 
 **The problem in one story.**
 Your service runs on your laptop, in staging and in production.
@@ -70,6 +96,8 @@ Where it breaks: a paper form cannot change later, while a real service may relo
 
 ### Whiteboard version
 
+**In plain words:** the smallest load-once-validate-everything config loader.
+
 The shape every service needs, with nothing else: read one variable, fail if it's missing, parse it.
 
 ```go
@@ -87,7 +115,7 @@ if err != nil {
 
 The rest of this note turns that one-variable shape into a typed struct that loads every variable a service needs, validates all of them together, and keeps secrets out of logs.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps runs the same binary in three environments: a developer's laptop, a staging cluster and production. The database address, the log verbosity and the JWT signing key are different in each one, but the code that uses them must not change.
 
@@ -97,7 +125,7 @@ Concretely, if `internal/repository` called `os.Getenv("DATABASE_URL")` directly
 
 A typed `Config`, loaded once in `main` and passed down as a constructor argument, fixes all three: one place reads the environment, `Load` fails before the server starts if anything is missing or malformed, and tests pass in a fake config instead of a real environment.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat configuration like a form someone has to fill out completely before a shop opens for the day.
 
@@ -107,9 +135,11 @@ Only once the form passes does the shop's `main` hand it to the cash register, t
 
 A secret is a field on that form that gets covered with a strip of tape before anyone photocopies it. It's still filled in, it still works when the register needs it, but anyone just glancing at the form, or printing it in a report, only ever sees "REDACTED".
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Resolution order
+
+**In plain words:** when the same setting is set in two places, a fixed ranking decides which one wins — flags beat env vars beat files beat defaults.
 
 ```mermaid
 flowchart LR
@@ -165,6 +195,8 @@ Nothing downstream of `Load` ever reads an environment variable again; every dep
 
 ### Fail-fast validation that reports everything at once
 
+**In plain words:** if 3 settings are wrong, say all 3 in one go — do not make the operator fix them one restart at a time.
+
 A naive loader returns on the first error:
 
 ```go
@@ -188,6 +220,8 @@ The standard library's `flag` package is enough for a handful of overrides; past
 
 ### Secrets: storage, not just loading
 
+**In plain words:** a password needs more than loading: it must live somewhere locked (a secret store), rotate, and never appear in a log line.
+
 `JWT_SECRET` and `RAZORPAY_WEBHOOK_SECRET` are config values, but they need more care than an address or a timeout:
 
 - **Source.** In Kubernetes, a `Secret` object is mounted either as environment variables (visible to anything that can read the pod spec or exec into the container) or as files under a volume mount (readable only by processes with filesystem access, and rotatable by updating the file without restarting the pod if the application watches it). AWS Secrets Manager, SSM Parameter Store and HashiCorp Vault serve the same purpose outside Kubernetes, typically fetched at startup through a sidecar (the CSI Secrets Store driver, External Secrets Operator) that still lands the value as a file or env var the typed loader reads the same way.
@@ -200,7 +234,7 @@ A feature flag (`new-checkout-flow: true`) changes behavior per user, cohort or 
 
 Treating a flag as a `Config` field means every flip needs a restart; treating config as a flag means a value that should never change per-request (`DATABASE_URL`) now has runtime-mutable state nothing guards. (Flag system design is [[Feature Flags]]'s job.)
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A `config` package that loads InvoiceOps' startup configuration: env vars with `os.LookupEnv`, typed parsing, `errors.Join` validation, flag overrides and a redacting `Secret` type. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -516,7 +550,7 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
 
 **Measured:** all five tests pass under `go test -race` on Go 1.24.4, darwin/arm64, 2026-11-07.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -528,14 +562,14 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
 | K8s Secret as mounted file | Secret's keys written as files under a volume | Rotation without a pod restart (watch the file); slightly more restrictive read access | Loader needs a file-watch path, not just env read |
 | External Secrets Operator / CSI Secrets Store | Pulls from Vault/AWS Secrets Manager/SSM into a K8s Secret or volume automatically | Secrets live in a dedicated store, Kubernetes never holds the source of truth | Extra infrastructure component to operate |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A tiny CLI tool with three flags doesn't need a `Config` struct or `errors.Join`; plain `flag.String` calls in `main` are simpler and the extra layer would be padding.
 - Reflection-based env binding (`caarlos0/env`) trades a few lines of boilerplate for a less readable failure path when a tag is malformed; worth it once the field count passes roughly 15-20.
 - A config file adds a deploy artifact to manage (who packages it, where does it live, how does it get updated without a binary rebuild) — skip it until environment variables and flags together are no longer expressive enough (nested structures, arrays of backend targets).
 - Watching a mounted secret file for rotation adds a goroutine and a race to get right (swap the value atomically, don't read half-written bytes mid-update); a short-lived process that restarts on every deploy doesn't need it at all.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every 12-factor-style service (Heroku's own apps, most Go services at Uber, Stripe and similar companies per their public engineering blogs) load config this way: one typed struct, built once, in `main`. Kubernetes' own `ConfigMap`/`Secret` objects are designed around "inject as env vars or mount as files", matching the two Config-loading paths this note covers.
 - **Failure modes → fixes:**
@@ -545,14 +579,14 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
   - Two replicas behave differently after the "same" deploy → one picked up a stale `ConfigMap`/`Secret` because nothing restarted it; either restart on config change (most common) or implement an explicit reload path and prove it with a test.
 - **What to monitor:** a start-up metric or log line that names which config fields came from env vs flags vs defaults (for debugging "why is staging behaving like prod"); an alert on any production container exiting immediately after start (frequently a config validation failure caught right where this note intends it to be caught).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why validate everything before constructing anything.** If `Load` returns as soon as `DATABASE_URL` parses, and `main` goes on to call `repository.Open(cfg.DatabaseURL)` before checking `cfg.JWTSecret`, a malformed JWT secret now surfaces as a runtime panic deep inside the auth middleware on the first request, not as a startup failure with a clear message. Validating the whole struct before `main` constructs a single dependency turns every configuration mistake into the same failure mode: a readable message on stderr and a non-zero exit code, at the moment before any resource (a DB connection, a listening socket) was even opened.
 - **`UnmarshalText` as the general typed-parsing hook.** `slog.Level` implements `encoding.TextUnmarshaler`, and so can custom config enums — implementing that one interface method lets `Load` call the same `field.UnmarshalText([]byte(raw))` pattern for any string-backed type without hand-rolling a switch statement per type, and the same type becomes usable directly with `encoding/json` and `encoding/yaml` for free.
 - **Why `Secret` is a distinct type, not a convention.** A team rule ("never log `cfg.JWTSecret` directly") is only as good as everyone remembering it, every time, including six months from now when someone adds a debug log line under deadline pressure. A type-level guarantee (`LogValue()` always redacts) holds regardless of who writes the next line of code, and `go vet` combined with a lint rule can even flag a raw `string` field tagged `secret` that bypasses the wrapper.
 - **Test isolation without `os.Setenv`.** `t.Setenv` (Go 1.17) is the right tool for testing code that must call `os.Getenv` directly, and it automatically restores the previous value and fails if the test calls `t.Parallel()` (mutating process-global env is inherently unsafe across parallel tests). The `source` interface in this note's `Load` goes one step further: tests never touch real env vars at all, so `TestLoadCollectsEveryError` and friends can run with `t.Parallel()` with zero risk of interference.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why `os.LookupEnv` instead of `os.Getenv` for required fields?
 > `Getenv` returns `""` both when a variable is unset and when it's deliberately set to empty, so a required secret left unset silently becomes an empty string instead of a startup error. `LookupEnv` returns `(value, ok)`, letting `Load` distinguish "missing" from "empty on purpose" and fail loudly on the former.
@@ -575,7 +609,7 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
 > [!question]- What's the precedence order between a config file, environment variables and flags, and why that order?
 > Defaults, then a config file, then environment variables, then flags — each later source overrides only the fields it sets. Flags are highest because they're the most deliberate, explicit, per-invocation override (a one-off smoke test); environment variables carry the normal per-deployment configuration in containers, where there's rarely an interactive flag to pass.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Read config once, in `main`, into a typed `Config` struct; never scatter `os.Getenv` calls across packages.
 - `os.LookupEnv`, not `os.Getenv`, for anything required — it distinguishes unset from empty.
@@ -586,7 +620,7 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
 - Secrets come from K8s Secrets (env or mounted file), AWS Secrets Manager/SSM, or Vault — storage and rotation are a different concern from typed loading.
 - A feature flag is not config: config is fixed per process start, a flag flips at runtime through its own system.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Service Project Layout and Wiring]]
 - **Next:** [[HTTP Server Fundamentals (net-http)]]

@@ -27,6 +27,8 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
+**In plain words:** same 6 questions, two ways of asking — one at a time vs all at once. The table below is the whole argument in two rows.
+
 Six requests, each taking 50ms to answer, fired at the same server:
 
 | Protocol, one connection | What happens | Measured here |
@@ -36,7 +38,43 @@ Six requests, each taking 50ms to answer, fired at the same server:
 
 That gap is the entire reason HTTP/2 exists: one connection, many requests in flight at once, instead of one request at a time or one connection per request.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A web page is not one file. It is one HTML file plus lots of little files: pictures, styles, scripts.
+
+Your browser must ask the server for each one. Each question-and-answer pair is a **request** and a **response**.
+
+With the oldest way, HTTP/1.1, the browser asks for one file, waits, gets it, then asks for the next. Like one checkout counter with a long queue.
+
+```mermaid
+flowchart LR
+    B["Browser"] -- "file 1, then file 2, then file 3..." --> S["Server"]
+```
+
+HTTP/2 lets the browser ask for all the files at once over one line, mixed together. Much faster.
+
+But that one line is a **TCP** line, and TCP has a strict rule: deliver everything in order. If one piece gets lost on the way, everything behind it waits.
+
+HTTP/3 swaps the line itself for a new one (called **QUIC**) where each file travels in its own lane. A lost piece only delays its own file.
+
+```mermaid
+flowchart LR
+    B["Browser"] -- "HTTP/2: one shared lane" --> S["Server"]
+    B -- "HTTP/3: a lane per file" --> S
+```
+
+That is the whole story. The rest of this note is just these 3 questions:
+1. Why was one-at-a-time (HTTP/1.1) too slow, and what did browsers do about it?
+2. How does HTTP/2 mix many files on one line, and where does it still get stuck?
+3. How does HTTP/3 make a lost piece hurt only one file?
+
 
 **The problem in one story.**
 You open a news site. The page needs the HTML, a stylesheet, scripts, twenty images and a font.
@@ -81,7 +119,7 @@ Where it breaks: real lanes do not share one congestion budget or one encryption
 > [!tip] Remember
 > Each version fixes the previous one's bottleneck: HTTP/2 shares one connection, HTTP/3 stops one lost packet from stalling every stream.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Browsers load a page that references dozens of resources: HTML, CSS, several JS bundles, a dozen images, a font.
 
@@ -113,7 +151,7 @@ flowchart LR
 
 HTTP/2 (2015, based on Google's SPDY) fixes this by multiplexing: many logical streams share one TCP connection, so you get the parallelism of 6 connections without opening 6 connections. HTTP/3 (RFC 9114, standardized 2022) goes further: it replaces TCP with QUIC, because even HTTP/2's one connection still suffers when the network drops a single packet.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a single doctor's office (one TCP connection):
 
@@ -121,9 +159,11 @@ Think of a single doctor's office (one TCP connection):
 - **HTTP/2:** one receptionist interleaves several patients in the same room, picking up one patient's chart, working on it, swapping to another chart, swapping back — all patients make progress concurrently, but it's still one room (one TCP connection). If the building's single entrance (TCP's byte stream) jams, every patient in that room waits.
 - **HTTP/3:** each patient gets their own entrance into the building (an independent QUIC stream), so a jam at one entrance doesn't block the others, even though they all still belong to the same building (the same QUIC connection, which carries its own encryption and congestion control).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### HTTP/1.1: text framing, no multiplexing
+
+**In plain words:** HTTP/1.1 messages are plain readable text, like a letter — easy to read, but the postbox takes one letter at a time.
 
 A request and response are plain text, terminated by a blank line, with chunked or `Content-Length`-delimited bodies:
 
@@ -137,6 +177,8 @@ Accept-Encoding: gzip, br
 Keep-alive (the default since HTTP/1.1) reuses the TCP connection for the next request, but strictly one in flight at a time per connection unless pipelining is used — and pipelining is dead in practice.
 
 ### HTTP/2: binary framing, multiplexing, HPACK
+
+**In plain words:** HTTP/2 chops every message into small labelled chunks (frames), so many conversations can share one line — like numbered puzzle pieces from several puzzles mixed in one box, sorted back out on arrival.
 
 HTTP/2 wraps every request and response in small binary **frames** (`HEADERS`, `DATA`, `SETTINGS`, `WINDOW_UPDATE`, `RST_STREAM`, ...), each tagged with a **stream ID**. Frames from different streams interleave freely on the same TCP connection; the receiver reassembles each stream from its tagged frames.
 
@@ -192,6 +234,8 @@ flowchart TB
 ```
 
 ### HTTP/3: QPACK over QUIC
+
+**In plain words:** HTTP/3 keeps the same chopped-into-chunks idea but ships the chunks over QUIC, where each conversation has its own delivery guarantee — one lost chunk no longer holds up everyone else.
 
 HTTP/3 keeps HTTP/2's request/response and frame model but changes the transport: QUIC (RFC 9000) runs over UDP and gives **each HTTP stream its own independent QUIC stream**, each with its own loss detection and retransmission. A packet lost on stream 5 only stalls stream 5; streams 1 and 3 keep delivering.
 
@@ -268,7 +312,7 @@ Go's `net.Conn` exposes the same underlying socket via `(*net.TCPConn).SyscallCo
 > [!tip] Remember
 > The HTTP layer cannot see TCP-level HOL blocking directly — correlate simultaneous stream stalls with a nonzero retransmit counter on that one connection (`ss -ti`'s `retrans` field, or `TCP_INFO`'s `tcpi_lost`/`tcpi_retransmits`) to tell it apart from ordinary application slowness.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The only thing that actually changes between protocols, as far as `net/http` is concerned, is which `http.RoundTripper` the client uses and what the server negotiates over TLS (ALPN, see [[TLS and HTTPS]]). The application code (handlers, `http.ResponseWriter`) is identical — which is itself worth noticing: the protocol upgrade is a transport-layer decision, not something application code has to branch on.
 
@@ -286,6 +330,8 @@ HTTP/3 needs a QUIC implementation (`golang.org/x/net/http3` or `quic-go`); the 
 
 ### Representative output: what a real negotiation looks like
 
+**In plain words:** browser and server agree on which HTTP version to speak during the TLS hello (a step called ALPN); these curl lines show that agreement happening.
+
 ```text
 $ curl -v --http2 https://example.com/ 2>&1 | grep -E "ALPN|HTTP/2"
 * ALPN: curl offers h2,http/1.1
@@ -300,7 +346,7 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
 ```
 *(representative output (curl 8.x with HTTP/3 support); exact ALPN and curl diagnostic lines vary by curl build and server.)*
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Version | Transport | Multiplexing | Header compression | Head-of-line blocking | Typical use today |
 | --- | --- | --- | --- | --- | --- |
@@ -308,14 +354,14 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
 | HTTP/2 | TCP + TLS (ALPN `h2`) | Yes, one connection, many streams | HPACK (static + dynamic table) | Fixed at the HTTP layer; **still present at the TCP layer** | Default for most web traffic and gRPC |
 | HTTP/3 | QUIC over UDP | Yes, independent per-stream loss recovery | QPACK (table updates on a side channel) | Fixed at both layers: one lost packet stalls only its own stream | Browsers and CDNs on lossy or mobile networks (YouTube, Google, Facebook, Cloudflare, Fastly) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - HTTP/2 and HTTP/3 add real complexity: frame parsing, flow-control windows per stream and per connection, and (for HTTP/3) a full QUIC stack. A tiny internal service talking to one known client gains little from either.
 - QUIC's UDP transport is sometimes blocked or throttled by restrictive corporate firewalls and some middleboxes that only recognize TCP; a client must be able to fall back to HTTP/2 (`Alt-Svc` header advertises HTTP/3 availability so this fallback is explicit, not silent).
 - QUIC does its congestion control and loss recovery in userspace, costing more CPU per byte than the kernel's TCP stack — real but usually acceptable at typical CDN and browser traffic volumes.
 - Pick HTTP/1.1 only when you control both ends, don't need multiplexing (e.g. one slow batch endpoint called rarely), or are debugging — HTTP/1.1 is far easier to read on the wire.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Go's `net/http` server and client negotiate HTTP/2 automatically over TLS. gRPC (see [[gRPC]] in `05 APIs`) requires HTTP/2 for multiplexed streaming RPCs. Major CDNs (Cloudflare, Fastly, Google, Akamai) serve HTTP/3 by default at the edge and advertise it via the `Alt-Svc` header so clients upgrade opportunistically.
 - **Failure modes → fixes:**
@@ -324,7 +370,7 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
   - UDP-based HTTP/3 traffic blocked by a middlebox silently falls back to TCP → rely on the client's automatic fallback via `Alt-Svc` rather than assuming HTTP/3 reached the server.
 - **What to monitor:** negotiated protocol version per response (`resp.Proto` in Go, or an access-log field), concurrent streams per connection, stream reset rate, and QUIC-specific packet loss/retransmission rate at the edge.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why pipelining really failed.** RFC 9112 still permits HTTP/1.1 pipelining, but responses must return in request order, so one response that never returns, or an intermediary that buffers and reorders incorrectly, wedges the whole connection.
   - No major browser shipped it enabled by default.
@@ -340,7 +386,7 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
   - RFC 9218's simpler "Extensible Priority" scheme (one urgency 0–7 plus an incremental flag) is what browsers moved to for both HTTP/2 and HTTP/3.
   - A server that ignores priority signals is still spec-conformant; it just can't offer any scheduling benefit from them.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Did HTTP/2 solve head-of-line blocking?
 > Only at the HTTP layer. Multiple HTTP/2 streams no longer block each other logically, but they still share one TCP byte stream, and TCP enforces in-order delivery. A single lost TCP segment stalls every stream on that connection until it's retransmitted. HTTP/3 fixes this by giving each stream its own QUIC-level loss recovery.
@@ -367,7 +413,7 @@ $ curl -v --http3 https://cloudflare.com/ 2>&1 | grep -E "using HTTP|HTTP/3"
 > [!question]- A client on a flaky Wi-Fi connection keeps stalling mid-download. Which protocol change helps most, and why?
 > Move it to HTTP/3. Under TCP (HTTP/1.1 or HTTP/2) a single lost packet pauses the entire connection until retransmission completes. QUIC isolates loss recovery per stream, so a lost packet on one stream doesn't stall unrelated streams, and QUIC's connection migration (by connection ID, not IP/port) also tolerates a network change like Wi-Fi to cellular without restarting the connection.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - HTTP/1.1: one request in flight per connection; browsers open ~6 connections per host to get parallelism; pipelining exists on paper but no browser enabled it.
 - HTTP/2: binary frames, one TCP connection, many multiplexed streams, HPACK header compression, optional (now mostly unused) stream priority.

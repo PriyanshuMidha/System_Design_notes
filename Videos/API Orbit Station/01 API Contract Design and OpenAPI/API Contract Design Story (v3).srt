@@ -1,0 +1,752 @@
+1
+00:00:02,399 --> 00:00:08,130
+Narrator: A ship is low on fuel. It has half an hour to dock. But the docking arm does not fit the hatch.
+
+2
+00:00:08,560 --> 00:00:13,185
+Vega: Wait. Say again? It doesn't fit?
+
+3
+00:00:13,715 --> 00:00:16,062
+Pip: The ship crew built the arm.
+
+4
+00:00:16,492 --> 00:00:19,102
+Vega: And the station crew built the hatch?
+
+5
+00:00:19,632 --> 00:00:23,346
+Pip: Yep. And nobody wrote the size down.
+
+6
+00:00:23,775 --> 00:00:28,282
+Vega: Oh no. Half an hour, and nobody owns this.
+
+7
+00:00:28,711 --> 00:00:36,194
+Narrator: Today's story is about one simple idea. When two teams build two halves of one thing, they must agree on the shape first, in writing.
+
+8
+00:00:36,624 --> 00:00:40,578
+Narrator: So the rule is: write the shape down before anyone builds.
+
+9
+00:00:43,527 --> 00:00:48,753
+Narrator: While Vega thinks, a second problem shows up. The cargo screen on the ship has gone blank.
+
+10
+00:00:49,183 --> 00:00:52,561
+Pip: Commander! It worked this morning!
+
+11
+00:00:52,991 --> 00:00:55,409
+Vega: Okay, so what changed?
+
+12
+00:00:55,939 --> 00:00:59,485
+Pip: One word. Price became amount.
+
+13
+00:00:59,915 --> 00:01:04,013
+Brix: Amount reads better, okay? Who'd mind?
+
+14
+00:01:04,444 --> 00:01:07,486
+Pip: Brix. The ship would.
+
+15
+00:01:07,915 --> 00:01:13,694
+Vega: Because the ship still looks for price. It finds nothing, so it shows nothing.
+
+16
+00:01:14,123 --> 00:01:18,006
+Brix: Huh? But my side passed every check!
+
+17
+00:01:18,536 --> 00:01:27,626
+Narrator: And here is the sneaky part. The station checked its own side, and everything passed. Nothing on the station could tell that a ship far away depended on that one word.
+
+18
+00:01:28,055 --> 00:01:38,682
+Narrator: It is just like an app on a phone. Many people do not update for weeks. Their old app still asks for the old word. For them the screen goes blank, and the station sees no error at all.
+
+19
+00:01:39,111 --> 00:01:45,394
+Vega: So the rule is: a name people rely on is a promise. No quiet changes.
+
+20
+00:01:48,343 --> 00:01:52,730
+Narrator: Before we fix it, five simple words. We will use them all story long.
+
+21
+00:01:53,159 --> 00:02:01,865
+Narrator: First, A P I. That is just a way for one program to ask another program for something. The ship asking the station for a berth is an A P I call.
+
+22
+00:02:02,296 --> 00:02:10,282
+Narrator: Second, request and response. The request is what you send. The response is what comes back. A question, and its answer.
+
+23
+00:02:10,711 --> 00:02:17,377
+Narrator: Third, a field. A field is one named piece of information, like price, or berth number. One box on a form.
+
+24
+00:02:17,807 --> 00:02:25,578
+Narrator: Next page. Fourth, a contract. A contract is the written promise of what you may ask for, and exactly what you will get back.
+
+25
+00:02:26,008 --> 00:02:32,889
+Narrator: Fifth, a breaking change. That is a change that makes an existing user fail. Renaming price to amount was one.
+
+26
+00:02:33,319 --> 00:02:40,250
+Narrator: So the rule is: an A P I is a conversation, and the contract is the written script of that conversation.
+
+27
+00:02:43,199 --> 00:02:47,921
+Narrator: Vega calls the one person who writes things down. Customs Officer Lex.
+
+28
+00:02:48,352 --> 00:02:54,081
+Lex: Evening. Let me guess. Two crews, no drawing?
+
+29
+00:02:54,512 --> 00:02:56,234
+Vega: How did you know?
+
+30
+00:02:56,764 --> 00:03:00,981
+Lex: Every single week. Think of a wall socket.
+
+31
+00:03:01,412 --> 00:03:04,693
+Pip: A wall socket? Why a socket?
+
+32
+00:03:05,223 --> 00:03:08,818
+Lex: Plugs and sockets are made by people who never meet.
+
+33
+00:03:09,247 --> 00:03:12,217
+Lex: But both follow one published shape.
+
+34
+00:03:12,647 --> 00:03:16,169
+Pip: Oh! That's why any plug fits!
+
+35
+00:03:16,599 --> 00:03:23,265
+Lex: Exactly. Write the shape down once. Everyone builds to it.
+
+36
+00:03:23,695 --> 00:03:32,330
+Narrator: The standard file for writing that shape is called Open A P I. Think of it as the technical drawing of the socket, so exact that a machine can check a plug against it.
+
+37
+00:03:32,759 --> 00:03:36,882
+Narrator: So the rule is: one published shape, and every side builds to it.
+
+38
+00:03:39,831 --> 00:03:46,954
+Narrator: There are two ways to work. In the first, you draw the blueprint, agree on it, and then build. That is called contract first.
+
+39
+00:03:47,383 --> 00:03:52,825
+Narrator: In the second, you build first, and draw the blueprint from what you built. That is called code first.
+
+40
+00:03:53,256 --> 00:03:55,145
+Pip: So which one's better?
+
+41
+00:03:55,675 --> 00:04:00,997
+Lex: Depends. Draw first, if lots of crews are involved.
+
+42
+00:04:01,427 --> 00:04:03,150
+Pip: Why's that?
+
+43
+00:04:03,680 --> 00:04:09,050
+Lex: The ship crew can start today. Even before the hatch exists.
+
+44
+00:04:09,479 --> 00:04:13,626
+Lex: Build first is quick, if one small team does it all.
+
+45
+00:04:14,056 --> 00:04:18,129
+Lex: But then the drawing only shows whatever the hatch happened to do.
+
+46
+00:04:18,560 --> 00:04:25,514
+Narrator: Either way, there is one danger. The drawing says one thing, and the real hatch does another. That is called drift.
+
+47
+00:04:25,944 --> 00:04:30,858
+Lex: Easy. A part cut from the drawing can't disagree with it.
+
+48
+00:04:31,288 --> 00:04:37,641
+Narrator: And if you build first, you redraw the blueprint automatically every time, and stop the work if it changed by accident.
+
+49
+00:04:38,072 --> 00:04:43,922
+Narrator: So the rule is: whichever way you work, make sure the drawing and the real hatch cannot drift apart.
+
+50
+00:04:46,872 --> 00:04:51,065
+Narrator: So what is inside the blueprint? Four things. Let us open it.
+
+51
+00:04:51,495 --> 00:04:58,425
+Narrator: One, the doors. Every address the station answers, and what kind of request each one takes. Those are called endpoints.
+
+52
+00:04:58,855 --> 00:05:04,250
+Narrator: Two, what goes in. Which fields you must hand over when you knock, like the berth and the bunks you want.
+
+53
+00:05:04,680 --> 00:05:09,161
+Narrator: Three, what comes out. The fields you get back, like the booking number and the total.
+
+54
+00:05:09,591 --> 00:05:15,153
+Narrator: Four, what the errors say. When the answer is no, every door says it the same way, with a clear reason.
+
+55
+00:05:15,584 --> 00:05:18,410
+Lex: Oh, and don't forget limits!
+
+56
+00:05:18,839 --> 00:05:24,473
+Lex: Every text has a longest length. Every list has a biggest size.
+
+57
+00:05:24,903 --> 00:05:26,721
+Pip: And if there's no limit?
+
+58
+00:05:27,252 --> 00:05:31,038
+Lex: Then someone pushes a giant message through the door.
+
+59
+00:05:31,468 --> 00:05:37,317
+Narrator: The blueprint also says who may enter. It can mark a few doors, like the health check, as open to everyone.
+
+60
+00:05:37,747 --> 00:05:43,886
+Narrator: So the rule is: write down every door, what goes in, what comes out, what the errors say, and how big things may be.
+
+61
+00:05:46,836 --> 00:05:51,005
+Narrator: Now some tidy habits that stop silly mistakes. One at a time.
+
+62
+00:05:51,435 --> 00:05:57,838
+Narrator: Times are written one standard way, in the same time zone for everybody. That way no ship reads noon as midnight.
+
+63
+00:05:58,267 --> 00:06:06,206
+Narrator: Money is kept as whole cents, plus the name of the currency. Not decimals. Ten cents plus twenty cents is always exactly thirty.
+
+64
+00:06:06,636 --> 00:06:14,526
+Narrator: Ids are written as text, even when they look like numbers. Some programs round very big numbers. Text never gets rounded.
+
+65
+00:06:14,956 --> 00:06:21,934
+Narrator: Next page. Names use one style everywhere. Pick one and stick to it. Mixed styles guarantee typos.
+
+66
+00:06:22,363 --> 00:06:28,718
+Narrator: Long lists always come in pages, with a maximum page size. One endless list can sink the whole station.
+
+67
+00:06:29,148 --> 00:06:37,230
+Narrator: And when a field has no value, leave it out. Do not send an empty text or a zero to mean nothing. To the ship, empty is a real value.
+
+68
+00:06:37,660 --> 00:06:40,798
+Narrator: So the rule is: one way to write each thing, everywhere.
+
+69
+00:06:43,747 --> 00:06:50,846
+Narrator: Here is a trap that catches even experienced crews. The cargo form has a note field, and it can be in three states.
+
+70
+00:06:51,276 --> 00:06:56,117
+Vega: Required means it must be there. No note, no form.
+
+71
+00:06:56,548 --> 00:06:58,269
+Pip: And optional?
+
+72
+00:06:58,800 --> 00:07:02,466
+Vega: It may be missing. Just leave it out.
+
+73
+00:07:02,896 --> 00:07:04,617
+Pip: And null?
+
+74
+00:07:05,148 --> 00:07:09,725
+Vega: There, but empty on purpose. Like, no note.
+
+75
+00:07:10,156 --> 00:07:12,526
+Pip: Okay, but why does it matter?
+
+76
+00:07:13,055 --> 00:07:19,410
+Vega: Say a ship updates its booking. Note is missing? Leave the old note alone.
+
+77
+00:07:19,839 --> 00:07:21,562
+Pip: And if it's empty?
+
+78
+00:07:22,091 --> 00:07:26,213
+Vega: Wipe it. And if it has words, replace it.
+
+79
+00:07:26,644 --> 00:07:32,038
+Vega: But if you mix up missing and empty? You wipe notes nobody meant to touch.
+
+80
+00:07:32,468 --> 00:07:37,574
+Vega: So the rule is: must, may, and empty are three different promises.
+
+81
+00:07:40,524 --> 00:07:43,014
+Pip: So can we ever change the blueprint?
+
+82
+00:07:43,543 --> 00:07:49,994
+Vega: Sure. Adding a new optional label is safe. Old ships just ignore it.
+
+83
+00:07:50,423 --> 00:07:52,218
+Pip: And taking one away?
+
+84
+00:07:52,747 --> 00:07:57,613
+Vega: Taking one away breaks them. They look, and find nothing.
+
+85
+00:07:58,043 --> 00:07:59,814
+Pip: What about renaming?
+
+86
+00:08:00,343 --> 00:08:05,762
+Vega: Renaming is taking one away and adding another. That breaks them too.
+
+87
+00:08:06,192 --> 00:08:09,137
+Vega: So does changing a number into text.
+
+88
+00:08:09,567 --> 00:08:14,362
+Lex: There's a safe way to rename, though. Four steps.
+
+89
+00:08:14,791 --> 00:08:17,593
+Lex: Step one, add the new label.
+
+90
+00:08:18,024 --> 00:08:22,026
+Lex: Step two, keep the old one, marked as going away.
+
+91
+00:08:22,456 --> 00:08:24,177
+Pip: And then?
+
+92
+00:08:24,708 --> 00:08:28,182
+Lex: Step three, watch till nobody uses it.
+
+93
+00:08:28,612 --> 00:08:32,206
+Lex: Step four, remove it in the next big version.
+
+94
+00:08:32,635 --> 00:08:45,350
+Narrator: One more habit makes all this work. Ships should read only what they need, and ignore labels they do not know. That is called a tolerant reader. A status word they do not know should show as unknown, not crash the screen.
+
+95
+00:08:45,779 --> 00:08:48,918
+Pip: So we can always add, and never take away?
+
+96
+00:08:49,447 --> 00:08:53,282
+Vega: So the rule is: add freely, take away slowly.
+
+97
+00:08:56,231 --> 00:09:00,066
+Narrator: Time for the full example. The ship wants to reserve a berth.
+
+98
+00:09:00,495 --> 00:09:07,330
+Narrator: The ship knocks on the door called bookings. It hands in the berth it wants, and which bunks. That is the request.
+
+99
+00:09:07,759 --> 00:09:13,826
+Narrator: The station answers with a booking. A booking number, a status, and a total, in whole cents with its currency.
+
+100
+00:09:14,255 --> 00:09:22,001
+Narrator: The status is a word like pending, confirmed or cancelled. The blueprint says that list may grow, so ships must cope with a new word.
+
+101
+00:09:22,432 --> 00:09:30,634
+Narrator: If something is wrong, the station says no in the same clear shape every time. A short title, a status, and a code a program can read, like bunk taken.
+
+102
+00:09:31,063 --> 00:09:34,610
+Pip: And if the same ship sends it twice, by accident?
+
+103
+00:09:35,139 --> 00:09:39,333
+Lex: Good question. The blueprint covers that too.
+
+104
+00:09:39,764 --> 00:09:46,166
+Lex: A special key lets the station spot a repeat. Same answer, no double booking.
+
+105
+00:09:46,596 --> 00:09:52,038
+Lex: It's called an idempotency key. Another episode is all about it.
+
+106
+00:09:52,467 --> 00:09:57,261
+Narrator: So the rule is: one shape in, one shape out, and one shape for every no.
+
+107
+00:10:00,211 --> 00:10:05,870
+Narrator: Now the safety line. Every change to the blueprint rides a conveyor belt before it reaches the dock.
+
+108
+00:10:06,299 --> 00:10:09,149
+Lex: Stop one, the style check.
+
+109
+00:10:09,580 --> 00:10:16,461
+Lex: A tool called Spectral checks the house rules. Names, limits, clear errors.
+
+110
+00:10:16,892 --> 00:10:19,741
+Lex: Stop two, the change check.
+
+111
+00:10:20,172 --> 00:10:21,894
+Pip: What does it compare?
+
+112
+00:10:22,423 --> 00:10:31,466
+Lex: The new blueprint against the last released one. Break something, and you get a red stamp. The tool's called oh ass diff.
+
+113
+00:10:31,895 --> 00:10:34,865
+Lex: Stop three, make the templates.
+
+114
+00:10:35,296 --> 00:10:42,706
+Lex: Tools write the server template and the ship's client code. In Go, that's oh A P I code gen.
+
+115
+00:10:43,135 --> 00:10:46,346
+Lex: Stop four, test the real hatch.
+
+116
+00:10:46,775 --> 00:10:51,977
+Lex: Throw weird requests at it. Check the answers match the drawing.
+
+117
+00:10:52,408 --> 00:10:58,761
+Lex: Skee ma thee sis. And Pact, which replays what each ship relies on.
+
+118
+00:10:59,192 --> 00:11:04,778
+Lex: Stop five, publish the guide. That becomes the new baseline.
+
+119
+00:11:05,207 --> 00:11:09,594
+Narrator: So the rule is: no change reaches the dock without passing the line.
+
+120
+00:11:12,543 --> 00:11:16,738
+Narrator: Now the same story in Go, the language the station's engineers use.
+
+121
+00:11:17,168 --> 00:11:26,570
+Narrator: A tool reads the blueprint and writes Go code for you. It writes the shape of the request, the shape of each possible answer, and one interface the server must fill in.
+
+122
+00:11:27,000 --> 00:11:37,697
+Narrator: Here is the trick. The handler must return one of the answers the blueprint allows. A good answer, or a clear error. Try to return anything else, and the code refuses to build.
+
+123
+00:11:38,128 --> 00:11:41,889
+Pip: Wait. The code just refuses to build?
+
+124
+00:11:42,419 --> 00:11:48,798
+Narrator: Exactly. That is the template that cannot lie. The drift problem is stopped before the code even runs.
+
+125
+00:11:49,227 --> 00:11:58,125
+Narrator: Your own code stays small and plain. It never touches the raw reply. It checks the amount is positive, and returns either the error answer or the good one.
+
+126
+00:11:58,556 --> 00:12:10,717
+Narrator: A second guard stands at the door. A library called kin Open A P I loads the same blueprint, and checks every request against it before your handler runs. A request with a missing field is turned away right there.
+
+127
+00:12:11,148 --> 00:12:21,173
+Narrator: One more Go detail. A plain pointer cannot tell missing from empty. So a small wrapper remembers three things: was the key there, was it empty on purpose, and what was the value.
+
+128
+00:12:21,604 --> 00:12:25,365
+Narrator: Missing keeps. Empty clears. A value sets.
+
+129
+00:12:25,796 --> 00:12:31,789
+Narrator: So the rule is: let the blueprint write the template, and let a guard check every request at the door.
+
+130
+00:12:34,740 --> 00:12:38,214
+Narrator: A contract is not free. Five honest trade-offs.
+
+131
+00:12:38,644 --> 00:12:47,254
+Narrator: One. Drawing first costs speed at the start. A quick prototype with one caller may not need it. Draw later, once a second crew shows up.
+
+132
+00:12:47,683 --> 00:12:55,837
+Narrator: Two. Generated code shapes your own code. Keep it at the edge, and map it to your own types, so the drawing's shape does not leak everywhere.
+
+133
+00:12:56,268 --> 00:13:07,374
+Narrator: Three. Strict checking can block a safe roll out. If the door rejects every label it does not know, a newer ship using one new optional label gets turned away by an older door during an upgrade.
+
+134
+00:13:07,803 --> 00:13:19,341
+Narrator: Next page. Four. Tests where each crew records what it relies on only work when you know your crews. A public station cannot collect promises from strangers, so it relies on the change check.
+
+135
+00:13:19,772 --> 00:13:29,798
+Narrator: Five. The blueprint cannot capture everything. Speed, the order of results, and how often you may knock are only words in the manual. And someone will rely on them anyway.
+
+136
+00:13:30,227 --> 00:13:34,518
+Narrator: So the rule is: a contract is a strong tool, but it has a price.
+
+137
+00:13:37,467 --> 00:13:42,070
+Vega: Okay. What actually goes wrong on real stations?
+
+138
+00:13:42,600 --> 00:13:47,177
+Vega: Story one. The drawing and the hatch drift apart.
+
+139
+00:13:47,607 --> 00:13:53,097
+Lex: Cut the hatch from the drawing. Or redraw, and stop on change.
+
+140
+00:13:53,528 --> 00:13:58,442
+Vega: Story two. A rename ships, and old ships break.
+
+141
+00:13:58,871 --> 00:14:03,186
+Lex: Compare with the last release. Block the break.
+
+142
+00:14:03,615 --> 00:14:08,625
+Vega: Story three. A new status word confuses an old ship.
+
+143
+00:14:09,056 --> 00:14:14,306
+Lex: Say from day one the list can grow. Test strange words.
+
+144
+00:14:14,735 --> 00:14:20,081
+Vega: Story four. No limits, and a huge message walks right in.
+
+145
+00:14:20,511 --> 00:14:25,450
+Lex: Limit every text and list. Cap the size at the door.
+
+146
+00:14:25,879 --> 00:14:29,833
+Vega: Now, what do we watch? Three screens.
+
+147
+00:14:30,264 --> 00:14:34,025
+Vega: One. Requests the door turned away.
+
+148
+00:14:34,456 --> 00:14:38,265
+Vega: Two. Who still uses the old labels.
+
+149
+00:14:38,696 --> 00:14:42,817
+Vega: Three. Test answers that don't match the drawing.
+
+150
+00:14:43,248 --> 00:14:45,809
+Lex: That's drift, caught early.
+
+151
+00:14:46,240 --> 00:14:51,322
+Vega: So the rule is: watch rejected requests, and who uses old labels.
+
+152
+00:14:54,272 --> 00:14:57,889
+Narrator: Deeper now. Details that bite. Two pages.
+
+153
+00:14:58,320 --> 00:15:09,809
+Narrator: One. The blueprint format has two common versions, called three point oh and three point one. The newer one writes the empty on purpose rule differently. Check that your tools support the version before you move.
+
+154
+00:15:10,240 --> 00:15:19,785
+Narrator: Two. Very big ids. Some programs, like a web browser, lose the last digits of a huge number. Send big ids as text, and the problem disappears.
+
+155
+00:15:20,216 --> 00:15:32,474
+Narrator: Next page. Three. Checking the shape is not the same as checking the journey. A reply can have the right shape and still be the wrong booking. Tests that follow a whole booking from ask to look up catch what shape checks miss.
+
+156
+00:15:32,903 --> 00:15:35,874
+Pip: So the shape was right, and the booking wrong?
+
+157
+00:15:36,303 --> 00:15:48,418
+Narrator: Four. The repeat safe key needs its own written rules: who it belongs to, how long the station remembers it, and what error a clash gives. Without them, ships cannot write safe retry code.
+
+158
+00:15:48,847 --> 00:15:53,354
+Narrator: So the rule is: the details that are not written down are the ones that break.
+
+159
+00:15:56,303 --> 00:15:59,250
+Narrator: Interview round. Pip asks, Vega answers.
+
+160
+00:15:59,679 --> 00:16:03,922
+Pip: Okay, quick one. What goes in a contract?
+
+161
+00:16:04,451 --> 00:16:10,734
+Vega: Who can call, and how. Every door, in and out. One error shape.
+
+162
+00:16:11,163 --> 00:16:17,782
+Vega: Limits. Repeats and versions. If a ship can depend on it, write it down.
+
+163
+00:16:18,211 --> 00:16:22,333
+Pip: Is a new field breaking? Or a new status word?
+
+164
+00:16:22,864 --> 00:16:27,898
+Vega: Depends. A new field breaks ships that reject unknown things.
+
+165
+00:16:28,327 --> 00:16:34,153
+Vega: A new status breaks ships expecting a closed list. So say the list is open.
+
+166
+00:16:34,583 --> 00:16:37,193
+Pip: Draw first, or build first?
+
+167
+00:16:37,724 --> 00:16:41,701
+Vega: Draw first, if lots of crews or outsiders are involved.
+
+168
+00:16:42,131 --> 00:16:47,597
+Vega: Build first for quick internal stuff. But redraw and compare by machine.
+
+169
+00:16:48,028 --> 00:16:50,398
+Pip: Why send money as whole cents?
+
+170
+00:16:50,927 --> 00:16:55,673
+Vega: Decimals drift. Ten dimes might not make exactly one.
+
+171
+00:16:56,104 --> 00:17:01,498
+Vega: Cents are exact. And the currency name matters, small units differ.
+
+172
+00:17:01,927 --> 00:17:05,857
+Pip: Must, may and empty. Why care?
+
+173
+00:17:06,387 --> 00:17:10,965
+Vega: They're three promises. Missing keeps, empty clears.
+
+174
+00:17:11,395 --> 00:17:14,077
+Vega: Mix them up, and you wipe data.
+
+175
+00:17:17,028 --> 00:17:22,253
+Narrator: The arm slides home. The hatch fits. The Nova docks with minutes to spare.
+
+176
+00:17:22,683 --> 00:17:26,326
+Pip: We docked! With minutes to spare!
+
+177
+00:17:26,756 --> 00:17:31,862
+Brix: Okay, okay. Next time I check the drawing first.
+
+178
+00:17:32,291 --> 00:17:35,814
+Vega: Alright. Let's put it all together.
+
+179
+00:17:36,243 --> 00:17:39,789
+Narrator: One. Write the promise first, and make everything from it.
+
+180
+00:17:40,220 --> 00:17:43,286
+Narrator: Two. Add freely. Take away slowly.
+
+181
+00:17:43,715 --> 00:17:45,942
+Narrator: Three. Write down every limit.
+
+182
+00:17:46,372 --> 00:17:49,942
+Narrator: Four. Must, may and empty are three different promises.
+
+183
+00:17:50,372 --> 00:17:53,294
+Narrator: Five. Every change rides the safety line.
+
+184
+00:17:53,723 --> 00:17:56,718
+Narrator: Six. Watch who still uses the old labels.
+
+185
+00:17:57,147 --> 00:18:03,286
+Vega: And the one line to keep. A contract is a promise. Keep it.
+
+186
+00:18:06,236 --> 00:18:25,789
+Narrator: To go deeper, open the note on contract design, and its Go note on Open A P I first development. Before it, read REST and H T T P A P I design, and choosing an A P I style. After it, read A P I error handling, versioning, and idempotency. Compare it with protocol buffers, and with graph Q L.
+
+187
+00:18:26,220 --> 00:18:28,541
+Pip: Commander, what's our next case?
+
+188
+00:18:28,971 --> 00:18:35,493
+Vega: Choosing an A P I style. Three ways to brief a ship. Stand by.
+

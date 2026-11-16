@@ -30,7 +30,39 @@ updated: 2026-11-13
 > - Rule: pick SSE for server-to-client updates, WebSocket only when the client also sends often.
 > - Classic mistake: no heartbeats, no resume after reconnect, and unbounded buffers for slow clients.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Normal web requests work like asking a question: the app asks, the server answers once, done. But a chat message should appear the moment your friend sends it — without the app asking over and over.
+
+```mermaid
+flowchart LR
+    A["Ask every 5 s:<br/>'anything new?'"] --> W["Mostly 'no',<br/>wasted work, late news"]
+    B["Keep a line open:<br/>server pushes"] --> F["Message arrives<br/>instantly"]
+```
+
+There are three main tricks, from simplest to most capable. **Long polling**: ask, and the server holds your question open until there is news. **SSE** (Server-Sent Events): one web response that never ends; the server keeps streaming events down it, one-way. **WebSocket**: the connection upgrades into an open phone line where both sides can talk anytime.
+
+```mermaid
+flowchart LR
+    LP["Long polling<br/>(held question)"] --> S["Server"]
+    SSE["SSE<br/>(one-way stream)"] --> S
+    WS["WebSocket<br/>(two-way line)"] <--> S
+```
+
+Rule of thumb: data only flows down to you → SSE. Both sides chat a lot → WebSocket. Everything blocked except plain HTTP → long polling.
+
+The rest of this note is just three questions:
+1. How does each trick work on the wire?
+2. How do you survive drops (heartbeats, reconnect, resume from last event)?
+3. How do you scale to 100,000 open connections without one slow client hurting the rest?
+
 
 **The problem in one story.**
 A chat app needs to show a friend's new message the moment it is sent.
@@ -74,7 +106,7 @@ Where it breaks: a phone line drops obviously; a network connection can die sile
 > [!tip] Remember
 > Use SSE for server-to-client updates, WebSocket only when the client also sends often, and always add heartbeats, resume and bounded buffers.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A trading screen shows prices that change several times a second. With plain request/response the browser has to ask.
 
@@ -83,14 +115,14 @@ A trading screen shows prices that change several times a second. With plain req
 
 The same problem appears in chat, notifications, live dashboards, collaborative editing, multiplayer games and streaming LLM output.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Short polling:** you call the shop every five minutes to ask "is my order ready?".
 - **Long polling:** you call once, and the clerk stays on the line until the order is ready, then hangs up. You call again right away.
 - **SSE:** the shop keeps a one-way radio channel open to you and announces updates. If the signal drops, your radio retunes automatically and asks for "everything after announcement 41".
 - **WebSocket:** an open phone line. Both sides talk whenever they want.
 
-## 3. How it works
+## 3. How it works 🟡
 
 | | Short polling | Long polling | SSE | WebSocket |
 | --- | --- | --- | --- | --- |
@@ -104,6 +136,8 @@ The same problem appears in chat, notifications, live dashboards, collaborative 
 
 ### Long polling
 
+**In plain words:** the client asks "anything after event 41?" and the server just does not answer until there is something (or a timer runs out). The cursor number means nothing is ever missed between calls.
+
 1. The client sends `GET /updates?after=41`.
 2. The server holds the request until an event after 41 exists, or until a timeout (for example 25 s, shorter than every proxy timeout on the path).
 3. It answers with the events (or an empty `200`), and the client immediately sends `GET /updates?after=<last id>`.
@@ -111,6 +145,8 @@ The same problem appears in chat, notifications, live dashboards, collaborative 
 The cursor makes it lossless: events that arrive between two requests are picked up by the next one. Real uses: the Telegram Bot API's `getUpdates` with a `timeout`, and Amazon SQS `ReceiveMessage` with `WaitTimeSeconds` up to 20 s. Long polling works everywhere plain HTTP works, which is why it survives as a fallback.
 
 ### Server-Sent Events
+
+**In plain words:** the server answers once and never finishes the answer: events keep flowing down as little text blocks. The browser even reconnects by itself and says "I had read up to event 42".
 
 The browser's `EventSource` sends a `GET`. The server answers `200` with `Content-Type: text/event-stream` and never finishes the response. Each event is a block of `field: value` lines ended by a blank line:
 
@@ -147,6 +183,8 @@ sequenceDiagram
 ```
 
 ### WebSocket
+
+**In plain words:** it starts as a normal web request that asks "can we switch to a raw two-way channel?" After the 101 answer, both sides exchange small framed messages on the same connection.
 
 **The handshake** is an ordinary HTTP/1.1 request that asks to switch protocols:
 
@@ -215,9 +253,11 @@ stateDiagram-v2
 
 **Over HTTP/2 and HTTP/3**, WebSockets use extended `CONNECT` (RFC 8441 and RFC 9220) so one connection can carry many sockets. Most deployments still upgrade over HTTP/1.1.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a working SSE endpoint in 25 lines: set the right content type, write `id:` and `data:` lines, flush, and stop when the client leaves.
 
 The bare SSE endpoint: set `text/event-stream`, write `id:` and `data:` lines, flush, stop when the client leaves. The full version below adds resume with `Last-Event-ID`, a replay buffer, slow-consumer limits and heartbeats.
 
@@ -253,6 +293,8 @@ func main() { http.HandleFunc("/events", events); http.ListenAndServe(":8080", n
 ```
 
 ### Full version
+
+**In plain words:** the grown-up version adds the four survival features: replay after reconnect, a memory of recent events, kicking clients that read too slowly, and heartbeats so idle timers never fire.
 
 An SSE hub in Go 1.24 with the standard library. It shows four design points: resume with `Last-Event-ID`, a replay buffer, a bounded per-client buffer that disconnects slow consumers, and heartbeat comments. The file also computes `Sec-WebSocket-Accept`. It compiles and passes `go vet` and `go test -race` on Go 1.24.4, using `net/http/httptest` for real HTTP connections.
 
@@ -549,7 +591,7 @@ func TestAcceptKeyRFC6455Example(t *testing.T) {
 - When the gap is older than the buffer (the client asks for "after 1" but only 4 and 5 remain), the hub reports it, and the handler sends a `reset` event so the client reloads its full state instead of silently missing events.
 - RFC 6455's example key produces `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Side by side, topic by topic:
 
@@ -575,7 +617,7 @@ Side by side, topic by topic:
 | Service-to-service streams | [[gRPC]] streaming | Typed contracts, deadlines, flow control |
 | GraphQL clients | GraphQL subscriptions over WebSocket ([[GraphQL]]) | Same schema as queries |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Long-lived connections are state.** Every node now holds thousands of sockets that deploys, autoscaling and load balancers must respect. Polling servers stay stateless.
 - **No HTTP caching:** real-time responses bypass CDN caches. If many users see the same slowly changing data, cached polling can be cheaper than fan-out.
@@ -583,11 +625,13 @@ Side by side, topic by topic:
 - **Do not use WebSocket just for server push.** SSE covers it with less code, and HTTP/2 removes its connection-limit problem.
 - **Do not build request/response on top of WebSocket** for ordinary CRUD. You lose status codes, caching, retries and standard tooling, and you rebuild them with message IDs.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Slack delivers real-time events to apps over WebSockets (Socket Mode). Exchanges publish market-data tickers over public WebSocket feeds. Collaborative editors such as Figma sync document changes over WebSockets. LLM APIs from OpenAI and Anthropic stream generated tokens as SSE.
 
 ### Authentication on connect
+
+**In plain words:** browsers cannot attach the usual auth header to these connections, so you log in by cookie (and then must check who the page is), by a short single-use ticket, or by a first hello message.
 
 - **Browsers cannot set an `Authorization` header** on a WebSocket or an `EventSource`. That leaves:
 	- **A cookie**, sent automatically with the upgrade request.
@@ -603,12 +647,16 @@ Side by side, topic by topic:
 
 ### Heartbeats and idle timeouts
 
+**In plain words:** every box between you and the server hangs up on silent connections (often after 60 s). A tiny ping every 20-30 s keeps the line officially "busy".
+
 - Every hop has an idle timeout. An AWS Application Load Balancer closes a connection that has carried no data for **60 seconds by default**, and that includes WebSockets. Nginx's `proxy_read_timeout` also defaults to 60 s.
 - Send a heartbeat well inside the shortest timeout, for example every 20–30 s. WebSocket servers send **ping** frames, and browsers answer with **pong** automatically. SSE servers send a comment line.
 - Browser JavaScript cannot send WebSocket pings. To detect a dead connection from the client side (a phone switching networks often leaves a half-open TCP connection), send an application-level heartbeat message and reconnect when replies stop.
 - Proxies must not buffer SSE: disable response buffering for the route (for Nginx, the response header `X-Accel-Buffering: no` or `proxy_buffering off`).
 
 ### Reconnect and resume
+
+**In plain words:** connections die all the time, so plan for it: wait a random bit before reconnecting (so 50,000 clients do not stampede), and resume from the last event number you saw.
 
 - **Exponential backoff with full jitter:** wait a random time between 0 and `min(cap, base × 2^attempt)`, for example base 1 s and cap 30 s. After a deploy drops 50,000 sockets at once, jitter spreads the reconnects over seconds instead of one spike.
 - **Resume from the last offset:** every event carries a sequence number.
@@ -618,6 +666,8 @@ Side by side, topic by topic:
 - **Graceful deploys:** send close `1001` (or end the SSE response) and let clients reconnect elsewhere. Drain over minutes rather than dropping everyone in one second.
 
 ### Scaling, briefly
+
+**In plain words:** with many servers, a message for room 42 must reach members on other servers too, so servers share messages through a common message bus (the backplane).
 
 The full treatment, with capacity numbers, lives in [[Scaling WebSockets]]. The scale-out picture:
 
@@ -642,17 +692,23 @@ flowchart LR
 
 ### Backpressure and slow consumers
 
+**In plain words:** one phone on bad network must not stall the broadcast to everyone else. Give each connection a small outbox; when it overflows, drop old values or drop the client.
+
 - Every connection gets a **bounded send buffer**, such as 64 messages or 1 MB. The fan-out loop must never block on one client.
 - When the buffer is full, choose: **drop** (fine for latest-value data such as prices; better, conflate to the newest value per key), or **disconnect** and let the client resume from its last sequence number (the hub above does this).
 - Set a write deadline (for example 10 s) on every write, so a stuck TCP peer cannot pin a goroutine and its buffer forever. More patterns are in [[Backpressure and Flow Control]].
 
 ### Ordering and delivery guarantees
 
+**In plain words:** within one connection messages arrive in order; across a reconnect all bets are off. Sequence numbers plus replay plus deduplication buy back the guarantees.
+
 - TCP keeps messages in order **within one connection**. Nothing is promised across reconnects, and messages in flight when the connection drops are simply lost. WebSocket has no acknowledgements.
 - For "at least once", add per-stream sequence numbers, client acks or last-seen IDs, a server replay buffer, and client-side deduplication by sequence number. Exactly-once processing is a separate problem ([[Delivery Semantics and Exactly-Once]]).
 - For client-to-server messages, give each a client-generated ID (`client_seq` in the diagram) so a resend after reconnect is idempotent.
 
 ### Implementing in Go
+
+**In plain words:** the standard pattern is one goroutine that only reads and one that only writes per connection; the writer owns the outbox and the pings.
 
 Use one **reader goroutine** and one **writer goroutine** per WebSocket connection.
 
@@ -676,7 +732,7 @@ Full handlers are in [[WebSockets and SSE in Go]].
 - Replay requests, and how many arrived too late for the buffer.
 - Delivery lag: event creation time to send time, p99.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Half-open connections:** if a phone loses its network, the server's TCP stack may not learn about it for many minutes. Only heartbeats with a read deadline detect it. Without them, dead connections accumulate along with their buffers and goroutines.
 - **Head-of-line blocking:** one WebSocket is one TCP stream.
@@ -693,7 +749,7 @@ Full handlers are in [[WebSockets and SSE in Go]].
 - **Thundering herd on deploy:** draining 50,000 connections in one second makes them all reconnect to the remaining nodes at once, and the newest node gets few of them. Drain in batches, add jitter, and use least-connections balancing for new connections.
 - **Ordering across nodes:** two messages for the same room published from different nodes can arrive in different orders at different members. Give each room a single sequencer (one partition key in Kafka, or one Redis Stream) when order matters ([[Message Ordering and Partition Keys]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: every idle WebSocket in production disconnects after exactly 60 seconds. What is going on?
 > An intermediary idle timeout, most likely the AWS ALB default of 60 s (or Nginx's 60 s `proxy_read_timeout`). WebSocket traffic does not count as "active" unless bytes flow. Send pings or application heartbeats every 20–30 s, raise the timeouts if needed, and make clients reconnect with jittered backoff anyway.
@@ -716,7 +772,7 @@ Full handlers are in [[WebSockets and SSE in Go]].
 > [!question]- Why does long polling still exist?
 > It works through every proxy and firewall that passes HTTP, needs no special server support, and with a cursor it loses nothing between requests. Libraries use it as a fallback when WebSockets are blocked. APIs such as Telegram's `getUpdates` and SQS `ReceiveMessage` use it to cut empty responses.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Short poll = simple but laggy and wasteful; long poll = held request plus a cursor; SSE = one-way HTTP stream; WebSocket = full duplex after `101`.
 - Handshake: `Sec-WebSocket-Accept` = base64(SHA-1(key + GUID)); it is not auth.
@@ -727,7 +783,7 @@ Full handlers are in [[WebSockets and SSE in Go]].
 - Bounded send buffers: drop, conflate or disconnect slow consumers; never block fan-out.
 - No built-in delivery guarantee: seq numbers, acks, replay buffer, dedupe.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[HTTP-1.1 vs HTTP-2 vs HTTP-3]], [[TCP - Handshake, Reliability, Flow and Congestion Control]]
 - **Next:** [[Scaling WebSockets]], [[WebSockets and SSE in Go]], [[Case Study - Chat System]], [[Case Study - Notification System]]

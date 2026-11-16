@@ -25,7 +25,39 @@ updated: 2026-11-13
 > - An iterator is a function that takes a `yield` callback and calls it once per element; `range` over that function calls it for you and turns `break` into `yield` returning `false`.
 > - `iter.Seq[V]` and `iter.Seq2[K, V]` are just names for those function shapes, so your own iterator and the standard library's compose for free.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). That is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You write a `Max` function for ints. Then you need one for floats. Then strings. Same code three times.
+
+**Generics** fix that: you write `Max` once with a blank where the type goes, and the compiler fills in the blank for each caller. The blank is called a **type parameter**, and a **constraint** is the rule saying which types are allowed in it (for `Max`: only types that support `<`).
+
+```mermaid
+flowchart LR
+    T["Max[T] — one template"] --> A["Max for int"]
+    T --> B["Max for float64"]
+    T --> C["Max for string"]
+```
+
+Iterators solve a different problem: walking a big (or endless) sequence one item at a time, stopping whenever you like. In Go an **iterator** is just a function that hands your loop one value at a time, and a plain `for range` can drive it.
+
+```mermaid
+flowchart LR
+    I["iterator"] -- "one item at a time" --> L["for v := range it"]
+    L -- "break = stop serving" --> I
+```
+
+The rest of this note is just these 4 questions:
+1. How do type parameters and constraints work (`comparable`, `cmp.Ordered`, `~int`)?
+2. How does `for range` over a function actually work (`yield`)?
+3. When do generics beat interfaces or copy-paste — and when not?
+4. How does the compiler build generic code (stenciling vs dictionaries)?
 
 **The problem in one story.**
 You write `MaxInt`, then need `MaxFloat`, then `MaxString`: three copies of the same code.
@@ -69,7 +101,7 @@ Where it breaks: a cutter only works on dough the constraint allows; Go will not
 > [!tip] Remember
 > Generics = one function for many types under a constraint; iterators = a function that calls `yield` per item until you stop.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Before Go 1.18, a container that worked for any type either gave up type safety (`[]interface{}`, with a type assertion and a possible panic on every read) or was copy-pasted per type (`IntSet`, `StringSet`, `UserSet`, …). A cache keyed by `string` could not be reused for a cache keyed by `int64` without copying the whole file.
 
@@ -81,7 +113,7 @@ Before Go 1.23, "give me a lazy, early-exitable sequence of my own type" meant e
 
 Range-over-func lets your own types plug into the same `for range` syntax as a slice or a channel.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A generic function is a **template that the compiler fills in and type-checks per call site**, not a function that accepts `any` and figures it out at runtime. `Max[int]` and `Max[string]` are different compiled instantiations (or share one shape via a dictionary — see the deep dive); neither one ever sees a value of the other's type.
 
@@ -91,9 +123,11 @@ An iterator is a **function that calls your loop body for you**. `for v := range
 
 `iter.Seq[V]` is the standard library's name for exactly that function type — it exists so iterator-returning functions have one documented signature to agree on, not a new language mechanism.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
+
+**In plain words:** one `Sum` for every number type — the constraint is the guest list saying which types may come in.
 
 ```go
 // A constraint is an interface restricting what T can be.
@@ -134,6 +168,8 @@ func Join[T Stringer](xs []T, sep string) string {
 
 ### The mechanism, step by step
 
+**In plain words:** the compiler guesses the type from your arguments, checks the body against the rules, then builds (or shares) a concrete version — all before the program runs.
+
 ```mermaid
 flowchart TB
     subgraph compile["Compile time"]
@@ -154,6 +190,8 @@ flowchart TB
 
 ### Range-over-func, step by step
 
+**In plain words:** the loop body becomes a callback the iterator calls once per item; `break` tells the iterator 'stop serving'.
+
 ```mermaid
 sequenceDiagram
     participant Caller as for v := range s.All()
@@ -173,11 +211,13 @@ sequenceDiagram
 
 Exactly one rule drives correctness: **the iterator must stop calling `yield` the first time `yield` returns `false`.** Ignore that and a `break` in the caller's loop does not actually stop the work underneath — the measured `TestRangeOverFuncEarlyBreak` test below exists specifically to catch that bug.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The full code lives in a scratch module (`scratch/generics`), compiles, passes `go vet`, and its tests pass under `go test -race` on Go 1.24.4.
 
 ### A generic type, with `comparable` and `any`
+
+**In plain words:** a container type can take type parameters too — this `Set` works for any key type that supports `==`.
 
 ```go
 // Set is a generic type: K is restricted to comparable because it is a map
@@ -202,6 +242,8 @@ func (s *Set[K]) Len() int     { return len(s.m) }
 
 ### A generic type alias (Go 1.24)
 
+**In plain words:** since Go 1.24 you can give a short nickname to one filled-in version of a generic type, and the nickname is the exact same type.
+
 Before 1.24, a type alias (`type A = B`) could not itself take type parameters, so you could not write a short name for one instantiation of a generic type. Go 1.24 lifts that:
 
 ```go
@@ -220,6 +262,8 @@ type Pair[A, B any] = struct {
 `StringSet` is not a new type — it is the identical type `Set[string]`, so a `StringSet` and a `*Set[string]` are interchangeable with no conversion, which plain generic types never allow between different instantiations.
 
 ### A range-over-func iterator (Go 1.23)
+
+**In plain words:** to make your own type loopable, return a function that calls `yield` per element and stops the moment `yield` says false.
 
 ```go
 // All returns an iter.Seq[K]: a range-over-func iterator. iter.Seq[K] is
@@ -255,6 +299,8 @@ func TestRangeOverFuncEarlyBreak(t *testing.T) {
 
 ### `iter.Pull`: turning push into pull
 
+**In plain words:** `range` pushes values at you; `iter.Pull` flips it so you ask for the next value yourself — rare, costs a goroutine, and you must call `stop()`.
+
 Most code should use `range`. `iter.Pull` exists for the rare case where you cannot write a `for range` loop — for example, stepping two iterators forward in lockstep to merge them:
 
 ```go
@@ -281,6 +327,8 @@ func FirstTwo[K comparable](s *Set[K]) (K, K, bool) {
 
 ### Standard library iterator helpers (`slices`, `maps`, `strings`)
 
+**In plain words:** the standard library already speaks iterator — keys of a map, sorted collection, splitting a string — without building a throwaway slice first.
+
 ```go
 m := map[string]int{"x": 1, "y": 2, "z": 3}
 keys := slices.Sorted(maps.Keys(m)) // maps.Keys(m) is an iter.Seq[string]
@@ -304,6 +352,8 @@ for p := range strings.SplitSeq("a-b-c", "-") { // Go 1.24: split without alloca
 
 ### `var zero T` and a generic cache
 
+**In plain words:** generic code cannot write `nil` for 'nothing' because T might be a plain number — `var zero T` is the universal empty value.
+
 ```go
 // zeroValue shows the idiom used when a generic function must hand back
 // "nothing" for an arbitrary type parameter — you cannot write a literal
@@ -324,7 +374,7 @@ The full `LRU` (`Get`/`Put`/eviction) and its test `TestLRU` are in the scratch 
 
 **Measured:** `go vet ./...` and `go test -race -v ./...` in `scratch/generics` (Go 1.24.4) — 8 tests, all PASS, 0 vet diagnostics.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -335,14 +385,14 @@ The full `LRU` (`Get`/`Put`/eviction) and its test `TestLRU` are in the scratch 
 | Materialized `[]T` | Build the whole slice up front | The caller needs random access or will consume all of it anyway | O(n) memory even if only the first few elements are used |
 | `iter.Seq[T]` iterator | `func(yield func(T) bool)`, lazy | The caller may stop early, or the source is unbounded/expensive per element | None of the up-front memory; slightly more code than a plain slice |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Do not reach for generics just to avoid writing two functions; if the two versions would have unrelated bodies, a generic signature forcing a shared shape onto them is the wrong abstraction — copy-paste or an interface is clearer. This guidance carries over unchanged from the old generics note.
 - Deep constraint hierarchies (`~T1 | ~T2`, nested interfaces) read worse than the duplication they replace; stop generalizing once the constraint is harder to read than two concrete functions.
 - Generic code can be slower to compile and, with the dictionary-passing instantiation strategy, carries a small runtime indirection that a hand-written monomorphic function does not pay — profile before assuming generics are free.
 - A range-over-func iterator is not a drop-in replacement everywhere: you cannot index into it, take its length without consuming it, or use it with two-value range-over-channel-style select statements. Reach for a slice or a channel when the caller genuinely needs those.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `golang.org/x/exp/slices` shipped generic slice helpers before they moved into the standard `slices` package (Go 1.21); the standard `maps`, `slices` and `cmp` packages are generic throughout; `iter.Seq` powers `maps.Keys/Values`, `slices.All/Values/Collect/Sorted`, and database/sql's planned iterator-based scanning.
 - **Failure modes → fixes:**
@@ -351,7 +401,7 @@ The full `LRU` (`Get`/`Put`/eviction) and its test `TestLRU` are in the scratch 
   - Choosing dictionary-based instantiation for a hot-path generic function → an extra indirect call per operation shows up in a CPU profile as time in the dictionary-passing wrapper; the fix is usually to drop generics on that one hot path, not to fight the compiler's heuristic.
 - **What to monitor:** binary size growth after adding generic code to a widely-instantiated function (many concrete types × stenciling); CPU profile share spent in dictionary-passing paths for generic hot paths.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why `Max[T cmp.Ordered]` and not a hand-rolled constraint?** `cmp.Ordered` (package `cmp`, Go 1.21) is a union of every built-in ordered type (`int`, `int64`, `float64`, `string`, …), maintained by the standard library so your code does not drift from it as new numeric types are added.
 
@@ -374,7 +424,7 @@ flowchart TD
     Q2 -->|no| GEN[generic function or type]
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is a type constraint, concretely?
 > It is an interface used in the `[T Constraint]` position: `comparable` allows `==`/`!=` (map keys), `cmp.Ordered` allows `<`/`<=`/`>`/`>=`, and a custom union such as `~int | ~float64` allows arithmetic on any type whose underlying type is one of those.
@@ -399,7 +449,7 @@ flowchart TD
 > [!question]- Generics vs an interface with methods: how do you choose?
 > Use an interface when types share *behaviour* you call through method dispatch (a `Writer`, a `Repository`). Use generics when types share a *shape* — the same container or algorithm — with no behavioural difference, like a `Set[K]` or `Sum[T Number]`. If you would still write two different-bodied functions per type, neither applies: write them separately.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `func F[T Constraint](...)`: the compiler infers `T` from arguments when it can, type-checks the body against the constraint, and instantiates (stencil or dictionary) per GC shape.
 - `comparable` → map keys and `==`; `cmp.Ordered` → `<`/`>`; `~T` in a union → named types with that underlying type count too.

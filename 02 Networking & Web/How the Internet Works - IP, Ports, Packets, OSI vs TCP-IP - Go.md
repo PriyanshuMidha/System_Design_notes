@@ -18,7 +18,14 @@ type: implementation
 > [!summary] TL;DR
 > This code opens a real TCP listener and a real TCP client on the loopback interface, and prints the 5-tuple each side sees, proving the claim in [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] that a connection's identity is `(protocol, source IP:port, destination IP:port)`, not just a port number.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Skim the Code steps' **Concept** lines only.
+> - 🟡 **Know the basics?** Read the Code sections in full, then Tests and Running it.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero** 🟢: this file is a tiny Go program plus one test. It opens a real connection on your own machine and prints the address pair each side sees, to show that every connection gets its own unique source port — which is how one server port can talk to thousands of clients at once. Read the Concept line above each code block first; the code just acts it out.
+
+## Before the code 🟢
 
 - **`net.Listen` / `net.Dial`**: the standard library's way to open a listening socket and an outgoing TCP connection.
 - **`net.Conn` (an interface)**: one live connection; `LocalAddr()` and `RemoteAddr()` give this end and the other end as `ip:port`.
@@ -27,7 +34,7 @@ type: implementation
 - **`defer`**: schedules `Close()` to run when the function returns, so sockets are never leaked.
 - **What to run:** `go vet ./...` then `go test -race -v ./...` in a module containing `socket.go` and `socket_test.go`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept | Theory section |
 | --- | --- | --- |
@@ -35,7 +42,7 @@ type: implementation
 | `EchoServer` | The server side of a socket, accepting one connection and reporting what it saw | [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP#Mental model]] |
 | `TestFiveTupleDiffersPerConnection` | Proves the OS assigns a distinct ephemeral source port per connection | [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP#Ports and sockets the 5-tuple]] |
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `socket`, with `socket.go` and `socket_test.go` in one directory.
 - **Go version:** 1.24.
@@ -48,9 +55,11 @@ go vet ./...
 go test -race -v ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Formatting the 5-tuple
+
+**In plain words:** a connection is named by both of its ends — like a phone call being "my number calling your number", not just "your number". This helper prints that full name.
 
 **Concept.** The theory note's "Ports and sockets" section says a connection's real identity on the wire is the 5-tuple, not the port alone.
 
@@ -85,6 +94,8 @@ func FiveTuple(network string, conn net.Conn) string {
 
 ### The echo server
 
+**In plain words:** a mini server that waits for one caller, notes the caller's full address pair, and repeats back anything said to it.
+
 **Concept.** `EchoServer` plays the server side: it accepts exactly one connection (enough for this demo), reports its own view of the 5-tuple over a channel, and then echoes back whatever bytes it reads. A real server would loop on `Accept` forever; stopping after one connection keeps the test deterministic and short-lived.
 
 ```go
@@ -111,9 +122,11 @@ func EchoServer(ln net.Listener, tuples chan<- string) {
 3. The tuple is sent over `tuples` and the channel is closed immediately after — the test reads exactly one value and then knows no more are coming.
 4. `io.Copy(conn, conn)` reads from the connection and writes whatever it read back to the same connection — a textbook one-line echo loop. The error is intentionally ignored because this is demo code, not production code; a real echo server would check and log it.
 
-## Tests
+## Tests 🟡
 
 ### TestFiveTupleDiffersPerConnection
+
+**In plain words:** connect twice to the same server and check the two connections got different source ports — the whole point of the demo.
 
 **What it proves:** each connection — even to the same listening port — gets its own distinct ephemeral source port, which is exactly the reason one listening port can serve many simultaneous clients.
 
@@ -191,7 +204,7 @@ Reading it line by line: `server saw: tcp 127.0.0.1:54664 -> 127.0.0.1:54665` me
 
 The client's line is the exact mirror: local `54665`, peer `54664` — the same socket pair, described from each side, with the OS having picked `54665` as a free ephemeral port for the client without being asked.
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative considered | Trade-off |
 | --- | --- | --- |
@@ -200,7 +213,7 @@ The client's line is the exact mirror: local `54665`, peer `54664` — the same 
 | Ignore `io.Copy`'s error | Log or propagate it | Fine for a demo; a production echo server should at least log a non-EOF error |
 | `127.0.0.1:0` to let the OS pick a free port | Hardcoding a port number | Avoids port collisions when tests run in parallel or repeatedly; mirrors how ephemeral ports work for the *client* side too |
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go test -race -v ./...
@@ -216,13 +229,13 @@ Reading the output: `RUN` announces the test name; the two `t.Logf` lines are ea
 
 The race detector (`-race`) finding nothing to report means no goroutine touched shared memory without synchronization — important here because the server and client run concurrently in separate goroutines.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Forgetting `defer conn.Close()` on either end** would leak a file descriptor per connection — in a long-running server this is exactly the `CLOSE_WAIT` accumulation a tool like `ss -tan` would surface (see [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]).
 - **`client.(*net.TCPConn).CloseWrite()`** is a half-close: it signals EOF to the server's `io.Copy` without fully closing the connection, so the client can still read the echoed bytes back. Calling `client.Close()` instead at that point would also close the read side and the test would never see the echo.
 - **`net.Listen("tcp", "127.0.0.1:0")`** binds to port `0`, which tells the OS "pick any free port." Hardcoding a specific port instead would make the test flaky whenever that port is already in use on the machine running it.
 
-## Exercises
+## Exercises 🔴
 
 1. Change the server to loop and accept multiple connections instead of stopping after one. Predict: what has to change about `tuples` (currently closed after a single send) to support more than one client, and why would leaving it as-is cause a panic on the second send?
 2. Remove the `defer client.Close()` call and rerun the test with `-race`. Predict whether the race detector flags anything, and explain why a missing client-side close is a resource leak but not necessarily a *data* race.

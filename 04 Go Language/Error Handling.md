@@ -24,7 +24,42 @@ updated: 2026-11-13
 > - `panic` is reserved for programmer bugs the caller cannot be expected to handle (nil map write, index out of range); recoverable business failures are always errors.
 > - Map errors to a transport (HTTP, gRPC) status only at the outermost boundary — the domain and service layers never import `net/http`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). That is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Things go wrong in programs. A file is missing, a seat is taken, a server is down.
+
+Many languages "throw" a failure and hope someone catches it. Go does something simpler: a function that can fail hands you back an extra value called an **error**, right next to its normal result. You look at it with `if err != nil` and decide what to do.
+
+```mermaid
+flowchart LR
+    F["find(id)"] --> R["result"]
+    F --> E["error (nil = all good)"]
+    E --> C{"err != nil?"}
+    C -- yes --> H["handle or pass it up"]
+    C -- no --> K["keep going"]
+```
+
+As an error travels up through layers, each layer can **wrap** it: add a short label ("while loading user 7:") but keep the original inside, like a parcel getting an extra sticker at every office.
+
+```mermaid
+flowchart LR
+    A["'not found'"] --> B["'find seat A7: not found'"] --> C2["'reserve seat: find seat A7: not found'"]
+```
+
+At the very edge (the HTTP handler), code peeks inside the parcel and picks the right reply: 404, 409 or 500.
+
+The rest of this note is just these 4 questions:
+1. What are the three error shapes (sentinel, typed, wrapped)?
+2. How do `errors.Is` and `errors.As` look through wraps?
+3. When is `panic` ever okay?
+4. Where do errors turn into HTTP status codes, and why only there?
 
 **The problem in one story.**
 You try to book a train seat and something goes wrong.
@@ -66,7 +101,7 @@ Where it breaks: real labels can be read by anyone; in Go, the inner error stays
 > [!tip] Remember
 > Return errors, wrap with `%w`, check with `errors.Is`/`errors.As`, and turn them into status codes only at the edge.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A function in Go can fail in an ordinary, expected way (a row does not exist, input is invalid) or in a way the caller cannot plan for (a nil pointer dereference). Go's designers chose to make the first kind an ordinary return value, not a thrown exception, so that:
 
@@ -90,7 +125,7 @@ The client cannot retry correctly, and an on-call engineer reading the log canno
 
 The fix is not more logging; it is giving errors enough structure (sentinel, typed, wrapped) that the boundary can tell them apart without parsing strings.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of an error as a **small, inspectable value**, not a signal. Everything in this note rests on one interface from the standard library:
 
@@ -108,9 +143,11 @@ By convention, an error string is lowercase and has no trailing punctuation, bec
 
 The idiomatic shape for the wrapping operation itself is `"<op>: %w"` — a short, lowercase description of what was being attempted, a colon, and the wrapped cause — which is what every `fmt.Errorf` call in this note follows.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The three shapes
+
+**In plain words:** a sentinel is a named flag ('this exact thing happened'), a typed error is a flag with a form attached (which field, why), and a wrap is a sticker layered on top of either.
 
 | Shape | Declared as | Caller checks with | Carries |
 | --- | --- | --- | --- |
@@ -121,6 +158,8 @@ The idiomatic shape for the wrapping operation itself is `"<op>: %w"` — a shor
 A sentinel error becomes part of your package's exported API the moment you export it: removing `ErrNotFound` or changing what triggers it is a breaking change for every caller that does `errors.Is(err, mypkg.ErrNotFound)`. Keep the sentinel set small and intentional.
 
 ### Wrapping and unwrapping
+
+**In plain words:** `%w` keeps the original error findable inside the new one; `%v` prints the same text but throws the original away.
 
 `fmt.Errorf` with `%w` returns a value whose `Unwrap() error` returns the wrapped error. Since Go 1.20, a single `fmt.Errorf` call can wrap more than one error with multiple `%w` verbs, producing an `Unwrap() []error` instead:
 
@@ -133,6 +172,8 @@ err := fmt.Errorf("process order: %w and %w", errA, errB)
 `errors.As(err, &target)` walks the same chain looking for the first error whose **type** matches `target`'s type, and if found, assigns it through the pointer. Using `%v` instead of `%w` prints the same text but severs the chain: `errors.Is`/`errors.As` can no longer see the original error.
 
 ### errors.Join
+
+**In plain words:** wrapping is one cause passed up a chain; `Join` is several independent problems reported together, like returning a whole list of form mistakes at once.
 
 `errors.Join(errs...)` (Go 1.20) combines a slice of errors into one value whose `Error()` prints each on its own line and whose `Unwrap() []error` exposes the originals, so both `errors.Is` and `errors.As` still look inside.
 
@@ -184,6 +225,8 @@ classDiagram
 
 ### panic, recover, and the typed-nil trap
 
+**In plain words:** `panic` is the fire alarm — only for bugs, never for a booked seat. And beware: a nil pointer stored in an error variable still counts as 'an error happened'.
+
 `panic` stops normal execution and unwinds the call stack, running deferred functions as it goes, until something calls `recover` inside a `defer` or the program crashes. Reserve it for programmer errors: a nil map write, an out-of-bounds index, an invariant your own code violated.
 
 Never use it for a seat that is already booked or a field that failed validation — those are errors, because the caller is expected to handle them.
@@ -206,7 +249,7 @@ An interface value is `nil` only when **both** its dynamic type and its dynamic 
 
 The fix is to never return a concrete error-implementing pointer type directly as `error` — return the interface type, or the literal `nil`.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -488,7 +531,7 @@ ok  	scratch/g3/errdemo	3.533s
 
 `go vet ./...` reports nothing.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Shape | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -498,14 +541,14 @@ ok  	scratch/g3/errdemo	3.533s
 | `errors.Join` | Combines independent errors into one value with `Unwrap() []error` | Reporting every validation failure instead of the first one | `errors.Is`/`errors.As` must check the whole tree, not a single path |
 | `panic`/`recover` | Unwinds the stack; a deferred `recover` stops it | Programmer bugs only (nil deref, invariant violated), recovered at a boundary as a last resort | Breaks the "errors are visible in signatures" guarantee if overused for business logic |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Wrapping every error at every layer produces long, repetitive log lines (`"reserve seat: lock seat A7 on show 42: seat unavailable"`). Wrap when you add real information (an ID, an operation name), not out of habit.
 - `errors.As` requires the exact pointer or value type you declared; renaming or restructuring a typed error is a breaking change for every caller using `errors.As` on it, the same as a sentinel.
 - `errors.Join`'s `Error()` string is multi-line and not meant for a single HTTP error message; map it to a list of field errors at the boundary instead of returning its raw text.
 - For a single, simple internal tool with one caller and no API boundary, plain `if err != nil { return err }` with no wrapping is often enough — add structure only once something downstream needs to distinguish error kinds.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** the Go standard library itself uses all three shapes — `io.EOF` (sentinel), `*url.Error` and `*json.UnmarshalTypeError` (typed), and `fmt.Errorf("%w")` wrapping throughout `os`, `net`, and `encoding/json`. `database/sql` returns the sentinel `sql.ErrNoRows`, which is exactly what repo layers wrap into a domain `ErrNotFound` in the diagram above.
 - **Failure modes → fixes:**
@@ -515,7 +558,7 @@ ok  	scratch/g3/errdemo	3.533s
   - The typed-nil trap shipping a "successful" response that is actually an error → never return a concrete error-implementing pointer type as `error`; `go vet`'s `nilness` analysis and some linters (e.g. `nilerr`) catch some but not all cases, so review functions that return named pointer-typed errors directly.
 - **What to monitor:** rate of each mapped HTTP status (a spike in 500s vs 400s tells you whether it is your backend or your clients), the sentinel or type behind each 5xx in logs (not just "internal error"), and panics recovered per minute (any sustained rate above zero is a bug, not noise).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `errors.Is` and not `==` after wrapping.** `fmt.Errorf("...: %w", err)` returns a new value every time; comparing that new value to `ErrNotFound` with `==` is always false. `errors.Is` instead calls `Unwrap()` in a loop and compares each link, so it sees through any number of wraps.
 
@@ -533,7 +576,7 @@ ok  	scratch/g3/errdemo	3.533s
 
   A `recover` in the function that started a goroutine does not catch a panic inside that goroutine — each goroutine that can panic needs its own recovery, which is why worker pools and `errgroup`-based fan-out usually wrap each unit of work in a small recover-to-error helper like `SafeHandler` above.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does Go use returned errors instead of exceptions?
 > So every call site that can fail shows it in the function signature and the compiler-visible `if err != nil` check, instead of a `try`/`catch` written (or forgotten) somewhere up the stack. It also keeps control flow linear: there is no stack unwinding to reason about for an ordinary, expected failure.
@@ -558,7 +601,7 @@ ok  	scratch/g3/errdemo	3.533s
 > [!question]- Trap: does `fmt.Errorf("%v", err)` still let `errors.Is` see the wrapped error?
 > No. `%v` only formats the text; it does not call `Unwrap()`. Only `%w` produces a value whose `Unwrap()` method exposes the original error, which is what `errors.Is` and `errors.As` rely on. A log line built with `%v` reads the same to a human but is invisible to error-chain inspection.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `error` is an interface with one method, `Error() string` — nothing more.
 - Sentinel → `errors.Is`. Typed → `errors.As`. Both still work through any number of `%w` wraps.

@@ -18,7 +18,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > A separate-chaining hash table in about 90 lines of Go: `Put`, `Get`, `Delete` and automatic doubling resize, plus a benchmark that measures it against Go's own built-in `map`. Demonstrates the ideas in [[Hash Tables and Go Maps]]: hashing to a bucket, chaining on collision, and amortized O(1) via resizing.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" and "Before the code", then just the Whiteboard version. Stop there.
+> - 🟡 **Know the basics?** Add Steps 1-3 of the code, the design decisions and the tests.
+> - 🔴 **Interview / SDE-3 prep?** Add the benchmarks, "Running it" and the pitfalls. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢 — This file is the hands-on twin of [[Hash Tables and Go Maps]]. It builds a small hash table in plain Go, about 90 lines: put a key in, get it back, delete it, and watch the table grow itself when it gets full. Then it races that toy against Go's real built-in `map` and reads the numbers honestly. Read the theory note first if any word here feels new; here, read the code blocks top to bottom and the "How it works" list after each one.
+
+## Before the code 🟢
 
 - **Structs and pointers**: `Table` holds a slice of `*entry`; each `entry` points to the `next` one, which forms a linked-list chain per bucket.
 - **Methods with pointer receivers**: `func (t *Table) Put(...)` lets the method change the table in place (resize, size counter).
@@ -27,7 +34,7 @@ updated: 2026-11-13
 - **`testing` package**: `TestXxx` functions check correctness; `BenchmarkXxx` functions measure ns/op against Go's built-in `map`.
 - **What to run**: `go vet ./... && go test -race -v ./...`, then `go test -bench=. -benchmem -run=^$ ./...` for the benchmarks.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Hash Tables and Go Maps]] |
 | --- | --- |
@@ -60,16 +67,18 @@ classDiagram
 
 The type is small on purpose: one slice of bucket heads, one linked-list node type for collisions, and one private `resize` that the public methods call when the load factor crosses `0.75`.
 
-## Setup
+## Setup 🟢
 
 - Module `hashtable` with `table.go`, `table_test.go`, and a sub-package `wb/` for the whiteboard version.
 - Go 1.24, standard library only (`hash/fnv`).
 - Run: `go vet ./... && go test -race -v ./...`
 - Benchmarks: `go test -bench=. -benchmem -run=^$ ./...`
 
-## Code
+## Code 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest table that works — hash the key, pick a shelf, drop the entry on top of whatever is there.
 
 **Concept.** The bare idea in [[Hash Tables and Go Maps#Whiteboard version]]: hash the key, mod by the bucket count, and prepend a new node to whatever list is already there.
 
@@ -110,6 +119,8 @@ func (t *tinyTable) put(key, val string) {
 3. `put` computes the bucket index with `int(hash(key)) % len(t.buckets)` and prepends — `O(1)` even on a collision, because prepending to a linked list never has to walk it.
 
 ### Step 1: the real type and its hash function
+
+**In plain words:** now we build the real thing — a struct that remembers how many entries it holds, and a hash helper that knows which size table it is aiming at.
 
 **Concept.** `Table` adds what the whiteboard skips: a `size` counter (so `LoadFactor` and resize decisions are O(1) instead of O(n) scans), and a `hashKey` helper that takes the bucket count as a parameter so the same function works before and after a resize.
 
@@ -174,6 +185,8 @@ flowchart LR
 ```
 
 ### Step 2: insert, lookup and delete
+
+**In plain words:** all three operations start the same way — hash the key, walk that one shelf — and only differ in what they do when they find (or don't find) the key.
 
 **Concept.** `Put`, `Get` and `Delete` all share the same first step — hash the key, walk that bucket's chain — which is the chaining strategy from [[Hash Tables and Go Maps#3.2 Collisions chaining vs open addressing]] made concrete.
 
@@ -256,6 +269,8 @@ func (t *Table) Delete(key string) bool {
 
 ### Step 3: resize
 
+**In plain words:** when the table gets too full, build a bigger wall of shelves and re-hang every entry — this is the one expensive move that keeps all other moves cheap.
+
 **Concept.** This is the amortized-O(1) argument from [[Hash Tables and Go Maps#3.3 Load factor and resizing]] made runnable: allocate a bigger array, walk every existing entry, recompute its bucket index against the *new* size, and move it over.
 
 `resize` reuses the existing `entry` nodes (just changing which bucket's chain they're in) instead of reallocating key/value pairs, which matters more for bigger value types than the `int` used here.
@@ -297,7 +312,7 @@ sequenceDiagram
     Table-->>Caller: Put returns
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -307,9 +322,11 @@ sequenceDiagram
 | Double the bucket count on resize | Grow by a fixed increment | Doubling amortizes resize cost to O(1) per insert; a fixed increment would resize far more often as the table grows. |
 | `size` maintained as a field | Recompute by walking all buckets | O(1) `LoadFactor`/`Len` instead of O(n); costs one extra `int` and must stay in sync in `Put`/`Delete`. |
 
-## Tests
+## Tests 🟡
 
 ### TestResizeKeepsAllKeys
+
+**In plain words:** throw 1,000 keys in, force many rebuilds, then check nothing was lost or duplicated on the way.
 
 **Property.** Inserting 1,000 keys must survive every resize the table performs along the way — no key lost, none duplicated — and the load factor afterward must be back under the `0.75` threshold.
 
@@ -361,6 +378,8 @@ func TestResizeKeepsAllKeys(t *testing.T) {
 **Measured** (Go 1.24.4, `go test -race`): this table, 1000 string keys starting from 4 buckets, survives 9 doublings (4 → 8 → 16 → … → 2048 buckets) with zero lost or duplicated entries; load factor after the run is 0.49.
 
 ### Benchmarks: hand-rolled table vs. Go's map
+
+**In plain words:** time our toy against Go's real map doing the same work, in nanoseconds per operation.
 
 **Property.** These aren't correctness tests — they measure nanoseconds per operation for `Put` and `Get`, pre-generating the 10,000 key strings once outside the timed loop so the benchmark measures table/map cost, not `fmt.Sprintf` cost. This is the measured comparison [[Hash Tables and Go Maps#Go's map is this idea built in]] points to.
 
@@ -433,7 +452,7 @@ func BenchmarkGoMapGet(b *testing.B) {
 
 **If it fails.** These are benchmarks, not assertions — there's nothing to "fail." A regression shows up as a large jump in ns/op between runs on the same hardware.
 
-## Running it
+## Running it 🔴
 
 ```text
 go vet ./... && go test -race -v ./...
@@ -472,20 +491,20 @@ This is a useful, honest result, not a disappointing one: Swiss Tables' real win
 
 Treat any single benchmark like this as a starting point for your own measurement, not a universal verdict.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **No random hash seed.** Unlike Go's own map, this table always hashes the same key to the same bucket across runs — fine for teaching, unsafe if it ever faced attacker-controlled keys ([[Hash Tables and Go Maps#3.4 Worst case and hash flooding]]).
 - **`resize` holds no lock.** This table is not safe for concurrent use, same as Go's own built-in map — see [[sync Primitives and Atomics]] for how to guard a shared map.
 - **Deleting during iteration isn't supported here** (there's no iterator at all) — a real traversal would need to snapshot keys first, the same caution that applies to deleting from a Go map mid-`range` on certain patterns.
 - **FNV-1a is not SIMD-friendly.** Comparing this table's benchmark to Go's map isn't an apples-to-apples test of Swiss Tables' SIMD metadata scan — it's testing "simple chaining with a cheap hash" against "Go's whole runtime map machinery," which includes extra generality this table doesn't need.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `maxLoad` from `0.75` to `0.5` and re-run `TestResizeKeepsAllKeys`. Predict how many total resizes happen on the way to 1,000 keys (more or fewer than before), then add a counter to `resize` and check.
 2. `Delete` a key, then `Put` a different key that hashes to the same bucket. Predict whether the deleted node's memory is reused, then trace through the code to confirm (hint: look at what `prev.next = e.next` actually frees).
 3. Modify `BenchmarkTablePut` to insert 10,000 *brand-new* keys per iteration instead of overwriting the same 10,000 repeatedly (so every `Put` is a true insert, not an update). Predict whether the chaining table or Go's map comes out ahead now, then measure it.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Hash Tables and Go Maps]]
 - **Related:** [[Consistent Hashing - Go]] (hashing for partitioning instead of in-memory lookup), [[Bloom Filters and Probabilistic Data Structures]]

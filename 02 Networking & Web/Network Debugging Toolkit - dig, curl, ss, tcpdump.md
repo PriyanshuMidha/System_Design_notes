@@ -37,7 +37,39 @@ flowchart LR
 
 Everything below expands each branch with the exact flags and how to read the output.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the playbook), 4 (each tool with real output) and 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Sometimes a website or app just will not load. The hard part is that the failure can happen at several different steps.
+
+First your computer looks up the site's number in a phone book (that lookup system is **DNS**). Then it opens a connection to that number. Then it sets up encryption. Then it finally asks for the page.
+
+```mermaid
+flowchart LR
+    A["Look up the number<br/>(DNS)"] --> B["Open a connection"]
+    B --> C["Set up encryption"]
+    C --> D["Ask for the page"]
+```
+
+Any one of those four steps can be the broken one. This note gives you one small command-line tool per step, so you check each step in order instead of guessing.
+
+```mermaid
+flowchart LR
+    X["It is broken,<br/>but where?"] --> Y["Run one tool per step,<br/>in order"]
+    Y --> Z["Found the broken step<br/>in minutes"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which tool checks which step?
+2. How do you read each tool's output?
+3. Given a symptom, which step do you check first?
+
 
 **The problem in one story.**
 You open an app and it says "something went wrong".
@@ -81,7 +113,7 @@ Where it breaks: real network layers can fail partly (1% of requests), and one t
 > [!tip] Remember
 > Match the symptom to one layer, then run the one tool that inspects that layer.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A request can fail at any of the layers in [[What Happens When You Type a URL]]: the name might not resolve, the port might not accept connections, the TLS certificate might not validate, or the HTTP response might be wrong or slow.
 
@@ -95,7 +127,7 @@ The error alone doesn't say whether DNS is flapping, a backend pod is unreachabl
 
 The playbook in this note turns "502 sometimes" into a 5-minute, layer-by-layer check instead of an open-ended investigation.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat the chain from [[What Happens When You Type a URL]] as a stack of layers, and keep one tool "fixed" to each layer:
 
@@ -109,9 +141,11 @@ Treat the chain from [[What Happens When You Type a URL]] as a stack of layers, 
 
 When a symptom doesn't point clearly at one layer, work top-down through this table: DNS first (cheapest to check), then TCP, then TLS, then HTTP, and drop to `tcpdump` only when a tool's own report doesn't explain the behavior.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The debugging playbook
+
+**In plain words:** this is the full decision tree: start from what you see (the symptom) and follow the arrows to the one command to run next.
 
 ```mermaid
 flowchart TD
@@ -129,6 +163,8 @@ flowchart TD
 ```
 
 ### TCP connection states, as `ss`/`netstat` show them
+
+**In plain words:** every connection is always in exactly one named state, like a parcel being "shipped", "out for delivery" or "delivered" — and `ss` just prints that state.
 
 `ss`/`netstat` report a socket's state from this exact state machine (RFC 9293); reading the state tells you which side is stuck:
 
@@ -151,9 +187,11 @@ stateDiagram-v2
 
 A socket stuck in `SYN_SENT` means the SYN or SYN-ACK never arrived (routing/firewall). A pile-up of connections in `CLOSE_WAIT` means the application accepted a close from the peer but never called `close()` itself — a resource leak. A large number in `TIME_WAIT` after a load test is normal cleanup, not a bug, unless it exhausts the ephemeral port range.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### DNS: `dig` and `nslookup`
+
+**In plain words:** `dig` asks the internet's phone book a question and shows you the raw answer, including how long that answer may be reused.
 
 **Measured** (`dig` 9.10.6, 2026-11-06, live query):
 
@@ -238,6 +276,8 @@ Each hop is a separate query your own machine sends — your normal resolver nev
 
 ### HTTP and timing: `curl -v` and `curl -w`
 
+**In plain words:** `curl -v` makes one web request and narrates every step out loud; `curl -w` adds a stopwatch to each step.
+
 **Measured** (`curl 8.x`, 2026-11-06, live request, TLS certificate details redacted since they depend on the network's TLS configuration — see [[TLS and HTTPS]] for what each handshake message means):
 
 ```bash
@@ -296,6 +336,8 @@ total:0.211868s code:200
 
 ### TLS: `openssl s_client`
 
+**In plain words:** this command does only the encryption handshake and shows you the server's ID card (its certificate), so you can see exactly why a browser would not trust it.
+
 ```bash
 $ echo | openssl s_client -connect example.com:443 -servername example.com
 CONNECTED(00000006)
@@ -327,6 +369,8 @@ Verify return code: 0 (ok)
 
 ### Sockets: `ss` / `netstat`
 
+**In plain words:** `ss` lists every connection your machine currently has, one per row, with its state — like a list of all phone calls in progress.
+
 **Representative output** (`ss -tan`, Linux; macOS lacks `ss` and uses `netstat -an` instead, shown with equivalent columns):
 
 ```text
@@ -345,6 +389,8 @@ Once `Recv-Q` reaches that limit, the kernel drops or refuses further incoming S
 Many `CLOSE-WAIT` rows for the same remote peer is the state diagram's leak: this process never called `close()` after the peer disconnected.
 
 ### The wire itself: `tcpdump`
+
+**In plain words:** `tcpdump` records the actual packets leaving and entering your machine — the ground truth when every other tool's story does not add up.
 
 **Representative output** (`tcpdump` 4.x, capturing a TCP handshake and HTTPS request; requires elevated privileges to open a raw socket):
 
@@ -365,6 +411,8 @@ The three-way handshake is the first three lines; line 4 is the TLS ClientHello 
 The filter expression (`host ... and port 443`) is Berkeley Packet Filter (BPF) syntax; narrowing it is essential on a busy interface.
 
 ### Reachability: `traceroute`, `mtr`, `nc`
+
+**In plain words:** `traceroute` shows every router your packets pass through on the way, and `nc` asks one simple question: is this door (port) open at all?
 
 **Measured** (`traceroute`, 2026-11-06, live, 5 hops):
 
@@ -418,7 +466,7 @@ Having a program classify a health check into these same buckets (rather than a 
 
 Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implementation and all four tests: [[Network Debugging Toolkit - dig, curl, ss, tcpdump - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Symptom | Likely layer | Command | What to read in the output |
 | --- | --- | --- | --- |
@@ -430,14 +478,14 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 | 200 OK but slow | Any layer; isolate with timing | `curl -w` phase timing | Which of dns/connect/tls/ttfb grew |
 | Everything above looks fine but behavior is still wrong | Needs ground truth | `tcpdump` | Actual bytes/flags on the wire, retransmissions, resets |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `dig`/`curl`/`openssl` are read-only and safe to run against production; `tcpdump` requires elevated privileges (`CAP_NET_RAW` or root) and can capture sensitive payloads — never run it without a tight filter and awareness of what it will capture (see [[CSRF, XSS and Security Headers]] for why capturing plaintext credentials is a real risk on an unencrypted hop).
 - `traceroute` and `mtr` measure the *path*, not the application; a clean traceroute does not rule out an application-level problem, and a path with packet loss doesn't always explain an application timeout (TCP retransmits and often recovers invisibly).
 - `curl --resolve` and DNS overrides are for testing; relying on them as a permanent fix instead of correcting the actual DNS record just hides the problem from everyone else who hits the real record.
 - Reading `tcpdump` output live is slow for complex problems; capture to a file (`-w capture.pcap`) and inspect it with a GUI tool (Wireshark) when the question is more than "did the SYN arrive."
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** this exact toolkit is what an on-call engineer runs during an incident, in roughly the order DNS → TCP → TLS → HTTP → packet capture; load balancer and Kubernetes health checks are the automated version of the `nc`/`CheckTCP` step, run continuously instead of once.
 - **Failure modes → fixes:**
@@ -447,7 +495,7 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
   - A host "sometimes" doesn't respond → capture with `tcpdump` during a failure window and look for retransmissions or resets, which point at network loss rather than application logic.
 - **What to monitor:** DNS query latency and NXDOMAIN rate, TCP connect failure rate (refused vs timeout, since they mean different things operationally), TLS handshake failure rate and days-to-certificate-expiry, and HTTP error rate broken down by phase timing (so a dashboard can already say "this is a TLS problem" before anyone opens a terminal).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **`dig`'s flags section decodes the resolution itself.** `qr` means this is a response (not a query), `rd` means recursion was requested, `ra` means the server supports recursion, `ad` means the answer was validated with DNSSEC. Missing `ad` on a zone that should be signed is itself a finding.
 - **BPF filter syntax is a small language, not a free-text search.** `tcpdump 'tcp and port 443 and (tcp[tcpflags] & tcp-syn != 0)'` captures only SYN packets — useful for counting connection *attempts* separately from established traffic.
@@ -465,7 +513,7 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 
   In Go, it is almost always a missing `defer conn.Close()` or a response body that's read but never closed (`resp.Body.Close()`).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A request times out with no error message at all. What's your first command, and why?
 > `nc -zv host port` (or `curl -v` with a connect timeout). It answers the single cheapest question first: does TCP even connect? If it hangs the same way, the problem is routing or a firewall silently dropping packets — check with `traceroute`/`mtr`. If `nc` succeeds instantly, the problem is above TCP (TLS or the application), and the timeout is really the app not responding.
@@ -488,7 +536,7 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 > [!question]- What's the practical difference between "connection refused" and "connection timed out," and why does it matter for debugging?
 > Refused means a SYN reached the host and something (the OS) answered with an RST because nothing is listening on that port — the network path works, but the service/port is wrong. Timed out means no reply came back at all within the deadline — usually a firewall dropping the packet or a dead route. The first points you at "is the right process listening on the right port," the second points you at routing and firewalls.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Order of attack: DNS (`dig`) → TCP reachability (`nc`, `ss`) → TLS (`openssl s_client`) → HTTP (`curl -v`/`-w`) → raw packets (`tcpdump`) only if the above don't explain it.
 - `dig name TYPE`: no `ANSWER SECTION` + an `AUTHORITY SECTION` SOA means NXDOMAIN; a timeout with neither means the resolver itself is unreachable.
@@ -499,7 +547,7 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 - `tcpdump` needs a tight BPF filter (`host`, `port`, `tcp[tcpflags]`) and root; capture to a file for anything beyond a one-line check.
 - `traceroute`/`mtr` measure the path, not the app — loss at one middle hop with clean hops around it is usually that router's ICMP policy, not a real problem.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[What Happens When You Type a URL]], [[DNS - Resolution, Records and Caching]], [[TCP - Handshake, Reliability, Flow and Congestion Control]], [[TLS and HTTPS]]
 - **Next:** [[Forward and Reverse Proxies - L4 vs L7]]

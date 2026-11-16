@@ -29,7 +29,36 @@ updated: 2026-11-13
 > - Keep 3 copies on 2 kinds of storage, 1 off-site, and make at least one immutable.
 > - A backup you have never restored is a hope, not a backup: automate restore drills and verify the data.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your database holds all your invoices. One day someone runs a delete by mistake, and the rows are gone everywhere, even on the live copies.
+
+```mermaid
+flowchart LR
+    M["Bad delete at 10:01"] --> DB["Main database: rows gone"]
+    DB --> C1["Copy 1: rows gone too"]
+    DB --> C2["Copy 2: rows gone too"]
+```
+
+A **backup** is a saved photo of the data, kept somewhere safe. The database also keeps a diary of every change, called the **WAL**. Put the two together and you can rebuild the data as it was at any second. That trick is called **PITR** (point-in-time recovery): start from the photo, replay the diary, stop just before the mistake.
+
+```mermaid
+flowchart LR
+    P["Last night's backup<br/>(the photo)"] --> R["Replay the change diary"]
+    R --> S["Stop at 10:00:59<br/>rows are back"]
+```
+
+The rest of this note is just these 3 questions:
+1. Why can't the live copies save you? (sections 1-2)
+2. How do you rebuild to an exact second? (sections 3-4)
+3. How do you know your backups will actually work on the bad day? (sections 5-8)
 
 **The problem in one story.**
 A teammate runs `DELETE FROM invoices` and forgets the `WHERE`.
@@ -73,7 +102,7 @@ Where it breaks: a lost piece of the video means you cannot get past that point,
 > [!tip] Remember
 > A replica copies mistakes; a base backup plus the WAL lets you rewind to the second before them.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 At 14:42 on a Tuesday an InvoiceOps engineer runs a data-fix script. A missing `WHERE` clause turns it into:
 
@@ -88,7 +117,7 @@ InvoiceOps runs a primary with two streaming replicas (see [[Replication]]). Bot
 
 The cost of not having it is concrete. The newest copy without PITR might be last night's 01:00 `pg_dump`; restoring it loses 13 hours and 42 minutes of invoices, payments and webhooks, which then have to be rebuilt from payment-provider exports and emails.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ```mermaid
 flowchart LR
@@ -114,9 +143,11 @@ Two numbers frame every decision:
 - **RPO (Recovery Point Objective):** the most data, measured in time, you accept losing. "RPO 5 minutes" means after a disaster at 14:42 you must recover everything up to at least 14:37.
 - **RTO (Recovery Time Objective):** the most time you accept being down. "RTO 1 hour" means service is back by 15:42.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Logical vs physical backups
+
+**In plain words:** there are two ways to copy a database — write out the data as SQL you can replay anywhere (logical, like re-typing a book), or copy the raw files byte for byte (physical, like photocopying it). Photocopying is faster but only works on the same kind of machine.
 
 | | Logical (`pg_dump`, `mysqldump`) | Physical (`pg_basebackup`, volume snapshot) |
 | --- | --- | --- |
@@ -142,6 +173,8 @@ flowchart TD
 
 ### 3.2 Base backup plus WAL archive
 
+**In plain words:** the base backup is the nightly photo; the WAL archive is the change diary shipped off-site every minute. Together they let you rebuild to any second.
+
 Every change PostgreSQL makes is first written to the **WAL** (write-ahead log; see [[Storage Engines - B-tree vs LSM and WAL]]) in 16 MB files called segments.
 
 With `archive_mode = on`, each completed segment is handed to `archive_command` (or an `archive_library` since PostgreSQL 15), which copies it to object storage.
@@ -162,6 +195,8 @@ flowchart LR
 ```
 
 ### The restore procedure
+
+**In plain words:** restoring is a recipe — copy the photo to a fresh server, tell it where the diary lives and what second to stop at, then start it and let it replay.
 
 ```mermaid
 sequenceDiagram
@@ -190,6 +225,8 @@ The restore:
 
 ### 3.3 Where RPO comes from
 
+**In plain words:** RPO is simply "how much of the diary could I lose?" — whatever sits in the page that has not been shipped off-site yet.
+
 ```mermaid
 flowchart LR
     subgraph arch["archived, safe off-host"]
@@ -210,6 +247,8 @@ Tools such as `pg_receivewal`, pgBackRest and Barman can also stream WAL continu
 
 ### 3.4 Disaster recovery tiers
 
+**In plain words:** DR tiers are how much of a spare kitchen you keep in another city — from just the recipes (cheap, slow) to a fully staffed duplicate restaurant (fast, expensive).
+
 | Tier | What runs in the DR region | Typical RPO | Typical RTO | Relative cost |
 | --- | --- | --- | --- | --- |
 | Backup and restore | Only stored backups | Hours | Hours to a day | $ |
@@ -226,9 +265,11 @@ flowchart LR
 
 These four tiers and their typical RPO/RTO ranges follow the AWS whitepaper *Disaster Recovery of Workloads on AWS*. Note the trap: every tier above "backup and restore" replicates mistakes too, so **each tier still needs PITR backups** for logical corruption.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the three code blocks below are the whole setup — turn on archiving on the live server, point a fresh server at the archive with a stop time, then check the data before trusting it.
 
 ```sql
 -- postgresql.conf on the primary
@@ -306,6 +347,8 @@ Runnable Go version: [[Backup, PITR and Disaster Recovery - Go]]
 
 ### 4.4 Partial restore of one tenant
 
+**In plain words:** when only one customer's rows were deleted, don't rewind the whole database — rebuild a side copy, export just that customer's rows, and paste them back.
+
 ```mermaid
 flowchart LR
     BK["base backup + WAL"] --> SS["side server restored to 11:14:59"]
@@ -359,7 +402,7 @@ sequenceDiagram
 
 The drill produces measured RTO and RPO each week. If the measured restore time grows past the target, you learn it from a dashboard instead of during an incident.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Method | RPO | RTO for 2 TB (estimate) | Protects against | Misses |
 | --- | --- | --- | --- | --- |
@@ -382,7 +425,7 @@ Aurora works differently: storage is continuously backed up, and its backtrack f
 
 **MySQL.** `mysqldump` or MySQL Shell dump utilities for logical; Percona XtraBackup or MySQL Enterprise Backup for physical; the **binlog** plays the role of the WAL for PITR (`mysqlbinlog --stop-datetime`).
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Logical dumps do not scale.** Beyond a few hundred GB, restore time is dominated by index rebuilds; keep dumps for small databases, upgrades and partial restores, not as the production recovery path.
 - **Short retention is cheap and risky.** Silent corruption or a slow bug is often noticed after days; 7 days of PITR cannot reach a mistake made 9 days ago. Keep weekly or monthly fulls longer (with immutability), even if PITR covers fewer days.
@@ -391,9 +434,16 @@ Aurora works differently: storage is continuously backed up, and its backtrack f
 - **Encryption without key backup** turns backups into noise. Store KMS keys or passphrases where a region or account loss does not take them too.
 - **When simpler wins:** a small internal tool with a 24-hour RPO is well served by managed automated backups and a monthly restore test. Do not build pilot light for it.
 
-## 7. In production
+## 7. In production 🔴
 
 **The 3-2-1 rule:** at least **3** copies of the data, on **2** different kinds of storage, **1** of them off-site. A modern extension is 3-2-1-1-0: one copy immutable or offline, and zero errors in restore verification.
+
+```mermaid
+flowchart LR
+    D["Your data"] --> C1["Copy 1: live database"]
+    D --> C2["Copy 2: backups in object storage"]
+    D --> C3["Copy 3: off-site, other account<br/>(one copy locked, nobody can delete it)"]
+```
 
 **Immutability.** S3 Object Lock in **compliance mode** prevents anyone, including the root user, from deleting or overwriting an object version until its retention date; **governance mode** can be bypassed by users with a special permission. AWS Backup Vault Lock offers the same for backup vaults.
 
@@ -414,7 +464,7 @@ Recovery used a copy of the database made about six hours earlier for staging, s
 
 **What to monitor:** age of the last successful base backup; age of the last archived WAL segment (`pg_stat_archiver.last_archived_time`) against the RPO; archive failures; backup size trend; measured restore duration from the latest drill against the RTO; replication lag of any delayed replica.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Delayed replica.** A standby with `recovery_min_apply_delay = '1h'` receives WAL immediately but applies each commit only after one hour. If a bad deploy is caught within the hour, pause replay (`pg_wal_replay_pause()`), then set `recovery_target_time` to just before the mistake and restart the standby (recovery target settings take effect only at server start) so it replays up to that point, and read the good data in minutes, without copying terabytes.
 ```mermaid
@@ -439,7 +489,7 @@ flowchart LR
 - **Backups and sharding.** With many shards, "restore to 14:41:59" must happen on every shard to the same point, or cross-shard references break. Use the same target time everywhere, and accept that clocks differ slightly; for strict consistency, record a cross-shard restore point with `pg_create_restore_point()` on every shard at the same moment.
 - **Backups and logical replication or outbox.** A restored database has an outbox table and consumer offsets from the past; downstream systems have already seen newer events. After a restore, plan for re-emitting or deduplicating events (see [[Transactional Outbox and CDC]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: "We have three replicas, so we don't need backups." Correct?
 > No. Replicas copy every change, including `DROP TABLE`, a bad `UPDATE` and ransomware encryption done through the database, within milliseconds. Replicas protect against hardware loss. Backups with PITR protect against bad changes. You need both.
@@ -462,7 +512,7 @@ flowchart LR
 > [!question]- What did the GitLab 2017 incident teach about backups?
 > Having several backup methods is meaningless if nobody verifies them: their dumps failed silently, alerts were not delivered, and snapshots were not enabled. Every backup needs monitoring of its success and automated restore tests that prove it works.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Replica ≠ backup. Replicas fix hardware loss; PITR backups fix bad data.
 - PITR = base backup + unbroken WAL archive + `recovery_target_time`. One missing segment breaks the window.

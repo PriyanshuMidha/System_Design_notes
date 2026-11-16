@@ -23,7 +23,34 @@ updated: 2026-11-13
 > - Endianness is the byte order used to store a multi-byte number; it matters whenever bytes cross a machine boundary (network, file formats).
 > - In Go, a `string` is a read-only sequence of bytes, `len()` always counts bytes, and a `rune` is one Unicode code point — these three can disagree for any non-ASCII text.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A computer can only store switches that are on or off. We call one switch a **bit** (a 0 or a 1). Everything — numbers, letters, emojis — must be turned into bits somehow.
+
+```mermaid
+flowchart LR
+    A["The letter 'A'"] --> B["An agreed number: 65"] --> C["Bits: 01000001"]
+```
+
+For numbers, the trick is place value in base 2 instead of base 10. For text, the trick is a big agreed table that says "this number means this character". That table is **Unicode**, and **UTF-8** is the popular way to pack those numbers into bytes.
+
+```mermaid
+flowchart LR
+    U["Character"] --> N["Unicode number<br/>(code point)"] --> E["UTF-8 bytes<br/>(1 to 4 of them)"]
+```
+
+That is the whole game: agreeing on how bits map to meaning. The rest of this note is just four questions:
+1. How do bits store whole numbers, including negative ones?
+2. Why do decimals like 0.1 come out slightly wrong in floats?
+3. How does text become bytes, and why do some characters take 4 bytes?
+4. Where does this bite you in real Go code?
 
 **The problem in one story.**
 You build a shop app. A cart shows $0.10 + $0.20 and your code checks "is it $0.30?" — it says no.
@@ -68,7 +95,7 @@ Where it breaks: Morse operators agree on one codebook, but a program can read t
 > [!tip] Remember
 > Bits have no meaning on their own; the type you read them with decides the number or letter you get.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Every value in a running program — an `int32` counter, a `float64` price, a UTF-8 log line — is ultimately just bits in memory.
 
@@ -83,7 +110,7 @@ All three are the direct, mechanical consequence of how numbers and text are rep
 > [!warning] Common mistake
 > Assuming "the compiler would warn me" or "this would crash if it were wrong." None of these three bugs produce an error. They produce a wrong number or a wrong byte count, silently, and the program keeps running.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of an integer's bits as an odometer with a fixed number of digits. Once it hits its maximum, the next increment rolls it back to the minimum (or to zero, for unsigned), silently, exactly like a car's mechanical odometer rolling over from `999999` to `000000`.
 
@@ -97,7 +124,7 @@ Think of a Go `string` as a shipping container of raw bytes with a label. The la
 
 The analogy breaks down in one place: a shipping container's weight is a property of the container, but a string's byte length also depends on *what characters* it contains, not just how many — two four-character strings can have different `len()`.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Two's complement and silent overflow
 
@@ -230,7 +257,7 @@ Any code that assumes `len(s)` equals "number of characters a user would count" 
 > [!tip] Remember
 > `len(s)` is always a byte count in Go; use `utf8.RuneCountInString(s)` or `for range s` when you actually mean "number of characters."
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -252,7 +279,7 @@ Runnable Go version: [[Number Representation and Text Encoding - Go]].
 
 All three confirm the mechanisms described above, not just claimed behavior.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Representation | Size | Exact for | Wraps / rounds silently? | Typical use |
 | --- | --- | --- | --- | --- |
@@ -273,14 +300,14 @@ All three confirm the mechanisms described above, not just claimed behavior.
 | Python | Never overflows: integers are arbitrary-precision by default, at the cost of per-operation overhead. |
 | C | Signed overflow is undefined behavior (compilers may assume it never happens); unsigned overflow wraps, defined by the standard. |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `int8`/`int16`/`int32` save memory over `int64` but overflow at much smaller values — use the smallest type only when the range is provably bounded (e.g. a day-of-month field), not for general-purpose counters.
 - Floats are the right choice for scientific computation, graphics, and anything where small relative error is acceptable and the dynamic range (very large and very small magnitudes) matters more than exactness — just never for money or anything requiring exact equality comparisons.
 - Arbitrary-precision decimal types are exact but slower and use more memory than native integers; for performance-critical money math where values fit comfortably in an `int64`, plain integer cents is usually both simpler and faster.
 - UTF-8 isn't always the right choice when interoperating with legacy systems that expect fixed-width encodings (UTF-16 on Windows APIs and inside the JVM/JavaScript strings internally) — conversion boundaries need explicit handling, not assumption.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Stripe and most payment processors represent amounts as integer minor units (e.g. cents) in their APIs. PostgreSQL's `numeric`/`decimal` type stores exact arbitrary-precision decimals for money columns, distinct from `real`/`double precision` (IEEE 754 floats). Network protocols (IP, TCP headers) fix big-endian ("network byte order") explicitly so endianness is never ambiguous on the wire.
 - **Failure modes → fixes:**
@@ -290,14 +317,14 @@ All three confirm the mechanisms described above, not just claimed behavior.
 	- Bytes read from a network protocol or binary file are mis-parsed as the wrong endianness, corrupting every multi-byte field → always decode using the protocol/format's documented byte order (`encoding/binary`'s `BigEndian`/`LittleEndian`), never the host's native order, unless the format explicitly says "native/host order."
 - **What to monitor:** overflow-prone counters approaching their type's max value (a surprisingly common production incident, e.g. an `int32` ID or timestamp field nearing its limit); any code path doing float arithmetic on monetary values (a static-analysis or code-review rule, not a runtime metric).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why two's complement, specifically?** The alternative schemes — sign-magnitude (a dedicated sign bit, rest is magnitude) and one's complement (invert bits for negation) — both have two representations of zero (`+0` and `-0`) and require special-case logic in the adder circuit for subtraction. Two's complement has exactly one representation of zero and lets the same binary adder hardware handle both addition and subtraction of signed values, which is why every mainstream CPU architecture uses it.
 - **IEEE 754 special values**: beyond ordinary numbers, binary64 reserves bit patterns for `+Inf`, `-Inf`, and `NaN` (not-a-number, the result of operations like `0.0/0.0`). Critically, `NaN != NaN` is true — `NaN` is not even equal to itself — which trips up naive equality-based deduplication or caching logic that doesn't special-case it.
 - **Why UTF-8 won over UTF-16/UTF-32**: it's backward compatible with ASCII (every ASCII byte is valid UTF-8 for that same character), self-synchronizing (you can find a character boundary from any byte offset without scanning from the start, because continuation bytes have a distinct bit pattern), and endianness-free (unlike UTF-16, which needs a byte-order mark or an explicit LE/BE variant).
 - **Go's design choice**: making `string` a read-only byte sequence (not an array of runes) means indexing a string by position (`s[i]`) gives a *byte*, not a character — a frequent surprise for newcomers expecting `s[i]` to return the i-th character. This is also why Go's standard library offers `utf8.RuneCountInString`, `[]rune(s)` conversion, and `strings.Reader`/`bufio.Scanner` with rune-aware splitting, rather than making every string operation rune-aware by default (which would cost performance for the common ASCII-heavy case).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `var x int8 = 127; x++` not panic in Go, and what does it actually produce?
 > Go's built-in integer arithmetic never checks for overflow, in any build mode; it simply wraps around using two's complement semantics. `127 + 1` as an `int8` produces `-128`, because the bit pattern for `128` interpreted as a signed 8-bit two's complement value is `-128`.
@@ -320,7 +347,7 @@ All three confirm the mechanisms described above, not just claimed behavior.
 > [!question]- Why is `NaN != NaN` true, and what bug does that commonly cause?
 > IEEE 754 defines `NaN` (not-a-number, produced by operations like `0.0/0.0`) to compare unequal to every value, including itself, so that any computation that has gone indeterminate is never mistaken for a valid, comparable number. This commonly breaks naive deduplication, set/map-key logic, or sorting code that assumes `x == x` always holds — `NaN` values need an explicit `math.IsNaN()` check rather than relying on `==`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Integers wrap silently on overflow in Go (two's complement, no panic, no check) — size types generously and add explicit bounds checks where it matters.
 - `0.1 + 0.2 != 0.3` in `float64`; never compare floats with `==`, and never use floats for money.

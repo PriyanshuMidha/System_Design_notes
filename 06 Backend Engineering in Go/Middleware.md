@@ -22,7 +22,32 @@ updated: 2026-11-13
 > - A canonical order exists for a reason: `recover → request ID → logging/tracing → CORS → body limit → auth → rate limit → routes`. Each step depends on something the step before it set up, or must run before a step it would otherwise break (CORS before auth, because a preflight carries no `Authorization` header).
 > - The one genuinely hard part is capturing the response **status and whether anything was written yet** — `http.ResponseWriter` has no `Status()` method, so recovery and logging middleware have to wrap it themselves.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Lots of things must happen on every single request: catch crashes, give the request an ID, log it, check who is calling. You do not copy that code into every handler.
+
+Instead you wrap handlers. **Middleware** is a function that takes a handler and returns a new handler that does something extra before or after.
+
+```mermaid
+flowchart LR
+    R[Request] --> M1[Recover] --> M2[Request ID] --> M3[Log] --> M4[Auth] --> H[Your handler]
+```
+
+A chain is just wrappers inside wrappers, like layers of an onion: the request walks in through each layer, hits the handler, and the response walks back out through the same layers.
+
+Order matters: the crash-catcher must be the outermost layer, or a crash inside logging escapes it.
+
+The rest of this note is just these 3 questions:
+1. What is the one shape all middleware shares, and how do chains nest?
+2. Why this order — recover, request ID, log, auth — and not another?
+3. How does middleware see the response (status, size) a handler wrote?
 
 **The problem in one story.**
 Your web server has 30 different pages (routes).
@@ -67,7 +92,7 @@ Where it breaks: a passenger does not walk back through security on the way out,
 > [!tip] Remember
 > Middleware is a wrapper around a handler: code before, code after, or stop the request early.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Every handler in InvoiceOps needs the same handful of things done around it: a panic must not take down the process, every request needs a correlation ID, every request needs an access-log line, `POST /invoices` needs the caller authenticated and rate-limited.
 
@@ -75,7 +100,7 @@ Without middleware, that is five blocks of boilerplate pasted into the top of ev
 
 [[Building REST Endpoints]] showed one handler done right. This note is about the thing that wraps **every** handler the same way: one small function type, a helper to chain several of them, and the specific middleware every production Go service ends up writing — recover, request ID, access logging, CORS, a body-size cap, auth, rate limiting, and timeouts.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An onion. The request enters at the outside and has to pass through every layer to reach the handler at the core; the response leaves by passing back out through the same layers in reverse. Each layer can:
 
@@ -85,7 +110,7 @@ An onion. The request enters at the outside and has to pass through every layer 
 
 `http.Handler` is one method, `ServeHTTP(w, r)`. A middleware is nothing more than a function that builds a new `http.Handler` whose `ServeHTTP` calls the old one — the same shape as a decorator in any language (see [[Decorator and Middleware]] for the general pattern outside HTTP).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 flowchart TB
@@ -126,6 +151,8 @@ func Chain(h http.Handler, mw ...Middleware) http.Handler {
 ```
 
 ### Ordering, and why it is this order
+
+**In plain words:** the onion's layers in order, with the reason each one must sit outside the next.
 
 ```mermaid
 sequenceDiagram
@@ -200,6 +227,8 @@ mux.Handle("/admin/", http.StripPrefix("/admin", Chain(admin, requireAdminRole))
 
 ### The one hard part: capturing the response
 
+**In plain words:** a handler writes straight past the middleware to the client, so to log the status code you slip a recorder in between — a wrapper around the pen it writes with.
+
 `http.ResponseWriter` cannot tell a wrapping middleware what status code a handler sent, or even whether it has written anything yet — both are things recovery and logging middleware need to know, and neither is exposed by the interface. The fix is the same one pattern twice, at two different granularities:
 
 - **[[Observability in Go Services]]** owns the full version: a `statusWriter` that records the exact status code and byte count for RED metrics and the access-log line, with an `Unwrap() http.ResponseWriter` method so `http.ResponseController` can still reach `Flush`/`Hijack` on the real writer through the wrapper (needed by a streaming handler further down the chain, e.g. SSE).
@@ -218,9 +247,11 @@ func (w *writeTracker) Unwrap() http.ResponseWriter  { return w.ResponseWriter }
 
 Both wrappers embed the real `ResponseWriter` and override only `WriteHeader`/`Write`, which is what makes `Unwrap` necessary in the first place: embedding hides the concrete type from anything doing a type assertion for `http.Flusher` or `http.Hijacker`, and `ResponseController` is the stdlib's sanctioned way to see through a chain of such wrappers.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** one middleware and one chain, as small as it gets.
 
 The bare shape, no chain helper, no recovery, just "wrap a handler":
 
@@ -586,7 +617,7 @@ func TestCORS_PreflightNeverReachesNext(t *testing.T) {
 
 **Measured:** `go test -race ./...` on this package (Go 1.24.4, `golang.org/x/time v0.8.0`): 12 test functions, all passed, covering chain ordering, all three `Recover` branches (clean panic, panic after a partial write, `ErrAbortHandler`), both `RequestID` branches, both `CORS` branches, the body limit, both rate-limit cases (burst-then-429, and two principals keyed separately), and the timeout's context deadline.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -596,14 +627,14 @@ func TestCORS_PreflightNeverReachesNext(t *testing.T) {
 | `http.TimeoutHandler` | Starts the handler in a goroutine, writes a timeout response itself if it doesn't finish in time | A single endpoint needs a response to go out even if the handler never notices the deadline | The handler goroutine keeps running after the timeout fires — it just stops mattering to the client; can still leak work |
 | Context-deadline middleware (`Timeout` above) | Sets `context.WithTimeout`, writes nothing itself | Propagating a deadline into database/HTTP calls the handler makes | Does nothing if the handler ignores `ctx.Err()` — Go cannot force a goroutine to stop |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Middleware is for concerns that are the same on **every** request regardless of business logic. The moment a "middleware" starts branching on which resource is being modified, it has become business logic wearing a middleware costume — move it into the handler or service layer.
 - A deep chain (eight-plus layers) adds one function call and one `defer` per layer per request. That overhead is real but tiny next to a database round trip; it is not where a slow endpoint's time goes.
 - Context values are easy to overuse. A `Principal` or a request ID earns a ctx key because it is genuinely request-scoped and needed by unrelated layers; a handler's own business parameters should be plain function arguments, not smuggled through context.
 - Per-route middleware composition (wrapping each handler individually) scales poorly past a handful of variations — at that point a router with built-in route groups (`chi`) usually reads cleaner than manually `Chain`-ing every registration.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every Go HTTP framework and router (`chi`, `gin`, `echo`) is built around exactly this `func(http.Handler) http.Handler` shape or a close variant, because it composes with the stdlib's own `httptest`, `http.ResponseController` and reverse-proxy tooling without an adapter layer. Envoy and Nginx apply the same onion model as HTTP filters/modules outside the application process entirely.
 - **Failure modes → fixes:**
@@ -613,7 +644,7 @@ func TestCORS_PreflightNeverReachesNext(t *testing.T) {
   - Recovery middleware swallows the panic with no log → a silent, misleading response with no trace of why: this vault's audit of the old middleware note reproduced exactly this — a panic after a partial write came back as status `200` with a truncated body, and the only log output was the runtime's cryptic `superfluous response.WriteHeader` warning, not a panic log with a stack trace. Always log `debug.Stack()`, never just the recover value.
 - **What to monitor:** the `panics` counter from `Recover` (any nonzero rate is a bug, not noise), `429` rate from `RateLimit` (separately for 401-adjacent abuse vs. legitimate traffic bursts), and CORS preflight failure rate (a spike usually means a frontend deploy added an origin nobody allow-listed yet).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `ErrAbortHandler` gets special treatment.** `net/http` defines `http.ErrAbortHandler` as a sentinel a handler can panic with to abort the response without the server logging a stack trace — used by `httputil.ReverseProxy` and some streaming code paths when the client has already gone away and there is nothing useful to report. A `Recover` middleware that treats every panic identically turns this intentional, silent abort into a noisy, wrong "panic recovered" log line; checking for this exact sentinel and re-panicking lets the per-connection recovery `net/http` already has do the (silent) right thing.
 - **Why the wrapper needs `Unwrap()`, specifically.** `http.ResponseController` (added in Go 1.20) is the stdlib's answer to "how do I call `Flush`/`Hijack`/`SetReadDeadline` through a chain of middleware wrappers without every wrapper having to forward every optional interface by hand". It looks for an `Unwrap() http.ResponseWriter` method and walks the chain until it finds a writer that implements the method it needs. Skip `Unwrap` on a custom wrapper and an SSE handler three middleware layers down loses the ability to `Flush` after every event — a bug that only shows up under a load balancer that buffers without it, not in a quick local test.
@@ -621,7 +652,7 @@ func TestCORS_PreflightNeverReachesNext(t *testing.T) {
 - **Why the rate limiter sweeps instead of using a `time.Ticker` goroutine.** A background goroutine needs a shutdown signal (another lifecycle thing to wire into [[Graceful Shutdown and Health Checks]]) and adds a second place state can race. Sweeping expired entries inline, under the same lock `allow` already takes, costs one extra map iteration per call and needs no separate lifecycle — the right trade at the request volumes a single-instance limiter is appropriate for in the first place. Past that volume, the Redis-backed limiter in [[Redis in Go]] replaces the in-memory map entirely.
 - **Per-route vs. global rate limiting during a webhook burst.** An InvoiceOps payment provider replaying 500 queued webhooks in ten seconds after an outage should not compete with `POST /invoices` for the same global bucket — keying by route pattern in addition to principal (or giving the webhook endpoint its own `RateLimiter` entirely) keeps one burst from starving unrelated traffic.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the type signature of HTTP middleware in Go, and why that shape?
 > `func(http.Handler) http.Handler`. It takes the next handler and returns a new one, which is exactly what you need to run code before and/or after another handler, and it composes by nesting: `mw1(mw2(handler))`. Because the result is itself an `http.Handler`, middleware, routers and plain handlers are all interchangeable wherever an `http.Handler` is expected.
@@ -644,7 +675,7 @@ func TestCORS_PreflightNeverReachesNext(t *testing.T) {
 > [!question]- Trap: does wrapping a handler in `Recover` protect the whole server from a panic?
 > Partially, and only per-goroutine. It protects every request that goes through that specific chain from that specific panic crashing the whole process — but `net/http` already recovers handler-goroutine panics per-connection on its own (the client just sees a dropped connection with no clean error, and the process survives either way). What `Recover` middleware actually adds is a *clean* JSON `500` instead of a dropped connection, a structured log with the stack trace, and a metric — not protection the server didn't already have at the process level.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Middleware's type is `func(http.Handler) http.Handler`; a chain is nested closures, first-in is outermost.
 - Canonical order: recover → request ID → logging/tracing → CORS → body limit → auth → rate limit → routes.
@@ -656,7 +687,7 @@ func TestCORS_PreflightNeverReachesNext(t *testing.T) {
 - `http.TimeoutHandler` writes a response for you but doesn't stop the handler; a context deadline stops propagated work but writes nothing itself.
 - Test each middleware alone with `httptest`, against a trivial `next` handler — not through the whole chain.
 
-## Links
+## Links 🟢
 - **Before this:** [[HTTP Server Fundamentals (net-http)]], [[Building REST Endpoints]], [[Context Package]]
 - **Next:** [[Authentication and Authorization in Go]], [[Observability in Go Services]], [[OpenAPI-First Development in Go]]
 - **Compare with:** [[Decorator and Middleware]] (the general OOP pattern this is an instance of), [[Chain of Responsibility and Pipelines]] (the general chaining pattern), [[CORS and Same-Origin Policy]] (the browser-side protocol this note's CORS middleware implements)

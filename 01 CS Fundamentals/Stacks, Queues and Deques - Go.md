@@ -15,7 +15,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > A generic slice-backed `Stack[T]`, a generic `RingBuffer[T]` queue, the monotonic-stack and monotonic-deque patterns, multi-source BFS, and a buffered channel used as a bounded concurrent pipeline — one tested implementation per idea in [[Stacks, Queues and Deques]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Stacks, Queues and Deques]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Stacks, Queues and Deques]]. It builds a stack from a slice, a proper queue as a ring buffer (and shows why a plain slice leaks as a queue), and the monotonic-stack interview pattern — all tested. Read each step's notes before the code.
+
+## Before the code 🟢
 
 - **Generics** (`Stack[T any]`, `RingBuffer[T any]`): one stack or queue type that works for any element type, checked at compile time.
 - **Slices** (`append`, `s[:len(s)-1]`): push and pop for a stack; a fixed slice used in a circle for the ring buffer.
@@ -24,7 +31,7 @@ updated: 2026-11-13
 - **`sync.WaitGroup` and `sync.Mutex`**: wait for goroutines to finish, and protect shared data from two goroutines writing at once.
 - **What to run:** `go vet ./sqd/... && go test -race ./sqd/...` inside the module; `-race` matters for `RunPipeline`.
 
-## What this code shows
+## What this code shows 🟢
 
 This file moves from the simplest structure (a stack, no concurrency at all) to the most involved (a channel-based pipeline with two goroutines and a mutex), in the same order the theory note introduces the ideas.
 
@@ -38,7 +45,7 @@ Reading top to bottom therefore also walks from "no concurrency concerns" to "co
 | `RottingOranges` | [[Stacks, Queues and Deques#Picture it BFS level order as multi-source expansion\|Multi-source BFS level order]] |
 | `RunPipeline` | [[Stacks, Queues and Deques#Picture it a buffered channel as a queue with backpressure\|Channel backpressure]] |
 
-## Setup
+## Setup 🟢
 
 ```text
 module cs1scratch
@@ -108,7 +115,7 @@ This note deliberately stops short of a few things a real production queue or pi
 
 None of these are bugs in the code as written — they're scope boundaries, chosen so the pattern itself (ring buffer mechanics, backpressure, monotonic structures, multi-source BFS) stays the single, legible thing each function demonstrates.
 
-## Code
+## Code 🟡
 
 ### Step 1: `Stack[T]`, a generic LIFO
 
@@ -441,7 +448,7 @@ The consumer goroutine drains the channel and writes results, guarded by a mutex
 1. `mu` guards `out`/`idx`, which the channel itself does *not* protect — the channel only serializes the values flowing through it, not arbitrary shared state the consumer touches afterward; `go test -race` is what actually proves this mutex is necessary and sufficient.
 2. `wg.Wait()` blocks the caller until both goroutines finish, which is what makes `RunPipeline` behave as a synchronous function despite running concurrently inside.
 
-## Tests
+## Tests 🟡
 
 Four tests, one per structure that has nontrivial state to get wrong (`Stack[T]` is simple enough that its correctness follows directly from a plain slice's, so it has no dedicated test of its own here).
 
@@ -559,7 +566,7 @@ $ go test -race ./sqd/...
 ok  	cs1scratch/sqd	0.187s
 ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 None of the pitfalls below show up as a compile error or a panic on first run — that's precisely what makes them pitfalls rather than bugs you'd catch immediately.
 
@@ -570,7 +577,7 @@ Each one either produces a plausible-looking wrong answer, a slow memory leak th
 - **Sharing `out`/`idx` across goroutines without `mu` in `RunPipeline`.** It would often *look* correct in casual testing and still be a data race — exactly why `go test -race` is specified as part of this note's own verification, not an optional extra. A race that never manifests in a thousand local test runs can still manifest under production load, different hardware, or a different Go runtime version's scheduling behavior.
 - **Assuming the monotonic deque pattern generalizes to "k largest overall."** `SlidingWindowMax` only ever tracks the maximum *within a moving window*; it is not a substitute for a heap when the question is "the k largest values across the whole dataset" rather than "the max of each window" — conflating the two is a common interview mistake.
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 |---|---|---|
@@ -586,7 +593,7 @@ A production codebase with many functions sharing grid coordinates would likely 
 
 Neither promotion changes the underlying pattern being taught, which is why this note keeps the simpler form.
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go test -race -run TestRunPipeline -v ./sqd/...
@@ -623,7 +630,7 @@ It's omitted here because adding cancellation correctly means also deciding what
 
 The exercises below point at exactly this gap.
 
-## Exercises
+## Exercises 🔴
 
 Each exercise asks for a prediction before you run anything — the value is in checking your mental model of the structure, not just in producing code that happens to pass.
 

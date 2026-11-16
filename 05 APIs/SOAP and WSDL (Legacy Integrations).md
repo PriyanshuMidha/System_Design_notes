@@ -29,7 +29,39 @@ updated: 2026-11-13
 > - Rule: wrap the SOAP service in an adapter so the rest of your code only sees domain types and domain errors.
 > - Classic mistake: building XML by string concatenation without escaping, or treating an HTTP 500 Fault as a generic network error.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some partners — banks, insurers, governments — built their systems 20 years ago, and those systems speak only one very strict format: **SOAP**.
+
+A SOAP call is an **XML** letter (text with tags) inside a fixed envelope, posted to the partner's address. Errors come back as an official rejection slip called a **Fault**.
+
+```mermaid
+flowchart LR
+    Y["Your service"] -- "XML envelope by POST" --> B["Bank's SOAP endpoint"]
+    B -- "reply, or a Fault slip" --> Y
+```
+
+The rule book for the letters is the **WSDL**: an XML file listing every operation, the exact shape of each message, and the address. Tools can read it and generate client code for you.
+
+You will almost never design a new SOAP API. The skill is calling one safely and hiding it behind a thin translator (**adapter**) so the rest of your code never sees XML.
+
+```mermaid
+flowchart LR
+    APP["Your clean code"] --> AD["Adapter<br/>(speaks SOAP)"] --> SOAP["Legacy partner"]
+```
+
+The rest of this note is just three questions:
+1. What does the envelope and the WSDL rule book look like?
+2. How do you call a SOAP service from Go without going mad?
+3. How do you keep the legacy mess contained (timeouts, retries, adapter)?
+
 
 **The problem in one story.**
 Your app needs to ask a bank "how much money is in account ACC-1?".
@@ -73,7 +105,7 @@ Where it breaks: a post office reads a messy letter anyway, while a SOAP server 
 > [!tip] Remember
 > SOAP = an XML Envelope posted over HTTP, described by a WSDL; hide it behind an adapter.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Around 2000, companies wanted programs on different platforms (Java, .NET, mainframes) to call each other over the internet. HTTP and XML were already supported on every one of those platforms, so SOAP put a typed XML message inside an HTTP `POST`, and WSDL described it precisely enough for tools to **generate the client code**.
 
@@ -86,7 +118,7 @@ The scenario today: your Go checkout service must check an account balance at a 
 
 The cost is real. Measured with the Go client below: the `GetBalance` request is **251 bytes** of XML; the equivalent JSON `{"accountId":"ACC-1"}` is **21 bytes**, about 12 times smaller.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 SOAP is **registered post with a strict form**:
 
@@ -98,9 +130,11 @@ SOAP is **registered post with a strict form**:
 
 The name: SOAP 1.1 stood for "Simple Object Access Protocol". SOAP 1.2 dropped the expansion; it is just "SOAP" now.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The envelope
+
+**In plain words:** every SOAP message is the same onion: Envelope outside, optional Header for stamps and seals, Body for the actual question or answer — or the Fault rejection slip.
 
 ```mermaid
 flowchart TD
@@ -159,6 +193,8 @@ Content-Type: application/soap+xml; charset=utf-8; action="urn:example:bank#GetB
 
 ### The WSDL contract
 
+**In plain words:** read a WSDL top to bottom as "what the data looks like → which messages exist → which operations → how they travel → where to send them".
+
 A WSDL 1.1 file has five parts, read from abstract to concrete:
 
 1. **`types`**: XML Schema (XSD) for every element in the messages.
@@ -214,9 +250,11 @@ A WSDL 1.1 file has five parts, read from abstract to concrete:
 
 This is the common **document/literal wrapped** style: the Body holds one element named after the operation (`GetBalance`), and that element is fully described by the XSD.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** calling SOAP by hand is 30 lines: fill an envelope template (escaping input!), POST it with the right headers, read the answer or the fault.
 
 The bare call: build an escaped envelope, `POST` it with the `SOAPAction` header, decode the body or the Fault. The full adapter below adds timeouts, retries only for safe operations, fault mapping and the anti-corruption layer.
 
@@ -265,6 +303,8 @@ func main() { fmt.Println(getBalance("http://localhost:8080/bank", "ACC-1")) }
 ```
 
 ### Full version
+
+**In plain words:** the production version wraps all the XML in one adapter package: domain types in, domain errors out, money as integers never floats, retries only for reads.
 
 A Go service calls the bank through an **adapter** (an anti-corruption layer). Nothing outside the adapter sees XML; callers get a domain `Balance` or a domain error.
 
@@ -578,7 +618,7 @@ func TestFaultWithHTTP500BecomesDomainError(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **SOAP 1.1 vs SOAP 1.2:**
 
@@ -615,7 +655,7 @@ A version mismatch is a classic first-day bug: sending a 1.1 envelope to a 1.2-o
 | HTTP caching | Practically none: calls are `POST` (SOAP 1.2 defines a `GET` binding, rarely used) | Built in for `GET` | None |
 | Use when | The partner only offers SOAP, or contract-level signing is required | Public and web APIs | Internal service-to-service calls ([[gRPC]]) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not design a new public API in SOAP.** Every mainstream client stack expects JSON over HTTP; choose with [[Choosing an API Style]].
 - **XML is expensive:** about 12 times the bytes of the same JSON in the example above, slower parsing, and practically no HTTP caching because calls are `POST`s.
@@ -623,7 +663,7 @@ A version mismatch is a classic first-day bug: sending a 1.1 envelope to a 1.2-o
 - **Message-level security is hard to get right.** Signing XML requires canonicalisation, and XML Signature Wrapping attacks (moving the signed element and inserting a forged one where the application reads) have broken real implementations. Prefer TLS or mTLS when the partner accepts it.
 - **Where SOAP still wins:** the partner already has it, the contract is stable for years, or a regulator demands signed messages that survive passing through intermediaries.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Where it still lives:**
 	- Banks and payment processors (core banking, account and mandate services).
@@ -640,7 +680,7 @@ A version mismatch is a classic first-day bug: sending a 1.1 envelope to a 1.2-o
 	- A WS-Security `Timestamp` is rejected → clock skew; run NTP on both sides and check the `Expires` window.
 - **What to monitor:** latency per operation, faults per `faultcode` and partner error code, timeouts, circuit-breaker state, and certificate expiry for WS-Security signing keys.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **WS-Security is a separate standard.** SOAP itself defines only the envelope, the processing model and the bindings. Security, reliability and transactions come from separate WS-* specifications layered on top through headers: WS-Security (OASIS), WS-ReliableMessaging, WS-AtomicTransaction, WS-Addressing and WS-Policy. A partner "using SOAP" may use none of them.
 
@@ -687,7 +727,7 @@ Scanned documents and PDFs in insurance and banking integrations travel this way
 
 It owns the timeouts, retries, circuit breaker and caching. When the bank later ships a REST API, you replace one adapter, and nothing else changes ([[Strangler Fig Pattern and Legacy Migration]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What are the parts of a SOAP message?
 > An `Envelope` containing an optional `Header` (security, addressing, other blocks, each can be `mustUnderstand`) and a required `Body` holding the operation's request or response, or a `Fault` on error.
@@ -710,7 +750,7 @@ It owns the timeouts, retries, circuit breaker and caching. When the bank later 
 > [!question]- How would you integrate a SOAP-only bank into a JSON microservice platform?
 > Put it behind one adapter service or package: wire types from the WSDL, translation to domain types, faults mapped to domain errors and then to `problem+json`, strict timeouts, a circuit breaker, safe retries only for reads, and contract tests against the bank's sandbox. No XML leaks past the adapter.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Envelope → optional Header (WS-Security, WS-Addressing, `mustUnderstand`) + Body (one operation) or Fault.
 - SOAP 1.1: `text/xml`, `SOAPAction` header, faults always HTTP 500. SOAP 1.2: `application/soap+xml; action=...`, `Sender` faults are 400.
@@ -720,7 +760,7 @@ It owns the timeouts, retries, circuit breaker and caching. When the bank later 
 - Timeouts always; retries only for reads or deduplicated operations; circuit breaker on the partner.
 - Hide the partner behind an anti-corruption adapter so it can be replaced.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Choosing an API Style]]
 - **Next:** [[Calling External APIs]] (the Go client side), [[Domain-Driven Design - Strategic Design]] (anti-corruption layer), [[Strangler Fig Pattern and Legacy Migration]]

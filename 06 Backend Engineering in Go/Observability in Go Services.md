@@ -24,7 +24,31 @@ updated: 2026-11-13
 > - A trace only stays one trace across a process boundary if its **context is explicitly carried**: HTTP and gRPC get this from `otelhttp`/`otelgrpc` automatically, but a message queue or background job needs the trace context injected into message headers by hand and extracted on the other side.
 > - `log/slog`'s `LogValuer` interface is how you make a field unloggable by construction — a secret type that always renders as `[REDACTED]` cannot leak just because someone logged the struct that holds it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+It is 3 a.m. and your service is slow. **Observability** is everything you set up beforehand so you can find out why without guessing.
+
+It is three kinds of signal. **Logs**: what happened on this one request. **Metrics**: counters and timings over all requests — how is the system doing overall. **Traces**: a timeline of one request as it hops across services — where did the time go.
+
+```mermaid
+flowchart LR
+    R[One slow request] --> M[Metrics say: p99 is up] --> T[Trace says: the DB call took 2 s] --> L[Logs say: this query, this user, this error]
+```
+
+The glue is the **trace ID**: a random ID stamped on the request at the door and carried everywhere, so the log lines and the trace for one request can be matched up.
+
+The rest of this note is just these 4 questions:
+1. How do you set up structured JSON logs with slog?
+2. Which metrics does every service need, and what labels are safe?
+3. How does a trace follow one request across HTTP, DB and a queue?
+4. How do the three signals link into one picture?
 
 **The problem in one story.**
 A customer says "I paid, but my invoice still says pending."
@@ -71,6 +95,8 @@ Where it breaks: a hospital never "runs out of memory" from too many wristband t
 
 ### Whiteboard version
 
+**In plain words:** the smallest wired trio — slog, one Prometheus histogram, one trace span.
+
 The shape every handler needs before any of the wiring below: one log line per request, with a trace ID if one exists.
 
 ```go
@@ -89,7 +115,7 @@ This gets the shape right but misses almost everything production needs:
 - no metric is actually recorded,
 - and `r.Context()` carries a trace ID only if something upstream put one there — which is the whole second half of this note.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps's payment webhook handler calls four things in sequence: verify the provider's signature, check for a duplicate event in Postgres, update the invoice, and publish a status change onto a queue a worker will pick up.
 
@@ -103,7 +129,7 @@ Three concrete gaps show why each signal in this note earns its place:
 - **An unbounded metric label silently grows until it pages someone.** A naive `requests_total{path="/invoices/482"}` counter creates a new time series per distinct invoice ID ever requested. At 50,000 invoices, that's 50,000 series for one counter, and Prometheus's memory grows with every new ID — a cardinality bug that looks fine in development and pages on-call in production, often attributed first to "a memory leak in the app."
 - **A trace that stops at the queue boundary hides exactly the gap that matters.** If the HTTP handler's span ends when it publishes to the queue, and the worker that later processes the message starts an unrelated trace, you can never answer "how long between the webhook arriving and the worker actually updating the invoice" from traces alone — which is usually the first question asked when something looks delayed.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture one webhook request as a relay race with four runners (steps), and three different instruments watching the whole race:
 
@@ -113,7 +139,7 @@ Picture one webhook request as a relay race with four runners (steps), and three
 
 The thing that ties all three together for one specific race is the **trace ID**: stamp it into every log line and it becomes the join key between "here's the graph that shows an error spike" and "here are the exact log lines from one of those failing requests."
 
-## 3. How it works
+## 3. How it works 🟡
 
 One webhook's trace, carried across every boundary it crosses — including the one boundary (the queue) that needs explicit propagation code, since only HTTP and gRPC get it automatically from instrumentation libraries:
 
@@ -160,7 +186,7 @@ flowchart LR
     LOKI -.trace_id in log line.-> TEMPO
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Structured logging** with a trace-aware handler: it wraps any `slog.Handler` and stamps `trace_id`/`span_id` onto every record from an active span in the context, and a `LogValuer` type that makes a secret field unloggable by construction rather than by developer discipline:
 
@@ -559,7 +585,7 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 
 **Measured:** built in a scratch module (`obsdemo`, Go 1.24.4, `go.opentelemetry.io/otel` v1.32.0, `github.com/prometheus/client_golang` v1.20.5) and run with `go vet` and `go test -race`. All 4 tests shown above passed, including the queue-propagation test proving a worker's span, started from headers alone with no shared Go `context.Context`, lands on the same trace ID the HTTP handler started, and the RED-metrics test proving two distinct invoice IDs produce exactly one time series under the `{id}` route pattern, not two. `StartProductionTracing` is not among these four; see the note above its code.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -569,14 +595,14 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 | Exemplars | A histogram bucket carries a sample trace ID that landed in it | Jumping from "p99 latency spiked" directly to one representative trace | Requires both metrics and tracing wired to the same backend (e.g. Prometheus + Tempo) |
 | Tail sampling at the Collector | Decide whether to keep a trace *after* seeing the whole thing (e.g. always keep errors and slow traces) | Keeping the traces that matter under a sampling budget, instead of a blind percentage | An extra Collector tier (gateway) that must buffer a whole trace before deciding |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Tracing every request at 100% is rarely affordable once traffic is meaningful; `TraceIDRatioBased` sampling (or better, tail sampling at the Collector) trades completeness for cost — but pair it with "always keep errors and slow requests," or the traces you most want during an incident are exactly the ones most likely to have been dropped.
 - A metric label is a one-way door: adding a new label value later is free, but adding a *new label* to an existing metric changes every existing time series' identity in Prometheus's storage, effectively starting the metric's history over. Decide your labels carefully up front.
 - Manual span instrumentation (the `ProcessWebhook` pattern above) is worth the code only for the steps you'd actually want to see separately in a trace; wrapping every three-line helper function in its own span adds overhead and visual noise without adding insight.
 - For a small internal tool with low traffic and one engineer on call, full OTel tracing is often more operational surface than it's worth; structured logs plus a handful of Prometheus counters frequently cover the real need.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Google's SRE practice popularized the RED/USE framing this note's metrics follow. The OpenTelemetry project itself is the CNCF-governed merger of OpenTracing and OpenCensus, now the standard instrumentation layer most observability vendors (Grafana, Datadog, Honeycomb, Lightstep) ingest from. Grafana's stack (Loki for logs, Mimir/Prometheus for metrics, Tempo for traces) is a common fully open-source destination for exactly the three signals this note produces.
 - **Failure modes → fixes:**
@@ -586,7 +612,7 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
   - High-cardinality or PII ends up in a span attribute or log field (a raw email address, a full request body) → treat span attributes and log fields with the same review bar as an API response: nothing goes in that you wouldn't put in an access log.
 - **What to monitor:** RED metrics per route, Go runtime metrics (goroutine count, GC pause time) from `collectors.NewGoCollector()`, worker queue depth and oldest-job age (so a stuck worker shows up before its backlog becomes a customer-visible delay), retry count and dead-letter-queue size per job type (a job retrying forever and one failing once look identical in a plain success/failure rate), DB connection pool stats (`db.Stats()`), active time-series count per metric (a cardinality canary), and the Collector's own export success/failure rate (a telemetry pipeline that's silently failing to export is itself worth alerting on).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `ParentBased(TraceIDRatioBased(...))` and not `TraceIDRatioBased` alone.** `TraceIDRatioBased` decides sampling from the trace ID's bits, which is deterministic but re-evaluates at every service if applied directly. `ParentBased` makes a service that receives an already-sampled request always continue sampling it, and only applies the ratio decision at the *root* of a trace (where there's no parent to defer to) — so sampling is a single decision made once, at the edge of the system, that every downstream service simply honours.
 - **Why metrics are pulled and traces are pushed.** Prometheus scraping a `/metrics` endpoint means the server stays alive and reachable on its own schedule, which keeps Prometheus itself simple (it controls the cadence) and makes "is this service even up" visible as a failed scrape. Traces are pushed because a span needs to leave the process promptly (batched, but not held indefinitely) to be useful during an incident — waiting for an external scraper to come get it would add unacceptable latency to seeing what's happening right now.
@@ -594,7 +620,7 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 - **`db.Stats()` is the one `database/sql` metric that isn't automatic.** `otelsql`/`otelpgx` instrument individual queries as spans, but pool-level numbers (open connections, idle connections, wait count, wait duration) come from `sql.DB.Stats()` and must be polled and exported as gauges yourself — a connection pool silently exhausted under load is invisible to query-level tracing alone.
 - **Tail sampling trades memory for completeness.** A Collector doing tail sampling must buffer every span of a trace until the trace completes (or times out) before deciding to keep or drop it, because "keep all error and slow traces" can only be evaluated once you've seen the whole trace. This is why tail sampling runs at a dedicated gateway tier with its own memory budget, not on every service's local agent-mode Collector.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why can't a single "requests by path" counter use the raw URL path as a label?
 > Prometheus allocates a new time series per unique label-value combination, and a raw path contains unbounded values (every invoice ID, every user ID that ever appears in a URL). The series count — and the memory it costs — grows without bound as new IDs appear. Use the route *pattern* (`/invoices/{id}`) as the label instead; it has a small, fixed number of values no matter how much data exists.
@@ -614,7 +640,7 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 > [!question]- Why does `TracerProvider.Shutdown` need to be called explicitly, and what breaks if it isn't?
 > The SDK's `BatchSpanProcessor` buffers finished spans and exports them in batches on a timer, for efficiency. If the process exits (including a graceful one) without calling `Shutdown`, whatever spans are still sitting in that buffer are dropped — which, unhelpfully, tends to include the very last requests before a deploy, exactly when something might be worth investigating.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Logs = what happened on one request; metrics = aggregate rate/error/duration; traces = where time went across the whole request. Each answers a question the others can't.
 - Metric labels come from a small, closed set (route pattern, method, status class) — never an ID, a raw path, or anything else unbounded.
@@ -625,7 +651,7 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 - Always call `TracerProvider.Shutdown` before exit (wire it into graceful shutdown) or buffered spans from the last moments before exit are silently lost.
 - Tail sampling at a Collector gateway can keep "all errors and slow requests" instead of a blind percentage, at the cost of buffering whole traces before deciding.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Building REST Endpoints]], [[Receiving Webhooks Idempotently]]
 - **Next:** [[Scheduled Jobs]], [[Graceful Shutdown and Health Checks]]

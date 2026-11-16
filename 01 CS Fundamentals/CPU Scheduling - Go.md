@@ -18,7 +18,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Three simulators in Go — round robin, FCFS, and a simplified CFS-style vruntime picker — plus a cgroup v2 `cpu.max` parser, all tested against hand-worked traces from [[CPU Scheduling]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Setup". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the Code steps, Design decisions and Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[CPU Scheduling]]. That note explains, in words, how an operating system shares a few CPU cores between many waiting programs. This note turns those explanations into four small, runnable Go programs: two toy schedulers (round robin and first-come-first-served), a parser that reads a container's CPU limit, and a tiny model of Linux's fairness rule. Each program is tested against the exact numbers the theory note worked out by hand, so the two notes check each other. Read the theory note first. Then read this top to bottom: each code step starts with the idea in plain words, shows the code, and then walks through how it works line by line. You do not need advanced Go — just structs, slices, maps and basic tests.
+
+## Before the code 🟢
 
 - **Structs and slices** (`[]Proc`): a list of small records; `copy` makes a private copy so the caller's list is never changed.
 - **Maps** (`map[string]int`): Go's built-in hash table, used here to store each process's finish time by name.
@@ -27,7 +36,7 @@ updated: 2026-11-13
 - **Table-driven tests with `t.Run`**: one test loops over a list of cases and runs each as a named subtest.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or generics are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 The theory note describes four mechanisms in words and diagrams:
 
@@ -45,16 +54,18 @@ Each has a direct code counterpart below, and each counterpart is tested against
 | `CPUQuota` | Parsing a cgroup v2 `cpu.max` file, [[CPU Scheduling#cgroups CPU quotas and throttling]] |
 | `TraceVRuntime` | The CFS "always pick lowest vruntime" rule, worked numerically in [[CPU Scheduling#Linux: CFS and EEVDF, step by step]] |
 
-## Setup
+## Setup 🟢
 
 - Module `cpusched`, Go 1.24, standard library only.
 - Four files: `sim.go` (the `Proc` type and the two classic simulators), `quota.go` (the cgroup parser), `vruntime.go` (the CFS-style trace), and `sim_test.go` (every test).
 - Run: `go vet ./... && go test -race -v ./...`
 - Nothing in this package touches the network, the filesystem outside of `t.TempDir()`, or any OS scheduling API — it's pure, deterministic computation, so the tests run in well under a second and give identical results on any machine.
 
-## Code
+## Code 🟡
 
 ### Step 1: round robin
+
+**In plain words:** a toy scheduler where everyone gets a short fixed turn, then goes to the back of the line — like a carousel.
 
 **Concept.** `RoundRobin` is the code form of the hand-traced example in [[CPU Scheduling#Whiteboard version: round robin vs. FCFS]]: a queue of processes, each one capped to a fixed `quantum` per turn, cycling until all are done.
 
@@ -113,6 +124,8 @@ func RoundRobin(procs []Proc, quantum int) map[string]int {
 
 ### Step 2: FCFS, for comparison
 
+**In plain words:** the dumbest possible scheduler — first in line runs until it is completely done, no interruptions. It exists here so we can measure how bad that is.
+
 **Concept.** `FCFS` is deliberately the simplest possible scheduler: no preemption, no quantum, just "run everything in arrival order, to completion."
 
 It exists in this file specifically so a test can measure the convoy effect by comparing its completion times against `RoundRobin`'s on the same input.
@@ -143,6 +156,8 @@ flowchart LR
 ```
 
 ### Step 3: parsing a cgroup v2 quota
+
+**In plain words:** read a container's CPU limit out of a two-number text file and turn it into "how many whole CPUs is that", rounding up.
 
 **Concept.** `CPUQuota` implements the parsing and rounding described in [[CPU Scheduling#cgroups CPU quotas and throttling]]: read the two numbers out of `cpu.max`, divide quota by period, and round up — because a container that can use 1.5 CPUs' worth of time still needs 2 OS threads able to run simultaneously to ever actually use all of it.
 
@@ -208,6 +223,8 @@ The function isn't done yet — the closing brace above is inside the `if`, not 
 2. `cpus < 1` is clamped to `1` as a defensive floor — a quota file should never produce zero usable CPUs.
 
 ### Step 4: a worked vruntime trace
+
+**In plain words:** a tiny model of Linux's fairness rule — every tick, run whoever has had the least CPU time so far, like always serving the customer who has waited longest.
 
 **Concept.** `TraceVRuntime` is the simplified CFS model walked through by hand in [[CPU Scheduling#Linux: CFS and EEVDF, step by step]]: every thread starts at `vruntime = 0`, and each tick the scheduler runs whoever currently has the lowest `vruntime`, then adds 1 to it.
 
@@ -280,7 +297,7 @@ sequenceDiagram
     S->>A: tick 4 (A lowest: 1,1,1)
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 None of this code touches a real OS scheduler — it's all in-process simulation, which is deliberate: the point is to make the *algorithm's* behavior checkable with exact, reproducible numbers, the same numbers the theory note works out by hand.
 
@@ -295,7 +312,7 @@ This mirrors a broader pattern worth naming: when a theory note makes a claim ab
 | `TraceVRuntime` uses equal weight for all threads | Model `nice`-derived weights too | Keeps the function focused on the core "lowest vruntime always wins" rule; real CFS's weight scaling is a multiplier on top of this same rule |
 | Tie-break by alphabetical name | Tie-break by arrival order or random | Deterministic and reproducible for tests and for the worked-example table in the theory note |
 
-## Tests
+## Tests 🟡
 
 ### TestRoundRobinMatchesHandTrace
 
@@ -426,7 +443,7 @@ func TestTraceVRuntimeAlternatesFairly(t *testing.T) {
 
 A failure here would mean the "lowest vruntime always wins" rule — the single most important sentence in CFS's design — isn't actually being followed by the implementation.
 
-## Running it
+## Running it 🟡
 
 A quick map of what each command below checks:
 
@@ -448,13 +465,13 @@ ok  	rollscratch/cpusched	1.619s
 
 None of this code is concurrent, so the race detector run is a cheap extra check rather than testing anything genuinely racy; the elapsed time is dominated by test-binary compilation, since none of the simulators do real I/O (the `CPUQuota` test uses `t.TempDir()`, a fast in-memory-backed temp directory).
 
-## Running it, what the numbers mean in context
+## Running it, what the numbers mean in context 🟡
 
 The `ok` result above says every behavior claim this note makes — the convoy effect, the exact hand-traced round-robin completion times, the cgroup quota rounding, and the vruntime alternation — is backed by a passing, repeatable check, not just prose description.
 
 If a future Go version changed `cpu.max` parsing semantics, or if a bug crept into the round-robin re-queueing logic, these tests would catch it before the theory note's claims went stale.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`RoundRobin` and `FCFS` key their result maps by `Proc.Name`.** Two processes with the same name silently overwrite each other's completion time in the map — fine for these simulations' distinct test names, but a real scheduler needs a unique process ID, not a human-readable label. If you adapt this code to simulate a larger, generated workload, switch the map key to an index or a synthetic ID first.
 - **`CPUQuota`'s `1e-9` epsilon** is a floating-point tolerance for the rounding comparison; an even smaller quota/period fraction near that epsilon could in principle round the wrong way, though cgroup quotas in practice use round microsecond values that don't get close to it.
@@ -465,7 +482,7 @@ Reading this code alongside the theory note is meant to work in both directions:
 
 Conversely, if one of these tests ever needs changing, the theory note's worked examples are the specification it must still satisfy — a passing test suite with a theory note that no longer matches it is a sign the two have drifted apart, not that either one is safely ignorable.
 
-## Exercises
+## Exercises 🔴
 
 These three exercises follow the same pattern as the theory note's own "what happens if" callouts: predict first, in writing, then run the code and compare.
 

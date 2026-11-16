@@ -23,7 +23,37 @@ updated: 2026-11-13
 > - `switch` never falls through by default, the opposite of C and Java.
 > - Every type has a zero value (`0`, `""`, `false`, or `nil`), which is why an unvalidated, unset field silently "works" instead of crashing.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how each construct works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A program is just boxes of values plus decisions about what to do next. In Go, every box is a **variable** with a fixed label saying what kind of thing it holds — a number, text, true/false. That label is its **type**, and it never changes.
+
+Go never swaps labels behind your back. To treat a whole number as a decimal, you must say so: `float64(qty)`. That one habit kills a whole family of bugs.
+
+```mermaid
+flowchart LR
+    A["price (decimal) * qty (whole)"] -- "other languages:<br/>quiet auto-convert" --> B["sometimes wrong"]
+    A -- "Go: refuses to compile<br/>until you write float64(qty)" --> C["always explicit"]
+```
+
+For decisions and repeats, Go keeps just three words: `if`, `for`, `switch`. There is no `while` — `for` does that job too.
+
+```mermaid
+flowchart LR
+    I["if: choose"] --> F["for: repeat<br/>(the only loop)"] --> S["switch: pick one<br/>of many cases"]
+```
+
+One more thing: a Go variable is never empty. Before you set it, it holds a default — `0`, `""`, `false` — called the **zero value**. The rest of this note is just these 4 questions:
+1. How do you declare variables and convert between types?
+2. How do `if`, `for` and `switch` really behave (and differ from C/Java)?
+3. What do zero values do to your data silently?
+4. Which sharp edges show up in production and interviews?
 
 **The problem in one story.**
 You write `total := price * qty` where `price` is a decimal and `qty` is a whole number.
@@ -66,7 +96,7 @@ Where it breaks: real jars start empty; Go jars start with a default zero value 
 > [!tip] Remember
 > Types are fixed at declaration, conversions are always explicit, `for` is the only loop, and `switch` never falls through.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A request handler reads a query parameter `page=2` and a team member writes:
 
@@ -86,15 +116,17 @@ if err != nil {
 
 That extra line is not boilerplate — it is the exact point where a malformed `page=abc` gets handled instead of crashing the process. Go's refusal to convert types implicitly is a deliberate trade: more typing at the boundary, in exchange for every type mismatch being caught at compile time instead of surfacing as a runtime surprise.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Go's type system is **static and explicit**: a variable's type never changes after declaration, and the compiler never silently reinterprets one type as another. Think of every value as living in a labelled box — moving a value between differently-labelled boxes (`int` to `float64`, `string` to `[]byte`) always needs an explicit relabelling step, spelled as a conversion.
 
 Control flow is deliberately small: three keywords (`if`, `for`, `switch`) cover everything a C-family programmer reaches for `while`, `do-while`, `for`, `switch-with-fallthrough`, and `goto`-as-labelled-break to do. Fewer keywords means fewer ways the same idea gets written, which is also why `gofmt` can reformat any Go file into one canonical layout.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Imports
+
+**In plain words:** an import is how one file borrows another package's tools; the three forms below are plain borrowing, borrowing under a nickname, and "just switch it on, I won't call it".
 
 ```go
 import (
@@ -139,6 +171,8 @@ This same trap appears any time an `if`, `for` or `switch` body uses `:=` with a
 
 ### Variables, constants and conversions
 
+**In plain words:** three ways to make a box (`var`, `var` with inference, `:=`), constants that stay shapeless until used, and conversions you always spell out yourself.
+
 ```mermaid
 flowchart TD
     A["var name string = v"] -->|"same as"| B["var name = v (type inferred)"]
@@ -153,6 +187,8 @@ flowchart TD
 - Go never converts between numeric types, or between `string` and numeric types, implicitly. `strconv.ParseInt(s, 10, 32)` takes a base (10 = decimal) and a bit size (32 = fits in `int32`); passing a value too large for that bit size returns an error with a wrapped `ErrRange`, rather than silently truncating.
 
 ### Integer behaviour: division, modulo and overflow
+
+**In plain words:** whole-number math in Go has house rules — division throws away the remainder, `%` copies the sign of the left number, and a number that grows too big quietly wraps around like a car odometer.
 
 Integer division truncates toward zero, and the sign of `%` follows the sign of the **dividend**, not the divisor — the opposite of Python, where `%` follows the divisor's sign:
 
@@ -329,6 +365,8 @@ Only exported identifiers need one; an unexported helper can skip it unless its 
 
 ### Built-ins: min, max, clear (Go 1.21)
 
+**In plain words:** three small helpers Go gives you for free, no import needed — pick the smallest, pick the biggest, empty a map or slice.
+
 ```go
 func MinMaxClear() (int, int, map[string]int) {
 	lo := min(7, 2, 9)
@@ -342,6 +380,8 @@ func MinMaxClear() (int, int, map[string]int) {
 `clear` on a map removes every entry but leaves the map allocated and non-nil (`len(m) == 0`, `m != nil`); on a slice it zeroes every element without changing its length. `min`/`max` take any number of same-typed, ordered arguments.
 
 ### fmt verbs
+
+**In plain words:** the `%` letters are camera lenses for printing a value — `%v` is the quick snapshot, `%+v` adds labels, `%#v` shows the exact Go source, `%T` tells you what the thing is.
 
 ```go
 type Invoice struct {
@@ -364,7 +404,7 @@ Unwrap ==base: true
 
 `%v` is the default format; `%+v` adds field names; `%#v` prints a Go-syntax representation you could paste back into source; `%T` prints the concrete type, which is the fastest way to see what a variable actually holds when an interface is involved; `%q` quotes a string safely for logs; `%w` (only valid inside `fmt.Errorf`) wraps an error so `errors.Is`/`errors.As` can still find the original beneath it — error wrapping itself belongs to [[Error Handling]], this note only covers the verb.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -472,7 +512,7 @@ ok  	syntaxdemo	1.154s
 ```
 *(measured: these three tests plus the rest of the file above, `go test -race -v ./...`, Go 1.24.4, darwin/arm64, 2026-11-07; `go vet ./...` reported no issues)*
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Construct | How it works | Use when | Cost / gotcha |
 | --- | --- | --- | --- |
@@ -483,14 +523,14 @@ ok  	syntaxdemo	1.154s
 | `for i := range n` (1.22+) | Loops i from 0 to n-1 | Only need the index, step is always 1 | Needs Go 1.22+; nothing before that version |
 | Labelled `break`/`continue` | Names the loop to exit/skip | Nested loops where a bare `break` only exits the inner one | Easy to over-use into goto-style control flow |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Explicit conversions mean more lines at every type boundary (parsing a query string, reading a DB numeric column); the payoff is that every mismatch is a compile error, not a runtime surprise.
 - A tagless `switch` with many cases can become as hard to read as a long `if/else if` chain — once a chain is checking fundamentally different things, separate functions usually read better than one giant switch.
 - `for i := range n` only helps when you need the index and nothing else; `for _, v := range slice` is still the right form when you need the value.
 - Silent integer overflow is a real production risk for any size computed from untrusted input (a `int32` byte count, a page size); validate bounds explicitly rather than relying on the type to "just handle it".
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `iota`-based enums with a hand-written or `stringer`-generated `String()` method are the standard way Go APIs represent a small fixed set of states (order status, job state, log level).
 - **Failure modes → fixes:**
@@ -499,14 +539,14 @@ ok  	syntaxdemo	1.154s
 	- A pre-1.22 codebase still has the loop-variable-capture bug in old code paths compiled with an older `go` directive → check the `go` line in `go.mod`; the fix only applies automatically when the module's directive is `go 1.22` or higher.
 - **What to monitor:** none of this is directly observable at runtime — these are compile-time and code-review concerns. The place this surfaces operationally is a spike in 500s from an unhandled parse error on a numeric query parameter, traceable back to a missing bounds check.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why untyped constants exist.** `const Pi = 3.14159` has no fixed type so it can be used as a `float32` in one expression and a `float64` in another without a conversion at each site — the compiler picks the type the usage context demands, at compile time, with no runtime cost and no implicit narrowing hazard, since an untyped constant that doesn't fit its target type is a compile error, not a silent truncation.
 - **Why the loop variable change in 1.22 was safe to make without a language version switch at the syntax level.** The Go team shipped it as a per-module opt-in keyed off the `go` directive in `go.mod`: a module declaring `go 1.21` or lower keeps the old, shared-variable semantics even when built with a Go 1.22+ toolchain, so the change could roll out without silently breaking code that (rarely, but sometimes intentionally) depended on the old sharing behaviour.
 - **Why Go has no `while` or `do-while` keyword.** `for condition { }` already covers `while`, and Go has no construct for "run the body once before checking the condition" (`do-while`) — the spec's authors considered the one extra keyword not worth it for a loop shape that's rare in practice and easy to write as `for { ...; if !condition { break } }` when genuinely needed.
 - **Modulo sign, formally.** The spec defines integer division to truncate toward zero (not floor, as some languages do), and guarantees `a == (a/b)*b + a%b`. Given that identity, `a%b`'s sign is fully determined by `a`'s sign once division truncates toward zero — it is a direct consequence of the division rule, not a separate design choice.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `-7 % 2` equal `-1` in Go, not `1`?
 > Go's `%` follows the sign of the dividend, not the divisor, because integer division truncates toward zero: `-7/2 = -3` (truncated, not floored to `-4`), and the identity `a == (a/b)*b + a%b` forces `a%b = -7 - (-3*2) = -1`. Python's `%` follows the divisor's sign instead, which is the usual source of the confusion.
@@ -533,7 +573,7 @@ ok  	syntaxdemo	1.154s
 >
 > To tell absent from explicit-zero, decode into a pointer field (`*int`) and check for `nil`, or check key presence in a `map[string]any` before decoding into the typed struct.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `var`/`:=`/multiple assignment are the three ways to declare; `:=` is function-local only.
 - No implicit conversions, ever: `T(x)` is always explicit, even `int` ↔ `int64`.
@@ -545,7 +585,7 @@ ok  	syntaxdemo	1.154s
 - Zero values exist for every type (`0`, `""`, `false`, `nil`); an absent JSON field and an explicit zero are indistinguishable without a pointer field.
 - `min`, `max`, `clear` (1.21) are built-ins, not package functions.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Go Toolchain, Tooling and Debugging]]
 - **Next:** [[Arrays, Slices and Maps (with internals)]], [[Functions, Closures, Defer, Panic and Recover]]

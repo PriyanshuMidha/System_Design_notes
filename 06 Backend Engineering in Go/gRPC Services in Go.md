@@ -24,7 +24,31 @@ updated: 2026-11-13
 > - Cross-cutting concerns (auth, logging, recovery, validation) live in a chain of interceptors that wrap every handler, not inside each handler.
 > - Classic mistake: calling `grpc.Dial` per request, or trusting the request body without running `protovalidate` first — one connection is reused for thousands of calls, and shape validation belongs in the interceptor chain, before any handler code runs.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+**gRPC** is how backend services call each other like functions. You write the contract in a `.proto` file — service names, methods, message shapes — and a generator turns it into Go code for both sides.
+
+```mermaid
+flowchart LR
+    P[.proto contract] --> G[buf generate] --> SRV[Server interface you implement] & CLI[Typed client others call]
+```
+
+Messages travel as **protobuf**: a compact binary format, much smaller and stricter than JSON. Calls ride on HTTP/2, so one connection carries many calls at once.
+
+Cross-cutting stuff — deadlines, auth, panic recovery — lives in **interceptors**, gRPC's version of middleware, instead of being repeated in every method.
+
+The rest of this note is just these 4 questions:
+1. How does codegen work, and what do you implement on the server?
+2. How do errors, status codes and deadlines travel?
+3. What do interceptors, metadata and TLS add?
+4. How do clients share one connection and balance load?
 
 **The problem in one story.**
 Your `payments` service needs to tell your `invoices` service "mark invoice 42 paid".
@@ -68,7 +92,7 @@ Where it breaks: a phone order still crosses a network; it can time out or fail,
 > [!tip] Remember
 > The `.proto` is the contract; every gRPC call is a network call with a deadline and a status code.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps has a `payments` service that calls the `invoices` service internally on every webhook: "mark this invoice paid."
 
@@ -93,7 +117,7 @@ This is why the common InvoiceOps shape is **public REST, internal gRPC**: exter
 
 [[Choosing an API Style]] covers that decision in general; this note is the Go implementation once gRPC has been chosen.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a `.proto` file as a function signature shared by two processes that will never share a compiler. `buf generate` turns it into:
 
@@ -104,9 +128,11 @@ Calling `client.GetInvoice(ctx, req)` *feels* like a local function call, but ev
 
 The `ctx` you pass in doesn't just cancel a goroutine, the way it does for an in-process call — its deadline is marshaled into a `grpc-timeout` header and re-materialized as a context on the server, and its cancellation is what actually stops the TCP stream.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Code generation
+
+**In plain words:** one buf command reads the contract and writes the boring halves of both sides; you only fill in the method bodies.
 
 A gRPC-in-Go project is driven by [Buf](https://buf.build) rather than invoking `protoc` by hand, so that plugin versions are pinned and import paths don't depend on a developer's local `protoc` install.
 
@@ -201,6 +227,8 @@ client := invoicev1.NewInvoiceServiceClient(conn)
 
 ### Status codes and errors
 
+**In plain words:** gRPC has its own small set of error codes instead of HTTP's; the server attaches one to every failure and the client switches on it.
+
 A gRPC handler returns `(response, error)`, and that `error` should almost always be built with `status.Error` / `status.Errorf`, never a bare `errors.New`. The code is what callers branch on — Go error string matching does not survive a process boundary.
 
 | Code | Means | Typical InvoiceOps source |
@@ -223,6 +251,8 @@ For field-level detail, attach `google.rpc.BadRequest` via the `errdetails` pack
 On the client side, `status.FromError(err)` recovers the `*status.Status` (code, message, details) from any error a call returns; `status.Code(err)` is the shortcut when only the code is needed, and both return `codes.Unknown` for a plain Go error that never went through `status.Error`.
 
 ### Deadlines
+
+**In plain words:** the caller says 'you have 300 ms' and that budget travels with the call across every hop, cancelling work that can no longer be useful.
 
 ```mermaid
 sequenceDiagram
@@ -259,6 +289,8 @@ token := md.Get("authorization")
 Metadata set before the first `Send` becomes **headers**; metadata set after (via `grpc.SetTrailer`) becomes **trailers**, sent after the final message — useful for values only known once the handler has finished (e.g. a row count).
 
 ### Interceptors
+
+**In plain words:** middleware by another name — functions wrapped around every RPC for logging, auth and recovery, written once.
 
 Interceptors are gRPC's middleware: a chain wraps every unary call, in order, each one able to inspect or reject the request before the next link (and the handler) runs.
 
@@ -328,9 +360,11 @@ Three layers, cheapest first:
 2. **`grpcurl`** (or Postman, which added gRPC support with the same reflection-driven discovery) — a client that uses server reflection to call any RPC without a local `.proto`, good for manual exploration and smoke tests.
 3. **`ghz`** — a load-testing tool for gRPC (not used in this note, but the natural next step once functional tests pass).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** one proto, one implemented method, one client call.
 
 The bare shape: one RPC, no interceptors, no validation.
 
@@ -765,7 +799,7 @@ That second call never reached `CreateInvoice`'s own handler code at all — `Va
 
 The structured `errdetails.BadRequest` — not just the status message — is what lets a client render "total_cents must be greater than 0" next to the right form field instead of parsing an error string.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Style | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -774,14 +808,14 @@ The structured `errdetails.BadRequest` — not just the status message — is wh
 | GraphQL | Client-specified query shape over one endpoint | Clients with very different data needs (mobile vs web) | Query complexity and caching are harder to reason about |
 | grpc-gateway / Connect | REST or gRPC-Web in front of the same gRPC service | You need gRPC's typed backend *and* a REST or browser surface | An extra translation layer; see [[Serving REST and gRPC Together]] |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Binary frames aren't readable with `curl` or a browser's network tab; you need `grpcurl`, reflection, or generated stubs to poke at it by hand.
 - Browsers can't speak raw gRPC (no low-level HTTP/2 trailer control); you need grpc-Web, Connect, or a gateway — see [[Serving REST and gRPC Together]].
 - A breaking proto change is caught at compile time, which is a strength, but it also means every consumer must regenerate and redeploy together, or you must follow strict additive-only evolution (see [[Protocol Buffers and Schema Evolution]]).
 - For a small system with one client and one server, hand-written REST with a JSON schema is simpler to debug and has no codegen step to maintain — gRPC earns its cost at a handful of services and up, or wherever streaming is a real requirement.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** etcd's client/server API is gRPC; Kubernetes uses gRPC for the Container Runtime Interface (CRI) and for device plugins; Envoy and Istio's xDS control-plane protocol runs over gRPC streams.
 - **Failure modes → fixes:**
@@ -791,7 +825,7 @@ The structured `errdetails.BadRequest` — not just the status message — is wh
   - Reflection left on in production → anyone who can reach the port can enumerate the whole API; disable it or put it behind the same auth as everything else.
 - **What to monitor:** request count and `DeadlineExceeded`/`Unavailable`/`Internal` rates per method (otelgrpc or a Prometheus interceptor), p50/p99 latency per method, open connection count per backend, and message size distribution against `MaxRecvMsgSize`.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Wire format.** Each gRPC message on an HTTP/2 DATA frame is prefixed with a 1-byte compression flag and a 4-byte big-endian length, followed by the protobuf-encoded bytes — this 5-byte header is why a gRPC message can't simply be read with a generic HTTP/1.1 client even if it could parse protobuf.
 - **Trailers-only vs headers+trailers.** A call that fails before any response message is sent (e.g. an auth rejection) returns a **trailers-only** response: `grpc-status` and `grpc-message` arrive as the one and only HTTP/2 header block.
@@ -801,7 +835,7 @@ The structured `errdetails.BadRequest` — not just the status message — is wh
 - **protovalidate vs protoc-gen-validate.** `protoc-gen-validate` (PGV) is in maintenance mode; `protovalidate` is its replacement, evaluating rules as CEL expressions read from the message's own descriptor at runtime rather than generating per-field Go validation code — slightly slower per call, much less generated code, and rules are inspectable from the compiled `FileDescriptorProto` without needing the original `.proto`.
 - **Service config retry policy** (JSON, set via `grpc.WithDefaultServiceConfig` or a resolver): declares max attempts, backoff, and which status codes are retryable, scoped per method — so only idempotent RPCs opt in, and a `CreateInvoice` without an idempotency key never does.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `grpc.NewClient` replace `grpc.Dial`, and do you need to change existing code?
 > `Dial` connected eagerly at call time and resolved the target lazily in ways that could surprise callers; `NewClient` resolves eagerly and connects lazily (on the first RPC). `Dial` still works (it's deprecated, not removed) but new code should use `NewClient`.
@@ -826,7 +860,7 @@ The structured `errdetails.BadRequest` — not just the status message — is wh
 > [!question]- Trap: is it safe to retry every gRPC call automatically on `Unavailable`?
 > No — only if the RPC is idempotent. `GetInvoice` is safe to retry; `CreateInvoice` without an idempotency key is not, since a retry after a successful-but-unacknowledged first attempt creates a duplicate invoice. Service-config retry policies should be scoped per method, same as HTTP retries in [[Timeouts, Retries and Backoff]].
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Codegen: `buf lint` → `buf breaking` → `buf generate`, pinned plugin versions, never hand-edit generated files.
 - One `grpc.ClientConn` per target, built with `grpc.NewClient` (not the deprecated `Dial`), reused for every call.
@@ -837,7 +871,7 @@ The structured `errdetails.BadRequest` — not just the status message — is wh
 - Reflection is a dev/staging convenience (`grpcurl`), not a production default.
 - Test with `bufconn` first: a real server and client, no network, no flakiness.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Service Project Layout and Wiring]], [[gRPC]], [[Context Package]]
 - **Next:** [[gRPC Streaming in Go]], [[Serving REST and gRPC Together]]

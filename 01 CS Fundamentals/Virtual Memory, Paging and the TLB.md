@@ -26,7 +26,35 @@ updated: 2026-11-13
 > - "Minor" page faults just map in a page already resident in RAM (or freshly zeroed); "major" page faults must pull the page's data in from disk/swap, which is orders of magnitude slower.
 > - This is why two processes can each believe they own address `0x1000`, why `fork` can be fast (section 3), and why Linux will overcommit memory and sometimes kill a process (the OOM killer) rather than honor every promise it made.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every program believes it has the computer's memory all to itself, starting at address 0. That is a lie — a useful one, called **virtual memory**. The OS and hardware translate each program's pretend addresses into real RAM locations.
+
+```mermaid
+flowchart LR
+    P["Program's pretend address<br/>(virtual)"] --> MMU["Translator<br/>(page tables)"] --> R["Real spot in RAM<br/>(physical)"]
+```
+
+Memory is managed in fixed-size chunks called **pages** (usually 4 KB). A map called the page table says which virtual page lives in which real page. Looking that map up for every single access would be slow, so the CPU keeps a tiny cheat sheet of recent translations: the **TLB**.
+
+```mermaid
+flowchart LR
+    A["address needed"] --> T{"in the TLB<br/>cheat sheet?"}
+    T -- "yes (almost always)" --> F["instant"]
+    T -- "no" --> W["walk the page table<br/>(slow), then remember it"]
+```
+
+The rest of this note is just three questions:
+1. Why lie to programs at all — what does virtual memory buy us?
+2. How does a virtual address become a physical one, step by step?
+3. What are page faults, swapping and huge pages, and when do they hurt?
 
 **The problem in one story.**
 You run two programs at once: a browser and a music player.
@@ -71,7 +99,7 @@ Where it breaks: a phone never secretly swaps a contact's number to someone else
 > [!tip] Remember
 > Every program gets made-up addresses; hardware and the kernel quietly map them to real RAM, one page at a time.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Before virtual memory, programs addressed physical RAM directly: if your program's code happened to load at physical address `0x8000`, every pointer, every jump target, baked in `0x8000`-relative addresses.
 
@@ -93,7 +121,7 @@ It also decouples "how much memory a process is promised" from "how much physica
 
 All of this happens without the process's own view of its addresses ever changing.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **In plain words:** before reading any mechanism, build one picture: every process has its own private, made-up set of addresses, and one piece of hardware (helped by the kernel) silently rewrites each one to a real location in RAM.
 
@@ -116,7 +144,7 @@ The kernel does exactly that under memory pressure (that's the eviction and swap
 > [!tip] Remember
 > Virtual addresses are a story every process is told; physical addresses are where the bytes actually live. The MMU is the only thing that knows how the two relate, per process.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The translation path
 
@@ -241,7 +269,7 @@ flowchart TD
 > [!warning] Common mistake
 > Assuming huge pages are a free performance win. They cut TLB misses, but a huge page can only be reclaimed or swapped out as one 2 MB (or 1 GB) unit — far less granular than a 4 KB page — and background compaction to assemble a free contiguous 2 MB block can itself stall a request. "Fewer TLB misses" and "worse reclaim granularity" are the same trade-off, not two separate facts.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -276,7 +304,7 @@ The runnable version distinguishes exactly these two `false` cases (and fills th
 | Major page fault, modern NVMe SSD (PCIe 4/5, documented vendor QD1 random-read figures) | ~tens to ~100 µs |
 | Major page fault, swapping to a spinning HDD (legacy, included for scale) | ~several ms (dominated by seek time) |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Mechanism | What changes | Use when | Cost |
 | --------- | ------------- | -------- | ---- |
@@ -286,7 +314,7 @@ The runnable version distinguishes exactly these two `false` cases (and fills th
 | Swap / page-out | A resident page's data is written to disk and its frame reclaimed | Memory pressure, inactive pages | Major fault (slow) on next access; avoids an immediate OOM kill |
 | `mmap` of a file | A file's data is paged in on demand instead of read up front | Large files, especially read mostly randomly | Pages fault in lazily; the page cache (see [[Page Cache, File Systems and fsync]]) backs it, so repeat access across processes shares one copy |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Virtual memory is not optional in any general-purpose OS — the question is tuning, not whether. Huge pages trade reclaim/compaction flexibility for TLB efficiency; most server workloads with large resident working sets benefit, interactive/short-lived workloads often don't need them.
 - **What happens if the kernel promises more memory than it has?** This is overcommit: the kernel can promise more virtual memory than it has physical RAM + swap to back, betting that not every process will touch every page it allocated.
@@ -315,7 +343,7 @@ The runnable version distinguishes exactly these two `false` cases (and fills th
 > [!tip] Remember
 > Overcommit turns a memory problem into a surprise `SIGKILL` later, not a clean allocation failure now — that's the trade-off, not a bug.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** PostgreSQL's and Redis's recommendations to disable or tightly limit swap and to use `madvise` (not `always`) THP; the JVM's and PostgreSQL's optional use of huge pages for large heaps/shared buffers to cut TLB misses; container memory limits (cgroups) that the OOM killer (or a cgroup-scoped OOM killer) enforces by killing processes that exceed them.
 - **Failure modes → fixes:**
@@ -325,7 +353,7 @@ The runnable version distinguishes exactly these two `false` cases (and fills th
   - A Go process's RSS looks far larger (or smaller) than expected → remember Go's reported heap size is influenced by `GOGC`/`GOMEMLIMIT` and that the Go runtime may not immediately return freed pages to the OS; RSS and "live heap objects" are related but not identical numbers.
 - **What to monitor:** `vmstat`'s `si`/`so` (swap in/out) and `free`/`buff`/`cache`; per-process `VmRSS` vs `VmSwap` in `/proc/<pid>/status`; `perf stat -e dTLB-load-misses,dTLB-store-misses` for TLB pressure; kernel log entries containing `Out of memory: Killed process`.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **ASLR and ISA-specific translation.** Address space layout randomization places the stack, heap, libraries and sometimes the executable itself at randomized virtual base addresses each run, specifically to make memory-corruption exploits harder to write (an attacker can't hardcode "the stack is at address X").
 
@@ -384,7 +412,7 @@ The runnable version distinguishes exactly these two `false` cases (and fills th
 
   The kernel's `khugepaged`/compaction machinery may need to actively move pages around to free up a contiguous 2 MB block before it can satisfy the request — work that can stall the requesting (or an unrelated) process for milliseconds, the documented reason several databases default THP to `madvise`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What problem does virtual memory actually solve?
 > Three things at once: isolation (one process can't read/corrupt another's memory, because the MMU only ever translates addresses the kernel mapped for that process), simplicity (every process can assume it has a large, contiguous address space starting near zero, regardless of what's physically free), and flexibility (pages can be mapped lazily, shared, or swapped out without the process's own addresses changing).
@@ -407,7 +435,7 @@ The runnable version distinguishes exactly these two `false` cases (and fills th
 > [!question]- Why does swap hurt latency so much more than a cache-level miss?
 > Because a major page fault isn't a memory operation at all — it's an I/O operation. Even a fast NVMe SSD's documented access latency (tens to roughly a hundred microseconds) is many thousands of times slower than a DRAM access (around a hundred nanoseconds), and a spinning disk is slower again by another couple of orders of magnitude. A process is parked, unable to run, for the whole round trip, which is exactly the kind of multi-millisecond stall that shows up as a latency spike in a service that otherwise looks healthy.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Virtual addresses are per-process and private; the MMU + page tables translate them to physical addresses, one page (commonly 4 KB) at a time.
 - Order of lookups: TLB (fast, small) → page table (multi-level, in memory) → page fault (trap into the kernel) if not mapped at all.

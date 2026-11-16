@@ -34,7 +34,39 @@ updated: 2026-11-13
 > - Clients are tolerant readers (ignore unknown fields); servers are strict about requests.
 > - Classic mistake: treating required, optional and nullable as the same thing.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Two teams build one product. One team builds the server, the other builds the app that talks to it.
+
+The app has to know exactly what to send and what comes back. That written agreement is the **contract**: a list of every URL, every field, every rule.
+
+```mermaid
+flowchart LR
+    A["App team"] -- "both read the same promise" --> C["Contract<br/>(openapi.yaml)"]
+    B["Server team"] --> C
+```
+
+**OpenAPI** is just the standard file format for writing that contract down, so tools can read it too. From that one file you can generate docs, client code and tests.
+
+The golden rule: you may **add** to the contract, but never remove or rename, because old apps out in the world still use the old names.
+
+```mermaid
+flowchart LR
+    S["Contract v1"] -- "add a new optional field: safe" --> OK["Old apps keep working"]
+    S -- "rename or remove a field: breaking" --> X["Old apps crash"]
+```
+
+That is the whole idea. The rest of this note is just three questions:
+1. How do you write the promise down (OpenAPI)?
+2. How do you change it without breaking anyone?
+3. How do machines check it for you (lint, diff, tests)?
 
 **The problem in one story.**
 Your team builds a movie-booking server; another team builds the phone app.
@@ -80,7 +112,7 @@ Where it breaks: a menu can change any day, but an API contract can only safely 
 > [!tip] Remember
 > Write the promise first, generate everything from it, and only ever add to it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A mobile app shows an order's total from `order.total`. A backend developer renames it to `order.total_amount` because it reads better. The change passes code review and every server test.
 
@@ -94,15 +126,17 @@ A contract makes the promise explicit and checkable:
 - a CI step compares the new file with the last released one and fails on `total` disappearing;
 - client SDKs, server stubs, docs and tests are generated from the same file, so they cannot quietly disagree.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A contract is an **electrical socket standard**. The plug maker and the socket maker never meet; both build to the published shape. You can add a new socket type (additive), but you cannot move the pins of the old one (breaking) while millions of plugs are in use.
 
 OpenAPI is the **technical drawing** of the socket: precise enough that a machine can check a plug against it.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Contract-first vs code-first
+
+**In plain words:** you can write the promise first and build code from it, or build code first and print the promise from it. Either works, as long as a machine keeps the two in sync.
 
 | Approach | How | Strength | Weakness |
 | --- | --- | --- | --- |
@@ -123,6 +157,8 @@ flowchart LR
 ```
 
 ### OpenAPI 3.1 anatomy
+
+**In plain words:** an OpenAPI file is like a form with fixed sections: who the API is, its URLs, the shapes of data it moves, and how you log in. Skim the bullets, then the big example.
 
 An OpenAPI document has a few top-level parts:
 
@@ -355,6 +391,8 @@ classDiagram
 
 ### Conventions that prevent client bugs
 
+**In plain words:** these are house rules for naming, dates, money and IDs. Pick one style and never mix, the same way a kitchen keeps all labels in one language.
+
 | Topic | Rule | Why |
 | --- | --- | --- |
 | Field casing | One style everywhere: `snake_case` (Stripe, Zalando) or `lowerCamelCase` (Google, Microsoft) | Mixed casing guarantees typos in clients |
@@ -367,6 +405,8 @@ classDiagram
 
 ### Required, optional and nullable are three different things
 
+**In plain words:** "must be there", "may be missing" and "may be there but empty (null)" are three different promises, like a form field that is mandatory, optional, or allowed to say "none".
+
 - **Required**: the key must be present (`required: [show_id, seats]`).
 - **Optional**: the key may be absent.
 - **Nullable**: the key may be present with the value `null`. OpenAPI 3.0 wrote this as `nullable: true`; OpenAPI 3.1 uses JSON Schema's `type: [string, "null"]`.
@@ -374,6 +414,16 @@ classDiagram
 The difference matters most in partial updates. With JSON Merge Patch, an absent `note` means "leave it", `"note": null` means "clear it" and `"note": "aisle"` means "set it". A server that cannot tell absent from `null` will wipe fields the client never mentioned.
 
 ### What counts as a breaking change
+
+**In plain words:** breaking means some app that worked yesterday fails today. Which changes break depends on direction: rules for what clients *send* can only loosen safely, rules for what servers *return* can only grow safely.
+
+```mermaid
+flowchart TB
+    R["Requests (client sends)"] -- "add a required field / tighten rules" --> B1["breaks"]
+    R -- "loosen rules / new optional field" --> S1["safe"]
+    P["Responses (server returns)"] -- "remove field / surprise enum value" --> B2["breaks"]
+    P -- "add a new field (tolerant readers)" --> S2["safe"]
+```
 
 A change is breaking if **any existing, correctly written client** can fail or misbehave. The full classification table lives in [[API Versioning and Backward Compatibility]].
 
@@ -385,9 +435,11 @@ The safe path for a rename: add `total_amount`, keep sending `total`, mark `tota
 
 **Tolerant reader.** Clients should read only the fields they need, ignore fields they do not know, and map unknown enum values to an "unknown" case. Servers can then add things freely. This is the half of the robustness principle that works well; being liberal in what a server *accepts* is riskier, because sloppy input becomes behaviour clients then depend on.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the code below shows the one habit in both directions: as a client, shrug at fields you do not know; as a server, reject fields you do not know.
 
 Tolerant on responses, strict on requests. The full version below adds the production concerns.
 
@@ -423,6 +475,8 @@ func DecodeRequest(b []byte) (Order, error) {
 ```
 
 ### Full version
+
+**In plain words:** a real Go client that proves three rules: unknown stuff never crashes it, typos in requests get rejected, and "missing", "null" and "set" are kept apart.
 
 A Go 1.24 client for the `Order` schema above, written as a tolerant reader. It shows three contract rules in code: unknown fields and enum values do not break decoding, the server can still be strict about requests, and absent, `null` and set are three different states. It passes `go vet` and `go test -race`.
 
@@ -595,7 +649,7 @@ A `*string` field cannot tell `{}` from `{"note": null}`; `Field[string]` can. T
 
 For the nullable `note` field it generated `Note *string` by default, which has exactly the absent-or-null ambiguity the test shows. Since v2.1.0, the `nullable-type: true` output option generates `nullable.Nullable[string]` instead.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **Tools along the contract pipeline:**
 
@@ -625,7 +679,7 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 
 **Style guides worth copying:** Google's API Improvement Proposals (AIPs, enforced on `.proto` files by `api-linter`), the Zalando RESTful API Guidelines and the Microsoft REST API Guidelines. Pick one as the base and write down only your exceptions.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Contract-first costs speed early.** For a prototype or an internal endpoint with one caller in the same repository, writing the spec first may be ceremony. Generate the spec from code and add the CI diff once a second consumer appears.
 - **Generated code shapes your codebase.** Generators decide type names, optional-field representation (pointers or wrapper types) and routing. Keep generated types at the edge and map them to domain types, or the spec's shape leaks into business logic.
@@ -633,7 +687,7 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 - **Pact needs known consumers.** It works for internal services that can publish their expectations. A public API cannot collect pacts from strangers, so it relies on the spec diff instead.
 - **A spec cannot capture everything.** Ordering, latency, rate limits and side effects are part of the real contract but are only prose in OpenAPI (Hyrum's law: every observable behaviour will be depended on by someone).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Stripe** publishes the OpenAPI description of its API in the `stripe/openapi` repository, including an SDK variant of the spec with annotations for generating client libraries. Files in its official SDKs, such as stripe-go, carry the header "File generated from our OpenAPI spec".
@@ -650,7 +704,7 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 	- Calls to `deprecated` operations and reads of deprecated fields, per client.
 	- Responses that fail schema validation in staging (a response validator in tests catches server-side drift).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **OpenAPI 3.0 vs 3.1.** 3.1 adopts JSON Schema Draft 2020-12 completely, while 3.0 used a modified subset. In practice: `nullable: true` becomes `type: [T, "null"]`, schema `example` becomes `examples` (a list), `exclusiveMinimum` takes a number instead of a boolean, `$ref` may sit beside `summary` and `description`, `paths` became optional, and `webhooks` is new.
 
@@ -661,7 +715,7 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 - **Contract tests vs schema validation.** Schema validation proves a response has the right shape. It does not prove `POST /orders` then `GET /orders/{id}` returns the same order. Schemathesis can chain operations using OpenAPI links; Pact tests the exact interactions consumers use.
 - **The Idempotency-Key contract in detail.** Document scope (per API key or account), retention (Stripe: removable after 24 hours), the reuse error (`422` for a different body in the IETF draft), the in-flight error (`409`) and which operations accept it. Without these, clients cannot write correct retry logic.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What belongs in an API contract?
 > Who calls it and with what auth; the method, URL, headers, query parameters and body; success response shapes; one error shape with stable codes; pagination, filtering and sorting rules and their limits; idempotency behaviour for creates and payments; rate limits; the versioning and deprecation policy; and request IDs for tracing.
@@ -684,7 +738,7 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 > [!question]- A partner says your API "broke" but the spec did not change. What could it be?
 > A behaviour the spec did not capture: default sort order, page size, a stricter validation rule, a new error code, slower responses, or a field that is now sometimes missing. That is Hyrum's law. Fix it by writing these behaviours into the contract (ordering, limits, error codes) and diffing them too.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - The contract is the promise; OpenAPI is the machine-checkable file that records it.
 - Contract-first for shared APIs; either way, CI must catch drift and breaking changes (Spectral + oasdiff).
@@ -695,7 +749,7 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 - Clients are tolerant readers: ignore unknown fields, map unknown enum values to "unknown".
 - One error schema (problem details) and an explicit `Idempotency-Key` contract for every create.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[REST and HTTP API Design]], [[Choosing an API Style]]
 - **Next:** [[API Error Handling]], [[API Versioning and Backward Compatibility]], [[Idempotency and Idempotency Keys]], [[OpenAPI-First Development in Go]]

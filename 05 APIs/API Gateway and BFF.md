@@ -32,7 +32,43 @@ updated: 2026-11-13
 > - Rule: no business logic in either; services still make their own authorization decisions.
 > - Classic mistake: trusting identity headers like `X-User-Id` that a client could set, instead of setting them only from a verified token.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A big backend is usually many small programs, each doing one job: one for users, one for orders, one for payments.
+
+The phone app should not have to know all of them. So you put one front door in front: the **API gateway**. Every request enters there. The gateway checks who you are, blocks abusers, and passes the request to the right program.
+
+```mermaid
+flowchart LR
+    APP["Phone app"] --> GW["Gateway<br/>(one front door)"]
+    GW --> U["Users"]
+    GW --> O["Orders"]
+    GW --> P["Payments"]
+```
+
+One more trick: a home screen may need data from five programs. Instead of the phone making five slow calls, a small helper called a **BFF** (backend for frontend) makes the five calls inside the data centre, where they are fast, and sends the phone one combined answer.
+
+```mermaid
+flowchart LR
+    APP2["Phone: 1 call"] --> BFF["BFF"]
+    BFF --> A["Users"]
+    BFF --> B["Orders"]
+    BFF --> C["Offers"]
+    BFF --> APP2
+```
+
+The rest of this note is just three questions:
+1. What exactly does the gateway do on each request (the checklist)?
+2. What does a BFF do, and what must it never do (business rules)?
+3. How do you keep this edge fast and safe when things fail?
+
 
 **The problem in one story.**
 Your company has 20 small backend services: users, orders, payments, offers and more.
@@ -78,7 +114,7 @@ Where it breaks: a receptionist may decide who enters, but each service must sti
 > [!tip] Remember
 > One front door for cross-cutting checks, one helper per client for shaping data, and no business logic in either.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A shop splits its monolith into 30 services. Without a gateway:
 
@@ -92,15 +128,17 @@ A shop splits its monolith into 30 services. Without a gateway:
 
 The gateway gives one stable public surface and one place for cross-cutting policy. The BFF gives each client exactly the data it needs in one round trip.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The gateway is the **reception desk of an office building**. It checks your badge, signs you in, tells you which floor to go to and keeps the visitor log. It does not do anyone's job on the floors above, and each office still decides whether *you* may open *its* filing cabinet.
 
 A BFF is a **personal assistant per type of visitor**. The assistant for mobile visitors collects documents from five offices and hands over one slim folder; the assistant for partners hands over a different folder.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The filter pipeline
+
+**In plain words:** each request passes a row of checkpoints, cheapest first, like airport security: ticket check before the slow body scanner. Fail early, fail cheap.
 
 Every request runs through an ordered chain of filters (Envoy calls them filters, Kong calls them plugins). Cheap rejections come first, so expensive work only happens for requests that deserve it.
 
@@ -137,6 +175,8 @@ flowchart LR
 - **Caching** of public `GET` responses and **compression** of responses ([[HTTP Caching - Cache-Control, ETag, Conditional Requests]]).
 
 ### North-south vs east-west
+
+**In plain words:** traffic coming in from the internet is "north-south"; chatter between your own services inside is "east-west". The gateway guards the first; a service mesh handles the second.
 
 ```mermaid
 flowchart TB
@@ -185,6 +225,8 @@ flowchart TB
 
 ### BFF: one response per client
 
+**In plain words:** the diagram below is one home-screen request: the BFF asks three services at the same time, waits a fixed budget, and ships whatever arrived, marking missing optional bits as partial.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -218,9 +260,11 @@ Rules for a BFF:
 - It **aggregates and shapes**: parallel calls, field selection, format conversion, and **degradation** (drop optional parts on timeout and say so).
 - It **contains no domain rules**. "Can this order be cancelled?" belongs to the orders service; the BFF only shows the answer.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a gateway in 25 lines: check there is a login header, match the path, forward. Everything after this adds safety rails.
 
 The bare idea: check credentials, match a path prefix, forward to the owning service. The full version below adds request IDs, longest-prefix matching, identity headers from a verified token, load shedding and a canary split.
 
@@ -256,6 +300,8 @@ func main() {
 ```
 
 ### Full version
+
+**In plain words:** the real rails: tag every request with an ID, never trust identity headers from outside, reject extra load fast instead of queueing, and send a small share of traffic to the new version (canary).
 
 A minimal gateway in Go: request IDs, longest-prefix routing, identity headers set only from a verified token, per-route load shedding and a weighted canary. It compiles and passes `go vet` and `go test -race` on Go 1.24. A production gateway is a product (section 5), not 80 lines; the code shows what each step really does.
 
@@ -464,7 +510,7 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 
 **Sizing the fleet** (all inputs are estimates). Peak is 30,000 requests per second and one gateway instance handles about 5,000, so 6 instances carry the peak. To survive losing one of 3 availability zones, the remaining 2 zones must still hold 6 instances: 3 per zone, **9 in total**, behind an L4 load balancer or DNS that spans the zones.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **What sits in front of services:**
 
@@ -487,7 +533,7 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 | AWS API Gateway HTTP API | Managed, simpler and faster; native JWT authorizers | AWS, Lambda or HTTP back ends, cost-sensitive | 1.00 USD per million (us-east-1, first tier); 30 s timeout; no usage plans, caching or request validation |
 | Apigee (Google Cloud) | Managed API management: proxies, policies, analytics, portal, monetisation | Selling or governing APIs for external developers | Expensive; heavy for internal-only APIs |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **An extra hop and an extra system.** Every request pays a proxy hop (typically around a millisecond in-region, an estimate) and you operate one more critical tier. A single service with a few clients only needs a load balancer and a middleware chain ([[Middleware]]).
 - **The gateway can become a monolith.** Business rules, response rewriting and per-feature scripts creep in, and soon every team waits for the gateway team to deploy. Keep it to configuration; push logic into services or BFFs.
@@ -495,7 +541,7 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 - **Timeout ceilings.** Managed gateways cap request time (AWS REST APIs: 29 s by default). Long work must become asynchronous: `202 Accepted` plus a status URL or a webhook ([[Background Jobs and Worker Pools]]).
 - **Not a security boundary on its own.** If services trust anything that reaches them, one gateway misconfiguration or one internal attacker exposes everything.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Netflix's Zuul edge gateway; SoundCloud's BFFs (Phil Calçado, formerly of SoundCloud, coined the name, and Sam Newman's 2015 article describes the pattern in use at SoundCloud and REA); Kong, Envoy Gateway and AWS API Gateway as the common off-the-shelf choices; Istio and Linkerd as meshes behind the edge.
 - **Failure modes → fixes:**
@@ -512,7 +558,7 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 	- Gateway overhead (total latency minus upstream latency), shed and rate-limited counts, circuit-breaker state, certificate expiry.
 	- Structured access logs with request ID, route, consumer, status, upstream and durations; inject a trace context (W3C `traceparent`) so traces start at the edge ([[Distributed Tracing with OpenTelemetry]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Zero trust: the gateway authenticates, services still authorize.** The gateway proves *who* is calling and whether the caller may use the route. It cannot know whether user 42 may read order 7; only the orders service knows who owns order 7. So services must:
 
@@ -542,7 +588,7 @@ Details live in [[Rate Limiting - Algorithms and Distributed Design]].
 
 HTTP APIs allow up to 30 s. Both cap payloads at 10 MB, and in most Regions an account starts with a 10,000 requests per second throttle (5,000 burst); some newer Regions start lower.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why put an API gateway in front of microservices?
 > One stable public surface that hides internal topology, and one place for cross-cutting edge concerns: TLS, authentication, rate limits and quotas, routing, request IDs, logs and metrics. Services stop re-implementing them inconsistently, and clients survive internal refactors.
@@ -568,7 +614,7 @@ HTTP APIs allow up to 30 s. Both cap payloads at 10 MB, and in most Regions an a
 > [!question]- You are on AWS API Gateway and a report endpoint takes 45 seconds. What do you do?
 > REST APIs time out at 29 s by default and HTTP APIs at 30 s. Make the endpoint asynchronous: return `202 Accepted` with a job ID, process in a worker, and let the client poll a status URL or receive a webhook. Raising the REST timeout quota is possible but treats the symptom.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Gateway = north-south front door: TLS, validate, IP rules, authn (JWT via JWKS or API key), coarse authz, rate limits, routing, discovery, translation, caching, compression, logs.
 - Mesh = east-west: sidecars give mTLS, retries, timeouts and telemetry between services.
@@ -578,7 +624,7 @@ HTTP APIs allow up to 30 s. Both cap payloads at 10 MB, and in most Regions an a
 - No single point of failure: stateless instances across zones, gradual config rollout.
 - AWS API Gateway: 29 s default (REST) or 30 s (HTTP API) timeout, 10 MB payload; long work goes async.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[REST and HTTP API Design]], [[Forward and Reverse Proxies - L4 vs L7]], [[Load Balancing]]
 - **Next:** [[Rate Limiting - Algorithms and Distributed Design]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[Circuit Breaker]], [[Load Shedding and Graceful Degradation]], [[Serving REST and gRPC Together]]

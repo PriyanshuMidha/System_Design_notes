@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code builds a minimal reverse proxy on top of `net/http/httputil.ReverseProxy` that correctly appends `X-Forwarded-For`, returns a clean `502` on a dead backend, and includes the hop-trust logic (`TrustedClientIP`) for reading that header safely. See the theory in [[Forward and Reverse Proxies - L4 vs L7]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Running it". You do not need to follow every line of Go yet.
+> - 🟡 **Know the basics?** Add the "Code", "Design decisions" and "Tests" sections.
+> - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls" and do the exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+In plain words: this file builds a tiny receptionist (a **reverse proxy**) in Go. It takes each incoming request, notes down who really sent it (the `X-Forwarded-For` list), passes the request to the real server, and answers with a clean "502" error when that server is down. It also includes the one function everyone gets wrong — reading that sender list *safely*, trusting only the entries our own machines wrote. Read the short explanation around each code block first; the code just does what the sentence above it says.
+
+## Before the code 🟢
 
 - **`net/http/httputil.ReverseProxy`**: a ready-made reverse proxy from the standard library; we only customize it.
 - **Closures (`Director`, `ErrorHandler`)**: functions stored in struct fields; the proxy calls them per request.
@@ -25,7 +34,7 @@ updated: 2026-11-13
 - **Goroutines (implicit)**: every request is served on its own goroutine, which is why tests run with `-race`.
 - **Run it**: `go vet ./...` then `go test -race ./...` (see Setup).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Theory section |
 | --- | --- | --- |
@@ -34,7 +43,7 @@ updated: 2026-11-13
 | `ErrorHandler` returning 502 | The 502 vs 504 distinction | [[Forward and Reverse Proxies - L4 vs L7#Timeouts, and why a proxy gives you two different error codes]] |
 | `TrustedClientIP` | Trusting only a fixed number of hops from the right | [[Forward and Reverse Proxies - L4 vs L7#Forwarded headers and trust]] |
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `proxy`, with `proxy.go` and `proxy_test.go`.
 - **Go version:** 1.24.
@@ -47,9 +56,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Building the proxy and rewriting outbound requests
+
+**In plain words:** we take Go's ready-made proxy and customize two moments — just before a request is forwarded (fix the Host, note the sender), and when the backend fails (log it and answer 502).
 
 ```go
 package proxy
@@ -103,6 +114,8 @@ Writing a reverse proxy entirely from scratch (manual `http.Client` calls) was r
 
 ### Appending X-Forwarded-For and X-Forwarded-Proto
 
+**In plain words:** add the caller's address to the end of the sender list — never erase what earlier hops wrote — so the final server can still trace the chain.
+
 ```go
 // appendForwardedFor appends the immediate peer's IP to X-Forwarded-For.
 // Only a proxy we trust may add to this header; a client-supplied value
@@ -132,6 +145,8 @@ func appendForwardedFor(req *http.Request) {
 3. `X-Forwarded-Proto` is set only if absent, so an upstream proxy's own (correct) value is never clobbered by this hop defaulting to `"http"`.
 
 ### Reading X-Forwarded-For safely: TrustedClientIP
+
+**In plain words:** the sender list can be forged at the front, so count from the back — trust exactly as many entries as proxies you actually run, and ignore the rest.
 
 ```go
 // TrustedClientIP returns the real client IP from X-Forwarded-For, trusting
@@ -244,7 +259,7 @@ flowchart TD
 > }
 > ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -253,7 +268,7 @@ flowchart TD
 | `ErrorHandler` writes 502 unconditionally | Distinguish 502 vs 504 in code | A real proxy would check for a timeout error specifically to return 504 instead; this minimal version always returns 502 to keep the example to one code path (see Exercise 1) |
 | Clamp `trustedHops` to `len(parts)` in `TrustedClientIP` | Return `""` or panic if `trustedHops` exceeds the entry count | Clamping degrades gracefully (returns the oldest entry) instead of crashing on a header shorter than expected |
 
-## Tests
+## Tests 🟡
 
 ### TestReverseProxyForwardsAndSetsHeaders
 
@@ -371,7 +386,7 @@ func TestTrustedClientIPTrustsOnlyKnownHops(t *testing.T) {
 }
 ```
 
-## Running it
+## Running it 🟢
 
 ```text
 $ go vet ./...
@@ -388,13 +403,13 @@ ok  	proxy	1.481s
 
 Reading it: all three tests pass under `-race`; since `httptest.NewServer` spins up real listening goroutines, this also incidentally proves no data race exists between the test's own assertions and the handler goroutines serving the requests.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Forgetting to call the original `director` before the override's own logic** would silently lose the standard library's own request rewriting (path/query merging), producing requests the origin can't route correctly — this is why `director(req)` is called first, not skipped.
 - **Setting `X-Forwarded-For` instead of appending** would make a multi-hop deployment indistinguishable from a single-hop one, breaking `TrustedClientIP`'s hop-counting for everyone downstream.
 - **Returning `200` or leaving the response unwritten in `ErrorHandler`** would hide a real backend outage from monitoring that watches for `5xx` rates, since the client would see success or a hang instead of a clear signal.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `ErrorHandler` to distinguish a context-deadline-exceeded error (slow backend) from any other error (backend refused/reset), returning `504` for the former and `502` for the rest. Predict which existing test still passes unmodified, then verify.
 2. Add a `MaxTrustedHops` guard to `TrustedClientIP` that returns `""` instead of clamping when `trustedHops > len(parts)`, on the reasoning that a shorter-than-expected header might itself be a sign of tampering. Predict which call sites in a real proxy would need to handle an empty-string "unknown" result, then update the test to cover it.

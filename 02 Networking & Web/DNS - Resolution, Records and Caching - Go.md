@@ -15,7 +15,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code is a `CachingResolver` that wraps Go's `net.Resolver` with the TTL-aware caching the standard library deliberately leaves out, plus a helper showing how to force the pure-Go resolver and point it at a specific DNS server. See the theory in [[DNS - Resolution, Records and Caching]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Running it". You do not need to follow every line of Go yet.
+> - 🟡 **Know the basics?** Add the "Code", "Design decisions" and "Tests" sections.
+> - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls" and do the exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+In plain words: Go can look up a domain name for you, but it forgets the answer immediately — ask twice and it goes to the network twice. This file builds a small wrapper that remembers each answer for a set time (a **cache** with a **TTL**, a countdown timer), and shows how to point Go at a specific DNS server. Read the short explanations around each code block first; the code just does what the sentence above it says.
+
+## Before the code 🟢
 
 - **Interfaces:** `Resolver` is a one-method interface, so a real `*net.Resolver` or a test fake can be plugged in.
 - **`context.Context`:** every lookup takes a context, so a caller can cancel or time out a slow DNS query.
@@ -24,7 +33,7 @@ updated: 2026-11-13
 - **`net.Resolver{PreferGo, Dial}`:** forces the pure-Go resolver and points it at a chosen DNS server.
 - **Run:** `go vet ./...` then `go test -race ./...` in a module containing `dnscache.go` and `dnscache_test.go`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Theory section |
 | --- | --- | --- |
@@ -33,7 +42,7 @@ updated: 2026-11-13
 | `realResolverExample` (`PreferGo`, custom `Dial`) | The pure-Go vs cgo resolver split, and pointing at a specific server | [[DNS - Resolution, Records and Caching#4. Worked example]] |
 | `TestCacheHitSuppressesUpstreamQuery` | Proof the cache actually suppresses a redundant query within the TTL, and requeries after it | [[DNS - Resolution, Records and Caching#Caching layers, TTL, and negative caching]] |
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `dnscache`, with `dnscache.go` and `dnscache_test.go`.
 - **Go version:** 1.24.
@@ -46,7 +55,7 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### The bare call this wraps
 
@@ -57,6 +66,8 @@ addrs, err := net.DefaultResolver.LookupHost(context.Background(), "example.com"
 ```
 
 ### The cache entry and the resolver interface
+
+**In plain words:** first we define the shape of things — "anything that can look up a host" (the interface) and "one saved answer plus its expiry time" (the entry).
 
 ```go
 // Package dnscache wraps net.Resolver with the TTL-aware caching that Go's
@@ -91,6 +102,8 @@ type entry struct {
 2. `entry` holds exactly what freshness requires: the cached value and when it stops being valid.
 
 ### CachingResolver and Lookup
+
+**In plain words:** this is the whole trick — before asking the network, check the notebook; if the note is still fresh, use it; otherwise ask, write it down, and return it.
 
 ```go
 // CachingResolver caches LookupHost answers in memory for ttl, the way an
@@ -150,6 +163,8 @@ Falling through to here means the cache missed, so the upstream resolver is quer
 4. On an upstream error, nothing is cached: a failed lookup should not poison the cache with a non-answer.
 
 ### A production-shaped resolver: forcing pure-Go and a specific server
+
+**In plain words:** this builds a resolver that ignores the machine's own DNS settings and always asks one chosen server (1.1.1.1), using Go's own DNS code instead of the operating system's.
 
 ```go
 // realResolverExample shows the production shape: a context-aware,
@@ -281,7 +296,7 @@ flowchart TD
 > }
 > ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -290,7 +305,7 @@ flowchart TD
 | Injectable `Now func() time.Time` | Use `time.Now()` directly | Makes TTL-expiry tests deterministic and fast instead of requiring a real sleep |
 | `PreferGo: true` + custom `Dial` | Rely on the OS resolver via cgo | Works identically in a minimal container with no libc resolver, and lets the app pin a specific DNS server |
 
-## Tests
+## Tests 🟡
 
 ### TestCacheHitSuppressesUpstreamQuery
 
@@ -394,7 +409,7 @@ func TestRealResolverExampleIsWellFormed(t *testing.T) {
 }
 ```
 
-## Running it
+## Running it 🟢
 
 ```text
 $ go vet ./...
@@ -409,13 +424,13 @@ ok  	dnscache	1.478s
 
 Reading it: `go vet` found nothing to flag, and both tests pass under the race detector, meaning the mutex around `cache` genuinely serializes every access — important since `Lookup` is meant to be called concurrently by multiple goroutines resolving different hosts at once.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Caching an error result** would mean a transient upstream failure gets "remembered" and returned to every subsequent caller until some other code path clears it — this is why `Lookup` returns early on `err != nil`, before ever touching `c.cache`.
 - **Comparing `now().Before(e.expires)` the wrong way round** (e.g. `After` instead of `Before`) would silently invert expiry, caching forever or never caching at all — exactly the kind of off-by-one the TTL-expiry test exists to catch.
 - **Forgetting `PreferGo: true`** would make `realResolverExample`'s custom `Dial` meaningless on a system where Go picks the cgo resolver instead, since the cgo path doesn't go through Go's own dialing code at all.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `TTL` from a single `time.Duration` field to a `map[string]time.Duration` keyed by host, so different hosts can have different TTLs (closer to how real DNS answers carry their own TTL). Predict which existing test would need to change, then update it.
 2. Remove the early return on `err != nil` in `Lookup` so a failed lookup still gets cached (with a very short TTL, say 1 second) as a "negative cache" entry, mirroring [[DNS - Resolution, Records and Caching#Caching layers, TTL, and negative caching]]'s negative caching.

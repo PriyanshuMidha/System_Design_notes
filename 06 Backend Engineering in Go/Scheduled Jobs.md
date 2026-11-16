@@ -23,7 +23,33 @@ updated: 2026-11-13
 > - The job's own SQL should be idempotent and resumable on its own (`FOR UPDATE SKIP LOCKED`, looping until a batch is empty), so a crash mid-run is a non-event rather than an incident.
 > - Classic mistake: doing the work inside the scheduler goroutine instead of enqueuing it, which lets one slow dependency stall every future tick.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some work runs on a clock, not on a request: "every night at 2 a.m., mark overdue invoices". That is a **scheduled job**.
+
+In Go the timer part is easy — a ticker or a cron library. The hard part is that your service runs as several identical copies, and all of them hear the same clock.
+
+```mermaid
+flowchart LR
+    T[Clock tick] --> R1[Replica 1] & R2[Replica 2] & R3[Replica 3]
+    R1 & R2 & R3 --> L{Who got the lock?}
+    L --> W[Only one runs the job]
+```
+
+So each tick, the replicas race for a **lock** in the database and only the winner runs. And the job itself must be safe to re-run after a crash: doing half of it twice must not double anything.
+
+The rest of this note is just these 4 questions:
+1. Why does a bare ticker drop ticks, and what is the fix?
+2. How do you stop runs from overlapping themselves?
+3. How does the cross-replica lock work?
+4. How do you write a batch that can resume after a crash?
 
 **The problem in one story.**
 A shop owner wants a reminder text sent every evening to customers whose bill is late.
@@ -71,7 +97,7 @@ Where it breaks: a real key cannot "expire" while someone holds it; a lock with 
 > [!tip] Remember
 > Every replica may tick, but only the lock winner works, and the work itself must be safe to run twice.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps runs 4 replicas of its API behind a load balancer. One of its jobs marks an invoice `overdue` once its `due_date` has passed and queues a reminder email.
 
@@ -83,7 +109,7 @@ A second problem is independent of replica count: if the overdue scan takes 90 s
 
 A bare ticker loop answers this by accident, not by design — and the accidental answer (explained below) is "that tick is silently thrown away."
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Separate two questions that a tutorial usually blurs together:
 
@@ -103,9 +129,11 @@ flowchart LR
     M -- yes --> R["release the lock"]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The bare ticker, and why it drops ticks
+
+**In plain words:** a ticker holds at most one pending tick; if a run is slower than the interval, ticks silently fall on the floor.
 
 ```go
 func RunTicker(ctx context.Context, interval time.Duration, run func(context.Context)) {
@@ -138,6 +166,8 @@ The loop never sees two ticks queued up and never "catches up"; it simply runs l
 > The drop-ticks behaviour above is unchanged by this (a non-blocking send with no ready receiver still drops the tick either way), but code that calls `len(t.C)` or `cap(t.C)` to probe for a pending tick sees a different number depending on the module's declared Go version, and this note's Go 1.24 module is on the new, unbuffered side.
 
 ### Never overlapping, and saying so
+
+**In plain words:** if last night's run is still going, this tick must skip — and log that it skipped, so you notice the job is too slow.
 
 The fix is not a bigger buffer; it is refusing to start a second run while one is in flight, and logging when a tick is skipped instead of hiding it:
 
@@ -188,6 +218,8 @@ c.Start()
 
 ### Running once across N replicas
 
+**In plain words:** all replicas try to grab the same database lock at the same moment; one wins, the rest shrug and go back to sleep.
+
 Coordination needs one more piece than the in-process loop: a lock that is visible to every replica.
 
 This note uses a Postgres advisory lock because InvoiceOps already runs on Postgres and the lock needs no new table, no TTL, and no extra infrastructure — it lives on a session and is released automatically if that session (connection) closes, even on a hard crash.
@@ -234,6 +266,8 @@ A Kubernetes `Lease` object gives a third option, used when the service already 
 
 ### Idempotent, resumable batches
 
+**In plain words:** write each batch step so running it again does nothing the second time — then a crash mid-batch costs nothing but a re-run.
+
 The lock answers "who runs this tick," not "what if the run itself dies halfway through 2 million rows." That is a query design question:
 
 ```sql
@@ -273,7 +307,7 @@ Two consequences follow from this:
 1. The advisory lock's `release()` still runs (it is a `defer`, not conditional on how the loop exited), so the next replica up can claim the lock immediately instead of waiting for a lease to expire.
 2. Any rows already claimed and hand-off to the worker channel in `enqueue` are the caller's responsibility to drain before the process exits, the same shutdown-ordering question every worker pool has (see [[Background Workers and Job Queues]]) — a scheduler that stops claiming new batches but abandons a channel full of already-claimed work on exit has only moved the dropped-work problem, not fixed it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -453,7 +487,7 @@ func TestRunTickerSkipIfBusy_NeverOverlaps(t *testing.T) {
 
 All three pass under `go test -race`, along with a fourth test (`TestRunTicker_DropsTicksWhenSlow`) that pins the bare ticker's dropped-tick behaviour described in section 3, so the note's central claim is checked, not asserted.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -464,14 +498,14 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 | Kubernetes `CronJob` | The kubelet starts a fresh Pod per scheduled tick | Per-tick isolation, independent resource limits, or a separate image | Pod cold-start latency per tick; `concurrencyPolicy` must be set explicitly (`Allow` is the default and the usual mistake), and `startingDeadlineSeconds` / `backoffLimit` need setting too, or a missed tick (control plane was down) or a failing Pod retries or is skipped in ways the defaults rarely match what you want |
 | DB-backed scheduler (river, asynq's periodic jobs) | A schedule row turns into a queued job the worker pool picks up | Want the job queue's own retry/visibility machinery for scheduled work too | Adds a dependency on that queue library and its schema |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A tick fires only approximately on time: lock-acquisition latency and clock drift between replicas both add jitter on top of the nominal interval. Nothing here is a real-time scheduler.
 - Coordination (locks, leases) is an extra moving part. For a job where running twice is harmless and cheap (recomputing a cache that is already idempotent, say), it can be simpler to let every replica run it and accept the duplicate work.
 - `cron.DelayIfStillRunning` trades dropped runs for a growing backlog: if a job is reliably slower than its own interval, that backlog never drains and memory for queued closures grows without bound. `SkipIfStillRunning` is the safer default; fix the real problem (the job is too slow for its interval) rather than queuing around it.
 - Kubernetes `CronJob` is the wrong tool for anything sub-minute: Pod scheduling and image pull overhead alone can exceed the interval.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Kubernetes `CronJob` for batch and reporting jobs; `robfig/cron` is the de facto standard in-process scheduler for Go services; river and asynq both ship a periodic-job feature on top of their durable queues; AWS EventBridge Scheduler and GCP Cloud Scheduler for schedules that should survive the whole fleet being down.
 - **Failure modes → fixes:**
@@ -483,7 +517,7 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
   - Every replica's ticker fires at `:00` exactly → add jitter (`time.Sleep(rand.N(sleepWindow))` before the first tick, or stagger `AddFunc` schedules per replica) so a fleet of 50 replicas does not all hit the database in the same 100ms window.
 - **What to monitor:** a `last_success_timestamp` gauge per job, alerting if it goes stale past (interval × 2) — a "dead man's switch" that fires on silence, not on an explicit error; run duration; rows processed per run; a counter of `SkipIfStillRunning` skips (a rising rate means the job is now too slow for its interval); lock-acquisition failures (expected under normal multi-replica operation, but a useful signal if a single replica suddenly never wins).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Go 1.23's timer GC change, precisely.** Before 1.23, the runtime kept a `Timer`/`Ticker` reachable (via its internal heap entry holding a reference back to it) for as long as it had not fired and not been stopped, even if the Go value itself had no other references.
 
@@ -500,7 +534,7 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 
   "Mark invoices overdue" and "reconcile payments" should always catch up, because skipping them leaves the data wrong. Decide this per job, and encode it in the batch query's `WHERE` clause (by due date, not by "how many ticks did we miss"), not in scheduler configuration.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does a `time.Ticker` silently drop ticks instead of queuing them?
 > Its channel is buffered to hold exactly one pending tick. If the consumer is still inside a run when the next tick fires, that tick overwrites the one not yet read; the channel never holds more than one, so ticks that arrive during a slow run are lost, not queued.
@@ -525,7 +559,7 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 > [!question]- When would you reach for a Kubernetes `CronJob` instead of an in-process scheduler?
 > When the job needs isolation the main service doesn't — its own image, its own resource limits, or a workload that would otherwise compete with request-serving goroutines for CPU — and when its interval is comfortably above a minute, since each tick pays Pod scheduling and (absent image caching) pull latency that an in-process timer never does.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - A bare `time.Ticker` drops a tick if the previous run is still executing when the next one fires; its channel buffers only 1.
 - Fix overlap with `SkipIfStillRunning` (drop) or `DelayIfStillRunning` (queue one) — `robfig/cron v3`'s `WithChain`.
@@ -536,7 +570,7 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 - Catch-up policy is per job: query by due date for anything that must eventually happen; never for "best effort, now stale" notifications.
 - Monitor a staleness gauge (`last_success_timestamp`), not just error counts — a scheduler that silently stopped firing produces no errors at all.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Context Package]], [[Background Workers and Job Queues]]
 - **Next:** [[Receiving Webhooks Idempotently]], [[Observability in Go Services]]

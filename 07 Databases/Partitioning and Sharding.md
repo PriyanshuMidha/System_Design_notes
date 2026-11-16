@@ -28,7 +28,40 @@ updated: 2026-11-13
 > - The rule: hash keys into many fixed logical shards, and keep a map from logical shard to database, so moving data is a map change.
 > - Classic mistakes: sharding by ranges of a growing ID (all new writes hit one shard) and routing with `hash(key) % servers` (adding a server moves almost every key).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (comparison and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Imagine one notebook where you write every sale your shop ever makes. After a few years the notebook is so thick you cannot flip through it, and only one person can write in it at a time.
+
+First fix: split the notebook into one slim book per month. Same shelf, same shop, but now you only open the book you need. That is **partitioning** (splitting one big table into pieces inside the same database).
+
+```mermaid
+flowchart LR
+    N["one huge notebook"] --> P1["Sep book"]
+    N --> P2["Oct book"]
+    N --> P3["Nov book"]
+```
+
+Second fix, when even the shelf and the one writer are not enough: give whole sets of books to different branches of the shop, each with its own staff. That is **sharding** (putting the pieces on separate machines).
+
+```mermaid
+flowchart LR
+    C["customer 'acme'"] --> D["directory: which branch<br/>holds acme's books?"] --> B2["branch 2"]
+```
+
+The label you split by (customer, month, region) is the **shard key**, and it is the whole game: a good key spreads the work evenly; a bad one piles everything on one branch.
+
+The rest of this note is just these 4 questions:
+1. When do you partition, when do you shard, and what comes before both?
+2. How does PostgreSQL partitioning actually work (and make deleting old data free)?
+3. How does a request find the right shard, and what makes a good shard key?
+4. How do you move data between shards without downtime, and what goes wrong at scale?
 
 **The problem in one story.**
 Your invoices table grows to billions of rows.
@@ -73,7 +106,7 @@ Where it breaks: letters to "everyone" must go in every van, just like a query w
 > [!tip] Remember
 > Hash into many fixed logical shards and map them to databases; a move is then a map change, not a rehash.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps after a few years, with numbers that are estimates for the scenario:
 
@@ -111,7 +144,7 @@ flowchart TD
     Q4 -- no --> F5["Shard across machines"]
 ```
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Partitioning is a filing cabinet with one drawer per month: the same office, but you only open the drawer you need, and throwing away last year means emptying one drawer.
 
@@ -143,7 +176,7 @@ flowchart LR
     end
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Partitioning inside PostgreSQL
 
@@ -395,7 +428,7 @@ Joins and transactions inside a workspace stay on one shard. What does not fit, 
 - **A huge enterprise workspace.** Give it a directory override to a dedicated shard.
 - **Cross-workspace reports.** Send them to a warehouse fed by CDC, not to a fan-out over every shard.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -479,7 +512,7 @@ stateDiagram-v2
 
 Runnable Go version: [[Partitioning and Sharding - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Where routing lives | Examples | Strengths | Costs |
 | --- | --- | --- | --- |
@@ -504,7 +537,7 @@ flowchart LR
     end
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Partitioning costs:**
 	- Primary keys and unique constraints must include the partition key; PostgreSQL has no global index.
@@ -520,7 +553,7 @@ flowchart LR
 	- When one well-tuned primary with replicas, caching and partitioned big tables still has headroom. Sharding changes the application's architecture and is very hard to undo.
 	- When you want SQL transactions across the whole dataset with automatic splitting: look at [[Distributed SQL]] before building your own router.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Notion shards PostgreSQL by workspace ID into 480 logical shards. 480 divides evenly over 32 hosts (15 each) and over 96 hosts (5 each), which made the re-shard a move of whole logical shards.
@@ -542,7 +575,7 @@ flowchart LR
 	- CDC lag and the freeze duration during moves.
 	- For partitions: the newest partition that exists, and partitions past retention not yet dropped.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Why many logical shards
 
@@ -614,7 +647,7 @@ sequenceDiagram
 - **Splitting hash partitions in place.** PostgreSQL allows different moduli in one table as long as each modulus divides the next larger one. To split `REMAINDER 0` of `MODULUS 4`, detach it, create `MODULUS 8, REMAINDER 0` and `MODULUS 8, REMAINDER 4`, then reinsert its rows.
 - **Hot ranges in range-sharded systems.** Systems that split ranges automatically (Bigtable, HBase, CockroachDB) still suffer when every insert has the newest key. The usual fix is to prefix or hash the key, such as hash-sharded indexes in CockroachDB or bit-reversed sequences in Spanner, which trades away range-scan locality on that key.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between replication, partitioning and sharding?
 > Replication copies the same data to more servers, which scales reads and availability. Partitioning splits a table into pieces inside one database, which helps maintenance, retention and pruning. Sharding places those pieces on different servers, which scales writes and storage, but the application or a router must find the right shard for every query.
@@ -637,7 +670,7 @@ sequenceDiagram
 > [!question]- Why not route with `hash(key) % number_of_servers`?
 > Adding one server changes almost every key's result (about 80% move when going from 4 to 5 servers), so you reshuffle nearly all data. Hash into a fixed, large number of logical shards and move whole logical shards, or use consistent hashing.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - The ladder: indexes → cache → replicas → partitions → bigger machine → shards.
 - PostgreSQL partitioning: `RANGE`, `LIST`, `HASH`; the primary key must include the partition key; pruning shows as missing partitions or `Subplans Removed`.
@@ -648,7 +681,7 @@ sequenceDiagram
 - Online move: snapshot at an LSN, CDC catch-up, verify, short freeze, flip the map, keep a rollback path.
 - Fan-out to N shards multiplies tail latency (`0.99^32 ≈ 72.5%` within p99).
 
-## Links
+## Links 🟢
 
 - **Go implementation:** [[Partitioning and Sharding - Go]]
 - **Before this:** [[Replication]], [[Indexing Fundamentals]], [[Query Plans and EXPLAIN]]

@@ -20,7 +20,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This note holds the runnable code behind [[NoSQL Data Modeling]]: a key builder and an in-memory `Query` for a DynamoDB single table (prefix queries, pagination with a cursor, an overloaded GSI, write sharding), plus the MongoDB invoice document and the atomic payment update written out in full.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Running it". That tells you what the code does without reading any of it.
+> - 🟡 **Know the basics?** Read the Code steps 1-8 in order, then the Design decisions and Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on half of [[NoSQL Data Modeling]]. It builds a tiny fake DynamoDB table in plain Go, so you can watch the ideas from the theory note actually run: building keys like `WS#acme`, reading one page of results at a time with a cursor, querying a second index, and spreading a hot key over many shards. It also shows the MongoDB invoice document and the one-step payment update written out in full. Read it top to bottom: each step gives the idea first, then the code, then a line-by-line "How it works".
+
+## Before the code 🟢
 
 - **String keys**: plain functions build DynamoDB keys such as `WS#acme` and `INV#2026-11#0042`.
 - **`sort` and `strings`**: the in-memory table keeps items in sort-key order and matches prefixes, like a real `Query`.
@@ -29,7 +38,7 @@ updated: 2026-11-13
 - **`package main`**: a small program prints the whiteboard example.
 - **Run**: `go vet ./... && go test -race ./...`, and `go run ./cmd` for the whiteboard.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept in [[NoSQL Data Modeling]] |
 | --- | --- |
@@ -56,17 +65,19 @@ flowchart LR
     SH -->|"KEY#0 .. KEY#n-1"| T
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only. A scratch module `dynkeys` with `dynkeys.go` (package `dynkeys`), `dynkeys_test.go`, and `cmd/main.go` for the whiteboard program.
 - Run the tests with `go vet ./... && go test -race ./...`, and the whiteboard with `go run ./cmd`.
 - The MongoDB documents are JSON and run in `mongosh`; they are not part of the Go module.
 
-## Code
+## Code 🟡
 
 The code has two halves. The first half (steps 1 to 3) is the design on paper: the keys each access pattern uses, the MongoDB document, and the atomic payment write. The second half (steps 4 to 8) is a small Go model of the DynamoDB read path, so you can watch prefix queries, cursors and shard keys behave.
 
 ### Step 1: the whiteboard program
+
+**In plain words: a five-line program that prints which key each question uses, so you can sanity-check the design before any database exists.**
 
 **Concept.** The central rule of [[NoSQL Data Modeling#3.1 Step 1: list the access patterns]] is that you list the reads first and derive the keys from them.
 
@@ -106,6 +117,8 @@ func main() {
 | AP3 client and invoices | GSI1 | `CLIENT#c_1` | none |
 
 ### Step 2: the invoice document in MongoDB
+
+**In plain words: the whole invoice is one JSON document — lines and payments tucked inside, the client's name copied in, totals pre-computed — so one read fetches the full picture.**
 
 **Concept.** [[NoSQL Data Modeling#3.2 MongoDB: embed or reference]] says to embed what is read together and bounded in size.
 
@@ -157,6 +170,8 @@ flowchart TD
 
 ### Step 3: recording a payment in one atomic write
 
+**In plain words: one update adds the payment and bumps the total in a single step, and a built-in guard makes a repeated webhook do nothing instead of charging twice.**
+
 **Concept.** AP6 in [[NoSQL Data Modeling#3.6 Transactions in both stores]] is "record a payment".
 
 Because the payment lives inside the invoice document, one update changes the array and the running total together, and MongoDB guarantees a single-document write is atomic, so no multi-document transaction is needed.
@@ -194,6 +209,8 @@ sequenceDiagram
 ```
 
 ### Step 4: the item, the key builders and the table type
+
+**In plain words: small helper functions build the key strings (`WS#acme`, `INV#2026-11#...`) so every part of the code spells them exactly the same way — one typo in a prefix and an item becomes unfindable.**
 
 **Concept.** [[NoSQL Data Modeling#3.5 Single-table design]] stores several entity types in one table and tells them apart by key prefixes such as `WS#`, `INV#` and `PAY#`.
 
@@ -260,6 +277,8 @@ func PaymentSK(paidAt, paymentID string) string {
 
 ### Step 5: write sharding
 
+**In plain words: when one key gets all the traffic, split it into ten numbered keys — like opening ten checkout counters instead of one — with a hash deciding which counter each write goes to.**
+
 **Concept.** A single partition accepts at most 1,000 write capacity units per second ([[NoSQL Data Modeling#3.4 DynamoDB: partition key, sort key and indexes]]). When one logical key is too hot, you append a shard number to the partition key so writes spread over `n` partitions.
 
 Hashing the write key, rather than using a random number, makes the shard choice repeatable, so the same event always lands in the same shard. The price is that readers must query all `n` keys and merge.
@@ -290,6 +309,8 @@ flowchart LR
 
 ### Step 6: the in-memory table and Put
 
+**In plain words: a toy table in a Go slice that behaves like DynamoDB's `PutItem` — writing with an existing key replaces the whole item.**
+
 **Concept.** `Table` stands in for one DynamoDB table so we can run queries without AWS. A real table is keyed by `(PK, SK)` and `PutItem` with an existing key replaces the whole item; `Put` copies that behaviour.
 
 We use a slice and a linear scan because clarity matters more than speed here; a map keyed by `PK+SK` would be faster but would hide the sorted-order idea that `Query` needs to show.
@@ -317,6 +338,8 @@ func (t *Table) Put(it Item) {
 4. The pointer receiver `*Table` is needed because `Put` changes the slice header.
 
 ### Step 7: Query with a cursor
+
+**In plain words: this read hands back one page of results plus a bookmark; the caller sends the bookmark back for the next page until the bookmark comes back empty.**
 
 **Concept.** [[NoSQL Data Modeling#4.2 The same invoice in DynamoDB, with pagination]] explains that a `Query` reads one partition, in sort-key order, one page at a time, and returns `LastEvaluatedKey` when more remains.
 
@@ -364,6 +387,8 @@ sequenceDiagram
 
 ### Step 8: the overloaded GSI query
 
+**In plain words: the same items read through a second index, where the client row and its invoices share one key, so "the client and all its invoices" is a single read.**
+
 **Concept.** [[NoSQL Data Modeling#3.4 DynamoDB: partition key, sort key and indexes]] describes a global secondary index as a second sort order of the same items.
 
 Overloading means one index serves several entities: the client row and each of its invoices share `GSI1PK = CLIENT#c_1`, so one query returns "the client and its invoices".
@@ -393,7 +418,7 @@ func (t *Table) QueryGSI1(pk, prefix string) []Item {
 
 In real code, `Query` is `dynamodb.Query` from the AWS SDK for Go v2, with `KeyConditionExpression: "PK = :pk AND begins_with(SK, :p)"` and the returned `LastEvaluatedKey` passed back as `ExclusiveStartKey`. The real cursor is a map of the key attributes, not a string, and a page also ends when it reaches 1 MB of data.
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice in the code | Alternative | Trade-off |
 | --- | --- | --- |
@@ -405,7 +430,7 @@ In real code, `Query` is `dynamodb.Query` from the AWS SDK for Go v2, with `KeyC
 | Embed items and payments in Mongo | separate collections | one read and one atomic write; document growth must stay bounded |
 | `$ne` guard on `provider_ref` | read, check, then write | atomic and retry-safe in one round trip; depends on `provider_ref` being unique |
 
-## Tests
+## Tests 🟡
 
 The tests share one fixture, `seed`, that builds one workspace with four invoices (in months 2026-09, 2026-10 and two in 2026-11), one client row and one payment. Seed first, then each test asserts one property.
 
@@ -539,7 +564,7 @@ func TestShardedPKIsStableAndSpread(t *testing.T) {
 
 **If it fails.** An unstable result means the hash depends on something other than the write key (such as a random seed), so reads cannot locate earlier writes. Fewer than 10 shards means the hash clusters, and the hottest shard would still hit the per-partition write limit.
 
-## Running it
+## Running it 🟢
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -579,7 +604,7 @@ item: WS#acme / INV#2026-11#inv_812
 
 Each line is one access pattern turned into a key, in the same order as the code, with `item:` showing where the invoice summary is stored.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **The cursor is a plain string.** `Query` returns the last sort key as the cursor, which works because the tests query one partition key. DynamoDB's `LastEvaluatedKey` is a map of the table's key attributes (and the index's, for a GSI), so a real pager must pass the whole map back.
 - **No 1 MB page limit and no filter.** The stand-in cuts pages only by `limit`. Real `Query` also stops at 1 MB and applies `Limit` before any `FilterExpression`, so a real page can come back empty with a cursor.
@@ -588,13 +613,13 @@ Each line is one access pattern turned into a key, in the same order as the code
 - **The JSON update is not Go.** The `$ne` value must equal the `provider_ref` being pushed (`pay_Q1z7`), or the retry guard does nothing.
 - **`QueryGSI1` has no pagination.** A real GSI query pages exactly like the base table.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `limit` in `TestPaginationWithCursor` from 3 to 1. Predict how many pages the loop reads and whether `all` still has 4 entries.
 2. In `seed`, change `"2026-11"` (the third invoice) to `"2026-12"`. Predict the result of `TestQueryByMonthPrefix` and which prefix query would now return that invoice.
 3. Change the shard count in `TestShardedPKIsStableAndSpread` from 10 to 1,000 with the same 1,000 write keys. Predict whether all 1,000 shards are used, and what that means for a reader.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[NoSQL Data Modeling]]
 - **Related code:** [[Wide-Column Stores and Cassandra - Go]], [[Materialized Views and Denormalization - Go]]

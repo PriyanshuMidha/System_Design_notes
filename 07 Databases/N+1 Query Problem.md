@@ -25,7 +25,37 @@ updated: 2026-11-13
 > - The rule: fetch related rows for the whole list at once (JOIN, or one `WHERE id = ANY($1)` query).
 > - Classic mistake: "fixing" it with goroutines. That still sends N queries and can exhaust the connection pool.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (fixes and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code asks the database for a list of 50 things. Then, for each thing on the list, it asks one more question. That is 51 separate trips to the database: 1 for the list plus N for the items. That pattern is the **N+1 problem**.
+
+```mermaid
+flowchart LR
+    A["Code"] -- "trip 1: give me 50 invoices" --> D[("Database")]
+    A -- "trips 2 to 51: who is this invoice's client?" --> D
+```
+
+Each trip is fast on its own. The problem is the waiting between trips, called a **round trip**, paid 51 times in a row.
+
+The fix is to ask for all the related things in one go, so 51 trips become 2.
+
+```mermaid
+flowchart LR
+    A["Code"] -- "trip 1: 50 invoices" --> D[("Database")]
+    A -- "trip 2: all 50 clients at once" --> D
+```
+
+That is the whole bug and the whole fix. The rest of this note is just these 3 questions:
+1. Where does the bug hide (loops, ORMs, GraphQL)?
+2. Which one-trip fix do you pick (JOIN, batch query, DataLoader)?
+3. How do you catch it in production and stop it coming back?
 
 **The problem in one story.**
 A page lists 50 invoices with each client's name.
@@ -70,7 +100,7 @@ Where it breaks: one huge list can also be a problem, so very large ID lists are
 > [!tip] Remember
 > Never query inside a loop: collect the IDs, fetch them in one query, join in memory.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps shows a page of invoices with the client's name next to each total. The obvious code loads the page, then looks up each invoice's client:
 
@@ -91,13 +121,13 @@ Each client lookup is a primary-key hit that the server answers in microseconds.
 
 At 200 page views per second, the N+1 version sends 10,200 queries per second where 400 would do. Latency grows with the page size, which is the signature of the bug.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The number that matters is **round trips per request**, not milliseconds per query.
 
 Think of a waiter who walks to the kitchen once per dish instead of once per table. Each trip is short, but 50 trips are slow, and the corridor fills up with waiters. Batching means writing the whole order on one ticket.
 
-## 3. How it works
+## 3. How it works 🟡
 
 N+1 hides wherever code that loads one related row runs inside a loop:
 
@@ -119,6 +149,8 @@ flowchart LR
 ```
 
 ### The difference on the wire
+
+**In plain words:** the diagram below shows the actual back-and-forth with the database — the slow version chats 51 times, the fast version chats twice.
 
 
 
@@ -142,6 +174,8 @@ sequenceDiagram
 
 ### The batching steps
 
+**In plain words:** the fix is a recipe — gather the IDs, drop duplicates, fetch them all with one query, then match them back up in memory, like doing one shop run for the whole list.
+
 Collect the foreign keys, remove duplicates, fetch each chunk with one query and stitch the result by key:
 
 ```mermaid
@@ -155,9 +189,11 @@ flowchart LR
     F --> G["Walk invoices in page order,<br/>look up each client,<br/>fail if one is missing"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest possible Go version of the bug and the fix, side by side — the slow one queries inside the loop, the fast one queries once before it.
 
 The bare idea: the slow version calls the database inside the loop; the fast one collects IDs, runs one batched query, and joins in a map.
 
@@ -198,6 +234,8 @@ The runnable version adds workspace scoping, context, a missing-client check, an
 
 ### A page of 50 invoices, traced
 
+**In plain words:** the same page measured both ways — 51 trips (about 51 ms) against 2 trips (about 2 ms). The table shows where the saving comes from.
+
 The page has 50 invoices that share 7 distinct clients, and the chunk size is 1,000.
 
 | Step | Naive | Batched |
@@ -235,7 +273,7 @@ The test that stops this bug from coming back counts queries against a fake stor
 
 Runnable Go version: [[N+1 Query Problem - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Fix | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -280,7 +318,7 @@ sequenceDiagram
 
 The other ORMs follow the same split. Django has `select_related` (JOIN) and `prefetch_related` (separate query). Rails has `includes`, `preload` and `eager_load`, plus `strict_loading` to raise on lazy loads. Hibernate has `JOIN FETCH` and `@BatchSize`.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 ```mermaid
 flowchart LR
@@ -314,7 +352,7 @@ sequenceDiagram
 
 - **Parallel goroutines are not a fix.** They cut latency but take up to N pool connections per request and leave the database load unchanged (see the trap question).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Facebook's DataLoader (JavaScript) popularised per-tick batching for GraphQL. gqlgen projects use Go loaders such as `dataloadgen`.
@@ -358,9 +396,11 @@ flowchart LR
 	- A shared, long-lived loader returns stale data, or another tenant's row → one loader per request, with the tenant in every query.
 - **What to monitor:** queries per request (histogram per route), `pg_stat_statements` calls per route call, DB spans per trace, and pool wait time.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### How a DataLoader works without an event loop
+
+**In plain words:** a DataLoader is like a shuttle bus — it waits a moment for passengers (lookup requests) to gather, then makes one trip for all of them instead of one trip each.
 
 JavaScript's DataLoader batches every `load()` made in one event-loop tick. Go has no tick, so Go loaders collect keys for a short **wait window**, or until **maxBatch** keys arrive, then run one fetch.
 
@@ -409,7 +449,7 @@ sequenceDiagram
 - **Parallel N+1 can deadlock the pool.** A request holding a transaction (1 connection) that fans out goroutines needing more connections can starve itself. Example: pool size 10 and 10 such requests means every request holds 1 and waits for a second, until each context times out.
 - **Across services** the same math applies with bigger numbers: 50 sequential calls at 20 ms each (an example figure) take 1 s. Add a batch endpoint, cache, or keep a local read model fed by events.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Each query takes 0.02 ms in `pg_stat_statements`. Why is the endpoint slow?
 > Because the cost is round trips, not server time. 51 sequential queries pay 51 network hops, driver overheads and pool checkouts, about 1 ms each in the same region. The database sees only its 0.02 ms per query. Count queries per request, not just query latency.
@@ -432,7 +472,7 @@ sequenceDiagram
 > [!question]- How do you stop N+1 from coming back?
 > Add tests that assert the query count stays constant as the page size grows (1 vs 50 rows), using a counting fake or a driver tracer against a real database. Turn on strict-loading modes in ORMs that have them. Track a per-route query budget in dashboards.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - N+1 = 1 list query + 1 query per row; cost grows with page size.
 - Cost is round trips (~1 ms each in-region, an estimate), not server time.

@@ -25,6 +25,8 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
+**In plain words:** one program asks, the other answers, and then both forget the conversation — that is the whole protocol in one picture.
+
 ```mermaid
 flowchart LR
     client["Client"] -- "GET /orders/42\n(method + path + headers)" --> server["Server"]
@@ -33,7 +35,38 @@ flowchart LR
 
 One request, one response, nothing remembered in between — that last part ("nothing remembered") is the single idea everything else in this note builds on.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your phone and a far-away server need to talk. They were built by different people, so they need shared rules. Those rules are **HTTP**.
+
+The rules are simple. The phone sends a short message: what it wants (`GET /orders`) plus some labelled extra lines called **headers**. The server replies with a 3-digit number saying how it went (the **status code**: 200 = fine, 404 = not found) plus the data.
+
+```mermaid
+flowchart LR
+    P["Your phone"] -- "GET /orders<br/>+ headers" --> S["Server"]
+    S -- "200 OK<br/>+ the order list" --> P
+```
+
+One catch: the server forgets you after every answer. So the server hands your browser a small sticky note (a **cookie**) and the browser shows it back on every visit — that is how "stay logged in" works.
+
+```mermaid
+flowchart LR
+    S2["Server: here, keep this note<br/>(Set-Cookie: session=abc)"] --> B["Browser stores it"]
+    B -- "shows the note every visit<br/>(Cookie: session=abc)" --> S2
+```
+
+That is all of HTTP. The rest of this note is just these 4 questions:
+1. What kinds of asking are there, and which are safe to repeat? (methods)
+2. What do the answer numbers mean? (status codes)
+3. What do the extra labelled lines do? (headers)
+4. How does a forgetful protocol remember you? (cookies)
 
 **The problem in one story.**
 You open a shopping app and tap "My orders".
@@ -77,7 +110,7 @@ Where it breaks: the counter staff forget you the moment you leave; HTTP itself 
 > [!tip] Remember
 > HTTP = ask with a method and path, answer with a status code; nothing is remembered between requests unless a cookie or token carries it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine every website invented its own private way of asking for a page and its own private way of saying "found it" or "not found" — a browser built for one site couldn't talk to any other.
 
@@ -90,7 +123,7 @@ HTTP (originally defined in RFC 1945, now specified across RFC 9110–9114) stan
 > [!tip] Remember
 > HTTP's whole job is to be a vocabulary every client and server already agree on, so nobody has to invent their own.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **In plain words:** a request is a short, structured letter.
 
@@ -131,9 +164,11 @@ flowchart TB
 > [!tip] Remember
 > Every request must be understandable entirely on its own — that's what "stateless" buys the system: any server in a pool can answer any request.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Request and response anatomy
+
+**In plain words:** here is one real conversation, captured as it happened — the lines your side sent and the lines the server sent back, nothing hidden.
 
 A **measured** request/response exchange against a local Go `net/http` server (Go 1.24, `curl` 8.7.1, loopback, 2026-11-06):
 
@@ -312,7 +347,7 @@ This is still head-of-line-blocked at the HTTP/1.1 level: requests on one connec
 > [!tip] Remember
 > Keep-alive saves handshakes, not ordering — one connection still answers one request at a time until HTTP/2.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A Go `net/http` server trace, step by step, for one `PUT` sent twice to the same resource:
 
@@ -325,7 +360,7 @@ A Go `net/http` server trace, step by step, for one `PUT` sent twice to the same
 
 Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Representation style | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -336,13 +371,13 @@ Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cooki
 > [!warning] Interview trap
 > HTTP's methods, status codes and headers are the same across HTTP/1.1, HTTP/2 and HTTP/3 — only the **wire format and connection model** changed. A candidate who says "HTTP/2 added new status codes" has it backwards; see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] for what actually changed.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - HTTP's statelessness is a deliberate simplicity trade: every request must carry its own context (auth token, session cookie), which is overhead compared to a protocol with a persistent session, but it's also why any server in a pool can answer any request.
 - Plain-text headers repeated on every HTTP/1.1 request are wasteful at scale; HTTP/2's HPACK header compression exists specifically to fix this (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]).
 - For truly bidirectional, low-latency, many-small-messages traffic (chat, live updates), request/response HTTP is the wrong shape entirely — see [[Real-time APIs - WebSocket, SSE and Long Polling]].
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every browser, every REST/HTTP API, every CDN and load balancer speaks this vocabulary; API gateways and reverse proxies route and rewrite based on exactly these methods, paths, and headers (see [[Forward and Reverse Proxies - L4 vs L7]]).
 - **Failure modes → fixes:**
@@ -352,7 +387,7 @@ Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cooki
 	- Missing `Secure`/`HttpOnly` on a session cookie → the session token is stealable over plain HTTP or via any XSS on the page.
 - **What to monitor:** status code distribution by class (a rising share of `5xx` is a server health signal; a rising share of `4xx` is often a client or API-contract problem), `304` hit rate on cacheable `GET` endpoints, and `Connection: close` rate (frequent forced connection closes defeat keep-alive's savings).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why 422 exists separately from 400 at all.** RFC 9110 defines 400 generically as "the server cannot or will not process the request due to something perceived as a client error," which technically covers everything from broken JSON to a business-rule violation — 422 (from WebDAV, RFC 4918, widely reused outside WebDAV) gives APIs a way to distinguish "your request is malformed" from "your request is well-formed but fails validation," which matters because client code often reacts differently (a 400 usually means a client bug; a 422 usually means user input needs correcting).
 - **Why safe methods matter beyond "don't delete things."** Safety is what lets infrastructure the request author never thought about — browser prefetchers, crawlers, CDNs, retry logic in HTTP client libraries — treat `GET`/`HEAD`/`OPTIONS` as free to issue speculatively or repeatedly. Breaking that contract (a `GET` with a side effect) causes bugs far from the code that violated it.
@@ -361,7 +396,7 @@ Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cooki
 
   `Transfer-Encoding: chunked` lets the server send the body in pieces of unknown total length up front, each prefixed with its own size, terminated by a zero-length chunk — HTTP/2 and HTTP/3 replace this mechanism with their own binary framing, which doesn't need chunking at all.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between a safe method and an idempotent one?
 > Safe means the method never changes server state at all (so it's always okay to call speculatively or repeatedly) — `GET`, `HEAD`, `OPTIONS`. Idempotent means repeating the call N times has the same effect on state as calling it once, but the call can still change state the first time — `PUT` and `DELETE` are idempotent but not safe.
@@ -392,7 +427,7 @@ Runnable Go version: [[HTTP Fundamentals - Methods, Status Codes, Headers, Cooki
 >
 > `Strict` never sends the cookie cross-site, which is safest but breaks things like clicking a link from an email and landing already logged in; `Lax` (the modern browser default) allows the cookie on top-level navigations (clicking a link) but not on embedded cross-site requests (an image, a form auto-submit), balancing security and usability.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Request = method + path + headers + optional body; response = status code + headers + optional body.
 - Safe = never changes state (`GET`, `HEAD`, `OPTIONS`); idempotent = same effect if repeated (`GET`, `PUT`, `DELETE`, not `POST`, usually not `PATCH`).

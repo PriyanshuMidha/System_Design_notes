@@ -29,7 +29,40 @@ updated: 2026-11-13
 > - Isolation is level-dependent. At the default READ COMMITTED level, "read stock, then write stock" still oversells; use a conditional `UPDATE`, `SELECT … FOR UPDATE` or a constraint.
 > - In Go: `BeginTx`, `defer tx.Rollback()`, `Commit()`, keep the transaction short, and never make HTTP calls inside it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (the worked example) and 5-6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You send money to a friend. The app must do two things: take money out of your account, and put it into theirs.
+
+If the computer dies after step 1 but before step 2, your money just vanished.
+
+```mermaid
+flowchart LR
+    A["Take ₹500 from you"] --> X["crash!"]
+    X -.-> B["₹500 never reaches your friend"]
+```
+
+A **transaction** fixes this. It is a way of telling the database: "these steps are one package — do all of them, or none of them."
+
+```mermaid
+flowchart LR
+    T["One package: take ₹500 + give ₹500"] -- "all ok" --> C["COMMIT: both happened"]
+    T -- "anything fails" --> R["ROLLBACK: neither happened"]
+```
+
+**Commit** means "save the whole package for good". **Rollback** means "throw the whole package away, like it never ran".
+
+That is the core idea. The rest of this note is just four questions:
+1. What exactly do the four ACID letters promise? (sections 1-2)
+2. How does the database keep those promises under the hood? (section 3)
+3. How do you stop two people buying the same last ticket? (section 4)
+4. What goes wrong in real systems, and in interviews? (sections 5-9)
 
 **The problem in one story.**
 You pay for concert tickets: money leaves your account, then the ticket is reserved.
@@ -75,7 +108,7 @@ Where it breaks: two shoppers can both see "1 left" on the shelf at once; a cart
 > [!tip] Remember
 > All or nothing, durable after COMMIT; but "read then write" can still race, so use a conditional `UPDATE`, a row lock or a constraint.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps (the running example in these notes: a multi-tenant invoicing SaaS) receives a payment webhook from its payment provider. Handling it takes four writes:
 
@@ -110,7 +143,7 @@ With a transaction, the four writes become one unit. A crash at any point before
 
 If two customers try to buy the last unit of a product at the same moment, two transactions run side by side. Section 4 shows that a transaction alone does **not** stop both of them from succeeding; you also need the right SQL.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a transaction as a **shopping basket at a checkout**. You put items in one by one (statements), but nothing is yours until you pay (`COMMIT`). If your card is declined or you walk away (`ROLLBACK`, error, crash), every item goes back on the shelf. Nobody ever leaves with half a basket.
 
@@ -125,6 +158,8 @@ flowchart LR
 
 ### The four letters, in plain words
 
+**In plain words:** ACID is just four promises — everything or nothing, your rules still hold, people working at the same time don't trample each other, and once saved it stays saved even if the power goes out.
+
 | Letter | Plain meaning | Who provides it | Mechanism (PostgreSQL 17) |
 | --- | --- | --- | --- |
 | **A**tomicity | All statements take effect, or none do | Database | Each row version is stamped with its transaction ID; if that transaction aborts, its versions are simply never visible, and the commit log (`pg_xact`) records the outcome |
@@ -137,7 +172,7 @@ flowchart LR
 - **C in ACID is not the C in CAP.** ACID consistency means "your invariants hold". CAP consistency means linearizability, a distributed-systems property. Same word, different ideas.
 - **The database cannot know your business rules unless you write them down.** "An invoice's `paid_minor` never exceeds `total_minor`" is only enforced if you add `CHECK (paid_minor <= total_minor)` or always check it in the same transaction.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The lifecycle of one transaction
 
@@ -192,6 +227,8 @@ sequenceDiagram
 
 ### Atomicity: invisible until committed
 
+**In plain words:** PostgreSQL never "un-does" your changes on rollback. It writes new drafts next to the old ones, and simply never shows a draft whose transaction failed — like a notebook where crossed-out pages are just skipped, not torn out.
+
 PostgreSQL writes each new row version as a new tuple in the table (the old version stays until VACUUM) and stamps it with the creating transaction ID (`xmin`). Readers check that ID against the commit log. An aborted transaction's versions are skipped and later cleaned up by VACUUM, so rollback is nearly free.
 
 ```mermaid
@@ -210,6 +247,8 @@ Example numbers: transaction 9001 updates invoice 501 from `paid_minor = 0` to `
 InnoDB works the other way: it writes old values to an **undo log** and copies them back on rollback, so rolling back a large transaction in MySQL does real work and can take a long time.
 
 ### Durability: the write-ahead log
+
+**In plain words:** before saying "saved", the database scribbles the change into a diary on disk. If it crashes, it re-reads the diary and redoes anything that was promised — like writing a receipt before handing over the goods.
 
 The **WAL** (write-ahead log) is an append-only file of change records. The rule is "log first, data pages later": before `COMMIT` returns, PostgreSQL flushes the WAL up to the commit record with `fsync` (a system call that forces data out of the OS cache onto the disk).
 
@@ -236,6 +275,8 @@ Example: the commit record for transaction 9001 is flushed at 10:00:00.001. The 
 
 ### Consistency: constraints inside the transaction
 
+**In plain words:** constraints are rules you write down once ("stock never goes below zero") and the database then refuses any transaction that would break them.
+
 A `CHECK`, `UNIQUE` or foreign-key violation raises an error and the transaction cannot commit. Constraints declared `DEFERRABLE INITIALLY DEFERRED` are checked at `COMMIT` instead of per statement.
 
 | Constraint | Example rule | Violation | SQLSTATE |
@@ -246,9 +287,13 @@ A `CHECK`, `UNIQUE` or foreign-key violation raises an error and the transaction
 
 ### Isolation: snapshots and locks
 
+**In plain words:** every reader gets a frozen photo of the data, and writers queue up on the rows they change — so nobody reads half-finished work.
+
 Each statement (READ COMMITTED) or each transaction (REPEATABLE READ and SERIALIZABLE) reads from a snapshot; writers take row locks. Which anomalies remain possible depends on the level: see [[Isolation Levels and MVCC]] and [[Locking - Optimistic vs Pessimistic]].
 
 ### Autocommit
+
+**In plain words:** if you don't open a transaction yourself, the database wraps each statement in its own tiny one — handy for one write, dangerous when two writes must stick together.
 
 If you send a statement without `BEGIN`, PostgreSQL wraps it in its own one-statement transaction and commits it immediately. This is **autocommit**. It is why a single `UPDATE` is always atomic, and also why two separate statements are **not** atomic together.
 
@@ -274,6 +319,8 @@ sequenceDiagram
 Example: with a pool of 10 connections, three `db.Exec` calls in a row can land on three different connections. The `ROLLBACK` in the diagram does nothing, while connection 1 keeps holding its open transaction and its locks until the pool closes it.
 
 ### Savepoints
+
+**In plain words:** a savepoint is a bookmark inside a transaction — if a later step fails, you can rewind to the bookmark instead of throwing the whole thing away.
 
 A **savepoint** is a named point inside a transaction you can roll back to without abandoning the whole transaction.
 
@@ -304,6 +351,8 @@ In PostgreSQL, rolling back to a savepoint is the only way to recover from an er
 
 ### Retrying: what to do on 40001 and 40P01
 
+**In plain words:** these two error codes mean "nothing was saved, just run the whole thing again" — like redialling a dropped call instead of shouting the last sentence into a dead phone.
+
 Two SQLSTATE codes mean "nothing was saved, try again": `40001` (`serialization_failure`, raised by REPEATABLE READ and SERIALIZABLE) and `40P01` (`deadlock_detected`). The transaction is already aborted, so retrying only the failing statement is useless. The fix is to run the **whole** function again from `BEGIN`, with a small capped backoff.
 
 ```mermaid
@@ -318,7 +367,7 @@ flowchart TD
 
 Example: attempt 1 hits `40001`, waits 10 ms, attempt 2 hits `40001`, waits 20 ms, attempt 3 commits. A business error such as "out of stock" is returned at once, because running it again gives the same answer. The helper that does this is in [[Transactions and ACID - Go]].
 
-## 4. Worked example: the last unit of stock
+## 4. Worked example: the last unit of stock 🟡
 
 The task: InvoiceOps sells add-on products (for example, 100 printed cheque books) with a limited `stock`. Two customers try to buy the **last unit** at the same moment. Exactly one must succeed.
 
@@ -342,6 +391,8 @@ UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock > 0;
 
 ### Why the naive version oversells
 
+**In plain words:** both buyers look at the shelf at the same moment, both see "1 left", and both walk to the till — looking does not reserve anything.
+
 Being inside a transaction does not help here. At **READ COMMITTED** (the PostgreSQL default), each statement sees all data committed before that statement started, and plain `SELECT` takes no lock. Both transactions read `stock = 1` before either commits.
 
 ```mermaid
@@ -362,6 +413,8 @@ sequenceDiagram
 
 ### Why the conditional UPDATE is safe
 
+**In plain words:** putting the check inside the write is like the till itself checking the shelf at the moment of sale — the second buyer is told "sold out" right at the till, not after paying.
+
 The key PostgreSQL behaviour: at READ COMMITTED, when an `UPDATE` waits for another transaction's row lock and that transaction commits, PostgreSQL re-evaluates the `WHERE` clause against the **newly committed** row version before updating it. That re-check is what makes the conditional `UPDATE` safe.
 
 ```mermaid
@@ -381,6 +434,8 @@ sequenceDiagram
 The `CHECK (stock >= 0)` constraint is a second safety net. Even if some code path runs `SET stock = stock - 1` without the condition, the second buyer's update would fail with `23514 check_violation` instead of storing `-1`.
 
 ### Four correct ways to sell the last unit
+
+**In plain words:** there are four honest ways to make sure only one buyer wins; pick by how complicated your rule is.
 
 | Technique | SQL shape | Loser sees | Use when |
 | --- | --- | --- | --- |
@@ -431,7 +486,7 @@ Sending the "payment received" email is **not** inside this transaction. An SMTP
 
 Instead, insert an outbox row in the same transaction and let a worker send the email: see [[Transactional Outbox and CDC]]. Why the dedupe step matters is covered in [[Idempotency and Idempotency Keys]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | What you get | Use when | Cost |
 | --- | --- | --- | --- |
@@ -457,7 +512,7 @@ flowchart TD
 
 Isolation levels are explained in full in [[Isolation Levels and MVCC]]. Cross-database atomicity is covered in [[Two-Phase Commit]] and [[Saga Pattern]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Long transactions are expensive.** A transaction holds its row locks until it ends, keeps one pooled connection busy, and in PostgreSQL keeps an old snapshot alive so VACUUM cannot remove dead row versions anywhere in the database. Keep them to milliseconds.
 - **No network calls inside.** HTTP, gRPC, email or queue publishes inside a transaction stretch lock time to the remote call's latency, and the remote side effect cannot be rolled back. Do them before (and pass the result in) or after (through an outbox).
@@ -480,7 +535,7 @@ flowchart LR
 
 The throughput figures are arithmetic (1 / lock time), not benchmarks: a row locked for 5 ms allows at most about 200 writers per second, a row locked for 3 s allows about one every 3 s.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** PostgreSQL, MySQL InnoDB, SQL Server and Oracle all provide ACID transactions on a single node. MongoDB has supported multi-document transactions since 4.0 (replica sets) and 4.2 (sharded clusters). Distributed SQL databases (CockroachDB, Spanner, YugabyteDB) provide them across nodes; CockroachDB and Spanner default to SERIALIZABLE, while YugabyteDB defaults to snapshot isolation (REPEATABLE READ): see [[Distributed SQL]].
 - **Failure modes and fixes:**
@@ -503,7 +558,7 @@ flowchart TD
     C -- "crashed client, connection still open" --> F2["pg_terminate_backend(pid), then fix timeouts"]
 ```
 
-## Whiteboard version
+## Whiteboard version 🟢
 
 If you have two minutes at a whiteboard, draw this:
 
@@ -515,7 +570,7 @@ C: constraints + your invariants         I: snapshot + row locks, level-dependen
 Oversell fix: UPDATE ... WHERE stock > 0, check rows affected
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Commit latency is an `fsync`.** With the default `synchronous_commit = on`, each commit waits for its WAL flush. On local NVMe with power-loss protection that is typically well under a millisecond; on network-attached cloud volumes it is often around 1–5 ms (estimates; measure your disk with `pg_test_fsync`). PostgreSQL batches concurrent commits into one flush (**group commit**); `commit_delay` can widen that window.
 - **`synchronous_commit = off`.** Commit returns before the flush. A crash can lose the last commits (up to about three times `wal_writer_delay`, which defaults to 200 ms), but cannot corrupt the database. It can be set per transaction: `SET LOCAL synchronous_commit = off` is reasonable for analytics events, never for payments.
@@ -537,7 +592,7 @@ flowchart LR
     A3 -.-> L["crash before the flush: last commits lost, database not corrupted"]
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does each letter of ACID guarantee, and how does PostgreSQL provide it?
 > Atomicity: all or nothing; row versions of an aborted transaction are never visible. Consistency: constraints and your invariants hold after commit; mostly the application's job, enforced with `CHECK`, `UNIQUE` and foreign keys.
@@ -567,7 +622,7 @@ flowchart LR
 > [!question]- What happens in PostgreSQL after one statement in a transaction fails?
 > The transaction enters the aborted state; every further statement returns `25P02` until you `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`). Even `COMMIT` performs a rollback. MySQL InnoDB usually rolls back only the failing statement, which surprises people moving between the two.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Transaction = all-or-nothing unit; `BEGIN`, then `COMMIT` or `ROLLBACK`.
 - A: aborted versions are invisible. C: constraints plus your invariants. I: depends on level. D: WAL `fsync` before commit returns.

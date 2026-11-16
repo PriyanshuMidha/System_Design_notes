@@ -25,7 +25,37 @@ updated: 2026-11-13
 > - **Deadlock** needs four conditions at once (Coffman): mutual exclusion, hold-and-wait, no preemption, circular wait. Break any one and it can't happen.
 > - The **Go memory model**'s happens-before relation is what actually tells you whether a value written by one goroutine is guaranteed visible to another — a mutex, channel or atomic op is what establishes that relation; a plain variable write gives you none.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how each tool works), 4 (worked example) and 5 (comparison).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Modern programs do many things at once. Two of those workers can touch the same piece of data at the same moment — and quietly corrupt it. That bug is called a **race condition**: the answer depends on who happened to run first.
+
+```mermaid
+flowchart LR
+    A["Worker A reads 100,<br/>adds 1, saves 101"] --> X["balance: 101<br/>(one deposit lost!)"]
+    B["Worker B also reads 100,<br/>adds 1, saves 101"] --> X
+```
+
+The fix is always some rule for taking turns. The simplest rule is a **mutex**: a lock on the door, only one worker inside at a time. A **semaphore** is the same idea but lets up to N in. An **atomic** operation skips the door entirely — the CPU promises one tiny step can never be interrupted.
+
+```mermaid
+flowchart LR
+    Q{"Who may touch<br/>the data now?"} --> M["Mutex: exactly one"]
+    Q --> S["Semaphore: up to N"]
+    Q --> AT["Atomic: no waiting,<br/>one unbreakable step"]
+```
+
+That is it. The rest of this note is just these 4 questions:
+1. How exactly does a race corrupt data? (section 1)
+2. How do mutex, semaphore and atomics each work? (sections 2-3)
+3. What new problems do the tools themselves cause — deadlock, the ABA trap? (section 3)
+4. What breaks in production, and what do interviewers ask? (sections 6-9)
 
 **The problem in one story.**
 Two people share one bank account and both open the banking app at the same moment.
@@ -70,7 +100,7 @@ Where it breaks: a bathroom line is fair and visible; real lock waiters may not 
 > [!tip] Remember
 > Shared data plus more than one writer needs a rule for who goes first; mutex, semaphore and atomics are three such rules.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Two goroutines both run `balance++` on a shared `int`. That one line of Go is really three separate CPU steps underneath:
 
@@ -105,7 +135,7 @@ That is because the race detector instruments every memory access and flags any 
 > [!tip] Remember
 > A race condition is not "the program crashed" — it's "the answer depends on timing you don't control." It can look completely correct for months and then silently corrupt data under load.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Each primitive below answers the same question — "who may touch the shared data right now?" — with a different rule. An analogy helps fix each rule in memory before the mechanics.
 
@@ -169,7 +199,7 @@ flowchart LR
 
 **Why it matters:** "A ran first" on your screen, in your terminal's print order, proves nothing about what a *different goroutine* can observe without a happens-before edge. This is exactly what section 8 formalizes.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
 
@@ -196,6 +226,8 @@ sequenceDiagram
 
 ### Mutex vs RWMutex
 
+**In plain words:** reading does not clash with reading — so an RWMutex lets any number of readers in together, and only makes everyone wait when someone wants to write.
+
 `sync.Mutex` excludes everyone, readers included.
 
 `sync.RWMutex` lets any number of readers hold `RLock()` concurrently, but a writer's `Lock()` waits for all current readers to finish and blocks new readers until it's done.
@@ -215,6 +247,8 @@ flowchart TD
 ```
 
 ### Semaphores
+
+**In plain words:** a semaphore is just a counter of free spaces — take one to enter, give it back when you leave, wait at the gate when it hits zero.
 
 A semaphore holds a count. `Acquire` decrements it, blocking if it's already zero; `Release` increments it, waking a waiter if any.
 
@@ -236,6 +270,8 @@ flowchart LR
 
 ### Atomics and compare-and-swap
 
+**In plain words:** the CPU itself offers a few unbreakable one-step moves — and the most useful one, CAS, means "swap in my new value only if nobody changed it since I looked."
+
 An atomic operation is a single CPU instruction (on x86-64, backed by the `LOCK` instruction prefix; on ARM64, by load-linked/store-conditional or the newer LSE atomic instructions) that reads, modifies and writes a word with a hardware guarantee that no other core can observe or interleave a partial step.
 
 `sync/atomic`'s `Add`, `Load` and `Store` cover the simple cases directly.
@@ -253,6 +289,8 @@ flowchart TD
 ```
 
 ### The ABA problem: why CAS is harder than it looks
+
+**In plain words:** CAS only checks "does it still look the same?" — like confirming your parked car is still there by its color. If someone swapped it for an identical car, the check passes, and you drive off in the wrong one.
 
 CAS checks "is the value still what I last read?" — but it compares *values*, not *history*.
 
@@ -290,6 +328,8 @@ The CAS then compares "value *and* version," not value alone — two states with
 
 ### Deadlock
 
+**In plain words:** a deadlock is two workers each holding something the other needs, both waiting forever — like two people in a narrow hallway each refusing to step back.
+
 A deadlock needs all four Coffman conditions simultaneously:
 
 1. **Mutual exclusion** — a resource can only be held by one thread at a time (true of any lock).
@@ -315,7 +355,7 @@ If every transfer locks the lower-numbered account before the higher-numbered on
 > [!tip] Remember
 > Breaking any single Coffman condition prevents deadlock. In practice, breaking circular wait (a fixed lock order) is almost always the cheapest fix, because the other three conditions are usually inherent to what a lock is for.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -344,7 +384,7 @@ No interleaving of the two `c.n++` operations is possible, because the mutex gua
 
 The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the channel-based `Semaphore`, and the deadlock-free `AccountStore` transfer — plus all five tests (including a hammered CAS-loop test, a live-holder-count semaphore test, and a 500-way concurrent-transfer test that would hang on a bad lock order) live in the runnable version: [[Concurrency Primitives - Mutex, Semaphore, Atomics - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Primitive | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -357,7 +397,7 @@ The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the 
 > [!warning] Interview trap
 > "Use atomics everywhere, they're faster" is wrong once more than one field must change together. `atomic.Int64` makes a single counter update indivisible; it says nothing about two fields staying consistent with each other. Multi-field invariants need a mutex (or a single atomic pointer swap to a whole new immutable struct).
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A mutex held across a blocking call (network I/O, another lock, a channel send with no ready receiver) can turn a short critical section into a long one, stalling every other goroutine waiting on it — never do I/O while holding a lock meant to protect in-memory state.
 - `RWMutex` only pays off when reads significantly outnumber writes and the critical section is long enough that read parallelism actually matters; for short, cheap critical sections, a plain `Mutex` can outperform it because `RWMutex` has more internal bookkeeping.
@@ -367,7 +407,7 @@ The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the 
 > [!tip] Remember
 > Pick the weakest tool that's still correct: a single word with simple logic → atomic; bounded concurrency → semaphore; a short critical section → mutex; data ownership passed between goroutines → channel.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Go's own runtime uses atomics extensively for its scheduler's internal counters and the garbage collector's write barriers; `sync.Map` internally mixes atomics and a mutex to make the common read-mostly case lock-free; database connection pools (`database/sql`, `pgxpool`) are counting semaphores bounding how many connections are checked out at once.
 - **Failure modes → fixes:**
@@ -377,7 +417,7 @@ The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the 
 	- CPU pegged at 100% with no progress → a CAS loop livelocking under extreme contention; switch the hot path to a mutex or reduce contention by sharding the counter (one atomic per CPU, summed occasionally).
 - **What to monitor:** `-race` results in CI as a hard gate, not advisory; goroutine count over time (a leak often means goroutines stuck waiting on a lock or channel that will never be released); lock-hold-time histograms if your mutex wrapper supports them; connection-pool wait time as a proxy for semaphore contention.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The Go memory model's happens-before relation**, formalized in `go.dev/ref/mem`, is the actual contract: a goroutine's write `W` is guaranteed visible to a read `R` in another goroutine only if there is a happens-before edge from `W` to `R`.
 	- The language guarantees such an edge for:
@@ -391,7 +431,7 @@ The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the 
 - **Spinlocks vs blocking mutexes**: a spinlock busy-waits (loops on CAS) instead of yielding to the scheduler, which is only a win when the expected wait is shorter than a context switch would cost — the Go runtime itself uses brief spinning before parking a goroutine on a contended `sync.Mutex`, a hybrid of both strategies.
 - **This note covers the general, OS/CS-level concurrency primitives.** Go-specific deeper material — `sync.Once`, `sync.Map`, `sync.Pool`, `errgroup`, and the full Go memory model's formal treatment of data races — lives in [[sync Primitives and Atomics]] and [[Memory Model and Data Races]]; goroutine-to-goroutine communication patterns built on channels live in [[Goroutines and Channels]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly is a race condition, and why doesn't it always reproduce?
 > Two or more threads access the same memory location concurrently, at least one access is a write, and there's no synchronization establishing an order between them. The outcome depends on the scheduler's exact interleaving of instructions, which varies run to run, under load, and across hardware — so the bug can pass thousands of test runs and still be real.
@@ -419,7 +459,7 @@ The full implementation — `AtomicCounter`, the CAS-based `IncIfLessThan`, the 
 > [!question]- What is the ABA problem, and why does a version counter fix it?
 > A CAS only compares the current value against the value you last read; if the value changes away and back to the same value in between, CAS can't tell the difference and swaps anyway, even though the data structure moved underneath you. Pairing the value with a monotonically increasing version (a tagged pointer) fixes it, because two states with the same value but different history now compare unequal.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Race condition = concurrent access to shared memory, at least one write, no ordering between them.
 - Mutex = exclusive; RWMutex = many readers or one writer; semaphore = up to N concurrent holders.

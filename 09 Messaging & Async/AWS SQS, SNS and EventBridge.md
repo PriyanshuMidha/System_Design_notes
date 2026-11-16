@@ -29,7 +29,39 @@ updated: 2026-11-13
 > - None of them gives exactly-once processing end to end. Consumers are idempotent.
 > - For ordered, replayable, high-volume streams use Kinesis or Kafka (MSK) instead.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how each service works), 4 (worked example) and 5-6 (comparison and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Sometimes one program needs to ask another program to do work later. Instead of calling it directly, it leaves a note in a shared place. That shared place on AWS is a **queue** (a waiting line of notes) called SQS.
+
+```mermaid
+flowchart LR
+    A["Checkout API"] -- "drops a note:<br/>'order 42 placed'" --> Q["SQS queue"]
+    Q --> W["Worker picks it up later"]
+```
+
+Sometimes many programs all want a copy of the same note. For that AWS gives you a **topic** (SNS): you post once, everyone subscribed gets a copy.
+
+```mermaid
+flowchart LR
+    A["Post once"] --> T["SNS topic"]
+    T --> B["Email team's copy"]
+    T --> C["Stock team's copy"]
+```
+
+EventBridge is the third service: a sorter that reads each note and routes it by its content, using rules you write. All three may deliver the same note twice, so your code must be safe to run twice (**idempotent**).
+
+The rest of this note is just these four questions:
+1. Which of the three do I pick for which job?
+2. How does a queue make sure a note is not lost and not handled by two workers at once?
+3. What happens to a note that keeps failing?
+4. Why do duplicates happen, and how do I live with them?
 
 **The problem in one story.**
 A shop's website takes an order and must send an email, update stock and alert the warehouse.
@@ -75,7 +107,7 @@ Where it breaks: a real sheet taken from a tray is gone, but an SQS message only
 > [!tip] Remember
 > SQS holds work for one worker, SNS copies to many, EventBridge routes by content; all are at least once, so make consumers idempotent.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An e-commerce backend on AWS wants: (1) a queue for 3 million thumbnail jobs a day from S3 uploads, (2) an `order.placed` event that 5 teams consume, and (3) routing where only orders above ₹50,000 from new customers go to the fraud team.
 
@@ -85,15 +117,17 @@ You pay per request and the services scale on their own.
 
 What you still own: visibility timeouts, retries, DLQs, idempotent consumers, IAM policies and cost. That is what this note is about.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **SQS** is a shared to-do tray. You take a card, it becomes invisible to others for a while; when you finish you shred it; if you do not, it reappears.
 - **SNS** is a photocopier with a mailing list. Every message is copied to each subscriber whose filter matches. It keeps no archive for a subscriber that missed it beyond its retry policy.
 - **EventBridge** is a mailroom sorter. Each letter (event) is read, matched against rules ("from billing, type InvoicePaid, amount > 50000"), and dropped into the right pigeonholes (targets).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### SQS: receive, hide, delete, or redrive
+
+**In plain words:** a worker picks a note from the tray; the note turns invisible for a while so no one else grabs it; if the worker finishes, it shreds the note; if not, the note reappears, and after too many tries it goes to a side tray (the DLQ).
 
 ```mermaid
 sequenceDiagram
@@ -145,6 +179,8 @@ Key behaviours, with their documented limits:
 
 ### SNS → SQS fan-out with filters
 
+**In plain words:** post one message to the topic and every team gets its own copy in its own queue, like a photocopier dropping pages into labeled trays; a filter means "only copy me the ones I care about".
+
 ```mermaid
 flowchart LR
     O[orders service] -->|Publish order.placed, attrs: country=IN, total=72000| T{{SNS topic orders-events}}
@@ -166,6 +202,8 @@ flowchart LR
 - SNS FIFO topics preserve order per message group and deliver to SQS FIFO queues.
 
 ### EventBridge: rules route by content
+
+**In plain words:** EventBridge is a mail room; every event is an envelope with a standard label, and rules say "letters that look like this go to these desks".
 
 ```mermaid
 flowchart LR
@@ -191,9 +229,11 @@ flowchart LR
 - **Scheduler** runs one-time and cron or rate schedules with time zones and flexible windows, invoking targets such as SQS or Lambda ([[Scheduled Jobs - Cron to Durable Schedulers]]).
 - `PutEvents` takes up to 10 entries per call, and the total request size is limited (256 KB historically; check the current EventBridge quota page, as AWS has been raising payload limits). Delivery is at least once and **unordered**.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** this is the whole design on one napkin — publish once, fan out to queues, and each worker loops: take, heartbeat, finish, delete.
 
 ```text
 order.placed  --> SNS topic (or EventBridge bus)
@@ -212,6 +252,8 @@ FIFO: one in-flight message per MessageGroupId; dedup id dropped for 5 min
 ```
 
 ### Configuration
+
+**In plain words:** these JSON blocks are the actual settings you paste into AWS: where failing messages go, how long a message hides, and which messages a subscriber wants.
 
 Queue attributes with a redrive policy, then an SNS filter policy. Keys in a filter policy are ANDed, so this example policy matches only orders from IN or SG **and** with `total >= 50000` (a stricter subscription than the diagram's `fraud-q`, shown to illustrate numeric matching):
 
@@ -269,6 +311,8 @@ $ aws sqs receive-message --queue-url https://sqs.ap-south-1.amazonaws.com/12345
 `ApproximateReceiveCount` is 2: this message was received once before and not deleted.
 
 ### Code 1: a worker against the real SDK interface
+
+**In plain words:** this is a real Go worker: it long-polls the queue, keeps slow messages hidden with a heartbeat, and deletes a message only after the work succeeded.
 
 The worker uses the AWS SDK for Go v2 (`service/sqs` v1.34.8). Its `API` interface is the subset of `*sqs.Client` it calls, so tests use a fake. In `main`, pass `sqs.NewFromConfig(cfg)`.
 
@@ -473,6 +517,8 @@ func TestSlowHandlerSendsHeartbeats(t *testing.T) {
 Run with `go test -race ./sqsworker` (Go 1.24): both tests pass. The first checks that only successful messages are deleted and that the receive call uses long polling (20 s), the batch maximum (10) and the 60 s visibility timeout; the second checks that a slow handler sends heartbeats.
 
 ### Code 2: an in-memory model of the semantics
+
+**In plain words:** this is a toy SQS written in Go so you can see the rules (hiding, redrive, FIFO groups, dedup, fan-out) work on your own laptop, no AWS account needed.
 
 The fake below models what the worker must survive: redrive after `maxReceiveCount`, heartbeats, stale receipt handles, FIFO group blocking and deduplication, and SNS filter fan-out. It is a test double for reasoning and unit tests, not a replacement for integration tests against real AWS or LocalStack.
 
@@ -806,7 +852,7 @@ Run with `go test -race ./sqsfake` (Go 1.24): all 4 tests pass. The FIFO test sh
 
 One simplification: real SQS FIFO can return several messages of the same group in one batch (in order); the model returns one per group per receive, which is stricter but keeps the same ordering guarantee.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Service | Model | Order | Retention | Consumers | Use when | Watch out for |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -821,7 +867,7 @@ One simplification: real SQS FIFO can return several messages of the same group 
 
 **SNS vs EventBridge for fan-out.** SNS has lower latency, higher throughput and simpler semantics; choose it for a high-volume topic owned by one team. EventBridge is better as an organisation-wide bus: richer content filtering, schema discovery, archive and replay, cross-account buses and SaaS integrations.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **No replay in SQS or SNS.** Once deleted, a message is gone. If a consumer bug corrupts data for an hour, you need an EventBridge archive, a Kinesis or Kafka stream, or the source database.
 - **Ordering is narrow.** FIFO orders only within a group; standard queues and EventBridge do not order at all. Design with versions ([[Message Ordering and Partition Keys]]).
@@ -830,7 +876,7 @@ One simplification: real SQS FIFO can return several messages of the same group 
 - **Lock-in.** APIs, IAM and quotas are AWS-specific. Hide them behind a small interface (as the worker does) if portability matters.
 - **Do not use** SNS alone for anything that must not be lost: always back critical subscribers with a queue and a DLQ. Do not use EventBridge for high-rate telemetry streams; use Kinesis or Kafka.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** S3 event notifications → SQS → workers is the standard upload pipeline ([[AWS 07 - S3]]); SNS → SQS fan-out per microservice; EventBridge as the central bus with one custom bus per domain and cross-account rules; EventBridge Scheduler for reminders and cron.
 - **Lambda as consumer:** the SQS event source mapping polls for you. Batch size up to 10,000 for standard queues (10 for FIFO); a batch size above 10 requires a batching window of at least 1 s.
@@ -845,7 +891,7 @@ One simplification: real SQS FIFO can return several messages of the same group 
 	- EventBridge rule matches nothing → pattern typo or wrong `source`; test patterns with `TestEventPattern` and alarm on `FailedInvocations` and zero `MatchedEvents`.
 - **What to monitor (CloudWatch):** `ApproximateNumberOfMessagesVisible`, `ApproximateAgeOfOldestMessage`, `ApproximateNumberOfMessagesNotVisible` (in flight), `NumberOfEmptyReceives` (cost), DLQ visible count > 0 as an alarm; SNS `NumberOfNotificationsFailed`; EventBridge `FailedInvocations`, `ThrottledRules`, `InvocationsSentToDlq`.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why SQS duplicates happen even without crashes.** Standard queues store copies on several servers for durability. On rare occasions a receive hits a server whose copy was not yet deleted, so a message is delivered again. That is why AWS documents standard queues as at-least-once and tells you to design idempotent consumers ([[Idempotency and Idempotency Keys]]).
 
@@ -861,7 +907,7 @@ One simplification: real SQS FIFO can return several messages of the same group 
 
 **Exactly-once claims, precisely.** SQS FIFO deduplicates sends within 5 minutes and orders per group. SNS FIFO does the same for fan-out. Neither makes your side effects exactly-once; an idempotency key or dedupe table in your database does.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How does SQS make sure two workers do not process the same message, and when does that fail?
 > A received message is hidden for the visibility timeout; others cannot receive it. It fails when processing outlasts the timeout (the message reappears and a second worker takes it) and, on standard queues, on rare duplicate deliveries. Fix with a timeout above p99, heartbeats, and idempotent handlers.
@@ -884,7 +930,7 @@ One simplification: real SQS FIFO can return several messages of the same group 
 > [!question]- Kinesis or SQS for clickstream events that three analytics jobs read?
 > Kinesis (or MSK). Several independent readers, per-key ordering and replay need a log. SQS would require one queue per reader via SNS and could not replay.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - SQS: long poll 20 s, batch 10, visibility 30 s default (max 12 h), retention 4 days default (max 14), delay ≤ 15 min, message ≤ 1 MiB.
 - Delete with the latest receipt handle; heartbeat with `ChangeMessageVisibility`.

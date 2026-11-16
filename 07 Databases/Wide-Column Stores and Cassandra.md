@@ -26,7 +26,39 @@ updated: 2026-11-13
 > - Each request picks a consistency level; `R + W > RF` makes a read see the latest acknowledged write.
 > - Classic mistakes: unbounded partitions (bucket by day), and deleting heavily without understanding tombstones (delete markers that must reach every replica before `gc_grace_seconds` ends).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (the worked example) and 5-6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Imagine one database server trying to swallow millions of writes a second. It can't. So Cassandra uses many ordinary servers and splits the data between them.
+
+How does it decide which server gets which row? Every row has a **partition key** — a field like "customer id". Cassandra turns that key into a number and the number picks the servers. Each row is also copied to a few servers, so losing one machine loses nothing.
+
+```mermaid
+flowchart LR
+    R["Row: customer 7's event"] -- "hash the partition key" --> N2["Server B"]
+    N2 --> N3["copy on Server C"]
+    N2 --> N4["copy on Server D"]
+```
+
+The catch: Cassandra only finds rows fast by that key. There are no joins and no "search by anything" — so you build **one table per question** you plan to ask, storing the same data more than once.
+
+```mermaid
+flowchart LR
+    Q["Question you will ask"] --> T["Design a table just for it"]
+    T --> F["Reads become one quick lookup"]
+```
+
+That is the whole trade: huge write volume and no downtime, in exchange for planning your questions up front. The rest of this note is just four questions:
+1. Where exactly does a row live, and how do reads and writes travel? (sections 1-3)
+2. How do you design the tables for a real feature? (section 4)
+3. What are the famous footguns — giant partitions and deleted rows coming back? (sections 4-6)
+4. What do you tune and watch in production and interviews? (sections 7-9)
 
 **The problem in one story.**
 Your app writes millions of audit events a day, from many regions, and must never stop accepting writes.
@@ -71,7 +103,7 @@ Where it breaks: a library lets you search by author too; Cassandra only finds r
 > [!tip] Remember
 > One table per query, partition key picks the nodes, keep partitions bounded, and `R + W > RF` for read-your-writes.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps adds an activity feed: every view, edit, send, payment and reminder becomes an audit event. The estimate for the scenario:
 
@@ -101,7 +133,7 @@ flowchart LR
 
 The arithmetic: 1.7 billion events a day × 300 bytes is about 510 GB a day, and a year of it is the roughly 190 TB quoted above, before replication multiplies it by 3 in each data centre.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a distributed, sorted **map of maps**: `partition key → (clustering key → row)`. Hashing the partition key decides which nodes hold the partition. Inside a partition, rows sit on disk in clustering order, so "the newest 50 events of workspace 7 on 2 November" is one sequential read from one partition.
 
@@ -131,9 +163,11 @@ Terms:
 > [!warning] "Wide-column" is not "column store"
 > Cassandra stores each row's cells together inside a partition: it is row-oriented on disk. Analytics column stores such as ClickHouse store each column separately. See [[Time-Series and Columnar Storage]].
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Placement: tokens and replicas
+
+**In plain words:** the cluster is a circle of servers; each row's key is hashed to a spot on the circle, and that spot plus the next couple of servers hold the copies.
 
 The default partitioner hashes the partition key with Murmur3 into a 64-bit **token**. Each node owns several token ranges (virtual nodes: `num_tokens` is 16 by default since Cassandra 4.0, 256 before), and replicas go to the next nodes clockwise on the ring, as described in [[Consistent Hashing]].
 
@@ -152,6 +186,8 @@ flowchart LR
 Example with numbers: with 6 nodes and `num_tokens` 16, the ring holds 96 token ranges, so each node owns 16 small slices. Adding a seventh node takes a few slices from every existing node instead of splitting one big range in half, so the load moves evenly. (The token value in the diagram is illustrative.)
 
 ### 3.2 Write path
+
+**In plain words:** a write is just appended to a log and dropped into memory — no reading, no checking — which is why Cassandra can swallow writes so fast.
 
 ```mermaid
 flowchart LR
@@ -180,6 +216,8 @@ That is why writes are cheap: a sequential append and a memory insert. The cost 
 Example with numbers: 20,000 events per second, each written to 3 tables with 3 replicas in the local data centre, is 180,000 replica mutations per second. Spread over 30 nodes (an estimate), that is about 6,000 per node, and each one is a commit-log append of about 300 bytes plus a memtable insert, with no disk read.
 
 ### 3.3 Read path
+
+**In plain words:** a read has to gather the pieces of a row from memory and several files, keep the newest piece of each cell, and double-check with other copies — so reads do the work that writes skipped.
 
 Inside a replica, for each SSTable that might hold the partition:
 
@@ -214,6 +252,8 @@ sequenceDiagram
 
 ### 3.4 Tunable consistency
 
+**In plain words:** every single request chooses how many copies must agree before it counts. Ask few copies and you are fast but may read stale data; ask enough so readers and writers always overlap, and you read your own writes.
+
 | Level | Replicas that must answer (RF = 3 in Mumbai and 3 in Frankfurt) | Use |
 | --- | --- | --- |
 | `ONE` / `LOCAL_ONE` | 1 (in any DC / in the local DC) | Fastest; may read stale data |
@@ -247,6 +287,8 @@ Example with numbers: RF = 3 and both sides use 2. The write reached A and B. An
 
 ### 3.5 Repair, hints and tombstones
 
+**In plain words:** a delete is not an erase — it is a sticky note saying "this is gone". If one copy never gets the note before the others throw theirs away, the deleted data comes back from the dead.
+
 - **Hinted handoff:** when a replica is down, the coordinator stores the write as a hint and replays it later, for up to `max_hint_window` (3 hours by default). A node down for longer misses writes until **repair**.
 - **Anti-entropy repair** (`nodetool repair`) compares replicas with Merkle trees per token range and streams the differences. Every table must be fully repaired at least once every `gc_grace_seconds`.
 - **Tombstones:** a delete, or an expired TTL, writes a marker that hides older data. Compaction may drop a tombstone only after `gc_grace_seconds`, which defaults to 864,000 s (10 days).
@@ -264,6 +306,8 @@ stateDiagram-v2
 ```
 
 ### 3.6 Lightweight transactions
+
+**In plain words:** when a write must be "only if nobody else did it first", Cassandra makes the replicas vote on it. It works, but it costs several round trips, so keep it rare.
 
 ```sql
 -- CQL: claim invoice number 1042 for workspace ws-7 exactly once
@@ -293,7 +337,7 @@ sequenceDiagram
 
 Example with numbers: at 1 ms between nodes in one data centre, a plain `LOCAL_QUORUM` write costs about 1 round trip, while a Paxos v1 write costs about 4 (an estimate), which is why LWTs stay off hot paths.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -312,6 +356,8 @@ CREATE TABLE events_by_workspace_day (
 The full version below adds production concerns: one table per query, bounded partitions, and what happens to deleted rows.
 
 ### Designing InvoiceOps audit events query-first
+
+**In plain words:** write down the questions the app will ask, then build one table shaped for each question — even though that means storing the same event three times.
 
 List the queries first, then build one table per query and accept duplicated data:
 
@@ -359,6 +405,8 @@ flowchart TB
 
 ### How deleted rows come back
 
+**In plain words:** three copies, one misses the delete note, the others throw their notes away after 10 days — now the forgetful copy is the only one with the row, so it "wins" and the deleted row returns.
+
 A model of replica reconciliation: last write wins per cell, deletes are tombstones, and compaction purges tombstones after `gc_grace_seconds`. Three replicas A, B and C hold the row `invoice.sent` written at timestamp 1,000. The delete (a tombstone stamped 2,000) reaches A and B while C is down longer than the hint window.
 
 ```mermaid
@@ -387,9 +435,11 @@ The model keeps one cell per key, as if compaction had already merged everything
 
 The model (`Cell`, `Reconcile`, `Replica`, `Compact`, `Read`, `Repair`) and its three tests (`TestDeleteResurrectsWithoutRepair`, `TestRepairWithinGCGraceKeepsDelete`, `TestLastWriteWins`) are in Go. Runnable Go version: [[Wide-Column Stores and Cassandra - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Compaction strategies
+
+**In plain words:** compaction is the background tidying that merges data files. The three flavours are just different tidying schedules: cheap and messy, expensive and neat, or binned by time.
 
 ```mermaid
 flowchart LR
@@ -412,6 +462,8 @@ flowchart LR
 | Unified (UCS, Cassandra 5.0) | One tunable strategy that can behave like tiered or leveled | New clusters on 5.0 | Newer, fewer operators know it |
 
 ### Wide-column and similar systems
+
+**In plain words:** several databases share this "big sorted map spread over servers" shape; they differ mainly in who leads the copies and how strict reads are.
 
 | System | Partitioning | Replication and consistency | Notes |
 | --- | --- | --- | --- |
@@ -439,7 +491,7 @@ flowchart LR
 | Best for | Relational consistency and ad-hoc queries | Very high write volume, multi-region availability, known queries |
 | Avoid for | Massive multi-region append-only write volume | Joins, ad-hoc queries, multi-row transactions |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Not for InvoiceOps' core data.** Recording a payment updates the payment and the invoice's status together, needs constraints, and support staff run ad-hoc queries. That is PostgreSQL's job. Cassandra fits the audit and activity events, notification delivery logs, and click tracking.
 - **Denormalization moves work to writes.** One event becomes three writes, and correcting data means finding every copy. Bugs show up as tables that disagree.
@@ -447,7 +499,7 @@ flowchart LR
 - **Operations are real work:** repairs on a schedule, compaction tuning, tombstone hygiene, JVM heap and GC, and disk headroom for compaction.
 - **A simpler option often wins.** Up to a few TB in one region, a PostgreSQL table partitioned by month (see [[Partitioning and Sharding]]) gives you SQL, transactions and cheap retention.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Discord started on a single MongoDB replica set, moved messages to Cassandra (2017 post), bucketed by channel and time, and in 2022 moved them to ScyllaDB (their 2023 post has the numbers above).
@@ -468,7 +520,7 @@ flowchart LR
 	- Hints pending, and time since the last successful repair compared with `gc_grace_seconds`.
 	- Disk usage and JVM GC pauses.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Last write wins uses timestamps, not arrival order.** Each cell carries a microsecond timestamp set by the client or the coordinator. If a node's clock runs 50 ms behind, its update to a cell that another node wrote less than 50 ms earlier gets the lower timestamp and is silently discarded. Keep clocks synchronised, avoid read-modify-write on a cell, and model updates as new rows (an event log) when order matters.
 - **The commit log is not fsynced on every write by default.** `commitlog_sync: periodic` with a 10 s period acknowledges writes before they reach disk; replication across nodes provides the durability. Switch to `batch` or `group` mode if every acknowledged write must survive a power cut of the whole cluster.
@@ -479,7 +531,7 @@ flowchart LR
 - **Read repair changed in 4.0.** The probabilistic background read repair (`read_repair_chance`) was removed. Reads at a consistency level above `ONE` still repair the replicas they compare, so repair coverage comes from scheduled anti-entropy repair.
 - **Paxos is per partition.** An LWT gives linearizable compare-and-set on one partition only. Cassandra 5.0 still has no general multi-partition ACID transactions.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does Cassandra modelling start from the queries?
 > Reads are only efficient by partition key (plus a clustering range), and there are no joins. So you list the queries first, then create one table per query, partitioned by what the query filters on and clustered by what it sorts on, and accept duplicated data. Writing the same event to three tables is normal.
@@ -507,7 +559,7 @@ flowchart LR
 > [!question]- When would you not use Cassandra?
 > When the workload needs joins, constraints, ad-hoc queries or multi-row transactions, such as InvoiceOps invoices and payments. Also when the data fits comfortably in one PostgreSQL cluster: Cassandra's operational cost only pays off at large write volume or multi-region write availability.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Primary key `((partition key), clustering…)`: the partition key picks the nodes, clustering columns sort rows inside the partition.
 - Model query-first: one table per query, duplicated data, logged batches to keep tables in step.

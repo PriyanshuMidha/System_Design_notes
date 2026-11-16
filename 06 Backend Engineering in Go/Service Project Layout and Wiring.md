@@ -23,7 +23,30 @@ status: reviewed
 > - There is no official or required Go project layout. `golang-standards/project-layout` is a popular community repo, not a Go team document; `go.dev/doc/modules/layout` is the only layout guidance the Go team actually publishes, and it says: keep it as flat as the project allows.
 > - A `util`/`common`/`helpers` package is where unrelated code goes to avoid being organized. It usually means a type or function hasn't found its real feature package yet.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A Go service's folders are not decoration. They exist to answer one question at a glance: who is allowed to import whom.
+
+The flow only ever points one way: handler → service → repository. The web layer may know about business logic; business logic never knows about the web.
+
+```mermaid
+flowchart LR
+    M[cmd/app/main.go - wires everything] --> H[handler] --> S[service] --> R[repository] --> D[(DB)]
+```
+
+`main.go` is the only file that knows every concrete type: it builds the config, the pool, the repositories, the services, the handlers — in that order — and plugs them together. Everything else lives under **internal/** (Go's "no one outside this repo may import this") and is grouped by feature, not by layer names.
+
+The rest of this note is just these 3 questions:
+1. What goes in cmd/, internal/, and the feature folders?
+2. What is the exact construction order in main?
+3. How do interfaces keep the import arrows pointing one way?
 
 **The problem in one story.**
 A new teammate opens your Go service for the first time.
@@ -68,7 +91,7 @@ Where it breaks: a stage manager can improvise mid-show, but Go wiring is fixed 
 > [!tip] Remember
 > Only `main.go` knows every concrete type; every other import arrow points one way: handler → service → repository.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A four-person team builds InvoiceOps for six months without a layout convention.
 
@@ -80,7 +103,7 @@ It's naming the two decisions that actually matter and writing them down once: *
 
 Once those two rules are fixed, "where does `MarkInvoicePaid` go" has exactly one answer: in the `invoice` package, because that's the feature it belongs to, regardless of whether it's "business logic" or "a handler."
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture the service as a one-way street map, not a layer cake. `cmd/api` is the entrance; it's the only building allowed to walk into every other building and introduce them to each other.
 
@@ -88,7 +111,7 @@ Every other building (`internal/invoice`, `internal/httpapi`, `internal/store`) 
 
 `internal/invoice` defines the door shape it needs ("something with `Get` and `Save`"); `internal/store` builds a thing matching that door shape without `invoice` ever being told the full blueprint of `store`. That's dependency inversion by construction, not by a generic rule: the consumer owns the interface.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 flowchart TD
@@ -194,9 +217,11 @@ invoiceops/
 
   When you're tempted to add to `internal/util`, ask which feature the function actually belongs to; a date-parsing helper used only by `invoice` belongs in `invoice`, even if it feels generic.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole folder tree and main's wiring order on one screen.
 
 The shape without the production concerns: one feature package holding its own interface, and `main` wiring a concrete type into it.
 
@@ -480,7 +505,7 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
 
 `cmd/api` has no test files — it is wiring only, exercised indirectly by the package tests above; `go build` is its correctness check.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Layout style | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -490,14 +515,14 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
 | Monorepo, one module per service | Every service is its own Go module in a subdirectory, no shared `internal/` | Independently versioned/deployed services with little shared code | Shared code needs its own published module instead of a free `internal/` import |
 | Single flat package (`main` only) | Everything in `package main`, no `internal/` split at all | A prototype or a script-sized tool, not a service with multiple binaries | No enforced boundaries; every function can call every other function |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A one-file prototype does not need `cmd/`, `internal/`, and three packages — that structure earns its cost once there's more than one binary, or once a package needs an interface to be testable in isolation.
 - Splitting by feature too early, before you know the feature boundaries, can produce packages that constantly import each other; it's fine to start with fewer, larger packages and split later once an import cycle or an oversized file forces the question.
 - `internal/` visibility is enforced by the compiler, which is good for discipline but means genuinely sharing a package across two separate repositories requires actually publishing it (a real module), not just renaming the folder.
 - Manual DI in `main.go` degrades once a service has 30+ dependencies with branching construction logic (different wiring per environment); that's the point to evaluate `wire`, not before.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** this is the layout Ardan Labs' Go service training teaches and the shape most production Go HTTP services converge on; `go.dev/doc/modules/layout` documents the same two conventions (`cmd/`, `internal/`) as the only ones the Go team itself recommends.
 - **Failure modes → fixes:**
@@ -507,7 +532,7 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
   - `go vet` or a linter flags an accidental public symbol inside `internal/` with no callers → it's dead code or should be lowercase (unexported); `internal/`'s compiler-enforced boundary doesn't prevent accidental over-exporting within the module.
 - **What to monitor:** this is a design-time concern more than a runtime one; the closest production signal is build time and the output of `go mod why`/`go list -deps` drifting toward packages importing things they shouldn't — worth a periodic `go vet` and import-graph review, not a dashboard metric.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why structural typing makes this layout possible.** Because Go interfaces are satisfied implicitly, `store.InMemoryInvoices` needs zero knowledge of `invoice.Repo` beyond happening to implement the same method set.
 
@@ -525,7 +550,7 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
   Keeping them as top-level non-Go folders, siblings to `cmd/` and `internal/`, signals that clearly. The contents of `deploy/` and how it's built and shipped are their own topic, out of scope here.
 - **Multiple binaries sharing `internal/` is the main reason `internal/` outlives `pkg/` cargo-culting.** A `pkg/` folder modeled on `golang-standards/project-layout` implies "code other repositories can import," which almost no InvoiceOps-sized service actually has; `internal/` shared across `cmd/api` and `cmd/worker` covers the real requirement (shared code, multiple binaries, same module) without promising a public API nobody asked for.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `cmd/api/main.go` construct the store before the service, and the service before the router?
 > Because each later construction needs the earlier one as an argument: `invoice.NewService` takes a `Repo`, and `httpapi.NewMux` takes the `*invoice.Service`. This is manual dependency injection — plain constructor calls in dependency order, no container or reflection involved.
@@ -549,7 +574,7 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
 >
 > `util`/`common` packages grow because "doesn't belong to any one feature" is treated as a destination instead of a sign to look harder at who actually calls the function.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `cmd/<binary>/main.go`: the only file that knows every concrete type; constructs dependencies in order and wires them together.
 - `internal/` packaged by feature (`invoice`, `payment`), not by generic layer name (`controllers`, `models`).
@@ -560,7 +585,7 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
 - Avoid `util`/`common`: ask which feature a function actually belongs to instead.
 - Start with manual DI in `main.go`; reach for `wire`/`fx` only once that becomes genuinely hard to read.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Backend Request Lifecycle and Layering]], [[Packages, Modules and Dependency Management]]
 - **Next:** [[Configuration and Secrets]], [[HTTP Server Fundamentals (net-http)]]

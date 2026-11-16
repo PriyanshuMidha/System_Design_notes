@@ -22,7 +22,30 @@ updated: 2026-11-13
 > - `DisallowUnknownFields` plus `MaxBytesReader` plus a trailing-data check close the three gaps that let a malformed or malicious body reach business logic.
 > - Validation collects every broken field at once; it never stops at the first error.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+JSON from a client is a stranger's parcel: it can be huge, mis-shaped, or carry fields you never asked for. You never unpack it straight into your real domain objects.
+
+Instead you unpack it into a **DTO** — a plain struct whose only job is to receive the JSON. Then a validate step checks every field and only then builds the trusted command your service runs.
+
+```mermaid
+flowchart LR
+    B[Raw JSON body] --> G[Gates: size cap, unknown fields, one value only] --> D[DTO struct] --> V[Validate] --> C[Trusted command]
+```
+
+The gates matter because Go's JSON decoder is forgiving by default: it ignores unknown fields, matches names loosely, and lets a last duplicate key win — all things you must switch off at the door.
+
+The rest of this note is just these 3 questions:
+1. What does the `readJSON` gate function check, in order?
+2. How do you turn decode errors into one clear 400 message?
+3. Why three different structs (request DTO, domain model, response DTO)?
 
 **The problem in one story.**
 A client sends your server some JSON to create an invoice.
@@ -67,7 +90,7 @@ Where it breaks: a clerk notices scribbles in the margin, but Go's decoder silen
 > [!tip] Remember
 > Decode strictly into a request-only struct, validate every field, then build the domain object yourself.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Take `CreateInvoiceRequest{ClientID, DueDate, Items}` decoded straight into a type that also happens to have a `Status` field, because someone reused the domain `Invoice` struct for both the wire format and the database row.
 
@@ -83,7 +106,7 @@ And `{"status":"draft","status":"paid"}` sets it to `"paid"`, because with dupli
 
 Neither of these is a bug in your code — they are `encoding/json`'s documented, default behavior, and a handler that doesn't know about them will ship surprises.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Decoding is a sequence of gates the request body passes through before any of it is trusted, and each gate can only make the data more restricted, never add information back:
 
@@ -93,7 +116,7 @@ raw bytes → size gate → parse (decode gate) → shape gate (unknown fields, 
 
 A request DTO is the type that exists only between "parsed" and "validated". Once validation succeeds, the DTO's job is done — the rest of the service never sees it again, only the domain command.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The gates, as code
 
@@ -111,6 +134,8 @@ flowchart LR
 ```
 
 ### `readJSON`: the size, decode and shape gates
+
+**In plain words:** one reusable doorman function: not too big, decodes cleanly, no unknown fields, nothing extra after the JSON.
 
 ```go
 const maxRequestBody = 1 << 20 // 1 MiB
@@ -142,6 +167,8 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 
 ### Classifying the error, instead of returning one generic 400
 
+**In plain words:** each way a body can be wrong has its own error type; naming it tells the client exactly what to fix.
+
 ```go
 func classifyDecodeErr(err error) error {
     var maxErr *http.MaxBytesError
@@ -172,6 +199,8 @@ func classifyDecodeErr(err error) error {
 
 ### `encoding/json` gotchas that make the gates necessary
 
+**In plain words:** the decoder's friendly defaults — loose name matching, silent extras — are exactly what an attacker leans on.
+
 | Behavior | What happens without a gate | Documented since |
 |---|---|---|
 | Case-insensitive key matching | `{"STATUS":"paid"}` sets a field tagged `json:"status"` | always (encoding/json) |
@@ -196,6 +225,8 @@ type statusHolder struct{ Status string `json:"status"` }
 Go 1.25 ships an experimental `encoding/json/v2` (behind `GOEXPERIMENT=jsonv2`) that is case-sensitive by default and rejects duplicate object keys outright, closing the first two gotchas at the decoder level instead of needing `DisallowUnknownFields` plus manual case-sensitivity checks. It is not yet the default decoder as of Go 1.24, so `readJSON` above still has to guard against both.
 
 ### DTO vs domain model vs response DTO
+
+**In plain words:** three shapes for three jobs: receive JSON, hold business truth, present JSON back — merging them lets a client write fields they never should.
 
 ```mermaid
 flowchart LR
@@ -255,9 +286,11 @@ The three types look similar today. They diverge the moment the database needs a
 
 The alternative at larger scale is JSON Merge Patch (RFC 7396): the whole body is a partial document and any key present, even with value `null`, means "set this field to null".
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the gate function plus one DTO with its Validate, end to end.
 
 The bare idea, no classification, no size limit — this is *not* what should ship, but it is the shape every real `readJSON` builds on:
 
@@ -415,7 +448,7 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
 
 **Measured (Go 1.24.4, `go test -race`, 2026-11-07):** all 6 tests shown above pass, including the three gotcha tests run against the real `encoding/json` package (not a mock); `go vet ./...` reports no issues.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 |---|---|---|---|
@@ -424,14 +457,14 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
 | Hand-written + a thin tag layer | hand code for cross-field/business rules, tags for simple per-field checks | teams that want tag convenience without losing custom rule clarity | two validation styles to keep consistent |
 | `json/v2` strict mode (Go 1.25, experimental) | case-sensitive keys, duplicate-key rejection built into the decoder | once stable: removes the need for manual case/duplicate gotcha handling | experimental; not the default decoder yet |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `DisallowUnknownFields` breaks forward compatibility in one direction: an older client (or an API gateway) that adds a field the server doesn't know about yet gets a `400` instead of the field being ignored. For a public API with independently-versioned clients, weigh that against the mass-assignment risk it closes.
 - Collecting every validation error costs a little more code than "return on the first error", but for any form a human fills in, round-tripping error-by-error is worse UX than seeing every problem in one response.
 - A tiny internal service with one trusted caller (another of your own services, not a browser) can skip the size gate and strict JSON rules if both ends are versioned together — the risk `DisallowUnknownFields` and `MaxBytesReader` guard against mostly comes from untrusted or independently-deployed clients.
 - Hand-written `Validate()` doesn't scale well past a few dozen fields across many DTOs; at that point the boilerplate `go-playground/validator` removes starts to outweigh the tag-syntax awkwardness.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Stripe's and GitHub's APIs reject unknown fields on write endpoints and return field-level error arrays, the same shape this note's `ValidationErrors` produces. The "DTO separate from domain model separate from response shape" split is the standard shape of any Go service built with a hexagonal/ports-and-adapters layering.
 - **Failure modes → fixes:**
@@ -441,14 +474,14 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
   - Fuzzing turns up a panic in a hand-written `Validate()` that indexes into `req.Items[0]` without checking length → always check `len(...)` before indexing a client-supplied slice.
 - **What to monitor:** rate of `400`s by classified reason (unknown field vs syntax vs type vs trailing data) — a spike after a client deploy usually means a new client version sends a field the server hasn't added yet; rate of `422`s by field, which doubles as a product signal for which input is hardest for users to get right.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the trailing-data check matters even though `Decode` "succeeded".** `json.Decoder.Decode` reads exactly one JSON value and stops; it does not consider leftover bytes an error by itself. A body like `{"client_id":"c_1"}{"client_id":"c_2"}` decodes the first object successfully and silently ignores the second — a smuggled second value an unaware reverse proxy or logging pipeline might still see and act on. The second `Decode(&struct{}{})` call forces the decoder to look again; getting `io.EOF` is the only way to confirm nothing is left.
 - **Fuzzing the decoder.** `go test -fuzz=FuzzReadJSON` with a seed corpus of valid and edge-case bodies (empty object, deeply nested arrays, very large numbers, invalid UTF-8) finds panics a handwritten test suite won't think to write; `DisallowUnknownFields` combined with deeply nested unknown objects is a classic case worth fuzzing specifically.
 - **Why money is `int64` minor units, never `float64`.** IEEE 754 double precision cannot represent most decimal fractions (including `0.10`) exactly; summing enough float-encoded cents produces off-by-one-cent totals that show up as real accounting discrepancies. `int64` cents (or `int64` plus a currency code) has no such rounding step.
 - **`omitempty` vs `omitzero` (Go 1.24).** `omitempty` on a `time.Time` or a struct never omits it, because a zero-value struct still isn't considered "empty" by the tag's old definition (it only recognizes empty strings, 0, nil, and empty collections/maps). Go 1.24's `omitzero` omits a field whenever it equals its type's zero value, covering structs like `time.Time{}` that `omitempty` could not.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `DisallowUnknownFields` matter even when every field the client might send maliciously already has a Go field, just one the DTO doesn't declare?
 > Because that's exactly the mass-assignment case: the DTO's job is to declare the *allowed* input surface. A domain field like `Status` that exists on some other struct the client doesn't know about is irrelevant — what matters is whether the *decode target* declares the field. If it doesn't, `DisallowUnknownFields` turns the client's attempt into a `400` instead of a silently ignored (or worse, silently applied) write.
@@ -468,7 +501,7 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
 > [!question]- Why is `encoding/json`'s case-insensitive key matching "by design" rather than a bug, and what's the practical risk?
 > It exists so that `json:"Name"` on a Go-convention PascalCase-tagged field still matches a lowerCamelCase or UPPERCASE wire key from a client that doesn't share Go's naming convention. The practical risk is that it is too forgiving for security-sensitive fields: a filter that checks `req.Status == ""` to decide "the client didn't ask to set a reserved field" can be bypassed by a client sending `"STATUS"` instead of `"status"` if the field was ever reachable by the decoder — another reason the DTO should never declare reserved fields at all.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `readJSON` = `MaxBytesReader` + `DisallowUnknownFields` + a second `Decode` checked for `io.EOF` (rejects oversized, unknown-field, and trailing-data bodies).
 - `encoding/json` defaults: case-insensitive keys, last-duplicate-wins, unknown fields silently dropped, numbers into `any` become `float64` unless `UseNumber()`.
@@ -479,7 +512,7 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
 - Money is `int64` minor units plus a currency code, never `float64`.
 - `omitzero` (Go 1.24) omits any zero-value field, including structs like `time.Time{}` that `omitempty` could not.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Building REST Endpoints]]
 - **Next:** [[Middleware]]

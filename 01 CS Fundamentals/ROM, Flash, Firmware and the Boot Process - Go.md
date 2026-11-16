@@ -18,7 +18,14 @@ updated: 2026-11-13
 >
 > It doesn't touch real hardware; it proves the *ordering and halt-on-failure* property that makes a physical boot diagnosable.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[ROM, Flash, Firmware and the Boot Process]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[ROM, Flash, Firmware and the Boot Process]]. It is a small Go model of a boot chain — stages that verify and hand off to the next, like firmware to bootloader to OS. The code is a simulation to make the ideas concrete, not real firmware. Read each step with its notes.
+
+## Before the code 🟢
 
 - **Structs** (`Stage`, `Result`): a named bundle of fields, like one row of a boot log.
 - **Function values** (`Run func() error`): a function stored in a field, so each boot stage carries its own "do the work" step.
@@ -27,7 +34,7 @@ updated: 2026-11-13
 - **Table-style tests** (`testing`, `reflect.DeepEqual`): tests build stages, run `Sequence`, and compare the result to what they expect.
 - **What to run:** `go vet ./boot/... && go test -race ./boot/...` inside the module. No goroutines, interfaces or generics are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept it demonstrates |
 |---|---|
@@ -35,7 +42,7 @@ updated: 2026-11-13
 | `Sequence` | The hand-off rule: a stage's success moves to the next; a failure halts everything downstream, matching the state diagram in [[ROM, Flash, Firmware and the Boot Process#4 Worked example\|the worked example]] |
 | `Result` | What a real firmware log or POST-code readout tells an operator: how far the machine got, and where it stopped |
 
-## Setup
+## Setup 🟢
 
 ```text
 module cs1scratch
@@ -51,7 +58,7 @@ go vet ./boot/...
 go test -race ./boot/...
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the `Stage` type
 
@@ -121,7 +128,7 @@ func Sequence(stages []Stage) Result {
 3. `fmt.Errorf("... %w", err)` wraps the underlying error so a caller can still `errors.Is`/`errors.Unwrap` down to the original cause, the same way a POST failure code still identifies the specific subsystem that failed.
 4. On success, the loop falls through to `return r` with `FailedAt` and `Err` left at their zero values — an explicit "all clear," not an absence of information.
 
-## Tests
+## Tests 🟡
 
 ### `TestSequenceAllStagesSucceed`
 
@@ -207,13 +214,13 @@ $ go test -race ./boot/...
 ok  	cs1scratch/boot	0.311s
 ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Forgetting `return r` after a failure.** If the early return were dropped, the loop would keep calling later stages' `Run` even after one failed — silently turning "halt on failure" into "best effort," which is exactly the bug `TestSequenceStopsAtFirstFailure` exists to catch.
 - **Losing stage order.** `Completed` is a slice specifically so order is preserved; swapping it for a `map[string]bool` would make "which stage failed first" unanswerable from the result alone.
 - **Swallowing the underlying error.** Wrapping with `%w` (not `%v`) keeps the original error inspectable via `errors.Unwrap`/`errors.Is`; using `%v` would flatten it to a string and lose that.
 
-## Exercises
+## Exercises 🔴
 
 1. Add a `Retries int` field to `Stage` so a stage is re-run up to `Retries` times before the whole sequence halts (mirroring a recoverable POST warning). Predict which existing test still passes unchanged.
 2. Change `Sequence` to continue past a failure, collecting every error that occurred, and work out why this would misrepresent a real boot (hint: what should "failed at bootloader" even mean, if the bootloader ran after POST failed?).

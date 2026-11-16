@@ -19,7 +19,14 @@ type: implementation
 > [!summary] TL;DR
 > This code implements the subnet arithmetic from [[IP Addressing, Subnets, NAT and VPC Basics]]: counting usable hosts in a prefix, finding a block's network/broadcast bounds, splitting a parent block into equal child subnets (the VPC `/16 → /20` example), and checking RFC 1918 membership.
 
-## Before the code
+## Before the code 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the "From zero" paragraph below, "Before the code" and "What this code shows", then just skim the code comments.
+> - 🟡 **Know the basics?** Read each Code section's Concept + How it works, then the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢 — This file is the runnable version of the IP addressing theory note. It is one small Go package that does subnet math: how many devices fit in a block, where a block starts and ends, how to split a big block into smaller ones (the AWS VPC example), and whether an address is private. Read the theory note first; here, read each "Concept" line, then the code, then "How it works".
 
 - **`net` package:** `net.ParseCIDR` parses `"10.0.0.0/16"` into an address and a `*net.IPNet` (address + mask).
 - **`net.IP`:** a byte slice holding an address; `To4()` gives its 4-byte IPv4 form.
@@ -28,7 +35,7 @@ type: implementation
 - **Table-driven tests:** tests loop over a `map` of input to expected output and report each mismatch with `t.Errorf`.
 - **What to run:** `go vet ./... && go test -race ./...` in the module folder.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept | Theory section |
 | --- | --- | --- |
@@ -56,7 +63,7 @@ flowchart TB
 
 `UsableHosts` and `IsPrivate` are self-contained; `Bounds` and `Subnets` both lean on the same pair of integer-conversion helpers, which is why those two are grouped together in the walkthrough below.
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `cidr`, with `cidr.go` and `cidr_test.go` in one directory.
 - **Go version:** 1.24.
@@ -69,9 +76,11 @@ go vet ./...
 go test -race -v ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Counting usable hosts
+
+**In plain words:** given a block size like `/24`, how many devices can actually get an address? (A couple of addresses are always reserved.)
 
 **Concept.** The theory note's prefix-math table says a `/24` has 254 usable hosts, a `/31` has 2 (not 0), and a `/32` has exactly 1 — the RFC 3021 special cases.
 
@@ -118,6 +127,8 @@ func UsableHosts(ones int) (int, error) {
 
 ### Finding a block's network and broadcast address
 
+**In plain words:** given any address in a block, find the block's first and last address, like finding where a street starts and ends from one house number.
+
 **Concept.** Given any address inside a CIDR block, `Bounds` finds the block's first address (network) and last address (broadcast) — the same two addresses `UsableHosts` subtracts out, made concrete.
 
 The alternative of doing this bit-by-bit on a raw byte slice (rather than going through `net.ParseCIDR`) was rejected because the standard library's `net.IPNet` already carries the parsed mask, and reusing it avoids re-implementing CIDR parsing from scratch.
@@ -157,6 +168,8 @@ func Bounds(cidr string) (network, broadcast net.IP, err error) {
 4. `byteIdx := 3 - i/8` walks from the last byte backward as `i` grows, since IPv4 addresses are stored most-significant-byte-first but host bits are the *least* significant ones.
 
 ### Splitting a block into equal subnets
+
+**In plain words:** cut one big address block into equal smaller blocks, the way you'd cut a cake into even slices.
 
 **Concept.** This is the function behind the theory note's `/16 → /20` VPC worked example: given a parent CIDR block and a longer (more specific) prefix, it returns every equal-sized child subnet, in address order.
 
@@ -218,6 +231,8 @@ func fromUint32(v uint32) net.IP {
 
 ### Checking RFC 1918 membership
 
+**In plain words:** answer one yes/no question: is this address one of the special "private, internal only" addresses?
+
 **Concept.** `IsPrivate` answers the question the theory note's private-ranges table poses: does this address fall inside one of the three reserved RFC 1918 blocks?
 
 It is deliberately a membership check against exactly three hardcoded CIDR blocks, rather than a general "is this address globally routable" classifier, because those are the only ranges the theory note's table claims to cover.
@@ -251,7 +266,7 @@ func IsPrivate(ipStr string) (bool, error) {
 2. The three string literals are exactly the three rows of the theory note's private-ranges table — there is nothing dynamic here on purpose, since the whole point is checking against a fixed, well-known set.
 3. `n.Contains(ip)` does the actual bitwise range check: it masks `ip` with the block's prefix and compares it to the block's network address.
 
-## Tests
+## Tests 🟡
 
 ### TestUsableHosts
 
@@ -388,7 +403,7 @@ PASS
 ok  	net02	1.530s
 ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative considered | Trade-off |
 | --- | --- | --- |
@@ -398,7 +413,7 @@ ok  	net02	1.530s
 | `IsPrivate` checks exactly 3 hardcoded RFC 1918 blocks | A general "is this globally routable" classifier | Matches exactly what the theory note's table claims; avoids testing claims not made in the note |
 | Return a materialized `[]string` from `Subnets` | Return an iterator/channel | VPC-scale subnet counts are small; a slice is simpler to test and consume |
 
-## Running it
+## Running it 🟢
 
 ```bash
 $ go test -race -v ./...
@@ -416,19 +431,19 @@ ok  	net02	1.530s
 
 Reading it: each `RUN`/`PASS` pair is one top-level test function; the overall `PASS` and `ok` line confirm every assertion across all four tests held, and the race detector (`-race`) found nothing to report — expected, since this package does no concurrent work at all; it is pure arithmetic on values passed by argument.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`Bounds` and `Subnets` both call `.To4()` and treat a `nil` result as an error** — forgetting this check anywhere that accepts a `net.IP` would silently panic or misbehave on an IPv6 address, since none of the bit arithmetic here is written to handle 16-byte addresses.
 - **`UsableHosts` must special-case `/31` and `/32` *before* the general formula**, not after: the general formula's `total - 2` would return `-1` for a `/32` (block size 1) if the special cases were missing, which is a classic reserved-address off-by-one.
 - **`toUint32`/`fromUint32` assume a 4-byte big-endian `net.IP`** — passing a `net.IP` that hasn't been normalized with `.To4()` first (which can be either 4 or 16 bytes depending on how it was constructed) would read the wrong bytes.
 
-## Exercises
+## Exercises 🔴
 
 1. Add an `IsPrivate` case for `127.0.0.1` (loopback). Predict whether the current three-block check classifies it as private, and explain why RFC 1918 and loopback are different reservations even though both are "never publicly routable."
 2. Change `Subnets("10.0.0.0/16", 20)` to request `newPrefix: 15` (shorter than the parent's `/16`) instead. Predict what the function returns, and check it against the explicit error the code already raises for this case.
 3. Add a function `Supernet(childCIDR string) (string, error)` that computes the `/N-1` block a given child subnet belongs to — the inverse operation of `Subnets`. Predict which existing helper function (`toUint32`, `fromUint32`, or neither) you'll reuse, before writing it.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[IP Addressing, Subnets, NAT and VPC Basics]]
 - **Related code:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP - Go]] (the 5-tuple demo this note's addresses eventually get carried inside)

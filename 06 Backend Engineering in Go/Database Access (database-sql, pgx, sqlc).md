@@ -24,7 +24,34 @@ status: reviewed
 > - `pgx` talks Postgres's wire protocol directly and is faster and more feature-complete than `database/sql` + a generic driver; `sqlc` removes hand-written `Scan` calls on top of either.
 > - N+1 queries are a Go-side problem: loop-and-query where one batched query would do.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your Go service needs to talk to a database. Opening a fresh connection for every request would be slow, like dialing a phone number from scratch for every sentence.
+
+So Go gives you a **pool**: a box of already-open connections. Each query borrows one, uses it, and puts it back.
+
+```mermaid
+flowchart LR
+    H[Handler] --> P[(Connection pool)]
+    P -->|borrow one| Q[Run query]
+    Q -->|return it| P
+    P --- D[(Postgres)]
+```
+
+`database/sql` is the standard pool that works with any database. **pgx** is a faster Postgres-only alternative. **sqlc** reads your SQL files and writes the boring Go wrapper code for you.
+
+The rest of this note is just these 4 questions:
+1. How do you open and size the pool?
+2. How does borrowing and returning a connection actually work?
+3. How do you handle NULLs, timeouts and the classic N+1 mistake?
+4. When do you pick pgx or sqlc over plain database/sql?
 
 **The problem in one story.**
 Your API saves invoices in Postgres.
@@ -70,7 +97,7 @@ Where it breaks: a library book does not time out by itself, but a query can be 
 > [!tip] Remember
 > `sql.DB` is a pool: size it, close every `rows`, check `rows.Err()`, and batch instead of looping queries.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps needs to read and write Postgres from Go: look up an invoice, list unpaid ones, mark one as paid. Go has no built-in ORM and no single blessed driver.
 
@@ -80,7 +107,7 @@ What `database/sql` does **not** do is manage a single connection per call. A na
 
 Get the pool sizing wrong and the symptoms show up far from the code that caused them: requests blocked in `db.Stats().WaitDuration`, or `FATAL: too many connections` while every Go profiler says the app is idle.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of `*sql.DB` as a **pool manager**, not a cable to the database. Every query or exec:
 
@@ -95,9 +122,11 @@ Nothing hands you a numbered connection to hold onto across calls — unless you
 - `pgx` replaces the *driver and the pool* with a Postgres-specific implementation (`pgxpool`) that skips the generic `database/sql` abstraction layer.
 - `sqlc` replaces the *calling code*: you write SQL, it generates a Go method with the right argument and return types, so you never hand-write a `Scan(&a, &b, &c)` list that silently drifts from the `SELECT` column list.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Opening the pool
+
+**In plain words:** 'opening' the database does not connect to anything yet — it just sets up the box of connections; the first real query connects.
 
 ```mermaid
 sequenceDiagram
@@ -143,6 +172,8 @@ The handler never sees "connection #7". It sees a `*sql.Row`, and the underlying
 
 ### Pool sizing knobs
 
+**In plain words:** three dials decide how many connections exist, how many may sit idle, and how old one may get before it is thrown away.
+
 | Knob | Go default | What it controls |
 | --- | --- | --- |
 | `SetMaxOpenConns(n)` | `0` (unlimited) | Hard cap on open connections, idle + in-use. Leaving this at the default lets a traffic spike open as many connections as Postgres allows, then fail with `too many connections`. |
@@ -176,6 +207,8 @@ Without a deadline, a slow query — a missing index, a lock wait — blocks tha
 
 ### pgx vs database/sql vs sqlc
 
+**In plain words:** three tools, one choice: the generic standard, the faster Postgres specialist, and the code generator that sits on top of either.
+
 ```mermaid
 flowchart TD
     Q[Need to run SQL against Postgres from Go] --> A{Multiple DB engines,<br/>or Postgres only?}
@@ -191,6 +224,8 @@ flowchart TD
 - **`sqlc`** reads your schema and `.sql` query files and generates a Go function per query, with request and response structs whose field types already match the columns. You write SQL once; `sqlc generate` keeps the Go side honest when a column is added, renamed, or its type changes — a renamed column becomes a compile error in the generated code, not a silent `Scan` mismatch at runtime.
 
 ### N+1 queries
+
+**In plain words:** the classic slowdown — one query for a list, then one more query per item in the list; fix it by asking for everything in one query.
 
 ```mermaid
 flowchart LR
@@ -210,9 +245,11 @@ When the loop was actually fetching a related table per row, a `JOIN` that pulls
 
 See [[N+1 Query Problem]] for the general pattern and its detection.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest wired repository: open the pool, size it, run one query.
 
 The bare shape: open, ping, query one row, check the right error.
 
@@ -426,7 +463,7 @@ WHERE id = $1 AND workspace_id = $2;
 
 `sqlc generate` turns that into a `Queries.GetInvoice(ctx, GetInvoiceParams{...}) (Invoice, error)` with a generated `Invoice` struct whose field types already match the table's column types — no hand-maintained `Scan` list, and a column rename breaks the build instead of breaking at runtime.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 The table below is drawn from each project's own documentation, not from running all five against one live Postgres instance side by side.
 
@@ -438,14 +475,14 @@ The table below is drawn from each project's own documentation, not from running
 | `sqlx` | Thin reflection-based helpers (`StructScan`) over `database/sql` | You want less `Scan` boilerplate without a codegen step | Reflection cost; struct tags can drift from columns silently |
 | GORM / ent | Full ORM: migrations, associations, query builder | Rapid CRUD prototyping, or a team that wants an ORM's conventions | GORM: hidden N+1s from its lazy-loaded associations. ent: no lazy loading (a forgotten `.With<Edge>()` returns a zero value instead of a query), but still generates SQL that's hard to predict and tune |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `pgx` native gives up database portability; if you genuinely expect to support MySQL or SQLite later, `database/sql` + a driver is the safer default even though it is slower.
 - `sqlc` needs real `.sql` files it can parse against your schema at generate time — it is a poor fit for SQL assembled dynamically at runtime (dynamic `WHERE` clause builders, for example).
 - `lib/pq` is in maintenance mode (no new features, security fixes only); do not choose it for new Postgres code — use `pgx/v5/stdlib` instead.
 - A single, rarely-changing query set and a small team sometimes do better with raw `database/sql` and no codegen at all: one more build step is a real cost if the project is small.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** pgx is used directly by CockroachDB's own tooling and widely in the Go Postgres ecosystem; sqlc is used by companies including Zapier and Sourcegraph for typed query layers; connection poolers like PgBouncer sit in front of either in transaction-pooling mode at scale.
 - **Failure modes → fixes:**
@@ -457,7 +494,7 @@ The table below is drawn from each project's own documentation, not from running
 - **PgBouncer transaction-mode caveat** (from PgBouncer's and pgx's own documentation — not exercised against a live PgBouncer in this environment): in transaction pooling mode, a session-level feature — prepared statements across requests, advisory locks held outside a transaction, `SET` statements meant to persist — breaks, because each statement can land on a different physical Postgres connection. Disable protocol-level prepared statement caching in the driver when using PgBouncer in this mode (pgx: set `QueryExecMode` to `QueryExecModeSimpleProtocol`, or set `StatementCacheCapacity: 0` on the pool config).
 - **What to monitor:** `db.Stats()` (`OpenConnections`, `InUse`, `Idle`, `WaitCount`, `WaitDuration`), Postgres's own `pg_stat_activity` connection count, query latency (p50/p99) per repository method, and the ratio of `WaitCount` to total queries as an early warning the pool is undersized.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `MaxIdleConns` defaults to 2.** As of Go 1.24's `database/sql` source, the unexported constant `defaultMaxIdleConns = 2` is what `maxIdleConnsLocked` falls back to when `SetMaxIdleConns` has never been called. With `MaxOpenConns` higher than that, a burst of concurrent requests opens new connections past 2, then closes most of them back down to 2 idle as soon as load drops — paying a fresh TCP + auth handshake on the next burst. Setting `MaxIdleConns` equal to `MaxOpenConns` avoids that churn at the cost of holding more idle connections open against the server.
 - **Why `Scan` is where errors surface.** `QueryRowContext` always returns a non-nil `*sql.Row`; it defers both the query execution and any resulting error (including `sql.ErrNoRows`) until `Scan` is called. This lets the call be chained (`db.QueryRowContext(...).Scan(...)`) but means skipping `Scan` — easy to do in a test stub or a copy-pasted example — silently discards every possible error.
@@ -465,7 +502,7 @@ The table below is drawn from each project's own documentation, not from running
 - **`CopyFrom` versus batched `INSERT`.** pgx's `CopyFrom` uses Postgres's binary `COPY` protocol and is dramatically faster than even a multi-row `INSERT ... VALUES (...), (...), ...` for bulk loads (tens of thousands of rows), because it avoids per-row SQL parsing entirely. It has no equivalent in plain `database/sql`.
 - **`sql.Null[T]` versus a pointer.** Go 1.22 added the generic `sql.Null[T]` (`Null[time.Time]`, `Null[int64]`, ...) as an alternative to `sql.NullTime`/`sql.NullInt64`/etc. and to `*T` fields. A pointer field also represents "nullable," but forces a heap allocation per nullable value and gives no compile-time guarantee the zero value means "absent" rather than "zero." `sql.Null[T]{V: zero, Valid: false}` is explicit either way.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is `*sql.DB` a single database connection?
 > No. It represents a pool of connections managed by the driver and the standard library together. A single call like `QueryRowContext` borrows one pooled connection for the duration of that call and returns it afterward; only starting a transaction pins one connection for longer.
@@ -488,7 +525,7 @@ The table below is drawn from each project's own documentation, not from running
 > [!question]- Trap: your service reads an invoice and then, in a loop, queries each of its 50 line items one at a time. What's wrong, and what's the fix?
 > That is the N+1 pattern: 1 query for the invoice plus 50 more, one per line item, instead of 2 total. The fix is to collect the line-item IDs first and issue one batched query — `WHERE id = ANY($1)` with pgx (passing the ID slice directly) or a dynamic `IN (...)` list with `database/sql` — turning 51 round trips into 2.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `sql.Open` never connects; call `PingContext` once at startup to fail fast.
 - `*sql.DB` is a pool: size `MaxOpenConns` against the server's `max_connections` ÷ replica count; set `MaxIdleConns` equal to it to avoid churn (default is 2).
@@ -500,7 +537,7 @@ The table below is drawn from each project's own documentation, not from running
 - `sqlc` trades a codegen step for compile-time safety on query shape; reach for native `pgx` when you need `CopyFrom`, batching, or rich Postgres types and don't need portability.
 - N+1 is fixed by collecting keys and batching the query, not by adding a cache on top of the loop.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Syntax, Types and Control Flow]], [[Error Handling]], [[Context Package]]
 - **Next:** [[Transactions and the Repository Pattern]], [[Testing Go Services]]

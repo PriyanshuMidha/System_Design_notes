@@ -28,7 +28,38 @@ updated: 2026-11-13
 > - Every `INSERT` updates every index on the table, so each extra index costs write speed, disk and memory.
 > - PostgreSQL indexes point to a row's physical location; InnoDB secondary indexes store the primary key, so a lookup walks two trees.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A database table is like a huge unsorted pile of records. To find one record, the database normally reads the whole pile.
+
+```mermaid
+flowchart LR
+    Q["Find invoice for workspace 7"] --> T["Read ALL 10 million rows<br/>one by one"]
+    T --> A["Found it... after seconds"]
+```
+
+An **index** fixes this. It is a separate, sorted list of one column's values, each with a pointer to its row. Sorted means the database can jump straight to the right spot, like flipping to "S" in a dictionary.
+
+```mermaid
+flowchart LR
+    Q["Find invoice for workspace 7"] --> I["Jump through a short sorted tree<br/>(3-4 small reads)"]
+    I --> A["Found it in under a millisecond"]
+```
+
+The sorted list is stored as a **B-tree**: a short, very wide tree where even 100 million rows are only 3 or 4 hops deep. The catch: every time you add a row, every index must be updated too, so each index makes writes a bit slower.
+
+The rest of this note is just these 4 questions:
+1. Why is reading the whole table so slow? (section 1)
+2. How does the sorted tree actually work? (section 3)
+3. How do I pick which columns to index, and in what order? (section 4)
+4. When does an index NOT help? (section 6)
 
 **The problem in one story.**
 A table holds 10 million invoices and you want the ones for workspace 7.
@@ -73,7 +104,7 @@ Where it breaks: a book index never changes, but a database index must be update
 > [!tip] Remember
 > An index is a sorted copy of some columns in a short tree, so a lookup reads a few pages instead of the whole table.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps (the running example in these notes: a multi-tenant invoicing SaaS) has an `invoices` table with 10 million rows across 20,000 workspaces. The invoice list page runs:
 
@@ -93,7 +124,7 @@ With an index on `(workspace_id, status, due_date)`, PostgreSQL walks 3 or 4 ind
 
 The same applies to lookups everywhere: login by email, an invoice by its number, a webhook by its provider event ID.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An index is the **index at the back of a textbook**. Topics are listed alphabetically with page numbers. To find "B-tree", you do not read the whole book; you jump to "B" in the sorted list and follow the page number.
 
@@ -108,9 +139,11 @@ Two terms used throughout:
 - **Selectivity**: the fraction of rows a condition matches. `id = 42` matches one row in 10 million (highly selective). `status = 'paid'` may match 70% of rows (not selective).
 - **Cardinality**: the number of distinct values in a column. `id` has high cardinality; `status` with 4 values has low cardinality.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The B+tree
+
+**In plain words:** the index is a short, very wide tree of fixed-size blocks. Like an office building directory: the lobby board points you to a floor, the floor board points you to a room. Two or three signs, and you are there.
 
 Databases store data in fixed-size **pages** (8 kB in PostgreSQL, 16 kB by default in InnoDB). A B-tree index is a tree of such pages. Strictly, PostgreSQL and InnoDB use the **B+tree** variant: all keys live in the leaf level, and the upper levels hold only separator keys that route the search.
 
@@ -150,6 +183,8 @@ The root and internal pages of a busy index are almost always cached in memory, 
 
 ### Fan-out and tree height, step by step
 
+**In plain words:** each page points to hundreds of children, so every extra level multiplies capacity by hundreds. That is why even huge tables need only 3-4 levels.
+
 Each level multiplies the number of reachable leaf entries by the fan-out. With a fan-out of 300, the capacity grows like this:
 
 ```mermaid
@@ -162,6 +197,8 @@ flowchart LR
 **Example with numbers.** 100,000,000 invoices exceed 300^3 = 27 million, so they need 4 levels at fan-out 300. A better fan-out of 500 gives 500^3 = 125 million, so 3 levels are enough. A point lookup therefore reads 3 or 4 index pages, and the top levels stay cached because every lookup passes through them.
 
 ### Seq scan versus index scan
+
+**In plain words:** the database has two ways to find rows: read everything and keep what matches (seq scan), or follow the sorted tree straight to the matches (index scan). A planner picks whichever looks cheaper.
 
 ```mermaid
 flowchart LR
@@ -182,6 +219,8 @@ Reading these plans is covered in [[Query Plans and EXPLAIN]].
 
 ### Where the pointer goes: PostgreSQL heap versus InnoDB clustered index
 
+**In plain words:** the index entry has to point somewhere. PostgreSQL points at the row's exact shelf location; MySQL InnoDB points at the row's primary key, so it has to do a second lookup to get the row itself.
+
 ```mermaid
 flowchart TB
     subgraph PG["PostgreSQL: heap + secondary indexes"]
@@ -201,7 +240,7 @@ Consequences: in InnoDB, range scans by primary key are very fast (the rows are 
 
 In PostgreSQL, all indexes are equal, but an update that moves a row to a new location must update every index, unless it qualifies as a HOT update (section 8).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The InvoiceOps table:
 
@@ -220,6 +259,8 @@ CREATE TABLE invoices (
 ```
 
 ### Whiteboard version
+
+**In plain words:** the whole workflow in three steps: prove the query is slow, create an index that matches its shape, prove it is now fast.
 
 ```sql
 -- 1. Find what is slow
@@ -325,6 +366,8 @@ Put columns compared with `=` first, then the column you sort by, then a column 
 
 ### Covering the query: index-only scans
 
+**In plain words:** if the index already contains every column the query asks for, the database never has to visit the table at all. Like a book index that quotes the sentence, not just the page number.
+
 The list page actually needs `number` and `total_minor` too. If those columns are in the index, PostgreSQL can answer from the index alone, an **index-only scan**, skipping the heap:
 
 ```sql
@@ -358,13 +401,15 @@ sequenceDiagram
 
 ### Unique indexes are constraints
 
+**In plain words:** "no duplicates allowed" is enforced by the same sorted tree: before inserting, the database looks the key up, and if it is already there the insert fails.
+
 `PRIMARY KEY` and `UNIQUE` are enforced with a unique B-tree: before inserting, the database descends the tree to check that the key is absent. That is why `UNIQUE (workspace_id, number)` both prevents duplicate invoice numbers per workspace and speeds up lookups by number.
 
 PostgreSQL does **not** create an index for a foreign key automatically; add one on `invoices.customer_id` yourself if you join or delete by it, or every `DELETE FROM customers` scans `invoices`.
 
 Runnable Go version: [[Indexing Fundamentals - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Access path | How it works | Planner picks it when | Cost |
 | --- | --- | --- | --- |
@@ -376,7 +421,7 @@ Runnable Go version: [[Indexing Fundamentals - Go]]
 
 Index *types* beyond the B-tree (hash, GIN, GiST, BRIN) and special forms (partial, expression, covering design) are covered in [[Index Types and Index Design]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Writes pay for every index.** An `INSERT` into a table with 6 indexes writes the row plus 6 index entries, each with its own WAL record. An `UPDATE` that changes an indexed column (or, in PostgreSQL, any update that cannot be HOT) also inserts new index entries. Write-heavy tables such as event logs should carry only the indexes their queries need.
 - **Indexes take disk and memory.** A B-tree on a `bigint` column of 10 million rows is roughly 200–300 MB (estimate; check with `pg_relation_size`). Indexes compete with table data for the buffer cache, and an index that no longer fits in RAM makes every lookup a disk read.
@@ -385,6 +430,8 @@ Index *types* beyond the B-tree (hash, GIN, GiST, BRIN) and special forms (parti
 - **Duplicates waste writes.** An index on `(workspace_id)` is redundant when `(workspace_id, status, due_date)` exists, because the composite already serves `workspace_id` lookups through its leftmost prefix.
 
 ### When the planner ignores your index
+
+**In plain words:** an index is an offer, not an order. If the planner thinks a full scan is cheaper, or the query is written in a way the index cannot serve, the index sits unused. This table lists the usual reasons.
 
 | Cause | Example | Fix |
 | --- | --- | --- |
@@ -396,7 +443,7 @@ Index *types* beyond the B-tree (hash, GIN, GiST, BRIN) and special forms (parti
 | Stale statistics | Estimates say 10 rows, actual is 1 million | `ANALYZE invoices` |
 | Tiny table | 200 rows | Nothing to fix |
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** PostgreSQL's default index type is a B-tree with sibling-linked leaves (Lehman and Yao), with deduplication of repeated keys since PostgreSQL 13. MySQL InnoDB clusters every table on its primary key. SQL Server offers both clustered and heap tables. MongoDB uses B-tree indexes in WiredTiger with the same leftmost-prefix rule for compound indexes.
 - **Failure modes and fixes:**
@@ -410,9 +457,11 @@ Index *types* beyond the B-tree (hash, GIN, GiST, BRIN) and special forms (parti
 	- Index size (`pg_relation_size`) against available memory, and the buffer cache hit ratio.
 	- Slow-query logs or `pg_stat_statements` for queries whose plans changed.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why B-trees and not binary trees or hash tables
+
+**In plain words:** a binary tree is too tall (too many hops) and a hash table has no order (no ranges). A B-tree is short AND sorted, which is why databases picked it.
 
 A binary tree has fan-out 2, so 100 million keys need about 27 levels, each a separate page read. A B+tree packs hundreds of keys per page to cut that to 3–4. Hash indexes give `O(1)` equality lookups but no order, so they cannot serve ranges or `ORDER BY`.
 
@@ -439,6 +488,8 @@ Sequential keys (identity, UUIDv7) always append to the rightmost leaf, which Po
 
 ### HOT updates in PostgreSQL
 
+**In plain words:** normally an update must touch every index. HOT is a shortcut: if the changed columns are not indexed and the new row version fits on the same page, the indexes are left alone.
+
 An update writes a new row version. If no indexed column changed and the new version fits on the same heap page, PostgreSQL makes it a **heap-only tuple** (HOT): the indexes keep pointing at the old item, which links to the new version, so no index is touched.
 
 ```mermaid
@@ -460,7 +511,7 @@ Indexing a frequently updated column such as `updated_at` disables HOT for those
 - **Descending and NULL order.** A B-tree can be scanned in both directions, so `(workspace_id, created_at)` also serves `ORDER BY created_at DESC` for one workspace. Mixed directions (`ORDER BY a ASC, b DESC`) need an index declared that way.
 - **Index size versus working set.** Only the part of an index that queries actually touch needs to be in memory. With time-ordered keys, that is the recent right-hand edge; with random keys, it is the whole index, which is the real cost of UUIDv4 at scale.
 - **Correlation.** PostgreSQL's statistics record how well a column's order matches the physical row order. A highly correlated column (such as `created_at` on an append-only table) makes index range scans read mostly sequential heap pages, so the planner keeps using the index for larger fractions of the table than it would for an uncorrelated column.
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How does a B-tree index make a lookup fast, and how many page reads does it take?
 > Keys are kept sorted in a tree of fixed-size pages with a fan-out of a few hundred, so each level narrows the search by that factor. 100 million keys fit in 3–4 levels. A lookup reads one page per level, then the row; the upper levels are usually cached, so it is often one or two disk reads at most.
@@ -483,7 +534,7 @@ Indexing a frequently updated column such as `updated_at` disables HOT for those
 > [!question]- Why are random UUIDv4 primary keys bad for B-tree indexes?
 > New keys land on random leaf pages, so inserts cause page splits across the whole tree, leave pages partly empty, and need the entire index in memory to stay fast. In InnoDB the table itself is the primary-key tree, so the rows fragment too. Time-ordered UUIDv7 or `bigint` identity keys append at the right edge instead.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Index = sorted structure from key to row; B+tree with fan-out in the hundreds, 3–4 levels for ~100M rows.
 - Seq scan reads every page; index scan reads ~4 index pages plus the matching rows.

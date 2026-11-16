@@ -23,7 +23,36 @@ updated: 2026-11-13
 > - The Go compiler decides stack vs heap at compile time via **escape analysis**; `go build -gcflags=-m` shows you its reasoning.
 > - Go goroutine stacks start small (about 2 KB) and grow by copying to a bigger stack, unlike a fixed-size OS thread stack that simply overflows when exhausted.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When your program runs, the OS gives it one big private block of memory. That block has rooms with fixed jobs. Two rooms matter most: the **stack** and the **heap**.
+
+The stack is a neat pile of trays. Each function call adds a tray with its local variables; when the function returns, the tray is thrown away. Automatic and very fast.
+
+The heap is open shelf space. You can put anything there, keep it as long as you like — but something (in Go, the **garbage collector**) must notice when nobody needs it anymore and clear it.
+
+```mermaid
+flowchart TD
+    A["Program memory"] --> S["Stack: function trays,<br/>auto-cleaned, fast"]
+    A --> H["Heap: shelf space,<br/>lives longer, needs cleanup"]
+```
+
+```mermaid
+flowchart LR
+    F["call a function"] --> P["tray pushed on stack"] --> R["function returns"] --> G["tray gone, instantly"]
+```
+
+The rest of this note is just three questions:
+1. What are all the rooms in a process's memory, and what goes where?
+2. How does the language decide stack vs heap (in Go: escape analysis)?
+3. Why do you care — what gets slow or crashes when this goes wrong?
 
 **The problem in one story.**
 You write a function that makes a small list, uses it, and returns.
@@ -67,7 +96,7 @@ Where it breaks: real trays are never moved, but Go copies a whole goroutine sta
 > [!tip] Remember
 > Short-lived values that die with their function go on the stack; anything that must outlive the call goes on the heap.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you call a function. Before you can picture what "the stack" is, picture the plainer problem it solves: every function call needs somewhere to put its local variables, and it needs to remember where to return to once it finishes.
 
@@ -88,7 +117,7 @@ That is the **heap**: a region with no inherent structure, managed by an **alloc
 > [!tip] Remember
 > The stack exists because function calls nest predictably (LIFO); the heap exists because not every value's lifetime does.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **In plain words:** think of the stack as a stack of trays in a cafeteria line: you can only add a tray to the top or take the top tray off. There's nothing to decide — the next free spot is always "wherever the top currently is."
 
@@ -120,7 +149,7 @@ If a pointer to the value might be used after the function returns — the funct
 > [!warning] Common mistake
 > Thinking "pointers go on the heap, values go on the stack." Wrong on both counts: a `*Counter` that never leaves its function stays on the stack, and a plain `int` returned by value through a long chain of escaping closures can still end up on the heap. The only question is lifetime, never the spelling of the type.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The address space, region by region
 
@@ -206,7 +235,7 @@ This analogy breaks down in one place: a goroutine never *shrinks* back down mid
 > [!tip] Remember
 > OS thread stacks are reserved large and fixed because moving them is unsafe without compiler cooperation. Go goroutine stacks start tiny and double on demand because the Go compiler tracks every pointer and can safely rewrite it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -295,7 +324,7 @@ A single goroutine never shrinks this number mid-recursion; it only grows, which
 
 Runnable Go version, including the escape-analysis demo, the LIFO call-stack model, and the full stack-growth measurement harness: [[Process Memory Layout - Stack vs Heap - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Region | Grows how | Lifetime | Allocation cost | Reclaimed by |
 | ------ | ---------- | -------- | ---------------- | ------------- |
@@ -304,14 +333,14 @@ Runnable Go version, including the escape-analysis demo, the LIFO call-stack mod
 | `mmap` region | Explicit `mmap`/`munmap` (or Go's large-allocation path, which also uses `mmap` under the hood) | Until explicitly unmapped | A syscall (see [[System Calls and User vs Kernel Mode]]); pages then fault in lazily | Explicit `munmap`, or process exit |
 | `data`/`bss` (globals) | Fixed size, set at link time | Whole process lifetime | None at runtime — space exists from process start | Process exit |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Stack allocation is nearly free but inflexible: a value's size must be known (or boundable) at compile time for a given frame, and its lifetime must not outlive the call. Neither constraint can be relaxed without moving the value to the heap.
 - Heap allocation is flexible but not free: in Go, every heap allocation is a candidate for the garbage collector to track and eventually scan, so unnecessary escapes (e.g., returning `*int` where returning `int` would do) add both allocator and GC pressure in a hot path — exactly what `-gcflags=-m` helps you find and what [[Pointers, Values and Escape Analysis]] covers in full.
 - Go's growable goroutine stacks remove the "reserve 8 MB per thread" cost, but stack growth itself (copy + pointer fixup) is not instant; a function with an unusually deep, tight recursive loop can pay repeated stack-growth costs if each growth step is quickly outgrown again. This is rarely a practical problem, but it's why extremely deep recursion in a hot path is worth profiling rather than assuming is free.
 - `mmap`-backed large allocations (Go's runtime uses this path for big objects) skip the heap's usual small-object bookkeeping, at the cost of needing a real syscall and page-fault-driven backing, which only pays off for allocations large enough that overhead is a rounding error.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Go's own runtime documents the 2 KB initial goroutine stack and its doubling growth policy; JVM threads famously default to large fixed stacks (`-Xss`) for exactly the reason Go avoids — without growable stacks, you must either over-provision per thread or risk `StackOverflowError`; C programs commonly crash with a segmentation fault on deep uncontrolled recursion because their OS thread stack is fixed-size and unmoving.
 - **Failure modes -> fixes:**
@@ -320,7 +349,7 @@ Runnable Go version, including the escape-analysis demo, the LIFO call-stack mod
   - A C/C++ or cgo-adjacent component segfaults under deep recursion -> its OS thread stack is fixed-size; check `ulimit -s` (Linux) and consider increasing it or bounding recursion depth, since there's no "morestack" there.
 - **What to monitor:** Go's allocation profile (`pprof`'s `alloc_objects`/`alloc_space`) for unexpected heap growth; `GODEBUG=gctrace=1` output for GC frequency and pause time; for native code, `ulimit -s` and any crash reports mentioning stack exhaustion.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Escape analysis, mechanically.** The compiler keeps a value on the stack only if it can prove the address never outlives the call; the full rules and how to read `-gcflags=-m` output live in [[Pointers, Values and Escape Analysis]].
 - **Stack growth's pointer-fixup problem, and why only Go's runtime can do it.** Moving a C thread's stack mid-flight is not generally safe: any raw pointer another part of the program holds into the old stack (a pointer to a local variable passed to another thread, for instance) would become invalid, and C's type system can't find and fix all of them.
@@ -331,7 +360,7 @@ Go's compiler emits per-function metadata describing exactly which stack slots h
 
 The heap has no such guarantee — a value allocated first might outlive one allocated after it, and vice versa — so free and in-use regions end up interleaved over time (fragmentation), and finding a free block of the right size, or coalescing adjacent free blocks, needs real data structures (free lists, size classes, Go's own span-based allocator) and, in a garbage-collected language, a separate process (the GC) to even determine what's still in use. See [[Runtime - Memory Allocator and Garbage Collector]] for that machinery in full.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What actually decides whether a value goes on the stack or the heap?
 > Not its type, and not whether you wrote `new`/`&` — its *provable lifetime*. If the compiler can prove a value's address never outlives the function call that created it, it stays on the stack.
@@ -366,7 +395,7 @@ The heap has no such guarantee — a value allocated first might outlive one all
 > [!question]- What's actually stored in `bss`, and why does it matter for a large Go program?
 > Zero-initialized package-level variables: Go arrays or slices backed by package-level zero values, for instance. `bss` costs nothing in the compiled binary on disk — it's a directive, not stored bytes — but it still reserves real virtual address space, and once the program actually touches those bytes, real physical pages get mapped in via ordinary demand paging, exactly like heap memory would.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Layout, low to high: text (code) -> data (initialized globals) -> bss (zeroed globals) -> heap (grows up) -> ... -> mmap region -> stack(s) (grows down).
 - Stack = LIFO, pointer-bump allocation, reclaimed automatically on return. Heap = unordered, needs a real allocator (and in Go, a GC) to track and reclaim.

@@ -30,7 +30,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Storage Engines - B-tree vs LSM and WAL]]: a toy write-ahead log whose records carry a CRC-32C and a length so recovery can drop a torn tail, a benchmark that measures one `fsync` per commit against one `fsync` for a group, and a toy LSM tree that shows the write-amplification versus read-amplification trade-off of compaction.
 
-## Before the code
+## Before the code 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "What this code shows" and "Setup". Skim the diagrams in the Code section; skip the line-by-line parts.
+> - 🟡 **Know the basics?** Work through the Code steps, Design decisions, Tests and Running it.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on half of [[Storage Engines - B-tree vs LSM and WAL]]. It builds two tiny toys in plain Go: a **WAL** (a diary file the database writes before saying "saved", with checksums so a crash cannot leave a lie in it) and a mini **LSM tree** (writes pile up in memory, get dumped as sorted files, and get merged later). You then run real tests and benchmarks on your own machine and see the theory's numbers appear: one disk flush per commit is about 100 times slower than one flush shared by 100 commits, and merging files more often makes writes expensive but reads cheap. Read it top to bottom; every code block is followed by a "How it works" list that explains it line by line.
 
 - **Files and `fsync`** (`os.OpenFile`, `f.Sync()`): open a file for appending; `Sync` asks the OS to really put the bytes on disk, which is what makes a commit durable.
 - **`encoding/binary` and `hash/crc32`**: write lengths as little-endian integers and varints, and add a checksum so a half-written (torn) record is detected on replay.
@@ -39,7 +48,7 @@ updated: 2026-11-13
 - **Tests and benchmarks**: `t.TempDir()` gives each test a real throwaway folder; `b.Loop()` is the Go 1.24 benchmark loop used to compare fsync-per-commit with group commit.
 - **What to run**: `go vet ./... && go test -race -v ./...`, then `go test -run xxx -bench Commit ./...` for the fsync cost.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -66,14 +75,14 @@ flowchart LR
     APP -. "a real engine logs before the memtable" .-> PUT
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only (`bufio`, `encoding/binary`, `hash/crc32`, `maps`, `slices`).
 - Layout: a module `kv` with `wal.go`, `wal_test.go`, `lsm.go` and `lsm_test.go`.
 - Run it with `go vet ./... && go test -race -v ./...`. Run the benchmarks with `go test -run xxx -bench Commit ./...`.
 - The tests use real files in `t.TempDir()`, so `File.Sync` really flushes. On macOS Go issues `F_FULLFSYNC`, which is why a single flush costs milliseconds.
 
-## Code
+## Code 🟡
 
 The code is two independent pieces that a real engine would combine. `wal.go` is the durability half: a log you append to and replay after a crash. `lsm.go` is the speed half: an in-memory table that spills to sorted runs and merges them. The WAL is left out of the LSM tree on purpose, to keep each lesson small.
 
@@ -93,6 +102,8 @@ sequenceDiagram
 ```
 
 ### Step 1: the record frame and the types
+
+**In plain words:** every diary entry gets a wrapper — a checksum and a length — so a half-written entry can be spotted later, like a sealed envelope you can tell has been opened.
 
 **Concept.** A log is only useful for recovery if recovery can tell a complete record from a half-written one ([[Storage Engines - B-tree vs LSM and WAL#Crash recovery in PostgreSQL]]). The fix used here is framing: every record carries a CRC-32C checksum and a length, the same idea PostgreSQL uses to find the end of its WAL.
 
@@ -140,6 +151,8 @@ flowchart LR
 
 ### Step 2: encode a record
 
+**In plain words:** this function packs one key-value pair into bytes in exactly the shape the reader expects to unpack.
+
 **Concept.** Encoding is the write side of the frame, and it must produce exactly what the reader in step 3 expects. The payload is built first, because the checksum and the length both describe the payload. The key length is stored as a varint so the reader knows where the key ends and the value begins, since neither has a terminator.
 
 Fixed-width little-endian integers are used for the checksum and the length so that the header is always 8 bytes and the reader can read it in one call.
@@ -162,6 +175,8 @@ func encode(r Record) []byte {
 4. Each `Append...` returns a new slice, so there is no shared buffer and the function is safe to call concurrently.
 
 ### Step 3: open and recover
+
+**In plain words:** at startup we read the diary entry by entry, keep every entry that checks out, and cut the file off at the first broken one.
 
 **Concept.** Recovery replays the log from the start and stops at the first frame that is not provably whole, exactly as in [[Storage Engines - B-tree vs LSM and WAL#Crash recovery in PostgreSQL]]. Everything after a bad frame is untrusted, even if it looks valid, because the bad frame means the write that followed it may have been lost or reordered.
 
@@ -243,6 +258,8 @@ Where each failure kind is caught, for a log of three good frames followed by da
 
 ### Step 4: append, and group commit
 
+**In plain words:** writing bytes is cheap; waiting for the disk to confirm them (`fsync`) is the slow part, so we let many commits share one wait.
+
 **Concept.** The WAL rule is to log before acknowledging, and the commit point is the `fsync` that makes the log durable ([[Storage Engines - B-tree vs LSM and WAL#Write-ahead logging]]). An `fsync` costs milliseconds because it waits for the device, while the write itself only copies into the OS page cache.
 
 So the cost is the flush, and group commit shares one flush among many records ([[Storage Engines - B-tree vs LSM and WAL#Group commit]]). `Append` takes a variadic list of records so a caller can pick one record per flush or many.
@@ -291,6 +308,8 @@ flowchart LR
 ```
 
 ### Step 5: the LSM entry and the tree type
+
+**In plain words:** the toy LSM is just a map in memory, a list of sorted lists standing in for files, and three counters that measure how much work it is doing.
 
 **Concept.** An LSM tree turns random writes into sequential ones: updates go to an in-memory table and are written out later as sorted, immutable runs ([[Storage Engines - B-tree vs LSM and WAL#LSM write and read paths]]). The `Tree` type holds exactly those parts: a memtable, a list of runs ordered newest first, and counters that measure the trade-off.
 
@@ -352,6 +371,8 @@ flowchart LR
 
 ### Step 6: write path and flush
 
+**In plain words:** a write just updates the in-memory pad; when the pad is full, it is sorted and dumped out as one new file, and a delete is written the same way, just marked "gone".
+
 **Concept.** A write is a memory operation. Only when the memtable is full is it turned into a new sorted run, which is a sequential write. This is the write path from [[Storage Engines - B-tree vs LSM and WAL#LSM write and read paths]].
 
 Flushing can trigger compaction, which is the policy step that keeps the run count bounded. Writing the flush check inside `write` keeps `Put` and `Delete` identical, since a delete is just a write of a tombstone.
@@ -390,6 +411,8 @@ func (t *Tree) flush() {
 6. A fresh `map` replaces the memtable, and `compact` runs only when there are too many runs.
 
 ### Step 7: compaction and read
+
+**In plain words:** compaction merges all the files into one, keeping only the newest copy of each key, and a read checks the pad first and then the files newest to oldest.
 
 **Concept.** Compaction merges runs so that reads probe fewer files and old versions and tombstones are discarded ([[Storage Engines - B-tree vs LSM and WAL#Deletes and compaction]]). The price is rewriting data, which is write amplification. This code uses the simplest policy, "merge everything into one run when there are more than `maxRuns`", which is enough to show the trade-off without levels or tiers.
 
@@ -461,7 +484,7 @@ func size(run []entry) (n int) {
 4. The first match returns immediately, even if it is a tombstone. Skipping it to look in older runs would bring a deleted key back to life.
 5. A key in no run returns the empty value and `false`, which costs one probe per run: the worst case, which the test deliberately triggers.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -476,11 +499,13 @@ func size(run []entry) (n int) {
 | Compaction merges all runs into one | Leveled or size-tiered compaction | Easiest to reason about and shows the trade-off, but rewrites everything each time |
 | Counters are plain `int` fields | `atomic` counters or metrics | Simple, but the tree is not safe for concurrent use |
 
-## Tests
+## Tests 🟡
 
 There are three checks: one correctness test for the WAL, two benchmarks that measure the cost of a flush, and one measuring test for compaction. The tests use real files in `t.TempDir()`, so `File.Sync` really flushes.
 
 ### TestWALDropsTornTailAndKeepsCommittedRecords
+
+**In plain words:** we fake a power cut halfway through writing the 4th entry and check that recovery keeps the 3 finished entries and throws away the broken one.
 
 **Property.** After a crash in the middle of writing a record, recovery returns exactly the committed records, drops the torn one, and leaves the log ready for new appends. This is the guarantee a WAL exists to give.
 
@@ -551,6 +576,8 @@ The crash simulation and the checks after recovery:
 
 ### The two commit benchmarks
 
+**In plain words:** same 100 commits twice — once with 100 disk waits, once with 1 — to measure how much group commit saves.
+
 **Property.** The same 100 durable commits cost about 100 times less when they share one `fsync`. This is the measured basis for group commit ([[Storage Engines - B-tree vs LSM and WAL#Group commit]]).
 
 | Benchmark | Calls per iteration | `fsync` calls |
@@ -606,6 +633,8 @@ func BenchmarkCommitGrouped(b *testing.B) {
 
 ### TestCompactionTradeoff
 
+**In plain words:** we turn the one knob (how many files may pile up before a merge) and watch write cost and read cost move in opposite directions.
+
 **Property.** As `maxRuns` grows, write amplification falls and the runs probed per missing key rise, which is the write against read amplification trade-off ([[Storage Engines - B-tree vs LSM and WAL#Read, write and space amplification]]).
 
 The test writes 100,000 invoice keys with a 1,000-key memtable and looks up one absent key every 100 writes. There are no bloom filters, so every run is searched.
@@ -648,7 +677,7 @@ func TestCompactionTradeoff(t *testing.T) {
 
 **What a failure means.** The `Fatalf` fires when either measure moves the wrong way from one `maxRuns` to the next. That means a compaction bug: for example, `compact` not counting its output in `DiskBytes`, or `Get` not incrementing `Probes` for every run.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -688,7 +717,7 @@ BenchmarkCommitGrouped-10      	       3	   3953264 ns/op
 3. `3953264 ns/op` is about 3.95 ms for the same 100 commits, which is about 40 microseconds per commit when 100 share one flush. That is roughly 100 times cheaper, and it is the whole case for group commit.
 4. An earlier set of three runs on the same machine gave 373-384 ms and 3.6-3.8 ms for the 100 commits, so the ratio is stable even though the absolute times vary.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`Append` without `sync` is not a commit.** The write sits in the OS page cache until something flushes it; a machine crash can lose it. Only `Append(true, ...)` is the commit point.
 - **A grouped `Append` is all or nothing only up to the first torn record.** If the crash happens mid-way through a batch, recovery keeps the intact leading records and drops the rest, so a caller must not acknowledge any record in a batch before `Append` returns.
@@ -697,13 +726,13 @@ BenchmarkCommitGrouped-10      	       3	   3953264 ns/op
 - **`Tree` is not safe for concurrent use**, and its counters are plain integers. The tests use one goroutine.
 - **`Get` returns the first version it finds, even a tombstone.** Skipping tombstones to look in older runs would resurrect deleted keys.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestCompactionTradeoff`, change the memtable limit from 1,000 to 5,000 keys. Predict the direction of write amplification and of runs probed per miss for `maxRuns = 4`, then run it.
 2. Call `Append(false, rec)` in the torn-tail test instead of `Append(true, rec)`. Does the test still pass on your machine? Explain why that does not prove the unsynced version is crash safe.
 3. Add a `Tree.Delete` test: put a key, flush it into a run, delete it, and check that `Get` reports it missing before and after `compact`. Predict how `DiskBytes` changes after the compaction.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Storage Engines - B-tree vs LSM and WAL]]
 - **Before this:** [[Indexing Fundamentals]], [[Transactions and ACID]], [[Page Cache, File Systems and fsync]]

@@ -20,7 +20,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code proves, on one machine, the single claim the theory note makes about multiplexing: six requests through **one** HTTP/1.1 connection run serially, while six requests through **one** HTTP/2 connection run almost fully in parallel. See [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] for why that gap exists.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Skim the Code steps' **Concept** lines only.
+> - 🟡 **Know the basics?** Read the Code steps in full, then Tests and Running it.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero** 🟢: this file is one small Go test that proves the theory note's big claim with a stopwatch. Six slow requests sent over old-style HTTP/1.1 on one connection take about 6x as long as the same six sent over HTTP/2, because HTTP/2 lets them all travel at once. Read the Concept line above each code block first; the code just acts it out.
+
+## Before the code 🟢
 
 - **Goroutines** (`go func() {...}()`): lightweight concurrent functions; here, one per request so all 6 fire at once.
 - **`sync.WaitGroup`**: a counter that lets the test wait until every goroutine has finished.
@@ -29,7 +36,7 @@ updated: 2026-11-13
 - **`testing` helpers** (`t.Helper`, `t.Logf`, `t.Fatalf`): mark helpers, log measurements, fail the test.
 - **What to run:** `go vet ./...` then `go test -race -v ./...` inside the module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept it demonstrates | Theory section |
 | --- | --- | --- |
@@ -38,7 +45,7 @@ updated: 2026-11-13
 | `httptest.Server{EnableHTTP2: true}` | HTTP/2 multiplexing many streams over that same single-connection constraint | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#3. How it works]] |
 | The two timing assertions | The measured gap between serial and parallel that section 1's table reports | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#Whiteboard version]] |
 
-## Setup
+## Setup 🟢
 
 - **Go version:** 1.24.
 - **Module:** a single package, `http2demo`, no external dependencies — everything needed (`net/http`, `net/http/httptest`) is in the standard library.
@@ -56,7 +63,7 @@ go vet ./...
 go test -race -v ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Step 0: package and imports
 
@@ -76,6 +83,8 @@ import (
 ```
 
 ### Step 1: a helper that fires N concurrent requests and times the batch
+
+**In plain words:** start 6 stopwatch-timed downloads at the same moment and note when the last one finishes — that one number is the whole experiment.
 
 **Concept.** The theory note's claim is about wall-clock time for a *batch* of requests, not any single request.
 
@@ -118,6 +127,8 @@ func measureConcurrency(t *testing.T, client *http.Client, url string, n int, de
 
 ### Step 2: set up one handler, two servers, two clients
 
+**In plain words:** build two tiny local servers that answer the same slow way, one speaking HTTP/1.1 on a single line, one speaking HTTP/2 — so any speed difference can only come from the protocol.
+
 **Concept.** This implements [[HTTP-1.1 vs HTTP-2 vs HTTP-3#2. Mental model]]'s "one room, one entrance" picture directly.
 
 The *same* handler (sleep 50ms, reply) is served two ways: once through an HTTP/1.1 client capped to one connection (`MaxConnsPerHost: 1`), once through an HTTP/2 server negotiated over TLS.
@@ -159,6 +170,8 @@ func TestH1SingleConnVsH2Multiplexing(t *testing.T) {
 
 ### Step 3: measure both batches and assert the gap
 
+**In plain words:** run the stopwatch on both servers and make the test fail if HTTP/2 is not clearly the faster one.
+
 **Concept.** This is the function body's second half, continuing directly inside `TestH1SingleConnVsH2Multiplexing` from Step 2. It calls `measureConcurrency` (Step 1) once per protocol, then turns the theory note's prose claim — "HTTP/2 multiplexes, HTTP/1.1 serializes" — into two numeric assertions so the test fails loudly if that claim ever stops holding on a future Go version.
 
 ```go
@@ -185,7 +198,7 @@ func TestH1SingleConnVsH2Multiplexing(t *testing.T) {
 2. The two `t.Fatalf` checks encode the theory note's claim as a test, not just a log line: HTTP/2 must land under half the serial ideal (closer to parallel), and HTTP/1.1 must land close to the full serial ideal (confirming the cap actually worked and nothing accidentally parallelized it).
 3. `context` is not needed here — `client.Get` ships its own request lifecycle — but a production version calling an unbounded number of hosts would use `http.NewRequestWithContext` with a deadline instead of a bare `Get`, so a hung server can't block the batch forever.
 
-## Tests
+## Tests 🟡
 
 | Test | Property it proves | Why it matters |
 | --- | --- | --- |
@@ -211,7 +224,7 @@ PASS
 
 If this test failed, the most likely cause is not a code bug but an environment one: a proxy or VPN forcing all traffic through an intermediary that itself serializes connections, or a Go version before 1.21 where `httptest.Server.EnableHTTP2` does not exist — both would make the HTTP/2 timing collapse toward the HTTP/1.1 number.
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -220,7 +233,7 @@ If this test failed, the most likely cause is not a code bug but an environment 
 | Assert a threshold (`< n*delay/2`, `≥ n*delay*7/10`) rather than an exact number | Assert against the literal measured milliseconds | Wall-clock timings vary run to run and machine to machine; a threshold proves the *qualitative* claim (multiplexed is much faster) robustly, without the test becoming flaky on a slower CI box |
 | Standard library only, no QUIC/HTTP-3 test | Add `golang.org/x/net/http3` or `quic-go` and test HTTP/3 too | Keeps this scratch module dependency-free and fast to verify; HTTP/3 behavior is covered conceptually in the theory note's deep dive instead, since Go's standard library doesn't speak QUIC as of 1.24 |
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go vet ./...
@@ -241,13 +254,13 @@ Reading it line by line:
 - 67.81ms for HTTP/2 is close to the 50ms parallel ideal, with the extra ~18ms accounting for TLS/ALPN negotiation and goroutine scheduling overhead rather than any serialization.
 - `PASS` and the final `ok` line confirm both threshold assertions held and `-race` found no data race in the concurrent `Get` calls or the shared `*testing.T`.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - Forgetting `resp.Body.Close()` in a loop like this leaks connections from the client's pool; over many iterations it can exhaust `MaxConnsPerHost` and make a test hang waiting for a connection that will never free up.
 - Calling `t.Fatalf` (not `t.Errorf`) from inside a spawned goroutine is a classic Go testing bug: `t.FailNow` (which `Fatalf` calls) must run on the test's own goroutine. This code avoids that trap by using `t.Errorf` inside the goroutines and reserving `t.Fatalf` for the main test goroutine after `wg.Wait()` returns.
 - Without `MaxConnsPerHost: 1`, Go's default `http.Transport` silently opens multiple HTTP/1.1 connections under concurrent load, which would shrink the measured gap and make the test's assertions flaky rather than wrong.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change this:** set `n = 2` instead of `6`. Predict the result: does the HTTP/2 vs HTTP/1.1 gap get smaller, larger, or stay about the same in absolute milliseconds? (Hint: think about what the serial ideal, `n*delay`, does as `n` shrinks.)
 2. **Change this:** remove `MaxConnsPerHost: 1` from the HTTP/1.1 client entirely. Predict the result: will the test still pass, and why might the measured HTTP/1.1 time now look surprisingly close to the HTTP/2 time?

@@ -24,7 +24,40 @@ updated: 2026-11-13
 > - Only the sender closes a channel, and only when every sender agrees no more values are coming.
 > - If you cannot say who closes a channel, or what makes a goroutine stop, you have a leak waiting to happen.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). That is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Normally a program does one thing at a time, top to bottom. But a server must handle thousands of users at once.
+
+Go's answer is the **goroutine**: a tiny worker you start with one word, `go`. Write `go doWork()` and `doWork` runs alongside your code instead of making it wait. Goroutines are so cheap you can have tens of thousands at once.
+
+```mermaid
+flowchart LR
+    M["main"] -- "go f()" --> A["worker A"]
+    M -- "go g()" --> B["worker B"]
+    M --> K["main keeps going"]
+```
+
+Workers need a safe way to pass things to each other. That is a **channel**: a typed pipe. One goroutine puts a value in, another takes it out, and the handoff itself keeps them in step.
+
+```mermaid
+flowchart LR
+    P["producer"] -- "ch <- job" --> C(["channel"]) -- "<-ch" --> W["consumer"]
+```
+
+Two rules prevent most disasters: know how every goroutine you start will stop, and let only the sender close a channel.
+
+The rest of this note is just these 4 questions:
+1. How do `go`, WaitGroup, buffered and unbuffered channels behave?
+2. What are the close rules, and what happens on closed or nil channels?
+3. How do goroutines leak, and how do you find the leaks?
+4. When is a channel the right tool, and when is a mutex simpler?
 
 **The problem in one story.**
 A restaurant has one waiter who takes an order, walks to the kitchen, waits for the food, and only then serves the next table.
@@ -69,7 +102,7 @@ Where it breaks: a real belt does not care who stops it; in Go only the sender s
 > [!tip] Remember
 > Start a goroutine only when you know how it stops, and let only the sender close the channel.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A web server handling 10,000 concurrent requests cannot afford an OS thread per request: a thread's stack defaults to 8 MiB on Linux, so 10,000 threads would need about 80 GiB of stack space alone, plus the kernel's per-thread scheduling overhead.
 
@@ -79,7 +112,7 @@ The second problem is coordination. If request handling spawns a goroutine to se
 
 Channels are Go's answer: a typed pipe through which one goroutine gives data to another, with the handoff itself acting as the synchronization point.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A goroutine is a **function call that runs alongside the caller** instead of blocking it. `go sendEmail(order)` is like handing a task to a coworker and continuing your own work, instead of doing the task yourself and making everyone wait.
 
@@ -87,9 +120,11 @@ A channel is a **conveyor belt between two workers**, sized either for instant h
 
 The only wrinkle: whoever puts items on the belt is the one who tells everyone else "no more items are coming" (`close`), and only once.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The `go` statement
+
+**In plain words:** `go f()` hands the task to a new worker and walks away — nothing waits for it, and nothing hears it fail, unless you build that yourself.
 
 ```go
 go sendEmail(order) // starts a new goroutine; the call returns no value here
@@ -118,6 +153,8 @@ Full mechanics of `WaitGroup`, `Once`, `Mutex` and the atomic types are in [[syn
 
 ### Goroutines are not OS threads
 
+**In plain words:** the Go runtime packs thousands of goroutines onto a handful of real threads, the way one bus carries many passengers.
+
 The Go runtime multiplexes many goroutines onto a much smaller number of OS threads (the **M:N scheduler**: G goroutines, M OS threads, P logical processors — previewed here, detailed in [[Runtime - Goroutine Scheduler (GMP)]]).
 
 A goroutine that blocks on a channel or a mutex parks cheaply inside the Go runtime; it does not tie up an OS thread the way a thread blocked in the kernel would.
@@ -136,6 +173,8 @@ flowchart LR
 ```
 
 ### Unbuffered vs. buffered: two different promises
+
+**In plain words:** an unbuffered channel is a hand-to-hand pass — both sides must be there; a buffered one is a short shelf that holds a few items first.
 
 ```mermaid
 sequenceDiagram
@@ -168,6 +207,8 @@ Buffering decouples the sender's and receiver's pace up to that limit; it does n
 
 ### Directional channel types
 
+**In plain words:** you can mark a channel parameter as send-only or receive-only, and the compiler then stops anyone using it the wrong way round.
+
 A function signature that only sends or only receives documents the contract and lets the compiler enforce it:
 
 ```go
@@ -178,6 +219,8 @@ func consume(in <-chan int)   // in: receive-only from this function's view
 Passing a bidirectional `chan int` into either parameter is allowed (it narrows); passing a `<-chan int` where `chan<- int` is required is a compile error.
 
 ### Close semantics
+
+**In plain words:** `close` means 'no more values are coming'. Reading a closed channel is fine (you get leftovers, then zeros); sending to one, or closing it twice, crashes.
 
 ```mermaid
 stateDiagram-v2
@@ -214,6 +257,8 @@ This is the idiomatic consumer loop: it needs no explicit `ok` check, and it is 
 
 ### Deadlock detection has a narrow trigger
 
+**In plain words:** Go only yells 'deadlock!' when every single goroutine is stuck; one stuck goroutine in a busy server stays silent and invisible.
+
 The Go runtime detects a deadlock only when **every** goroutine in the process is blocked at once, and then it crashes the whole program: `fatal error: all goroutines are asleep - deadlock!`.
 
 A single stuck goroutine inside a busy server never triggers this — the other goroutines keep serving requests, and the stuck one just sits there forever, invisible until someone notices rising goroutine counts or a stalled handler.
@@ -227,6 +272,8 @@ job := <-jobs            // never reached
 Running this standalone (`main` as the only goroutine) does trigger the detector, because main itself is the one and only blocked goroutine. The fix is either `make(chan Job, 1)` (buffer absorbs one send with nobody receiving yet) or starting a receiver on another goroutine before the send.
 
 ### Ownership pattern
+
+**In plain words:** whoever makes the channel writes to it and closes it; everyone else only reads. Return it receive-only and the compiler polices this for you.
 
 The clearest rule for who creates, writes to and closes a channel: **the function that creates the channel owns it**, writes to it, and is the only one that closes it. It returns the channel typed as receive-only so the compiler enforces "callers only consume":
 
@@ -251,6 +298,8 @@ This "generator" shape also gives request/response semantics for free: a caller 
 
 ### Goroutine leaks
 
+**In plain words:** a leak is a worker waiting forever for something that will never come — the three usual shapes are a send nobody receives, a channel nobody closes, and a loop that ignores cancel.
+
 A goroutine leak is a goroutine that will never finish, holding its stack and anything it references alive for the life of the process. Three recurring shapes:
 
 1. **Blocked send after the receiver gave up.** A goroutine does `done <- result` on an unbuffered channel, but the only reader returned early (for example, after a timeout). Nobody will ever receive, so the sender blocks forever. Fix: buffer the channel by 1, so the lone send always succeeds even with no reader:
@@ -264,6 +313,8 @@ A goroutine leak is a goroutine that will never finish, holding its stack and an
 Detecting leaks: the goroutine count in `runtime.NumGoroutine()` (and the Prometheus Go collector's `go_goroutines` metric) climbing without bound in production; `go.uber.org/goleak`'s `VerifyTestMain` failing a test package in CI if any goroutine it started is still alive when the tests finish — far cheaper than finding the leak in production.
 
 ### Fire-and-forget from a request handler
+
+**In plain words:** work launched from a handler dies with the request unless you deliberately detach it and give it its own time limit.
 
 `go sendEmail(order)` launched straight from an HTTP handler is a trap: the handler's `context.Context` is cancelled the moment the handler returns (`r.Context()` is tied to the request's lifetime — see [[Context Package]]), so `sendEmail` can be cut off mid-flight with no error reported to anyone.
 
@@ -281,11 +332,13 @@ go func() {
 
 ### Channels vs. a mutex
 
+**In plain words:** a channel moves data between workers; a mutex lets workers share one piece of data. Moving → channel. Sharing → mutex.
+
 A channel moves **ownership** of data from one goroutine to another; a mutex lets multiple goroutines **share** one piece of state safely. Guarding a `map[string]int` that many goroutines read and write is a mutex problem — adding channels and `select` statements to serialize access to a struct is usually harder to reason about than one `sync.Mutex`.
 
 Channels earn their keep when work or data genuinely needs to move between goroutines: a pipeline stage, a worker pool's job queue, a cancellation signal. The full decision table lives in [[Concurrency for LLD]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -436,7 +489,7 @@ func TestNilChannel_BlocksForever(t *testing.T) {
 
 **Measured:** `go vet ./...` clean; `go test -race -v ./...` — `ok example.com/goroutines 1.483s`, all 4 tests passed (Go 1.24.4, Apple Silicon, 2026-11-07).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Shape | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -446,13 +499,13 @@ func TestNilChannel_BlocksForever(t *testing.T) {
 | Ownership (generator) channel | One goroutine creates, writes and closes; others only receive | Any producer/consumer relationship | Requires discipline: a second accidental sender will panic the receiver eventually |
 | `context.Context` cancellation | A `Done()` channel closed by `cancel()`, observed in a `select` | Stopping a tree of goroutines together, with a reason (`ctx.Err()`) | Only a signal, not a transport — pair with channels or shared memory for actual data |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A goroutine is cheap to start but not free: each one holds at least a 2 KiB stack, a bit of scheduler bookkeeping, and anything it closes over. Spawning one per item of an unbounded input (one per row of a 10-million-row query) can still exhaust memory; bound it (see the worker pool in [[select and Concurrency Patterns]]).
 - Channels add real complexity once you have more than two or three of them feeding into each other with multiple `select` statements. A single `sync.Mutex` around a plain struct is often easier to reason about and to prove correct — see the decision table in [[Concurrency for LLD]].
 - `go f()` with no `WaitGroup`, no channel and no logged error is invisible to tests and to the caller: if `f` panics, the whole process crashes (a panic in a goroutine is not recoverable by any other goroutine), and if it silently fails, nobody is told. Treat "fire and forget" as a deliberate, documented decision, not a default.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** HTTP servers (one goroutine per accepted connection via `net/http`'s internal model, not literally per request under HTTP/2 multiplexing); database connection pools that hand work to worker goroutines; `io.Copy`-style streaming pipelines; graceful shutdown that fans a `context.Context`'s cancellation out to every in-flight goroutine.
 - **Failure modes → fixes:**
@@ -461,7 +514,7 @@ func TestNilChannel_BlocksForever(t *testing.T) {
   - The whole process crashes with "fatal error: all goroutines are asleep - deadlock!" → every goroutine is blocked; dump stacks (`SIGQUIT` or `/debug/pprof/goroutine?debug=2`) to see exactly where.
 - **What to monitor:** `runtime.NumGoroutine()` / the Prometheus Go collector's `go_goroutines` gauge, watched for a trend rather than an absolute number; `goleak.VerifyTestMain` wired into `TestMain` for every package with goroutines, so a leak fails CI instead of showing up as a slow memory climb in production.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **What actually synchronizes.** Under the Go memory model, a send on a channel happens-before the corresponding receive completes, and (for an unbuffered channel) the receive happens-before the send returns. For a buffered channel of capacity C, the k-th receive happens-before the (k+C)-th send completes — the buffer behaves like a capacity-C semaphore.
 
@@ -478,7 +531,7 @@ func TestNilChannel_BlocksForever(t *testing.T) {
 
   Any cleanup that must run (flushing a log buffer, finishing an in-flight write) has to be waited on explicitly before `main` returns, typically with a `WaitGroup` or a bounded shutdown `context.Context`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What happens when you receive from a channel that is closed but still has buffered values in it?
 > You get the next buffered value with `ok=true`, in the order it was sent — close does not discard what is already queued. Only once the buffer is empty does a receive start returning the zero value with `ok=false`.
@@ -505,7 +558,7 @@ func TestNilChannel_BlocksForever(t *testing.T) {
 >
 > When multiple goroutines need to read and write the *same* shared state, a mutex is usually simpler and easier to verify than an equivalent built from channels and `select`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `go f()` starts `f` concurrently and returns immediately; nothing waits for it unless you add a `WaitGroup` or a channel.
 - Unbuffered = synchronous handoff; buffered(N) = queue up to N before blocking.

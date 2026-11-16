@@ -30,7 +30,35 @@ updated: 2026-11-13
 > - `filepath.IsLocal` (Go 1.20) is a cheap, purely lexical check — not a symlink-aware one. `os.Root` (Go 1.24, see [[File Uploads and Object Storage]]) is the syscall-level check that closes the gap a lexical check leaves open.
 > - Classic mistake: assuming `govulncheck` passing means "no known vulnerable dependencies." It specifically means "no known vulnerable function in a dependency that this binary's call graph can actually reach" — a vulnerable function your code never calls does not fail the build.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Attackers do not break the crypto; they use your own features against you. Secure coding means treating every value a client can influence — URL, body, filename, header — as hostile until checked.
+
+The big three injections all share one shape: data gets pasted into a place where it is read as **instructions**.
+
+```mermaid
+flowchart LR
+    U[Untrusted input] --> Q{Pasted into a command?}
+    Q -- "SQL string" --> I1[SQL injection]
+    Q -- "shell string" --> I2[Command injection]
+    Q -- "file path" --> I3[Path traversal]
+    Q -- "kept as data" --> OK[Safe]
+```
+
+The defence is always the same idea: keep data as data. Use SQL placeholders, pass command arguments as a list (never a shell string), and pin file access inside one directory.
+
+The rest of this note is just these 4 questions:
+1. What is checked at the request trust boundary, control by control?
+2. How do you do SQL, shell commands and file paths safely in Go?
+3. How do you guard uploads (zip bombs) and secrets (timing, logs)?
+4. Which modern crypto helpers should you reach for?
 
 **The problem in one story.**
 A user types a name into a search box.
@@ -80,7 +108,7 @@ Where it breaks: a mailroom checks once at the door; in code each destination (S
 > [!tip] Remember
 > Untrusted text must pass one typed gate for where it is going, and never becomes code.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps ships a bulk-import feature: an admin uploads a `.zip` of CSV invoice batches, picks a column to sort the import summary by, and the system renders that summary to PDF by shelling out to an external renderer.
 
@@ -97,7 +125,7 @@ One feature, four different places untrusted input can reach something dangerous
 
 Each of these has a narrow, specific Go fix — not "be more careful," but a specific function or pattern that removes the category of bug entirely.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat every value that crossed the network — a query parameter, a form field, an uploaded file's contents or name, a response from a URL a user configured — as adversarial input until it has passed through exactly one narrow, typed gate meant for its destination:
 
@@ -108,9 +136,11 @@ Treat every value that crossed the network — a query parameter, a form field, 
 
 String concatenation, a shell, or an un-capped decoder are never that gate — each is a way for input to carry its own structure past the destination's rules instead of being treated as inert data.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The request trust boundary, control by control
+
+**In plain words:** a walk along the front door: for each thing a client sends, the one check that makes it safe to touch.
 
 ```mermaid
 flowchart LR
@@ -133,6 +163,8 @@ Everything left of "this note" in the diagram already has its own full treatment
 
 ### SQL: why `ORDER BY` cannot use a placeholder
 
+**In plain words:** placeholders protect values, not structure — a column name is structure, so it needs an allowlist instead.
+
 ```go
 // Both of these run against the same *sql.DB. Only one is safe.
 db.QueryContext(ctx, "SELECT * FROM invoices WHERE status = $1", status) // OK: value
@@ -146,6 +178,8 @@ A column name or `ASC`/`DESC` keyword is part of the grammar itself; there is no
 [[Building REST Endpoints]] already shows this exact allowlist pattern for a `WHERE`-clause filter value (`allowedStatusFilter`); the function below applies the same idea to the one place a value-allowlist isn't the whole story — a sort column feeds directly into the query text, not into a bind parameter, even once it's been validated.
 
 ### `os/exec`: argv vs. a shell string
+
+**In plain words:** pass a program and its arguments as separate list items; the moment you build one shell string, attacker text becomes attacker commands.
 
 ```mermaid
 flowchart TD
@@ -163,9 +197,11 @@ The moment code builds a string and passes it to `sh -c` (or shells out via `os/
 
 Two residual risks remain even with argv: a user-controlled value starting with `-` can be read by the child as an option (use the tool's `--` end-of-options marker where it supports one, or only pass server-generated paths), and `exec.Command` resolves a bare name through `PATH`, so call a tool by absolute path in hardened containers (Go refuses to run a binary found via the current directory and returns `exec.ErrDot`).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the three injections and their three one-line defences, side by side.
 
 The four vulnerable one-liners, for reference — none of these are ever acceptable, shown only so the fixed versions below are legible by contrast:
 
@@ -327,6 +363,8 @@ func TestRunArgvPassesMetacharactersLiterally(t *testing.T) {
 
 ### Path traversal: the lexical first check
 
+**In plain words:** '../' in a filename is a ladder out of your folder; the first check is pure string math, before the filesystem is ever touched.
+
 ```go
 package securecoding
 
@@ -380,6 +418,8 @@ func TestSafeJoin(t *testing.T) {
 ```
 
 ### Closing the symlink gap with `os.Root`
+
+**In plain words:** string checks cannot see symlinks; os.Root makes the operating system itself refuse to follow anything out of the folder.
 
 ```go
 package securecoding
@@ -702,7 +742,7 @@ func TestSecretIsRedactedInLogs(t *testing.T) {
 
 **Measured:** the test files for the snippets above (SQL sort, argv execution, `IsLocal` plus `os.Root`, zip guard, crypto and constant-time compare, log redaction) pass under `go vet` and `go test -race` on Go 1.24.4, darwin/arm64, 2026-11-07, in under 2 seconds total — 12 tests, including the decompression-ratio assertion above.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | OWASP API Security Top 10 (2023) item | Go-specific control | Owned by |
 | --- | --- | --- |
@@ -737,7 +777,7 @@ Smaller controls from the same audit, each with a one-line Go answer:
 >
 > A vulnerable function in an imported package that the code never calls does not fail the check — which is also exactly why upgrading the dependency is still the right fix the moment that code path does start getting used.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - An identifier allowlist needs a code change every time a new sortable column ships — more maintenance than a value placeholder, but there is no safer alternative for identifiers, so the cost is unavoidable, not optional.
 - Avoiding a shell entirely means losing shell conveniences (globbing, pipes, `&&` chaining) at the call site; where those are genuinely needed, build the pipeline in Go (`io.Pipe`, multiple `exec.Cmd`s) rather than reaching for `sh -c`.
@@ -745,7 +785,7 @@ Smaller controls from the same audit, each with a one-line Go answer:
 - AES-GCM key management (rotation, where the key itself lives) is a real operational cost on top of the cipher code; [[Secrets Management]] is where that key's own lifecycle belongs, not this note.
 - `gosec` produces real false positives (flagging `#nosec`-worthy patterns like a hardcoded non-secret constant or a deliberately weak hash used for a cache key, not a credential); a blanket "fix every finding" policy trains a team to silence the tool instead of reading it — require a one-line justification on every suppression instead.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** the Go vulnerability database (`vuln.go.dev`) that powers `govulncheck` is maintained by the Go security team specifically to support this reachability-based workflow; `gosec` is maintained under the `securego` GitHub organization and ships as a `golangci-lint` linter as well as a standalone binary; OWASP's own API Security Top 10 project collects real incident categories (the BOLA, SSRF and mass-assignment entries are each backed by named public breaches in OWASP's own write-up).
 - **Failure modes → fixes:**
@@ -755,7 +795,7 @@ Smaller controls from the same audit, each with a one-line Go answer:
   - A decrypted-at-rest field comes back as garbage after a key rotation → the old ciphertext was encrypted under the previous key; keep the previous key available for decryption until every existing ciphertext has been re-encrypted under the new one, the same overlap-window pattern [[Service-to-Service Auth - API Keys, HMAC, mTLS]] uses for API key rotation.
 - **What to monitor:** `govulncheck`/`gosec` CI job pass rate and new-finding count per PR (see [[CI-CD Pipelines (GitHub Actions for Go)]] for exactly where these gates sit in the pipeline); `400` rate on sort/filter parameters (a spike suggests either an attack attempt or a client bug); archive-extraction rejections (`ErrDecompressionBomb`) as a signal of either a malicious upload or a misbehaving integration partner.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **How `govulncheck`'s reachability analysis actually works.** It builds a static call graph starting from the binary's `main` (or, for a library, its exported API) and checks, function by function, whether any function named in a Go vulnerability database entry is present in that graph.
 
@@ -778,7 +818,7 @@ Smaller controls from the same audit, each with a one-line Go answer:
 
   This is a property of the package itself, not something a Go service has to opt into or verify per-regex — the one caveat is that `regexp` does not support backreferences or lookahead precisely because supporting them would require abandoning the linear-time guarantee.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why can a `WHERE` clause value be parameterized but an `ORDER BY` column cannot?
 > A placeholder works because the database driver can distinguish a *value* from the query's own grammar at the wire-protocol level and substitute it safely.
@@ -819,7 +859,7 @@ Smaller controls from the same audit, each with a one-line Go answer:
 >
 > `io.LimitReader` wrapped around the entry's decompressing reader enforces the real limit on the real byte stream as it comes out, regardless of what the header claims or how small the compressed file is on disk.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - SQL values → placeholders (`$1`). SQL identifiers (`ORDER BY` column/direction) → an allowlist; there is no placeholder for identifiers.
 - Run external commands with `exec.Command(name, args...)`; never build a string and hand it to `sh -c`.
@@ -831,7 +871,7 @@ Smaller controls from the same audit, each with a one-line Go answer:
 - `gosec` catches the static shape of these bugs (variable URLs and paths, weak crypto, unchecked errors) as a second, automated layer behind code review.
 - Most of the OWASP API Security Top 10 is already fully covered elsewhere in this vault — check the table in section 5 before writing a new fix for BOLA, mass assignment, SSRF, or XSS.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[OWASP API Security Top 10]], [[Request Decoding, Validation and DTOs]], [[Containerizing Go Services]]
 - **Next:** [[gRPC Services in Go]]

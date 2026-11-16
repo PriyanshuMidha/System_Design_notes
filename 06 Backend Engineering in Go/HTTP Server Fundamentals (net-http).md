@@ -23,7 +23,33 @@ updated: 2026-11-13
 > - `ResponseWriter` has ordering rules a compiler can't check: set headers before `WriteHeader`, call `WriteHeader` at most once, and an unwritten status defaults to 200 the instant anything is written.
 > - One goroutine serves one HTTP/1.1 connection's requests sequentially; HTTP/2 hands each stream its own goroutine, so true request-level concurrency on one TCP connection is an HTTP/2 property, not an HTTP/1.1 one.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Everything in Go's web world is built on one tiny idea: a **handler**, a function that takes a request and writes a response. That is the whole interface — one method.
+
+A **ServeMux** (router) is a table that maps "this verb + this path" to "that handler". Since Go 1.22 it understands methods and path wildcards by itself.
+
+```mermaid
+flowchart LR
+    C[Client] --> L[Listener] --> M[ServeMux picks a handler] --> H[Handler writes response]
+```
+
+Each request runs on its own goroutine, so handlers run in parallel and must be safe to run at the same time.
+
+One trap: a default `http.Server` has **no timeouts**. A slow or hostile client can hold a connection open forever. Setting the timeouts is mandatory in production.
+
+The rest of this note is just these 4 questions:
+1. What exactly are `Handler`, `HandlerFunc` and `ServeMux`?
+2. What do the 1.22 routing patterns look like?
+3. What are the rules for writing a response (order of header, status, body)?
+4. Which server timeouts exist, and what attack does each one block?
 
 **The problem in one story.**
 A browser asks your server for `GET /invoices/42`.
@@ -71,6 +97,8 @@ Where it breaks: a clerk handles one card at a time, but Go serves many connecti
 
 ### Whiteboard version
 
+**In plain words:** the smallest real server with sane timeouts.
+
 The whole shape in six lines: register a pattern with a method, start a server with timeouts set, write a response.
 
 ```go
@@ -86,7 +114,7 @@ srv.ListenAndServe()
 
 Everything below fills in why each piece of that shape exists and what breaks when a piece is missing.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A Go process that wants to answer HTTP requests needs three things: something that decides which function handles a given method and path, something that calls that function with the right arguments, and something that enforces limits on misbehaving clients before a handler ever runs.
 
@@ -96,7 +124,7 @@ Concretely: before Go 1.22, `net/http`'s router matched paths only (`"/invoices/
 
 InvoiceOps' old HTTP note had exactly that bug: a hand-rolled method check that the ServeMux itself now does correctly, for free, as long as the registration says which method the pattern is for.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A `ServeMux` is a filing clerk holding a stack of index cards, each one reading "if the request's method and path look like *this*, hand it to *that* function".
 
@@ -110,9 +138,11 @@ Its timeouts are the building's opening-hours policy: `ReadHeaderTimeout` is how
 
 Without a policy, one slow visitor can occupy the clerk's desk (and the goroutine behind it) forever.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The `Handler` interface and the goroutine model
+
+**In plain words:** one interface with one method runs the whole web layer, and every request gets its own goroutine — parallel by default.
 
 ```go
 type Handler interface {
@@ -184,6 +214,8 @@ This was the exact bug the audit found in the old note for this topic: a manual 
 
 ### `ResponseWriter` rules
 
+**In plain words:** writing a response has a fixed order — headers, then status code, then body — and breaking the order fails silently.
+
 Three rules, none enforced by the compiler:
 
 1. **Set headers before calling `WriteHeader` or `Write`.** `w.Header().Set(...)` after either one is a no-op — the header map is only read once, at the moment the status line is actually sent.
@@ -203,6 +235,8 @@ That sniffing is a convenience, not something to depend on for anything security
 `http.TimeoutHandler(h, d, "timed out")` wraps a whole handler so a response that doesn't finish within `d` gets a `503` instead of running unbounded — useful as a blanket backstop around a handler whose own deadline handling can't be trusted yet.
 
 ### `http.Server` fields, with values and the failure each one prevents
+
+**In plain words:** each timeout field is a lock on a different door; the table says which attacker or accident each one keeps out.
 
 ```mermaid
 flowchart TD
@@ -241,6 +275,8 @@ Treating every non-nil return as a crash means a normal, intentional shutdown lo
 
 ### `DefaultServeMux` is a trap, not a convenience
 
+**In plain words:** the global default router is shared by every package in your program, so a stray import can quietly add routes to your server.
+
 `http.HandleFunc` (the package-level function, not a method on a mux you created) registers onto `http.DefaultServeMux`, a single mux shared by the whole process.
 
 Importing `net/http/pprof` anywhere in a binary's dependency graph registers `/debug/pprof/*` on that same default mux as an `init()` side effect — including transitively, through a dependency that imports it for its own reasons.
@@ -263,7 +299,7 @@ The decode/validate/encode steps are [[Request Decoding, Validation and DTOs]]'s
 
 `fiber` is a different thing entirely: it's built on `fasthttp`, not `net/http`, so it is not compatible with any of the stdlib's `http.Handler`-based middleware, and migrating away from it later means rewriting the HTTP layer, not just swapping a router.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A trimmed InvoiceOps HTTP server showing method+wildcard routing, every `http.Server` timeout, `MaxBytesReader`, and the `ResponseWriter` ordering rules enforced in one place. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -720,7 +756,7 @@ func TestServerHasProductionTimeouts(t *testing.T) {
 
 **Measured:** all ten tests pass under `go test -race` on Go 1.24.4, darwin/arm64, 2026-11-07.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Router | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -736,14 +772,14 @@ func TestServerHasProductionTimeouts(t *testing.T) {
 | `WriteTimeout` | Time to write the whole response | No limit |
 | `IdleTimeout` | Time a keep-alive connection may sit idle | Falls back to `ReadTimeout` if that's set, else no limit |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - The stdlib mux's pattern matching covers method, host and path wildcards, but has no built-in route groups, so a service with many nested route prefixes and shared per-group middleware will hand-roll that structure or reach for `chi`.
 - A global `recoverMiddleware` adds a small amount of overhead (one `defer` per request) in exchange for turning every unhandled panic into a logged 500 instead of a silently dropped connection — worth it on every production handler, and arguably unnecessary on an internal tool where a crash is acceptable and visible immediately.
 - `MaxBytesReader` on every body-reading endpoint means picking a limit per endpoint; too tight breaks a legitimate large payload (a bulk import), too loose doesn't actually protect anything. There's no single correct number — it has to match the endpoint's real traffic.
 - Setting `ResponseController` deadlines per-handler only pays off for the one or two endpoints that genuinely need a different timeout than the server-wide default; doing it everywhere just duplicates the server's own `WriteTimeout` with extra code.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** nearly every Go HTTP service at scale (Google's own internal Go services, Cloudflare, HashiCorp's Go tooling) builds on `net/http` directly or on a thin wrapper like `chi`, specifically because stdlib compatibility means every middleware, every `httptest` helper and every profiling tool works without an adapter layer.
 - **Failure modes → fixes:**
@@ -753,14 +789,14 @@ func TestServerHasProductionTimeouts(t *testing.T) {
   - A route that should 404 for `DELETE` instead returns a generic error → the mux only knows about methods actually registered on that path; register the method explicitly (even just to return 405) rather than relying on routing to another handler.
 - **What to monitor:** request duration histograms per route (catches a route silently exceeding its intended `WriteTimeout` budget); count of `413`s (body limit) and `405`s (method mismatches, often from stale clients) per route; goroutine count correlated with active connections, as an early signal of a timeout misconfiguration.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Pattern specificity, precisely.** The router prefers, in order: a pattern with a literal (non-wildcard) segment over one with a wildcard in the same position; among wildcard patterns, a single-segment `{id}` over a multi-segment `{path...}`; and a host-qualified pattern over a host-generic one. Two patterns that could both match some request and where neither is more specific than the other is flagged as a build-time conflict: `mux.Handle` panics the instant such a pair is registered, so the earliest possible point a routing ambiguity can be caught is process startup, not a request that happens to hit the ambiguous case in production.
 - **Why `recoverMiddleware` still matters even though net/http recovers panics itself.** The stdlib's `(*conn).serve` already wraps each request's handler call in its own `recover`, logs the panic and stack to the server's `ErrorLog`, and closes the connection — the process does not crash. But the client sees nothing but a dropped connection (often surfacing as `EOF` or a reset), not an HTTP response at all, and the log entry has no request-scoped context (trace ID, path) unless the middleware adds it. The middleware exists to give the *client* a clean 500 and the *log* request context, not to prevent a process crash that stdlib already prevents.
 - **`MaxBytesReader`'s effect on the connection, not just the read.** Once the limit is exceeded, `MaxBytesReader` doesn't just return an error from the next `Read` call — it also calls `w.(requestTooLarger).requestTooLarge()` internally (an unexported mechanism) to mark the response so the connection is closed after the handler returns, rather than kept alive for a client that may still be mid-stream of an oversized body. That's why an endpoint that uses `MaxBytesReader` and writes `413` can't simply keep serving more requests on the same connection as if nothing happened — net/http deliberately tears the connection down.
 - **HTTP/2's effect on the "one goroutine, sequential requests" model.** HTTP/1.1 without pipelining (which virtually nothing enables) genuinely serializes requests per TCP connection, which is why browsers historically opened up to 6 parallel connections per host. HTTP/2 multiplexes many logical streams over one TCP connection and `net/http`'s HTTP/2 implementation (`golang.org/x/net/http2`, wired in automatically for TLS listeners) gives each stream independent handling, so a single slow request on one stream does not block others on the same connection — a structural difference, not just a performance tweak.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is `if r.Method != http.MethodPost { ... }` wrong to write in a Go 1.22+ handler?
 > Because registering the pattern as `"POST /invoices"` already makes the `ServeMux` return `405 Method Not Allowed` with a correct `Allow` header for any other method on that path, before the handler ever runs. A manual check inside the handler duplicates that logic, usually without the `Allow` header, and can disagree with the mux's own decision if the two are ever out of sync.
@@ -783,7 +819,7 @@ func TestServerHasProductionTimeouts(t *testing.T) {
 > [!question]- Trap: if a handler panics, does the whole server crash?
 > No — `net/http` recovers a panic per-connection on its own and logs it, so the process survives and other connections are unaffected. What the client sees without extra middleware is a dropped connection (often an `EOF`), not a clean error response; `recoverMiddleware` exists to turn that into an actual HTTP `500` with a body the client can parse, not to prevent a crash that was never going to happen anyway.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `http.Handler` is one method, `ServeHTTP`; `http.HandlerFunc` adapts a plain function into one.
 - Go 1.22 patterns: `"METHOD /path/{id}"`, `{path...}` for a trailing wildcard, `{$}` to anchor an exact path. Most-specific pattern wins; ambiguous pairs panic at registration.
@@ -795,7 +831,7 @@ func TestServerHasProductionTimeouts(t *testing.T) {
 - `http.MaxBytesReader` bounds request bodies; `http.ResponseController` and `http.TimeoutHandler` bound per-handler or whole-handler response time.
 - One goroutine per HTTP/1.1 connection, requests sequential on it; HTTP/2 gives each stream its own handling.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Backend Request Lifecycle and Layering]]
 - **Next:** [[Building REST Endpoints]], [[Graceful Shutdown and Health Checks]]

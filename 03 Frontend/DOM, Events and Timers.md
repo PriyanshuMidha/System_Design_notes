@@ -24,7 +24,38 @@ updated: 2026-11-13
 > - One listener on a parent, checking `event.target`, replaces listeners on every child — that's event delegation.
 > - `setInterval(fn, 1000)` fires repeatedly every ~1000ms until `clearInterval` is called; it does not run once. Both timers' delays are a minimum, not a guarantee.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A web page starts as a text file of HTML. The browser reads it once and builds a live model of the page in memory — one object per tag, arranged as a tree. That tree is the **DOM**. From then on, JavaScript changes the page by changing the tree, never the original text.
+
+When you click something, the browser creates an **event** and lets it travel through the tree; any code listening along the way can react.
+
+```mermaid
+flowchart LR
+    H["HTML text<br/>(read once)"] --> T["DOM tree<br/>(live, in memory)"]
+    J["Your JavaScript"] -- "change the tree" --> T
+    T -- "browser repaints" --> S["What you see"]
+```
+
+**Timers** let code run later: `setTimeout` runs once after a wait, `setInterval` keeps repeating until you stop it. The wait is a minimum, not a promise.
+
+```mermaid
+flowchart LR
+    A["setTimeout(fn, 1000)"] --> B["wait ≥ 1s"] --> C["fn runs ONCE"]
+    D["setInterval(fn, 1000)"] --> E["fn runs every ~1s<br/>until clearInterval"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do I find and change things in the DOM tree?
+2. How do events travel, and how do I listen cheaply (delegation)?
+3. What exactly do timers promise, and what do they not?
 
 **The problem in one story.**
 You click a "Like" button and the heart turns red without reloading the page.
@@ -68,7 +99,7 @@ Where it breaks: real family members can't cancel a shout; `stopPropagation` can
 > [!tip] Remember
 > JS changes the page through the DOM tree; events flow down then up; timer delays are a minimum, not a promise.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 HTML describes a page's initial structure, but a page has to react after that: a click, a typed character, data arriving from the network.
 
@@ -80,7 +111,7 @@ There is no HTML for "delete the 4th item" — the delete has to find that speci
 
 That round trip — structure in memory, events telling you what changed, timers letting you defer work — is what this note covers.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The **DOM tree is not the HTML file** — HTML is the opening instructions, and the DOM is the building the browser constructs from them and then keeps live and mutable for the rest of the page's life.
 
@@ -90,9 +121,11 @@ An event is a ripple starting at the window, traveling down to the exact element
 
 A timer is a sticky note with a minimum wait time on it, handed to the browser: "run this no sooner than N ms from now." The browser is free to run it later if it's busy, but never sooner.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The DOM tree, selecting, and updating nodes
+
+**In plain words:** the tree below is the page as the browser holds it in memory. Finding a node is "walk the tree"; changing the page is "edit the tree" — the browser repaints to match.
 
 ```mermaid
 flowchart TD
@@ -132,6 +165,8 @@ Writing to the DOM triggers layout recalculation; reading a layout property (`of
 Fix: read all the values you need first, then do all the writes, or batch writes with `requestAnimationFrame`.
 
 ### Event flow: capture, target, bubble, and delegation
+
+**In plain words:** a click does not land only on the thing you clicked. The event rides down the tree to it, then back up through every parent — so a parent can listen once for all of its children.
 
 ```mermaid
 sequenceDiagram
@@ -247,7 +282,7 @@ sequenceDiagram
 > [!tip] Remember
 > A timer's delay is always a minimum, never a guarantee — the callback still waits in line for the call stack to clear and for its turn on the task queue.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -261,6 +296,8 @@ document.querySelector("#images").addEventListener("click", (e) => {
 
 ### Timer trace: one-shot vs repeating
 
+**In plain words:** run the snippet in your head first — the synchronous lines always print before any timer, even a 0ms one.
+
 ```js
 console.log("A");
 setTimeout(() => console.log("C - once, after >= 0ms"), 0);
@@ -273,6 +310,8 @@ setTimeout(() => clearInterval(id), 1700); // stop the interval after about 3 ti
 `A` and `B` print immediately because they're synchronous; `C` and the first `D` only run once the current script finishes and the stack is empty, confirming the "minimum delay, not guaranteed" rule even for a `0ms` timeout.
 
 ### Go comparison: `time.Timer` vs `time.Ticker`
+
+**In plain words:** Go has the same two alarm clocks as JavaScript — one that rings once and one that keeps ringing — so the mapping below is one-to-one.
 
 Go's standard library draws exactly this same one-shot-vs-repeating line, and the parallel makes `setInterval` easy to remember: a `Timer` is `setTimeout`, a `Ticker` is `setInterval`, and `Ticker.Stop()` is `clearInterval`. Both sides share the same rule traced above: the delay is a minimum, never a guarantee.
 
@@ -295,7 +334,7 @@ flowchart TD
     Q -->|"run repeatedly, every N ms, until stopped"| SI["setInterval"]
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -306,14 +345,14 @@ flowchart TD
 | `IntersectionObserver` | Callback fires when an element crosses a viewport threshold | Lazy-loading images, infinite scroll, "seen" tracking | Cheaper than scroll-event polling; still asynchronous |
 | `AbortController` + `{ signal }` | One `abort()` call removes every listener registered with that signal | Removing several listeners together, e.g. on component teardown | Needs a listener-registration API that accepts `signal` (most DOM APIs do) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `setInterval` drifts: each tick's delay is measured from "whenever the previous callback finished running," so a slow callback makes real intervals longer than requested. A self-rescheduling `setTimeout` is more predictable when exact spacing matters.
 - Attaching a listener per list item instead of delegating one listener to the parent costs more memory and must be re-attached whenever the list changes — delegation avoids both, at the cost of one `if` check per bubbled event.
 - `innerHTML` is the fastest way to write a chunk of markup but is unsafe with any string that could contain user input; `textContent` and DOM-building APIs are safer but more verbose.
 - Polling the DOM (`setInterval` checking `element.getBoundingClientRect()`) to detect visibility works but burns CPU continuously — `IntersectionObserver` does the same job without polling.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `setTimeout`/`clearTimeout` are the backbone of debounce (wait for input to pause before acting — search-as-you-type) and throttle (run at most once per interval — scroll handlers) utilities used in nearly every production frontend. `IntersectionObserver` powers lazy-loaded images and infinite-scroll feeds; `MutationObserver` underlies many browser extensions and some virtual-DOM diffing debug tools.
 - **Failure modes → fixes:**
@@ -322,14 +361,14 @@ flowchart TD
   - A `setInterval`-based poll that silently stops updating → an uncaught exception inside the callback doesn't stop future ticks, but a forgotten `clearInterval` leak does accumulate timers; always store and clear the id when the component/page using it goes away.
 - **What to monitor:** long task warnings in DevTools' Performance panel (tasks over 50ms block input); listener counts per page over time; `IntersectionObserver`/`MutationObserver` callback frequency if a feature feels sluggish.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Macrotasks vs microtasks, and where timers sit.** `setTimeout`/`setInterval` callbacks are macrotasks, always run after any pending Promise callbacks — see [[JavaScript Async - Event Loop, Promises, async-await]] for the full event-loop mechanics.
 - **Minimum delay in practice.** Browsers clamp nested timers: after about 5 levels of a timer re-scheduling itself with `delay < 4ms`, engines force a 4ms floor, specifically to stop runaway timer loops from starving the rest of the page. A background (inactive) tab is throttled further, often to once per second or slower, to save power.
 - **Event delegation and `stopPropagation`.** Calling `stopPropagation` inside a delegated listener for one widget can silently break a different, unrelated listener higher up the tree that was relying on the event reaching it (for example, a modal's "click outside to close" handler on `document`). Treat `stopPropagation` as a last resort, not a default habit.
 - **`requestAnimationFrame` vs timers for animation.** A `setInterval(fn, 16)` tries to approximate 60fps but drifts and keeps running in a background tab (wasting battery) unless you manage it yourself; `requestAnimationFrame` is synced to the actual display refresh and is automatically paused when the tab isn't visible.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: does `setInterval(fn, 1000)` run `fn` once, after 1 second?
 > No — that's `setTimeout`. `setInterval` runs `fn` repeatedly, roughly every 1000ms, forever, until you call `clearInterval` with the id it returned. Conflating the two is the most common timer mistake.
@@ -355,7 +394,7 @@ flowchart TD
 > [!question]- You attached five listeners in a component and need to remove all of them when it unmounts. What's the cleanest way?
 > Create one `AbortController`, pass its `signal` to every `addEventListener` call (`{ signal: ac.signal }`), and call `ac.abort()` once on teardown. That removes all five listeners in one call, instead of storing five separate function references and calling `removeEventListener` on each — and it can't accidentally miss one.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - The DOM is a live in-memory tree built from HTML text once; HTML itself isn't consulted again after parsing.
 - Events: capture (down) → target → bubble (up); `stopPropagation` stops the ripple, `preventDefault` stops the browser's default action.
@@ -366,7 +405,7 @@ flowchart TD
 - Prefer `IntersectionObserver`/`MutationObserver` over polling the DOM in a loop.
 - Share one `AbortController` across several listeners that should all be removed together; one `abort()` replaces a list of paired `removeEventListener` calls.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[JavaScript Core - Types, Scope, Hoisting, Closures, this]], [[JavaScript Objects, Arrays and Iteration]]
 - **Next:** [[JavaScript Async - Event Loop, Promises, async-await]], [[React Fundamentals - Components, JSX, Props, State]]

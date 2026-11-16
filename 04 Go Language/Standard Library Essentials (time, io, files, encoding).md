@@ -25,7 +25,38 @@ updated: 2026-11-13
 > - `bufio.Scanner` silently stops at 64KB per token unless you grow its buffer.
 > - Stdlib crypto/encoding helpers (`base64`, `hex`, `sha256`, `hmac`) are usually enough; reach for a library only past that.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how each package works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every program needs the same boring jobs done: know what time it is, read a file, write a file, turn data into text and back. Go ships ready-made code for all of that. That bundle is called the **standard library** — packages that come with Go, no download needed.
+
+The clever part is one tiny idea: anything you can read bytes from is an **io.Reader**, and anything you can write bytes to is an **io.Writer**. A file, a network connection, a zip — all the same shape.
+
+```mermaid
+flowchart LR
+    A["File / network /<br/>anything"] -- "io.Reader" --> B["Your code"]
+    B -- "io.Writer" --> C["File / response /<br/>anything"]
+```
+
+Because everything has the same shape, pieces snap together like pipe fittings. Read a file, hash it, and save it — all in one flow, piece by piece, without loading it all into memory.
+
+```mermaid
+flowchart LR
+    U["2 GB upload"] --> T["read in small chunks"] --> F["file on disk"]
+    T -.-> H["checksum, computed<br/>in the same pass"]
+```
+
+The rest of this note is just these 4 questions:
+1. How do you handle dates and times without timezone bugs?
+2. How do you stream big data without big memory?
+3. How do you write a file so a crash never leaves it half-written?
+4. Which encoding/hashing helper do you reach for, and when?
 
 **The problem in one story.**
 Your service must log the time, read a 2 GB upload, save it to disk and return JSON.
@@ -67,7 +98,7 @@ Where it breaks: real pipes leak visibly; a forgotten `Close` or `Flush` loses d
 > [!tip] Remember
 > Most of the standard library is small types plugged together through `io.Reader` and `io.Writer`.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An invoice service in Go 1.24 has to: parse a due date from a form field, store an uploaded PDF without ever leaving a half-written file if the client disconnects mid-upload, and compute a checksum of that file for later integrity checks. Three one-line mistakes are common here:
 
@@ -77,7 +108,7 @@ An invoice service in Go 1.24 has to: parse a due date from a form field, store 
 
 Each of these is a standard-library idiom away from being correct, and all three idioms — `ParseInLocation`, checking `Close`'s error, and write-to-temp-then-rename — are this note.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The standard library's I/O and file packages are built from a few tiny interfaces that compose like Unix pipes:
 
@@ -94,9 +125,11 @@ io.MultiWriter(ws...)  one Write fans out to every w
 
 Two `time.Time` values for "the same instant" can still differ in location or in whether they carry a monotonic reading, so `==` is the wrong comparison; `Equal` compares the instant only.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### time: instants, durations, timers
+
+**In plain words:** a `time.Time` is like a photo of a clock plus a label saying which city's clock it was — comparing two photos needs `Equal`, not `==`.
 
 - **Fields and comparison.** `t.Year()/Month()/Day()` read wall-clock fields in `t`'s location. `t.UTC()`/`t.In(loc)` convert the location without changing the instant. Use `a.Equal(b)` for "same instant", `a.Before(b)`/`a.After(b)` for ordering, and reserve `==` for things like map keys where you deliberately want location and monotonic-reading equality too.
 - **Elapsed time.** `time.Since(start)` and `time.Until(deadline)` use the monotonic reading when `start`/`deadline` still carry one, so they are immune to the wall clock being adjusted (NTP, manual clock change) mid-measurement. Values decoded from JSON, a database, or `ParseInLocation` have **no** monotonic reading — they are reconstructed from wall-clock fields — so timing code should call `time.Now()` fresh, not reuse a parsed/stored time.
@@ -120,11 +153,15 @@ stateDiagram-v2
 
 ### io and bufio: streaming without buffering everything
 
+**In plain words:** instead of pouring a whole lake into a bucket, you pass water along cup by cup — `io.Copy` and friends move data in small chunks so memory stays tiny.
+
 - **Composition.** `io.Copy(dst, src)` streams in fixed-size chunks (32KB by default, or `src`'s own `WriteTo`/`ReadFrom` if it implements one) — a 2GB file copies without a 2GB buffer. `io.TeeReader(r, w)` lets you compute a hash *while* copying, in one pass, instead of reading the data twice. `io.LimitReader(r, n)` caps how much a handler will read from a client body, which is also a denial-of-service guard. `io.MultiWriter(a, b)` writes once, fans out to both. `io.Pipe()` returns a synchronous in-memory `*PipeWriter`/`*PipeReader` pair with no buffer: a `Write` blocks until a matching `Read` consumes it (and vice versa) — the standard way to feed something that only accepts an `io.Reader` (like `http.NewRequest`'s body) from something that only produces via `io.Writer` (like `json.NewEncoder`), by running the writer side in its own goroutine.
 - **bufio.Scanner's token limit.** `bufio.NewScanner(r)` defaults to a 64KB (`bufio.MaxScanTokenSize`) maximum token (by default, one line with `ScanLines`). A longer line makes `Scan()` return `false` and `Err()` return `bufio.ErrTooLong` — not a crash, just silently-stops-reading unless you check `Err()`. Call `sc.Buffer(buf, max)` to raise the cap.
 - **bufio.Writer.Flush.** A `bufio.Writer` buffers writes in memory; the underlying writer never sees the last partial buffer until `Flush()` (or `Close()` on types that call it) runs. Forgetting `Flush` is how "the file is empty" bugs happen when a program exits right after writing.
 
 ### Files and paths
+
+**In plain words:** saving a file safely is like swapping a painting in a gallery — you hang the new one next to it fully finished, then swap in one move (`Rename`), so no visitor ever sees a half-painted canvas.
 
 - **Whole-file helpers.** `os.ReadFile`/`os.WriteFile` are the right tool for small, complete files (open, do the I/O, close, in one call) — they are not streaming APIs. `os.OpenFile(path, flag, perm)` gives control: `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREATE`, `O_TRUNC` (truncate existing content), `O_APPEND` (writes always go to the end, atomically per write on POSIX), `O_EXCL` (fail if the file already exists — useful for "create, don't overwrite").
 - **Check Close's error.** `Write` can return `nil` even though the data isn't safely on disk yet if the writer buffers internally (true of some network filesystems and, for `*os.File`, true of the final flush at `Close` on some platforms/filesystems). Always check the error from `Close`, especially on the write path; see `AtomicWriteFile` below.
@@ -146,6 +183,8 @@ flowchart LR
 
 ### Encoding, hashing and a few more
 
+**In plain words:** encodings are just safe ways to write raw bytes as text (like spelling a word out letter by letter over the phone), and hashes are short fingerprints of data.
+
 - **base64.** `base64.StdEncoding` (`+`/`/`, padded with `=`) is for general binary-to-text; `base64.URLEncoding` (`-`/`_`) is safe inside URLs and filenames. `RawStdEncoding`/`RawURLEncoding` drop the `=` padding, which some systems (JWT) require.
 - **hex.** `encoding/hex.EncodeToString`/`DecodeString` — the simplest binary-to-text form, twice the length of the input, used for checksums and IDs that need to be eyeballed.
 - **sha256 and hmac.** `crypto/sha256.Sum256(data)` for content fingerprints (not for passwords — use `golang.org/x/crypto/bcrypt` for those). `crypto/hmac.New(sha256.New, key)` for a keyed, forgery-resistant checksum (webhook signature verification); always compare the computed and received MAC with `hmac.Equal`, which runs in constant time and avoids leaking timing information a byte-by-byte `==` would.
@@ -155,7 +194,7 @@ flowchart LR
 - **os/exec and os/signal.** `exec.CommandContext(ctx, name, args...)` ties a subprocess's lifetime to a context, so a cancelled request kills the child instead of leaking it; `CombinedOutput`/`Output` capture stdout/stderr. `signal.Notify(ch, os.Interrupt, syscall.SIGTERM)` is how a service catches a graceful-shutdown signal from its orchestrator instead of dying mid-request.
 - **math/rand/v2 vs crypto/rand.** `math/rand/v2` (Go 1.22+) is fast and reproducible with a seed — fine for load-test jitter, shuffling non-security data, or sampling. It is never safe for tokens, session IDs, or anything an attacker could predict and exploit; use `crypto/rand.Read` (or `crypto/rand.Text()`, added in Go 1.24, for a ready-made random string) for those.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -329,7 +368,7 @@ func TestReadConfigHandlesLineOverDefaultScannerLimit(t *testing.T) {
 
 **Measured** (Go 1.24.4, darwin/arm64, 2026-11-07, `go test -race -v ./...`): all 5 tests pass, including `TestParseInvoiceDateIsAnchoredToLocation` which checks that `"2026-11-07"` parsed in `Asia/Kolkata` round-trips to `2026-11-07T00:00:00+05:30`, while the same string parsed in `UTC` gives `2026-11-07T00:00:00Z` — two different instants from the same digits, which is exactly the bug `ParseInLocation` prevents.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Need | Option | Use when | Cost |
 | --- | --- | --- | --- |
@@ -343,14 +382,14 @@ func TestReadConfigHandlesLineOverDefaultScannerLimit(t *testing.T) {
 | Random bytes | `math/rand/v2` | Simulations, jitter, load tests, shuffling | Predictable: never for security |
 | Random bytes | `crypto/rand` | Tokens, IDs, nonces, anything security-sensitive | Slower; always check the error |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `io.Copy`/streaming composition is the wrong tool when you must validate the *whole* payload before acting on any of it (e.g., verify a signature covering the full body before processing) — buffer first, or use a dedicated verifying reader that fails closed if the check happens after bytes have already been acted on.
 - Atomic rename only protects a single file's replace; it does not make a multi-file update (config + its index) atomic. For that, write all the new files under a new directory name and rename the directory, or use a database.
 - `os.Root` is new (Go 1.24): a service that must also support older Go, or needs the boundary enforced at the OS/container level (chroot, a read-only bind mount) rather than in-process, should not rely on it alone.
 - `text/template` is fine, even preferred, for machine-to-machine output (config files, SQL fragments a human reviews) where HTML escaping would corrupt the output — just never for a browser response.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** S3 SDKs use `io.Reader`/`TeeReader` throughout for streaming uploads with checksums; most backup/export tools use the temp-file-then-rename pattern for crash-safe writes; API gateways validate webhook signatures with `hmac.Equal`.
 - **Failure modes → fixes:**
@@ -361,7 +400,7 @@ func TestReadConfigHandlesLineOverDefaultScannerLimit(t *testing.T) {
   - Timer leak in a hot retry loop → reuse one `Timer` with `Reset`, don't call `time.After` per iteration.
 - **What to monitor:** disk free space before large atomic writes (temp + final both exist briefly, doubling peak usage); `Close`/`Sync` error rates on the write path; config-parse failures after a deploy (a line that grew past the old Scanner buffer is a real incident, not a flake).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why rename is atomic but copy isn't.** `os.Rename` on the same filesystem just repoints a directory entry — one metadata operation the filesystem journals or makes atomic at the inode level. Copying bytes into an existing file (`O_TRUNC`+write) is many separate write syscalls; a crash between any two of them leaves a mixed-content file. This is also why the temp file must be created in the **same directory** (same filesystem/mount) as the target — `os.Rename` across filesystems returns `EXDEV` and is not atomic (Go's `os.Rename` does not silently fall back to copy+delete).
 - **Monotonic time internals.** On Linux, `time.Now()` reads both `CLOCK_REALTIME` (wall) and `CLOCK_MONOTONIC` (monotonic) in one call and stores both in the `Time` struct; `Sub`, `Since`, `Until`, `After`, `Before` prefer the monotonic reading when both values have one, so NTP step adjustments to the wall clock don't corrupt an elapsed-time measurement mid-flight. Marshaling a `Time` to text (`String`, `Format`, JSON) always drops the monotonic reading — only the wall clock and location survive a round trip through a layout.
@@ -369,7 +408,7 @@ func TestReadConfigHandlesLineOverDefaultScannerLimit(t *testing.T) {
 - **HMAC vs a plain hash for signatures.** `sha256.Sum256(secret + body)` is subtly breakable (length-extension attacks let an attacker append data and compute a valid hash for the extended message without knowing the secret, because SHA-256 is a Merkle–Damgård construction). `hmac.New(sha256.New, key)` is specifically designed to resist this; always use `hmac`, never a bare hash, for a keyed signature.
 - **`embed` is compile-time.** `//go:embed templates/*.html` bakes the files into the binary at build time — there is no way to update an embedded file without rebuilding and redeploying. It is for static assets that ship with the binary (migrations, templates, default config), not for anything an operator needs to change independently.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `time.Parse("2006-01-02", s)` return the "wrong" time for a non-UTC business?
 > It has no timezone in the layout, so Go assumes UTC. `time.ParseInLocation(layout, s, loc)` assumes `loc` instead — always use it for a date with local business meaning, and store the result as UTC afterward.
@@ -392,7 +431,7 @@ func TestReadConfigHandlesLineOverDefaultScannerLimit(t *testing.T) {
 > [!question]- Trap: is `a == b` ever wrong for two `time.Time` values that represent the same moment?
 > Yes. `==` compares the struct fields directly, including location and whether a monotonic reading is attached; two `Time` values for the same instant in different locations, or one freshly read and one round-tripped through JSON, can differ there and fail `==` while still being the same instant. Use `a.Equal(b)`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `time.ParseInLocation` for business dates; store UTC; compare with `Equal`/`Before`/`After`, never `==`.
 - `Add` for exact durations, `AddDate` for calendar units (DST-safe because it re-normalizes wall-clock fields).
@@ -403,7 +442,7 @@ func TestReadConfigHandlesLineOverDefaultScannerLimit(t *testing.T) {
 - `os.Root` (Go 1.24) confines file access to a directory, even against `..` and symlink escapes.
 - `hmac.Equal` for signature comparison (constant-time); `crypto/rand` for anything security-sensitive.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Syntax, Types and Control Flow]], [[Error Handling]], [[Strings, Bytes, Runes and Unicode]]
 - **Next:** [[Testing in Go]], [[Context Package]]

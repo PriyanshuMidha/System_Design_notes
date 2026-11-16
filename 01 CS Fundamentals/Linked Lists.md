@@ -20,7 +20,36 @@ updated: 2026-11-13
 > - In Go, a slice beats a linked list for almost everything, because contiguous memory wins on cache locality even when the Big-O looks worse on paper; the exception is when you already hold a reference to the node you need to change.
 > - The textbook case where that exception matters is an LRU cache: a hash map for `O(1)` lookup by key, paired with a doubly linked list for `O(1)` reordering by recency.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example, LRU cache).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An array stores items side by side, like numbered seats in a row. To squeeze a new item into the middle, everyone after it must shift over.
+
+A **linked list** stores items anywhere in memory. Each item is a little box (a **node**) that holds a value plus the address of the next box (a **pointer**).
+
+```mermaid
+flowchart LR
+    A["Array: [10][20][30]<br/>side by side"] -->|insert in middle| B["everything after shifts"]
+```
+
+```mermaid
+flowchart LR
+    N1["10"] -->|"points to"| N2["20"] -->|"points to"| N3["30"] --> X["end (nil)"]
+```
+
+Because boxes only point at each other, pulling one out or hooking one in is instant — you rewrite a pointer or two and nothing shifts. The catch: to find box number 37 you must walk through the 36 boxes before it, one hop at a time.
+
+The rest of this note is just these 4 questions:
+1. When is "instant unhook/re-hook" actually worth it?
+2. How do singly, doubly and circular lists differ?
+3. Why does a plain Go slice still beat a list most of the time?
+4. How does the classic map + list combo make an LRU cache?
 
 **The problem in one story.**
 You keep a "recently viewed" list of 50 products.
@@ -62,7 +91,7 @@ Where it breaks: real train carriages sit side by side, while list nodes are sca
 > [!tip] Remember
 > A linked list is fast to rewire at a node you hold, slow to find a node in the first place.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you're building the "recently viewed items" list for a user, capped at 50 entries. Viewing an already-listed item must move it back to the front instead of adding a duplicate.
 
@@ -77,7 +106,7 @@ It's rarely the right default collection (see "Trade-offs" below for why), but i
 > [!tip] Remember
 > A linked list trades fast *random access* for fast *local* insert/delete — it is a specialist tool for the second job, not a general-purpose replacement for a slice.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a treasure hunt where each clue tells you only the location of the *next* clue. You can't skip ahead, and you can't see every clue laid out at once — you only know "here," plus how to get to "next" (a **singly linked list**), or "here," "next," **and** "previous" (a **doubly linked list**).
 
@@ -86,7 +115,7 @@ A slice is the opposite: a numbered map where you can jump straight to clue 37 w
 > [!warning] Common mistake
 > Treating "linked lists are O(1) to insert" as a blanket win over slices. The `O(1)` only applies *after* you've already reached the right node — and reaching it, for a linked list, is `O(n)` with no shortcut. A slice's `O(n)` insert is often faster in practice precisely because *finding* the spot is `O(1)` (you already have the index) and the shift itself is one fast, cache-friendly `memmove`.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
 
@@ -163,9 +192,11 @@ flowchart LR
 > [!tip] Remember
 > Circular = tail's `next` points at the head (and, if doubly linked, the head's `prev` points at the tail) instead of at `nil`.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** reversing a list means walking it once and making every arrow point backwards instead of forwards.
 
 ```go
 type Node struct {
@@ -219,7 +250,7 @@ flowchart LR
 > [!tip] Remember
 > LRU = map (instant lookup by key) + doubly linked list (instant reorder by recency), with the map's values pointing directly into the list's nodes so neither structure ever has to search the other.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -229,17 +260,25 @@ flowchart LR
 | `container/list` | Go's built-in doubly linked list, `any`-typed | You want the pattern without writing it yourself, and the type-assertion cost is acceptable | Same as doubly linked list; extra type assertion per access |
 | Slice (for comparison) | Contiguous array | Almost everything else: iteration, index access, append at the end | See [[Arrays and Dynamic Arrays (Go Slices)]] |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **In Go, a slice wins for most workloads, even ones that look list-shaped.** Each node is a separate heap allocation, so walking a list of `n` nodes means `n` potential cache misses, versus a slice's single contiguous scan. For small-to-medium `n`, a slice's `O(n)` middle-insert (a shift) is often faster in wall-clock time than a linked list's `O(1)` insert, because the shift is a tight, cache-friendly `memmove`, while the list insert is preceded by an `O(n)` cache-unfriendly search just to find the insertion point. See [[Memory Hierarchy and CPU Caches]] for the actual latency numbers behind "cache miss."
 - **Per-node overhead.** Every node is its own allocation with its own pointer(s) and (in Go) a few bytes of allocator bookkeeping. For small value types, this overhead can dwarf the value itself, and it adds garbage-collector pressure that a single slice allocation doesn't.
 - **No random access.** Reaching element `k` is `O(k)`, always — there is no way to jump to an index the way a slice does.
 - **When it's still the right call.** You hold external references to nodes and need `O(1)` splice/move/delete at those references without a preceding search (the LRU case above), or you need to merge/split lists without copying (reattaching pointers is `O(1)`; splitting or merging slices copies).
 
+**Slice or linked list? One question decides it:**
+
+```mermaid
+flowchart TD
+    Q["Do you already hold a pointer<br/>to the exact node to change?"] -- "no" --> S["Use a slice<br/>(cache-friendly, simpler)"]
+    Q -- "yes, and you move/delete it often" --> L["Linked list earns its keep<br/>(LRU cache pattern)"]
+```
+
 > [!warning] Common mistake
 > Reaching for a linked list because "insert is O(1)" without checking whether you actually hold a node reference. If you don't, every insert or delete first pays an `O(n)` search to find the right spot — at which point a slice's `O(n)` shift, which skips that search entirely, is usually both simpler and faster in practice.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Memcached maintains an exact LRU list per slab class this way — a hash table for `O(1)` key lookup plus a doubly linked list for `O(1)` move-to-front on every `get`. Java's `LinkedHashMap` in access-order mode is the same pairing exposed as a library call (override `removeEldestEntry` and you have an LRU cache in a few lines). Redis, by contrast, deliberately avoids an exact recency list: `maxmemory-policy allkeys-lru` approximates LRU by sampling a few random keys and evicting the oldest of that sample, because a full doubly linked list reordered on every access doesn't scale to Redis's typical keyspace sizes. Browser history and most undo/redo UIs model "back/forward" as two stacks rather than a list, but editors that need arbitrary jump-to-any-point-in-history sometimes use a doubly linked list of states.
 - **Failure modes → fixes:**
@@ -248,14 +287,14 @@ flowchart LR
   - Nil-pointer panics from forgetting to update a neighbor's pointer during a manual delete → prefer `container/list`'s tested implementation over hand-rolled pointer surgery unless you specifically need a typed version.
 - **What to monitor:** for an LRU built this way, hit rate and eviction rate. A map/list size mismatch (`len(items) != ll.Len()`) is a sign of a bug, not something to monitor in steady state — it should never happen.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why Go has no generic linked list in the standard library until you build one.** `container/list` predates Go generics (added in Go 1.18) and stores `any`, trading compile-time type safety and an allocation-free unboxed value for genericity. Most production code wraps it in a small generic type, or writes the roughly 20 lines of a typed doubly linked list directly, as shown in the Go note.
 - **GC pressure.** Each node is a separate heap object the garbage collector must trace; a slice of `n` elements is one object (plus however many its elements themselves allocate). For large `n`, a linked list meaningfully increases GC scan work compared to one contiguous slice.
 - **Why `q = q[1:]` isn't "a linked list without the pointers."** It looks similar — drop the front, keep going — but it leaks the first element's backing-array slot: the underlying array never shrinks, so a long-running queue built this way grows its backing array without bound even though `len` stays small. See [[Stacks, Queues and Deques]] for the ring-buffer fix.
 - **Intrusive lists.** In lower-level systems code (the Linux kernel's `list_head`, for example), the "next/prev" pointers live *inside* the struct being linked rather than wrapping it in a separate node. This avoids one extra allocation and pointer hop per element, at the cost of a less generic design: one element can only be a member of that specific list type. Go's `container/list` is not intrusive; it wraps your value in its own `Element`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why would you choose a linked list over a slice in Go, given slices usually win on cache locality?
 > Only when you hold a reference to a specific node and need to insert, delete, or move it without first searching for it — the clearest case being an LRU cache's recency list, where `Get`/`Put` must reorder in `O(1)` given a node you already have via a side map.
@@ -278,7 +317,7 @@ flowchart LR
 > [!question]- What's the practical downside of a linked list that Big-O doesn't show?
 > Per-node heap allocation and pointer-chasing: each hop between nodes is a potential cache miss (tens to roughly 100 ns on modern DRAM, versus well under 1 ns for data already in cache), and more heap objects means more work for the garbage collector to trace, even when the asymptotic complexity matches or beats a slice's.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Linked list = chain of heap nodes; `O(1)` insert/delete at a known node, `O(n)` to reach any node by position.
 - Singly linked: forward pointer only. Doubly linked: also backward, which is what makes `O(1)` delete-from-the-middle possible.
@@ -288,7 +327,7 @@ flowchart LR
 - `q = q[1:]` on a slice is not a substitute for a ring buffer: it leaks the dropped prefix's backing-array space.
 - Classic patterns: reverse (prev/cur/next), Floyd's cycle detection (slow/fast), slow/fast for the middle, dummy node for merges and nth-from-end.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Data Structures Overview and Big-O Cheat Sheet]], [[Arrays and Dynamic Arrays (Go Slices)]]
 - **Next:** [[Stacks, Queues and Deques]]

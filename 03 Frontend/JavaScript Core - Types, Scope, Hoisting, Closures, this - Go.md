@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This note's Go code demonstrates, with real tests, the two JavaScript mechanisms that are easiest to get wrong on a whiteboard: how a closure captures a variable by reference (not by value), and how a "primitive-like" copy differs from a "reference-like" copy. See [[JavaScript Core - Types, Scope, Hoisting, Closures, this]] for the JavaScript side of each idea.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the "Code" walkthrough and the "Tests" section.
+> - 🔴 **Interview / SDE-3 prep?** Add "Design decisions", "Pitfalls" and the "Exercises". Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of the JavaScript Core theory note. In plain words: it uses small Go programs with real tests to prove two ideas people mix up. First, a **closure** — a function that keeps using a variable from the function that created it, even after that function returned; the counter here really shares one `count` across calls. Second, the copy question: copying a plain value (a struct, a JS number) gives you an independent copy, but copying a slice or a JS array only copies the handle — both handles still point at the same data. Read "Before the code" for the Go bits, then walk the four short steps. All code stays runnable as-is.
+
+## Before the code 🟢
 
 - **Closures** (`func() int { count++; ... }`): a function literal that uses a variable from the function around it and keeps it alive after that function returns.
 - **Function types** (`func() int`, `[]func() int`): functions are values, so they can be returned and stored in slices.
@@ -25,7 +34,7 @@ updated: 2026-11-13
 - **Slices share their backing array**: copying a slice copies a small header, not the elements, so writes through the copy are visible to the caller.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module (with `go 1.22` or later in `go.mod`). No goroutines, interfaces or generics are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 | Go code | Implements the theory idea at | What it proves |
 | --- | --- | --- |
@@ -34,7 +43,7 @@ updated: 2026-11-13
 | `MovePrimitiveLike` | [[JavaScript Core - Types, Scope, Hoisting, Closures, this#Primitive vs reference types]] | A value-type copy (Go struct, JS primitive) is independent of the original |
 | `MoveReferenceLike` | [[JavaScript Core - Types, Scope, Hoisting, Closures, this#Primitive vs reference types]] | A reference-type copy (Go slice header, JS object/array) shares the underlying data |
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, no external dependencies.
 - Module layout: a single package, `closures`, with its implementation and its tests side by side.
@@ -47,9 +56,11 @@ jscoredemo/
     └── closures_test.go
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: a closure that captures a counter by reference
+
+**In plain words:** `NewCounter` builds a tiny machine with a hidden number inside. Every time you press the button (call the returned function), the same hidden number goes up by one.
 
 **Concept.** This is the Go equivalent of JavaScript's `makeCounter()` from the theory note: a function returns another function, and that returned function keeps working with the *same* `count` variable across calls, because it was never copied — it was captured.
 
@@ -85,6 +96,8 @@ flowchart TD
 
 ### Step 2: per-iteration capture (the loop-variable fix)
 
+**In plain words:** three functions are made inside a loop, and each remembers its own `i` (0, 1, 2) — not one shared `i`. This is the modern fix for a classic bug both languages had.
+
 **Concept.** This function exists to demonstrate a single, specific fact: as of Go 1.22, a `for` loop's index variable is a fresh variable on every iteration, not one variable reused and mutated in place.
 
 Before Go 1.22, every closure created inside the loop body would have shared the *same* `i`, and all three would have read whatever `i` ended up being after the loop finished — identical to the pre-`let` JavaScript `var` bug shown in the theory note.
@@ -111,6 +124,8 @@ func CapturePerIteration() []func() int {
 
 ### Step 3: primitive-like copies stay independent
 
+**In plain words:** handing over a struct is like photocopying a page — scribble on the copy all you like, the original stays clean.
+
 **Concept.** This models JavaScript's primitive assignment (`let b = a`), where copying a number, string or boolean gives you a fully independent value.
 
 In Go, passing a `Point` (a plain struct of two `int`s) by value does the same thing: the function receives its own copy, and mutating that copy can never reach back and change the caller's original.
@@ -134,6 +149,8 @@ func MovePrimitiveLike(p Point) Point {
 3. The caller's original `Point` is never touched — it's a completely separate copy, the same way `b = a; b = 10` leaves `a` alone for a JS number.
 
 ### Step 4: reference-like copies share the underlying data
+
+**In plain words:** handing over a slice is like sharing a link to the same document — edits made through either link show up for both.
 
 **Concept.** This models JavaScript's reference assignment (`let arr2 = arr1`), where both names end up pointing at the same underlying array.
 
@@ -211,7 +228,7 @@ flowchart LR
 > }
 > ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -219,7 +236,7 @@ flowchart LR
 | `CapturePerIteration` relies on Go 1.22+ loop semantics rather than manually shadowing `i := i` | Keep the pre-1.22 `i := i` workaround for portability | The module declares `go 1.24` in `go.mod`, so the newer semantics are guaranteed; code meant to run on older Go toolchains would need the manual shadow |
 | `MovePrimitiveLike` takes and returns `Point` by value | Take `*Point` and mutate in place | Pass-by-value is what makes the "independent copy" property true and testable; a pointer parameter would turn this into the reference-like case instead |
 
-## Tests
+## Tests 🟡
 
 ### TestNewCounterCapturesByReference
 
@@ -320,7 +337,7 @@ func TestReferenceLikeSharesBackingArray(t *testing.T) {
 
 A failure where `original[0]` stayed `1` would mean the slice's backing array was somehow copied instead of shared — contradicting how Go slices actually work.
 
-## Running it
+## Running it 🟢
 
 ```text
 $ go vet ./...
@@ -348,18 +365,18 @@ Each `--- PASS` line confirms one property held: the counter's shared state grew
 
 The final `ok` line with `-race` enabled also confirms no data race was detected across any of the four tests — though none of these four functions touch shared memory from more than one goroutine, so this is a basic sanity check rather than a concurrency stress test.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `NewCounter`'s `count` escapes to the heap because the compiler can prove a reference to it outlives the call to `NewCounter` — this is normal and correct, but it's worth knowing that *every* Go closure capturing a local variable can force that variable onto the heap, which has a (usually negligible) allocation cost compared to a stack-only function.
 - `CapturePerIteration` only behaves this way because the module's `go.mod` declares Go 1.22 or later. A module built with an older declared language version keeps the pre-1.22 shared-loop-variable behavior even on a newer `go` toolchain, since the fix is gated by the language version, not the installed compiler.
 - `MoveReferenceLike` silently does nothing on an empty slice (`len(s) > 0` guards the write) rather than panicking — a deliberate choice here, but a caller who expects every call to mutate index 0 could be surprised by an empty slice being silently skipped.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `NewCounter` so it initializes `count` to `10` instead of `0`. Predict what `c()` and the second `c()` call return, then run the test to check.
 2. Remove the Go-1.22 per-iteration guarantee by rewriting `CapturePerIteration` to declare `i` once before the loop with `var i int` and use `i++` inside the loop body instead of `for i := 0; ...`. Predict what all three closures now return, then run `TestCapturePerIteration` and see it fail with the old pre-1.22 bug reproduced.
 3. Add a new function `MoveMapLike(m map[string]int)` that sets `m["x"] = 10`, plus a test that confirms the caller's original map sees the write — maps are reference-like in Go exactly like slices. Predict the result before writing the test.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[JavaScript Core - Types, Scope, Hoisting, Closures, this]]

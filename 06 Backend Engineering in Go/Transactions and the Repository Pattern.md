@@ -27,7 +27,33 @@ status: reviewed
 > - Never make a network call — a queue publish, an HTTP request — while a transaction is open. Write an outbox row instead, and publish it after commit.
 > - Optimistic locking (a version column) and row locks (`SELECT ... FOR UPDATE`) solve the same problem — a concurrent writer — at different costs.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some changes only make sense together. Move money: subtract here, add there. If the power dies between the two, the money vanishes.
+
+A **transaction** makes a group of writes all-or-nothing: either every one lands, or none do.
+
+```mermaid
+flowchart LR
+    B[Begin] --> W1[Write 1] --> W2[Write 2] --> C{All good?}
+    C -- yes --> OK[Commit: all land]
+    C -- no --> RB[Rollback: none land]
+```
+
+In Go the catch is plumbing: every repository call that must be inside the same transaction has to receive the same `*sql.Tx`, not grab a fresh connection from the pool. A **repository** is just the struct that wraps your SQL; this note shows how several repositories share one transaction cleanly.
+
+The rest of this note is just these 4 questions:
+1. What is the begin / defer rollback / commit lifecycle?
+2. How do several repositories share one transaction?
+3. Row locks or version numbers — how do you stop lost updates?
+4. Why can "publish to the queue" never be a step inside a transaction (the outbox)?
 
 **The problem in one story.**
 A customer pays an invoice. Your code must mark the invoice paid AND record the payment.
@@ -74,7 +100,7 @@ Where it breaks: a real shop lets other shoppers grab items while you browse; a 
 > [!tip] Remember
 > One transaction, one connection, passed to every repository; commit once at the end, and never call the network while it is open.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps processes a payment webhook: record the webhook event, apply the payment amount to the invoice, insert a payment row, and queue a notification — four writes that must all happen or none of them should.
 
@@ -88,7 +114,7 @@ The repository pattern solves a separate but related problem: without it, the we
 
 A repository hides the SQL behind `repo.ApplyPayment(ctx, id, amount)`; the question this note answers is how several repositories agree to share one transaction instead of each opening its own.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A transaction is a **tab you open at a bar**: everything ordered against that tab is provisional until you either `COMMIT` (pay and keep it) or `ROLLBACK` (walk away, nothing happened).
 
@@ -96,9 +122,11 @@ A transaction is a **tab you open at a bar**: everything ordered against that ta
 
 The repository pattern is a **job ticket that doesn't care which tab it's billed to**. A repository method takes a `DBTX` — "something that can run a query" — and the caller decides whether that's the bar's shared register (`*sql.DB`, no transaction) or one specific open tab (`*sql.Tx`, inside `WithTx`). The repository's code never changes either way.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The transaction lifecycle
+
+**In plain words:** begin, do the writes, commit — with a deferred rollback as the safety net that undoes everything if the function bails out early.
 
 ```mermaid
 stateDiagram-v2
@@ -117,6 +145,8 @@ stateDiagram-v2
 `defer tx.Rollback()` placed immediately after a successful `BeginTx` covers every exit path: an early `return err`, a panic that unwinds through the defer, or simply reaching `tx.Commit()` — at which point the deferred `Rollback` call still runs, finds the transaction already finished, and does nothing.
 
 ### Sharing one transaction across repositories
+
+**In plain words:** the service opens the transaction and hands the same handle to every repository call, like one shopping basket passed between aisles.
 
 ```mermaid
 sequenceDiagram
@@ -188,6 +218,8 @@ Neither `InvoiceRepo` nor `PaymentRepo` imports `*sql.DB` or `*sql.Tx` directly 
 
 ### `DBTX` and the `WithTx` helper
 
+**In plain words:** one small interface that both the pool and a transaction satisfy, so the same repository code runs in either without knowing which.
+
 ```go
 // DBTX is satisfied by both *sql.DB and *sql.Tx. Every repository is
 // built from this interface, not from *sql.DB directly, so the exact
@@ -233,6 +265,8 @@ Three hazards `BeginTx` and `*sql.Tx` carry that are easy to miss:
 
 ### Row locks vs optimistic locking
 
+**In plain words:** two ways to stop two writers trampling each other: lock the row while you work, or let both try and reject the one holding stale data.
+
 ```mermaid
 flowchart TD
     C[Concurrent writers touching one row] --> Q{Expected contention?}
@@ -249,6 +283,8 @@ flowchart TD
   - It reads a `version` column, then writes with `WHERE id = ? AND version = ?`; if another transaction committed a change in between, `RowsAffected()` comes back `0` and the caller knows to re-read and retry — see [[Locking - Optimistic vs Pessimistic]] for the general trade-off.
 
 ### The outbox pattern, and why step 5 cannot be "publish to the queue"
+
+**In plain words:** a queue cannot join a database transaction, so you write the message into an outbox table inside the transaction and ship it afterwards.
 
 The old note's webhook steps put "enqueue follow-up job or outbox event" inside the transaction, as if a queue publish and an outbox insert were interchangeable.
 
@@ -268,7 +304,7 @@ Under `SERIALIZABLE` or `REPEATABLE READ` isolation, Postgres can abort a transa
 
 Both are meant to be retried: wrap the whole transaction body in a retry loop with a short backoff, and only retry these two codes — a unique-constraint violation or a syntax error retried in a loop just repeats the same failure forever.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -563,7 +599,7 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 - `TestRetryTx_RetriesRetryableThenSucceeds` / `TestRetryTx_StopsOnNonRetryableError` — the retry loop retries a transient error and gives up immediately on a business one.
 - `TestConcurrentApplyPayment_OnlyOneWinnerPerVersion` — 8 goroutines race `ApplyPayment` from the same starting version; exactly one wins and the other 7 get `ErrVersionConflict`, proving the version check is a real compare-and-swap under `go test -race`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -572,7 +608,7 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 | Service-layer transaction script | The service function itself calls `tx.ExecContext` directly, no repository layer | A very small service, or a single-table CRUD app | SQL and business logic mixed in one function; harder to test or reuse |
 | ORM-managed transaction (GORM `.Transaction(...)`) | The ORM opens and manages the transaction, you pass a callback | Already committed to an ORM across the codebase | Less control over isolation level and retry behavior; the ORM's own abstractions leak into error handling |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A transaction that spans an entire request, including slow calls to other services, holds one pooled connection — and often row locks — for the whole time. Keep transactions short: only the database writes that must be atomic, nothing else.
 - Optimistic locking pushes the retry burden to the caller. For a hot row with constant contention, the version check fails so often that `SELECT ... FOR UPDATE` (serializing writers but succeeding on the first try) can be the simpler, faster choice in practice — measure instead of assuming optimistic is always cheaper.
@@ -580,7 +616,7 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
   - For a system that can tolerate an at-least-once publish with no ordering guarantee and doesn't need the commit and the publish to be atomic, publishing directly after commit (accepting the small window where the publish can fail and nothing retries it) is sometimes an acceptable, simpler trade.
 - A single-statement write never needs a transaction at all — `*sql.DB` already runs one statement atomically. Wrapping it in `BeginTx`/`Commit` only adds overhead.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** the outbox pattern is the standard fix for the dual-write problem in event-driven services (documented extensively by Chris Richardson's microservices.io patterns and implemented via Debezium-style CDC in production Kafka pipelines); sqlc's generated `WithTx` method is the same `DBTX`-interface idea shipped as codegen; payment processors (Stripe's own webhook-handling guidance) specifically recommend a unique event-id constraint for webhook idempotency.
 - **Failure modes → fixes:**
@@ -590,7 +626,7 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
   - Retrying every database error, including constraint violations, in a loop → check the actual SQLSTATE/error and only retry `40001`/`40P01`-class errors.
 - **What to monitor:** transaction duration (p50/p99), `pg_stat_activity.state = 'idle in transaction'` count and age, lock wait time, outbox table backlog (`published = 0` row count and oldest row age), and the ratio of version conflicts to total writes per hot row.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `defer tx.Rollback()` is always safe.** `database/sql`'s `Tx.Rollback` is documented to return `sql.ErrTxDone` if the transaction has already been committed or rolled back, rather than erroring or re-rolling-back. The deferred call's return value is simply discarded (hence the `//nolint:errcheck`), which is correct here specifically because that one error value is defined to be harmless.
 - **Isolation levels change what "version conflict" even means.** Under Postgres's default `READ COMMITTED`, an `UPDATE ... WHERE version = ?` can still race correctly because each statement sees a fresh snapshot — this is why the optimistic check above works without raising the isolation level.
@@ -601,7 +637,7 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 - **Savepoints** (`SAVEPOINT`, `ROLLBACK TO SAVEPOINT`) give a transaction a partial rollback point for isolated recoverable sub-steps — useful when one step in a larger transaction (for example, an optional enrichment call that itself hits the database) is allowed to fail without discarding everything already done.
   - `database/sql` has no direct savepoint API; it requires running the `SAVEPOINT ...` SQL text through the same `*sql.Tx`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is `defer tx.Rollback()` placed right after `BeginTx`, not after the last statement?
 > So it covers every exit path — an early `return err`, a panic, or reaching `Commit()` successfully — with one line. It is safe after a successful commit because `Tx.Rollback` is documented to return `sql.ErrTxDone` (a no-op signal) once the transaction is already finished, rather than erroring or undoing the commit.
@@ -638,7 +674,7 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 >
 > Classify errors first: only retry Postgres SQLSTATE `40001`/`40P01` (or, in this note's SQLite test environment, "database is locked"/"database is busy"), and return everything else immediately.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `defer tx.Rollback()` immediately after `BeginTx`; it's a safe no-op after a successful `Commit`.
 - A transaction pins one connection: don't use it from two goroutines, and don't hold it open across a slow or external call.
@@ -649,7 +685,7 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 - Retry only SQLSTATE `40001` (serialization failure) and `40P01` (deadlock) — never retry a business error like a conflict or a constraint violation.
 - A unique constraint on `(provider, event_id)` with `ON CONFLICT DO NOTHING` is the simplest correct webhook idempotency check.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Database Access (database-sql, pgx, sqlc)]], [[Transactions and ACID]]
 - **Next:** [[Schema Migrations in Go Services]], [[Testing Go Services]]

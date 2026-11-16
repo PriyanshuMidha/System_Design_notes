@@ -18,7 +18,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code builds a toy flash translation layer (FTL) — the firmware logic every real SSD runs — and measures write amplification rising as a drive fills up. It demonstrates in a runnable, testable form the mechanism described in [[Storage Devices - HDD, SSD, NVMe]]: pages, erase blocks, garbage collection, and why over-provisioning matters.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Storage Devices - HDD, SSD, NVMe]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Storage Devices - HDD, SSD, NVMe]]. It builds a toy version of the firmware brain inside every SSD (a flash translation layer), then measures write amplification growing as the drive fills up — the theory note's pages, erase blocks and garbage collection made runnable. Read each step's notes before the code.
+
+## Before the code 🟢
 
 - **Structs with methods** (`FTL`, `func (f *FTL) Write`): the flash translation layer is one struct whose methods change its state.
 - **Pointer receivers** (`*FTL`): methods change the shared FTL itself, not a copy.
@@ -27,7 +34,7 @@ updated: 2026-11-13
 - **Helper functions in tests** (`writeRandom`): shared setup that several tests reuse.
 - **What to run:** `go vet ./... && go test -race ./...` inside the module; add `-v -run TestAmplification` to see the amplification numbers.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept | Link |
 | --- | --- | --- |
@@ -37,7 +44,7 @@ updated: 2026-11-13
 | `FTL.WriteAmplification` | The WAF formula `(host writes + GC writes) / host writes` | [[Storage Devices - HDD, SSD, NVMe#Deep dive]] |
 | `TestAmplificationRisesAsOverProvisioningShrinks` | Over-provisioning keeps WAF low; a full drive amplifies more | [[Storage Devices - HDD, SSD, NVMe#Wear leveling TRIM and over-provisioning the three levers that fight write amplification]] |
 
-## Setup
+## Setup 🟢
 
 - Module: `storage`, Go 1.24.4, no external dependencies.
 - Layout:
@@ -54,7 +61,7 @@ updated: 2026-11-13
   go test -race -v ./... -run TestAmplification
   ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the geometry and page states
 
@@ -452,7 +459,7 @@ func (f *FTL) WriteAmplification() float64 {
 > }
 > ```
 
-## Tests
+## Tests 🟡
 
 ### `TestSequentialWritesNoAmplification`
 
@@ -551,7 +558,7 @@ func TestGCPreservesMapping(t *testing.T) {
 
 A failure here is the most serious possible bug class for this code: silent data loss or corruption during garbage collection, exactly the class of bug a real SSD's firmware testing exists to rule out.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -560,7 +567,7 @@ A failure here is the most serious possible bug class for this code: silent data
 | `panic` on exhausted capacity | Return an error from `allocPage` | A panic is louder and simpler for a teaching toy proving over-provisioning math; production code should return an error (`ErrDriveFull`) so callers can apply backpressure instead of crashing |
 | `map[int]int` for the translation table | A flat `[]int` indexed by LBA | The map works for any LBA value without needing to know the logical address space size up front, at the cost of slower lookups than direct array indexing |
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go test -race -v ./...
@@ -581,13 +588,13 @@ The second test's `t.Logf` line is the headline number from the theory note's wo
 
 The third test's silent pass confirms no data was lost or corrupted across 5,000 writes and repeated garbage collection cycles. `-race` found no data races because this code is single-goroutine; it is run here for consistency with every other Go note in this vault.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - Forgetting `float64(...)` on either side of the division in `WriteAmplification` silently truncates the ratio to an integer — Go will not warn you, because integer division is valid Go, just wrong here.
 - `garbageCollect` assumes at least one block exists with a computable `bestLive`; calling it on an `FTL` with zero blocks would leave `best == -1` and panic on `f.blocks[best]` — not exercised by the tests above because `NewFTL` is never called with 0 blocks, but worth guarding in production code.
 - The `panic` calls in `allocPage` and `copyForward` are correctness safety nets, not expected code paths — if a test ever triggers one, the fix is almost always "this working set doesn't fit the configured over-provisioning," not a bug in the GC logic itself.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change this, predict the result:** lower `pagesPerBlock` from 4 to 2 and rerun `TestAmplificationRisesAsOverProvisioningShrinks`. Predict whether the 80%-full amplification goes up or down before running it, and explain why using the "fewest live pages" GC policy.
 2. **Change this, predict the result:** change `allocPage`'s trigger from `f.freePages() <= pagesPerBlock` to `f.freePages() <= pagesPerBlock*2` (double the effective over-provisioning reserve) and predict what happens to both the 40%-full and 80%-full amplification numbers.

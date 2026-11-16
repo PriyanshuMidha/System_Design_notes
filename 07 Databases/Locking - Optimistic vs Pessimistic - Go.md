@@ -23,7 +23,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Runnable Go for [[Locking - Optimistic vs Pessimistic]]: an optimistic `RecordPayment` loop that re-reads and retries when the version check fails, an in-memory store that behaves like the SQL `UPDATE … WHERE id = $1 AND version = $2`, a PostgreSQL store, the pessimistic alternative with `FOR NO KEY UPDATE` and `lock_timeout`, a lock-ordering helper, an error classifier, and the `SKIP LOCKED` job-queue SQL. The optimistic logic and its 50-goroutine race test run without a database.
 
-## Before the code
+## Before the code 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and Step 1 only.
+> - 🟡 **Know the basics?** Add Steps 2-4 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢 This file is the hands-on half of [[Locking - Optimistic vs Pessimistic]]: working Go code for both cures to the lost-update bug. The heart of it is one small loop, `RecordPayment`, that reads an invoice, does the maths, and writes back only if the row's version number has not moved; if it has, the loop re-reads and tries again. The same loop runs against a tiny in-memory store (for tests, no database needed) and against real PostgreSQL, and the file ends with the pessimistic lock-first version and the job-queue SQL. Read the theory note first, then follow the steps in order; the tests show the 50-writers race actually coming out right.
 
 - **Interfaces**: `Store` has only `Get` and `UpdateIfVersion`, so the same `RecordPayment` works with memory or PostgreSQL.
 - **Sentinel errors**: `ErrConflict` and `ErrOverpay` are compared with `errors.Is` to decide "retry" or "stop".
@@ -32,7 +39,7 @@ updated: 2026-11-13
 - **`context.Context`**: every database call can be cancelled; `pgx` transactions use it too.
 - **Run**: `go mod tidy && go vet ./... && go test -race -v ./...` (no database needed).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where it is explained |
 | --- | --- | --- |
@@ -58,7 +65,7 @@ flowchart TD
 
 The `Store` interface is the seam. The optimistic loop depends only on it, so the same business logic runs against an in-memory map in tests and against PostgreSQL in production. The pessimistic function is separate because it needs a real transaction with a held lock, which no in-memory fake can imitate faithfully.
 
-## Setup
+## Setup 🟢
 
 - Module `example.com/locking`, one package `locking` with five files: `optimistic.go` (types, `Store`, `RecordPayment`), `memstore.go`, `pgstore.go` (PostgreSQL store, pessimistic variant, `LockOrder`, `Retryable`), `locking_test.go`.
 - Go 1.24. The only dependency is `github.com/jackc/pgx/v5` (v5.7.2 for the measured run), used by `pgstore.go` and the classifier test.
@@ -71,9 +78,11 @@ go vet ./...
 go test -race -v ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the optimistic loop
+
+**In plain words:** the whole optimistic idea as one small function: read, check the business rule, write only if the version is unchanged, and on a clash wait a moment and start over.
 
 **Concept.** Optimistic locking assumes conflicts are rare: read the row with its `version`, compute the change, and write only if the version is unchanged ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]).
 
@@ -205,6 +214,8 @@ The second half writes with the version check. Success returns the new invoice, 
 
 ### Step 2: an in-memory store with the same semantics as the SQL
 
+**In plain words:** a toy database made of a Go map and a mutex, built to reject stale versions exactly the way the real SQL does, so the loop can be tested with no database at all.
+
 **Concept.** The version check is simple enough to reproduce exactly in memory: compare under a mutex, then write.
 
 This gives a test double with the same contract as `UPDATE … WHERE id = $1 AND version = $2` evaluated under a row lock ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]).
@@ -285,6 +296,8 @@ flowchart LR
 ```
 
 ### Step 3: the PostgreSQL side
+
+**In plain words:** the same two store methods done with real SQL, plus the lock-first alternative, the lock-several-rows-in-order helper, and the "is this error worth retrying?" classifier.
 
 **Concept.** The same two-method contract is implemented over PostgreSQL, plus the pessimistic alternative, lock ordering and an error classifier. The version column is added once:
 
@@ -464,6 +477,8 @@ Note that the pessimistic version still bumps `version`. Mixing styles is fine a
 
 ### Step 4: the SKIP LOCKED job queue in SQL
 
+**In plain words:** the one statement that lets many workers share a to-do table: each claims the next few unclaimed rows and skips, rather than waits on, rows another worker holds.
+
 **Concept.** A job table with many workers is a contention hot spot if every worker waits for the same first row.
 
 `FOR UPDATE SKIP LOCKED` makes each worker skip rows another worker has locked, so workers take disjoint batches without waiting ([[Locking - Optimistic vs Pessimistic#The SKIP LOCKED job queue]]).
@@ -506,7 +521,7 @@ sequenceDiagram
     W1->>T: COMMIT, rows 1 to 10 are running
 ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -521,7 +536,7 @@ sequenceDiagram
 | `LockOrder` sorts and de-duplicates ids | Rely on deadlock detection (`40P01`) | Prevents most deadlocks outright; detection after `deadlock_timeout` is still the fallback |
 | `SKIP LOCKED` job claim | `ORDER BY ... LIMIT 1 FOR UPDATE` per worker | Workers do not wait on each other; strict global order is lost |
 
-## Tests
+## Tests 🟡
 
 The tests: a deterministic replay of the lost-update interleaving, 50 goroutines paying at once, the no-retry rule for business errors, lock ordering and the error classifier. All of them use `MemStore` or pure functions, so no database is needed.
 
@@ -550,6 +565,8 @@ import (
 | `TestLockOrder`, `TestRetryable` | pure functions | no I/O at all |
 
 ### TestStaleVersionIsRejected
+
+**In plain words:** write with yesterday's version number and check the store says no.
 
 **Property.** An update based on a stale version is rejected, and the first writer's change survives. This is the lost-update scenario replayed without any concurrency, so it is fully deterministic and shows exactly what the version check prevents.
 
@@ -586,6 +603,8 @@ func TestStaleVersionIsRejected(t *testing.T) {
 If B's write is accepted, A's 30,000 is overwritten (the paid amount would read 50,000), which is exactly the lost update the version column exists to stop. If the final version is not 8, the store bumps the version wrongly, so later writers would be mis-detected.
 
 ### TestConcurrentPaymentsAllLand
+
+**In plain words:** fire 50 payments at one invoice at the same time and check that every single one lands: the total is exact and the version moved exactly 50 times.
 
 **Property.** Under real concurrency with `-race`, no payment is lost and none is applied twice: 50 goroutines each pay 2,000 against an invoice of 100,000, and the loop's retries make every one of them land. It also checks that `RecordPayment` is free of data races.
 
@@ -673,6 +692,8 @@ An unsorted result would reintroduce the lock-order deadlock between a transacti
 
 ### TestRetryable
 
+**In plain words:** feed the classifier the three retryable database errors plus some that are not, and check it sorts them correctly.
+
 **Property.** The classifier accepts `40001`, `40P01` and `55P03`, rejects other codes such as `23505`, and works when the error is wrapped. A plain non-database error is never retryable.
 
 | Error | Expected `Retryable` |
@@ -727,7 +748,7 @@ ok  	example.com/locking
 3. `TestStaleVersionIsRejected` has no log line because it is deterministic: exactly one conflict, by construction.
 4. `PASS` followed by `ok example.com/locking` means all five tests passed with the race detector enabled and no data race was found, which confirms that the mutex in `MemStore` protects the shared map.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`MemStore` is not a database.** It reproduces the version-check semantics, not isolation levels, lock waits or deadlocks. `PGStore` and `RecordPaymentLocked` need a real PostgreSQL to test lock timeouts.
 - **`UpdateIfVersion` returns the same `ErrConflict` for "row changed" and "row deleted".** The Postgres store cannot tell them apart from `RowsAffected() == 0`; the retry's `Get` then returns `ErrNotFound`.
@@ -737,13 +758,13 @@ ok  	example.com/locking
 - **Every writer must bump `version`.** One code path that updates `paid_minor` without `version = version + 1` silently disables the optimistic check for everyone else.
 - **At REPEATABLE READ the conflict arrives as `40001`, not as 0 rows.** `PGStore.UpdateIfVersion` would return that error unchanged; `Retryable` is the place to treat it as a conflict.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `maxAttempts` in `TestConcurrentPaymentsAllLand` from 1000 to 2. Predict whether the test still passes and what error some goroutines return, then run it several times with `-race`.
 2. Remove `slices.Compact` from `LockOrder`. Predict the result for `LockOrder([]int64{42, 7, 42, 13})` and why a duplicate id in a `FOR UPDATE` list is a problem even though PostgreSQL tolerates it.
 3. In `MemStore.UpdateIfVersion`, delete the `m.Conflicts++` line and the `expected` comparison so every write succeeds. Predict which test fails first.
 
-## Links
+## Links 🟢
 
 - Theory: [[Locking - Optimistic vs Pessimistic]]
 - **Before this:** [[Isolation Levels and MVCC - Go]], [[Transactions and ACID - Go]]

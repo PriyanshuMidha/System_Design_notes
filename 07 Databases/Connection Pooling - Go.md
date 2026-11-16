@@ -24,7 +24,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Connection Pooling]]: a pool written as a buffered channel with a deadline on waiting, a fake `database/sql` driver that sleeps 20 ms per query so the real Go pool can be measured without a server, a leaky and a fixed query function with tests that prove the leak and the fix, and the production configuration for `database/sql` and `pgxpool`.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" just below, then "Before the code", "What this code shows" and Step 1 (the tiny channel pool). That is enough for a first pass.
+> - 🟡 **Know the basics?** Read all Code steps, Design decisions and Running it.
+> - 🔴 **Interview / SDE-3 prep?** Add the Tests, Pitfalls and Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero** 🟢 — This file is the hands-on twin of [[Connection Pooling]]. It builds a pool out of one Go channel, then uses a fake database driver (every query just sleeps 20 ms) to measure the real Go pool: how a small pool caps speed, how a forgotten `rows.Close()` drains it, and how the fix works. Read the theory note first, then walk the steps top to bottom; the tests prove each claim.
+
+## Before the code 🟢
 
 - **Buffered channels** (`chan *Conn`): a queue with a fixed capacity; receiving borrows a connection and sending returns it.
 - **`select`**: waits on several channel operations at once, here "a free connection" or "the deadline passed".
@@ -33,7 +40,7 @@ updated: 2026-11-13
 - **`defer`**: runs `rows.Close()` when the function returns, which is what prevents the leak.
 - **What to run:** `go vet ./... && go test -race -v ./...`; `config.go` needs `github.com/jackc/pgx/v5` (`go mod tidy`).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -54,21 +61,23 @@ flowchart LR
     PW["pool.go<br/>channel pool"] -. "whiteboard model of the same idea" .-> DB
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. The only dependency is `github.com/jackc/pgx/v5` v5.8.0, used by `config.go`; everything else is the standard library.
 - Layout: a module `pool` with `pool.go`, `config.go`, `fakedb.go`, `overdue.go` and their tests (`pool_test.go`, `overdue_test.go`).
 - Run it with `go vet ./... && go test -race -v ./...`. No database is needed: the tests use the fake driver. `NewPool` needs a real PostgreSQL DSN and is verified to compile only.
 
-## How to read this note
+## How to read this note 🟢
 
 Each code step has the same shape: a Concept paragraph that links the code to the theory note and names the alternatives, a short block of at most about 25 lines, and a numbered How it works list that walks through the key lines.
 
 Blocks that belong to one file continue each other, so a function may be cut in two pieces with a sentence in between. The files are `pool.go`, `fakedb.go`, `overdue.go`, `config.go`, `pool_test.go` and `overdue_test.go`.
 
-## Code
+## Code 🟡
 
 ### Step 1: the channel pool
+
+**In plain words:** a pool in 30 lines — a channel pre-filled with connections; taking one is borrowing, sending it back is returning, and `select` adds the "give up after a while" rule.
 
 **Concept.** The theory note says a pool is a bounded queue of connections where a caller waits when the queue is empty and gives up when its deadline passes ([[Connection Pooling#Borrowing and returning]], [[Connection Pooling#Waiting for a connection]]).
 
@@ -141,6 +150,8 @@ sequenceDiagram
 ```
 
 ### Step 2: a fake driver
+
+**In plain words:** a pretend database whose every query sleeps 20 ms, so we can measure the real Go pool on a laptop with no server.
 
 **Concept.** To measure a real `database/sql` pool without a PostgreSQL server, the code plugs a fake driver under it.
 
@@ -248,6 +259,8 @@ flowchart LR
 
 ### Step 3: the leaky and the fixed query
 
+**In plain words:** two versions of the same function — one forgets `rows.Close()` and quietly steals a connection, the other defers it and always gives the connection back.
+
 **Concept.** The theory note's leak example shows that `QueryContext` holds its connection until `rows.Close()` or until `rows.Next()` returns false ([[Connection Pooling#Borrowing and returning]], [[Connection Pooling#A leak, traced]]).
 
 The two functions below are identical except for one line, so a test can prove that the missing `defer rows.Close()` is the entire bug.
@@ -328,6 +341,8 @@ stateDiagram-v2
 
 ### Step 4: production configuration
 
+**In plain words:** the real-world settings — one helper that sets all four pool dials for `database/sql` and one for pgx.
+
 **Concept.** In production you size the pool from the connection budget, not from the defaults ([[Connection Pooling#The knobs]], [[Connection Pooling#Production configuration]]). The defaults are unsafe: `MaxOpenConns` is unlimited, so a traffic spike turns into a connection storm on PostgreSQL.
 
 `ConfigureDB` sets the four `database/sql` knobs, and `NewPool` does the same for `pgxpool`, which also has jitter on the lifetime.
@@ -394,7 +409,7 @@ func NewPool(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, er
 4. `NewWithConfig` returns without connecting, so `Ping` makes a wrong DSN or a down database fail at start-up.
 5. If `Ping` fails, `pool.Close()` releases the background health-check goroutine before returning the error.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -407,7 +422,7 @@ func NewPool(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, er
 | `Ping` inside `NewPool` | Lazy first-use failure | Fails at start-up, costs one round trip |
 | Lifetime jitter only in `NewPool` | Same for both | `database/sql` has no jitter setting, so only pgx can spread reconnects |
 
-## Tests
+## Tests 🟡
 
 ### Test 1: acquire waits, then times out
 
@@ -628,7 +643,7 @@ The second piece polls until the connection comes back.
 
 **If it fails.** A timeout means the rows were never closed after cancel. That would suggest the driver ignores the context or the Go version changed this behaviour.
 
-## Running it
+## Running it 🟢
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -665,7 +680,7 @@ The earlier measurements with other pool sizes show the same law, time = 40 / po
 | 20           | 42 ms               | 20        | 21 ms        |
 | 40           | 21 ms               | 0         | 0            |
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`SetMaxIdleConns` defaults to 2.** `newDB` raises it to `maxOpen`; without that, bursts close and reopen connections and the timing numbers mean nothing.
 - **`rows.Next()` returning false closes the rows,** but returning early after a successful `Next` does not. Always `defer rows.Close()` right after the error check.
@@ -674,7 +689,7 @@ The earlier measurements with other pool sizes show the same law, time = 40 / po
 - **`database/sql` has no connection-lifetime jitter,** so `ConfigureDB` cannot spread reconnects; `NewPool` can, through `MaxConnLifetimeJitter`.
 - **The fake database has unlimited capacity,** so a bigger pool always wins in these tests. A real server stops scaling past its cores.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestPoolCapsThroughput`, change the pool size from 4 to 8. Predict the minimum elapsed time and the `WaitCount`, then adjust the assertion and run it.
 2. Remove `db.SetMaxIdleConns(maxOpen)` from `newDB` and run with `maxOpen = 4`. Predict which `DBStats` counter starts to climb, and print it.

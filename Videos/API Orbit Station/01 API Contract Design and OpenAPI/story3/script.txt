@@ -1,0 +1,207 @@
+# API Contract Design and OpenAPI, v3 (conversational). Orbit Station ep 1: The Two Hatches. Source: [[API Contract Design and OpenAPI]], [[OpenAPI-First Development in Go]]
+== s1 The ship that cannot dock
+a1 | N | hook | A ship is low on fuel. It has half an hour to dock. But the docking arm does not fit the hatch.
+a2 | VEGA | question | Wait. Say again? It doesn't fit?
+a3 | PIP | warn | The ship crew built the arm.
+a3b | VEGA | question | And the station crew built the hatch?
+a3c | PIP | warn | Yep. And nobody wrote the size down.
+a4 | VEGA | warn | Oh no. Half an hour, and nobody owns this.
+a5 | N | normal | Today's story is about one simple idea. When two teams build two halves of one thing, they must agree on the shape first, in writing.
+a6 | N | calm | So the rule is: write the shape down before anyone builds.
+== s2 The label nobody told us about
+b1 | N | normal | While Vega thinks, a second problem shows up. The cargo screen on the ship has gone blank.
+b2 | PIP | warn | Commander! It worked this morning!
+b2b | VEGA | question | Okay, so what changed?
+b2c | PIP | warn | One word. Price became amount.
+b3 | BRIX | normal | Amount reads better, okay? Who'd mind?
+b3b | PIP | warn | Brix. The ship would.
+b4 | VEGA | normal | Because the ship still looks for price. It finds nothing, so it shows nothing.
+b4b | BRIX | question | Huh? But my side passed every check!
+b5 | N | normal | And here is the sneaky part. The station checked its own side, and everything passed. Nothing on the station could tell that a ship far away depended on that one word.
+b6 | N | normal | It is just like an app on a phone. Many people do not update for weeks. Their old app still asks for the old word. For them the screen goes blank, and the station sees no error at all.
+b7 | VEGA | calm | So the rule is: a name people rely on is a promise. No quiet changes.
+== s3 The words we need
+c1 | N | normal | Before we fix it, five simple words. We will use them all story long.
+c2 | N | normal | First, A P I. That is just a way for one program to ask another program for something. The ship asking the station for a berth is an A P I call.
+c3 | N | normal | Second, request and response. The request is what you send. The response is what comes back. A question, and its answer.
+c4 | N | normal | Third, a field. A field is one named piece of information, like price, or berth number. One box on a form.
+c5 | N | normal | Next page. Fourth, a contract. A contract is the written promise of what you may ask for, and exactly what you will get back.
+c6 | N | normal | Fifth, a breaking change. That is a change that makes an existing user fail. Renaming price to amount was one.
+c7 | N | calm | So the rule is: an A P I is a conversation, and the contract is the written script of that conversation.
+== s4 Lex and the blueprint
+d1 | N | normal | Vega calls the one person who writes things down. Customs Officer Lex.
+d2 | LEX | normal | Evening. Let me guess. Two crews, no drawing?
+d3 | VEGA | question | How did you know?
+d4 | LEX | normal | Every single week. Think of a wall socket.
+d4b | PIP | question | A wall socket? Why a socket?
+d4c | LEX | normal | Plugs and sockets are made by people who never meet.
+d4d | LEX | normal | But both follow one published shape.
+d4e | PIP | punch | Oh! That's why any plug fits!
+d5 | LEX | punch | Exactly. Write the shape down once. Everyone builds to it.
+d6 | N | normal | The standard file for writing that shape is called Open A P I. Think of it as the technical drawing of the socket, so exact that a machine can check a plug against it.
+d7 | N | calm | So the rule is: one published shape, and every side builds to it.
+== s5 Draw it first or build it first
+e1 | N | normal | There are two ways to work. In the first, you draw the blueprint, agree on it, and then build. That is called contract first.
+e2 | N | normal | In the second, you build first, and draw the blueprint from what you built. That is called code first.
+e3 | PIP | question | So which one's better?
+e4 | LEX | normal | Depends. Draw first, if lots of crews are involved.
+e4b | PIP | question | Why's that?
+e4c | LEX | normal | The ship crew can start today. Even before the hatch exists.
+e5 | LEX | normal | Build first is quick, if one small team does it all.
+e5b | LEX | normal | But then the drawing only shows whatever the hatch happened to do.
+e6 | N | warn | Either way, there is one danger. The drawing says one thing, and the real hatch does another. That is called drift.
+e7 | LEX | normal | Easy. A part cut from the drawing can't disagree with it.
+e8 | N | normal | And if you build first, you redraw the blueprint automatically every time, and stop the work if it changed by accident.
+e9 | N | calm | So the rule is: whichever way you work, make sure the drawing and the real hatch cannot drift apart.
+== s6 What is inside the blueprint
+f1 | N | normal | So what is inside the blueprint? Four things. Let us open it.
+f2 | N | normal | One, the doors. Every address the station answers, and what kind of request each one takes. Those are called endpoints.
+f3 | N | normal | Two, what goes in. Which fields you must hand over when you knock, like the berth and the bunks you want.
+f4 | N | normal | Three, what comes out. The fields you get back, like the booking number and the total.
+f5 | N | normal | Four, what the errors say. When the answer is no, every door says it the same way, with a clear reason.
+f6 | LEX | warn | Oh, and don't forget limits!
+f6b | LEX | normal | Every text has a longest length. Every list has a biggest size.
+f6c | PIP | question | And if there's no limit?
+f6d | LEX | warn | Then someone pushes a giant message through the door.
+f7 | N | normal | The blueprint also says who may enter. It can mark a few doors, like the health check, as open to everyone.
+f8 | N | calm | So the rule is: write down every door, what goes in, what comes out, what the errors say, and how big things may be.
+== s7 Tidy habits that stop mistakes
+g1 | N | normal | Now some tidy habits that stop silly mistakes. One at a time.
+g2 | N | normal | Times are written one standard way, in the same time zone for everybody. That way no ship reads noon as midnight.
+g3 | N | normal | Money is kept as whole cents, plus the name of the currency. Not decimals. Ten cents plus twenty cents is always exactly thirty.
+g4 | N | normal | Ids are written as text, even when they look like numbers. Some programs round very big numbers. Text never gets rounded.
+g5 | N | normal | Next page. Names use one style everywhere. Pick one and stick to it. Mixed styles guarantee typos.
+g6 | N | normal | Long lists always come in pages, with a maximum page size. One endless list can sink the whole station.
+g7 | N | normal | And when a field has no value, leave it out. Do not send an empty text or a zero to mean nothing. To the ship, empty is a real value.
+g8 | N | calm | So the rule is: one way to write each thing, everywhere.
+== s8 Must, may and empty
+h1 | N | normal | Here is a trap that catches even experienced crews. The cargo form has a note field, and it can be in three states.
+h2 | VEGA | normal | Required means it must be there. No note, no form.
+h3 | PIP | question | And optional?
+h3b | VEGA | normal | It may be missing. Just leave it out.
+h4 | PIP | question | And null?
+h4b | VEGA | normal | There, but empty on purpose. Like, no note.
+h5 | PIP | question | Okay, but why does it matter?
+h6 | VEGA | normal | Say a ship updates its booking. Note is missing? Leave the old note alone.
+h6b | PIP | question | And if it's empty?
+h6c | VEGA | normal | Wipe it. And if it has words, replace it.
+h7 | VEGA | warn | But if you mix up missing and empty? You wipe notes nobody meant to touch.
+h8 | VEGA | calm | So the rule is: must, may, and empty are three different promises.
+== s9 What breaks and what is safe
+i1 | PIP | question | So can we ever change the blueprint?
+i2 | VEGA | normal | Sure. Adding a new optional label is safe. Old ships just ignore it.
+i2b | PIP | question | And taking one away?
+i3 | VEGA | warn | Taking one away breaks them. They look, and find nothing.
+i3b | PIP | question | What about renaming?
+i4 | VEGA | warn | Renaming is taking one away and adding another. That breaks them too.
+i4b | VEGA | warn | So does changing a number into text.
+i5 | LEX | normal | There's a safe way to rename, though. Four steps.
+i5a | LEX | normal | Step one, add the new label.
+i5b | LEX | normal | Step two, keep the old one, marked as going away.
+i5c | PIP | question | And then?
+i5d | LEX | normal | Step three, watch till nobody uses it.
+i5e | LEX | normal | Step four, remove it in the next big version.
+i6 | N | normal | One more habit makes all this work. Ships should read only what they need, and ignore labels they do not know. That is called a tolerant reader. A status word they do not know should show as unknown, not crash the screen.
+i8 | PIP | question | So we can always add, and never take away?
+i9 | VEGA | punch | So the rule is: add freely, take away slowly.
+== s10 Booking a berth, the full example
+j1 | N | normal | Time for the full example. The ship wants to reserve a berth.
+j2 | N | normal | The ship knocks on the door called bookings. It hands in the berth it wants, and which bunks. That is the request.
+j3 | N | normal | The station answers with a booking. A booking number, a status, and a total, in whole cents with its currency.
+j4 | N | normal | The status is a word like pending, confirmed or cancelled. The blueprint says that list may grow, so ships must cope with a new word.
+j5 | N | normal | If something is wrong, the station says no in the same clear shape every time. A short title, a status, and a code a program can read, like bunk taken.
+j6 | PIP | question | And if the same ship sends it twice, by accident?
+j7 | LEX | normal | Good question. The blueprint covers that too.
+j7b | LEX | normal | A special key lets the station spot a repeat. Same answer, no double booking.
+j7d | LEX | normal | It's called an idempotency key. Another episode is all about it.
+j8 | N | calm | So the rule is: one shape in, one shape out, and one shape for every no.
+== s11 The safety line
+k1 | N | normal | Now the safety line. Every change to the blueprint rides a conveyor belt before it reaches the dock.
+k2 | LEX | normal | Stop one, the style check.
+k2b | LEX | normal | A tool called Spectral checks the house rules. Names, limits, clear errors.
+k3 | LEX | normal | Stop two, the change check.
+k3b | PIP | question | What does it compare?
+k3c | LEX | normal | The new blueprint against the last released one. Break something, and you get a red stamp. The tool's called oh ass diff.
+k4 | LEX | normal | Stop three, make the templates.
+k4b | LEX | normal | Tools write the server template and the ship's client code. In Go, that's oh A P I code gen.
+k5 | LEX | normal | Stop four, test the real hatch.
+k5b | LEX | normal | Throw weird requests at it. Check the answers match the drawing.
+k5d | LEX | normal | Skee ma thee sis. And Pact, which replays what each ship relies on.
+k6 | LEX | normal | Stop five, publish the guide. That becomes the new baseline.
+k7 | N | calm | So the rule is: no change reaches the dock without passing the line.
+== s12 In Go: the template that cannot lie
+l1 | N | normal | Now the same story in Go, the language the station's engineers use.
+l2 | N | normal | A tool reads the blueprint and writes Go code for you. It writes the shape of the request, the shape of each possible answer, and one interface the server must fill in.
+l3 | N | warn | Here is the trick. The handler must return one of the answers the blueprint allows. A good answer, or a clear error. Try to return anything else, and the code refuses to build.
+l3b | PIP | question | Wait. The code just refuses to build?
+l4 | N | normal | Exactly. That is the template that cannot lie. The drift problem is stopped before the code even runs.
+l5 | N | normal | Your own code stays small and plain. It never touches the raw reply. It checks the amount is positive, and returns either the error answer or the good one.
+l6 | N | normal | A second guard stands at the door. A library called kin Open A P I loads the same blueprint, and checks every request against it before your handler runs. A request with a missing field is turned away right there.
+l7 | N | normal | One more Go detail. A plain pointer cannot tell missing from empty. So a small wrapper remembers three things: was the key there, was it empty on purpose, and what was the value.
+l8 | N | normal | Missing keeps. Empty clears. A value sets.
+l9 | N | calm | So the rule is: let the blueprint write the template, and let a guard check every request at the door.
+== s13 Trade-offs: nothing is free
+m1 | N | normal | A contract is not free. Five honest trade-offs.
+m2 | N | normal | One. Drawing first costs speed at the start. A quick prototype with one caller may not need it. Draw later, once a second crew shows up.
+m3 | N | normal | Two. Generated code shapes your own code. Keep it at the edge, and map it to your own types, so the drawing's shape does not leak everywhere.
+m4 | N | normal | Three. Strict checking can block a safe roll out. If the door rejects every label it does not know, a newer ship using one new optional label gets turned away by an older door during an upgrade.
+m5 | N | normal | Next page. Four. Tests where each crew records what it relies on only work when you know your crews. A public station cannot collect promises from strangers, so it relies on the change check.
+m6 | N | normal | Five. The blueprint cannot capture everything. Speed, the order of results, and how often you may knock are only words in the manual. And someone will rely on them anyway.
+m7 | N | calm | So the rule is: a contract is a strong tool, but it has a price.
+== s14 When it goes wrong, and what to watch
+n1 | VEGA | question | Okay. What actually goes wrong on real stations?
+n2 | VEGA | warn | Story one. The drawing and the hatch drift apart.
+n2b | LEX | normal | Cut the hatch from the drawing. Or redraw, and stop on change.
+n3 | VEGA | warn | Story two. A rename ships, and old ships break.
+n3b | LEX | normal | Compare with the last release. Block the break.
+n4 | VEGA | warn | Story three. A new status word confuses an old ship.
+n4b | LEX | normal | Say from day one the list can grow. Test strange words.
+n5 | VEGA | warn | Story four. No limits, and a huge message walks right in.
+n5b | LEX | normal | Limit every text and list. Cap the size at the door.
+n7 | VEGA | normal | Now, what do we watch? Three screens.
+n8 | VEGA | normal | One. Requests the door turned away.
+n9 | VEGA | normal | Two. Who still uses the old labels.
+n10 | VEGA | normal | Three. Test answers that don't match the drawing.
+n10b | LEX | normal | That's drift, caught early.
+n11 | VEGA | calm | So the rule is: watch rejected requests, and who uses old labels.
+== s15 Deeper: the details that bite
+o1 | N | normal | Deeper now. Details that bite. Two pages.
+o2 | N | normal | One. The blueprint format has two common versions, called three point oh and three point one. The newer one writes the empty on purpose rule differently. Check that your tools support the version before you move.
+o3 | N | normal | Two. Very big ids. Some programs, like a web browser, lose the last digits of a huge number. Send big ids as text, and the problem disappears.
+o5 | N | normal | Next page. Three. Checking the shape is not the same as checking the journey. A reply can have the right shape and still be the wrong booking. Tests that follow a whole booking from ask to look up catch what shape checks miss.
+o5b | PIP | warn | So the shape was right, and the booking wrong?
+o6 | N | normal | Four. The repeat safe key needs its own written rules: who it belongs to, how long the station remembers it, and what error a clash gives. Without them, ships cannot write safe retry code.
+o7 | N | calm | So the rule is: the details that are not written down are the ones that break.
+== s16 Interview round
+q0 | N | hook | Interview round. Pip asks, Vega answers.
+q1 | PIP | question | Okay, quick one. What goes in a contract?
+q2 | VEGA | normal | Who can call, and how. Every door, in and out. One error shape.
+q2b | VEGA | normal | Limits. Repeats and versions. If a ship can depend on it, write it down.
+q3 | PIP | question | Is a new field breaking? Or a new status word?
+q4 | VEGA | normal | Depends. A new field breaks ships that reject unknown things.
+q4b | VEGA | normal | A new status breaks ships expecting a closed list. So say the list is open.
+q5 | PIP | question | Draw first, or build first?
+q6 | VEGA | normal | Draw first, if lots of crews or outsiders are involved.
+q6b | VEGA | normal | Build first for quick internal stuff. But redraw and compare by machine.
+q7 | PIP | question | Why send money as whole cents?
+q8 | VEGA | normal | Decimals drift. Ten dimes might not make exactly one.
+q8b | VEGA | normal | Cents are exact. And the currency name matters, small units differ.
+q11 | PIP | question | Must, may and empty. Why care?
+q12 | VEGA | normal | They're three promises. Missing keeps, empty clears.
+q12b | VEGA | warn | Mix them up, and you wipe data.
+== s17 Docked: the summary
+s0 | N | calm | The arm slides home. The hatch fits. The Nova docks with minutes to spare.
+s0a | PIP | punch | We docked! With minutes to spare!
+s0b | BRIX | normal | Okay, okay. Next time I check the drawing first.
+s0c | VEGA | normal | Alright. Let's put it all together.
+s1a | N | normal | One. Write the promise first, and make everything from it.
+s1b | N | normal | Two. Add freely. Take away slowly.
+s1c | N | normal | Three. Write down every limit.
+s1d | N | normal | Four. Must, may and empty are three different promises.
+s1e | N | normal | Five. Every change rides the safety line.
+s1f | N | normal | Six. Watch who still uses the old labels.
+s1g | VEGA | punch | And the one line to keep. A contract is a promise. Keep it.
+== s18 Where to go next
+rn1 | N | calm | To go deeper, open the note on contract design, and its Go note on Open A P I first development. Before it, read REST and H T T P A P I design, and choosing an A P I style. After it, read A P I error handling, versioning, and idempotency. Compare it with protocol buffers, and with graph Q L.
+z1 | PIP | hook | Commander, what's our next case?
+z2 | VEGA | punch | Choosing an A P I style. Three ways to brief a ship. Stand by.

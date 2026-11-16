@@ -24,7 +24,30 @@ status: reviewed
 > - A domain error (e.g. "invoice is void") is just a Go error until the handler maps it to an HTTP status; the service layer never imports `net/http`.
 > - Production backends add observability (request ID, logs, metrics) and graceful shutdown around this pipeline, not inside the business logic.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You click "Pay" in an app. Your request does not land straight on business code. It walks through a fixed hallway of doors first.
+
+The **router** reads the URL and picks which function should answer. Before that function runs, a chain of **middleware** runs: small helpers that log the request, check who you are, and catch crashes. Then the work splits into three rooms: the **handler** (talks HTTP), the service (makes decisions), and the repository (talks to the database).
+
+```mermaid
+flowchart LR
+    A[Request] --> B[Router] --> C[Middleware chain] --> D[Handler] --> E[Service] --> F[Repository / DB]
+```
+
+The response walks back out through the same hallway. Every request, every time, same order.
+
+The rest of this note is just these 3 questions:
+1. What are the stages of the pipeline, in order?
+2. Which job belongs in which layer (handler vs service vs repository)?
+3. What does one real request (`POST /payments`) look like end to end?
 
 **The problem in one story.** You post a letter to pay a bill.
 It goes through the post office, a sorting room, a clerk who reads it, an accountant who decides, and a filing cabinet.
@@ -70,7 +93,7 @@ Where it breaks: in a real airport you do not come back through the same checkpo
 > [!tip] Remember
 > Handler translates, service decides, repository persists; middleware wraps them all.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Without an agreed pipeline, every endpoint reinvents where auth, validation and error formatting live. A team of five without this agreement ends up with five different places that check `X-Api-Key`, five different error JSON shapes, and a bug where one handler forgets rate limiting because nothing enforces that it runs for every route.
 
@@ -80,7 +103,7 @@ If that logic is scattered across the handler, a shared library, and ad hoc `if`
 
 The lifecycle gives that question one answer: transport and routing are fixed by `net/http`, middleware runs in a declared order for every route, the handler only translates HTTP ↔ Go types, the service owns the business decision and the transaction boundary, and the repository is the only thing that knows SQL exists.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the request as a parcel going through airport security, not a function call. Each checkpoint (middleware) can stop the parcel and send a response back immediately — a `401` from auth, a `429` from rate limiting — without the parcel ever reaching the handler.
 
@@ -88,7 +111,7 @@ The handler is a translator standing at a desk: it turns the parcel's contents (
 
 The service is the only one allowed an opinion about the business ("a void invoice cannot be paid"); the repository is a filing clerk who only knows how to put a form in a cabinet and take one out, with no opinion about whether the form made sense.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 sequenceDiagram
@@ -171,9 +194,11 @@ No layer below the handler stores or reuses a `ctx` past the call that received 
 
 Nothing below the handler ever constructs an `http.StatusX` value. The richer version of this mapping — error response bodies, field-level validation errors — belongs to [[API Error Handling]]; this note only establishes that the mapping happens in one place.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest possible sketch of the pipeline in code, before any real project structure is added.
 
 The shape without any of the production concerns: a handler that calls a service, and one function that turns an error into a status code.
 
@@ -197,6 +222,8 @@ func paymentHandler(svc *Service) http.HandlerFunc {
 The full version below adds the parts that make it production code: middleware, idempotency, a bounded outbound call, and tests.
 
 ### `POST /payments` end to end
+
+**In plain words:** we follow one payment request through every layer, line by line, so you can see which file does which job.
 
 The service layer. It never imports `net/http`:
 
@@ -588,7 +615,7 @@ if err := srv.Shutdown(shutdownCtx); err != nil { // waits for in-flight request
 
 The timeout fields on `http.Server` and why their zero values are dangerous are covered in [[HTTP Server Fundamentals (net-http)]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Layering style | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -599,14 +626,14 @@ The timeout fields on `http.Server` and why their zero values are dangerous are 
 
 Hexagonal architecture is the same core idea as handler/service/repository with more names for the same seams; InvoiceOps-sized services get the same testability from the plain three-layer split without the extra vocabulary.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Three layers for a single `GET /health` endpoint is pure ceremony; a one-line handler is fine for truly static or trivial routes.
 - The split only pays off once a service method is called from more than one place (HTTP handler, a worker, a CLI) or needs a unit test that doesn't want a real database.
 - Over-applying "the service never sees `http`" can go too far: validation errors that are inherently about the wire format (malformed JSON, wrong content type) belong in the handler, not smuggled into the service as a special error type.
 - A strict interface-per-dependency style (ports and adapters) on a two-person team building a CRUD app is usually over-engineering; start with concrete types and extract an interface when a second implementation or a test actually needs one.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** this is the shape of a typical Go REST service at companies using `net/http` plus a thin router (Chi, Echo) or the 1.22+ standard `ServeMux` — e.g. the layering taught in Ardan Labs' public Go service training materials, which describe handler packages calling into business-logic packages, which call into storage packages. Several large Go shops are reported to favor a similar handler → service → storage split in their internal style guides, but that specific detail isn't independently checkable here, so it's left out rather than stated as fact.
 - **Failure modes → fixes:**
@@ -616,7 +643,7 @@ Hexagonal architecture is the same core idea as handler/service/repository with 
   - A deploy kills in-flight requests mid-response → graceful shutdown (`srv.Shutdown`) draining for a few seconds before the process exits.
 - **What to monitor:** request count and error rate by status code class (4xx vs 5xx) and by route; p50/p95/p99 latency by route; in-flight request count; time spent in each outbound dependency (the provider call above) separately from total handler time.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `net/http` gives one goroutine per connection, not per request.** A keep-alive HTTP/1.1 connection serves many requests serially on the same goroutine; HTTP/2 multiplexes several requests over one connection but `net/http` still schedules each request's handler to run concurrently via its own goroutine, synchronized by the connection's internal state. The practical effect for this note: a slow handler only blocks the goroutines currently serving requests on its connection(s), not every client — but with enough slow handlers, goroutine count and memory still grow unbounded without the timeouts in [[HTTP Server Fundamentals (net-http)]].
 - **Where the transaction boundary really is.** In the worked example, "check idempotency, charge, persist" is a business transaction but not a single database transaction — the provider call cannot be inside a DB transaction since it's a network call with its own side effects. This is why idempotency keys exist: they make "charge, then maybe fail to persist, then retry" safe, because a retry with the same key replays the first result instead of charging twice. See [[Idempotency and Idempotency Keys]] for the general pattern and [[Transactions and the Repository Pattern]] for the parts that are a true DB transaction.
@@ -624,7 +651,7 @@ Hexagonal architecture is the same core idea as handler/service/repository with 
 - **The check-then-act idempotency window, and why `ErrDuplicateKey` exists.** `FindByIdempotencyKey` then `Save` is two steps, not one atomic operation: two concurrent requests carrying the same idempotency key can both see "not found" and both call the provider, charging twice. The in-memory `Repo` above doesn't guard against this; a real repository backed by Postgres closes the window with a `UNIQUE` constraint on `idempotency_key`, and `Save` returns `ErrDuplicateKey` when that constraint is violated so the service (or a retry) can treat it as "already charged" instead of a fresh failure. `mapError` already has a case for it; this note's simplified example just never triggers that path.
 - **Why the handler, not the service, owns `errors.Is` on `context.DeadlineExceeded`.** The service returns the raw `context` error (wrapped) because it has no opinion on what HTTP status a timeout deserves; a worker consuming the same service method might retry a timeout instead of surfacing it to a user at all. Only the HTTP-facing boundary decides that a timeout is a `504`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk me through what happens between a client sending `POST /payments` and getting a response.
 > TCP accept → `net/http` routes the request on its own goroutine → `ServeMux` matches the method+path pattern → the middleware chain runs in order (recover, request ID, logging, auth, rate limit, body limit) → the handler decodes JSON into a DTO and calls one service method → the service validates, checks idempotency, calls the provider with a bounded timeout, and persists → the handler maps any error to a status code and encodes the response → logging middleware records the status and duration on the way back out.
@@ -649,7 +676,7 @@ Hexagonal architecture is the same core idea as handler/service/repository with 
 > [!question]- Trap: a client complains a request "hangs forever" even though you set `context.WithTimeout(ctx, 2*time.Second)` around the provider call. What else could be missing?
 > `http.Server`'s own `ReadTimeout`/`WriteTimeout`/`IdleTimeout` are separate from any per-call context you create inside a handler. If the client is slow to send the request body or slow to read the response, and the server has no `ReadTimeout`/`WriteTimeout` set, the connection itself can hang indefinitely regardless of what timeouts your handler code sets internally. See [[HTTP Server Fundamentals (net-http)]].
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Five stages, always in this order: transport → routing → middleware → handler/service/repository → response.
 - Middleware order: recover → request ID → logging → auth → rate limit → body limit.
@@ -660,7 +687,7 @@ Hexagonal architecture is the same core idea as handler/service/repository with 
 - `net/http` defaults an unset status to 200 on the first `Write` — a logging middleware wrapper must match that default.
 - `http.Server` timeouts are independent of any `context.WithTimeout` inside a handler; both are needed.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Context Package]]
 - **Next:** [[Service Project Layout and Wiring]], [[HTTP Server Fundamentals (net-http)]], [[Middleware]]

@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Graphs and Graph Algorithms]]: an adjacency-list `Graph`, BFS, recursive DFS, three-color cycle detection, Kahn's topological sort, a heap-backed Dijkstra, and union-find-backed Kruskal's MST — tested against one shared sample graph.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Setup". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the Code steps, Tests and Design decisions.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Graphs and Graph Algorithms]]. That note explains, in pictures and words, how to store a network of connected things (a graph) and walk it: level by level (BFS), deep first (DFS), cheapest first (Dijkstra), in dependency order (topological sort), and how to spot loops. This note is the same material as working Go code: one small `Graph` type, then each algorithm built on it step by step, each step opening with the idea in plain words before the code. Two tests run everything against one tiny 4-vertex sample graph that the theory note traces by hand, so the code and the diagrams prove each other. Read the theory note first, then read this top to bottom; the Go you need is maps, slices, recursion and one standard-library heap.
+
+## Before the code 🟢
 
 - **Maps (`map[int][]Edge`)**: Go's built-in hash table; here it maps each vertex to its list of outgoing edges.
 - **Slices as queues**: `queue = queue[1:]` drops the front item; `append` adds to the back.
@@ -25,7 +34,7 @@ updated: 2026-11-13
 - **`iota` constants**: auto-numbered `white=0, gray=1, black=2`, so a fresh map entry starts as white.
 - **What to run**: `go vet ./... && go test -race -v ./...` in a scratch module (no goroutines here, so `-race` just confirms none are needed).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -47,15 +56,17 @@ flowchart LR
     KT["kruskal_test.go"] --> U
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only (`container/heap`, `sort`) — no third-party dependencies.
 - Layout: a module `graph` with `graph.go`, `bfs_dfs.go`, `cycle_toposort.go`, `dijkstra.go`, `unionfind_kruskal.go`, and two test files.
 - Run it with `go vet ./... && go test -race -v ./...`.
 
-## Code
+## Code 🟡
 
 ### Step 1: the graph type and adjacency list
+
+**In plain words:** store the graph as a notebook with one page per vertex, listing who it points to — that is all an adjacency list is.
 
 **Concept.** This is [[Graphs and Graph Algorithms#Representations]]'s default choice made concrete: `map[int][]Edge` gives `O(degree(u))` neighbor iteration at `O(V+E)` total space, which every algorithm below builds on.
 
@@ -89,6 +100,8 @@ func (g *Graph) AddEdge(u, v, weight int) {
 3. The `if _, ok := ...; !ok` line ensures `v` has an entry in `adj` even with zero out-edges — without it, `TopoSort`'s in-degree counting would miss vertices that are only ever a destination, never a source.
 
 ### Step 2: BFS and recursive DFS
+
+**In plain words:** BFS walks the graph like ripples in a pond (nearest first, using a waiting line); DFS walks it like exploring a maze (go deep, back up when stuck).
 
 **Concept.** These implement the two traversal orders from [[Graphs and Graph Algorithms#BFS: breadth-first search]] and [[Graphs and Graph Algorithms#DFS: depth-first search]]. `BFS` uses an explicit queue (a plain slice); `DFSRecursive` uses Go's own call stack via a recursive closure.
 
@@ -142,6 +155,8 @@ func DFSRecursive(g *Graph, start int) []int {
 3. `DFSRecursive`'s `visit` is declared as a `var` before being assigned a closure that calls itself — this two-step form (`var visit func(u int); visit = func(u int) { ...; visit(...) }`) is the idiomatic way to write a recursive closure in Go, since a closure can't refer to itself in its own `:=` declaration.
 
 ### Step 3: three-color cycle detection
+
+**In plain words:** while exploring, paint each vertex white (not seen), gray (on the path I am walking right now) or black (fully done). Bumping into a gray one means you walked in a circle.
 
 **Concept.** This implements [[Graphs and Graph Algorithms#Cycle detection (directed graphs): three-color DFS]] exactly: a `colorOf` map standing in for the white/gray/black states, with a gray-to-gray edge as the cycle signal.
 
@@ -197,6 +212,8 @@ func HasCycle(g *Graph) bool {
 
 ### Step 4: topological sort (Kahn's algorithm)
 
+**In plain words:** keep picking any task that has no unfinished prerequisites, do it, and cross it off everyone else's list. If you get stuck with tasks left over, there is a circular dependency.
+
 **Concept.** This is [[Graphs and Graph Algorithms#Topological sort: Kahn's algorithm]] directly: repeatedly remove in-degree-0 vertices.
 
 The alternative — DFS-based topological sort (post-order, then reverse) — is equally valid and is what many textbooks show first, but Kahn's version was chosen here because its `len(order) == len(g.adj)` check gives cycle detection for free, without a separate pass.
@@ -249,6 +266,8 @@ The first loop initializes every vertex's in-degree to 0 before the second loop 
 3. `len(order) == len(g.adj)` is the cycle check: every vertex that was ever added via `AddEdge` appears as a key in `g.adj` (see step 1's `g.adj[v] = nil` line), so if some of them never reached in-degree 0, `order` comes up short.
 
 ### Step 5: Dijkstra with a min-heap frontier
+
+**In plain words:** always expand from the cheapest place you can currently reach — a min-heap is just the gadget that hands you "cheapest so far" quickly.
 
 **Concept.** `distHeap` implements Go's `container/heap` interface to give [[Graphs and Graph Algorithms#Dijkstra's algorithm: shortest paths with non-negative weights]] its min-heap frontier.
 
@@ -311,6 +330,8 @@ func Dijkstra(g *Graph, start int) map[int]int {
 3. `heap.Push`/`heap.Pop` are the package-level `container/heap` functions, not `distHeap`'s own methods directly — they wrap the methods with the sift-up/sift-down bookkeeping that keeps the heap property intact after each call.
 
 ### Step 6: union-find and Kruskal's MST
+
+**In plain words:** to wire every city together as cheaply as possible, take the cheapest cables first and skip any cable joining two cities that are already connected. Union-find is the quick "already connected?" checker.
 
 **Concept.** `UnionFind` implements [[Graphs and Graph Algorithms#Union-find and Kruskal's MST]]'s path-compression-plus-union-by-rank design, and `KruskalMST` uses it to answer "would this edge close a cycle?" in near-constant time.
 
@@ -619,7 +640,7 @@ The loop then greedily keeps any edge whose `Union` call returns `true`, which i
 > }
 > ```
 
-## Tests
+## Tests 🟡
 
 ### `TestDijkstraShortestPaths`
 
@@ -691,7 +712,7 @@ func TestKruskalMST(t *testing.T) {
 }
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -701,7 +722,7 @@ func TestKruskalMST(t *testing.T) {
 | Flat `WEdge` list for `KruskalMST` | Reusing the `Graph`/`Edge` adjacency-list type | Kruskal's algorithm only ever needs to sort and scan every edge once — a flat list avoids paying for adjacency-list structure Kruskal's never uses |
 | `container/heap` interface for `distHeap` | A third-party priority queue package | The standard library's `container/heap` has zero dependencies and is the idiomatic choice for a single `Push`/`Pop`/peek priority queue in Go |
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./...
@@ -721,13 +742,13 @@ ok  	graph	1.490s
 
 Reading it: both tests pass under `-race` with zero flagged data races (none expected — this package has no concurrency of its own), and the sample graph's shortest-path and MST results match by-hand tracing of the theory note's diagrams exactly.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `BFS` and `TopoSort` both re-slice `queue = queue[1:]` to dequeue — this never reclaims the already-dequeued elements' backing array space until the whole slice is discarded, which is fine for a one-shot traversal but would leak memory in a long-lived, continuously-refilled queue; a ring buffer (see [[Stacks, Queues and Deques]]) avoids this.
 - `Dijkstra`'s `dist` map can hold multiple stale entries in the heap for the same vertex (pushed once per improving relaxation) — forgetting the `cur.dist > d` staleness check would make the algorithm re-process a vertex with an already-worse distance, silently degrading performance (though not correctness, since the check still runs before any work).
 - `KruskalMST` assumes vertex IDs are `0..n-1` with no gaps, because `NewUnionFind(n)` allocates exactly `n` slots — passing an edge list with a vertex ID `>= n` panics on an out-of-range slice index.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change it, predict the result:** add a fifth edge `0→3` with weight `2` to `buildSample()`. Predict the new `Dijkstra(g, 0)` result for vertex 3 before running it — does the new direct edge beat the existing `0→1→3` path?
 2. **Change it, predict the result:** remove the staleness check (`if d, ok := dist[cur.vertex]; ok && cur.dist > d { continue }`) from `Dijkstra`. Does `TestDijkstraShortestPaths` still pass? Explain why removing it changes performance but not (for this algorithm) correctness.

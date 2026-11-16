@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Two measured demonstrations of amortized `O(1)` cost in Go — slice `append` and map insertion — with tests that check reallocation counts grow logarithmically while per-operation cost stays flat, backing every number in [[Complexity Analysis - Big-O and Amortized Cost]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Running it".
+> - 🟡 **Know the basics?** Work through the Code steps 1-3 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the runnable half of [[Complexity Analysis - Big-O and Amortized Cost]]. The theory note claims that Go's `append` and map inserts are cheap on average even though single calls can be expensive. This file does not just repeat the claim — it measures it: small Go programs count every real reallocation and time real map builds, and tests fail if the numbers ever stop matching the theory. Read each "Step" top to bottom: plain-words line, code, then a numbered walk-through.
+
+## Before the code 🟢
 
 - **Slices and `append`**: a Go slice is a growable list; `append` adds an element and may move it to a bigger backing array.
 - **`cap()`**: the reserved room in a slice; a change in `cap` after `append` means a reallocation happened.
@@ -25,7 +34,7 @@ updated: 2026-11-13
 - **`time.Now` / `time.Since`**: wall-clock timing used to measure map build cost.
 - **`testing` package**: `TestXxx` functions run with `go test`; `t.Logf` prints data, `t.Fatalf` fails. Run `go vet ./... && go test -race -v ./...`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Complexity Analysis - Big-O and Amortized Cost]] |
 | --- | --- |
@@ -35,14 +44,16 @@ updated: 2026-11-13
 | `TestTotalCopiesIsLinearInN` | Total copying work is `O(n)`, which is what makes per-append cost amortized `O(1)` |
 | `TestMapInsertStaysRoughlyFlat` | Map insertion's ns/op stays bounded as `n` grows 1,000x |
 
-## Setup
+## Setup 🟢
 
 - Module `complexity`, Go 1.24, standard library only.
 - Run: `go vet ./... && go test -race -v ./...`
 
-## Code
+## Code 🟡
 
 ### Step 1: logging every slice reallocation
+
+**In plain words:** this code appends items one by one and writes down every moment Go had to build a bigger array — like keeping a diary of every time the valet moved your cars to a larger lot.
 
 **Concept.** [[Complexity Analysis - Big-O and Amortized Cost#Measuring Go's actual slice growth]] claims reallocations happen `O(log n)` times and the total copying work is `O(n)`; `GrowthLog` makes that claim checkable by recording every point where `cap(s)` actually changed as `n` elements are appended one at a time.
 
@@ -86,6 +97,8 @@ func GrowthLog(n int) []ReallocPoint {
 
 ### Step 2: turning the log into a total-cost number
 
+**In plain words:** this adds up all the copying work those growth events caused, giving one total number we can divide by n to get the average cost per append.
+
 **Concept.** `TotalCopiesFor` converts the reallocation log into the one number amortized analysis actually bounds: the *total* element-copies across the whole sequence of `n` appends.
 
 The theory note's claim "amortized `O(1)` per append" is precisely the claim that this total, divided by `n`, stays bounded by a constant — this function computes the numerator of that division.
@@ -116,6 +129,8 @@ func TotalCopiesFor(n int) int {
 3. Summing this across every reallocation gives the grand total of element-copies caused by building the slice from empty to `n` elements.
 
 ### Step 3: the second measured example — map insertion
+
+**In plain words:** same experiment, different structure — build maps of growing sizes with a stopwatch running, and check the time per insert stays flat instead of growing with the map.
 
 **Concept.** [[Complexity Analysis - Big-O and Amortized Cost#A second measured example: Go map insertion]] generalizes the amortized-`O(1)` argument beyond slices.
 
@@ -167,7 +182,7 @@ flowchart LR
     Slice["GrowthLog / TotalCopiesFor<br/>(reallocation count + total copies)"] -->|"same amortized O(1) shape"| Map["BuildMapTimings<br/>(wall-clock ns/op)"]
 ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -176,7 +191,7 @@ flowchart LR
 | `BuildMapTimings` measures wall-clock time, not an operation count | Count rehash/bucket-evacuation events like `GrowthLog` does for slices | Go's `map` doesn't expose a `cap()`-equivalent signal for bucket growth, so timing is the only externally observable proxy available from user code |
 | Map benchmark uses a generous 50x band in its test | A tight, exact bound | Wall-clock timing is noisy (GC pauses, scheduler jitter); a tight bound would make the test flaky on a shared CI machine without making the underlying claim any more true |
 
-## Tests
+## Tests 🟡
 
 ### TestReallocCountIsLogarithmic
 
@@ -279,7 +294,7 @@ A generous 50x band absorbs scheduler noise and GC pauses on a shared test machi
 
 A failure here would mean map insertion's cost is growing with `n` instead of staying flat — contradicting the theory note's generalization from slices to maps.
 
-## Running it
+## Running it 🟢
 
 ```text
 go vet ./... && go test -race ./...
@@ -310,13 +325,13 @@ ok  	rollscratch/complexity	2.245s
 
 `PASS` on all four tests under the race detector confirms both "reallocations are logarithmic" and "map insertion's per-op cost stays flat" are not just plausible arguments but checked facts about this exact Go version and platform.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **The map timing test is wall-clock-based, not operation-count-based**, unlike the slice tests (which count real reallocations). That makes `TestMapInsertStaysRoughlyFlat` inherently noisier — a busy CI machine or a GC pause mid-benchmark can inflate one data point. The generous 50x band exists specifically to absorb that noise without weakening the underlying claim.
 - **`GrowthLog` and `TotalCopiesFor` only model a nil-slice, one-at-a-time append pattern.** A program that appends in batches (`append(s, many, values...)`) or pre-sizes with `make([]T, 0, n)` has a completely different reallocation profile — these functions measure the worst common case (no pre-sizing), not every possible append pattern.
 - **`BuildMapTimings` measures build time, not steady-state lookup time.** A map that's already built and is only being read from has very different performance characteristics (no growth happening at all), which this code doesn't measure.
 
-## Exercises
+## Exercises 🔴
 
 1. Modify `GrowthLog` to also record the *ratio* `cap(s) / prevCap` at each reallocation point, and predict how that ratio changes as `n` crosses 256 (hint: compare to the growth table in [[Arrays and Dynamic Arrays (Go Slices)]]). Then run it.
 2. Add a third measured example to `BuildMapTimings`'s sibling: time deleting all `n` keys from a fully built map one at a time, and predict whether deletion shows the same flat-ns/op shape as insertion (map deletion doesn't shrink the bucket array in Go, so predict accordingly before running).

@@ -26,6 +26,8 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
+**In plain words:** the whole product on one napkin — the few tables and the one state machine everything else hangs off.
+
 ```mermaid
 flowchart LR
     Client -->|REST + WS| API[API service]
@@ -41,7 +43,35 @@ A client calls the API over REST (or gRPC internally); every write that changes 
 
 If you read nothing else: **the invoice is the aggregate, the outbox is the only way anything leaves that aggregate's transaction, and workspace_id is non-negotiable on every row.**
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every note in this folder builds one piece of the same imaginary product: **InvoiceOps**, a small service where freelancers send invoices and get paid.
+
+This note is the blueprint of that product: what it stores, what states an invoice moves through, and in what order to build it.
+
+```mermaid
+flowchart LR
+    D[draft] --> S[sent] --> P[paid]
+    S --> O[overdue] --> P
+    D --> V[void]
+```
+
+An invoice is a row in a database that moves through a **state machine**: a fixed set of states with fixed allowed moves. Money amounts are stored as whole cents (integers), never decimals, so rounding can never lose a cent.
+
+Payments arrive as **webhooks**: the payment provider calls us when a card is charged, and the same message may arrive twice, so handling it twice must change nothing.
+
+The rest of this note is just these 4 questions:
+1. What exactly is in and out of scope, and what does the data model look like?
+2. How do the two hardest flows work (payment webhook, idempotent create)?
+3. In what order do you build it, with what "done" check per phase?
+4. How do you tell this story in an interview?
 
 **The problem in one story.** A freelancer sends a client an invoice for some work.
 The client pays online; the bank tells the freelancer's app; the invoice turns to "paid" and the dashboard updates.
@@ -86,7 +116,7 @@ Where it breaks: a shop assistant does not run two copies at once; workers can, 
 > [!tip] Remember
 > The invoice is the aggregate, the outbox is the only way out of its transaction, and `workspace_id` is on every row.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A list of Go topics without one body to hang them on teaches each topic in isolation: you can write a correct JWT middleware and a correct webhook handler and still not know how they compose, because nothing ever asked you to make a request pass through both of them against the same schema.
 
@@ -96,13 +126,13 @@ InvoiceOps is the one system every `06` note writes code against. Concretely: a 
 
 That one paragraph already touches nine of the `06` notes.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of InvoiceOps as **one ledger with three doors in**: the REST API (a human or a frontend), the payment webhook (the outside world telling you something happened), and the scheduler (time itself telling you something happened — a due date passed). All three doors write through the same rule: **one database transaction updates the invoice and appends exactly one outbox row**, and nothing downstream (a WebSocket push, an email, a metric) is allowed to be the thing that decides whether the money state changed.
 
 If the outbox write commits, the event *will* eventually be delivered, even across a crash; if it doesn't commit, nothing happened, full stop.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Scope and non-goals
 
@@ -111,6 +141,8 @@ If the outbox write commits, the event *will* eventually be delivered, even acro
 **Explicit non-goals:** multi-currency conversion (store the invoice's currency, don't convert it), multiple payment providers (the webhook handler is written so a second provider is "one more handler, same core", but only one ships), a public GraphQL API (the capstone marks it optional; see [[REST and HTTP API Design]] for why REST is the default here), partial refunds split across multiple payments (a refund voids the whole payment in this scope).
 
 ### 3.2 Data model (ERD)
+
+**In plain words:** the handful of tables and how they point at each other — every workspace owns clients, invoices and payments.
 
 ```mermaid
 erDiagram
@@ -219,6 +251,8 @@ Every table except `workspaces` itself carries `workspace_id` (directly, or via 
 
 ### 3.5 Invoice state machine
 
+**In plain words:** an invoice is only ever in one state, and only certain moves are legal — the code refuses every other move.
+
 ```mermaid
 stateDiagram-v2
     [*] --> draft
@@ -243,6 +277,8 @@ stateDiagram-v2
 The exact guarded transition function, tested against every arrow above (including the `overdue -> partially_paid` arrow the old project plan was missing), is in the worked example.
 
 ### 3.6 Payment webhook flow
+
+**In plain words:** the provider tells us "this invoice got paid"; we must record it exactly once even if they tell us three times.
 
 ```mermaid
 sequenceDiagram
@@ -309,7 +345,7 @@ Nothing in `internal/invoice` imports `net/http`, `database/sql` concrete types,
 - **Reminders via scheduler + `SKIP LOCKED` workers.** A `jobs` row of kind `reminder` is inserted with `run_at` set to some offset before `due_date`. A worker polls `SELECT ... FROM jobs WHERE run_at <= now() AND locked_at IS NULL FOR UPDATE SKIP LOCKED LIMIT 20`, which lets N worker replicas share the queue with no double-send: a row another replica already locked is invisible to this `SELECT`, not merely slower to reach. See [[Scheduled Jobs]] for the general pattern this reuses.
 - **Dashboard cache invalidated by payment events.** `GET /dashboard/summary` (counts and totals per status) reads through a Redis key keyed by `workspace_id` with a short TTL as a backstop; the outbox worker that handles `invoice.payment_received` (3.6) also issues a `DEL` on that workspace's dashboard key, so a payment is reflected on the next dashboard read rather than waiting out the TTL. Redis is never the write path for money — it only ever caches a read already committed in Postgres. See [[Redis in Go]] for the cache-aside mechanics this relies on.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The transition table and the webhook's signature-verify-dedupe-apply-outbox shape are small enough to unit test completely without a real Postgres instance (which this environment cannot run), so that is exactly what ships here: a `Money` type, the guarded `Transition` function for every arrow in 3.5, and `HandlePaymentWebhook` tested against an in-memory fake store standing in for the pgx repository.
 
@@ -801,7 +837,7 @@ Running this scratch module: `go vet ./...` is clean, and `go test -race -v ./..
 
 The suite includes `TestHandlePaymentWebhookDedupesRetry`, which delivers the same webhook 3 times and asserts `paidTotal == 50000`, not `150000` — the concrete regression test for the idempotency story in 3.6.
 
-## 5. Build phases and acceptance criteria
+## 5. Build phases and acceptance criteria 🟡
 
 ```mermaid
 flowchart LR
@@ -825,14 +861,14 @@ flowchart LR
 
 Every note that ships code should do it against this project: if a `06` note has no InvoiceOps code task attached, treat it as unfinished.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **This much structure is overkill for a weekend CRUD toy.** If the goal is "learn `net/http` routing", write 3 endpoints against an in-memory map and stop — don't build the tenancy and outbox machinery for a throwaway.
 - **Postgres-as-queue (the outbox + `SKIP LOCKED` workers) vs a real broker.** InvoiceOps chooses Postgres-as-queue for reminders and outbox dispatch because the volumes are low (one row per invoice event, not per click) and it buys exactly-once-effective delivery for free from the same transaction that already has to commit. A system with high job volume or cross-service fan-out should use a real broker instead (see [[Queues vs Streams and Broker Comparison]]) — this is an ADR decision, not a universal rule.
 - **JWT + refresh rotation vs server-side sessions.** InvoiceOps picks JWT + refresh rotation so the internal gRPC call and a future mobile client can reuse the same token without a shared session store; a single server-rendered app with no other client would be simpler with sessions (see [[Authentication and Authorization in Go]] for the full comparison).
 - **Row-level security is optional, not required.** It adds a real operational cost (every connection must set `app.workspace_id`, and a forgotten `SET` fails closed with confusing empty results, not an error) for a benefit that is pure defense-in-depth on top of an already-correct `WHERE` clause. Skip it if the team isn't ready to debug that failure mode.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** this shape (tenant-scoped ledger + webhook + outbox + worker) matches how billing systems at Stripe-style payment platforms and B2B SaaS invoicing products are built; the specific choice of Postgres-as-queue over a broker is also how small-to-mid-size services commonly start before traffic justifies a broker.
 - **Failure modes → fixes:**
@@ -841,7 +877,7 @@ Every note that ships code should do it against this project: if a `06` note has
   - A reminder job double-fires because two replicas's clocks disagree on "is it time yet" → the job claim itself (`FOR UPDATE SKIP LOCKED` on the `jobs` row) is the lock, not the clock; see [[Scheduled Jobs]].
 - **What to monitor:** webhook → status-update latency (p50/p95/p99, an SLO candidate — e.g. p95 under 2s from webhook receipt to outbox dispatch); outbox backlog depth (rows with `dispatched_at IS NULL` older than 1 minute); webhook signature-rejection rate (a spike means a secret rotated without updating config, or an attack); login rate-limit trip rate.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why the outbox pattern and not a Kafka/Debezium CDC pipeline for this scope
 
@@ -865,7 +901,7 @@ The polling outbox is strictly simpler to run and test, at the cost of a small p
 - Handler tests (`httptest`): REST endpoints against a fake repository.
 - Load test target (an estimate, not measured in this environment): the payment webhook path should sustain 50 requests/second with p99 under 300ms on modest hardware (4 vCPU, Postgres with a 20-connection pool) before the connection pool, not the handler logic, becomes the bottleneck — verify with `wrk` or `ghz` for the gRPC path per [[Testing Go Services]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does the webhook handler return 200 even when it detects a duplicate event?
 > Because the provider's retry policy stops only on a 2xx response. Returning anything else (4xx/5xx) on a duplicate tells the provider to retry a webhook that was already fully processed, which either loops forever or — worse — tempts a future change to "fix" the error by re-applying the payment.
@@ -895,7 +931,7 @@ The polling outbox is strictly simpler to run and test, at the cost of a small p
 > [!question]- What would you change if InvoiceOps needed to support a second payment provider tomorrow?
 > Keep `VerifySignature` and the core `HandlePaymentWebhook` logic provider-agnostic (already true: it takes a secret and a body, not a provider name), add a second thin HTTP handler that maps that provider's payload into the same `WebhookEvent`/`Money` shapes, and extend the `webhook_events` unique key's `provider` column (already present) to disambiguate event ids across providers.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - One system, three doors in: REST/gRPC API, payment webhook, scheduler — all three write through one DB transaction plus one outbox row.
 - Every tenant-owned table carries `workspace_id`; every query filters on it; RLS is an optional second layer, not a replacement.
@@ -906,7 +942,7 @@ The polling outbox is strictly simpler to run and test, at the cost of a small p
 - Build order: setup → REST core → database/tx → auth/tenancy → async (jobs + webhook) → realtime + advanced APIs → production hardening.
 - ADRs you should be able to defend out loud: Postgres-as-queue vs a broker; JWT+refresh vs sessions.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Backend Request Lifecycle and Layering]], [[Service Project Layout and Wiring]], [[Configuration and Secrets]]
 - **Every 06 note this capstone exercises:** [[HTTP Server Fundamentals (net-http)]] · [[Building REST Endpoints]] · [[Request Decoding, Validation and DTOs]] · [[Middleware]] · [[OpenAPI-First Development in Go]] · [[Database Access (database-sql, pgx, sqlc)]] · [[Transactions and the Repository Pattern]] · [[Schema Migrations in Go Services]] · [[Testing Go Services]] · [[Authentication and Authorization in Go]] · [[Calling External APIs]] · [[Redis in Go]] · [[Background Workers and Job Queues]] · [[Scheduled Jobs]] · [[Receiving Webhooks Idempotently]] · [[File Uploads and Object Storage]] · [[Observability in Go Services]] · [[Graceful Shutdown and Health Checks]] · [[TLS, HTTPS and HTTP2 in Go Servers]] · [[Containerizing Go Services]] · [[Secure Coding for Go Services]] · [[gRPC Services in Go]] · [[gRPC Streaming in Go]] · [[Serving REST and gRPC Together]] · [[WebSockets and SSE in Go]]

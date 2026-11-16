@@ -19,7 +19,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code demonstrates the two transports side by side: a plain UDP echo exchange that times out silently on loss, and a QUIC connection carrying two independent streams over loopback, proving that a large, slow stream never blocks a small, fast one. See the theory in [[UDP and QUIC]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the "From zero" paragraph below, then "Before the code", "What this code shows" and Setup. Stop there.
+> - 🟡 **Know the basics?** Read the Code and Tests sections top to bottom; each block has a plain-words opener first.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero** 🟢 — This file is the hands-on twin of [[UDP and QUIC]]. It shows, in runnable Go, the two ideas from the theory note: first a plain UDP client that sends a packet and only learns about failure by waiting and giving up (no error ever comes back), then a QUIC server where two downloads share one connection but a big slow one never delays a tiny fast one. Read each "In plain words" line before its code block, and you can follow along without knowing Go deeply.
+
+## Before the code 🟢
 
 - **`net.UDPConn`**: the standard library's UDP socket; `ReadFromUDP` / `WriteToUDP` send and receive single datagrams.
 - **Deadlines (`SetReadDeadline`)**: make a blocking read give up after a time limit; the only way a UDP client learns a reply is missing.
@@ -28,7 +35,7 @@ updated: 2026-11-13
 - **`sync.WaitGroup`**: lets the test wait until all goroutines finish.
 - **Run it:** the commands in Setup below (`go vet ./...` and `go test -race ./...`); needs the `quic-go` module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Theory section |
 | --- | --- | --- |
@@ -38,7 +45,7 @@ updated: 2026-11-13
 | `RunQUICEchoServer`, `OpenStreamAndEcho` | Independent streams on one connection, each served in its own goroutine | [[UDP and QUIC#QUIC reliable streams multiplexed over UDP]] |
 | `TestQUICStreamsAreIndependent` | A 64 KB stream never blocks a 25-byte stream on the same connection | [[UDP and QUIC#QUIC reliable streams multiplexed over UDP]] |
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `udpquic`, with `udp.go`, `quic.go` and `udpquic_test.go` in one directory.
 - **Go version:** 1.24.
@@ -52,9 +59,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### UDP: echo and a timing-out client
+
+**In plain words:** two tiny functions — a server that bounces back whatever one packet it gets, and a client that sends one packet and waits. If no reply comes, the client's only clue is its own stopwatch running out.
 
 ```go
 package udpquic
@@ -135,6 +144,8 @@ sequenceDiagram
 ```
 
 ### QUIC: a self-signed TLS config and an echo server with independent streams
+
+**In plain words:** QUIC refuses to run without encryption, so the demo first makes a throwaway certificate in memory. Then the server gives every incoming stream its own worker, so no stream ever queues behind another — that is the whole head-of-line-blocking fix, in code.
 
 ```go
 package udpquic
@@ -264,6 +275,8 @@ sequenceDiagram
 ```
 
 ### Wiring the listener and dialer
+
+**In plain words:** the glue — one function opens a door on a random local port, the other knocks on it. The "skip verify" flag only exists because our certificate is homemade; real code never uses it.
 
 ```go
 // Listen starts a QUIC listener on a loopback UDP port with the demo's
@@ -424,7 +437,7 @@ func Dial(ctx context.Context, addr string) (quic.Connection, error) {
 > }
 > ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -433,7 +446,7 @@ func Dial(ctx context.Context, addr string) (quic.Connection, error) {
 | `DialUDP` (connected) for the UDP client | `ListenUDP` and filter manually | `DialUDP` filters incoming datagrams by source address for free, avoiding a stray datagram from an unrelated source being misread as the reply |
 | `SetReadDeadline` for the UDP timeout | No deadline, rely on an external context cancellation | A deadline on the socket itself is simpler and doesn't need a second goroutine racing the read |
 
-## Tests
+## Tests 🟡
 
 ### TestUDPNoReplyTimesOut
 
@@ -534,14 +547,14 @@ PASS
 ok  	udpquic	1.950s
 ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Forgetting `SetReadDeadline` on the UDP client** would make `Read` block forever on a lost reply, since UDP never delivers an asynchronous "this failed" notification the way TCP's RST does.
 - **Reusing a 1500-byte buffer across concurrent calls without per-call allocation** would be a data race if the same `EchoUDP` connection were ever read from two goroutines at once; this code sidesteps it by allocating a fresh buffer per call.
 - **Closing the whole QUIC connection instead of one stream** when only one logical exchange is done would tear down every other in-flight stream too — `stream.Close()` (half-close on one stream) versus `conn.CloseWithError` (the whole connection) are not interchangeable.
 - **Skipping certificate verification (`InsecureSkipVerify: true`) outside a test** is a pitfall specific to this demo: it exists solely because the certificate is self-signed, and must never be copied into production code — see [[TLS and HTTPS]].
 
-## Exercises
+## Exercises 🔴
 
 1. Modify `TestQUICStreamsAreIndependent` to introduce an artificial delay in the server's handling of stream A only (for example, `time.Sleep` before the `io.Copy` for the first stream accepted). Predict whether stream B's goroutine still completes quickly, then run it and confirm.
 2. Change `EchoUDP` so it returns an error when `conn.ReadFromUDP` succeeds but the datagram is empty (`n == 0`), and write a test that sends a zero-length UDP datagram to prove the new error path is reached. Predict first whether a zero-length UDP datagram is even distinguishable from "no datagram at all" at this layer.

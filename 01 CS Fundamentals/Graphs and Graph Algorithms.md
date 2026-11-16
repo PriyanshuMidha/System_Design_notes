@@ -21,7 +21,45 @@ updated: 2026-11-13
 > - **Dijkstra** finds shortest weighted paths using a min-heap frontier, same shape as [[Heaps and Priority Queues]].
 > - **Topological sort** only exists for a DAG (directed, acyclic graph) — if there's a cycle, there's no valid order.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how each algorithm works), 4 and 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Think of a city map. The corners are points, and the streets join them.
+
+In computer terms the points are called **vertices** and the connections are **edges**. Points plus connections together make a **graph**.
+
+```mermaid
+flowchart LR
+    H((Home)) --- S((Shop))
+    S --- P((Park))
+    H --- P
+    P --- F((Friend))
+```
+
+Lots of real things are secretly this picture: friends on a social app, roads, which package needs which other package.
+
+Every algorithm in this note is just a careful way of walking that picture without getting lost or going in circles.
+
+Walk it level by level and you find the route with the fewest hops. Put travel times on the streets and walk "closest first", and you find the fastest route.
+
+```mermaid
+flowchart LR
+    A["Question about<br/>connected things"] --> B["Draw it as a graph"]
+    B --> C["Walk it with the<br/>right recipe"]
+    C --> D["Answer: route, order,<br/>or 'there is a loop'"]
+```
+
+That is the whole topic. The rest of this note is just these 4 questions:
+1. How do you store a graph in memory? (adjacency list vs matrix)
+2. How do you walk it? (BFS level by level, DFS deep first)
+3. How do you find the fastest route when streets have costs? (Dijkstra)
+4. How do you order things that depend on each other, and spot loops? (topological sort, cycle detection, union-find)
 
 **The problem in one story**
 
@@ -72,7 +110,7 @@ Where it breaks: real traffic changes every minute, but graph algorithms assume 
 > [!tip] Remember
 > Graph = things (vertices) + connections (edges); every algorithm here is just a disciplined way to walk them.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you're building a package manager: package A depends on B and C, B depends on D, and you need to install everything in an order where every dependency comes before the package that needs it.
 
@@ -85,7 +123,7 @@ Both are graphs, and both have a standard, well-understood algorithm: topologica
 > [!tip] Remember
 > A tree is a special case of a graph (no cycles, exactly one path between any two vertices). Reach for graph algorithms the moment "depended on by many" or "can get back to where you started" is true of your data.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A graph is a map of "what connects to what."
 
@@ -97,7 +135,7 @@ Most of this note is "how do you walk this map systematically" (BFS/DFS) and "ho
 
 Routing services handle this by re-running the algorithm on a fresh snapshot rather than mutating state mid-traversal.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Terms
 
@@ -284,9 +322,11 @@ flowchart TD
 
 The full analysis of path compression's amortized cost, and the related ordered-structure problem skip lists solve, live in [[Union-Find and Skip Lists]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** if you can draw an adjacency list and walk it with a queue, you can rebuild everything else in this note on a whiteboard.
 
 The bare mechanism — adjacency list plus BFS — needs only the shape of the two core types to picture the rest of this note:
 
@@ -299,7 +339,7 @@ Every algorithm above (BFS, DFS, cycle detection, topological sort, Dijkstra, Kr
 
 Tracing Dijkstra on that sample graph by hand is exactly the sequence diagram above; the Go tests assert the same result (`dist = {0:0, 1:1, 2:4, 3:3}`) under `go test -race`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Algorithm | Finds | Requires | Cost |
 |---|---|---|---|
@@ -312,7 +352,7 @@ Tracing Dijkstra on that sample graph by hand is exactly the sequence diagram ab
 | Kruskal's (MST) | Minimum spanning tree | Undirected, weighted | O(E log E) (dominated by the sort) |
 | Union-find | Connected components, cycle checks | — | Near O(1) amortized per op (see [[Union-Find and Skip Lists]]) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - BFS/DFS visit every reachable vertex and edge — `O(V+E)` — there's no way to do better if you genuinely need to explore the whole reachable graph.
 - Dijkstra breaks silently wrong (not a crash, just an incorrect answer) on negative edge weights, because it commits to a vertex's shortest distance as soon as it's popped from the heap. Use Bellman-Ford if negative weights are possible.
@@ -324,7 +364,7 @@ Tracing Dijkstra on that sample graph by hand is exactly the sequence diagram ab
 >
 > Because it already finalized that vertex's distance before the negative edge had a chance to offer a cheaper path through it. This is the single most common "my shortest-path code is wrong but I don't see why" bug in practice.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Facebook's TAO (the social graph serving layer) and Neo4j (a dedicated graph database) store and query relationship data as a graph natively, rather than reconstructing it from SQL joins every time.
@@ -339,9 +379,11 @@ Tracing Dijkstra on that sample graph by hand is exactly the sequence diagram ab
 	- A dependency graph with an accidental cycle (circular imports, circular service calls) has no valid topological order → detect the cycle (Kahn's algorithm reports it directly: `len(order) < V`) and surface it as a build/deploy error instead of silently picking an arbitrary order.
 - **What to monitor:** for a routing or dependency service, query latency as the graph grows (does it stay near `O(log V)`-ish per lookup, or does it degrade toward `O(V)`?), and the depth/size of DFS recursion on production data, not just test fixtures.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why Dijkstra needs non-negative weights
+
+**In plain words:** Dijkstra works like paying for petrol — costs only ever add up, never come back. A negative edge is like a street that pays *you* to drive it, and that breaks the "closest first is final" promise.
 
 Dijkstra's correctness proof relies on **greedy finalization**.
 
@@ -349,9 +391,19 @@ Once a vertex is popped from the frontier with the smallest tentative distance, 
 
 A negative edge breaks that argument: a path through a vertex with a *larger* current tentative distance could still end up cheaper overall if it crosses a negative edge later.
 
+```mermaid
+flowchart LR
+    S((S)) -- 1 --> A((A))
+    S -- 5 --> B((B))
+    B -- "-10" --> A
+    note["Dijkstra finalises A at cost 1,<br/>but S→B→A is really -5"]
+```
+
 Bellman-Ford instead relaxes every edge up to `V-1` times, never assuming any distance is final until the last pass, which is why it tolerates negative weights (and can detect negative cycles: if a `V`-th pass still finds an improvement, a negative cycle exists).
 
 ### Path compression's effect on union-find's complexity
+
+**In plain words:** every time you ask "which group is this in?", union-find flattens the chain it just walked, so the next ask is almost instant — like writing the boss's name on everyone's desk after asking up the chain once.
 
 Naive union-find (no path compression, no union by rank) can degrade to `O(n)` per `Find` in the worst case — a tall, unbalanced tree of parent pointers.
 
@@ -365,6 +417,8 @@ The fuller treatment, including the related ordered-structure problem skip lists
 
 ### BFS vs. DFS for cycle detection
 
+**In plain words:** to spot a loop in a one-way graph, you need to know who is on your *current* path, not just who you have ever seen — and DFS tracks exactly that.
+
 BFS can detect cycles in an undirected graph (a visited neighbor that isn't your immediate parent means a cycle) but is awkward for directed cycle detection, because "already visited" doesn't distinguish "visited on this path" from "visited on a completely different branch that happens to share a descendant."
 
 DFS's three-color scheme makes that distinction explicit (gray = on the current path), which is why directed cycle detection is conventionally taught with DFS, not BFS.
@@ -377,7 +431,7 @@ DFS's three-color scheme makes that distinction explicit (gray = on the current 
 - **Network delay time** (Dijkstra from the broadcasting node; the answer is the maximum distance across all reachable nodes, or -1 if some node is unreachable).
 - **Word ladder** (BFS over an implicit graph where words are vertices and an edge connects two words differing by one letter — shortest transformation sequence is a shortest-path-by-edge-count problem.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When does BFS give you the shortest path, and when does it not?
 > BFS gives the shortest path by **edge count** on an unweighted graph, because it explores strictly level by level. On a weighted graph it can return a path with more total weight than the true shortest one — Dijkstra (or BFS variants like 0-1 BFS for only two distinct weights) is needed instead.
@@ -397,7 +451,7 @@ DFS's three-color scheme makes that distinction explicit (gray = on the current 
 > [!question]- What does union-find give you that BFS/DFS from scratch wouldn't, for Kruskal's algorithm?
 > A near-O(1) amortized "are these two vertices already connected" check, maintained incrementally as edges are added — re-running BFS/DFS from scratch after every edge to check connectivity would cost O(V+E) per edge, turning an O(E log E) algorithm into O(E(V+E)).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Representations: adjacency list (sparse, default, O(V+E) space) vs. adjacency matrix (dense, O(1) edge check, O(V²) space).
 - BFS = queue, level by level, shortest path by edge count on unweighted graphs. O(V+E).

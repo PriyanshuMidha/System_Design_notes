@@ -19,12 +19,21 @@ updated: 2026-11-13
 
 # Replication - Go
 
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "How to read this note" and Step 3 (the whiteboard version). Stop there.
+> - 🟡 **Know the basics?** Add the Code steps 4-7 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Replication]]. It builds one small Go program: a **read router** that decides, for every database read, whether to use a replica (fast) or the primary (always fresh). The trick is a bookmark: every write gets a position number from the database's change log, and a read may use a replica only if that replica has caught up past the bookmark. Read it top to bottom: setup commands first, then the code in seven small steps (each step is a short Concept, the code, then a numbered walkthrough), then the tests that prove it works. If you only want the idea, Step 3 is the whole thing in a dozen lines.
+
 > [!summary] TL;DR
 > A read router in Go that keeps read-your-writes on asynchronous PostgreSQL replicas: it parses WAL positions (LSNs), tracks each replica's replay position, and only sends a read to a replica that has replayed past the user's last write, as explained in [[Replication]].
 >
 > The router logic is tested under `go test -race`; the pgx calls need a live PostgreSQL 17 cluster and are verified to compile only.
 
-## Before the code
+## Before the code 🟢
 
 - **Generics**: `Router[T any]` and `Replica[T any]` work for any connection type, so tests use `string` and production uses `*pgxpool.Pool`.
 - **Atomics**: each replica's replay position is read and written with `sync/atomic`, so the poller and readers never race.
@@ -33,7 +42,7 @@ updated: 2026-11-13
 - **`time.Ticker`**: fires on a fixed interval to refresh replay positions.
 - **Run**: `go mod tidy`, then `go vet ./... && go test -race -v ./...`; the tests need no database.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Replication]] |
 | --- | --- |
@@ -68,14 +77,14 @@ sequenceDiagram
     RT-->>H: replica with replay >= token, else primary
 ```
 
-## Setup
+## Setup 🟢
 
 - Module `rwsplit` with `rwsplit.go`, `rwsplit_test.go`, and a sub-package `wb/` for the whiteboard version.
 - Go 1.24 and `github.com/jackc/pgx/v5` v5.8.0 (for `pgxpool`). Run `go mod tidy` after creating the module.
 - Run: `go vet ./... && go test -race -v ./...`
 - The tests use the generic `Router[string]` and need no database. `WriteToken` and `PollReplay` need PostgreSQL 17 and are checked by compilation only.
 
-## How to read this note
+## How to read this note 🟢
 
 The note has two halves. The first is operational SQL and shell commands (create a slot, take a base backup, read lag, set up logical replication), which you run against a real cluster. The second is the Go read router, which you can run anywhere.
 
@@ -93,9 +102,11 @@ flowchart LR
     D -->|"no replica qualifies"| PR["read from primary"]
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: replica setup commands
+
+**In plain words:** two commands to give the primary a new copy: first tell it "save your change diary for a new reader", then clone the whole data folder onto the new machine.
 
 **Concept.** A physical replica is a byte-for-byte copy of the primary that replays the primary's write-ahead log ([[Replication#3.1 PostgreSQL streaming replication]]).
 
@@ -136,6 +147,8 @@ sequenceDiagram
 ```
 
 ### Step 2: monitoring and tuning SQL
+
+**In plain words:** these queries answer two questions by hand: how far behind is each copy, and how much diary is the primary hoarding for readers that may be gone?
 
 **Concept.** Replication needs measurement. The primary tracks each connected replica in `pg_stat_replication`, with the byte lag and three time lags (write, flush and replay), and tracks slots in `pg_replication_slots` ([[Replication#3.3 Measuring lag]]).
 
@@ -192,6 +205,8 @@ CREATE SUBSCRIPTION invoiceops_sub
 
 ### Step 3: the whiteboard version
 
+**In plain words:** the whole router in a dozen lines: walk the replica list and return the first one that has caught up past your bookmark, otherwise answer "primary".
+
 **Concept.** The bare read-your-writes idea from [[Replication#Whiteboard version]]: remember the WAL position (LSN) where the user's write ended, and read only from a replica that has replayed that far. It fits in a dozen lines because it ignores concurrency, parsing and polling. It is the model to draw in an interview before the full version.
 
 ```go
@@ -226,6 +241,8 @@ func pickForRead(replicas []Replica, token LSN) string {
 The full version adds LSN parsing, a background poller, round-robin, concurrency safety, and tests.
 
 ### Step 4: parse and print LSNs
+
+**In plain words:** the bookmark positions come from Postgres as text like `16/B374D848`; this step turns them into plain numbers so "is A past B" is a normal comparison.
 
 **Concept.** PostgreSQL prints an LSN as two hexadecimal numbers separated by a slash, the high and the low 32 bits, such as `16/B374D848` ([[Replication#3.3 Measuring lag]]). The numbers are not zero-padded, so as text `16/FFFFFF` sorts after `16/1000000` even though it is the smaller position.
 
@@ -294,6 +311,8 @@ The last two rows show why strings must not be compared: as text `16/FFFFFF` is 
 
 ### Step 5: a replica that never moves backwards
 
+**In plain words:** each replica remembers the newest position it was seen at, and the code makes sure that memory can only move forward, even when many goroutines update it at once.
+
 **Concept.** Each replica carries the last replay position seen by a poller, and several goroutines may update it.
 
 The position must never move backwards, because a stale value that overwrote a newer one would make a replica look further behind than it is, and a stale value that looked further ahead would break read-your-writes.
@@ -344,6 +363,8 @@ sequenceDiagram
 ```
 
 ### Step 6: the router
+
+**In plain words:** given a bookmark, try the replicas in rotating order and use the first one that has caught up; if none has, use the primary, which always has everything.
 
 **Concept.** The router decides, for each read, which connection to use. A read that carries a token goes to a replica whose replay position is at least that token; a session that never wrote passes 0 and may use any replica.
 
@@ -409,6 +430,8 @@ flowchart TD
 
 ### Step 7: the database calls
 
+**In plain words:** two tiny SQL calls glue it to real Postgres: one asks the primary "where does the diary end right now?" after a write, the other keeps asking each replica "how far have you read?".
+
 **Concept.** Two small functions connect the router to PostgreSQL. After a write commits, `WriteToken` reads the primary's current WAL insert position; this is never behind the commit record, so a replica that has replayed it has certainly replayed the write ([[Replication#The stale read]]).
 
 `PollReplay` runs in a goroutine and refreshes a replica's replay position every interval.
@@ -468,7 +491,7 @@ func PollReplay(ctx context.Context, rep *Replica[*pgxpool.Pool], every time.Dur
 4. The `select` waits for the next tick or for `ctx.Done()`, so cancelling the context stops the goroutine cleanly.
 5. A caller starts one goroutine per replica: `go PollReplay(ctx, rep, 100*time.Millisecond)`.
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -482,7 +505,7 @@ func PollReplay(ctx context.Context, rep *Replica[*pgxpool.Pool], every time.Dur
 | Poll errors ignored | Mark the replica unhealthy | The router stays simple; a dead replica silently stops qualifying |
 | Physical slot per replica | `wal_keep_size` only | The primary never recycles needed WAL; a stuck slot can fill the disk |
 
-## Tests
+## Tests 🟡
 
 ### Helper: `lsn`
 
@@ -649,7 +672,7 @@ func TestPickForRead(t *testing.T) {
 
 **If it fails.** `r1` for token 15 means the comparison is reversed; anything other than `primary` for token 25 means the fallback is missing.
 
-## Running it
+## Running it 🟢
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -676,7 +699,7 @@ ok  	rwsplit	1.461s
 4. `ok rwsplit 1.461s` is the package total. Most of the time is compiling with the race detector, not running tests.
 5. `go vet` prints nothing when it is clean. The `wb` package has its own `ok` line with `TestPickForRead`.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`WriteToken` is not the commit LSN.** It returns the insert position at the time of the call, which may be slightly ahead of your commit. That is safe (reads wait a little longer) but never use it as a precise commit position.
 - **Keep the maximum in the session.** Two writes in a row must leave the larger token. Overwriting with a smaller value from a different pooled connection reintroduces stale reads.
@@ -686,7 +709,7 @@ ok  	rwsplit	1.461s
 - **`ForRead(0)` ignores freshness.** Only sessions that never wrote may pass 0.
 - **Monotonic reads are not covered.** The router fixes read-your-writes; pin sessions to a replica, or also keep the highest LSN the session has seen, to stop reads going backwards ([[Replication#Monotonic reads, traced]]).
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestReadYourWrites`, make `replica-1` also reach `16/B374D848`. Predict which replicas the ten token reads return, then run it.
 2. Change `ForRead` to skip the round-robin and always start at index 0. Predict which assertion in `TestReadYourWrites` fails.

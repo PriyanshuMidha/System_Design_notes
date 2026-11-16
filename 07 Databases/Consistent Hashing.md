@@ -25,7 +25,41 @@ updated: 2026-11-13
 > - Virtual nodes (many points per server) even out the load and spread a failed server's keys across all the others.
 > - Classic mistake: thinking it fixes hot keys. One very popular key still lands on one server.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You run a website and have too much data for one computer. So you use several computers, called **nodes**, and you need a rule that says which node holds which piece of data.
+
+The obvious rule is: turn the data's name into a number (a **hash**) and take the remainder after dividing by the number of nodes.
+
+```mermaid
+flowchart LR
+    K["key 'user:42'"] -->|"hash, then % 4"| S["server number 2"]
+```
+
+The obvious rule has a nasty surprise. Add one more computer and the remainders all change, so almost every piece of data is suddenly on the "wrong" machine.
+
+Consistent hashing is a smarter rule. Imagine a clock face. Put every node somewhere on the clock, and every key too. Each key belongs to the next node going clockwise.
+
+```mermaid
+flowchart LR
+    K["key"] --> R["spot on the clock"]
+    R -->|"walk clockwise"| N["first node you meet owns it"]
+```
+
+Now add a node: it only takes the keys just behind it on the clock. Everyone else keeps their data. That is the whole trick.
+
+The rest of this note is just these 4 questions:
+1. Why does the obvious `%` rule break so badly? (section 1)
+2. How does the clock trick actually work in code? (sections 2-3)
+3. What are the other ways to do this, and when to pick each? (section 5)
+4. What goes wrong in real systems, and in interviews? (sections 6-9)
 
 **The problem in one story.**
 You have 4 cache servers and put each key on server `hash(key) % 4`.
@@ -67,7 +101,7 @@ Where it breaks: one house that gets a million letters (a hot key) still overloa
 > [!tip] Remember
 > Put servers and keys on one circle; each key goes to the next server clockwise, so a change moves only one arc.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 You have 4 cache servers and pick one per key with `server = hash(key) % 4`. Traffic grows, you add a 5th server, and the formula becomes `hash(key) % 5`.
 
@@ -78,6 +112,8 @@ For a database, it means moving 80% of your data to add one machine.
 Consistent hashing makes the same change move only the new server's fair share: about 20%.
 
 ### 1.1 The modulo trap, with numbers
+
+**In plain words: when the divisor changes, almost every remainder changes — like renumbering all the houses on a street because one new house was built.**
 
 Take the hash values 0 to 19 and see where each lands before and after the fifth server arrives.
 
@@ -111,7 +147,7 @@ flowchart LR
     before -- "16 of 20 keys change server" --> after
 ```
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a clock face numbered from `0` to `2^64 − 1`.
 
@@ -123,9 +159,11 @@ Adding a server only steals keys from the arc just behind it. Every other key ke
 
 Analogy: a circular road with petrol stations. Each house (key) drives clockwise to the first station. A new station only takes customers from the stretch of road just before it; nobody else changes stations.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 The ring is a sorted array
+
+**In plain words: there is no magic circle in the computer — just a sorted list of numbers that pretends its end connects back to its start.**
 
 A ring is just a **sorted array of positions** that wraps around at the end:
 
@@ -144,6 +182,8 @@ flowchart LR
 `order:9` sits at 252. No node exists at or after 252, so the lookup wraps to the start and lands on A.
 
 ### 3.2 Lookup is a binary search
+
+**In plain words: finding a key's owner is like finding the next bus stop after your position on a sorted timetable — jump to the right spot, and if you ran off the end, go back to the first stop.**
 
 | Step | What happens | Toy example: `order:9` |
 | --- | --- | --- |
@@ -208,6 +248,8 @@ Removal is the reverse: the node's arc goes to its clockwise successor. If E lea
 
 ### 3.5 Virtual nodes
 
+**In plain words: instead of giving each server one seat at the round table, give it 200 seats scattered around — luck evens out, and so does the load.**
+
 With one point per server, arcs come out uneven (one server can own half the ring by luck), and when a server dies its whole arc lands on a single neighbour. The fix is to give each server many points, called **virtual nodes** (vnodes): `A#0, A#1, …, A#199`.
 
 ```mermaid
@@ -225,6 +267,8 @@ flowchart LR
 A server with twice the capacity simply gets twice as many vnodes.
 
 ### 3.6 When a node dies, vnodes spread its load
+
+**In plain words: a dead server's work gets split among many neighbours instead of dumped on one — like a closed shop whose customers scatter to several nearby shops.**
 
 If B dies, each of its three arcs passes to the vnode that follows it clockwise.
 
@@ -253,6 +297,8 @@ flowchart TB
 
 ### 3.7 Replication uses the next distinct nodes
 
+**In plain words: to keep spare copies of a key, keep walking clockwise and hand a copy to the next few *different* servers you meet.**
+
 Dynamo-style stores keep each key on the first `R` **distinct physical** nodes clockwise (the "preference list"). Extra vnodes of a node that was already chosen are skipped.
 
 ```mermaid
@@ -263,7 +309,7 @@ flowchart LR
     V3 --> V4["B#1 @ 190: node B, 3rd replica"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -309,7 +355,9 @@ Two lessons: vnodes even out the load, and the **hash function matters**. CRC32 
 
 Runnable Go version: [[Consistent Hashing - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words: the ring is only one way to "move few keys when servers change" — there are five or six recipes, and each shines in a different situation.**
 
 | Scheme                          | How it works                                                                     | Use when                                                                                   | Cost                                                                    |
 | ------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
@@ -336,6 +384,8 @@ flowchart TD
 
 ### 5.1 Bounded loads
 
+**In plain words: give every server a "full" sign — when its queue hits the cap, the next customer just walks on to the next server.**
+
 Plain ring hashing balances keys but not traffic. Bounded loads give every node a cap of `⌈(1 + ε) × average⌉`; a key whose node is full continues clockwise to the next node with room.
 
 ```mermaid
@@ -354,14 +404,14 @@ sequenceDiagram
 > [!warning] Interview trap
 > Redis Cluster does **not** use consistent hashing. It uses 16,384 fixed hash slots. Use hash tags such as `{user:42}:cart` to keep related keys in one slot.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - It balances **keys, not traffic**. One viral key still lands on one node.
 - Membership must be agreed on. Two clients with different views of the ring send the same key to different nodes.
 - Range queries suffer: hashing scatters neighbouring keys, so `WHERE id BETWEEN …` hits every node. Use range partitioning when range scans dominate.
 - With a fixed, rarely changing set of shards, plain `hash % N` or jump hash is simpler and just as good.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Akamai's CDN (the 1997 paper's original use case).
@@ -381,6 +431,8 @@ sequenceDiagram
 
 ### 7.1 A membership change in a cache fleet
 
+**In plain words: servers joining or leaving go through stages, like an employee being onboarded or marked absent — nobody flips a switch instantly.**
+
 ```mermaid
 stateDiagram-v2
     [*] --> Stable
@@ -393,7 +445,7 @@ stateDiagram-v2
     Removed --> Stable: successors serve the arcs, repair restores replicas
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **How many vnodes?** Each node's share is a sum of `V` random arcs, so its load varies by roughly `1/√V`: 100 vnodes gives about ±10%. More vnodes means smoother load, but more metadata and more overlap between nodes' replicas. With 256 vnodes, almost any two failed nodes share some ranges. That is part of why Cassandra 4.0 lowered its default to 16 and added a token-allocation algorithm that keeps load even with few tokens.
 - **Hash quality.** Ring position is decided mostly by the high bits of the hash. CRC32 is a linear checksum, and FNV-1a mixes the last bytes of its input poorly into its high bits. So similar inputs (`cache-a#1`, `cache-a#2`, `user:41`, `user:42`) can land in clumps. Use a well-mixed hash: SHA-256 or MD5 (ketama uses MD5) for simplicity, xxHash or Murmur3 for speed. Then measure with your own keys.
@@ -401,7 +453,7 @@ stateDiagram-v2
 - **Bounded loads.** Give every node a capacity of `⌈(1 + ε) × average⌉`. A key whose node is full walks clockwise to the next node with room. Vimeo shipped this in HAProxy and cut cache bandwidth sharply.
 - **Weighted nodes.** Give a node vnodes in proportion to its capacity. For rendezvous hashing, use the weighted form: pick the node with the highest `-w / ln(hash01(node, key))`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not just use `hash(key) % N`?
 > Changing N remaps about `N/(N+1)` of all keys (80% when going from 4 to 5 nodes). For a cache that means a miss storm. For a database it means moving almost all the data. A ring moves about `1/(N+1)`.
@@ -421,7 +473,7 @@ stateDiagram-v2
 > [!question]- Ring, rendezvous, or jump hash: which would you pick?
 > Pick the ring with vnodes as the general default. Pick rendezvous when there are few nodes and you want simple code without a ring. Pick jump hash for numbered shards that only grow or shrink at the end, with no memory overhead.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `hash % N` remaps ~`N/(N+1)` of keys on resize; a ring remaps ~`1/(N+1)`.
 - Ring = sorted array of points, binary search, wrap to index 0.
@@ -431,7 +483,7 @@ stateDiagram-v2
 - It balances keys, not traffic: hot keys need their own fix.
 - Redis Cluster uses 16,384 hash slots, not a ring.
 
-## Links
+## Links 🟢
 
 - **Go implementation:** [[Consistent Hashing - Go]]
 - **Before this:** [[Hash Tables and Go Maps]], [[Partitioning and Sharding]]

@@ -17,7 +17,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > A Go package demonstrating the growth formula, insert/delete, row-major 2-D indexing, and five classic array/slice interview patterns from [[Arrays and Dynamic Arrays (Go Slices)]], all backed by passing tests.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Running it". You do not need to understand every line yet.
+> - 🟡 **Know the basics?** Work through the Code steps 1-4 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the runnable half of [[Arrays and Dynamic Arrays (Go Slices)]]. The theory note explains slices in words and pictures; this one proves the same ideas with real Go code and passing tests. Read it top to bottom: each "Step" shows a small piece of code, then explains it line by line. If a code block looks scary, read the bolded plain-words line above it and the numbered "How it works" list below it — the code is just those sentences written in Go.
+
+## Before the code 🟢
 
 - **Slices** (`[]int`): Go's growable list, a header (`ptr`, `len`, `cap`) over a backing array.
 - **`append` and `copy`**: built-ins that grow a slice and move elements; `copy` handles overlapping ranges safely.
@@ -26,7 +35,7 @@ updated: 2026-11-13
 - **Closures** (`canFinish := func(...)`): a function value that can read local variables like `piles` and `h`.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines or interfaces are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Arrays and Dynamic Arrays (Go Slices)]] |
 | --- | --- |
@@ -36,14 +45,16 @@ updated: 2026-11-13
 | `TestAliasing` | Two slices sharing a backing array, and the full slice expression that stops it, [[Arrays and Dynamic Arrays (Go Slices)#Aliasing: two tickets, one lot]] |
 | `TwoSumSorted`, `MaxWindowSum`, `PrefixSums`/`RangeSum`, `MaxSubArray`, `MinEatingSpeed` | The five classic interview patterns the theory note's cheat sheet points to here |
 
-## Setup
+## Setup 🟢
 
 - Module `arrdyn`, Go 1.24, standard library only, two files of production code (`slice.go`, `patterns.go`) and two test files.
 - Run: `go vet ./... && go test -race -v ./...`
 
-## Code
+## Code 🟡
 
 ### Step 1: the growth formula
+
+**In plain words:** this function answers one question — when a slice runs out of room, how big should the new row of boxes be? Double it when small, grow more gently when big.
 
 **Concept.** [[Arrays and Dynamic Arrays (Go Slices)#append and growth, step by step]] describes `append`'s growth rule in words; `NextCap` is that rule as a function, so it can be tested against the measured table directly instead of trusting the description alone.
 
@@ -90,6 +101,8 @@ flowchart LR
 
 ### Step 2: insert, delete and 2-D indexing
 
+**In plain words:** to squeeze a value into the middle of a packed row, everything after it has to shuffle one spot over — like people sliding down a full bench to make room.
+
 **Concept.** `Insert` and `Delete` are the code form of the "shift the elements after the gap" picture in [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example]]: there's no way to make or close a gap in contiguous memory without moving everything on one side of it.
 
 `RowMajorIndex` is the one-line arithmetic behind the flat-array 2-D layout diagram in the same section.
@@ -133,6 +146,8 @@ func RowMajorIndex(row, col, width int) int {
 4. `RowMajorIndex` is pure arithmetic: row `r`, column `c`, width `w` maps to flat index `r*w + c` — row 0 occupies indices `0..w-1`, row 1 occupies `w..2w-1`, and so on.
 
 ### Step 3: aliasing and the full slice expression
+
+**In plain words:** this test proves that two slices can secretly share the same memory, so writing through one changes the other — and shows the one-line trick that stops it.
 
 **Concept.** This test is the proof, not just the description, of [[Arrays and Dynamic Arrays (Go Slices)#Aliasing: two tickets, one lot]]: two slices sharing a backing array really do see each other's writes, and `s[low:high:max]` really does stop that by pinning capacity so the next `append` is forced onto a new array.
 
@@ -179,6 +194,8 @@ flowchart LR
 ```
 
 ### Step 4: the five interview patterns
+
+**In plain words:** five famous interview tricks, all built on the same fact — a slice lets you jump to any index instantly and scan forward cheaply.
 
 **Concept.** These five functions are what [[Arrays and Dynamic Arrays (Go Slices)]]'s cheat sheet calls "the five classic patterns" — two pointers, sliding window, prefix sums, Kadane's algorithm, and binary search on the answer.
 
@@ -354,7 +371,7 @@ func MinEatingSpeed(piles []int, h int) int {
 3. The loop is a standard binary search over `[lo, hi]`, except the thing being tested is "is this speed fast enough," not "does this element equal the target."
 4. When the loop ends, `lo == hi` is the smallest speed for which `canFinish` is true — the monotonic boundary binary search is built to find.
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -363,7 +380,7 @@ func MinEatingSpeed(piles []int, h int) int {
 | Patterns kept in their own file (`patterns.go`) | Mixed into `slice.go` | Matches the theory note's own split: core slice mechanics vs. the interview-pattern catalogue that builds on them |
 | `TwoSumSorted` assumes sorted input | Hash-map two-sum for unsorted input | `O(1)` extra space instead of `O(n)`, but only valid because the precondition (sorted) holds |
 
-## Tests
+## Tests 🟡
 
 ### TestNextCap
 
@@ -425,7 +442,7 @@ A failure in any of these means the pattern's core logic (the pointer-movement r
 
 These are the five patterns' textbook edge cases, so a wrong answer here usually generalizes to being wrong everywhere.
 
-## Running it
+## Running it 🟢
 
 ```text
 go vet ./... && go test -race ./...
@@ -441,14 +458,14 @@ ok  	rollscratch/arrdyn	1.474s
 
 The elapsed time is dominated by compiling the test binary, not running the tests themselves, since none of them touch real I/O or sleep.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`Insert`'s placeholder append.** `append(s, zero)` grows the slice by one *before* the shift; if `i` is out of range this panics with an index-out-of-range error rather than a friendlier one — production code would validate `i` first.
 - **`Delete` assumes `i < len(s)`.** Same caveat: no bounds check, by design, to keep the function matching the theory note's description exactly.
 - **`MinEatingSpeed`'s `canFinish` closure allocates** a new function value on each call if hoisted into a hot loop; here it's defined once per `MinEatingSpeed` call, which is fine, but capturing it in a loop that calls `MinEatingSpeed` repeatedly would not reuse it across calls.
 - **`TestAliasing`'s pointer comparisons (`&b[0] != &backing[0]`)** only work because Go guarantees slices sharing a backing array also share element addresses; don't generalize this comparison to compare *values*, only to prove *aliasing*.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `Insert`'s placeholder line to insert at `i = len(s)` (append at the very end) and predict whether `copy(s[i+1:], s[i:])` does anything. Then run it and check.
 2. In `NextCap`, change the threshold constant from `256` to `128` and predict which existing test case in `TestNextCap` would then fail. Run the test to confirm.

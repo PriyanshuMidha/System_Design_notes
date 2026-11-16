@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code demonstrates JavaScript's `map`/`filter`/`reduce` in Go, using generics (Go 1.18+) to write each operation once for any element type. It's a companion to [[JavaScript Objects, Arrays and Iteration]] — read that note first for the concepts; this note shows the same three operations as a small, tested Go package.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the "From zero" paragraph below, then "Before the code" and "What this code shows". Stop there.
+> - 🟡 **Know the basics?** Add the Code section (both steps) and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the Go twin of the JavaScript note on `map`, `filter` and `reduce`. It shows how you would build those three helpers yourself in Go: `Map` changes every item in a list, `Filter` keeps only the items you want, and `Reduce` squashes a whole list into one value (like a cart total). Read the theory note first; then read this top to bottom — each code block is followed by a plain "How it works" walkthrough, and the Tests section proves the code actually behaves like the JavaScript versions.
+
+## Before the code 🟢
 
 - **Generics** (`func Map[T, U any]`): one function written once that works for any element type, like JS methods that accept any array.
 - **Function values / closures** (`func(n int) int { ... }`): functions passed as arguments, the Go version of a JS callback.
@@ -25,7 +34,7 @@ updated: 2026-11-13
 - **Testing** (`testing`, `reflect.DeepEqual`): `TestXxx` functions run by `go test`; `DeepEqual` compares two slices element by element.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or `context` are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept |
 | --- | --- |
@@ -36,7 +45,7 @@ updated: 2026-11-13
 
 Go has no built-in generic `Map`/`Filter`/`Reduce` in its standard library (the `slices` package has other helpers, but not these three), so this package exists to show the shape JavaScript's array methods would take if you wrote them yourself in a statically typed, generic language.
 
-## Setup
+## Setup 🟢
 
 - **Go version:** 1.24 (generics have been stable since 1.18; nothing here needs a newer feature).
 - **Module layout:** a single package, two files.
@@ -53,9 +62,11 @@ Go has no built-in generic `Map`/`Filter`/`Reduce` in its standard library (the 
   go test -race -v ./...
   ```
 
-## Code
+## Code 🟡
 
 ### Step 1: `Map` and `Filter`
+
+**In plain words:** the next code block is the whole trick — two short loops. `Map` makes a new list by changing each item; `Filter` makes a new list by keeping only some items. Neither touches the original list.
 
 **Concept.** These two implement [[JavaScript Objects, Arrays and Iteration#map / filter / reduce|the theory note's map/filter section]]: both return a brand-new slice and leave the input untouched, exactly like JS's non-mutating array methods.
 
@@ -99,6 +110,8 @@ func Filter[T any](in []T, pred func(T) bool) []T {
 5. Neither function reads or writes `in` — only `range` reads it — so the caller's original slice is guaranteed untouched, matching the theory note's "map/filter never mutate" rule.
 
 ### Step 2: `Reduce` and the cart example
+
+**In plain words:** `Reduce` walks a list once and folds it into a single answer, like adding up a receipt line by line. You must say what the running total starts at (usually 0).
 
 **Concept.** `Reduce` implements [[JavaScript Objects, Arrays and Iteration#map / filter / reduce|the theory note's reduce]], including its most interview-relevant rule: an initial value is mandatory, not optional.
 
@@ -189,7 +202,7 @@ func CartTotal(items []CartItem) int {
 > }
 > ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -198,7 +211,7 @@ func CartTotal(items []CartItem) int {
 | Pre-sized `make([]U, len(in))` in `Map` | `append` into a zero-length slice, as `Filter` does | Faster for `Map` (output length is always known up front); would be wrong for `Filter`, where the final length isn't known until every predicate has run |
 | Plain generic functions, no package-level state | A `Stream`-style chainable type (`.Map().Filter().Reduce()`) | Chainable types read closer to the JS call-site style but add API surface; plain functions keep this demo minimal |
 
-## Tests
+## Tests 🟡
 
 ### `TestMapFilterChain`
 
@@ -272,7 +285,7 @@ func TestReduceSum(t *testing.T) {
 
 A failure here would isolate the bug to `Reduce` itself, rather than to how `CartTotal` calls it — useful for narrowing down a regression quickly.
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go vet ./...
@@ -295,14 +308,14 @@ All three tests pass under the race detector, confirming no data race in the pac
 - `=== RUN`/`--- PASS` lines: each test function ran and its assertions held.
 - `ok  mapfilter  2.201s`: the whole package's test suite passed; the duration is dominated by the Go toolchain's race-detector instrumentation, not the (trivial) work the functions themselves do.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `Map`'s `make([]U, len(in))` pre-sizes the result — correct and fast here, but if `f` were allowed to skip or add elements (it isn't; this signature guarantees one output per input) this pattern would under- or over-allocate.
 - `Filter`'s `make([]T, 0, len(in))` only *reserves* capacity for the worst case (every element passes); the actual length can be anywhere from `0` to `len(in)`, so always use `len(out)`, never assume it equals `len(in)`.
 - `Reduce`'s accumulator type `A` is fully caller-controlled generic — nothing stops a caller from passing a mismatched `initial` and `f` that compiles but produces a meaningless result (e.g. reducing to a `string` with a numeric-looking initial value of `"0"` that's never parsed); Go's generics check type *shapes*, not semantic intent.
 - None of these three functions are safe to call concurrently on the *same* input slice if another goroutine is mutating that slice at the same time — they don't mutate it themselves, but `range` over a slice another goroutine is appending to or resizing is a data race regardless of which function reads it.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change this:** add a `FilterMap[T, U any](in []T, f func(T) (U, bool)) []U` that combines `Map` and `Filter` into one pass (the `bool` says "keep this one"). Predict: would this remove one of the two intermediate allocations that `Map(...).Filter(...)` currently creates in the chain test? Verify by tracing through `TestMapFilterChain`'s own numbers with your new function.
 2. **Change this:** rewrite `CartTotal` to use `float64` prices (dollars, not paise) and sum ten items each priced `0.1`. Predict the printed total before running it — then explain, from [[Number Representation and Text Encoding]], why it isn't exactly `1.0`.

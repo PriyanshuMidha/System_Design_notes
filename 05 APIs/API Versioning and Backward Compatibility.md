@@ -33,7 +33,41 @@ updated: 2026-11-13
 > - Retire old versions on a published schedule with `Deprecation` and `Sunset` headers.
 > - Classic mistake: copying the whole codebase per version, so every fix must be made N times.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Millions of phones run last year's copy of your app. You cannot update them. But your server changes every week.
+
+So the rule is: changes that only **add** things are safe. Old apps simply ignore what they do not know.
+
+```mermaid
+flowchart LR
+    C["Change"] --> Q{"Old apps still work?"}
+    Q -- "add a field: yes" --> OK["Ship to everyone"]
+    Q -- "rename / remove: no" --> V["Needs a new version"]
+```
+
+When you must break something, you give the API a new **version**: a label like `v2` or a date. Old apps keep asking for the old version and keep getting the old shape. New apps opt into the new one.
+
+Old versions do not live forever. You announce a **sunset** (a published shut-off date), warn everyone, then turn the old version off.
+
+```mermaid
+flowchart LR
+    A["v1 live"] --> B["v2 ships,<br/>v1 marked deprecated"] --> D["warnings + emails"] --> E["v1 turned off<br/>(410 Gone)"]
+```
+
+The rest of this note is just four questions:
+1. Which changes break old clients and which do not?
+2. Where does the version label live (URL, header, date)?
+3. How do you serve many versions without copying the codebase?
+4. How do you retire an old version politely?
+
 
 **The problem in one story.**
 Last year your app shipped reading `status: "paid"` from the payments API.
@@ -78,7 +112,7 @@ Where it breaks: you can never force people to buy new appliances, but an API ca
 > [!tip] Remember
 > Add freely, never change meaning, and give breaking changes a new version with a published end date for the old one.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Your payments API returns `"amount": 49900` (an integer, in paise). The mobile app parses it straight into an `Int`. The backend team decides amounts should carry their currency and ships:
 
@@ -92,7 +126,7 @@ Partners who integrated through your SDK broke the same day, and their deploy ca
 
 Versioning lets the server keep changing while each client sees the contract it was written against, until that client chooses to move.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An API is a contract with many signatories you cannot call into a room. Two rules follow:
 
@@ -101,9 +135,11 @@ An API is a contract with many signatories you cannot call into a room. Two rule
 
 Analogy: one power grid, many plug shapes. You do not build a second grid for travellers with old plugs; you hand them an **adapter**. In the best designs the server has one core implementation (the grid) and a thin adapter per old version (the version transformers).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: classify the change
+
+**In plain words:** before touching anything, ask one question: could any app written yesterday fail after this? This table is the answer sheet.
 
 | Change | Breaking? | Why, or the safe alternative |
 | --- | --- | --- |
@@ -121,6 +157,8 @@ Hyrum Wright's observation ("Hyrum's law") applies: with enough users, every obs
 
 ### Step 2: pick where the version lives
 
+**In plain words:** the client has to say which version it wants. The only choice is where it says it: in the URL, in a header, in the query string, or remembered per account.
+
 - **URI path:** `/v1/orders`, `/v2/orders`. Visible, easy to route and cache. Google uses major versions this way (AIP-185).
 - **Custom header:** `API-Version: 2025-03-01`. Clean URLs; one resource has one URI. New headers should not use the `X-` prefix (RFC 6648).
 - **Media type:** `Accept: application/vnd.example.v2+json`. Most "RESTful", least convenient; GitHub's older `application/vnd.github.v3+json` worked this way.
@@ -128,6 +166,8 @@ Hyrum Wright's observation ("Hyrum's law") applies: with enough users, every obs
 - **Date-based with pinning:** Stripe pins an account to the latest version at its first request; a request can override with `Stripe-Version`. GitHub's REST API takes `X-GitHub-Api-Version: 2022-11-28`.
 
 ### Step 3: serve old versions from one core
+
+**In plain words:** keep one real implementation that always speaks the newest shape, then a small "translate back" step per old version, like a power adapter per old plug. Never copy the whole codebase per version.
 
 Stripe's 2017 post describes the approach that lets it keep every API version since 2011 working: responses are first rendered for the current version, then the system walks back through time, applying each **version change module** until it reaches the version the request asked for.
 
@@ -147,6 +187,8 @@ Requests need the mirror image: an `Up` step per change that upgrades an old req
 
 ### Step 4: retire old versions on a schedule
 
+**In plain words:** retiring a version is a slow goodbye: announce, warn in every response, watch who still calls, do short practice blackouts, then switch off for real.
+
 ```mermaid
 flowchart LR
     A["Announce<br/>changelog, email, docs<br/>(sunset date fixed)"] --> D["Deprecation + Sunset headers<br/>on every response<br/>of the old version"]
@@ -163,9 +205,11 @@ flowchart LR
 - **Brownouts** turn the old version off for short, announced windows. Clients that ignored emails and headers now see errors while you can still switch the version back on.
 - After the sunset, answer `410 Gone` rather than `404`: the version existed and was removed on purpose.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** six lines that show the whole trick: build the newest shape, then flatten it back for anyone pinned to an older date.
 
 One core shape, walked back for an older version. The full version below adds the production concerns.
 
@@ -189,6 +233,8 @@ func Render(c Charge, version string) map[string]any {
 ```
 
 ### Full version
+
+**In plain words:** the real version adds the paperwork: reject retired or unknown versions, stamp warning headers on deprecated ones, and keep caches from mixing versions.
 
 A charge resource with two breaking changes: on 2025-03-01 the status enum gained `partially_refunded`; on 2025-09-01 `amount` became an object. One core handler renders the latest shape; the policy walks it back for older clients, adds deprecation headers, and rejects retired or unknown versions.
 
@@ -410,7 +456,7 @@ Notes on the design:
 - Versions are ISO dates so plain string comparison orders them. A semver-style `v10` would sort before `v9` as a string.
 - The core returns `map[string]any` so transformers can reshape freely. In a typed codebase the core returns a struct, marshals it once to a generic tree, and the transformers edit the tree.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Where the version lives:
 
@@ -431,7 +477,7 @@ How old versions are served:
 | Branches in the code | `if version < "2025-03-01" { ... }` in handlers | One or two small changes | Version checks spread everywhere and are never deleted |
 | One core + transformers | Core renders the latest; a chain of `Down`/`Up` steps per change | Many versions, long support windows | Transformer per change, contract tests per version |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Every live version costs money.** Each one adds transformers, contract tests, docs and support load. A version nobody calls still costs review time on every change near it.
 - **Internal APIs with one owner rarely need versions.** If every caller deploys from the same repository or you control all consumers, use expand/contract instead: add the new field, move callers, then remove the old field.
@@ -439,7 +485,7 @@ How old versions are served:
 - **URI versions invite big-bang rewrites.** Date-based versions push teams toward small, frequent, well-documented changes.
 - **Versioning does not cover behaviour drift.** Changing rate limits, latency, or ordering of results can break clients without any field changing; announce those in the changelog too.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Stripe pins each account to the newest version at its first request, allows a per-request `Stripe-Version` override, and lets accounts upgrade from the dashboard. Its 2017 post describes keeping every version since 2011 working through version change modules applied backwards. Version strings now also carry a release name (for example `2024-09-30.acacia`).
@@ -457,7 +503,7 @@ How old versions are served:
 	- Error rates per version after each deploy (a transformer bug shows up only for old versions).
 	- 410 responses after the sunset, by client, to find stragglers.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Mobile clients that never update.** Apps send their version on every request (`User-Agent` or an app-version header). The server keeps a **minimum supported app version** per platform and exposes it through a small config endpoint.
 
@@ -499,7 +545,7 @@ A common rule of thumb for public APIs is a deprecation notice of at least 6 to 
 
 **Transformers are code with edge cases.** A `Down` must handle every place the resource appears: list items, nested expansions, webhook payloads, and error bodies. Keep one golden-file test per version per resource so a core change that a transformer forgot shows up as a diff.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is adding a field to a JSON response a breaking change? (trap)
 > Not by contract, if you documented that clients must ignore unknown fields. In practice it breaks clients that validate strictly (`additionalProperties: false`, generated strict decoders) or that store the whole object in a fixed-size schema. Say "additive is safe for tolerant readers", state that rule in the contract, and test popular SDKs against new fields.
@@ -522,7 +568,7 @@ A common rule of thumb for public APIs is a deprecation notice of at least 6 to 
 > [!question]- Half your users are on an app version from last year. What does your API do?
 > Treat the oldest supported app version as a client you must not break: version the API or keep changes additive. Keep a minimum supported version, enforced by a tiny, frozen config endpoint and a stable error code, so you can force an update when a change is unavoidable.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Additive (new endpoint, optional input, new response field) is safe for tolerant readers; say so in the contract.
 - Breaking: remove, rename or retype a field, new required input, changed default or meaning, new enum value for strict clients, changed status codes, tighter validation.
@@ -532,7 +578,7 @@ A common rule of thumb for public APIs is a deprecation notice of at least 6 to 
 - Mobile: minimum supported version, frozen force-update endpoint, never trust that users update.
 - GraphQL: `@deprecated` and field usage; protobuf: never reuse field numbers, use `reserved`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[REST and HTTP API Design]], [[API Contract Design and OpenAPI]], [[Pagination, Filtering and Sorting]]
 - **Next:** [[Idempotency and Idempotency Keys]], [[Contract Testing]]

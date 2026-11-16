@@ -20,7 +20,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > A hash ring with virtual nodes in about 80 lines of Go: `Add`, `Remove`, `Get` and `GetN`, plus tests that prove the two promises of [[Consistent Hashing]]: keys only move to a joining node, and only about `1/N` of them.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, "Before the code", the whiteboard version, then "Running it". Stop there.
+> - 🟡 **Know the basics?** Add the full "Code" walkthrough, "Design decisions" and "Tests".
+> - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls in the code" and do the "Exercises". Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Consistent Hashing]]. It builds a working hash ring in about 80 lines of Go: you can add servers, remove servers, and ask "which server owns this key?". Read the theory note first if the ring idea is new. Here, start with the tiny whiteboard version, then read the full version step by step; each code block is followed by a plain "How it works" list. The tests at the end are the proof: they show that adding a server moves only about one fifth of the keys, while the naive `%` rule moves 80%.
+
+## Before the code 🟢
 
 - **Sorted slices plus `slices.BinarySearch`**: the ring is a sorted `[]uint64` and lookup is a binary search for the first point at or after the key.
 - **Maps** (`map[uint64]string`): from a point on the ring back to the physical node that owns it.
@@ -29,7 +38,7 @@ updated: 2026-11-13
 - **Multiple return values** (`(string, bool)`): `Get` reports "no node" with `false` instead of panicking.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module (includes the `wb/` sub-package).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Consistent Hashing]] |
 | --- | --- |
@@ -63,15 +72,17 @@ classDiagram
 
 The code is small because the idea is small: two data structures (a sorted slice of positions and a map from position to node) and one function that turns a string into a position. Everything else is bookkeeping for locks, duplicates and replicas.
 
-## Setup
+## Setup 🟢
 
 - Module `ring` with `ring.go`, `ring_test.go`, and a sub-package `wb/` for the whiteboard version.
 - Go 1.24, standard library only.
 - Run: `go vet ./... && go test -race -v ./...`
 
-## Code
+## Code 🟡
 
 ### Whiteboard version
+
+**In plain words: the smallest ring that works — one sorted list, one map, one binary search.**
 
 **Concept.** The ring in [[Consistent Hashing#3.1 The ring is a sorted array]] is just a sorted array of numbers that is treated as a circle.
 
@@ -135,6 +146,8 @@ The full version adds virtual nodes, removal, collision handling, replica lookup
 
 ### Step 1: the ring type and the hash function
 
+**In plain words: the struct holds the circle (a sorted list of numbers), a map saying who sits where, and a lock so readers and writers do not trip over each other.**
+
 **Concept.** Virtual nodes ([[Consistent Hashing#3.5 Virtual nodes]]) fix the uneven spread of one point per server: each physical node gets many points, so its share of the circle is the sum of many small random arcs and approaches `1/N`.
 
 The struct therefore keeps three things: how many vnodes per node, the sorted positions, and a map from position back to the physical node. A `sync.RWMutex` protects them because lookups are frequent and changes are rare.
@@ -183,6 +196,8 @@ func position(s string) uint64 {
 5. `position` hashes with SHA-256 and keeps the first 8 bytes as a `uint64`. The same function places both vnodes and keys, which is what lets them share one circle.
 
 ### Step 2: adding and removing nodes
+
+**In plain words: adding a server just drops its 200 points onto the circle; removing one just picks its points back up — nobody else's keys are touched.**
 
 **Concept.** Adding and removing nodes is where the minimal-movement promise comes from ([[Consistent Hashing#3.3 Adding a node]], [[Consistent Hashing#3.4 Removing a node]]).
 
@@ -251,6 +266,8 @@ Keys that used to land on `b` at 40 (positions 11 to 40) now continue clockwise 
 
 ### Step 3: lookup and replica lookup
 
+**In plain words: `Get` finds the next point clockwise from the key; `GetN` keeps walking to collect a few *different* servers for spare copies.**
+
 **Concept.** Lookup is the binary search in [[Consistent Hashing#3.2 Lookup is a binary search]]: find the first point at or after the key, wrapping at the end.
 
 Replication ([[Consistent Hashing#3.7 Replication uses the next distinct nodes]]) extends this by continuing clockwise and collecting nodes until it has `n` distinct physical ones. It must skip further vnodes of a node it already chose, otherwise all replicas could be on one machine.
@@ -318,7 +335,7 @@ flowchart LR
     V4 -.-> R3["replica 3 = b"]
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -330,7 +347,9 @@ flowchart LR
 | `Get` returns `ok` | Panic on empty ring | The caller handles "no servers" explicitly. |
 | `GetN` may return fewer than `n` | Return an error | Callers decide whether a short list is acceptable. |
 
-## Tests
+## Tests 🟡
+
+**In plain words: each test checks one promise of the ring, and the table before each test says what goes in and what must come out.**
 
 The tests prove the two promises of the ring (keys move only to a joining node, and only `1/N` of them) and the supporting behaviour of removal, replica lookup and the comparison against `hash % N`.
 
@@ -533,7 +552,7 @@ func TestModuloVersusRing(t *testing.T) {
 
 The imports for the test file are `hash/fnv`, `strconv` and `testing`. A one-test file in `wb/` checks that `Get` wraps and returns a known server.
 
-## Running it
+## Running it 🟢
 
 ```text
 go vet ./... && go test -race -v ./...
@@ -568,7 +587,7 @@ ok  	ring	2.035s
 
 The measured table in [[Consistent Hashing#4. Worked example]] compares several hash functions and vnode counts. The exact percentages depend on the key names and the vnode naming scheme, so expect numbers near 20% moved rather than identical ones.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Sort on every `Add`.** `Add` re-sorts all points, which is `O(P log P)` while holding the write lock. Fine for a few hundred vnodes; for large rings, merge the new sorted points instead.
 - **`Remove` leaves no tombstones.** After removal, any cached `GetN` result may still name the node. Callers must refresh.
@@ -577,13 +596,13 @@ The measured table in [[Consistent Hashing#4. Worked example]] compares several 
 - **The whiteboard `Get` panics on an empty ring**, because `r.points[0]` does not exist. The full `Get` returns `false` instead.
 - **The whiteboard uses CRC32 with one point per node**, which the measurements show can give one server 97,950 of 100,000 keys. It is for the idea only.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `New(200)` to `New(1)` in `TestAddingNodeOnlyMovesKeysToIt`. Predict whether the `moved` bound still passes and how the busiest node's share changes. Then run it.
 2. Replace `position` with `crc32.ChecksumIEEE` widened to `uint64`. Predict what happens to the balance with 200 vnodes, then measure it with the logging test.
 3. Write a test that removes node `b` and counts how many different nodes received its keys. Predict the answer for 200 vnodes (hint: nearly every survivor).
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Consistent Hashing]]
 - **Related:** [[Partitioning and Sharding - Go]] (fixed logical shards instead of a ring), [[Replication - Go]]

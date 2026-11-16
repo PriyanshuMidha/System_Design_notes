@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code is a small specificity calculator: it parses a CSS compound selector string (like `#nav .item a`) into the `(IDs, classes, types)` triple described in [[CSS Fundamentals - Cascade, Selectors, Box Model]], and compares two triples the same way a browser's cascade does — left-to-right, never summed.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the "Code" walkthrough and the "Tests" section.
+> - 🔴 **Interview / SDE-3 prep?** Add "Design decisions", "Pitfalls" and the "Exercises". Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of the CSS theory note. In plain words: when two CSS rules fight over the same element, the browser scores each selector with three counters (IDs, classes, tag names) and compares them left to right — it never adds them up. The Go code here builds that scorer: it reads a selector string like `#nav .item a`, counts what is in it, and compares two scores the same way a browser would. Read "Before the code" for the Go bits you need, skim the table of what maps to what, then walk the code top to bottom. All code stays runnable as-is.
+
+## Before the code 🟢
 
 - **Structs** (`type Triple struct{ A, B, C int }`): a named group of fields, here the three specificity counters.
 - **Methods with a value receiver** (`func (t Triple) Less(...)`): a function attached to a type, called as `x.Less(y)`.
@@ -25,7 +34,7 @@ updated: 2026-11-13
 - **Table-driven tests**: one test loops over a list of input/expected pairs, the usual Go testing style.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or generics are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept it implements | Theory section |
 | --- | --- | --- |
@@ -34,15 +43,17 @@ updated: 2026-11-13
 | `Of` | classifying each token of a selector into the right counter | [[CSS Fundamentals - Cascade, Selectors, Box Model#How it works\|Specificity table]] |
 | `splitCompound` | breaking a compound selector like `div.card:hover::before` into its parts | same section |
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, no external dependencies — the standard library's `strings` package only.
 - Module layout: a single package, `specificity`, with `specificity.go` and `specificity_test.go` side by side.
 - Run it: `go vet ./...` then `go test -race ./...` from the module root.
 
-## Code
+## Code 🟡
 
 ### The specificity type and its comparison rule
+
+**In plain words:** this is the scoreboard. Three numbers, and a rule that says "compare the first number; only on a tie look at the second; only on another tie look at the third" — like comparing versions 2.1.9 vs 2.2.0.
 
 **Concept.** The theory note's whole point is that specificity is three separate counters compared in order, never added together. `Triple` is that triple, and `Less` is the comparison rule, written exactly as the "compare `a`, then `b`, then `c`" rule reads in prose.
 
@@ -76,6 +87,8 @@ func (t Triple) Less(other Triple) bool {
 3. The three `if`/`return` pairs are the lexicographic comparison: it only ever inspects `B` when `A` is exactly equal, and only inspects `C` when both `A` and `B` are equal — mirroring the cascade's own rule that a later round only runs after every earlier round tied.
 
 ### Parsing a selector into a triple
+
+**In plain words:** this function reads a selector string character by character and sorts each piece into the right bucket — `#` things count as IDs, `.` things as classes, bare names as tags.
 
 **Concept.** `Of` is the piece that turns a raw selector string into a `Triple`, by walking each compound (the part between combinators) and classifying each token inside it.
 
@@ -119,6 +132,8 @@ func Of(selector string) Triple {
 4. The comment on the `case tok != "":` branch flags that this is the fallback: anything left over (a bare tag name) is a type selector.
 
 ### Splitting a compound selector into tokens
+
+**In plain words:** before we can count the pieces, we have to cut a glued-together selector like `div.card:hover` into its separate pieces. This helper does the cutting.
 
 **Concept.** `splitCompound` is the helper that turns `div.card:hover::before` into `["div", ".card", ":hover", "::before"]`, so `Of` can classify each piece on its own. It is a hand-rolled scanner rather than a regular expression, chosen so the one subtle rule — don't split `::before`'s two colons apart — is a single, readable `s[i-1] != ':'` check instead of a harder-to-read regex lookbehind.
 
@@ -211,7 +226,7 @@ func splitCompound(s string) []string {
 > }
 > ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice made | Alternative | Trade-off |
 | --- | --- | --- |
@@ -220,7 +235,7 @@ func splitCompound(s string) []string {
 | Prefix classification (`#`, `.`, `[`, `:`, `::`) | A full CSS selector grammar parser | A real parser handles escaped characters and nested functional pseudo-classes like `:not(.a, .b)` correctly; the prefix classifier is far simpler and sufficient to teach the specificity rule, at the cost of the documented `:not()` inaccuracy below. |
 | `Triple` compared with plain `if` statements | `cmp.Compare` / a generic ordering helper | Three explicit `if`s read clearly as "round 1, round 2, round 3" to a reader coming from the theory note's tournament analogy; a generic comparator would be more reusable but less obviously tied to the cascade's own round structure. |
 
-## Tests
+## Tests 🟡
 
 ### `TestOf`
 
@@ -291,7 +306,7 @@ func TestLessOrdersByIDFirst(t *testing.T) {
 
 **What a failure would mean.** If this test failed, `Less` would be comparing the wrong field first (or summing the fields), and the whole premise of "one ID beats any number of classes" would no longer hold for this code — exactly the bug the theory note's common-mistake callout warns about.
 
-## Running it
+## Running it 🟢
 
 ```sh
 $ go vet ./...
@@ -313,18 +328,18 @@ Reading it line by line: `go vet` printed nothing, meaning it found no suspiciou
 
 The final `ok` line with a duration confirms the whole package built and ran clean under the race detector — meaningful here because, while this particular package does no concurrent work, running `-race` on every package is the project-wide habit that catches accidental concurrency bugs early rather than only when they first appear in production.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `Of` does not special-case `:not()`, so `a:not(.disabled)` over-counts by one class-weight token relative to a real browser's parser (see `TestOf` above) — fine for teaching the general rule, not a drop-in replacement for an actual CSS engine.
 - `splitCompound`'s loop starts at index `1` and assumes the string is non-empty; calling `Of("")` returns a zero `Triple` safely because `strings.Fields("")` returns an empty slice, but `splitCompound("")` alone (if called directly) would still append one empty token — harmless here only because `Of` never calls it with an empty string.
 - The classifier is case-sensitive only incidentally (it matches on punctuation prefixes, not letters), so it never needs to normalize selector case — but a real selector list with escaped characters (`\.`) or Unicode class names would not parse correctly with this simple scanner.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change this:** add a `case` to `Of` that gives `:not(...)` the specificity of only its argument (matching the real CSS spec), rather than counting both the pseudo-class and its argument. Predict which existing test needs its expected value updated before you run it.
 2. **Change this:** add a new selector shape to `TestOf`'s table, `"a:is(#x, .y)"`, and predict its triple before running the test. (Hint: this simplified parser does not implement `:is()`'s "take the most specific argument" rule either — what does it actually compute instead?)
 3. **Predict the result:** without running it, what does `Of("#a#b")` return? Then run it and check whether the parser handles two IDs in one compound the way you expected.
 
-## Links
+## Links 🟢
 - **Theory:** [[CSS Fundamentals - Cascade, Selectors, Box Model]]
 - **Related:** [[CSS Layout - Position, Flexbox, Grid]], [[React Fundamentals - Components, JSX, Props, State]]

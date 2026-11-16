@@ -24,7 +24,38 @@ updated: 2026-11-13
 > - Decide the **staleness budget** with the product owner ("the revenue chart may lag 5 minutes"), then pick the refresh strategy that meets it.
 > - Every copy needs a rebuild path and a drift check, because it *will* disagree with the source one day.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A dashboard asks the database the same hard question again and again: "add up all my invoices".
+
+Adding up millions of rows takes time, so every page load is slow.
+
+```mermaid
+flowchart LR
+    A["Dashboard page load"] -- "re-add millions of rows, slow" --> B[("invoices table")]
+```
+
+The fix is simple: compute the answer once, write it down, and let the page read the written-down answer. That written-down answer is a **materialized view** (the database stores it for you) or a **denormalized** copy (you keep the copy yourself, like a running total column).
+
+```mermaid
+flowchart LR
+    B[("invoices table")] -- "compute once, store" --> C["Stored answer<br/>(6 small rows)"]
+    A["Dashboard page load"] -- "fast lookup" --> C
+```
+
+The catch: a written-down answer goes **stale**. It stops matching the real data the moment something changes, until you update it.
+
+That is the whole topic. The rest of this note is just these 3 questions:
+1. How do you keep the stored answer up to date (refresh, triggers, events)?
+2. How stale is the stored answer allowed to get?
+3. What do you do when the copy and the truth disagree?
 
 **The problem in one story.**
 A dashboard shows "total revenue per workspace this month".
@@ -67,7 +98,7 @@ Where it breaks: the whiteboard is only as fresh as the last time someone update
 > [!tip] Remember
 > A materialized view or summary trades freshness for fast reads; agree the staleness budget and always keep a rebuild path.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps shows each workspace a dashboard: how many invoices are in each status, and how much money is invoiced, paid and outstanding. The source of truth is the `invoices` table from [[Relational Schema Design]], where money is stored as `bigint` minor units (`total_minor`, `paid_minor`; 1 rupee = 100 paise).
 
@@ -100,7 +131,7 @@ flowchart LR
     end
 ```
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - A **view** (`CREATE VIEW`) is a named query. Reading it runs the query every time. It is never stale and never faster.
 - A **materialized view** (`CREATE MATERIALIZED VIEW`) runs the query once and stores the rows on disk. Reading it is as fast as reading a small table. It is stale from the moment the base tables change until the next refresh.
@@ -121,9 +152,11 @@ flowchart LR
 
 A summary table is a running tally that the cashier updates with every sale: always current if nobody forgets a sale.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 View vs materialized view vs summary table
+
+**In plain words:** three ways to answer the same question — re-ask it every time (view), read yesterday's written answer (materialized view), or keep a tally you update as you go (summary table). The table compares them.
 
 | | View | Materialized view (PostgreSQL 17) | Summary table |
 | --- | --- | --- | --- |
@@ -135,6 +168,8 @@ A summary table is a running tally that the cashier updates with every sale: alw
 | Cost of an update | none | recompute the whole query | one small delta per change |
 
 ### 3.2 Creating and refreshing a materialized view in PostgreSQL 17
+
+**In plain words:** you make the stored answer once, then re-make it on a schedule. The only real decision is whether readers are allowed to keep reading while you re-make it.
 
 The view groups invoices by `(workspace_id, status)` and stores `invoice_count`, `total_minor` and `outstanding_minor`, created `WITH DATA` so it is readable at once (`WITH NO DATA` leaves it unreadable until the first `REFRESH`).
 
@@ -228,9 +263,11 @@ flowchart TD
     Q -- "seconds, at high write rate" --> A["async rollup from outbox or CDC"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole trick in three lines — the slow question, the stored answer, and a timer that re-computes it.
 
 ```sql
 -- the slow question
@@ -243,6 +280,8 @@ FROM invoices WHERE workspace_id = 42 GROUP BY status;
 The complete whiteboard SQL is in [[Materialized Views and Denormalization - Go]].
 
 ### 4.1 Before: the live aggregation
+
+**In plain words:** this is the slow version measured — the database reads 400,000 rows just to produce 6, like recounting every receipt to answer one question.
 
 Assume (estimates for this example) 20 million invoices across 50,000 workspaces, with workspace 42 owning 400,000 of them. The index `invoices_ws_status_due_idx (workspace_id, status, due_date)` exists, but the query also needs `total_minor` and `paid_minor`, which are not in the index, so each matching row is fetched from the table.
 
@@ -259,6 +298,8 @@ Execution Time: 382.011 ms
 Reading the plan ([[Query Plans and EXPLAIN]] covers this in detail): 400,112 rows are fetched from 54,301 table pages, of which 24,120 came from disk, only to be grouped into 6 output rows.
 
 ### 4.2 After: read the materialized view
+
+**In plain words:** same question, but now the answer is already written down — the database just looks up 6 small rows, about 10,000 times faster.
 
 Representative output (PostgreSQL 17), key lines:
 
@@ -324,6 +365,8 @@ HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 
 ### 4.5 Asynchronous rollup in Go, with idempotency and a drift check
 
+**In plain words:** when updates arrive as messages, the same message can arrive twice. If you add it twice, your total is wrong — so you note down each message's ID and skip repeats.
+
 When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event. Delivery is **at-least-once**: after a consumer crash, the same event can arrive again. Applying it twice is the classic double-counting bug.
 
 The fix is to remember which event IDs were applied; in SQL, that is a `processed_events` table written in the same transaction as the rollup update.
@@ -354,7 +397,7 @@ If an event is lost altogether, a drift check recomputes the totals from the sou
 
 The Go rollup (`Rollup.Apply`, `Rollup.Get`, `Rollup.Drift`), its four tests including four concurrent consumers receiving the same 1,000 events, and the idempotent apply as one SQL transaction are in Go. Runnable Go version: [[Materialized Views and Denormalization - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -373,7 +416,7 @@ The Go rollup (`Rollup.Apply`, `Rollup.Get`, `Rollup.Drift`), its four tests inc
 
 Use a cache when a small fraction of keys is hot and recomputing one key is cheap. Use a materialized view when computing any single key requires scanning a lot of data, or when other queries want to join and filter the precomputed rows.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Staleness.** A refreshed view is wrong between refreshes. Never use one for a balance that drives a decision (allowing a refund, blocking an overdraft).
 - **Refresh cost grows with total data, not with change.** A full refresh of 20 million rows every 4 minutes costs the same whether 10 invoices changed or 10,000. When the view grows, either refresh less often, move to incremental maintenance, or partition the source.
@@ -383,7 +426,7 @@ Use a cache when a small fraction of keys is hot and recomputing one key is chea
 - **When not to use:** if the right index makes the live query fast enough, stop there ([[Indexing Fundamentals]], [[Index Types and Index Design]]). For example, a covering index on `(workspace_id, status) INCLUDE (total_minor, paid_minor)` might turn the 380 ms query into an index-only scan. Precompute only when the remaining cost is the aggregation itself.
 - **When not to use:** heavy analytics across all tenants. A column store ([[Time-Series and Columnar Storage]]) aggregates billions of rows faster than any row-store view refresh.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems.**
 - PostgreSQL materialized views have no automatic refresh; teams pair them with `pg_cron` or an application scheduler.
@@ -410,7 +453,7 @@ Use a cache when a small fraction of keys is hot and recomputing one key is chea
 - Rows reported by the nightly drift check (should be 0).
 - Dead tuples and autovacuum activity on the view and summary tables.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **What `CONCURRENTLY` actually does.** PostgreSQL computes the new result into a temporary table, then compares it with the current contents using a full outer join on all columns. Rows only in the old result are deleted, rows only in the new result are inserted.
 
@@ -445,7 +488,7 @@ That is why incremental view engines restrict which aggregates they support, and
 
 **Read-your-writes with an async read model.** A user pays an invoice and immediately opens the dashboard, which still shows the old total. Options: read the single affected value from the primary database for that user's next request, show "updating…" until the projection's version catches up, or keep that value synchronous.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between a view, a materialized view and a cache?
 > A view is a saved query that re-runs on every read, so it is always fresh and never faster. A materialized view stores the result for all keys inside the database, can be indexed and joined, and is stale until refreshed. A cache stores results only for keys that were requested, outside the database, with TTL-based expiry. Choose by how many keys are hot and how expensive one key is to compute.
@@ -468,7 +511,7 @@ That is why incremental view engines restrict which aggregates they support, and
 > [!question]- When would you not build a materialized view?
 > When an index makes the live query fast enough, for example a covering index allowing an index-only scan. When the data must be exact (balances that gate actions). When the workload is cross-tenant analytics over billions of rows, where a column store is the better tool.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - View = saved query; materialized view = saved answer; summary table = answer you maintain row by row.
 - PostgreSQL 17: no automatic refresh. `REFRESH` blocks readers (`ACCESS EXCLUSIVE`); `REFRESH ... CONCURRENTLY` does not, needs a unique index on plain columns with no `WHERE`, and is slower.

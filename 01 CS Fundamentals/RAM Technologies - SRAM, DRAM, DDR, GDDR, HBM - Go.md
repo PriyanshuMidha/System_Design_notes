@@ -18,7 +18,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Runnable code for [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]: a `GOMEMLIMIT` capacity-planning helper that turns a container's DRAM budget into a safe Go soft-memory-limit, with table-driven tests covering the normal cases and every invalid input.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]. It is a small, tested Go helper that turns a container's DRAM budget into a safe GOMEMLIMIT value — a practical capacity-planning use of knowing how much memory you really have. Read the code with its notes, then the table-driven tests.
+
+## Before the code 🟢
 
 - **Packages:** `memlimit` is a plain Go package; `fmt.Errorf` builds the error values it returns.
 - **Multiple return values:** `ForContainer` returns `(int64, error)`; callers check `err` before using the number.
@@ -26,7 +33,7 @@ updated: 2026-11-13
 - **Table-driven tests:** a slice of anonymous structs lists cases; `t.Run` runs each as a named subtest.
 - **What to run:** `go vet ./... && go test -race ./...` from the module root.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -41,13 +48,13 @@ flowchart LR
     Limit -.-> Runtime["runtime/debug.SetMemoryLimit\nor GOMEMLIMIT env var"]
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. No external dependencies — standard library only (`fmt`).
 - Layout: one package, `memlimit`, holding `ForContainer` and its table-driven test.
 - Run it with `go vet ./... && go test -race ./...`.
 
-## Code
+## Code 🟡
 
 ### Step 1: computing a safe GOMEMLIMIT
 
@@ -92,7 +99,7 @@ func ForContainer(containerBytes int64, headroomPct int) (int64, error) {
 3. `usable := containerBytes * int64(100-headroomPct) / 100` computes the percentage kept for the Go heap. Multiplying before dividing (rather than dividing first) avoids losing precision to integer truncation on the intermediate result.
 4. The final `usable <= 0` check catches any remaining pathological combination (in practice, this only matters for a `containerBytes` so small that integer division rounds it down to zero) before returning a limit the caller might otherwise pass straight to `debug.SetMemoryLimit` unchecked.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -101,7 +108,7 @@ func ForContainer(containerBytes int64, headroomPct int) (int64, error) {
 | Multiply before dividing | Divide first, then multiply | Preserves precision: `containerBytes * (100-headroomPct) / 100` only loses the final division's remainder, while dividing first would compound rounding error |
 | Return an error rather than panic | Panic on invalid input | Lets a caller (e.g. a config-loading path reading an operator-supplied headroom percentage) handle a bad value gracefully instead of crashing the process that would use this very function to avoid being killed |
 
-## Tests
+## Tests 🟡
 
 ### Test: ForContainer across normal and invalid inputs
 
@@ -174,7 +181,7 @@ The loop body runs each case and checks both the error and the value:
 
 **If it fails.** A `wantErr` case passing with `err == nil` means a validation check in `ForContainer` is missing or has a boundary off by one (e.g. accepting `headroomPct == 100`). A value mismatch on a valid case means the arithmetic itself changed — most likely the multiply/divide order, which would reintroduce the precision loss the design decisions table above explains.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race ./...
@@ -190,7 +197,7 @@ ok  	cs1scratch/memlimit	1.224s
 
 That mostly confirms there is nothing to race on: `ForContainer` is a pure function with no shared mutable state, so the race detector's clean pass is really a statement about the test harness rather than about the arithmetic itself.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`headroomPct` is an `int`, not a `float64`.** Only whole-percent headroom values are supported; a caller wanting "12.5% headroom" would need to pre-convert that into an equivalent byte-based call instead, since this function has no fractional-percent path.
 - **No upper bound on how small `usable` can be and still be "valid."** A `headroomPct` of 99 on a tiny `containerBytes` could return a technically positive but practically useless `GOMEMLIMIT` of a few bytes.
@@ -198,7 +205,7 @@ That mostly confirms there is nothing to race on: `ForContainer` is a pure funct
 - **The function has no knowledge of `runtime.NumCPU()` or any other runtime fact.** It is a pure arithmetic helper.
   Wiring its result into `debug.SetMemoryLimit` at process start-up is left to the caller, intentionally, so this function stays trivially testable without touching real runtime state.
 
-## Exercises
+## Exercises 🔴
 
 1. Change the headroom check from `headroomPct >= 100` to `headroomPct > 100`, which would allow exactly `100`. Predict what `ForContainer` would return for `(1<<30, 100)` with that change, then run the existing test suite and see which case catches the regression.
 2. Add a new table case for `headroomPct == 0` (no headroom at all). Predict whether it should be treated as valid or invalid, then write the case and run it.

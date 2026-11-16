@@ -23,7 +23,39 @@ updated: 2026-11-13
 > - `useRef` holds a mutable value, or a DOM node reference, that survives renders without ever causing one itself.
 > - Custom hooks are just functions that call other hooks, letting you extract and reuse logic across components.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the main hooks) and 4 (the fetch race traced and fixed).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A React component is a function, and a function forgets everything when it finishes. But a counter needs to remember its number between clicks. **Hooks** are small helper functions, all starting with `use`, that give a component memory and other powers.
+
+The two you will use most: `useState` remembers a value between runs, and `useEffect` runs code after the page updates — the right spot for things like fetching data or starting a timer (called a **side effect**).
+
+```mermaid
+flowchart LR
+    C["component runs"] --> P["page updates"] --> E["useEffect runs<br/>(fetch, timer...)"]
+    E -- "new data: setState" --> C
+```
+
+One strange rule: React keeps each component's hook values in a numbered list, so you must call hooks in the same order every time — never inside an `if`.
+
+```mermaid
+flowchart LR
+    H1["1st use... call"] --> S1["slot 1"]
+    H2["2nd use... call"] --> S2["slot 2"]
+```
+
+The rest of this note is just these 4 questions:
+1. Why must hooks be called in the same order every render?
+2. How do `useState` and `useEffect` really work?
+3. How do I fetch data without old answers overwriting new ones?
+4. When do the caching hooks (`useMemo`, `useCallback`, `useRef`) actually help?
+
 
 **The problem in one story.**
 A product page shows a price fetched from a server.
@@ -68,7 +100,7 @@ Where it breaks: real lockers have names; hooks only have positions, which is wh
 > [!tip] Remember
 > Hooks give a function memory and effects, matched by call order, so call them the same way every render.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A function component is, each render, just a function call: its local variables are thrown away when it returns. Before hooks (pre-React 16.8, 2019), the only way to keep data across renders was to convert the component to a **class**, with `this.state`, `this.setState`, and lifecycle methods like `componentDidMount`.
 
@@ -83,7 +115,7 @@ Hooks solve this by giving a *function* component access to React's internal per
 > [!tip] Remember
 > Hooks exist to give a plain function the one thing it was missing: memory across calls, without the ceremony of a class.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture each component instance as owning a single ordered list of slots — one slot per hook call. On every render, React walks that same list from the top and hands the `n`-th slot's stored value to the `n`-th hook call in your function body, in order.
 
@@ -106,9 +138,11 @@ The analogy breaks down because a real coat-check has one ticket per item; React
 > [!warning] Common mistake
 > Writing `if (condition) { const [x, setX] = useState(0); }`. This looks harmless but, on a render where `condition` is false, every hook call *after* this one shifts up by one slot — React has no way to know a hook was "skipped" rather than simply not yet reached.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Rules of hooks, and why
+
+**In plain words:** two rules, one reason. Always call hooks at the top of the component, never inside an `if` or loop, because React only knows each hook by its position in line — like a coat check that works by ticket number.
 
 1. Only call hooks at the top level of a component (or another hook) — never inside `if`, loops, or after an early `return`.
 2. Only call hooks from React function components or custom hooks — not plain JS functions.
@@ -235,7 +269,7 @@ Before reaching for an effect at all, ask "can this be computed during render in
 
 **Why it matters:** use it only when you must measure or mutate the DOM before the user sees a flicker (e.g. positioning a tooltip based on a just-rendered element's size); otherwise `useEffect` is preferred because it doesn't block painting, keeping the UI responsive.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -324,6 +358,8 @@ function ProductList({ products, query }) {
 
 ### `useRef`: DOM access and renderless mutable storage
 
+**In plain words:** `useRef` is a pocket the component keeps between renders. You can put anything in it (a timer id, a DOM element), and changing it never repaints the screen.
+
 ```jsx
 function AutoFocusInput() {
   const inputRef = useRef(null);
@@ -357,6 +393,8 @@ flowchart LR
 > Reading `ref.current` *during render* (not inside an effect or an event handler) to decide what to show. Since mutating a ref never triggers a re-render, the screen can silently fall out of sync with `.current`'s latest value — React has no way to know it should re-render just because a ref changed.
 
 ### A custom hook: extracting the fetch pattern
+
+**In plain words:** a custom hook is just your own function named `useSomething` that bundles a few built-in hook calls, so two components can share the same logic instead of copy-pasting it.
 
 Custom hooks are just functions, named `use...`, that call other hooks — this is how the race-condition-safe fetch above gets reused instead of copy-pasted:
 
@@ -402,7 +440,7 @@ flowchart TD
 > [!tip] Remember
 > A custom hook buys you reuse, not new capability — it's the same `useState`/`useEffect` calls you'd write inline, just named and packaged so two components don't duplicate the same fetch-and-cleanup logic.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Hook | What it's for | Use when | Cost / gotcha |
 | --- | --- | --- | --- |
@@ -415,14 +453,14 @@ flowchart TD
 | `useRef` | A mutable value, or a DOM node, that doesn't trigger renders | Timer ids, previous values, imperative DOM access | Reading `.current` during render (not in an effect/handler) is a footgun — it can read a stale value |
 | `useContext` | Read a value provided higher in the tree | Avoiding prop drilling for cross-cutting values (theme, auth) | Every consumer re-renders when the context value changes, even if it only reads one field |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Don't reach for `useMemo`/`useCallback` by default; profile first. The memoization itself has a cost (storing the previous dependency array and comparing it), and an incorrect dependency array makes the cache silently return a stale value instead of just being slow.
 - `useEffect` is for synchronizing with something *outside* React (the DOM, a subscription, a timer, the network) — deriving UI state from props/state belongs in the render body, not in an effect that calls `setState` right after rendering (an extra render for no reason).
 - `useReducer` adds a layer of indirection (action types, a reducer function) that isn't worth it for one or two independent booleans; reach for it once several state fields change together in response to the same events.
 - Hooks don't fix prop drilling — `useContext` does, but every consumer re-renders on any change to the Context value; for anything beyond a handful of consumers or a frequently-changing value, see [[React State Management - Props, Context, Redux]].
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** essentially all React code written since 2019 uses hooks; data-fetching libraries like TanStack Query and RTK Query are themselves built as custom hooks (`useQuery`, `useMutation`) wrapping exactly the fetch-in-an-effect-with-cleanup pattern shown above, plus caching and retries.
 - **Failure modes → fixes:**
@@ -433,7 +471,7 @@ flowchart TD
   - Effects seem to double-fire in development → React 18+ `StrictMode` intentionally mounts, unmounts, and remounts each component once in development to surface effects with missing or broken cleanup; it does not happen in production builds.
 - **What to monitor:** number of unnecessary re-renders per interaction (React DevTools Profiler, "why did this render" flame graph); effect cleanup correctness is a code-review concern, not a runtime metric — missing cleanup usually shows up as a memory/listener leak over a long session instead.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why call order, not names, identifies a hook.** React doesn't know the hooks are named `useState`/`useEffect`; it simply keeps, per component instance, a linked list of "hook records" and advances one node per hook call during render. This is a deliberate simplicity trade-off (no need to track hook identity by name or location) that makes the two rules of hooks non-negotiable rather than stylistic.
 - **`useReducer` for complex state.**
@@ -452,7 +490,7 @@ flowchart TD
 - **Newer hooks (React 18–19), briefly:** `useTransition`/`useDeferredValue` mark an update as low-priority so urgent updates (typing) aren't blocked by expensive ones (re-filtering a big list); `useId` generates stable ids safe for server and client rendering; `use` reads a Promise or a Context value inside render (including conditionally, unlike other hooks, since it isn't tracked by the same slot-order mechanism); `useActionState` and `useOptimistic` pair with Actions to manage a form submission's pending/error/optimistic-result state without hand-written `useState` plumbing.
 - **`StrictMode`'s double-invoke in development** exists specifically to catch exactly the bugs this note warns about: an effect without correct cleanup will visibly misbehave (e.g. a doubled subscription) in development, rather than only failing quietly in production under real remounts.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why can't you call a hook inside an `if` statement?
 > React identifies each hook call by its position in a fixed, ordered list for that component instance, not by name. If a conditional sometimes skips a hook call, every hook call after it shifts to the wrong slot on renders where the condition differs, corrupting unrelated state — hence "hooks must be called unconditionally, in the same order, every render."
@@ -475,7 +513,7 @@ flowchart TD
 > [!question]- When would you choose `useReducer` over several `useState` calls?
 > When multiple state fields change together in response to the same events and the *transitions* themselves are complex enough to be worth naming and testing in isolation — a reducer is a plain function you can unit test without rendering anything, whereas scattered `useState` setters spread that logic across every event handler.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Hooks are matched to state by call order, not name — never call one conditionally or after an early `return`.
 - `useState`: replace values immutably; use the functional updater `(prev) => ...` when the new value depends on the old one.

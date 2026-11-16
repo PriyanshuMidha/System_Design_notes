@@ -20,7 +20,42 @@ updated: 2026-11-13
 > - Pick a structure by naming the operation your code does most often, then matching it against the table below.
 > - When in doubt, start with a slice or a map. Reach for a tree, heap, or specialised structure only once you know *why* a slice or map isn't enough.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 and the master table in 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A program stores lots of values. How you arrange them decides how fast you can find one.
+
+Think of a messy drawer vs a labelled shelf: same stuff, very different time to find the scissors.
+
+That arrangement is called a **data structure** — a way to lay values out in memory so the thing you do most often is quick.
+
+```mermaid
+flowchart LR
+    A["Messy pile:<br/>check every item"] --> B["Find scissors: slow"]
+    C["Labelled shelf:<br/>go straight to the spot"] --> D["Find scissors: fast"]
+```
+
+There is no single best arrangement. The one that makes "find by name" fast may make "list in order" slow.
+
+To talk about "fast" without a stopwatch, we use **Big-O**: a rough label for how the work grows when you store more items. `O(1)` means "same work at any size"; `O(n)` means "double the items, double the work".
+
+```mermaid
+flowchart LR
+    Q["What do you do most?"] --> O1["Grab by position → slice"]
+    Q --> O2["Grab by name → map"]
+    Q --> O3["Always want the biggest → heap"]
+```
+
+That is the whole topic. The rest of this note is just these 3 questions:
+1. How do I pick the right structure for my code? (the flowchart)
+2. What does each structure cost? (the master table)
+3. What does Big-O hide, and when does it lie to you? (layout, constants, amortised spikes)
 
 ### The problem in one story
 
@@ -67,7 +102,7 @@ Where it breaks: a kitchen rarely holds a million items, so the "hidden" costs h
 > [!tip] Remember
 > Name the operation your code does most, then pick the structure that makes that operation cheap.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you're building a leaderboard that supports three operations: add a player's score, look up a player's score by name, and list the top 10 scores.
 
@@ -84,7 +119,7 @@ A cache that only ever needs recency order would reach for a different pair (map
 > [!tip] Remember
 > There is no single "best" data structure — only the best structure for the exact mix of operations your code performs most often.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a data structure as answering one question: **"when I ask for item X, how much work do you do before you can touch it?"**
 
@@ -107,7 +142,7 @@ A hash table's "box number" is a hash of the key modulo the table size, so two d
 
 Everything else — trees, heaps, graphs, tries, skip lists, union-find — is a specialisation of one of these four answers, built to make one more operation (ordered range scans, "the current minimum", "is there a path", "the longest shared prefix") just as cheap.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Choosing a structure
 
@@ -256,7 +291,7 @@ flowchart TD
 
 **Why it matters:** this is why a heap's `Access` (peek at the min/max) is `O(1)` — it's always at index 0 — while `Insert`/`Delete` are `O(log n)`, the cost of re-establishing the heap property by swapping along one root-to-leaf path.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -266,9 +301,11 @@ Two different needs, two structures, used together — this is normal, not a sig
 
 The `Need`/`Choose` function that turns this flowchart into testable Go code, plus its test, live in the runnable version: [[Data Structures Overview and Big-O Cheat Sheet - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### The master table
+
+**In plain words:** this is the whole note in one grid — each row is a structure, each column is the price of one operation. Read your row, scan for the costly cells, and that is the trade you are making.
 
 `n` is the number of elements. All costs below are average case unless a worst-case column exists; "amortised" means the cost averaged over a sequence of operations, explained in [[Complexity Analysis - Big-O and Amortized Cost]].
 
@@ -307,7 +344,7 @@ Every row above gets its own note with the full mechanism, a tested Go implement
 - [[Tries, Suffix Trees and Suffix Arrays]] — prefix trees, suffix structures.
 - [[Union-Find and Skip Lists]] — disjoint-set union, probabilistic ordered lists.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Picking a fancy structure too early is a cost, not a win.** A tree or heap has real overhead (pointer chasing, rebalancing, more allocations) that a slice or map doesn't. Reach for one only once a measured bottleneck names the operation it would fix.
 - **Big-O ignores constants.** A linked list's `O(1)` insert and a slice's `O(n)` insert can lose to the slice in practice for small-to-medium `n`, because the slice's contiguous memory makes every touched byte cheap and the linked list's pointer chases are all cache misses (see [[Memory Hierarchy and CPU Caches]]).
@@ -317,7 +354,7 @@ Every row above gets its own note with the full mechanism, a tested Go implement
 > [!warning] What happens if… you use a plain BST for data that arrives already sorted?
 > Every insert goes to the same side (always "greater than the last one"), building the exact degenerate, linked-list-shaped tree from section 3 — `O(n)` for every operation, with none of a tree's benefit. This is precisely why production ordered structures (`google/btree`, database indexes) are self-balancing by construction, not plain BSTs.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems:**
 
@@ -342,7 +379,7 @@ Every row above gets its own note with the full mechanism, a tested Go implement
 - p99 latency of the operation your structure serves (the amortisation subsection above explains why p99, not just p50, is where a slice's occasional resize shows up).
 - For anything backed by a hash table: load factor and the collision/resize rate.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 Big-O describes how a cost **grows**, not how large it is at any one `n`. Two structures with the same asymptotic cost can differ by orders of magnitude at the `n` your program actually sees, because of three things Big-O deliberately throws away:
 
@@ -352,7 +389,7 @@ Big-O describes how a cost **grows**, not how large it is at any one `n`. Two st
 
 The practical rule that falls out of all three: **measure before you specialise**. Start with the simplest structure that is asymptotically correct for your operation mix (usually a slice or map), and move to something more specialised only once a profile or benchmark shows it's the bottleneck.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- You need O(1) lookup by key and to keep insertion order. What do you reach for, and why doesn't a plain map give you this?
 > A Go map's iteration order is intentionally randomised, so insertion order needs a second structure: a slice of keys alongside the map, or a map from key to a doubly linked list node (the same pattern an LRU cache uses, see [[Linked Lists]]).
@@ -375,7 +412,7 @@ The practical rule that falls out of all three: **measure before you specialise*
 > [!question]- What's the difference between "union-find" and just running BFS/DFS to check if two nodes are connected?
 > Union-find answers "same group?" in near-constant amortised time per query after the groups are built (with path compression and union by rank), and it supports merging groups online. A fresh BFS/DFS per query is `O(V+E)` every time, which is far more expensive if you ask the question repeatedly as merges happen.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Name the operation your code does most, then match it to the flowchart in section 3.
 - Slice: `O(1)` index, `O(n)` middle insert/delete, cache-friendly, the default choice.

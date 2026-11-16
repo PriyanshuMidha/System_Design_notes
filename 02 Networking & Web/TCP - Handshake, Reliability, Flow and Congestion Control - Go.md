@@ -19,7 +19,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code models the two windows that gate every TCP sender — a flow-control `Window` (the receiver's buffer limit) and a congestion-control `Sender` (slow start, congestion avoidance, loss response) — and then proves the handshake and byte-stream behavior for real over a loopback socket. See the theory in [[TCP - Handshake, Reliability, Flow and Congestion Control]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" and "Before the code", then skim the Code section's plain-words lines and the Running it output. Skip the tests on a first pass.
+> - 🟡 **Know the basics?** Read the Code and Tests sections properly, plus Design decisions.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls in the code and do the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on twin of the TCP theory note. It builds TCP's two "how fast may I send" limits as tiny Go types you can run on your laptop — one for the receiver's buffer (flow control), one for the network's capacity (congestion control) — and then opens one real connection over loopback to prove the handshake and the byte-stream behavior are real, not just diagrams. Read the theory note first; here, read each code block's bold intro line, then the code.
+
+## Before the code 🟢
 
 - **Structs with methods:** `Window` and `Sender` are plain structs; methods like `OnACK` change their fields through a pointer receiver.
 - **Two packages:** `wb` holds pure flow-control math with no networking; `main` holds congestion control and real sockets.
@@ -28,7 +35,7 @@ updated: 2026-11-13
 - **Goroutine + channel:** the echo test runs `Serve` in a goroutine and collects its error on a buffered channel.
 - **What to run:** `go vet ./...` then `go test -race ./...` in a module containing both packages.
 
-## What this code shows
+## What this code shows 🟢
 
 This note turns three separate pieces of the theory note into runnable code, each testable in isolation: a pure flow-control model with no network involved, a pure congestion-control state machine with no network involved, and then a real TCP connection over loopback that exercises the actual kernel handshake and socket options.
 
@@ -42,7 +49,7 @@ Keeping the first two network-free is deliberate — it lets the tests below ass
 | `TestSlowStartThenCongestionAvoidance` | The exact doubling-then-linear growth curve RFC 5681 describes | [[TCP - Handshake, Reliability, Flow and Congestion Control#Congestion control cwnd slow start CUBIC and BBR]] |
 | `TestTCPHandshakeAndEcho` | A byte stream, not a message queue: one write, one read, over a real socket | [[TCP - Handshake, Reliability, Flow and Congestion Control#Mental model]] |
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** two packages — `wb` (the whiteboard flow-control model, in its own `wb/` subdirectory) and `main` (congestion control plus the real socket code), each with its own `_test.go` file.
 - **Go version:** 1.24.
@@ -58,9 +65,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### The whiteboard model: flow control alone
+
+**In plain words: a tiny calculator that answers one question — "how many more bytes may I send before the receiver's inbox is full?"**
 
 ```go
 package wb
@@ -105,6 +114,8 @@ A single merged type was considered and rejected: it would make it impossible to
 3. `OnAck` takes both the new ACKed position and the new advertised window in one call, because a real ACK segment always carries both pieces of information together — splitting them into two calls would let them go out of sync.
 
 ### Congestion control: the sender's state machine
+
+**In plain words: the sender's own speedometer — double the speed each round trip while all is well, halve the remembered limit and restart slow when a packet is lost.**
 
 ```go
 package main
@@ -158,6 +169,8 @@ func (s *Sender) OnLoss() {
 4. There's no separate "fast recovery" state modeled here; this is deliberately the simpler Reno-style collapse described in the theory note's variants table, not CUBIC's cubic-growth curve or BBR's model — see the theory note for why those differ.
 
 ### A real socket: handshake, `TCP_NODELAY` and keepalive
+
+**In plain words: a real echo server — the kernel does the 3-way handshake for you inside `Accept` and `Dial`; this code just turns two tuning knobs and copies bytes back.**
 
 ```go
 package main
@@ -271,7 +284,7 @@ func DialAndRoundtrip(addr string, msg []byte) ([]byte, time.Duration, error) {
 > }
 > ```
 
-## Design decisions
+## Design decisions 🟡
 
 A reader coming from the theory note might expect this code to model CUBIC or BBR directly, since those are what Linux and most production stacks actually run.
 
@@ -284,7 +297,7 @@ It deliberately doesn't: the goal here is a state machine small enough to assert
 | Reno-style reset only (no CUBIC/BBR model) | Implementing CUBIC's cubic growth function | Keeps the state machine small enough to unit-test exactly against RFC 5681's three rules; CUBIC and BBR are covered conceptually in the theory note instead of re-implemented here |
 | `io.ReadFull` in the client | A single `conn.Read` call | Matches the theory note's warning that TCP has no message boundaries — a single `Read` is not guaranteed to fill the buffer |
 
-## Tests
+## Tests 🟡
 
 ### TestSlowStartThenCongestionAvoidance
 
@@ -398,7 +411,7 @@ func TestWindowCanSendShrinksAsBytesGoInFlight(t *testing.T) {
 }
 ```
 
-## Running it
+## Running it 🟢
 
 ```text
 $ go vet ./...
@@ -439,7 +452,7 @@ Across all four tests, the shape to notice is the same one the theory note argue
 
 That separation is also why a bug in one almost never shows up as a failure in another — each test's blast radius is exactly one mechanism.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Comparing `Cwnd` with `==` after repeated multiplication** would be fragile with real floating-point segment sizes; this demo's inputs happen to stay exact powers of two, but production congestion-control code tracks bytes as integers specifically to avoid float drift over millions of RTTs.
 - **Forgetting the `Ssthresh` floor of 2** in `OnLoss` would let a run of consecutive losses drive the threshold toward zero, permanently trapping the sender in a tiny `Cwnd` it can never grow out of.
@@ -448,7 +461,7 @@ That separation is also why a bug in one almost never shows up as a failure in a
 
 Each exercise below is deliberately a "change this, predict the result" task, not a "write this from scratch" task: the point is to build intuition for how a small change to the state machine or the socket code ripples through the existing tests, the same intuition that matters when debugging a real connection's `cwnd` trace in production.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `OnLoss` to model "fast recovery" instead of a full reset: on a fast-retransmit-triggered loss (as opposed to a timeout), set `Cwnd = Ssthresh` instead of `Cwnd = 1`. Predict how the `TestSlowStartThenCongestionAvoidance`-style trace changes, then write a test for it.
 2. Change `DialAndRoundtrip` to use a single `conn.Read(buf)` instead of `io.ReadFull(conn, buf)`, then run the existing test in a loop (`go test -race -count=100`). Predict whether it ever fails on loopback, and why relying on that result would still be a mistake for code that has to run over a real network.

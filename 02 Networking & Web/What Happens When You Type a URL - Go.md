@@ -18,7 +18,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code measures the four phases [[What Happens When You Type a URL]] walks through for a single HTTP request — DNS lookup, TCP connect, TLS handshake, and time to first byte — using `net/http/httptrace`, the same mechanism `curl -w` and a browser's DevTools waterfall panel are built on.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the "From zero" paragraph below, then "Before the code", "What this code shows" and Setup. Stop there.
+> - 🟡 **Know the basics?** Read the Code and Tests sections top to bottom; each big block has a plain-words opener first.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero** 🟢 — This file is the hands-on twin of [[What Happens When You Type a URL]]. It builds a tiny stopwatch in Go that times the four phases of one web request — finding the address (DNS), connecting (TCP), agreeing on encryption (TLS), and waiting for the first answer byte — then proves with tests that a second request on the same kept-open connection skips the connect and encryption steps entirely. Read each "In plain words" line before its code block and you can follow without deep Go knowledge.
+
+## Before the code 🟢
 
 - **`net/http`**: Go's built-in HTTP client and server; `client.Do(req)` sends one request.
 - **`net/http/httptrace`**: lets you attach callbacks that fire at DNS, connect, TLS and first-byte moments.
@@ -27,7 +34,7 @@ updated: 2026-11-13
 - **`httptest.NewTLSServer`**: a real local HTTPS server for tests, no network needed.
 - **Run it:** `go vet ./...` and `go test -race ./...` (standard library only).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Theory section |
 | --- | --- | --- |
@@ -36,7 +43,7 @@ updated: 2026-11-13
 | `TestDoHTTPS` | A plain request pays for connect + TLS; a phase is zero only when the transport genuinely skipped it | [[What Happens When You Type a URL#TCP and TLS two handshakes before one byte of HTTP moves]] |
 | `TestDoReusesConnection` | A second request on a kept-alive connection skips Connect and TLSHandshake entirely | [[What Happens When You Type a URL#Where the time actually goes]] |
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `urltrace`, with `urltrace.go` and `urltrace_test.go` in one directory.
 - **Go version:** 1.24.
@@ -49,9 +56,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### The Timings type: one field per phase
+
+**In plain words:** first we need a box with five slots, one per phase we want to time. An empty slot is meaningful too — it means that phase was skipped, not that it was instant.
 
 ```go
 package urltrace
@@ -88,6 +97,8 @@ An alternative design (one flat `map[string]time.Duration`) was rejected because
 2. `Total` is the one field that always has a non-zero, meaningful value for a successful request; the others are legitimately zero in specific circumstances described above each field.
 
 ### Do: wiring the trace to the request
+
+**In plain words:** Go lets you hang little bells on an outgoing request — one rings when DNS starts, one when the connection opens, one when encryption finishes, one when the first answer byte lands. `Do` hangs the bells, sends the request, and writes down when each bell rang.
 
 The first half of `Do` builds the trace itself — one callback per phase boundary:
 
@@ -170,7 +181,7 @@ sequenceDiagram
     Do-->>Caller: Timings, status, error
 ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -179,9 +190,11 @@ sequenceDiagram
 | Zero-value phases for skipped steps | A `*time.Duration` (nil = skipped) | A plain `time.Duration` with "0 means skipped" is simpler to read and compare in tests, at the cost of not distinguishing "skipped" from "measured exactly 0ns" (never happens in practice) |
 | Attaching the trace via `context.Context` | A global/package-level trace variable | Context-scoped tracing is safe for concurrent requests on a shared `*http.Client`; a global would corrupt readings under concurrent use |
 
-## Tests
+## Tests 🟡
 
 ### TestDoHTTPS
+
+**In plain words:** this test starts a tiny local HTTPS server that deliberately dawdles for 5 ms, makes one request, and checks each stopwatch slot matches what the theory predicts.
 
 **Property proved:** a plain HTTPS request pays for connect and TLS (both strictly greater than zero), never pays for DNS when connecting to a literal IP (as `httptest.NewTLSServer` does), and every phase is internally consistent — nothing measures longer than the request's own `Total`.
 
@@ -415,14 +428,14 @@ PASS
 > }
 > ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Forgetting to drain the response body** before computing `Total` would leave the connection unable to return to the pool, silently defeating `TestDoReusesConnection`'s whole premise — a caller copying this pattern elsewhere must keep the drain-then-close order.
 - **Reading `timings.Connect == 0` as "instant"** instead of "skipped" is an easy misread — the zero value means the transport never called `ConnectStart` at all, not that connecting took zero nanoseconds.
 - **Sharing one `*http.Client` across goroutines while reusing the same `*http.Request`** would race, because `req.WithContext` returns a new request value but the original request object is still shared; each goroutine in a concurrent caller needs its own `*http.Request`, not a shared one with a swapped context.
 - **Treating absolute test timings as portable numbers** is a pitfall of the numbers in this note generally: the exact milliseconds measured here are specific to this machine and a loopback `httptest` server, not a guarantee about any other network path — only the *ordering* and *zero vs. non-zero* relationships are the stable, teachable claims.
 
-## Exercises
+## Exercises 🔴
 
 1. Add a `DNSLookup` test using `httptest.NewServer` with a hostname instead of a literal IP (you'll need a fake resolver or a real hostname that resolves to loopback). Predict whether `DNSLookup` will be non-zero, then confirm.
 2. Change `Do` to also record `TLSHandshake` as zero for a plain `http://` test server (`httptest.NewServer`, not `NewTLSServer`). Predict the result before running it, then write the test.

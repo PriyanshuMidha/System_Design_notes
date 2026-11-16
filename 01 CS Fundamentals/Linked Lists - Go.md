@@ -15,7 +15,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Linked Lists]]: a typed singly linked list with the five classic traversal patterns (reverse, cycle detection, middle node, merge, remove-nth-from-end), and an LRU cache built from a map plus Go's standard-library doubly linked list.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there.
+> - 🟡 **Know the basics?** Add "Code" (steps 1-6) and "Design decisions".
+> - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢
+
+This file is the hands-on twin of the linked lists theory note. It builds the five classic interview moves in Go — reverse a list, detect a loop, find the middle, merge two sorted lists, delete the n-th node from the end — and then an LRU cache that combines a map with a doubly linked list. Read it top to bottom; every code block has a plain "How it works" list right after it, and every claim is pinned down by a test.
+
+## Before the code 🟢
 
 - **Pointers (`*Node`)**: a variable holding the address of a node; `nil` means "no node", which marks the end of a list.
 - **Structs**: `Node` and `entry` group a value with its links into one record.
@@ -24,7 +33,7 @@ updated: 2026-11-13
 - **Maps**: `map[int]*list.Element` gives `O(1)` key lookup straight to a list node.
 - **What to run**: `go vet ./... && go test -race -v ./...` inside the module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -42,15 +51,17 @@ flowchart LR
     N -.->|"FromSlice / ToSlice helpers"| N
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. No external dependencies: everything is the standard library (`container/list`, `sort` is not needed here).
 - Layout: a module `linkedlist` with `node.go` (the five traversal patterns plus `FromSlice`/`ToSlice` helpers) and `lru.go` (the LRU cache), each with its own `_test.go`.
 - Run it with `go vet ./... && go test -race -v ./...`. No external service is needed.
 
-## Code
+## Code 🟡
 
 ### Step 1: the node and reversing it
+
+**In plain words:** walk the chain once and flip every arrow to point backwards; the old last node becomes the new first.
 
 **Concept.** The theory note's whiteboard trace shows reversing a 3-node list by walking forward once and re-pointing each `Next` to the node before it ([[Linked Lists#Worked example]]). The alternative is a recursive reverse, which is also `O(n)` time but uses `O(n)` stack frames instead of `O(1)` extra space — the iterative version below is preferred for exactly that reason.
 
@@ -98,6 +109,8 @@ sequenceDiagram
 ```
 
 ### Step 2: cycle detection and the middle node
+
+**In plain words:** send a slow walker and a fast runner down the chain — if the chain loops, the runner laps the walker; if it ends, the walker is standing in the middle when the runner finishes.
 
 **Concept.** Both functions reuse the same slow/fast pointer shape from [[Linked Lists#Interview questions]]: a slow pointer moves one node per step, a fast pointer moves two. The alternative for cycle detection is a `map[*Node]bool` of visited nodes, which works but costs `O(n)` extra memory; Floyd's approach is chosen here because it needs none.
 
@@ -147,6 +160,8 @@ func MiddleNode(head *Node) *Node {
 
 ### Step 3: merging two sorted lists
 
+**In plain words:** keep picking the smaller front item of the two lists and hooking it onto a growing result, starting from a throwaway "dummy" node so the first hook needs no special case.
+
 **Concept.** The theory note's dummy-node trick avoids special-casing which list's head is smaller ([[Linked Lists#Worked example]]). The alternative is to compare the two heads up front to decide the real head, then loop — correct, but it duplicates the comparison logic that the loop already does once more, for no benefit.
 
 ```go
@@ -182,6 +197,8 @@ func MergeSorted(a, b *Node) *Node {
 4. `dummy.Next` is the real head; `dummy` itself is discarded by the garbage collector once the function returns.
 
 ### Step 4: removing the n-th node from the end
+
+**In plain words:** send one pointer n steps ahead, then move both together — when the front one falls off the end, the back one is standing right before the node to remove.
 
 **Concept.** Finding the n-th-from-end node naively needs two passes: one to count the length, one to walk to the right spot. The lead/trail pattern does it in one pass by creating the gap first ([[Linked Lists#How it works]] covers the general shape of these two-pointer techniques).
 
@@ -222,6 +239,8 @@ flowchart LR
 
 ### Step 5: the FromSlice / ToSlice helpers
 
+**In plain words:** two little converters between a normal Go slice and a linked list, so the tests can compare plain slices instead of walking pointers.
+
 **Concept.** The tests build lists from slices and read them back as slices, so each check is one `reflect.DeepEqual` instead of a hand-written pointer walk. Both helpers live in `node.go`.
 
 ```go
@@ -254,6 +273,8 @@ func ToSlice(head *Node) []int {
 3. `ToSlice` is a plain forward walk, `O(n)` time; on a cyclic list it would loop forever, so `TestHasCycle` never calls it after creating a cycle.
 
 ### Step 6: the LRU cache
+
+**In plain words:** the map answers "where is key X?" instantly, and the list keeps items ordered by how recently they were touched — front is freshest, back gets evicted.
 
 **Concept.** The theory note's LRU section pairs a map (key to list element) with a doubly linked list ordered by recency ([[Linked Lists#The LRU cache: map and list working together]]). Front of the list = most recently used; back = next to evict.
 
@@ -312,7 +333,7 @@ func (c *LRU) Put(key, val int) {
 3. `Put` on a new key at capacity removes `Back()` from both the list and the map, then pushes the new entry to the front.
 4. The entry stores its own key, because eviction starts from the list element and must find the map key to delete.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -322,7 +343,7 @@ func (c *LRU) Put(key, val int) {
 | `container/list` for the LRU cache | A hand-rolled doubly linked list | Tested, standard-library code, at the cost of a type assertion on every access (`Value any`) |
 | Map plus list, kept in one type | Two free-standing collections the caller wires together | `Get`/`Put` can never let the map and list disagree, because only `LRU`'s own methods touch either |
 
-## Tests
+## Tests 🔴
 
 ### Test 1: reverse
 
@@ -499,7 +520,7 @@ func TestLRUUpdateExistingKeyRefreshesRecency(t *testing.T) {
 
 **If it fails.** Key `1` evicted instead of `2` means `Get` or the update branch of `Put` forgot to call `MoveToFront`. A panic on the type assertion `el.Value.(*entry)` means a value of the wrong type was pushed onto the list somewhere.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Saving `cur.Next` before overwriting it** in `Reverse` is not optional — skip it and the rest of the original list becomes unreachable the moment the first `cur.Next = prev` runs.
 - **The loop guard order matters** in `HasCycle` and `MiddleNode`: `fast != nil && fast.Next != nil` must check `fast != nil` first, or `fast.Next` panics on a nil `fast` once short-circuit evaluation would otherwise have skipped it.
@@ -507,13 +528,13 @@ func TestLRUUpdateExistingKeyRefreshesRecency(t *testing.T) {
 - **`MoveToFront` must run on every access that counts as "used,"** including the update branch of `Put`, not only `Get` — `TestLRUUpdateExistingKeyRefreshesRecency` exists specifically to catch that one missing call.
 - **The dummy node is discarded, not part of the list.** Returning `dummy` instead of `dummy.Next` from `MergeSorted` or `RemoveNthFromEnd` would silently prepend a zero-value node to every result.
 
-## Exercises
+## Exercises 🔴
 
 1. In `RemoveNthFromEnd`, change the first loop to `for i := 0; i <= n; i++`. Predict which node gets removed instead, and verify with `TestRemoveNthFromEnd`.
 2. Add a `Len()` method to `LRU` that returns `c.ll.Len()`. Write a test that calls it after a mix of `Put`s that exceed capacity, and predict the number before running it.
 3. In `TestLRU`, change the capacity from `2` to `3` and keep the same sequence of calls. Predict whether `Get(2)` now succeeds, then run it to check.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Linked Lists]]
 - **Before this:** [[Data Structures Overview and Big-O Cheat Sheet]], [[Arrays and Dynamic Arrays (Go Slices)]]

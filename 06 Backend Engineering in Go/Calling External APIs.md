@@ -26,6 +26,8 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
+**In plain words:** the smallest safe outgoing call — one client, one timeout — before the retry and breaker layers.
+
 The shape every outbound call needs, before any of the hardening below:
 
 ```go
@@ -49,7 +51,35 @@ func callProvider(ctx context.Context, url string) (*http.Response, error) {
 
 Everything below fixes what this whiteboard version gets wrong: no transport pool tuning, no retry, no drain-and-close, and a status check that is right by luck but not explicit about which codes are retryable.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your service often has to call someone else's server — a payment provider, an email sender. That other server is slow sometimes, down sometimes, and you cannot fix it.
+
+So every outgoing call needs a **timeout**: a hard limit on how long you will wait. Go's default HTTP client has no timeout at all — it can wait forever.
+
+```mermaid
+flowchart LR
+    S[Your service] -->|call with a timeout| P[Provider API]
+    P -. "slow or down" .-> S
+    S -->|retry only safe calls, then give up| F[Fallback / error]
+```
+
+If a call fails, you may **retry** it — but only if doing it twice is harmless. Charging a card twice is not harmless.
+
+If the provider keeps failing, a **circuit breaker** stops calling it for a while, like a fuse, so your whole service does not jam up waiting.
+
+The rest of this note is just these 4 questions:
+1. How do you build the one HTTP client you reuse for a provider?
+2. Which calls are safe to retry, and how do you space the retries?
+3. What is a circuit breaker and when does it open and close?
+4. How do deadlines flow from the user's request into the provider call?
 
 **The problem in one story.** Your shop phones a supplier for every order.
 If the supplier never picks up and you wait on the line forever, every other customer in your shop waits too.
@@ -94,7 +124,7 @@ Where it breaks: a phone call either connects or not; an HTTP call can succeed o
 > [!tip] Remember
 > One reused client per provider, a deadline on every call, retry only what is safe to repeat.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps calls four external providers: a payment gateway to charge a card, an email provider to send a receipt, object storage to persist a generated PDF, and an SMS provider for two-factor codes. Each is a network call to a system you do not control, and each can fail in a way a local function call never does: a TCP connect that hangs for 30 seconds because the provider's load balancer is unhealthy, a response that starts streaming and then stalls at byte 40 of a 2KB body, or a `200 OK` with a body that silently contains an error.
 
@@ -103,7 +133,7 @@ Two concrete failures show why this needs explicit engineering, not just "call t
 - **No timeout, one bad dependency, service-wide outage.** If every `createInvoice` handler calls the payment provider with `http.DefaultClient` and the provider's connect path degrades to a 60-second hang, every concurrent checkout request parks a goroutine for 60 seconds. At even moderate traffic, the server runs out of available goroutines/file descriptors and stops serving *unrelated* requests, like reading an existing invoice — a dependency that is merely slow takes down a service that didn't even need it.
 - **Blind retries double-charge a customer.** If `createCharge` times out after the provider actually processed the charge (the response was simply lost on the way back), and the client naively retries the same POST, a customer is charged twice. The Idempotency-Key pattern — the client generates a key once and the provider deduplicates by it — is what makes a retry here safe at all; see [[Idempotency and Idempotency Keys]] for the key-generation and storage side.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat every outbound call as a budget with three nested timers, not one:
 
@@ -125,7 +155,7 @@ flowchart LR
 - **`Client.Timeout`** bounds one entire attempt (connect through reading the full body). It is not the same as a per-attempt context deadline — `Client.Timeout` applies even if you pass a context with no deadline, and a context deadline applies even if `Client.Timeout` is zero. Set both: `Client.Timeout` as the per-attempt ceiling, the context deadline as the overall budget.
 - **Transport-level timeouts** (`DialContext`, `TLSHandshakeTimeout`, `ResponseHeaderTimeout`) catch failures earlier and more precisely than the blunt `Client.Timeout` — a DNS lookup that hangs is a different failure mode from a slow response body, and distinguishing them in logs matters when you're debugging which part of the call actually failed.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 sequenceDiagram
@@ -160,6 +190,8 @@ The circuit breaker's own state machine (closed → open → half-open) is taugh
 
 ### Deciding what to retry
 
+**In plain words:** retry only what is harmless to repeat: reads almost always, writes only when you attach an idempotency key so the provider can spot the duplicate.
+
 ```mermaid
 flowchart TD
     R[Response or error] --> E{Network error<br/>or 5xx or 429?}
@@ -172,7 +204,7 @@ flowchart TD
     W --> R
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The pool-tuned client — a shared transport per provider, built once:
 
@@ -369,7 +401,7 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 
 **Measured:** built in a scratch module (`extapidemo`, Go 1.24.4, `golang.org/x/time` v0.5.0) and run with `go test -race`. All 7 test functions passed: transient-failure recovery in exactly 3 attempts with 2 sleeps, `Retry-After: 7` honoured as exactly a 7-second sleep, a 400 returned on the first attempt with zero retries, attempt exhaustion returning `ErrAllAttemptsFailed`, and the rate limiter both bursting 2 requests instantly and throttling the 3rd, and returning an error when its context expired while waiting for a token.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -379,14 +411,14 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 | Circuit breaker (closed/open/half-open) | Stops calling a provider entirely once failures cross a threshold, probes occasionally | A dependency that is down, not just slow — stop making it worse | Theory and state machine in [[Circuit Breaker]] |
 | Hedged requests | Fire a second identical request if the first hasn't answered by some percentile latency, take whichever answers first | Idempotent reads where tail latency matters more than a 2x request-rate cost | Only ever for idempotent operations; doubles load on a slow provider |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Retrying a non-idempotent write without an Idempotency-Key is not a tuning choice — it's a correctness bug that can double-charge or double-send. If a provider has no idempotency mechanism, the safe default is zero retries on writes, with the user told to check before retrying manually.
 - A circuit breaker adds state and a failure mode of its own: an incorrectly tuned threshold can pop open on a minor blip and reject traffic a merely-degraded (not actually down) provider could still have served.
 - Transport pool tuning (`MaxIdleConnsPerHost`, etc.) only matters once request volume to one host is high enough to see connection churn in metrics; for a call made once a minute, the default settings are fine and tuning is wasted effort.
 - Hedged requests trade provider load for tail latency — never do this for a payment charge or any write, only for cheap, idempotent reads.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** AWS SDKs implement exactly this backoff-plus-jitter default (the "full jitter" formula is from AWS's own Builders' Library). Stripe's API requires an `Idempotency-Key` header on every write and documents retry guidance built around it. Netflix popularized the circuit breaker pattern at scale with Hystrix (now largely superseded by resilience4j and language-native breakers like `sony/gobreaker` in Go).
 - **Failure modes → fixes:**
@@ -396,7 +428,7 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
   - Idempotency key reused across genuinely different requests → scope the key to (endpoint, request body hash), not just a random UUID, so an accidental key collision cannot apply one request's effect to another's.
 - **What to monitor:** per-provider p50/p95/p99 latency, retry rate (not just error rate — a high retry rate with a low final-error rate is still a cost, and a leading indicator), circuit breaker state transitions, and connection pool stats (`Transport` has no built-in metrics exporter in stdlib; wrap `DialContext` or use `httptrace` to count dials vs reused connections).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **`Client.Timeout` vs context deadline vs `Transport` timeouts — why all three.** `Client.Timeout` includes connection time, any redirects, and reading the entire response body; it cannot be adjusted per-request once the client is built. A context deadline passed via `NewRequestWithContext` is per-request and composes naturally with the parent request's remaining budget. `Transport`'s `DialContext`, `TLSHandshakeTimeout` and `ResponseHeaderTimeout` catch failures at specific phases, which turns "the call timed out" into "DNS/connect took too long" vs "the provider accepted the connection but never sent headers" — a real debugging difference when a provider's status page says "operational" but your calls still fail.
 - **Why `MaxIdleConnsPerHost` defaults to 2 (`http.DefaultMaxIdleConnsPerHost`), and why that's wrong for a single busy provider.** The default assumes many different hosts, each getting a little traffic. A service calling one payment provider host at moderate concurrency will otherwise constantly open new connections (and redo TLS handshakes) because only 2 idle connections are kept per host — set this per-provider based on measured concurrent call volume to that host.
@@ -404,7 +436,7 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 - **Hedging is a tail-latency tool, not a reliability tool.** Firing a second request at, say, the p95 latency mark only helps if the provider's slowness is independent per request (a different backend instance, a different network path) — if the whole provider is uniformly slow, hedging doubles load for no latency benefit. It's valuable specifically for reads against a replicated or horizontally scaled provider API.
 - **Tracing an outbound call.** `otelhttp.NewTransport(base)` wraps your `*http.Transport` to emit a client span per call automatically, including the status code and any error, which is what makes a cross-service trace show "handler → payment provider call → 3 retries → success" as one connected timeline instead of three unrelated log lines.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's wrong with `http.DefaultClient` for calling an external API?
 > `http.DefaultClient` has `Timeout: 0` — no timeout at all — so a provider that accepts the connection and then never finishes the response hangs that call forever unless the request's context carries its own deadline. It's also a shared package-level value other code may configure differently; a dedicated per-provider client avoids surprising interactions.
@@ -431,7 +463,7 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 > [!question]- How would you safely call a URL a customer configured themselves (e.g. a webhook delivery address)?
 > Treat it as untrusted input with SSRF potential: resolve the hostname, reject private/link-local/loopback IP ranges via a custom `Dialer.Control`, and re-check on every connection attempt (not just once at config time) because DNS can rebind an external-looking hostname to an internal IP between the check and the actual connect.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - One `*http.Client` per provider, built once; never `http.DefaultClient` (Timeout: 0) and never built per request.
 - Set `Client.Timeout` (per-attempt ceiling) and a context deadline (overall budget) — they are not the same thing.
@@ -442,7 +474,7 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 - Outbound rate limit with `x/time/rate` to respect provider quotas; a circuit breaker stops calling a provider that's reliably down.
 - SSRF-guard any URL that came from user input, at connect time, not just at input validation time.
 
-## Links
+## Links 🟢
 - **Before this:** [[Building REST Endpoints]], [[Context Package]], [[Timeouts, Retries and Backoff]]
 - **Next:** [[Circuit Breaker]], [[Redis in Go]] (caching a provider's slow or rate-limited responses)
 - **Compare with:** [[Idempotency and Idempotency Keys]], [[Authentication and Authorization in Go]] (calling an OAuth-protected provider)

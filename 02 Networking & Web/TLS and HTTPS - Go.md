@@ -21,7 +21,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code proves three real handshakes with Go's `crypto/tls`: a server negotiating TLS 1.3, a TLS-1.2-only client being rejected by a TLS-1.3-only server, and mutual TLS (mTLS) using a throwaway test certificate authority. See the theory in [[TLS and HTTPS]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" and "Before the code", then skim each code block's bold plain-words line and the Running it output. Skip the test details on a first pass.
+> - 🟡 **Know the basics?** Read the Code and Tests sections properly, plus Design decisions.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls in the code and do the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on twin of the TLS theory note. It runs three real TLS handshakes on your own machine with Go's standard library: one that succeeds with modern TLS 1.3, one that correctly *fails* when the client is too old, and one where the server also demands an ID card from the client (mutual TLS). It even builds its own throwaway certificate authority in memory, so nothing is faked and no files are needed. Read the theory note first; here, read each code block's bold intro line, then the code.
+
+## Before the code 🟢
 
 - **`crypto/tls`**: Go's built-in TLS; a `tls.Config` sets versions (`MinVersion`, `MaxVersion`), certificates and client-cert rules.
 - **`crypto/x509` + `crypto/ecdsa`**: build and sign certificates in memory, so the tests need no certificate files.
@@ -30,7 +37,7 @@ updated: 2026-11-13
 - **Handler goroutines**: the server runs each request on its own goroutine, which is why the tests run with `-race`.
 - **Run it**: `go vet ./...` then `go test -race -v ./...` inside a module named `tlsdemo` (see Setup).
 
-## What this code shows
+## What this code shows 🟢
 
 All three tests below exercise a real TLS handshake over a real `net.Listener` (via `httptest`), never a mocked connection — the point of this note is to make the theory note's handshake diagrams literally observable in test output, not just plausible on paper.
 
@@ -66,7 +73,7 @@ One throwaway certificate authority (`testCA`) feeds every test that needs a rea
 
 Keeping one CA type shared across all three tests, rather than three separate ad-hoc certificate setups, is what lets `TestMutualTLS` reuse `testCA.issue` unchanged.
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `tlsdemo`, with the test-CA helper in its own file and the three handshake tests in another.
 - **Go version:** 1.24.
@@ -84,9 +91,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Pinning a server to TLS 1.3 for testing
+
+**In plain words: a tiny helper that starts a real local HTTPS server which refuses to speak anything older than TLS 1.3.**
 
 ```go
 package tlsdemo
@@ -118,6 +127,8 @@ func newTLS13Server(handler http.Handler) *httptest.Server {
 3. `StartTLS()` finally binds the socket and begins serving — any client connecting from this point negotiates against the `MinVersion: tls.VersionTLS13` constraint.
 
 ### Proving TLS 1.3 actually negotiated
+
+**In plain words: connect to that server and check the receipt — did the handshake really land on TLS 1.3, not a quiet downgrade?**
 
 ```go
 func TestServerNegotiatesTLS13(t *testing.T) {
@@ -155,6 +166,8 @@ func TestServerNegotiatesTLS13(t *testing.T) {
 
 ### A version mismatch failing closed
 
+**In plain words: cap the client at the older TLS 1.2 and prove the connection is refused outright — failing safely instead of silently downgrading.**
+
 ```go
 func TestTLS12ClientRejectedByTLS13Server(t *testing.T) {
 	srv := newTLS13Server(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +198,8 @@ Cloning the transport (`.Clone()`) rather than mutating the client's shared defa
 3. The error returned by `client.Get` here is a handshake failure, not an HTTP-level error (no status code exists yet, because no HTTP exchange happened — the connection never got past the TLS layer).
 
 ### Building a real chain of trust for mTLS
+
+**In plain words: make our own tiny ID-card office (a throwaway CA) in memory, so the tests can check real signatures instead of switching verification off.**
 
 ```go
 package tlsdemo
@@ -250,6 +265,8 @@ func newTestCA(t *testing.T) *testCA {
 
 ### Issuing leaf certificates for the server and the client
 
+**In plain words: the CA prints two ID cards — one for the server, one for the client — each stamped for its own job.**
+
 ```go
 func (ca *testCA) issue(t *testing.T, name string, client bool) tls.Certificate {
 	t.Helper()
@@ -289,6 +306,8 @@ The alternative of two separate functions was rejected as unnecessary duplicatio
 3. `tmpl.DNSNames = []string{"localhost"}` plus the loopback `IPAddresses` entry are the SANs the theory note says are the only thing modern clients actually check, not the legacy `CommonName` field (though `CommonName` is still set here for human readability in log lines).
 
 ### Requiring and verifying a client certificate (mTLS)
+
+**In plain words: now the server checks ID too — a client with no certificate is turned away at the door, and one with the right certificate gets in and is known by name.**
 
 ```go
 func TestMutualTLS(t *testing.T) {
@@ -357,7 +376,7 @@ func TestMutualTLS(t *testing.T) {
 1. `withCertClient` presents the signed `clientCert`, so the handshake now succeeds, and the server reads the verified identity straight from `r.TLS.PeerCertificates[0]` — no separate authentication step beyond the TLS handshake itself.
 2. The response body (`client-cn=test-client`) is read directly out of the certificate the server verified, which is the concrete version of the theory note's claim that mTLS lets "every hop independently prove its peer's identity."
 
-## Design decisions
+## Design decisions 🟡
 
 Every choice in this section is one a reader could reasonably make differently; the table exists so the trade-off is explicit rather than left for a future maintainer to rediscover by trial and error.
 
@@ -376,7 +395,7 @@ Three design pressures shaped this file as a whole.
 | One `issue` function with a `client bool` flag | Two separate `issueServerCert`/`issueClientCert` functions | The only real difference is `ExtKeyUsage` and SAN fields; one function with a flag avoids duplicating the certificate-template boilerplate |
 | `httptest.NewUnstartedServer` + manual `srv.TLS` | `httptest.NewTLSServer` | Needed to set a custom `tls.Config` (`MinVersion`, `ClientAuth`) before the listener starts accepting connections |
 
-## Tests
+## Tests 🟡
 
 Each test below asserts exactly one property of the handshake, matching the table in "Design decisions": a reader who wants to confirm the version negotiation works can read only the first test, and a reader who only cares about mTLS can skip straight to the third, without needing the others to make sense of it.
 
@@ -411,7 +430,7 @@ A failure here (no error) would mean Go's TLS stack allowed an incompatible vers
 
 A failure in the first case would mean the server isn't actually enforcing `RequireAndVerifyClientCert`; a failure in the second would mean either the chain-of-trust verification or the server's reading of `r.TLS.PeerCertificates` is broken — both are the exact mechanism this test exists to prove works end to end.
 
-## Running it
+## Running it 🟢
 
 The commands below are the same two steps every Go module in this vault's implementation notes runs.
 
@@ -443,7 +462,7 @@ The second log line, `handshake failed as expected: remote error: tls: protocol 
 
 Seeing the real alert text, rather than a generic "connection refused," is the detail that makes a production TLS error log readable the first time it shows up for real: the alert name usually names the mismatched parameter directly.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Using `InsecureSkipVerify` to make a TLS test "just work"** is the single most common shortcut that quietly defeats the entire point of a certificate-chain test — a server with an expired, wrong-hostname, or entirely self-signed-without-a-trusted-root certificate would still pass.
 - **Forgetting `BasicConstraintsValid: true` and `IsCA: true` on the CA template** would produce a certificate that some strict verifiers reject as a CA even though `KeyUsageCertSign` is set — both fields together are what x509 actually checks.
@@ -452,7 +471,7 @@ Seeing the real alert text, rather than a generic "connection refused," is the d
 - **Giving the test CA and its leaf certificates a long `NotAfter`** would be a subtler mistake than it looks: a one-hour validity window is a deliberate signal to anyone reading the test later that these certificates are disposable test fixtures, never something to copy into a real deployment where certificate lifetimes matter for revocation and rotation.
 - **Sharing one `*testCA` instance across unrelated test functions running in parallel** (via `t.Parallel()`, not used here) would need the CA's key generation to be safe for concurrent reads, which `newTestCA` does not currently guarantee — each test here calls `newTestCA` fresh instead of sharing one, specifically to sidestep that question entirely.
 
-## Exercises
+## Exercises 🔴
 
 Each exercise below is a "change this, predict the result" task rather than a "write this from scratch" task: the goal is to build the same intuition needed to debug a real handshake failure in production, where the error message is often the only clue available.
 

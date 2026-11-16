@@ -22,7 +22,40 @@ updated: 2026-11-13
 > - Keep interfaces small and declare them next to the code that calls them (the consumer), not next to the implementation.
 > - `any` is justified when the shape of the data is genuinely unknown until runtime; when you know the type ahead of time, use it directly or use a generic constraint instead.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You write a checkout function. It needs to save stock in a database.
+
+If you write "this function needs a Postgres database", you are stuck: tests now need a real database too.
+
+```mermaid
+flowchart LR
+    A["Checkout code"] -- "needs exactly" --> B["Postgres database"]
+```
+
+Instead you say what you need by **behaviour**: "give me anything that can Reserve stock". That list of required abilities is an **interface**.
+
+Now the real database fits, and a tiny fake fits in tests. Go checks the fit for you, automatically — a type that has the listed methods just fits, no extra declaration (that is called **satisfying** the interface).
+
+```mermaid
+flowchart LR
+    A["Checkout code"] --> I{{"anything with Reserve()"}}
+    P["Real Postgres type"] -. fits .-> I
+    F["Tiny fake (for tests)"] -. fits .-> I
+```
+
+That is the whole idea. The rest of this note is just four questions:
+1. How does Go decide a type "fits"? (implicit satisfaction)
+2. What is an interface value made of inside? (a two-part pair)
+3. What are the traps? (the nil trap, mainly)
+4. When should you NOT use one? (pollution, hot loops, generics instead)
 
 **The problem in one story.**
 A phone charger works with any wall socket, because the socket only cares about the shape of the plug.
@@ -64,7 +97,7 @@ Where it breaks: a real socket either has power or not, but a Go interface holdi
 > [!tip] Remember
 > Ask for the smallest set of methods you need, declared where you use them; Go checks the fit for you.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service needs to reserve stock before charging a card. Writing it directly against `*PostgresInventory` works until a test needs to run without a real database, or until the team swaps Postgres for a cache-backed store — at which point every caller of the concrete type needs to change, and every test needs a running database.
 
@@ -72,7 +105,7 @@ An interface breaks that coupling: `CheckoutService` depends on a `StockReserver
 
 In tests, a five-line fake satisfies it too, because Go checks the method set, not a declared relationship. Neither `*PostgresInventory` nor the fake ever writes the word `StockReserver` anywhere in their own code.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of an interface as a **socket**, not a blueprint. A wall socket doesn't care what brand of device you plug in — it only cares that the plug has the right pins in the right places.
 
@@ -80,9 +113,11 @@ Any type whose methods line up with the interface's "pins" fits, with no registr
 
 An interface **variable**, though, is not the plugged-in device itself — it's a small adapter that remembers two things: which kind of device is plugged in (its concrete type), and where that device actually is (its data). That adapter is always the same fixed size, two machine words, no matter how large or small the plugged-in device is.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Implicit satisfaction and small, consumer-side interfaces
+
+**In plain words:** you never write "X implements Y" in Go; if the type has the methods, it already fits — like a plug that just has the right pins.
 
 ```go
 // Declared next to checkout — the CONSUMER — not next to inventory.
@@ -128,6 +163,8 @@ Accepting an interface lets the caller supply any satisfying type, real or fake.
 
 ### Compile-time assertion
 
+**In plain words:** one throwaway line that makes the build fail early if a type stops fitting the interface — a smoke alarm for drift.
+
 ```go
 var _ StockReserver = (*PostgresInventory)(nil)
 ```
@@ -135,6 +172,8 @@ var _ StockReserver = (*PostgresInventory)(nil)
 This line does nothing at runtime — `_` discards the value. Its only job is to fail the **build** the moment `PostgresInventory`'s methods drift away from what `StockReserver` requires, catching the mismatch at the implementation site instead of at some distant call site.
 
 ### The interface value: a `(type, data)` pair
+
+**In plain words:** an interface variable is a small two-slot box: one slot remembers WHAT kind of thing is inside, the other WHERE its data lives.
 
 An interface variable is always two machine words, regardless of what's stored in it: **measured** with `unsafe.Sizeof` (Go 1.24.4, darwin/arm64 — 8-byte words):
 
@@ -159,6 +198,8 @@ Calling `s.Area()` through the interface means: follow the type word to the itab
 That extra hop is the entire cost of dynamic dispatch — there's no reflection and no map lookup involved.
 
 ### Nil interface vs. typed nil
+
+**In plain words:** the box can hold "a pointer that points at nothing" — the box itself is not empty, so `err != nil` still says yes. This is Go's most famous trap.
 
 Because an interface value is a `(type, data)` pair, it is nil only when **both** halves are nil. A concrete nil pointer, once assigned to an interface variable, produces the pair `(*FieldError, nil)` — non-nil as an interface, even though the pointer half is nil:
 
@@ -194,6 +235,8 @@ flowchart LR
 **Fix:** only ever `return nil` literally for an interface-typed result; never return a concrete pointer variable that might itself be nil. A full catalogue of this and eight other Go traps, each with a runnable test, lives in [[Go Interview Questions and Traps]] — this note explains the mechanism; that one is the interview-facing drill.
 
 ### Type assertion (comma-ok) and type switches
+
+**In plain words:** assertions are how you open the box and ask "is a Circle in here?" — the comma-ok form asks politely, the one-result form panics if it guessed wrong.
 
 A **type assertion** recovers the concrete type behind an interface value. The two-result ("comma-ok") form never panics — it reports failure instead:
 
@@ -272,6 +315,8 @@ func Sum[T Number](xs []T) T {
 
 ### Interfaces vs. generics
 
+**In plain words:** interface = different types BEHAVE differently; generic = same logic, just a different type filled in. Pick by what varies.
+
 | | Interfaces | Generics |
 |---|---|---|
 | What varies | **behaviour** — different types do different things for the same method call | the **algorithm is identical**, only the type changes |
@@ -288,7 +333,7 @@ It adds a layer of indirection, a naming collision (`I`-prefixes and `Impl`-suff
 
 Declare the interface when a consumer actually needs one, sized to exactly what that consumer calls.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -565,7 +610,7 @@ The interface call costs about 35% more per call here — the itab lookup and in
 
 A larger concrete type, or one captured by a pointer, would add an allocation on top of this dispatch cost if it has to escape (see [[Pointers, Values and Escape Analysis]]).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Form | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -575,7 +620,7 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
 | Interface embedding | union of required methods | a role genuinely needs both sets of behaviour (`io.ReadWriter`) | same per-method dispatch cost as any interface |
 | One-off `IX`/`XImpl` pair | an interface with exactly one implementation, created preemptively | almost never — add the interface when a second shape actually exists | indirection with no present benefit; interface pollution |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - An interface you declare "just in case" before any second implementation or test fake exists is pure overhead: an extra hop on every call, and a layer of indirection a reader has to look through to find the real logic. Add the interface when a concrete second need shows up.
 - Dynamic dispatch defeats inlining: the compiler generally cannot inline a call made through an interface, because it doesn't know the concrete type until runtime.
@@ -583,7 +628,7 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
   A hot inner loop calling a method millions of times per second may be measurably faster against a concrete type (see the benchmark above); profile before reaching for an interface purely on principle in such a loop.
 - `any` throws away the compiler's help entirely. Every `any` parameter is a promise you're keeping in your head instead of letting `go build` check it — reach for a generic constraint first if the set of valid types is actually fixed.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `io.Reader`/`io.Writer` are the standard library's own proof of small, decoupling interfaces working at scale — nearly every I/O type in Go satisfies them without ever importing `io`.
 
@@ -594,7 +639,7 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
   - A team migrating from Java ships `IOrderService`/`OrderServiceImpl` pairs everywhere → reviewers flag it in every PR → point to this note and to [[OOP in Go - Structs, Interfaces, Embedding]] for the idiomatic alternative.
 - **What to monitor:** nothing runtime-specific; this is a design-time and code-review concern. PGO profiles (below) are the one place dispatch cost becomes an observable, measurable signal.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The itab in more detail.** An itab is built once per distinct `(concrete type, interface type)` pair the first time that combination is needed, then reused — it is not rebuilt on every assignment.
 
@@ -615,7 +660,7 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
 
   A type satisfying `ReadWriter` is simply a type whose method set happens to be a superset of both; `Reader` and `Writer` never "know" `ReadWriter` exists.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does "interfaces are satisfied implicitly" actually mean?
 > A type satisfies an interface purely by having the right methods with the right signatures — there is no `implements` keyword and no declared link between the type and the interface. The compiler checks this structurally, at every point an interface value is assigned or passed, not just once at a declaration site.
@@ -637,7 +682,7 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
 > [!question]- When do you reach for a generic type parameter instead of an interface?
 > When the algorithm is identical across types and only the type itself varies — a cache, a stack, a `Sum` function. An interface is for when *behaviour* varies between implementations (a real repository vs. a test fake); a generic is for when the logic is the same and you just don't want to duplicate it per type.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Satisfaction is structural and implicit: have the methods, satisfy the interface — no declared relationship needed.
 - Keep interfaces small (1–3 methods) and declare them at the consumer, next to the code that calls them, not next to the implementation.

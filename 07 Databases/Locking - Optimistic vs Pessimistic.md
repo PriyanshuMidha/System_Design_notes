@@ -29,7 +29,39 @@ updated: 2026-11-13
 > - Pick by contention: rare conflicts favour optimistic, hot rows and expensive retries favour pessimistic.
 > - Whenever a transaction locks more than one row, lock in a fixed order (for example by id) to avoid deadlocks.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, the whiteboard version and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (row locks, version columns, deadlocks), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Two requests want to change the same database row at the same moment. Each reads the row, does a little maths, and writes the result back. The second write quietly wipes out the first. That bug is called a **lost update**.
+
+```mermaid
+flowchart LR
+    A["Request A: reads 10,000,<br/>writes 12,000"] --> R["Row says 12,000"]
+    B["Request B: reads 10,000,<br/>writes 12,000"] --> R
+    R --> X["Should be 14,000:<br/>one payment vanished"]
+```
+
+There are two cures, and this whole note is about choosing between them.
+
+**Pessimistic locking** means "lock the row first": the second request waits its turn, like a bathroom door lock. **Optimistic locking** means "write only if nothing changed": each row carries a counter (a **version**), and a write that quotes an old counter is rejected, so you re-read and try again.
+
+```mermaid
+flowchart LR
+    Q{"Fights over this<br/>row common?"} -- "yes" --> P["Pessimistic:<br/>lock, others wait"]
+    Q -- "no" --> O["Optimistic:<br/>version check, retry"]
+```
+
+The rest of this note is just these four questions:
+1. Can one SQL statement avoid the problem entirely? (section 1)
+2. How do row locks and version columns actually work? (section 3)
+3. How do you avoid two transactions waiting on each other forever (deadlock)? (section 3.3)
+4. Which cure do you pick for which situation? (sections 4-6)
 
 **The problem in one story.**
 An invoice has 10,000 paid. Two payments of 2,000 arrive at the same instant.
@@ -74,7 +106,7 @@ Where it breaks: rooms are visibly occupied, but a database writer only finds ou
 > [!tip] Remember
 > Rare conflicts: optimistic with a version check. Hot rows: lock first. Many rows: always lock in a fixed order.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps records payments against invoices. Invoice 501 has `total_minor = 100000` (₹1,000.00 in paise, the minor unit) and nothing paid yet. Two payment webhooks arrive within the same 5 ms, one for 30,000 and one for 50,000. The handler does what most first versions do:
 
@@ -118,7 +150,7 @@ flowchart TD
     D2 -- "no, conflicts are rare" --> F3["optimistic: version column, retry on 0 rows"]
 ```
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Pessimistic locking** assumes a conflict will happen, so it prevents one. You take a lock on the row before you read it; anyone else who wants to change that row waits until you commit or roll back.
 - **Optimistic locking** assumes a conflict is rare, so it detects one. Nothing waits. Every row carries a version number; you remember the version you read, and your write says "only if the version is still N". If someone got there first, your write matches zero rows and you start again.
@@ -145,9 +177,11 @@ flowchart LR
 | Needs a schema change | no | yes: a `version` column |
 | Can span several HTTP requests | no | yes |
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Pessimistic: row locks in PostgreSQL
+
+**In plain words:** `SELECT ... FOR UPDATE` is how you say "this row is mine until I commit"; anyone else who wants to change it stands in line behind you.
 
 A **row lock** is a lock on one row version, taken by a locking read or by `UPDATE`/`DELETE`, and held until the transaction ends. There is no way to release a row lock early, so the lock lives exactly as long as the transaction ([[Transactions and ACID]] covers where transactions begin and end).
 
@@ -183,6 +217,8 @@ At READ COMMITTED, when B's wait ends, PostgreSQL re-reads the newest committed 
 
 #### The four row-lock strengths
 
+**In plain words:** locks come in four strengths, like door signs from "do not enter" down to "please do not repaint this room"; a stronger sign blocks more kinds of visitors.
+
 PostgreSQL has four row-lock strengths. **FOR KEY SHARE** is what foreign-key checks take on the parent row; "key" here means the columns of a unique index that a foreign key could reference.
 
 | Lock clause | Taken by | Blocks | Does not block |
@@ -209,6 +245,8 @@ Practical reading of the table:
 
 #### What happens when the row is already locked
 
+**In plain words:** when the row is taken you have four choices: wait forever, give up at once, quietly skip it, or wait a bounded time. Pick one on purpose; the default is "wait forever".
+
 Three modifiers decide what happens when the row is already locked:
 
 | Modifier | Behaviour | Error | Typical use |
@@ -232,6 +270,8 @@ flowchart TD
 `lock_timeout` is off (0) by default in PostgreSQL 17, which means a blocked request waits forever, holding a pooled connection. Set it per transaction with `SET LOCAL`, which resets at commit or rollback.
 
 ### 3.2 Optimistic: the version column
+
+**In plain words:** give every row a counter. You note the counter when you read, and your write says "only if the counter is still 7". If someone bumped it meanwhile, your write touches zero rows and you redo the work on fresh data.
 
 Add a counter to every row that is edited by read-modify-write:
 
@@ -292,6 +332,8 @@ Runnable Go version: [[Locking - Optimistic vs Pessimistic - Go]]
 
 ### 3.3 Deadlocks and lock ordering
 
+**In plain words:** a deadlock is two people each holding one door and waiting for the other's door. The fix is a house rule: everyone always takes the doors in the same order.
+
 A **deadlock** is a cycle of waits: transaction A holds row 1 and wants row 2, while B holds row 2 and wants row 1. Neither can proceed.
 
 ```mermaid
@@ -344,6 +386,8 @@ sequenceDiagram
 
 ### 3.4 Advisory locks
 
+**In plain words:** sometimes there is no row to lock, so you lock an agreed-upon number instead, like hanging your coat on hook 42 to say "statement job for workspace 42 is taken".
+
 An **advisory lock** is a lock on a number that you choose rather than on a row. PostgreSQL enforces nothing about what it protects; your code agrees on what the number means. It is useful as an application mutex when there is no row to lock, for example "only one job may regenerate the monthly statement for workspace 42".
 
 ```sql
@@ -376,6 +420,8 @@ Prefer the transaction-scoped form. A session-scoped lock taken through a transa
 
 ### 3.5 Optimistic concurrency outside SQL: compare-and-set
 
+**In plain words:** the version-check trick is everywhere, not just SQL: HTTP, DynamoDB, Redis and ORMs all have a way to say "write only if it still looks like what I read".
+
 Optimistic concurrency outside SQL uses the same idea, called **compare-and-set** (CAS: write only if the current value still equals what you expect):
 
 | System | Mechanism | Conflict signal |
@@ -405,11 +451,13 @@ sequenceDiagram
     API-->>U2: 412 Precondition Failed, reload and merge
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The task: record payments against invoice 501 safely. Two handlers are possible. Both are correct; they differ in who pays when two webhooks collide.
 
 ### The bare idea in SQL
+
+**In plain words:** both cures for the same payment handler, side by side, in six lines of SQL each.
 
 The pessimistic style: lock, check, write, commit.
 
@@ -431,6 +479,8 @@ UPDATE invoices SET paid_minor = 30000, version = 8
 ```
 
 ### Trace: 50 payments of 2,000 at once
+
+**In plain words:** fifty writers attack one invoice with the optimistic loop; each round exactly one wins and the rest re-read and try again, like a raffle re-drawn until everyone has had a turn.
 
 Invoice 1 has `total_minor = 100,000`. Fifty goroutines each pay 2,000 using the optimistic loop. Each round, exactly one writer wins; the others re-read and retry.
 
@@ -466,7 +516,7 @@ Runnable Go version: [[Locking - Optimistic vs Pessimistic - Go]]
 - **Seat booking:** "hold seat 14F" is a conditional write, `UPDATE seats SET held_by = $1 WHERE id = $2 AND held_by IS NULL`, and zero rows means the seat is gone. No retry: the user picks another seat.
 - **Inventory decrement:** `UPDATE stock SET qty = qty - 1 WHERE sku = $1 AND qty > 0`. The condition is the version check. On a flash-sale SKU with thousands of buyers per second, every writer queues on that one row lock, so teams split stock into several rows (buckets) or reserve it in a cache first.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -494,7 +544,7 @@ flowchart TD
     E -- "no" --> OP2["optimistic with retry and cap"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not lock what one statement can do.** `SET paid_minor = paid_minor + $1` with a `CHECK (paid_minor <= total_minor)` constraint needs neither style.
 - **Optimistic under heavy contention wastes work.** If 50 writers hit the same row together, each round lets one succeed and 49 retry. The number of attempts grows with contention, so cap attempts (the code uses a caller-given limit) and switch to a lock for genuinely hot rows.
@@ -514,7 +564,7 @@ flowchart LR
     pool --> S
 ```
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** ORMs ship optimistic locking as a built-in (Hibernate `@Version`, Rails `lock_version`). Job-queue libraries on PostgreSQL such as River (Go), Oban (Elixir) and Solid Queue (Rails) fetch work with `FOR UPDATE SKIP LOCKED`. Kubernetes uses optimistic concurrency on every object through `resourceVersion` and rejects stale updates with HTTP 409.
 - **Failure modes → fixes:**
@@ -546,6 +596,8 @@ flowchart TD
 
 ### The SKIP LOCKED job queue
 
+**In plain words:** many workers share one to-do table without stepping on each other: each grabs only rows nobody else holds, skipping locked ones instead of waiting.
+
 Many workers can pull from one table without blocking each other. Each worker runs one statement that selects the next 10 due rows with `FOR UPDATE SKIP LOCKED` and marks them `running` in the same statement. The full SQL is in [[Locking - Optimistic vs Pessimistic - Go]].
 
 ```mermaid
@@ -566,7 +618,7 @@ Worker 1 locks the first 10 due rows; worker 2, running the same query a millise
 
 Once the claim has committed, the rows stay `running`, so a reaper must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling belong to [[Background Workers and Job Queues]].
 
-## Whiteboard version
+## Whiteboard version 🟢
 
 ```text
 lost update = read -> compute in app -> write, overlapping another writer
@@ -577,9 +629,11 @@ lost update = read -> compute in app -> write, overlapping another writer
 5. several rows?                -> lock in ascending id order ; retry on 40P01
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Where PostgreSQL stores row locks
+
+**In plain words:** PostgreSQL writes the lock into the row itself, not into a central list, which is why locking a million rows does not run out of lock memory.
 
 A row lock is not an entry in the shared lock table. It is written into the row's header: the locker's transaction id goes into `xmax` with flag bits saying "locked, not deleted" (see [[Storage Engines - B-tree vs LSM and WAL]] for page layout).
 
@@ -605,6 +659,8 @@ A surprising consequence: `UPDATE … WHERE status = 'sent'` may wait, re-check,
 
 ### Lock queues
 
+**In plain words:** waiters line up in arrival order, and a big waiting lock blocks everyone who arrives after it, which is how one stuck ALTER TABLE can freeze a whole table.
+
 Waiters on table-level locks queue in arrival order, and a waiting strong lock blocks later weaker requests from jumping ahead. That is what makes one `ALTER TABLE`, waiting behind a long transaction, block every later reader of the table.
 
 ```mermaid
@@ -622,6 +678,8 @@ sequenceDiagram
 ```
 
 ### InnoDB differs
+
+**In plain words:** MySQL's InnoDB also locks the empty space around rows (gaps), so even a row that does not exist yet can be "locked", with its own surprising deadlock.
 
 MySQL InnoDB at its default REPEATABLE READ locks index ranges, not just rows. A locking read takes **next-key locks**: a lock on the index record plus the **gap** before it, so no one can insert into that gap.
 
@@ -649,6 +707,8 @@ The version check works at READ COMMITTED because the `UPDATE` re-reads the late
 
 ### Behaviour at scale
 
+**In plain words:** one row is a single till: locked writes queue one by one, so a hot row tops out near a thousand writes a second no matter how big the server is.
+
 One row can absorb only so many locked writes per second, because they serialize on its lock and each one waits for the previous commit's WAL flush.
 
 If a commit takes about 1 ms, one row tops out around 1,000 writes per second, regardless of how many CPUs the server has (an estimate from commit latency, not a benchmark).
@@ -670,7 +730,7 @@ flowchart LR
     shard --> T2["about 4,000 writes per second (estimate), summed on read"]
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is a lost update, and does READ COMMITTED prevent it?
 > Two transactions read the same value, each computes a new value in the application, and the second write overwrites the first. READ COMMITTED does not prevent it in PostgreSQL. Fixes: an atomic `SET x = x + 1`, a locking read (`FOR NO KEY UPDATE`), a version check, or REPEATABLE READ, which turns the second write into a `40001` error.
@@ -693,7 +753,7 @@ flowchart LR
 > [!question]- What are advisory locks and when do they bite?
 > Locks on an application-chosen 64-bit key, with no link to any row. Use `pg_advisory_xact_lock` for a mutex such as "one statement run per workspace". Session-level ones break under transaction-pooling proxies, because the lock stays on a server connection someone else gets, and they do nothing across separate database clusters.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Lost update = read, compute in the app, write back, overlapping with another writer. Atomic SQL beats any lock.
 - Pessimistic: `FOR NO KEY UPDATE` for updates, `FOR UPDATE` for deletes and key changes, `FOR SHARE` to freeze a row; lock lives until commit.
@@ -704,7 +764,7 @@ flowchart LR
 - `FOR UPDATE SKIP LOCKED` = job queue; `pg_advisory_xact_lock` = app mutex.
 - Retry whole transactions on `40001`, `40P01`, `55P03`; never retry business-rule failures.
 
-## Links
+## Links 🟢
 
 - **Implementation:** [[Locking - Optimistic vs Pessimistic - Go]]
 - **Before this:** [[Transactions and ACID]], [[Isolation Levels and MVCC]]

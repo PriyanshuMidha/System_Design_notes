@@ -23,7 +23,35 @@ updated: 2026-11-13
 > - On a multi-core CPU, caches must stay consistent with each other. The **MESI** protocol makes every core agree on who owns a cache line before writing it — and two cores writing to *different* variables that happen to share one cache line pay for that agreement anyway. That's **false sharing**.
 > - This note is about CPU/hardware caches only. The OS page cache and file-system caches are a different mechanism, covered in [[Page Cache, File Systems and fsync]]; the TLB (a cache for address translation) is covered in [[Virtual Memory, Paging and the TLB]]; application-level caches (Redis, in-process caches) are covered in `08 Caching & Redis`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (the false-sharing worked example), plus 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your computer's brain (the **CPU**) is incredibly fast. But the data it works on lives in big, slow memory chips (the **RAM**). Fetching from RAM takes hundreds of times longer than doing the actual math.
+
+```mermaid
+flowchart LR
+    A["CPU<br/>ready in 0.3 ns"] -- "waits ~100 ns<br/>for every fetch" --> B["RAM<br/>(big but slow)"]
+```
+
+So the CPU keeps tiny, super-fast shelves of recently used data right next to it. Those shelves are called **caches**. Most of the time, what you need is already on a shelf, so there is no long wait.
+
+```mermaid
+flowchart LR
+    A["CPU"] --> C["Cache shelf<br/>(tiny, 1 ns)"]
+    C -. "only when the shelf<br/>does not have it" .-> B["RAM (~100 ns)"]
+```
+
+That is the whole trick. The rest of this note is just four questions:
+1. How many shelves are there, and how fast is each one? (sections 1-3)
+2. Why does keeping recent stuff work so well? (locality, section 3)
+3. What happens when several CPU cores share data? (MESI and false sharing, sections 3-4)
+4. What should you do about it in real Go code? (sections 6-8)
 
 **The problem in one story.**
 You are cooking and the recipe needs salt.
@@ -68,7 +96,7 @@ Where it breaks: in a kitchen you choose what to keep close; the hardware decide
 > [!tip] Remember
 > Keep hot data small, close and contiguous: the CPU is only as fast as the memory level its data lives in.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine two co-workers: one sits at a desk with everything they need in arm's reach, the other has to walk to a warehouse across town for every single document. That is, roughly, the gap between a CPU register and main memory (**DRAM**).
 
@@ -90,7 +118,7 @@ The exact ratio depends on the machine, so treat this as an illustration of the 
 > [!tip] Remember
 > The memory hierarchy exists because DRAM is roughly 300× slower than a CPU cycle, and real programs touch the same data and nearby addresses repeatedly — that repetition is what a cache exploits.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a programmer's workspace:
 
@@ -104,7 +132,7 @@ You never fetch "one byte" from the warehouse — you fetch a whole box (a 64-by
 
 The analogy breaks down in one place: unlike a human archive, the hardware automatically decides what to keep nearby based on what you recently touched, without being asked.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The pyramid
 
@@ -227,7 +255,7 @@ That broadcast is not free: it crosses the inter-core interconnect, and it happe
 > [!tip] Remember
 > MESI's whole job is to stop any core from reading a stale copy after another core writes — it does this by requiring ownership (Modified/Exclusive) before a write, or a broadcast invalidate if the line was Shared.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -275,7 +303,7 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
 > [!tip] Remember
 > False sharing is a performance bug, not a correctness bug: both layouts compute the right answer, but the packed one pays invisible coherence traffic for data that was never logically shared.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Mechanism | What it caches | Granularity | Who manages it |
 |---|---|---|---|
@@ -284,13 +312,13 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
 | OS page cache | File data read from disk | 4 KB pages | Kernel — see [[Page Cache, File Systems and fsync]] |
 | Application cache (Redis, in-process) | Query results, computed values | Arbitrary keys | Application code — see `08 Caching & Redis` |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Bigger caches are slower per access (more sets/ways to search), which is exactly why the hierarchy has several small, fast levels instead of one big one.
 - Padding data to avoid false sharing wastes memory (7 unused `int64`s per counter in the worked example) — only worth it for genuinely hot, independently-written counters; padding every struct "just in case" bloats memory and can itself hurt cache utilization by spreading related data across more lines.
 - Chasing cache-friendliness can fight readability (e.g. manually flattening a tree into an array). For code that isn't on a hot path, clarity wins; profile before restructuring data layout.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Go's own `runtime` pads per-P scheduler structures and some `sync` internals to avoid false sharing; high-throughput systems (databases, message brokers) commonly pad hot counters and shard per-CPU accumulators (`sync/atomic` counters per shard, summed on read) specifically to avoid cache-line contention under concurrency.
 - **Failure modes → fixes:**
@@ -299,7 +327,7 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
   - Pointer-chasing data structures (linked lists, trees of individually-allocated nodes) are far slower than their Big-O suggests on real hardware → this is why Go slices usually beat linked lists in practice even for workloads where a list's O(1) insert looks better on paper: contiguous memory keeps the prefetcher and spatial locality working.
 - **What to monitor:** IPC and cache-miss rate (`perf stat -e cache-misses,cache-references,instructions,cycles ./binary` on Linux), L3 miss rate specifically (a proxy for "how often do we hit DRAM"), and, for Go specifically, `go test -bench` with `-cpu` swept across core counts to catch contention that only appears at concurrency.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Cache lines and false sharing, precisely.** A cache line is the hardware's unit of coherence, not just of transfer: MESI tracks state per *line*, not per *variable*. Two `int64` variables 8 bytes apart that fall in the same 64-byte line are, as far as the coherence protocol is concerned, one unit — a write to either one invalidates the whole line everywhere else it's cached, per the Modified/Shared/Exclusive/Invalid transitions above.
 - **Hardware prefetching.** Modern cores detect simple access patterns (e.g. "address N, then N+64, then N+128…") and speculatively fetch the next expected line before it's requested, which is a large part of why sequential array access is faster than its raw cache-miss count alone would predict, and why spatial locality matters even within a single core's own traffic.
@@ -307,7 +335,7 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
 - **Associativity and thrashing.** A direct-mapped cache (1-way) can thrash badly if a program happens to access two hot addresses that map to the same set, even if the cache overall has plenty of free space; higher associativity (8-way, 12-way, common for modern L2/L3) makes that collision far less likely at the cost of more comparison hardware per lookup.
 - **Measuring instead of guessing.** `perf stat` on Linux and `go test -bench` with multiple `-cpu` values are the two tools that turn "this feels slow" into a number; always benchmark on hardware close to production, with enough repetitions to see the run-to-run spread, before and after a cache-layout change — effects like false sharing are both hardware-dependent and noisy at small sample counts.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does the memory hierarchy have multiple cache levels instead of one big cache?
 > Access latency grows with cache size (more sets and ways to search, physically farther from the core), so one big cache would be as slow as a small L3 for every access. Several small, fast levels let the common case (data already in L1) stay fast while still backstopping misses with progressively larger, slower caches instead of going straight to DRAM.
@@ -330,7 +358,7 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
 > [!question]- How would you detect false sharing was happening in a production Go service?
 > Look for throughput that stops scaling (or regresses) as concurrency increases while CPU usage stays high, profile with `perf stat -e cache-misses,cache-references` (Linux) or vendor equivalents to confirm an unusually high miss rate on specific cache lines, and benchmark the suspected hot variable with `go test -bench -cpu 1,2,4,8,...` — a result that gets relatively worse per core as `-cpu` rises, for code with no real contention on the data itself, points at false sharing.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Hierarchy: registers (~0.3 ns) → L1 (~1 ns) → L2 (~3–4 ns) → L3 shared (~10–20 ns) → DRAM (~80–120 ns, documented) → SSD (~10–100 µs).
 - Caches work because of locality: temporal (reuse soon) and spatial (nearby addresses soon).

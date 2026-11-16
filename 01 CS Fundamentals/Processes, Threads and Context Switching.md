@@ -23,7 +23,37 @@ updated: 2026-11-13
 > - A context switch costs real time, mostly from saving/restoring CPU state and from cold caches and TLB afterward, not from the save/restore instructions themselves.
 > - Go goroutines are not OS threads: the Go runtime multiplexes many goroutines onto a handful of OS threads, so a goroutine "switch" is far cheaper than a thread switch — measured on this machine, about two orders of magnitude cheaper.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your computer runs many programs at once, but each CPU core can only do one thing at a time. The OS fakes "at once" by switching between tasks very quickly.
+
+A **process** is one running program with its own private memory — like a separate house. A **thread** is one worker inside that house; a house can have many workers sharing the same rooms.
+
+```mermaid
+flowchart TD
+    P1["Process A<br/>(own memory)"] --> T1["thread 1"]
+    P1 --> T2["thread 2"]
+    P2["Process B<br/>(own memory)"] --> T3["thread 1"]
+```
+
+Switching the CPU from one task to another is a **context switch**: save where task 1 was, load where task 2 was. It is not free — it costs time and warms-up loss.
+
+```mermaid
+flowchart LR
+    A["Task 1 running"] --> S["save task 1's state"] --> L["load task 2's state"] --> B["Task 2 running"]
+```
+
+The rest of this note is just three questions:
+1. What exactly is in a process vs a thread, and why does sharing memory matter?
+2. What happens during a context switch, and what does it really cost?
+3. How do Go's goroutines fit in, and why are they so much cheaper?
 
 **The problem in one story.**
 Your laptop plays music while you type in an editor and a browser downloads a file.
@@ -68,7 +98,7 @@ Where it breaks: a real manager does not wipe the desk's warm memory each swap, 
 > [!tip] Remember
 > A process owns memory, a thread is a turn on the CPU, and swapping turns costs mostly cold caches.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say a web server needs to handle 10,000 concurrent connections. One option is one **process** per connection — a running program with its own private slice of memory.
 
@@ -91,7 +121,7 @@ Section 4 measures the practical effect on this machine: a goroutine-to-goroutin
 > [!tip] Remember
 > Threads exist because the expensive part of a process (its address space) doesn't need to be duplicated for every independent flow of execution.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **In plain words:** think of a **process** as an office: it has its own address (the address space), its own filing cabinets (open files), and its own phone line (signal handlers).
 
@@ -129,7 +159,7 @@ They are separate operations because sometimes you want only one of them:
 > [!warning] Common mistake
 > Assuming "thread" means "cheap, independent program." A thread shares everything about its process except its own execution state. A bug in one thread's pointer arithmetic can silently corrupt another thread's data, because there is no office wall between them — only between separate processes.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Process creation: fork + exec
 
@@ -220,7 +250,7 @@ A switch can be **voluntary** (the running thread calls a blocking syscall, wait
 > [!tip] Remember
 > Direct switch cost (registers) is tens of nanoseconds. Indirect cost (cold caches/TLB) is what actually puts real thread switches in the microsecond range.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -288,7 +318,7 @@ The difference is entirely explained by section 3:
 
 Runnable Go version, including the process-table model, both the unpinned and pinned hand-off benchmarks, and their tests: [[Processes, Threads and Context Switching - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Unit | Owns an address space? | Created by | Typical creation cost | Switch cost (same core) |
 | ---- | ----------------------- | ---------- | ---------------------- | ------------------------ |
@@ -296,14 +326,14 @@ Runnable Go version, including the process-table model, both the unpinned and pi
 | OS thread | No, shares its process's | `pthread_create` / `clone(CLONE_VM\|CLONE_THREAD)` | A syscall, smaller than a process: no new address space | Microseconds, but cheaper than a cross-process switch (no page table change). Measured on this machine (threads pinned via `LockOSThread`): ~7-7.8 µs |
 | Goroutine | No, shares its process's (and its OS thread's) | `go f()` | No syscall at all; the Go runtime allocates an ~2 KB stack in userspace, growable | Measured on this machine: ~80-84 ns; never touches the kernel unless the goroutine itself makes a blocking syscall |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Threads buy cheap communication (shared memory) at the cost of needing synchronization (see [[Concurrency Primitives - Mutex, Semaphore, Atomics]]): a data race in shared memory is a correctness bug; a crash in one thread can corrupt memory for the whole process.
 - A process crash only takes down that process; a misbehaving goroutine or thread (e.g. an unrecovered panic, or corrupting shared memory through an unsafe pointer) can take the whole process with it. Favour separate processes when isolation matters more than shared-memory speed (a plugin that might crash, a sandboxed job).
 - Spawning one OS thread per unit of work still costs a fixed-size stack (commonly 1-8 MB reserved per `pthread_create` call on Linux, though only the touched pages are committed) and a kernel scheduling entity; spawning millions of OS threads will exhaust memory or hit the OS's thread-count limits long before spawning millions of goroutines would (Go starts goroutine stacks at about 2 KB, growable — see [[Process Memory Layout - Stack vs Heap]]).
 - Goroutines are not free: a CPU-bound goroutine still occupies an OS thread while it runs, and goroutines that block on a syscall make the Go runtime spin up another OS thread to keep `GOMAXPROCS` logical processors busy (see [[Runtime - Goroutine Scheduler (GMP)]]). Thousands of goroutines blocked on CPU-bound work, not I/O, do not scale better than thousands of OS threads.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Nginx and PostgreSQL (still process-per-connection as of PostgreSQL 17, hence the usual advice to front it with a pooler like PgBouncer) use one process per connection/worker for strong isolation; Redis and Node.js run single-threaded event loops per process to avoid locking entirely; Go backend services commonly run one process per container with goroutines handling each request, the pattern this note sets up [[Runtime - Goroutine Scheduler (GMP)]] to explain.
 - **Failure modes -> fixes:**
@@ -312,14 +342,14 @@ Runnable Go version, including the process-table model, both the unpinned and pi
   - A process fork in a multi-threaded program only clones the calling thread; locks held by other threads at fork time can deadlock the child -> avoid `fork` in multi-threaded programs except immediately followed by `exec` (the common and safe pattern).
 - **What to monitor:** `vmstat`'s `cs` (context switches/sec) and `r` (runnable queue length) columns; `/proc/<pid>/status`'s `voluntary_ctxt_switches` / `nonvoluntary_ctxt_switches`; Go's `runtime.NumGoroutine()` and the scheduler latency exposed via `runtime/trace`.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **1:1 vs M:N threading.** Linux and macOS use a **1:1** model: every userspace thread (`pthread`) maps to exactly one kernel scheduling entity, so the kernel scheduler sees and switches between them directly. Go uses an **M:N** model (M goroutines multiplexed onto N OS threads, managed by **P**rocessors that hold the run queues — the "GMP" model) so that creating a goroutine, and switching between goroutines that aren't blocked in the kernel, never crosses into kernel mode at all. Full mechanics: [[Runtime - Goroutine Scheduler (GMP)]].
 - **What "shares the address space" buys and costs.** Threads of one process see the same virtual-to-physical mappings (see [[Virtual Memory, Paging and the TLB]]), so passing a pointer between threads is free — no serialization, no copy — but also means one thread's stray write through a bad pointer can corrupt another thread's data. Processes get the opposite trade: passing data needs IPC (pipes, sockets, shared memory segments explicitly mapped) but a crash is contained.
 - **The clone() syscall.** On Linux, `fork()`, `pthread_create()`, and `vfork()` are all built from one general syscall, `clone()`, parameterized by flags like `CLONE_VM` (share memory), `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`. A "thread" is, at the kernel level, just a process created with most of these flags set; `task_struct` (Linux's PCB-equivalent) does not have a separate "thread struct" — this is why Linux documentation sometimes calls threads "lightweight processes."
 - **Zombies and orphans.** A terminated process stays as a "zombie" entry in the process table (state `Terminated` above) holding its exit code until its parent calls `wait()`/`waitpid()` to reap it; an unreaped zombie wastes a PID slot. An **orphan** (parent exited first) is re-parented to `init`/PID 1 (or a subreaper), which reaps it automatically.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the real difference between a process and a thread?
 > An address space. A process has its own; a thread runs inside a process and shares that process's address space, open files, and other process-wide resources with every other thread in it. Each thread still has its own stack, registers, and program counter, because that's what lets it be scheduled independently.
@@ -342,7 +372,7 @@ Runnable Go version, including the process-table model, both the unpinned and pi
 > [!question]- A service spawns a new goroutine per incoming request with no limit. Under load, what breaks first, and why?
 > Likely memory, not CPU: each blocked goroutine still holds its stack (starting around 2 KB but growing) and whatever it's retaining (buffers, DB rows). Thousands of goroutines all blocked waiting on the same overloaded downstream service accumulate memory and scheduler bookkeeping without doing useful work. The fix is bounding concurrency (a worker pool or semaphore) rather than relying on goroutines being "cheap" without limit.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Process = address space + at least one thread. Thread = schedulable unit sharing its process's address space.
 - `fork` clones a process (copy-on-write, so it's fast); `exec` replaces the program in the current process, keeping its PID. Most process creation is `fork` + `exec`.

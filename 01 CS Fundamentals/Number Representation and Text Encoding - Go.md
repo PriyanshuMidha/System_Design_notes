@@ -17,7 +17,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Five small functions and their tests demonstrate, by running real code, the sharp edges described in [[Number Representation and Text Encoding]]: silent `int8` overflow, float rounding that breaks `0.1 + 0.2 == 0.3`, exact integer-cent money math, endianness, and the byte-vs-rune gap in Go strings.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Number Representation and Text Encoding]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Number Representation and Text Encoding]]. It is small Go programs that poke at how numbers and text really live in bytes — integer overflow, float surprises like 0.1 + 0.2, and walking a string's UTF-8 bytes. Read each code step with its notes; run the tests to see the surprises happen on your own machine.
+
+## Before the code 🟢
 
 - **Fixed-width integer types** (`int8`, `int64`, `uint32`): each has a set size and range; arithmetic wraps when it leaves the range.
 - **`float64`**: Go's IEEE 754 double; `==` compares exact bits.
@@ -26,7 +33,7 @@ updated: 2026-11-13
 - **`for range` on a string**: decodes UTF-8 and steps one rune (code point) at a time.
 - **What to run**: `go vet ./... && go test -race -v ./...` in the `numrep` module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Number Representation and Text Encoding]] |
 | --- | --- |
@@ -47,13 +54,13 @@ flowchart TB
 
 Each function is a minimal, pure, standalone demonstration of exactly one representation rule — none of them depend on each other, so each can be read (and tested) in isolation.
 
-## Setup
+## Setup 🟢
 
 - Module `numrep` with `numrep.go` and `numrep_test.go`.
 - Go 1.24, standard library only (`encoding/binary`, `testing`).
 - Run: `go vet ./... && go test -race -v ./...`
 
-## Code
+## Code 🟡
 
 ### Step 1: silent integer overflow and exact money math
 
@@ -184,7 +191,7 @@ flowchart LR
     S -->|"for range: 4 iterations"| R4["4"]
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -194,7 +201,7 @@ flowchart LR
 | Returning a fixed `[4]byte` from `BytesLE`/`BytesBE` | Returning a `[]byte` slice | A fixed-size array is directly comparable with `==` in a test, with no allocation beyond the array itself. |
 | Five independent, single-purpose functions | One larger "demo" function covering everything | Each representation rule is testable, and failing, in isolation — a reader can see exactly which rule a given test is about. |
 
-## Tests
+## Tests 🟡
 
 ### TestAddInt8Wrapping
 
@@ -335,7 +342,7 @@ $ go vet ./numrep/...
 $ go test -race -v ./numrep/...
 ```
 
-## Running it
+## Running it 🟡
 
 Measured with `go test -race -v ./...` on Go 1.24.4, darwin/arm64 (2026-11-06):
 
@@ -358,14 +365,14 @@ ok  	roll4scratch/numrep	1.516s
 
 `AddInt8Wrapping(127, 1) = -128`, `FloatsAreApproximate(0.1, 0.2, 0.3) = false`, and `StringLens("café") = (5, 4)` are the three headline results the theory note cites as measured, not merely claimed, behavior.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`AddInt8Wrapping` has no guard rail.** It is Go's own `+` with no bounds check, by design — calling it with values near the `int8` boundary in real code (not just the test) will wrap exactly the same way.
 - **`FloatsAreApproximate` can mislead if misread.** It returns `true` for some inputs (e.g. integral values) and `false` for others — a reader skimming only the `false` case could wrongly conclude "floats are always imprecise," when the precision is exact for values that happen to be sums of powers of two.
 - **`BytesLE`/`BytesBE` do not validate `v`.** Any `uint32` value is accepted; there is no "this value doesn't fit" case to worry about, unlike signed-integer wraparound.
 - **`StringLens` counts runes, not grapheme clusters.** A visible "character" built from multiple combining code points (e.g. some emoji with skin-tone modifiers) will count as more than one rune even though a user sees one glyph — `for range` decodes Unicode code points, not what a font renders as a single glyph.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `AddInt8Wrapping`'s parameter types from `int8` to `int16` and update the test's expected values for the new range's boundary (`32767 + 1`). Predict the new wrapped value before running it.
 2. Add a new case to `TestFloatsAreApproximate` that checks `FloatsAreApproximate(0.5, 0.25, 0.75)`. Predict whether it returns `true` or `false` before running it, using the "sums of powers of two are exact" rule from the theory note.

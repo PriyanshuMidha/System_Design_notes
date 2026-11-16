@@ -23,7 +23,42 @@ updated: 2026-11-13
 > - Expected height is `O(log n)`, not guaranteed — a skip list is simple but probabilistic, not worst-case bounded like a red-black tree.
 > - Classic mistake: forgetting path compression and union by rank, which degrades union-find to `O(n)` worst case per operation — the forest becomes a straight line.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This note covers two unrelated but interview-favorite structures.
+
+**Union-find** answers one question fast: "are these two things in the same group?" Think friend circles: every person points toward one representative of their circle. To check if two people are connected, follow the pointers up; if they reach the same representative, same circle. Merging two circles is just pointing one representative at the other.
+
+```mermaid
+flowchart TD
+    A["Alice"] --> R1["Raj (leader)"]
+    B["Bob"] --> R1
+    C["Cara"] --> R2["Zoe (leader)"]
+    R2 -. "union: merge circles" .-> R1
+```
+
+A **skip list** is a sorted linked list with express lanes stacked on top: the bottom lane has every item, each higher lane skips more. You search from the top lane, dropping down when you overshoot — binary-search speed in a linked list.
+
+```mermaid
+flowchart LR
+    subgraph lanes["Skip list lanes"]
+        E["express: 1 ----------> 50"]
+        M["middle: 1 ---> 20 ---> 50"]
+        L["local: 1, 7, 20, 31, 50"]
+    end
+```
+
+The rest of this note is just three questions:
+1. How does union-find get near-constant time (path compression, union by rank)?
+2. How does a skip list search, insert and stay balanced by coin flips?
+3. Where does each one win in real systems (Kruskal, Redis sorted sets)?
 
 ### The problem in one story
 
@@ -81,7 +116,7 @@ This note covers two unrelated structures that happen to share a chapter because
 
 In exchange, each gets code that's dramatically simpler than the "proper" alternative (a disjoint-set forest instead of general graph connectivity; randomized levels instead of tree rotations).
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 ### Union-find
 
@@ -106,7 +141,7 @@ A **skip list** gets the same `O(log n)` expected bounds with no rebalancing at 
 > [!tip] Remember
 > Union-find and skip lists solve different problems; what they share is "give up a guarantee, get simpler code and still-fast amortized/expected performance."
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### Union-find: a forest of parent pointers
 
@@ -187,7 +222,7 @@ Three "express" hops plus one local hop instead of walking all 6 nodes one at a 
 
 **Why it matters:** a search starts at the top level and moves right as far as it can without overshooting, then drops down a level and repeats — exactly like taking the express train as far as possible before switching to the local for the last few stops.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Union-find: path compression and union by rank
 
@@ -261,7 +296,7 @@ This is the same "express lane, then local" walk from the mental model, repeated
 > [!tip] Remember
 > A skip list's height is a random outcome, not an invariant the code enforces — that is both its simplicity (no rebalancing code) and its one real weakness (no worst-case guarantee).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -284,7 +319,7 @@ This degrades to `O(n)` per `Find` if unions always attach the new tree under th
 
 The runnable version adds path compression and union by rank (which is what makes it fast), a Kruskal's-algorithm minimum spanning tree built on top, and a from-scratch skip list keyed the way Redis's `ZSET` is. Runnable Go version: [[Union-Find and Skip Lists - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Structure | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -298,14 +333,14 @@ The runnable version adds path compression and union by rank (which is what make
 > [!warning] Interview trap
 > `O(α(n))` is not the same as `O(1)`. It's a function that grows, just unimaginably slowly — interviewers want to hear "inverse Ackermann, effectively constant for any realistic input," not a flat claim that union-find is `O(1)`.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Union-find answers "same group?" and "merge" — it does **not** support splitting a group back apart efficiently; if you need to undo a union in general (not just via an offline rollback log), it's the wrong structure.
 - Skip lists are simple to implement correctly but are **probabilistic**: a worst-case unlucky sequence of coin flips can degrade a specific query to `O(n)`, whereas a red-black tree guarantees `O(log n)` every time. For a real-time system with hard latency bounds, that matters.
 - A skip list's extra forward-pointer arrays cost more memory per node than a plain linked list or array — typically 1.5–2× the pointers of a single-level list, depending on `p`.
 - For small, mostly-static sets, a sorted slice with binary search is simpler than either a skip list or a balanced tree and just as fast in practice.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Kruskal's minimum-spanning-tree algorithm (network design, clustering) is union-find's textbook use.
@@ -334,7 +369,7 @@ The setup: build a graph of 50,000 nodes with 25,000 random edges already unione
 
 **Measured:** `BenchmarkConnectedQueries` (in the Go note's test file) runs this exact comparison — the naive baseline is only run over a 2,000-query slice, since a full 100,000-query BFS pass is slow enough to make test timeouts likely, and the gap is already clear from the smaller sample.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why union by rank bounds the height.** A tree of rank `r` must have been formed by merging two trees of rank `r-1` (or a taller one absorbing a shorter one, which doesn't increase rank), so a tree of rank `r` has at least `2^r` nodes.
 
@@ -348,7 +383,7 @@ Treat the result, not the proof, as interview-ready knowledge.
   Redis actually uses `p = 1/4` for its `ZSET` skip list, trading slightly taller expected search paths for fewer pointers per node (`1/(1-0.25) ≈ 1.33` on average) since memory matters more than a few extra comparisons for a typical sorted-set size.
 - **Why skip lists, not balanced trees, in Redis.** The Redis documentation notes that skip lists are about as fast as balanced trees for range operations while being noticeably simpler to implement correctly — no rotations, no recoloring, and the per-node structure is a flat array of forward pointers rather than a tangle of parent/child/color fields.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Implement union-find with path compression and union by rank.
 > See the worked example: `parent` and `rank` slices; `Find` recurses to the root and repoints every visited node to it; `Union` attaches the lower-rank root under the higher-rank one, bumping rank only on a tie.
@@ -368,7 +403,7 @@ Treat the result, not the proof, as interview-ready knowledge.
 > [!question]- Trap: is union-find good for "has this edge already been removed from a dynamic graph"?
 > No. Union-find only supports merging sets, not splitting them back apart efficiently. A graph where edges are both added and removed over time needs a different structure (e.g., a link-cut tree, or rebuilding union-find from scratch after removals) — recognizing this limitation is the trap.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Union-find: parent-pointer forest; `Find` walks to the root, `Union` merges two roots.
 - Path compression (flatten on `Find`) + union by rank (shorter tree under taller) together give `O(α(n))` amortized — "effectively constant," never claim literal `O(1)`.

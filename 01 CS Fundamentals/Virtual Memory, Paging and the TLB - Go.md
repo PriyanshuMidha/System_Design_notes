@@ -16,7 +16,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Virtual Memory, Paging and the TLB]]: a small, deterministic `MMU` that simulates a page table, a fixed-capacity LRU TLB, and demand paging with a bounded number of physical frames — so a TLB hit, a TLB miss, a minor fault and a major fault are all things a test can actually observe and assert on.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[Virtual Memory, Paging and the TLB]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[Virtual Memory, Paging and the TLB]]. It builds a tiny pretend MMU in Go — a page table, a small LRU TLB and a few physical frames — so that TLB hits, TLB misses and page faults become things a test can trigger and check on purpose. Read the notes, then the tests.
+
+## Before the code 🟢
 
 - **Maps** (`map[uint64]*pte`): Go's built-in hash table. Here it plays the page table and the TLB's storage.
 - **Pointers to structs** (`*pte`, `*MMU`): changing `entry.swapped` through a pointer changes the one shared entry, not a copy.
@@ -25,7 +32,7 @@ updated: 2026-11-13
 - **Methods** (`func (m *MMU) Translate`): functions attached to a type, called as `m.Translate(addr)`.
 - **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or generics are needed here.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -41,7 +48,7 @@ flowchart LR
     M --> T["tlb.go: lruTLB"]
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. No external dependencies — everything here is standard-library-free, pure in-memory simulation.
 - Layout: a module `vm` with `mmu.go` (the `MMU`, page table and fault logic), `tlb.go` (the LRU TLB), and `mmu_test.go` (all four tests, pinning down the exact event sequence the theory note describes).
@@ -49,7 +56,7 @@ flowchart LR
 - This is a teaching model, not a real MMU. Real hardware walks a radix-tree page table in silicon, and the OS handles faults in kernel code written in C/assembly.
 - Here both are modelled directly in plain Go. The sequence of events (TLB hit, TLB miss, minor fault, major fault) is visible and testable in a few milliseconds, with no root privileges, kernel module or virtual machine required.
 
-## Code
+## Code 🟡
 
 **Reading order.** Steps 1-5 build `mmu.go`: the outcome names, the MMU's state, the two cheap translation paths, the two fault paths, and frame allocation with eviction.
 
@@ -337,7 +344,7 @@ func (t *lruTLB) evictOldest() {
 1. `invalidate` and `touch` share the same "find and remove from `order`" loop, duplicated rather than factored into one more helper — a reasonable call at this size, though a larger codebase would likely pull it into a shared `removeFromOrder` function.
 2. `evictOldest` reads `order[0]` because `touch` always appends to the *end*, making the front of `order` the least-recently-used entry by construction — the two functions' invariants depend on each other, which is worth noticing when changing either one.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -347,7 +354,7 @@ func (t *lruTLB) evictOldest() {
 | `handleFault` split out from `Translate` | One long `Translate` method with all four outcomes inline | Keeps each function under the vault's code-block length guideline and gives the fault-only logic its own name and doc comment |
 | No `context.Context`, no `error` returns anywhere | Threading a `ctx` and returning `error` from every method, "to be safe" | This is pure, synchronous, in-memory computation with nothing to cancel and no failure mode that isn't one of the four named `Event`s — adding either would be decoration, not design |
 
-## Tests
+## Tests 🟡
 
 ### Test 1: first touch is a minor fault
 
@@ -457,7 +464,7 @@ That function marks whichever page it evicts (the lowest-numbered frame, here fr
 
 That is a correctness bug that would look like "re-accessing lost data silently becomes a fresh zero-filled page," which is a much worse failure than a slow major fault.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **The eviction policy is not a real LRU over frames.** `evictAndReuse` picks the *lowest-numbered* occupied frame, not the least-recently-accessed page — two different things.
   - A real kernel's clock algorithm (or true LRU, which is expensive to implement exactly in hardware) approximates "least recently used page," not "smallest frame number."
@@ -469,7 +476,7 @@ That is a correctness bug that would look like "re-accessing lost data silently 
 - **`handleFault`'s major-fault branch never actually reads data from anywhere.** This simulation only tracks *that* a major fault would occur and updates the bookkeeping state; it doesn't model an actual backing store (disk or swap file) with its own latency, since the theory note's point is the event sequence, not a disk I/O simulator.
 - **Frame numbers are never reused across different `MMU` instances or returned to a shared pool.** `freeFrame` only ever increments within one `MMU`'s lifetime; this is a single-process model, not a multi-process physical-memory allocator.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `evictAndReuse`'s victim selection from "lowest-numbered frame" to true LRU (track access order per *frame*, not per TLB entry) and re-run `TestFrameExhaustionCausesMajorFaultOnReaccess` with a third page added. Predict which page gets evicted under each policy before running it.
 2. Add a `Stats() (hits, misses, minorFaults, majorFaults int)` method to `MMU` that counts each `Event` across every `Translate` call. Write a test asserting the exact counts after a fixed sequence of accesses.

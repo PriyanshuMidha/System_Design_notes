@@ -17,6 +17,15 @@ updated: 2026-11-13
 
 # Search Engines and Inverted Indexes - Go
 
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note [[Search Engines and Inverted Indexes]] first, then just "Before the code" and "What this code shows" here.
+> - 🟡 **Know the basics?** Walk the Code section step by step, then the Tests: each code block has a numbered walkthrough right under it.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in one paragraph** 🟢
+
+This file builds a tiny search engine in plain Go, small enough to read in one sitting. It teaches by doing what the theory note explains in words: clean text into search words (the analyzer), keep a map from each word to the documents that contain it (the inverted index), rank matches with the BM25 formula, and answer quoted-phrase searches from stored word positions. Read each short code block, then the numbered notes right below it; nothing uses anything outside Go's standard library, and you can run the whole thing with one test command.
+
 > [!summary] TL;DR
 > A teaching-sized inverted index in Go: an analyzer, postings lists with positions, BM25 ranking with the Lucene defaults (`k1 = 1.2`, `b = 0.75`) and a phrase query.
 >
@@ -24,7 +33,7 @@ updated: 2026-11-13
 >
 > Every piece of code below is small, is introduced by the theory it implements, and is followed by a numbered walkthrough.
 
-## Before the code
+## Before the code 🟢
 
 - **Maps of slices**: the index is `map[string][]Posting`, term to postings list.
 - **`unicode` and `strings`**: the analyzer splits on non-letters, lowercases and strips a plural `s`.
@@ -33,7 +42,7 @@ updated: 2026-11-13
 - **Table tests with `reflect.DeepEqual`**: compare whole result slices.
 - **Run**: `go vet ./... && go test -race -v ./...` inside the `search` module.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where the theory explains it |
 | --- | --- | --- |
@@ -83,7 +92,7 @@ classDiagram
     Index ..> Hit : Search returns
 ```
 
-## Setup
+## Setup 🟢
 
 - Module layout: one package `search` with `search.go` and `search_test.go`.
 - Go 1.24, standard library only (`math`, `sort`, `strings`, `unicode`, `reflect`, `testing`).
@@ -97,7 +106,7 @@ go mod init search
 go vet ./... && go test -race -v ./...
 ```
 
-## Code
+## Code 🟡
 
 The package implements the analyzer, postings with positions, BM25 with Lucene's default parameters, and a phrase query. It is a teaching model: Lucene compresses postings, keeps position gaps where stop words were removed (this toy compacts them), and stores everything in immutable segments.
 
@@ -486,7 +495,7 @@ How to read the plan from the bottom up:
 
 Limits: `ts_rank` uses term frequency and proximity but **no IDF**, so it is not BM25; there are no built-in facets, fuzzy matching beyond `pg_trgm`, or per-field analyzers at scale; and every search runs on the database you also write to.
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -501,7 +510,7 @@ Limits: `ts_rank` uses term frequency and proximity but **no IDF**, so it is not
 | Full sort of all hits | Top-k heap | Simpler code; wasteful for large result sets |
 | Per-index IDF statistics | Global statistics across shards | Scores from different indexes are not comparable |
 
-## Tests
+## Tests 🟡
 
 The five tests below share one fixture of four documents, then check the analyzer, the postings layout, BM25 behavior and the phrase query.
 
@@ -672,7 +681,7 @@ The scores of `Search` on the four test documents (measured with a temporary `t.
 
 Reading the table: in the first query, only length separates doc 1 and doc 3. In the second query, doc 4 wins with one rare match, and the three `invoice` documents are ordered by length alone: 4, then 5, then 8 terms.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `Add` must receive document ids in increasing order; otherwise postings lists are not sorted and any merge-style intersection built on them would be wrong.
 - The toy stemmer only strips a plural `s`: `invoices` becomes `invoice`, but `invoiced` stays unchanged. Real stemmers (Porter, Snowball) handle far more.
@@ -680,7 +689,7 @@ Reading the table: in the first query, only length separates doc 1 and doc 3. In
 - Stop words are dropped before positions are assigned, so positions are compacted. A document saying `overdue for invoice` therefore matches the phrase `overdue invoice`; Lucene keeps position gaps to avoid this.
 - IDF is computed from this one index only, like a single shard. Scores from two such indexes are not comparable.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `k1` to `0` and run `TestBM25PrefersShortDocAndRareTerms`. Predict whether term frequency still matters, and which of the two documents wins.
 2. Change `b` to `0` and re-run the same test. Predict the order of documents 1 and 3, then confirm the scores are equal.

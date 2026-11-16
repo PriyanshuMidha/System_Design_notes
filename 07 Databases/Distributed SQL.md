@@ -27,7 +27,38 @@ updated: 2026-11-13
 > - Serializable is the default in CockroachDB and Spanner, so conflicts surface as `40001` "retry the transaction" errors that the client must handle.
 > - Global consistency costs cross-region latency on every write. If one PostgreSQL primary with replicas fits your load, it is simpler, cheaper and faster.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (comparison).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A normal SQL database lives on one computer. One day your data, or your traffic, no longer fits on one computer.
+
+```mermaid
+flowchart LR
+    APP["Your app"] --> ONE["One database server<br/>(full, and if it dies, you're down)"]
+```
+
+A **distributed SQL** database looks the same to your code — you still write plain SQL — but behind the curtain it cuts each table into slices and spreads the slices over many machines. Each slice is copied to 3 machines, and the copies vote on every change so nothing is lost when one machine dies.
+
+```mermaid
+flowchart LR
+    APP["Your app, plain SQL"] --> DB["Looks like one database"]
+    DB --> S1["slice 1 on machines A,B,C"]
+    DB --> S2["slice 2 on machines B,C,D"]
+```
+
+The hard part is time: a **transaction** ("move money from A to B, all or nothing") may touch two slices on different machines, and the machines' clocks disagree slightly. Most of this note is about how they agree anyway.
+
+The rest of this note is just these 4 questions:
+1. When does one normal database stop being enough? (section 1)
+2. How is a table split, copied and kept in sync? (sections 2-3)
+3. How do transactions and clocks work across machines? (sections 3-4)
+4. Which product does what, and when should you NOT use any of them? (sections 5-9)
 
 **The problem in one story.**
 Your invoices table no longer fits on one server, and you need it in two regions.
@@ -72,7 +103,7 @@ Where it breaks: branches are minutes apart, but a real library has no clock pro
 > [!tip] Remember
 > Cut tables into ranges, replicate each with Raft, join them with 2PC, and order everything by timestamps.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps runs on one PostgreSQL 17 primary with two replicas. It now has 40,000 workspaces in the US, EU and India. Three problems appear:
 
@@ -84,7 +115,7 @@ The classic fix is manual sharding by `workspace_id` ([[Partitioning and Shardin
 
 Distributed SQL moves that work into the database: one logical SQL database, data split and rebalanced automatically, transactions that span machines, and failover without data loss because every write is committed by a quorum.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a library that outgrew one building.
 
@@ -101,9 +132,11 @@ Terms used below:
 - **Write intent**: a provisional MVCC (multi-version concurrency control) value written by an uncommitted transaction.
 - **Gateway node**: whichever node the client connected to; it parses SQL and coordinates the transaction.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Range sharding with Raft per range
+
+**In plain words: every row becomes a key on one long sorted shelf; the shelf is cut into chunks, and each chunk has 3 copies that vote on changes.**
 
 ```mermaid
 flowchart TB
@@ -128,6 +161,8 @@ flowchart TB
 
 ### Range splits
 
+**In plain words: when a chunk gets too fat or too busy, the database cuts it in two — like splitting an overfull binder into two binders.**
+
 A range is not fixed. When it grows past the size limit or draws too much traffic, the database cuts it in two at a key and hands one half to a different set of nodes.
 
 ```mermaid
@@ -146,6 +181,8 @@ flowchart LR
 Example: a 1 GiB table with a 512 MiB limit ends up as at least 2 ranges. Each new range gets its own Raft group, and the balancer may move its leaseholder to a less busy node.
 
 ### Hot spots from sequential keys
+
+**In plain words: if every new row's key is "the next number", all inserts pile onto the last chunk — one machine does all the work while the rest sit idle.**
 
 Range sharding keeps nearby keys together, so range scans are efficient. The price is that a monotonically increasing key (a timestamp or a sequence) sends all inserts to the last range: a hot spot.
 
@@ -167,6 +204,8 @@ flowchart LR
 The fixes are UUID keys, hash-sharded indexes, or a leading `workspace_id`. YugabyteDB hash-shards the first primary-key column by default for this reason, and lets you choose range sharding with `ASC`/`DESC`.
 
 ### Transactions across ranges: two-phase commit over Raft
+
+**In plain words: write "pencil" entries on every chunk first, then flip one master switch that turns them all into "ink" at once — and the switch itself is copied to 3 machines so no single crash can lose it.**
 
 ```mermaid
 sequenceDiagram
@@ -200,6 +239,8 @@ TiDB uses the Percolator protocol: a primary lock and secondary locks in TiKV, w
 
 ### What a reader does when it meets a write intent
 
+**In plain words: a reader who finds a pencil entry goes and checks the master switch — committed means "use it", aborted means "ignore it", pending means "wait or push".**
+
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: intent written, txn record PENDING
@@ -215,6 +256,8 @@ Example: transaction T1 has an intent on invoice 42 and then its coordinator cra
 
 ### Timestamps: TrueTime vs HLC vs a timestamp oracle
 
+**In plain words: machines must agree on what happened first, but their watches all run slightly differently — the three schemes below are three ways of coping with bad watches.**
+
 All of these databases use MVCC ([[Isolation Levels and MVCC]]): every value is stored with a commit timestamp, and a transaction reads the newest version at or below its read timestamp. The question is where the timestamps come from, given that server clocks drift ([[Clocks and Ordering]]).
 
 - **Spanner: TrueTime.** Google's datacentres have GPS receivers and atomic clocks. `TT.now()` returns an interval `[earliest, latest]` guaranteed to contain true time; the uncertainty ε was typically 1–7 ms in the 2012 paper. At commit, Spanner picks timestamp `s = TT.now().latest` and then **waits until `TT.now().earliest > s`** before releasing locks (commit wait, about 2ε). After that wait, any transaction that starts later in real time is guaranteed to get a larger timestamp. That property is **external consistency** (also called strict serializability).
@@ -228,6 +271,8 @@ All of these databases use MVCC ([[Isolation Levels and MVCC]]): every value is 
 - **TiDB: timestamp oracle (TSO).** The Placement Driver (PD) cluster hands out strictly increasing timestamps from one leader. Ordering is trivial; the cost is a round trip to PD for each transaction (batched) and a dependency on PD's availability and location.
 
 ### An HLC keeps cause before effect
+
+**In plain words: when a machine hears from someone whose clock is ahead, it moves its own clock forward — so an effect can never get an earlier timestamp than its cause.**
 
 Example: node A's clock reads 5 ms, node B's clock reads 0 ms. A commits invoice 42 at timestamp (5.000 ms, 0) and sends the news to B. Without help, B would stamp the payment it writes next with a time near 0 ms, earlier than the invoice it depends on.
 
@@ -243,6 +288,8 @@ sequenceDiagram
 ```
 
 ### Commit wait in Spanner
+
+**In plain words: Spanner knows its clock is at most a few milliseconds wrong, so it just waits those few milliseconds before saying "done" — after the wait, time has definitely passed the chosen timestamp.**
 
 ```mermaid
 sequenceDiagram
@@ -262,6 +309,8 @@ sequenceDiagram
 ```
 
 ### Isolation and retries
+
+**In plain words: these databases prefer to cancel one of two clashing transactions rather than let them corrupt each other — your code must be ready to simply run the whole transaction again.**
 
 ```mermaid
 stateDiagram-v2
@@ -285,7 +334,7 @@ TiDB defaults to snapshot isolation under the name `REPEATABLE READ`, with pessi
 
 The practical rule for every one of them: **wrap each transaction in a retry loop**, and keep anything non-transactional (HTTP calls, emails, Kafka publishes) outside it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -303,6 +352,8 @@ COMMIT;
 ```
 
 ### Tracing the latency in three layouts
+
+**In plain words: where you put the 3 copies decides how long every write takes — copies in one city are fast, copies on three continents make every commit cross an ocean.**
 
 Assume 3 replicas, about 1 ms round trip inside a region, about 70 ms US-east to EU and about 200 ms US-east to India (round numbers, **estimates**). Each write needs one Raft quorum round from the range leader; commit with parallel commits needs one more round, overlapped with the last write.
 
@@ -361,7 +412,9 @@ SHOW RANGES FROM TABLE invoices WITH DETAILS;  -- v23.1+: lease and replica colu
 
 Runnable Go version: [[Distributed SQL - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words: all five products use the same recipe — sorted slices, voting copies, timestamps — and differ mainly in where the timestamps come from and which wire protocol they speak.**
 
 | System | Sharding and replication | Timestamps | Default isolation | Wire protocol | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -372,7 +425,7 @@ Runnable Go version: [[Distributed SQL - Go]]
 | Amazon Aurora DSQL | Serverless, multi-region active-active | Managed | Snapshot, optimistic | PostgreSQL wire (subset) | Conflicts reported at commit; check feature limits |
 | PostgreSQL + replicas | One primary, streaming replicas | Local clock, no distributed txns | Read committed | PostgreSQL | Fastest single-region writes; manual sharding to scale writes |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Latency floor.** Every write waits for a quorum. In one region that is a millisecond or two; across regions it is the round trip to the second-closest replica. A single PostgreSQL primary commits with one local fsync.
 - **Retries are part of the API.** Serializable plus optimistic concurrency means hot rows (one counter, one invoice sequence per workspace) cause restart storms. Code must be idempotent and wrapped in `RunTx`; hot counters need redesign.
@@ -381,7 +434,7 @@ Runnable Go version: [[Distributed SQL - Go]]
 - **Cost and operations.** Three or more replicas of everything, more CPU per query (key-value encoding, consensus), and a new system to learn.
 - **When a single PostgreSQL wins.** If the write load fits on one large machine (often thousands to tens of thousands of writes per second, an estimate that depends on the workload), reads scale with replicas, and failover of a few seconds with synchronous replication is acceptable, then PostgreSQL with replicas is simpler, cheaper and faster. Consider distributed SQL when writes outgrow one primary, when you need zero-data-loss failover across zones or regions, or when data residency forces rows into specific regions within one logical database.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems.** Google built Spanner for its ads backend (F1) and offers it as Cloud Spanner. CockroachDB, YugabyteDB and TiDB are open-source or source-available and run self-hosted or as managed services. Aurora DSQL is AWS's serverless option.
 
@@ -396,7 +449,7 @@ Runnable Go version: [[Distributed SQL - Go]]
 
 **What to monitor:** p99 commit latency per region, transaction restarts per second by reason, clock offset between nodes, ranges per node and range rebalancing activity, under-replicated or unavailable ranges, leaseholder distribution, and CPU per node (the hot-range signal).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why Raft per range and not one Raft for the cluster.** One log would serialise every write in the cluster through one leader. Thousands of small groups spread leadership across all nodes and let each range move, split and recover independently. The cost is per-group heartbeats; CockroachDB quiesces idle ranges and coalesces heartbeats per node pair.
 
@@ -430,7 +483,7 @@ CockroachDB guarantees serializability and orders causally related transactions,
 
 **Schema changes.** Online schema changes run as multi-step state machines across nodes (an F1-paper technique), so `ALTER TABLE` is non-blocking but can take long on big tables; compare with [[Zero-Downtime Schema Migrations]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How does a distributed SQL database commit a transaction that touches two machines without the blocking problem of classic 2PC?
 > It still runs two-phase commit, but every participant and the transaction record are Raft groups. If the coordinator crashes, the record and intents survive on a quorum, and any node can read the record and finish or abort the transaction. Blocking requires losing a majority of a range, not one machine.
@@ -456,7 +509,7 @@ CockroachDB guarantees serializability and orders causally related transactions,
 > [!question]- Why are sequential primary keys a problem in range-sharded databases?
 > New keys always sort to the end of the key space, so every insert goes to the last range and its single leaseholder. Use UUIDs, a hash-sharded index, or a leading high-cardinality column such as `workspace_id`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Tables → sorted keys → ranges (CockroachDB, 512 MiB default), tablets (YugabyteDB), regions (TiDB); 3+ replicas, Raft per range.
 - Leaseholder serves consistent reads without consensus; writes need a quorum round.
@@ -467,7 +520,7 @@ CockroachDB guarantees serializability and orders causally related transactions,
 - Avoid sequential keys and hot rows.
 - One PostgreSQL primary with replicas wins whenever it fits.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Transactions and ACID]], [[Isolation Levels and MVCC]], [[Replication]], [[Partitioning and Sharding]], [[Consensus - Raft and Paxos]]
 - **Runnable Go version:** [[Distributed SQL - Go]]

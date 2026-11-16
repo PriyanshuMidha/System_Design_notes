@@ -25,7 +25,32 @@ updated: 2026-11-13
 > - A **presigned URL** lets a browser `PUT` or `POST` a file straight to S3; your API server only issues the URL and later confirms the object landed. This is the production default for anything beyond a few megabytes — it removes your server from the data path entirely.
 > - An attachment is a **row with a lifecycle** (`pending → scanned → available`), not just a file: the row exists before the bytes are durable and before a virus scan clears them, so a crash mid-upload or a flagged file is visible state, not a silent gap.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A user uploads a file to your service. Everything the user's browser tells you about that file can be a lie: its name, its type, its size.
+
+A filename like `../../etc/passwd` is an attempt to escape your folder. A "picture" might really be a program. A "small" file might never stop arriving.
+
+```mermaid
+flowchart LR
+    U[Browser upload] --> C[Cap the size] --> S[Sniff real type from bytes] --> R[Store under a random name] --> O[(Object storage)]
+```
+
+So: cap the size with a hard limit, read the real type from the first bytes, and store the file under a random key you chose, in **object storage** (a service like S3 that stores files by key).
+
+For big files, do not let the bytes pass through your server at all: hand the browser a **presigned URL** — a short-lived permission slip to upload straight to storage.
+
+The rest of this note is just these 3 questions:
+1. How do you receive an upload safely (size cap, type sniff, random key)?
+2. How do you stream a file without loading it all into memory?
+3. When and how do you switch to presigned URLs?
 
 **The problem in one story.**
 A user attaches a PDF invoice to their account.
@@ -71,6 +96,8 @@ Where it breaks: a pass for a warehouse is not a signed cryptographic URL that e
 
 ### Whiteboard version
 
+**In plain words:** the smallest safe upload handler — cap, sniff, random key, stream to storage.
+
 The bare shape: accept one file, cap its size, write it to disk under a random name.
 
 ```go
@@ -98,7 +125,7 @@ This "works" on a demo but fails in production three separate ways:
 
 The full version below fixes all three and adds the production path: presigned direct-to-S3 uploads.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps lets a user attach a PDF invoice, a payment receipt, or a scanned contract to a workspace. Each of those is a file an untrusted browser sends you, and "accept a file from the internet and write it to a disk or bucket you control" is one of the oldest paths to a compromised server if handled naively.
 
@@ -108,7 +135,7 @@ Three concrete failures show why each piece of this note earns its place:
 - **Trusting the declared type, stored executable content served as itself.** A client uploads `invoice.pdf` with `Content-Type: application/pdf`, but the bytes are an HTML file with a `<script>` tag. If the server trusts the header (or the extension) and later serves the file back without `X-Content-Type-Options: nosniff`, a browser may sniff it as HTML and execute the script in your application's origin — a stored XSS attack delivered through the upload feature, not a comment field.
 - **Filename as storage key, path traversal.** A client sets the multipart filename to `"../../../etc/cron.d/evil"`. A naive handler that does `os.Create(filepath.Join(uploadDir, header.Filename))` without validating the result can write outside `uploadDir` entirely. The fix in this note is simpler than validating every filename: never use the client's filename as a storage key at all.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat every upload as **untrusted bytes of unknown size and unknown type**, and treat every stored file as **a database row with a lifecycle**, not just bytes sitting in a bucket:
 
@@ -116,7 +143,7 @@ Treat every upload as **untrusted bytes of unknown size and unknown type**, and 
 - The **key**: a random, unguessable identifier the server generates, never the client's filename. The filename is kept only as metadata for display and the `Content-Disposition` header on download.
 - The **row**: `pending` the instant the upload starts, `scanned` once a virus scanner has cleared it, `available` once it can be safely served — so "the file exists" and "the file is safe to serve" are two different, checkable facts.
 
-## 3. How it works
+## 3. How it works 🟡
 
 Two upload paths exist side by side in a real service: small files proxied through your API, and large files uploaded directly to object storage via a presigned URL.
 
@@ -175,7 +202,7 @@ A presigned PUT URL is not a password-protected link; it is a normal S3 request 
 
 Anyone holding the URL before it expires can perform exactly the one operation it authorizes (e.g. `PutObject` on that one key, with that one `Content-Type`), which is why the expiry is short (minutes, not hours) and why `confirm` still calls `HeadObject` server-side rather than trusting the browser's say-so.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The supporting types the handler below needs: the attachment's lifecycle status, the sentinel errors each failure mode returns, and the `Repo` interface a real implementation backs with the `attachments` table.
 
@@ -549,7 +576,7 @@ All 4 tests shown above passed, including the disguised-script rejection (415), 
 
 The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go-v2` calls, but presigning is pure local computation — the test needs no live S3 endpoint or credentials.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -558,14 +585,14 @@ The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go
 | Presigned POST | API issues a signed form (URL + fields) with conditions baked in (`content-length-range`, `Content-Type`, key prefix) | Browser `<form>` uploads where you need multiple enforced conditions, not just one PUT | More setup than PUT; still needs a confirm step |
 | Resumable upload (S3 multipart, or tus) | File is split into parts uploaded independently and assembled server-side (or by the bucket) | Large files over unreliable connections, where a dropped connection shouldn't restart from byte 0 | More moving parts: part tracking, an abort/cleanup path for incomplete uploads |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Streaming with `r.MultipartReader()` means you cannot read the same part twice or look ahead past what you've already consumed — if a later part's value changes how you'd handle an earlier one, buffer that specific field instead (not the whole request).
 - A presigned URL moves the bandwidth cost off your server but adds a new failure mode: the browser can abandon the direct upload entirely, leaving an object with no confirmed row (the orphan sweep job exists specifically for this).
 - Content sniffing with `http.DetectContentType` only recognizes a fixed set of common signatures; it is not a full-format validator. A byte-for-byte malformed PDF that happens to start with `%PDF-` still sniffs as `application/pdf`. If you must validate structure, parse the file with a real library after the sniff check passes, not instead of it.
 - For an internal tool with a handful of trusted uploaders (not public internet users), the whiteboard version's simpler `ParseMultipartForm` path is genuinely fine — the hardening here earns its complexity specifically because the uploader is untrusted.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
   - Most SaaS products with user-generated file uploads (Slack, Notion, GitHub issues) route large files through a presigned-URL pattern so their API tier never touches multi-megabyte payloads.
@@ -577,7 +604,7 @@ The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go
   - A legitimate large file gets rejected by a size limit sized for the common case → raise the limit per route/plan tier rather than globally, and switch that route to resumable/multipart uploads instead of a single raw `PUT`.
 - **What to monitor:** upload success/failure rate and 413/415 rate (a sudden spike in either signals a client bug or a probing attacker), time from `pending` to `available`, orphaned-object count found per sweep, and virus-scan queue depth.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why size the limit on the raw body, not after decoding.** `http.MaxBytesReader` wraps `r.Body` before anything else reads it, so it bounds the literal bytes on the wire — including multipart boundaries and headers, not just the file payload. A limit applied only after `ParseMultipartForm` has already let an unbounded body be read into memory defeats the purpose.
 - **Why `os.Root` and not just `filepath.Clean` + a prefix check.** Go 1.24's `os.Root` opens a directory file descriptor once and resolves every subsequent path against it at the OS level, which also rejects a symlink inside the root that points outside it — a `filepath.Clean("../x")` style check only inspects the string, so a symlink planted by an earlier, now-deleted upload could still escape a string-based check.
@@ -585,7 +612,7 @@ The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go
 - **The pixel-count guard is not the only decompression-bomb vector.** `image.DecodeConfig` catches an oversized raster image cheaply, but a zip bomb or a PDF with deeply nested objects can exhaust memory the same way through a different decoder; any format you fully parse needs its own resource ceiling (a page/object count limit for PDFs, a decompressed-size cap for archives), not just this one check.
 - **Checksums do two different jobs.** A SHA-256 computed during upload detects corruption in transit or at rest (compare it on download); it is not a substitute for a virus scan, which inspects content for known-malicious signatures. InvoiceOps computes both, independently, before a row moves past `scanned`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why check the content type from the file's bytes instead of the `Content-Type` header the client sent?
 > The header is supplied by the client and is exactly as trustworthy as any other request header — an attacker sends whatever value helps their attack. `http.DetectContentType` sniffs the first 512 bytes against known signatures, which the client cannot talk its way around without actually changing the file's content.
@@ -608,7 +635,7 @@ The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go
 > [!question]- What does `HeadObject` after a presigned-PUT upload actually verify, and why is it necessary if the browser already got a 200 from S3?
 > It independently confirms, from the server's own trusted call, that an object of the expected key actually exists (and reads its real size/etag) rather than trusting the browser's claim that the upload succeeded. A browser could report success after a network blip truncated the request, or simply lie; `HeadObject` is the server's own evidence before it marks the row `available` for anyone else to see.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Cap the raw body with `http.MaxBytesReader` before anything parses it; a client that exceeds it gets cut off with a `*http.MaxBytesError` → 413.
 - Stream with `r.MultipartReader()` + `io.Copy`; never `ParseMultipartForm` for anything you intend to stream, since it buffers the whole form first.
@@ -619,7 +646,7 @@ The S3 calls in `TestPresignPut_SignsLocallyWithoutNetwork` are real `aws-sdk-go
 - An attachment is `pending → scanned → available`, backed by a real row — not just bytes in a bucket.
 - Serve downloads with `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`, and clean up orphans with a sweep job plus an S3 Lifecycle rule for incomplete multipart uploads.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Building REST Endpoints]], [[Request Decoding, Validation and DTOs]]
 - **Next:** [[Observability in Go Services]], [[Database Access (database-sql, pgx, sqlc)]]

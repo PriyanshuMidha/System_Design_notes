@@ -22,7 +22,37 @@ updated: 2026-11-13
 > - Calling the state setter schedules a re-render; it does not mutate anything immediately, and React batches multiple setter calls from one event into a single re-render.
 > - Lists need a stable `key` per item so React can tell which item is which across renders.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (one click traced step by step).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A web page is made of elements: buttons, text, images. Without React, when your data changes you must find each element and update it yourself, by hand, everywhere.
+
+```mermaid
+flowchart LR
+    D["data changes<br/>(cart has 3 items)"] --> H1["you update the badge"]
+    D --> H2["you update the cart page"]
+    D --> H3["you update the checkout button"]
+```
+
+React flips this. You write a **component**: a small function that says "given this data, here is what this piece of the page looks like". The data a parent hands in is called **props**; the data the component remembers on its own is called **state**. When either changes, React re-runs your function and fixes the page for you.
+
+```mermaid
+flowchart LR
+    DA["data changes"] --> R["React re-runs your component"] --> P["page updates itself"]
+```
+
+The rest of this note is just these 4 questions:
+1. What is a component and what is JSX really?
+2. What are props and why can't a child change them?
+3. What is state and what happens when I change it?
+4. What exactly happens between a click and the page updating?
+
 
 **The problem in one story.**
 A shopping site shows a cart badge with "3 items".
@@ -66,7 +96,7 @@ Where it breaks: a formula has no memory of its own, but a component can hold st
 > [!tip] Remember
 > Write what the UI should look like for the current props and state; React works out the page updates.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Before component frameworks, updating a page meant hand-written `document.getElementById(...).innerHTML = ...` calls scattered across the codebase. Every place that could change the DOM had to remember every other place that depended on the same data.
 
@@ -79,7 +109,7 @@ React re-runs the function on every relevant change and reconciles the differenc
 > [!tip] Remember
 > You describe the end result for the current data, not the sequence of DOM edits to get there — React works out the edits.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A component is a function. Think of it like a spreadsheet formula cell: give it inputs (props), and it deterministically produces an output (the UI description). Every time the inputs change, the formula is just re-evaluated — you never "patch" the old answer by hand.
 
@@ -100,7 +130,7 @@ flowchart LR
 > [!tip] Remember
 > Component = pure function of `(props, state)`. If two renders get the same props and state, they produce the same JSX.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 flowchart LR
@@ -213,6 +243,8 @@ If the key were the array *index* instead (`0, 1, 2`), after removing `B` the it
 
 ### Optional chaining in JSX data access
 
+**In plain words:** `?.` means "only keep going if this exists". It saves you from a crash when data has not loaded yet, like checking a door is there before walking through it.
+
 A common pattern when a prop might not have loaded yet:
 
 ```jsx
@@ -244,7 +276,7 @@ function App() {
 
 **Why it matters:** this is what lets a bundler split a route's code into its own chunk (see "Tooling, briefly" below) instead of shipping the whole app up front. Only `lazy` components and promises read via `use` can trigger a `Suspense` fallback — passing an ordinary Promise down as a prop does not suspend anything by itself.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -273,6 +305,8 @@ Clicking the button calls `setCount`, which schedules a re-render; React re-runs
 8. The button now visibly shows `1`.
 
 ### Controlled inputs and events
+
+**In plain words:** a controlled input is a text box whose contents React owns. Every keystroke goes into state first, and the box just shows whatever state says — like a cashier repeating your order back from their notepad, not from memory.
 
 A form input whose value is driven by React state (a "controlled" input) rather than read from the DOM on demand:
 
@@ -347,6 +381,8 @@ The analogy breaks down because in React the "manager" (the parent component) is
 
 ### Batched updates (React 18+)
 
+**In plain words:** if you change state twice in one click, React is smart enough to repaint the page once, not twice. That bundling is called batching.
+
 ```jsx
 function handleClick() {
   setCount((c) => c + 1);
@@ -366,7 +402,7 @@ A component typically renders a loading state immediately, fetches inside a `use
 
 In new code, a data-fetching library (TanStack Query, RTK Query) or a framework's built-in data layer (Next.js Server Components, React Router loaders) usually replaces this pattern — see [[React Routing and Rendering Strategies - CSR, SSR, SSG]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -375,14 +411,14 @@ In new code, a data-fetching library (TanStack Query, RTK Query) or a framework'
 | Controlled input | React state is the single source of truth for a form field's value | You need to validate, transform or react to every keystroke | A re-render per keystroke (usually negligible) |
 | Uncontrolled input | DOM holds the value; read it via a ref when needed (e.g. on submit) | Simple forms, file inputs, third-party widgets | No per-keystroke React involvement, but harder to validate live |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A component re-renders every time its state or props change, even if the resulting JSX would be identical; for most UI this is fast enough that optimizing it is premature (see [[React Hooks]] for when `useMemo`/`React.memo` actually pay off).
 - Prop drilling (passing a prop through several layers that don't use it themselves) is fine for 2–3 levels; past that, consider Context or a store — covered in [[React State Management - Props, Context, Redux]].
 - Controlled inputs cost a re-render per keystroke; for very large forms or a high-frequency input (e.g. a canvas drag), an uncontrolled input with a ref can be cheaper.
 - This vault is backend-focused: treat this note as "enough to read and lightly modify a React codebase", not as full frontend-engineer depth — state management, styling systems and build tooling go only as deep as a backend engineer needs.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** React 19 is the current stable release (2024) and powers most large single-page apps and, via Next.js's App Router, server-rendered and hybrid apps with Server Components.
 - **Failure modes → fixes:**
@@ -392,7 +428,7 @@ In new code, a data-fetching library (TanStack Query, RTK Query) or a framework'
   - A fetch inside `useEffect` sets state after the component has moved on to a different id → use the `ignore` flag or `AbortController` pattern shown above.
 - **What to monitor:** render count per component in dev tools (React DevTools Profiler) if a screen feels slow; client-side error rate from a boundary (error boundaries, covered in [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **JSX is not HTML.** Attributes are JS identifiers in camelCase (`className`, `htmlFor`, `onClick`), and `{}` embeds any expression, not just strings — including other JSX, which is how composition works (`<Layout><Page /></Layout>`).
 - **`children` is just a prop.** `<Parent><Child /></Parent>` is sugar for passing `<Child />` as `props.children`; this is how generic wrapper components (layouts, modals) work without hardcoding what goes inside them.
@@ -400,7 +436,7 @@ In new code, a data-fetching library (TanStack Query, RTK Query) or a framework'
 - **React 19 additions relevant here:** the `use` API (reads a Promise or Context inside render, conditionally), Actions and `useActionState` for form submissions with built-in pending/error state, and `ref` can now be passed as a plain prop to function components without `forwardRef`. These are extensions of the same props/state model, not a replacement for it.
 - **Tooling, briefly:** `package.json` declares `dependencies` (shipped to the browser) vs `devDependencies` (build-time only, e.g. the bundler itself); a lockfile pins exact versions for reproducible installs. A bundler (Vite, webpack) turns your JSX/TS modules into the handful of files the browser actually loads, tree-shaking unused exports and splitting code at `React.lazy()` boundaries so a route's code only downloads when that route is visited.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between props and state?
 > Props are inputs passed down from a parent and are read-only inside the component that receives them. State is a component's own data, created with `useState` (or similar), that it can change itself, and changing it schedules a re-render.
@@ -420,7 +456,7 @@ In new code, a data-fetching library (TanStack Query, RTK Query) or a framework'
 > [!question]- What is "lifting state up"?
 > Moving state from a child component to its nearest common ancestor when two or more components need to share or stay in sync on that data, then passing the state and update functions back down as props.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Component = function of `(props, state) → JSX`; React re-runs it on relevant changes.
 - Props flow one way (parent → child) and are read-only in the child; state is owned and changed only by its component, via the setter.

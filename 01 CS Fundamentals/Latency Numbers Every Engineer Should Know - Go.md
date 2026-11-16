@@ -16,7 +16,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Latency Numbers Every Engineer Should Know]]: a percentile function used the same way real APM dashboards compute p50/p95/p99, a formula that proves why fan-out makes the tail worse than any single dependency, and Little's Law as three lines of Go.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there.
+> - 🟡 **Know the basics?** Add "Code", "Design decisions" and "Running it".
+> - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢
+
+This file is the hands-on twin of the latency theory note. It holds three tiny Go functions: one that computes p50/p95/p99 the way real dashboards do, one that shows why calling 100 services in parallel makes slow requests almost certain, and one that is Little's Law as a single multiplication. Read it top to bottom; every code block is followed by a plain "How it works" list, and the tests prove each claim with real numbers.
+
+## Before the code 🟢
 
 - **Package and exported functions**: a capitalized name like `Percentile` is visible outside the package `latency`.
 - **Slices (`[]float64`)**: a growable view over an array; passing one shares the same backing data, which is why sorting in place affects the caller.
@@ -25,7 +34,7 @@ updated: 2026-11-13
 - **`testing` package**: functions named `TestXxx(t *testing.T)` run under `go test`; `t.Fatalf` fails the test.
 - **What to run**: `go vet ./... && go test -race -v ./...` inside the module folder.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -40,16 +49,18 @@ flowchart LR
     T --> L["LittlesLaw<br/>(L = lambda * W)"]
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. No external dependencies: everything is the standard library (`sort`).
 - Layout: a single-package module `latency` with `latency.go` and `latency_test.go`.
 - Run it with `go vet ./... && go test -race -v ./...`.
 - No external service is needed; every measurement in this note comes from this code running on commodity hardware, not from a live network or database.
 
-## Code
+## Code 🟡
 
 ### Step 1: percentiles from a batch of samples
+
+**In plain words:** sort the measured times, then pick the value that sits X% of the way up the sorted list — that is all a "p99" is.
 
 **Concept.** The theory note explains why p99 matters more than the average ([[Latency Numbers Every Engineer Should Know#p50, p95, p99: why the average lies]]): a handful of slow requests can hide inside a healthy-looking mean.
 
@@ -105,6 +116,8 @@ flowchart LR
 
 ### Step 2: why fan-out makes the tail worse
 
+**In plain words:** if each helper is slow 1 time in 100, and you need 100 helpers at once, the chance that at least one is slow is huge — this function computes exactly that chance.
+
 **Concept.** This is the probability argument behind "the aggregator's tail is worse than any single dependency's tail" ([[Latency Numbers Every Engineer Should Know#Why fan-out makes the tail worse, not just the average]]).
 
 The alternative to a closed-form formula is a Monte Carlo simulation (draw `n` random outcomes many times and count how often at least one is slow).
@@ -137,6 +150,8 @@ func FanOutP99(n int) float64 {
 
 ### Step 3: Little's Law in three lines
 
+**In plain words:** requests arriving per second, times how long each one stays, equals how many are inside the system at once.
+
 **Concept.** `L = λW` ties concurrency to arrival rate and time-in-system ([[Latency Numbers Every Engineer Should Know#Little's Law connects concurrency to the ladder]]).
 
 There is no real alternative implementation to discuss here — the formula is the whole algorithm — so the only design choice is the signature: taking `lambdaPerSec` and `wSeconds` as separate named parameters instead of a single struct keeps call sites self-documenting (`LittlesLaw(1000, 0.05)` reads naturally next to its doc comment).
@@ -155,7 +170,7 @@ func LittlesLaw(lambdaPerSec, wSeconds float64) float64 {
 
 There is no loop, no state, because the law holds for any stable queue regardless of its arrival or service distribution.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -163,7 +178,7 @@ There is no loop, no state, because the law holds for any stable queue regardles
 | A plain multiplication loop in `FanOutP99` | `math.Pow(0.99, n)` | Reads as "multiply this probability n times," matching the theory note's derivation line by line; `math.Pow` would be marginally faster for very large `n` |
 | Two named `float64` parameters for `LittlesLaw` | A single `Workload` struct | Self-documenting call sites for a two-argument formula; a struct would pay off only if more fields were likely to join it later |
 
-## Tests
+## Tests 🔴
 
 ### Test 1: percentile on known values
 
@@ -288,7 +303,7 @@ func TestLittlesLaw(t *testing.T) {
 
 **If it fails.** Any result other than `50` means the function body no longer computes a plain product of its two arguments — check for an accidental unit conversion (seconds vs. milliseconds) or a changed operator.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -315,7 +330,7 @@ ok  	latency	1.440s
 2. `ok latency 1.440s` is the whole package's time including the race detector's own start-up and instrumentation overhead — not a reflection of the four tests' own cost.
 3. `FanOutP99(100) = 0.634` (computed separately, matching the theory note's cited figure): with each of 100 independent downstream legs slow only 1% of the time, 63.4% of fanned-out requests see at least one slow leg.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`Percentile` sorts its argument in place.** Calling it twice on the same slice for two different percentiles is harmless (it is already sorted the second time).
   - But calling it on a slice you still need in its original order elsewhere will silently reorder it — copy first, as `TestPercentileTailIsWorseThanMedian` does.
@@ -323,13 +338,13 @@ ok  	latency	1.440s
   - So the true probability of "at least one is slow" is usually higher than this formula predicts, not lower — treat the output as a floor, not a precise forecast.
 - **`LittlesLaw` assumes a stable system.** If arrivals exceed capacity for a sustained period, the queue grows without bound and the formula's "average in flight" stops being a meaningful, finite number — it describes steady state, not an overloaded one.
 
-## Exercises
+## Exercises 🔴
 
 1. `LittlesLaw` takes `lambdaPerSec` before `wSeconds`, but since it only multiplies them, swapping the call to `LittlesLaw(0.05, 1000)` gives the same answer. Add a doc comment or a named-parameter wrapper that would make a genuine unit mix-up (seconds passed where requests/sec was expected) visible at the call site instead of silently compiling.
 2. Add a `FanOutP999(n int, pFast float64)` that takes the per-call fast-probability as a parameter instead of hardcoding `0.99`. Predict `FanOutP999(100, 0.999)` before running it, and compare it to `FanOutP99(100)`.
 3. In `TestPercentileKnownValues`, change the sample count from 101 to 100 and predict the new p50. Run it and explain the difference using the rank formula in "How it works."
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Latency Numbers Every Engineer Should Know]]
 - **Before this:** [[Memory Hierarchy and CPU Caches]], [[Storage Devices - HDD, SSD, NVMe]]

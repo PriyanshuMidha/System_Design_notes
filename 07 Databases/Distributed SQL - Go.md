@@ -21,7 +21,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Three small Go building blocks that a distributed SQL client or gateway relies on: a hybrid logical clock, a range router that finds and splits ranges, and a retry loop for `40001` errors. Each one is tested with `go test -race`. The concepts are explained in [[Distributed SQL]].
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, "Before the code", "What this code shows" and "Running it". Stop there.
+> - 🟡 **Know the basics?** Add the full "Code" walkthrough, "Design decisions" and "Tests".
+> - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls in the code" and do the "Exercises". Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Distributed SQL]]. It builds three small Go pieces that make a distributed SQL database work from the client's side: a clock that keeps "cause before effect" across machines with bad watches (the HLC), a router that finds which data slice holds a key, and a retry loop for the "please run that transaction again" errors these databases return. Read the theory note first if any of those words are new. Here, go step by step; every code block has a plain "How it works" list after it, and the tests prove each promise without needing a real database.
+
+## Before the code 🟢
 
 - **`sync.Mutex`**: guards the clock's state so concurrent `Now` and `Update` calls never go backwards.
 - **Function values** (`physNow func() int64`): the wall clock is injected, so tests can freeze or rewind time.
@@ -31,7 +40,7 @@ updated: 2026-11-13
 - **Goroutines and `sync.WaitGroup`**: one test hammers the clock from many goroutines under `-race`.
 - **What to run:** `go vet ./... && go test -race ./...`; the pgx snippet in step 4 is shown only, not compiled.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Distributed SQL]] |
 | --- | --- |
@@ -54,7 +63,7 @@ The three pieces are independent. A real database wires the router and the clock
 
 They are shown together because each solves one of the three problems that a distributed SQL database creates: where does a key live, what time is it across machines, and what do I do when the database asks me to try again.
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only. The pgx snippet in step 4 needs `github.com/jackc/pgx/v5` and a running CockroachDB, YugabyteDB or PostgreSQL, so it is shown but not compiled in the tests.
 - Module layout: one package `distsql` with `hlc.go`, `router.go`, `retry.go` and `distsql_test.go`.
@@ -66,9 +75,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: hybrid logical clock
+
+**In plain words: a clock that never runs backwards, and jumps forward whenever it hears from a machine whose watch is ahead — so an effect always gets a later timestamp than its cause.**
 
 **Concept.** Ordering events across machines needs timestamps that respect cause and effect. Physical clocks drift apart, and a message can arrive "before" it was sent according to the receiver's clock.
 
@@ -201,6 +212,8 @@ sequenceDiagram
 
 ### Step 2: range router
 
+**In plain words: a sorted list of "this slice holds keys from X to Y" entries, plus a binary search that answers "which slice owns this key?".**
+
 **Concept.** A distributed SQL table is a sorted key space cut into contiguous ranges, each replicated by its own Raft group ([[Distributed SQL#Range sharding with Raft per range]]).
 
 A gateway node must find the range that owns a key before it can send the request to that range's leaseholder. The router in this step is that range cache in miniature: a sorted slice of ranges plus a binary search.
@@ -314,6 +327,8 @@ flowchart LR
 
 ### Step 3: retry loop
 
+**In plain words: when the database says "try that transaction again", this loop re-runs the whole thing, waiting a short random time between tries so clients don't all collide again.**
+
 **Concept.** Distributed SQL databases run at SERIALIZABLE and detect conflicts optimistically, so a transaction can be told to restart with SQLSTATE `40001` ([[Distributed SQL#Isolation and retries]]).
 
 The database cannot retry for you because it does not know what your application code did between statements, so the client wraps the whole transaction in a retry loop.
@@ -407,6 +422,8 @@ func RunTx(ctx context.Context, maxAttempts int, fn func(ctx context.Context) er
 
 ### Step 4: using `RunTx` with pgx
 
+**In plain words: the real-world glue — the retry loop wraps a whole BEGIN-to-COMMIT block, and business answers like "already paid" are returned as errors the loop knows not to retry.**
+
 **Concept.** The loop above is useful only if the closure begins and commits its own transaction. If the closure reused an outer transaction, a retry would resume inside an aborted transaction and fail again.
 
 `pgx.BeginTxFunc` fits this shape: it begins, runs the function, and commits or rolls back. The business outcome "invoice was already paid" is returned as a plain error that `Retryable` does not recognise, so it stops the loop at once.
@@ -450,7 +467,7 @@ sequenceDiagram
     DB-->>App: ok
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -464,7 +481,9 @@ sequenceDiagram
 | Full jitter, capped at 1 s | Fixed or pure exponential delay | Concurrent clients spread out. A single caller may wait slightly longer or shorter than expected. |
 | Retry only `40001` and `40P01` | Retry every error | Never repeats permanent errors such as `23505` or business results. |
 
-## Tests
+## Tests 🟡
+
+**In plain words: each test checks one promise — the clock never repeats or goes backwards, the router sends keys to the right slice, and the retry loop retries only what retrying can fix.**
 
 The tests use a fake physical clock, a two-range router, and a fake error type with a `SQLState()` method, so no database is needed. The file starts with the imports and the fake clock:
 
@@ -735,7 +754,7 @@ func TestRunTxStopsOnOtherErrorsAndGivesUp(t *testing.T) {
 
 **If it fails.** `calls != 1` in the first case means the loop retries permanent errors, which can repeat an unsafe operation. `calls != 3` in the second means the cap is wrong and a failing database could be hammered forever or abandoned too early.
 
-## Running it
+## Running it 🟢
 
 ```text
 go vet ./...
@@ -767,7 +786,7 @@ ok  	example.com/distsql	1.255s
 | `TestRunTxStops... (0.02s)` | The give-up case sleeps twice before the third attempt. |
 | `ok example.com/distsql 1.255s` | The whole package passed. The total is higher than the sum because `-race` instruments the binary. |
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `Clock.Update` must hold the same mutex as `Now`. Without it, two goroutines can hand out the same timestamp. `TestHLCConcurrent` checks 8,000 timestamps for duplicates.
 - `Router.Split` mutates the slice in place and is not safe for concurrent use. A real range cache needs a lock or copy-on-write.
@@ -776,13 +795,13 @@ ok  	example.com/distsql	1.255s
 - Anything with side effects (an HTTP call, a Kafka publish) inside `fn` runs once per attempt. Keep those outside the closure.
 - A `RowsAffected() == 0` result is a business outcome, not a retry case, so return a non-retryable error.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestHLCCausality`, set node B's clock ahead of A's instead (`tb.ns = 9_000_000`). Predict `recv.Wall` and `later.Wall` before running it.
 2. Call `r.Split("/invoices/m", 9)` on the router from `TestRouter`. Predict whether the router changes and which range `Lookup("/invoices/m")` returns.
 3. Change the `maxAttempts` in the give-up test from 3 to 1. Predict `calls` and whether `Retryable(err)` is still true.
 
-## Links
+## Links 🟢
 
 - Theory: [[Distributed SQL]]
 - **Before this:** [[Transactions and ACID]], [[Consensus - Raft and Paxos]]

@@ -18,7 +18,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This note holds the code behind [[Materialized Views and Denormalization]]: the PostgreSQL 17 SQL for a materialized view and its refresh, the same-transaction payment update, the drift query, the slot-sharded counter, and a Go rollup that applies change events idempotently and detects drift, with race-tested unit tests.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Running it". Skim the SQL in Step 1 and stop there.
+> - 🟡 **Know the basics?** Work through the Code steps in order, then "Design decisions" and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls in the code" and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on half of the materialized views note. It shows, with real SQL and Go you can run, how to store a precomputed answer and keep it honest: the SQL that creates and refreshes a materialized view, the before/after query plans proving the speedup, a payment update that keeps a copied column exact, and a small Go program that adds up invoice totals from a stream of change events without ever counting the same event twice. Read the theory note first if any of those words feel new; then read this top to bottom, running `go test -race` on the Go part if you want to see it work.
+
+## Before the code 🟢
 
 - **Structs and maps**: the rollup is a map from workspace ID to `Totals`, plus a set of seen event IDs.
 - **`sync.Mutex`**: one lock guards both maps so a duplicate check and an update happen together.
@@ -27,7 +36,7 @@ updated: 2026-11-13
 - **SQL blocks**: the PostgreSQL parts are SQL, not Go; read them as the database side of the same design.
 - **Run**: `go vet ./... && go test -race ./...` (standard library only).
 
-## What this code shows
+## What this code shows 🟢
 
 The theory note describes three ways to keep a precomputed result: a scheduled full refresh, a same-transaction update, and an asynchronous rollup from events.
 
@@ -63,15 +72,17 @@ sequenceDiagram
     D-->>D: return workspaces that disagree
 ```
 
-## Setup
+## Setup 🟢
 
 - SQL: PostgreSQL 17. The plans below are representative output for that version, not measured in this vault.
 - Go 1.24, standard library only. A scratch module `rollup` with `rollup.go` and `rollup_test.go`.
 - Run: `go vet ./... && go test -race ./...`.
 
-## Code
+## Code 🟡
 
 ### Step 1: the dashboard query and the whiteboard view
+
+**In plain words:** the whole trick in one block of SQL — the slow question, the stored answer, a fast read, and the timer that re-computes it.
 
 **Concept.** The dashboard asks one question per workspace: how many invoices are in each status, and what do they add up to? Computing it live reads every invoice of the workspace ([[Materialized Views and Denormalization#3.1 View vs materialized view vs summary table]]).
 
@@ -145,6 +156,8 @@ CREATE UNIQUE INDEX workspace_dashboard_uidx ON workspace_dashboard (workspace_i
 4. The named index `workspace_dashboard_uidx` is the one the plan in Step 4 uses.
 
 ### Step 3: the plan before the view
+
+**In plain words:** this plan is the receipt for the slow version — the database admits it read 400,000 rows and 56,000 pages just to hand back 6 rows.
 
 **Concept.** The plan is the evidence that the view is worth having ([[Query Plans and EXPLAIN]]). `EXPLAIN (ANALYZE, BUFFERS)` runs the query and shows how many pages it touched, which is a better cost measure than time alone. The block below is representative output for PostgreSQL 17, not a measurement from this vault.
 
@@ -365,6 +378,8 @@ func New() *Rollup {
 
 #### 7c: apply one event
 
+**In plain words:** `Apply` is a bouncer with a guest list — if the event's ID is already on the list it is turned away, otherwise it is written down and its numbers are added.
+
 **Concept.** `Apply` is exactly-once processing built from at-least-once delivery: check the ID, mark it, apply the delta. It returns `false` for a duplicate, so the caller can acknowledge the message either way.
 
 The mark and the delta happen under the same lock, so no other goroutine can observe one without the other. A duplicate is detected by ID only, not by comparing content, so IDs must be unique per change.
@@ -505,6 +520,8 @@ The toy treats `total_minor = 0` as "no invoice"; a real event carries an explic
 
 ### Step 8: the same idempotent apply in SQL
 
+**In plain words:** the same bouncer trick in SQL — write the event ID and the delta in one transaction, and roll back if the ID was already there.
+
 **Concept.** Inside Postgres the same idea needs the dedupe key and the update in one transaction, because a crash between them would either lose the delta or apply it twice.
 
 `INSERT ... ON CONFLICT DO NOTHING` into `processed_events` is the atomic "have I seen this?" check, and the row count says what happened. The alternative of a `SELECT` followed by an `INSERT` has a race between the two statements.
@@ -532,6 +549,8 @@ COMMIT;
 4. `COMMIT` makes the event ID and the delta visible together, which matches `Apply` holding one lock around both maps.
 
 ### Step 9: a hot summary row split into slots
+
+**In plain words:** one busy row is like one cash register for the whole store — everyone queues. Splitting it into 16 rows is opening 16 registers; at closing time you add up all 16 drawers.
 
 **Concept.** A single summary row is a serial bottleneck: every transaction that updates it waits for the previous one's row lock ([[Materialized Views and Denormalization#8. Deep dive]]).
 
@@ -577,7 +596,7 @@ flowchart LR
     S --> SUM["read: sum 16 rows"]
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -591,7 +610,7 @@ flowchart LR
 | 16 slot rows for a hot counter | one row | Removes the lock queue; reads sum 16 rows |
 | Plain structs and maps in Go | real database | Fast race-tested logic, but not a test of the SQL |
 
-## Tests
+## Tests 🟡
 
 All four tests exercise the in-memory `Rollup`: redelivery, deletes, a lost event caught by the drift check, and four concurrent consumers receiving the same 1,000 events. The SQL in Steps 1 to 6, 8 and 9 is representative and not executed by these tests.
 
@@ -722,7 +741,7 @@ func TestConcurrentApplyWithDuplicates(t *testing.T) {
 
 **What a failure means.** A total of 40,000 means two goroutines passed the `seen` check together, so the check and the mark are not atomic. A `go test -race` report means a map is touched outside the lock. Either failure would show up in production as a rollup that drifts under load.
 
-## Running it
+## Running it 🟢
 
 Measured output (Go 1.24, `go vet ./... && go test -race -v ./...`):
 
@@ -747,7 +766,7 @@ Reading the output line by line:
 4. `go vet` printed nothing, which means it found no problem, and `-race` found no data race.
 5. `PASS` is the package result, and `ok  rollup  1.480s` is the summary line. Most of the time is compiling with the race detector.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Zero means "no invoice".** `Apply` and `Drift` treat a total of 0 as absent, so a real zero-value invoice would be miscounted. Use an explicit operation field.
 - **The seen set grows forever.** In memory it is a map of every event ID; in SQL, `processed_events` needs a retention policy, which must outlast the longest possible redelivery window.
@@ -756,7 +775,7 @@ Reading the output line by line:
 - **Slot reads must sum every slot.** Reads must sum all 16 slots; a reader that forgets a slot under-counts.
 - **Plans are representative.** The `EXPLAIN` numbers come from the scenario in the theory note, not from a run here.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestApplyIsIdempotent`, change the redelivered `edit` event's ID to `inv-1:v3`. Predict `Get(7)`.
 2. In `TestConcurrentApplyWithDuplicates`, give each of the four consumers different event IDs (`fmt.Sprint(w, "-", i)`). Predict the final `Totals`.

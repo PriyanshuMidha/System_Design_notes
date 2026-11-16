@@ -15,7 +15,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[Data Structures Overview and Big-O Cheat Sheet]]: a small `Choose` function that turns the theory note's decision flowchart into testable Go code, so "which structure for this need" is something a test checks instead of only a diagram.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and "Setup". Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the Code steps, Tests and Design decisions.
+> - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Data Structures Overview and Big-O Cheat Sheet]]. That note has a flowchart that answers "which data structure should I use?". This note turns that flowchart into one tiny Go function, `Choose`: you describe what your code needs (look up by key? always want the smallest? first in, first out?) as a small struct of yes/no flags, and `Choose` returns the name of the right structure. A test then checks every branch, so if the flowchart and the code ever drift apart, the test fails. Read the theory note's flowchart first, then read this top to bottom — it is short, and the only Go you need is structs, a `switch`, and a simple table-driven test.
+
+## Before the code 🟢
 
 - **Structs**: `Need` groups several `bool` fields into one value; unset fields default to `false`.
 - **Bodyless `switch`**: `switch { case cond: ... }` checks each condition top to bottom and takes the first true one.
@@ -23,7 +32,7 @@ updated: 2026-11-13
 - **`%+v` / `%q` verbs**: print a struct with field names, and a string in quotes, in failure messages.
 - **What to run**: `go vet ./... && go test -race -v ./...` inside a module named `datastructures`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -38,15 +47,17 @@ flowchart LR
     Test["TestChoose"] --> Choose
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only — no third-party dependencies.
 - Layout: a module `datastructures` with `choose.go` and `choose_test.go`.
 - Run it with `go vet ./... && go test -race -v ./...`.
 
-## Code
+## Code 🟡
 
 ### Step 1: `Need`, the seven questions the flowchart asks
+
+**In plain words:** before picking a structure, write down what your code actually needs as a checklist of yes/no boxes. `Need` is that checklist as a Go struct.
 
 **Concept.** Each field mirrors one branch of [[Data Structures Overview and Big-O Cheat Sheet#Choosing a structure]]'s decision flowchart.
 
@@ -74,6 +85,8 @@ type Need struct {
 2. The comments are part of the design: each one restates the exact phrase from the flowchart's decision node, so the mapping from diagram to code stays obvious without needing to re-derive it.
 
 ### Step 2: `Choose`, the flowchart as a switch
+
+**In plain words:** `Choose` walks the checklist top to bottom and returns the first structure that fits — the order of the checks is the priority, like triage at a clinic.
 
 **Concept.** This function is deliberately a priority-ordered `switch`, not a lookup table, because some needs should win over others when a caller's `Need` sets more than one field.
 
@@ -113,7 +126,7 @@ func Choose(n Need) string {
 2. The `default` case returns `"slice"`, matching the theory note's advice to start with a slice or map and only reach for something more specialised once a measured need justifies it.
 3. Returning a `string`, not a typed constant, is a deliberate simplification for a teaching function — production code mapping to an actual structure choice would more likely return a constructor or a type, not a label.
 
-## Tests
+## Tests 🟡
 
 ### `TestChoose`
 
@@ -159,7 +172,7 @@ func TestChoose(t *testing.T) {
 }
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -167,7 +180,7 @@ func TestChoose(t *testing.T) {
 | Priority-ordered `switch` | A map keyed by `Need` | The switch can express "prefer this branch when several fields are true"; a map lookup has no concept of priority between overlapping keys |
 | Returns a descriptive `string` | Returns a typed constant or constructor | A string is easier to read in a test table and keeps this teaching function decoupled from any one real implementation; production code mapping to an actual structure would more likely return a constructor |
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./...
@@ -185,12 +198,12 @@ ok  	datastructures	1.428s
 
 Reading it: one test, six table cases (not `t.Run` subtests, so they report as one PASS), all passing — confirming `Choose`'s priority order matches the flowchart's branch order exactly, with no drift between the diagram and the code.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - Adding a new field to `Need` without also adding a `case` for it in `Choose` silently falls through to whatever `case` comes next (or `default`) — there's no compiler warning for an unhandled boolean field, unlike an unhandled case in a `switch` over an enum type.
 - The priority order in `Choose` is load-bearing: swapping the order of two `case` branches changes behaviour for any `Need` that sets both of their fields, with no type error to catch the swap.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change it, predict the result:** add a new field `NeedsPrefixSearch bool` to `Need`, with a `case` in `Choose` returning `"trie"`. Where in the priority order should it go relative to `RandomAccessByKey`, and why — think about which need a trie actually satisfies better.
 2. **Change it, predict the result:** reorder the `AlwaysNeedTheMin` and `FIFO` cases in `Choose` (put `FIFO` first). Construct a `Need{AlwaysNeedTheMin: true, FIFO: true}` and predict what `Choose` now returns before running it.

@@ -35,7 +35,43 @@ updated: 2026-11-13
 > - gRPC fits internal service-to-service calls; GraphQL or a BFF (backend for frontend) fits many-screen mobile clients; SSE, WebSocket or webhooks fit push.
 > - Classic mistake: choosing a style because it is fashionable rather than because of who calls and which way data flows.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Programs talk to each other all day: your phone app asks a server for data, servers ask each other, partners get told when things happen.
+
+An **API style** is just the agreed way of talking: who speaks first, what the messages look like, and whether answers come once or keep flowing.
+
+Two questions pick the style almost every time: **who is calling**, and **which way does the data flow**?
+
+```mermaid
+flowchart TD
+    Q{"Who calls?"} -- "public app / browser" --> REST["REST (the default)"]
+    Q -- "your own services" --> G["gRPC"]
+    Q -- "needs live updates" --> P["SSE / WebSocket"]
+    Q -- "partner wants events" --> W["Webhooks"]
+```
+
+The default is **REST**: plain web requests like `GET /shows/42`. You only leave the default for a concrete reason, like needing the server to push updates the moment something changes.
+
+```mermaid
+flowchart LR
+    A["Ask and answer"] --> B["REST / gRPC / GraphQL"]
+    C["Server pushes to you"] --> D["SSE / WebSocket"]
+    E["We call you when it happens"] --> F["Webhooks"]
+```
+
+The rest of this note is just three questions:
+1. What are the four basic conversation patterns?
+2. How do you walk the decision tree for each caller?
+3. What does each style cost you (caching, debugging, scaling)?
+
 
 **The problem in one story.**
 A movie-booking company has a public website, a phone app, internal services, partner cinemas and a live seat map.
@@ -79,7 +115,7 @@ Where it breaks: real systems mix several styles at once, often for the same dat
 > [!tip] Remember
 > Ask who calls and which way data flows; default to REST and switch only for a concrete reason.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A movie-ticket platform needs five kinds of communication at once:
 
@@ -95,7 +131,7 @@ If partners must **poll** for cancellations, they either miss them or hammer you
 
 Each API style exists because it makes one of these shapes cheap. Choosing well means matching style to caller and data flow, and keeping the number of styles small.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the ways a restaurant talks to people:
 
@@ -111,9 +147,11 @@ Think of the ways a restaurant talks to people:
 
 Two questions decide most cases: **who is calling** and **who speaks first**.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The four communication patterns
+
+**In plain words:** every API conversation is one of four shapes: ask-and-answer, server pushes to you, a long two-way stream, or "I'll tell you later". Name the shape first and the style picks itself.
 
 Every style is one of four patterns, or a mix:
 
@@ -143,6 +181,8 @@ sequenceDiagram
 ```
 
 ### The decision
+
+**In plain words:** walk the tree top-down: first who is calling, then whether data must be pushed. Do not start with "is it CRUD?", because everything looks like CRUD.
 
 Ask about the **caller first**, then the **direction of data**. The old "is it normal CRUD?" first question is the wrong root: almost everything looks like CRUD, so the push and internal branches never get asked.
 
@@ -202,9 +242,11 @@ flowchart LR
     RT -- "seat updates" --> M
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole chapter compressed into one `switch` statement.
 
 The whole decision fits in one function. The full version below adds the production concerns.
 
@@ -232,6 +274,8 @@ func Pick(caller, flow string) string {
 
 ### Full version
 
+**In plain words:** one realistic company, six callers, six styles, and real arithmetic showing why polling a live seat map is 25,000 requests per second of mostly nothing.
+
 **Interview drill: "How would you expose seat booking for a movie-ticket platform?"** Walk each caller through the decision tree, then size the push channel.
 
 | Need | Caller | Style | Why |
@@ -255,7 +299,7 @@ Which to pick depends on what is scarce. With HTTP/2 at the edge, SSE avoids the
 
 **The "one company uses many styles" check.** The table above uses six styles: REST, GraphQL, gRPC, SSE, webhooks and SOAP. That is normal. What is not normal is using two styles for the **same caller and job**, for example REST and GraphQL both serving the same mobile screen. That doubles the contracts, auth paths and tests with no gain.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Style | Transport | Payload | Contract | Browser support | HTTP caching | Streaming | Best fit |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -270,7 +314,7 @@ Which to pick depends on what is scarce. With HTTP/2 at the edge, SSE avoids the
 
 Per-style details live in their own notes: [[REST and HTTP API Design]], [[GraphQL]], [[gRPC]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Webhooks - Sending and Receiving]], [[SOAP and WSDL (Legacy Integrations)]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not expose gRPC directly to browsers.** Browsers cannot read HTTP/2 trailers through `fetch`, where gRPC puts its status, so you need gRPC-Web or Connect plus a proxy. Binary payloads are also harder for partners to debug with `curl`.
 - **Do not add GraphQL for one client and simple CRUD.** You pay for a schema, resolvers, N+1 batching (DataLoader), query cost limits and lost HTTP caching, and get nothing a few REST endpoints would not give you.
@@ -279,7 +323,7 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 - **Webhooks are at-least-once.** Receivers must deduplicate by event ID (see [[Delivery Semantics and Exactly-Once]]). If partners cannot host an HTTPS endpoint, offer an events list endpoint they can poll instead.
 - **Every extra style has a fixed cost:** another contract format, code generator, auth integration, gateway rule, dashboard and on-call runbook.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Stripe**'s main (v1) API is REST: resource URLs, form-encoded request bodies, JSON responses, and webhooks for events.
@@ -299,7 +343,7 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 	- For webhooks: delivery success rate, delivery lag, retries per endpoint.
 	- For gRPC: the distribution of status codes (`UNAVAILABLE`, `DEADLINE_EXCEEDED`).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why gRPC needs HTTP/2.** gRPC sends each call as an HTTP/2 stream: headers, length-prefixed protobuf messages, then **trailers** carrying `grpc-status` and `grpc-message`. Multiplexing lets thousands of concurrent calls share one TCP connection.
 
@@ -314,7 +358,7 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 
   GraphQL scales to many clients; a BFF is simpler when there are two or three and each team owns its own (see [[API Gateway and BFF]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How would you expose live order tracking for a food-delivery app?
 > REST for placing and reading orders (`POST /orders`, `GET /orders/{id}`). SSE for the live courier position and status, because data only flows to the client and SSE reconnects by itself. gRPC between the order, courier and pricing services. Webhooks to tell restaurants about new orders. Size the SSE fleet by open connections, not request rate.
@@ -339,7 +383,7 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 > [!question]- Can one system use several styles without duplicating business logic?
 > Yes. Keep business logic in internal services with one contract (often `.proto`). Expose it as REST through transcoding (grpc-gateway or Envoy), as GraphQL through resolvers that call the same services, and as events through a broker. Each edge is a thin adapter.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Decide by **caller** (browser, own service, partner) and **direction** (ask, push, stream, event).
 - Public resource API → **REST + OpenAPI**. Many client shapes → **GraphQL** or a **BFF**.
@@ -350,7 +394,7 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 - Only `GET` is cacheable in practice: REST caches, GraphQL over `POST` and gRPC do not.
 - Mixed is normal: REST/GraphQL at the edge, gRPC inside, transcoding to avoid duplicate logic.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]
 - **Next:** [[REST and HTTP API Design]], [[API Contract Design and OpenAPI]], [[GraphQL]], [[gRPC]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Webhooks - Sending and Receiving]]

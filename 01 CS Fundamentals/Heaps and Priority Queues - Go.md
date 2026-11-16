@@ -17,7 +17,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Four small, runnable heaps: a hand-rolled `MinHeap`, a `container/heap`-based `TaskQueue` with in-place reprioritizing, a size-k `TopKLargest`, and a two-heap `MedianFinder`. Together they demonstrate every mechanism in [[Heaps and Priority Queues]]: sift-up, sift-down, O(n) heapify, `heap.Fix`, and the size-k and two-heap patterns.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" and "Before the code", then just Step 1 (the hand-rolled MinHeap). Stop there.
+> - 🟡 **Know the basics?** Add Steps 2-3, the design decisions and the tests.
+> - 🔴 **Interview / SDE-3 prep?** Add "Running it", the pitfalls and the exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢 — This file is the hands-on twin of [[Heaps and Priority Queues]]. It builds four small working heaps in Go: a from-scratch min-heap (to see the mechanics), a task queue using Go's standard `container/heap` (the way real code does it), a "keep the k biggest" helper, and a running-median tracker. Read the theory note first if any word feels new; here, read each code block top to bottom, then the numbered "How it works" list under it.
+
+## Before the code 🟢
 
 - **Slices** (`[]int`): Go's growable arrays; the heap lives in one slice and uses index math for parent/child.
 - **Methods on types**: `func (h *MinHeap) Push(...)` attaches behavior to a struct; the pointer receiver lets it change the slice.
@@ -26,7 +33,7 @@ updated: 2026-11-13
 - **Multiple return values**: `Pop() (int, bool)` returns the value plus an "ok" flag for the empty case.
 - **What to run**: put the code and tests in one package, then `go vet ./...` and `go test -race ./...`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Heaps and Priority Queues]] |
 | --- | --- |
@@ -68,15 +75,17 @@ classDiagram
 
 Four independent, self-contained pieces of code in one package: `MinHeap` is the hand-rolled mechanism, `TaskQueue` is the idiomatic `container/heap` pattern, and `TopKLargest`/`MedianFinder` are two interview-standard applications built on top of `container/heap`.
 
-## Setup
+## Setup 🟢
 
 - Module `pq` with `minheap.go`, `taskqueue.go`, `topk.go`, `median.go`, and matching `_test.go` files.
 - Go 1.24, standard library only (`container/heap`, `sort`).
 - Run: `go vet ./... && go test -race -v ./...`
 
-## Code
+## Code 🟡
 
 ### Step 1: a hand-rolled MinHeap
+
+**In plain words:** we build the heap by hand first — one slice, plus two helpers that let values bubble up or sink down — so the index math stops being magic.
 
 **Concept.** This is §3.2–§3.4 of [[Heaps and Priority Queues]] made literal:
 
@@ -196,6 +205,8 @@ flowchart LR
 
 ### Step 2: the standard `container/heap` interface
 
+**In plain words:** Go's standard library does not give you a heap type — it gives you a 5-method plug socket; implement those methods on your own type and the library drives it as a heap.
+
 **Concept.** Go's standard library doesn't ship a heap type directly — it ships `container/heap`, which turns *any* type satisfying a 5-method interface (`sort.Interface`'s `Len`/`Less`/`Swap`, plus `Push`/`Pop`) into a heap ([[Heaps and Priority Queues#Go's container/heap the standard interface]]).
 
 This is the idiomatic way to build a priority queue in Go, and it's what `TopKLargest` and `MedianFinder` below both build on.
@@ -281,6 +292,8 @@ sequenceDiagram
 ```
 
 ### Step 3: top-K and the running median
+
+**In plain words:** two classic uses — keep only the k biggest values from a stream, and keep the live middle value of a stream using two heaps leaning against each other.
 
 **Concept.** Both of these build on a second, minimal `heap.Interface` implementation (`intMinHeap`/`maxIntHeap`) rather than reusing `TaskQueue`, because they operate on plain `int`s, not `*Task`s — a good example of why `container/heap` asks you to implement the interface per concrete type instead of offering one generic heap.
 
@@ -423,7 +436,7 @@ flowchart LR
     lower -. "lower[0]=5 and upper[0]=15:\nsizes differ by 2, rebalance" .-> upper
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -433,7 +446,7 @@ flowchart LR
 | `MedianFinder` rebalances by at most one element per `Add` | Rebalance fully after every insert | O(log n) worst case per `Add` instead of a potentially larger rebalance; relies on the invariant "sizes differ by at most one" never being violated by more than one insert at a time. |
 | `TopKLargest` returns a freshly sorted slice | Return the heap's internal slice unsorted | Callers get a predictable, ascending answer; costs one extra `O(k log k)` sort at the end. |
 
-## Tests
+## Tests 🟡
 
 ### TestMinHeapPushPopIsSorted
 
@@ -582,7 +595,7 @@ func TestMedianFinderStream(t *testing.T) {
 
 **If it fails.** A wrong median at step 2 (`{5, 15}`, equal-size heaps) points at the "average both tops" branch of `Median`. A wrong median at step 3 or 4 (unequal sizes) points at the rebalancing logic in `Add`.
 
-## Running it
+## Running it 🔴
 
 ```text
 go vet ./... && go test -race -v ./...
@@ -616,7 +629,7 @@ ok  	pq	1.473s
 | `TestTopKLargest ... PASS` | The size-k heap pattern returned the exact 3 largest values. |
 | `ok pq 1.473s` | The whole package passed under `-race`, meaning none of the heap operations have a data race (they aren't meant to be used concurrently without external locking — see [[sync Primitives and Atomics]]). |
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`MinHeap` is not safe for concurrent use.** Like Go's own `map`, nothing here synchronizes access; a shared heap across goroutines needs an external `sync.Mutex`.
 - **Comparing against only one child in `siftDown`** is the single most common bug when hand-rolling a heap — the code here deliberately computes `smallest` by checking both `left` and `right` before swapping.
@@ -624,13 +637,13 @@ ok  	pq	1.473s
 - **`TaskQueue.Pop` sets the vacated slot to `nil`** before shrinking the slice — skipping this is a classic Go memory-leak pattern: the underlying array would keep a `*Task` reachable long after logically removing it, until the array itself is garbage collected.
 - **`TopKLargest`'s heap only guarantees the *set*, not the order** of the k largest values — the final `sort.Ints` is not optional if a caller expects ascending output.
 
-## Exercises
+## Exercises 🔴
 
 1. In `siftDown`, change `h.data[left] < h.data[smallest]` to always compare against `left` only (drop the `right` check). Predict which test fails first and why, then run the tests to confirm.
 2. Add a `Remove(index int)` method to `TaskQueue` that removes an arbitrary task (not just the root) using `heap.Remove`. Predict what it needs to track to find the task's current index, then implement it using the existing `index` field.
 3. Modify `MedianFinder.Add` to rebalance by more than one element in a single pass (e.g. move all excess elements at once instead of one `if`/`else if`). Predict whether this changes the worst-case time complexity of `Add`, then verify with `TestMedianFinderStream`.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Heaps and Priority Queues]]
 - **Related:** [[Graphs and Graph Algorithms]] (min-heap as Dijkstra's frontier), [[Scheduled Jobs - Cron to Durable Schedulers]]

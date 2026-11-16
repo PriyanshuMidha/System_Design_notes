@@ -20,7 +20,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[N+1 Query Problem]]: an invoice-list handler written twice (one query per row, then one batched query), the pgx query that sends all IDs as a single `bigint[]` parameter, a query counter for pgx, a generic per-request DataLoader, and tests that pin the query count so it cannot grow with the page size.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and Steps 1-3 (the bug and the fix). Stop there.
+> - 🟡 **Know the basics?** Add Step 4 (the pgx query), Step 5 (the query counter), the Tests and "Query-count arithmetic".
+> - 🔴 **Interview / SDE-3 prep?** Add Step 6 (the DataLoader), "The loader trace", "Pitfalls in the code" and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on half of the N+1 note. It shows the bug and the fix as real Go code you can run: the same invoice-list page written twice — once querying the database inside a loop (slow, 51 trips) and once collecting the IDs and fetching them all in one query (fast, 2 trips) — plus the Postgres query that takes a whole list of IDs as one parameter, a small counter that tells you how many queries each web request made, and a DataLoader that quietly merges many little lookups into one batch. Read the theory note first if "N+1" is new to you; then read the steps here in order, and run `go test -race` to watch the tests prove the query count stays flat as the page grows.
+
+## Before the code 🟢
 
 - **Interfaces**: the handler depends on a small `Store` interface, so tests use a fake store that counts queries.
 - **Generics**: `Loader[K, V]` batches lookups for any key and value type.
@@ -29,7 +38,7 @@ updated: 2026-11-13
 - **`context.Context`**: a waiting `Load` returns early if the request is cancelled.
 - **Run**: `go mod tidy && go vet ./... && go test -race -v ./...` (no database needed).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -52,19 +61,19 @@ flowchart LR
     CT["QueryCounter tracer"] -.-> PG
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24 (`slices.Chunk` needs 1.23 or later). The one dependency is `github.com/jackc/pgx/v5` v5.8.0, used by `pgstore.go` and `counter.go`.
 - Layout: a module `n1` with `store.go`, `pgstore.go`, `counter.go`, `loader.go`, `n1_test.go`, and a small `wb` package for the whiteboard version.
 - Run it with `go vet ./... && go test -race -v ./...`. The tests use an in-memory fake store that counts queries, so no PostgreSQL is needed. `PGStore` and `QueryCounter` are verified to compile only.
 
-## How to read this note
+## How to read this note 🟢
 
 Every step has a Concept paragraph that ties the code to the theory note and names the alternatives, a block of at most about 25 lines, and a numbered How it works list.
 
 Where a file is long, it is cut into consecutive pieces; read them in order and they form the file. Every piece beginning without a `package` line belongs to the file of the piece above it.
 
-## Code map
+## Code map 🟢
 
 | Step | File | Idea | Theory section |
 | --- | --- | --- | --- |
@@ -78,7 +87,7 @@ Where a file is long, it is cut into consecutive pieces; read them in order and 
 
 The recurring theme is that the fix changes the shape of the work, not the speed of the database. In every step, ask how many round trips happen and whether that number depends on the size of the page.
 
-## Code
+## Code 🟡
 
 ### Step 1: the repository interface and the types
 
@@ -139,6 +148,8 @@ classDiagram
 
 ### Step 2: the naive list handler
 
+**In plain words:** this is the bug on purpose — the line inside the loop makes one trip to the database per invoice, like a waiter walking to the kitchen once per dish.
+
 **Concept.** This is the textbook N+1: one query for the page, then a query inside the loop for each row ([[N+1 Query Problem#1. Why it exists]]). It is correct, and it is fast on a developer laptop with five rows, which is why it ships.
 
 The cost is N round trips, each paying network latency, a pool checkout and a query parse. It is kept in the code on purpose, as the baseline that the tests compare the batched version against.
@@ -191,6 +202,8 @@ sequenceDiagram
 ```
 
 ### Step 3: the batched list handler
+
+**In plain words:** the fix is a four-step recipe — gather the IDs, drop duplicates, fetch them in one (or a few) queries, then match clients back to invoices with a map.
 
 **Concept.** The fix follows the steps in [[N+1 Query Problem#The batching steps]]: collect the foreign keys, remove duplicates, fetch them in a few queries, and stitch the results in memory with a map. Sorting first matters because `slices.Compact` only removes adjacent duplicates.
 
@@ -268,6 +281,8 @@ flowchart LR
 ```
 
 ### Step 4: the Postgres side of the batch
+
+**In plain words:** the trick on the wire — the whole list of IDs travels as one single parameter (a Postgres array), so one query serves 5 IDs or 500.
 
 **Concept.** On the wire, a batch of IDs must be one statement with one parameter.
 
@@ -390,6 +405,8 @@ sequenceDiagram
 ```
 
 ### Step 6: a per-request DataLoader
+
+**In plain words:** a DataLoader is a shuttle bus for lookups — each resolver asks for one key, the loader waits a moment for more passengers, then makes one trip for everyone.
 
 **Concept.** In GraphQL, resolvers for different fields run independently, so no single function can collect all the IDs.
 
@@ -600,7 +617,7 @@ func namesFast(invs []Invoice, clientsByIDs func([]int64) []Client) []string {
 3. `namesFast` calls `clientsByIDs` once, builds `byID`, and reads names from it.
 4. The last line reads `byID[...]` without the `ok` check, so a missing client silently gives an empty string. That is the bug the full `ListBatched` guards against.
 
-## The loader trace
+## The loader trace 🔴
 
 The loader test is the hardest one to picture, so here is the timeline for three of the 300 callers asking for keys 1, 2 and 1 again, with `maxBatch = 3` for brevity.
 
@@ -628,7 +645,7 @@ sequenceDiagram
 
 Reading the trace: the mutex is held only while the first four steps decide which batch a key belongs to, the fetch runs outside any lock, and a single `close(done)` releases all waiters at once. The duplicate `Load(1)` costs nothing because the cache already maps key 1 to the batch.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -642,7 +659,7 @@ Reading the trace: the mutex is held only while the first four steps decide whic
 | One loader per request | A global cache | No stale data and no cross-tenant leaks; no sharing between requests |
 | `sync.Once` and a `done` channel | A lock held during the fetch | Many callers share one fetch without blocking each other |
 
-## Query-count arithmetic
+## Query-count arithmetic 🟡
 
 The tests assert counts, so it helps to be able to predict them. Let `n` be the number of invoices on the page, `d` the number of distinct clients among them, and `c` the chunk size.
 
@@ -660,9 +677,11 @@ Three things follow from the table.
 
 A useful habit is to write the expected formula in the test failure message, as the first two tests do, so a failing run says what the query count should have been and why.
 
-## Tests
+## Tests 🟡
 
 ### Test fixture: a fake store that counts queries
+
+**In plain words:** the tests do not need a real database — a fake store answers from memory and keeps a tally of how many times it was asked, which is the number the whole note cares about.
 
 **Concept.** The key property of the batched code is the number of queries, so the fake store counts every call it serves in an atomic counter. It keeps invoices in a slice and clients in a map, and it behaves like SQL in one important way: `ClientsByIDs` silently omits IDs that do not exist.
 
@@ -929,7 +948,7 @@ func TestSlowAndFastAgree(t *testing.T) {
 
 **If it fails.** A difference means the join in `namesFast` misaligns names with invoices.
 
-## Running it
+## Running it 🟢
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -956,7 +975,7 @@ ok  	n1/wb	1.434s
 3. `n1/wb` is a separate package, so it has its own result: one test, `TestSlowAndFastAgree`, and its own `ok` line.
 4. No `WARNING: DATA RACE` lines appear, so the loader's locking and channel hand-off are sound under the load of 300 goroutines.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **The batch query omits missing IDs without an error.** `ListBatched` has to check every stitched row, or a deleted client shows up as an empty name.
 - **`slices.Compact` only removes adjacent duplicates,** so `ListBatched` sorts first.
@@ -965,7 +984,7 @@ ok  	n1/wb	1.434s
 - **The loader's wait window is a latency floor.** A lone `Load` waits the full `wait` duration before dispatching, unless `maxBatch` is reached.
 - **`QueryCounter` counts only queries that use the context from `WithQueryCount`.** A query run with `context.Background()` is invisible to it.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestQueryCountDoesNotGrowWithPageSize`, change `newFakeStore(n, 7)` to `newFakeStore(n, n)` (every invoice has its own client). Predict how many queries `ListBatched` uses for `n = 50` with chunk 1,000 and with chunk 20, then run it.
 2. Change the loader test to `maxBatch = 50` with the same 100 keys. Predict the number of fetches and the number of keys per fetch, then run it with `-race`.

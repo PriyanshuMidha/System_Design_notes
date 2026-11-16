@@ -25,7 +25,38 @@ updated: 2026-11-13
 > - Compressed (radix) tries collapse single-child chains into one edge; this is what Go HTTP routers and IP routing tables actually use.
 > - Classic mistake: reaching for a suffix tree/array when an inverted index (word → documents) is the right tool, or vice versa — they solve different search problems.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **trie** is a tree built from letters. Words that share a beginning share a path: "car", "cat" and "cart" all walk through c → a. That makes "find every word starting with ca..." instant — exactly what autocomplete does.
+
+```mermaid
+flowchart TD
+    ROOT(( )) --> C["c"]
+    C --> A["a"]
+    A --> R["r (car)"]
+    A --> T["t (cat)"]
+    R --> T2["t (cart)"]
+```
+
+Tries answer questions about the *starts* of many words. **Suffix** structures flip the idea: take ONE big text, and index every possible ending (suffix) of it. Then "does this substring appear anywhere in the text?" becomes a fast lookup instead of a scan.
+
+```mermaid
+flowchart LR
+    Q["Which words start with 'ca'?"] --> TR["Trie over many words"]
+    Q2["Does 'ana' appear in 'banana'?"] --> SA["Suffix array over one text"]
+```
+
+The rest of this note is just three questions:
+1. How does a trie store and find words, and what does it cost in memory?
+2. What are suffix trees and suffix arrays, and when is each worth it?
+3. Where are these used for real (autocomplete, search, bioinformatics)?
 
 ### The problem in one story
 
@@ -80,7 +111,7 @@ This note covers two genuinely different questions, built from the same underlyi
 
 Keep the two apart in your head: that split is itself the most common interview trap in this area.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 ### Part A: the prefix problem
 
@@ -108,7 +139,7 @@ These are two different tools for two different questions — "which stored stri
 > [!warning] Common mistake
 > Treating "trie" and "suffix tree" as interchangeable because both are trees of characters. A trie indexes *many separate strings*; a suffix tree indexes *every suffix of one string*. Mixing them up in an interview is an immediate red flag.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### Part A: tries, the filing-cabinet analogy
 
@@ -144,7 +175,7 @@ flowchart TD
 > [!tip] Remember
 > Same mechanism (index by character), different input shape: many strings for a trie, one text's own suffixes for a suffix tree/array.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Tries
 
@@ -265,7 +296,7 @@ Building both in `O(n)` (the SA-IS algorithm, or `O(n log n)` with simpler doubl
 > [!tip] Remember
 > A suffix array is the practical default: a flat, sorted slice of integers beats a pointer-heavy tree in memory almost every time the data sets are large.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -288,7 +319,7 @@ The runnable version fixes the one real inefficiency in that sketch — a `map[b
 
 It also adds prefix search (autocomplete), a production-grade suffix array from Go's standard library, and tests. Runnable Go version: [[Tries, Suffix Trees and Suffix Arrays - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Structure | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -301,7 +332,7 @@ It also adds prefix search (autocomplete), a production-grade suffix array from 
 > [!warning] Interview trap
 > A suffix tree/array answers "where does this substring occur in this one text?" An inverted index answers "which documents contain this word?" Real search engines (and Postgres full-text search) use inverted indexes, not suffix trees — text editors use ropes or piece tables for the editing buffer, not suffix trees either. Reaching for a suffix tree when asked to design a search engine is the classic trap.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A plain trie over a wide alphabet (Unicode, not just `a`–`z`) wastes memory per node if you use a fixed-size array; switch to a `map[rune]*node`, at the cost of slower, pointer-chasing lookups.
 - A suffix tree's constant factor is brutal: each of the `n` leaves plus internal nodes typically costs several times the memory of the raw text, because of pointers, edge-label bookkeeping and suffix links. For anything beyond a few hundred MB of text, this stops being practical.
@@ -309,7 +340,7 @@ It also adds prefix search (autocomplete), a production-grade suffix array from 
 - If you only need "does this one word appear" rather than general substrings, a hash set or an inverted index is simpler and faster to build.
 - For a small, fixed, rarely changing set of routes or prefixes, a flat sorted slice with binary search can beat a radix trie's pointer overhead — measure before reaching for the trie.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Go's own HTTP routers: `julienschmidt/httprouter` and `go-chi/chi` route requests through a radix tree keyed by URL path segments.
@@ -327,7 +358,7 @@ It also adds prefix search (autocomplete), a production-grade suffix array from 
 	- p99 route-lookup latency in an HTTP router under a large, deeply nested route table.
 	- Rebuild time for a suffix array/LCP pair when the backing text changes, if the structure is refreshed on any kind of interval.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why a sentinel (`$`) matters.** Without a unique terminator lower than every real character, one suffix (`"ana"`) could be a prefix of another suffix (`"anana"`), and a leaf in the suffix tree would need to also be an internal node — breaking the "every suffix ends at a distinct leaf" invariant the structure depends on.
 
@@ -345,7 +376,7 @@ It also adds prefix search (autocomplete), a production-grade suffix array from 
   Neither structure is "just `O(n)` for free" — the fast construction algorithms are genuinely more complex than the naive ones, which is why many codebases reach for a suffix array library instead of hand-rolling Ukkonen's algorithm.
 - **Compressed tries at scale.** A production radix router doesn't store one byte per edge either — `httprouter`'s tree stores whole path segments per edge and specializes nodes for static text, named parameters (`:id`) and catch-alls (`*filepath`), so a lookup is a handful of segment comparisons, not hundreds of single-byte steps.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Implement a trie with insert and search.
 > See the worked example above: a node per character with `[26]*node` children (or a map for wider alphabets) and an `end` flag; insert and search both walk one node per character, `O(L)`.
@@ -374,7 +405,7 @@ It also adds prefix search (autocomplete), a production-grade suffix array from 
 > [!question]- Word Search II: given a grid of letters and a list of words, find every word that can be traced through adjacent cells.
 > Checking each word with a separate grid DFS costs `O(words × cells)`; instead, insert all the words into a trie and run one DFS over the grid that walks the trie alongside the path, pruning immediately whenever the current cell isn't a child of the current trie node. This turns many independent searches into one combined walk bounded by the grid size and the trie's shared structure, with a `end`-of-word marker (storing the whole word at that node avoids rebuilding it from the path) reporting a match.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Trie: one edge per character, shared prefixes share a path, `O(L)` insert/search.
 - Radix (compressed) trie: single-child chains collapsed into one edge — this is what httprouter/chi and IP routing tables actually use.

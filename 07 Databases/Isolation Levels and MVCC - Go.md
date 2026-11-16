@@ -25,7 +25,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > Runnable Go for [[Isolation Levels and MVCC]]: a small model of PostgreSQL's row-version visibility rule (`xmin`, `xmax`, snapshot) with a test that replays one invoice through five situations, and a `Serializable` helper that runs a whole transaction at SERIALIZABLE and runs it again on `40001` or `40P01`, with the credit-limit check built on top of it.
 
-## Before the code
+## Before the code 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and Step 1 only.
+> - 🟡 **Know the basics?** Add Steps 2-4 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢 This file is the hands-on half of [[Isolation Levels and MVCC]]: small Go programs that act out what the theory note describes. One package re-builds, in plain Go, the rule PostgreSQL uses to decide which copy of a row you can see; another shows the retry loop every real app needs when it runs transactions at SERIALIZABLE, ending with the credit-limit check done safely. Read the theory note first, then skim the code top to bottom; each step says which theory section it proves, and the tests run with no database at all.
 
 - **Packages**: three packages in one module; `mvccmini` and `mvcc` are pure logic, `txretry` talks to PostgreSQL.
 - **Function types**: `Committed` is a `func(uint32) bool`, so a test can say "105 aborted" in one line.
@@ -34,7 +41,7 @@ updated: 2026-11-13
 - **`context.Context` and `errors.As`**: cancel retries on shutdown, and read the SQLSTATE (`40001`, `40P01`) from a `*pgconn.PgError`.
 - **Run**: `go mod tidy && go vet ./... && go test -race ./...` (no database needed).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where it is explained |
 | --- | --- | --- |
@@ -59,7 +66,7 @@ flowchart TD
 
 The two packages are independent. `mvcc` is pure logic that explains what the database does internally; `txretry` is what an application does about the consequences, namely that SERIALIZABLE can abort a transaction that did nothing wrong.
 
-## Setup
+## Setup 🟢
 
 - Module `example.com/mvcc` with three packages: `mvcc` (the visibility model), `mvcc/mvccmini` (the 15-line version) and `mvcc/txretry` (the retry helper and `CreateInvoice`).
 - Go 1.24. Only `txretry` has a dependency: `github.com/jackc/pgx/v5` (v5.7.2 was used for the measured run).
@@ -72,9 +79,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the visibility rule in 15 lines
+
+**In plain words:** the smallest possible version of PostgreSQL's "can I see this row copy?" check: who made it, who replaced it, and did those transactions finish.
 
 **Concept.** PostgreSQL never overwrites a row in place: an `UPDATE` stamps the old version with the updater's transaction id in `xmax` and writes a new version with that id in `xmin` ([[Isolation Levels and MVCC#MVCC in PostgreSQL: versions in the heap]]).
 
@@ -120,6 +129,8 @@ flowchart LR
 ```
 
 ### Step 2: the full visibility model
+
+**In plain words:** the same check, now with the real-life wrinkles: my own unfinished writes, transactions that aborted, and the snapshot written as three numbers.
 
 **Concept.** The mini rule is wrong in two cases that matter. A transaction must see its own uncommitted changes, and an aborted transaction's versions must stay invisible even though its id is below `Xmax`.
 
@@ -204,6 +215,8 @@ flowchart TD
 ```
 
 ### Step 3: retry serialization failures
+
+**In plain words:** SERIALIZABLE sometimes cancels an innocent transaction, so this helper simply runs the whole thing again, with a short random pause between tries.
 
 **Concept.** SERIALIZABLE in PostgreSQL is implemented as serializable snapshot isolation: it lets transactions run concurrently on snapshots and aborts one with `40001` when it detects a dangerous pattern ([[Isolation Levels and MVCC#SERIALIZABLE in PostgreSQL: SSI]]).
 
@@ -298,6 +311,8 @@ sequenceDiagram
 
 ### Step 4: the credit-limit check, made safe
 
+**In plain words:** the two-cashiers bug from the theory note, fixed for real: the whole check-and-insert runs inside the retrying SERIALIZABLE wrapper.
+
 **Concept.** The write-skew story ([[Isolation Levels and MVCC#Write skew]]) has two transactions that each read the customer's open balance, each see room under the limit, and each insert an invoice.
 
 Neither writes a row the other wrote, so snapshot isolation lets both commit and the limit is exceeded. At SERIALIZABLE the database sees that each transaction read data the other changed and aborts one with `40001`.
@@ -381,7 +396,7 @@ sequenceDiagram
     B-->>B: 90,000 + 30,000 exceeds limit, ErrCreditLimit
 ```
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -394,11 +409,13 @@ sequenceDiagram
 | `Beginner` interface defined by the helper | Take `*pgxpool.Pool` directly | Works with a pool, a connection or a fake; one more indirection |
 | `Serializable` takes the attempt budget as a parameter | A package constant | The caller decides how long a request may spend retrying |
 
-## Tests
+## Tests 🟡
 
 The tests have two groups: a deterministic check of the visibility rule, and retry tests that need no database. Together they prove the rule gives each snapshot exactly one version and that the retry loop retries only what it should.
 
 ### TestEachSnapshotSeesExactlyOneVersion
+
+**In plain words:** one invoice, five different moments to look at it; the test checks that each moment sees exactly one copy, never zero, never two.
 
 **Property.** For every snapshot there is exactly one visible version of the invoice. If two were visible a query would return a duplicate; if none, the row would vanish. The two middle cases are the whole difference between REPEATABLE READ (one snapshot for the transaction) and READ COMMITTED (a fresh snapshot per statement).
 
@@ -502,6 +519,8 @@ func TestMiniVisible(t *testing.T) {
 A failure of the first assertion means the rule hides rows that another transaction is still deleting, which would make reads block-like or wrong. A failure of the second means dirty reads: uncommitted rows leak into other snapshots. A failure of the third means deleted rows are resurrected.
 
 ### The retry tests
+
+**In plain words:** a fake database hands back scripted errors, so we can check the helper retries on 40001, gives up at the cap, and stops on a real error.
 
 The retry logic is tested without a database. A fake `BeginTx` hands out transactions whose `Commit` returns scripted errors; `pgx.BeginTxFunc` only ever calls `Commit` and `Rollback` on them.
 
@@ -692,7 +711,7 @@ ok  	example.com/mvcc/txretry
 4. `TestUniqueViolationIsNotRetried` and `TestStopsWhenContextIsCancelled` show `0.00s`: the first never sleeps, the second exits as soon as it sees the cancelled context.
 5. No `WARNING: DATA RACE` lines appear, so the race detector found nothing.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **The model ignores wraparound, command ids and lock-only `xmax`.** It is a teaching model of the rule, not a PostgreSQL clone. `xmax` set by `SELECT … FOR UPDATE` does not mean the row was deleted.
 - **`Committed` stands in for `pg_xact`.** In the model a transaction that is neither committed nor running counts as aborted, which is how the "105 aborted" case keeps the old version visible.
@@ -701,13 +720,13 @@ ok  	example.com/mvcc/txretry
 - **`CreateInvoice` only helps if every writer uses SERIALIZABLE.** One writer at READ COMMITTED can still create the anomaly.
 - **The retry loop has no per-attempt timeout.** The only limits are `maxAttempts` and the context; a slow transaction that keeps failing can hold its connection for a long time.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestEachSnapshotSeesExactlyOneVersion`, change the case "105 aborted" so that `committed` is `both`. Predict which version is seen and which case in the table it now equals, then run it.
 2. Change the `fakeDB` in `TestRetriesSerializationFailuresUntilCommit` to fail three times and keep `maxAttempts` at 3. Predict the error type and the value of `runs`.
 3. Remove the `s.Running[xid]` check in `mvccmini.committedBefore`. Predict which of the three assertions in `TestMiniVisible` fails.
 
-## Links
+## Links 🟢
 
 - Theory: [[Isolation Levels and MVCC]]
 - **Before this:** [[Transactions and ACID - Go]]

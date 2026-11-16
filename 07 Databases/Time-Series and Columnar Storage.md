@@ -30,7 +30,41 @@ updated: 2026-11-13
 > - Raw data is expensive to keep forever: keep raw for days, rollups for years, and the full archive in cheap object storage.
 > - Analytics belongs off the primary OLTP database: a replica for small loads, a separate column store for big ones.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked examples), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7 and the deep dives in 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Picture a filing cabinet of invoices, one full form per invoice. Finding one invoice is easy. But "add up the amount on every invoice this year" means pulling out every single form, even though you only care about one box on each.
+
+A normal database (a **row store**) works like that cabinet: it keeps all of a row's fields together. An analytics database (a **column store**) flips the layout: it keeps all the values of one field together, like one long strip per spreadsheet column. Now "add up the amounts" reads just one strip and skips everything else.
+
+```mermaid
+flowchart LR
+    Q["Sum amounts for the year"] --> RS["Row store:<br/>read every full form"]
+    Q --> CS["Column store:<br/>read 1 strip of amounts"]
+```
+
+There is a bonus: values of the same type sitting together squeeze down very well, often 5 to 20 times smaller.
+
+Time-stamped data (CPU readings, events) gets one more trick. It always arrives in time order, so the store cuts it into one box per day, and deleting old data just means throwing away the oldest box.
+
+```mermaid
+flowchart LR
+    N["New data"] --> D3["Box: today"]
+    D3 --- D2["Box: yesterday"] --- D1["Box: 90 days ago"]
+    D1 --> X["Retention: drop the<br/>whole box, no row deletes"]
+```
+
+The rest of this note is just these 4 questions:
+1. Why do big summary queries hurt a normal row database?
+2. How does storing by column make them cheap (pruning, compression, skipping)?
+3. How do time-series stores ingest, roll up and expire data?
+4. Which tool do you pick at which size, and what does each cost?
 
 **The problem in one story.**
 Your app stores every invoice as one row: id, customer, total, date and 16 other fields.

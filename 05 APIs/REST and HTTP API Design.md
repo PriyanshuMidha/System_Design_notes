@@ -33,7 +33,41 @@ updated: 2026-11-13
 > - An **ETag** is a version label: `If-None-Match` saves bandwidth (`304`), `If-Match` prevents lost updates (`412`).
 > - Classic mistake: verbs in URLs (`/createOrder`) and `200 OK` with an error inside the body.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+REST is the standard way to shape a web API. The idea is simple: everything the API offers is a **resource** — a thing with its own web address, like `/orders/42`.
+
+You act on resources with a few fixed verbs everyone already knows: `GET` reads, `POST` creates, `PUT` replaces, `PATCH` edits, `DELETE` removes. The answer always comes with a **status code**, a 3-digit number saying how it went (200 fine, 404 not found).
+
+```mermaid
+flowchart LR
+    C["Client"] -- "GET /orders/42" --> S["Server"]
+    S -- "200 + the order" --> C
+    C -- "DELETE /orders/42" --> S
+    S -- "204 (gone)" --> C
+```
+
+Why bother with standards? Because caches, retry logic, browsers and monitoring tools all understand these verbs and codes already. Invent your own and all of that stops working.
+
+```mermaid
+flowchart LR
+    G["Standard GET"] --> CDN["Cacheable, retry-safe,<br/>monitorable for free"]
+    X["POST /doStuff"] --> N["None of that works"]
+```
+
+The rest of this note is just four questions:
+1. How do you name resources and pick verbs?
+2. Which status code fits which outcome?
+3. How do ETags stop two people overwriting each other?
+4. How do you handle slow jobs, lists and retries?
+
 
 **The problem in one story.**
 A mobile app, a website and a partner company all talk to your booking server.
@@ -77,7 +111,7 @@ Where it breaks: a library hands you the book itself; an API hands you a copy (a
 > [!tip] Remember
 > Nouns in URLs, standard verbs, honest status codes, and ETags to stop lost updates.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine an API that grew without rules:
 
@@ -100,7 +134,7 @@ REST replaces those private conventions with shared ones that HTTP already defin
 - `404` means the same thing to every client, proxy and monitoring tool.
 - When two support agents edit the same booking, HTTP's conditional requests stop one from silently overwriting the other.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A REST API is a **library catalogue**:
 
@@ -109,9 +143,11 @@ A REST API is a **library catalogue**:
 - What you carry away is a **copy** in some format (JSON, CSV): the **representation**, not the book itself.
 - The librarian keeps no memory of you between visits; you show your card every time (**statelessness**).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The REST constraints
+
+**In plain words:** REST is officially a list of rules, and each rule buys you something concrete: statelessness buys easy scaling, cacheability buys cheap reads. Skim the table for the "what it buys" column.
 
 Roy Fielding defined REST in his 2000 dissertation as a set of constraints. Each one buys a property:
 
@@ -137,12 +173,16 @@ Most good public APIs sit at level 2 and borrow one idea from level 3: links for
 
 ### Resources and URLs
 
+**In plain words:** URLs name things, never actions. Think street addresses: a house has one address, and what you do there is a separate question.
+
 - **Plural nouns for collections, an ID for an item:** `/products` and `/products/{id}`. Never verbs: `/api/v3/products` is right, `/api/v3/getAllProducts` is wrong.
 - **Sub-resources show ownership, one level deep:** `/users/{id}/addresses`. Stop at one level, two at most.
 - **Prefer filters to deep nesting.** `/posts/{postId}/comments/{commentId}/likes` couples clients to a hierarchy. Give comments a top-level home and filter: `/comments?post_id=7`. Each resource gets **one canonical URL**.
 - **Lowercase, hyphens or one consistent casing, no file extensions:** `/order-items`, not `/OrderItems.json`.
 
 ### Where each piece of data goes
+
+**In plain words:** every request has four pockets: the path says which thing, the query says how to view a list, the body carries the data, headers carry metadata. Put each item in its pocket.
 
 | Place | Carries | Example |
 | --- | --- | --- |
@@ -167,6 +207,8 @@ A body on `GET` has no generally defined meaning in HTTP (RFC 9110), and some se
 
 ### Method semantics
 
+**In plain words:** "safe" = just looking; "idempotent" = repeating causes no extra effect. These two words decide what may be retried or cached automatically, so they are worth memorising.
+
 **Safe** means the client asks for no change on the server. **Idempotent** means sending the same request twice has the same effect on server state as sending it once (the response may differ). Both matter because clients, proxies and retry libraries may resend safe and idempotent requests after a timeout.
 
 | Method | Safe | Idempotent | Cacheable | Typical use |
@@ -185,6 +227,8 @@ A body on `GET` has no generally defined meaning in HTTP (RFC 9110), and some se
 - **JSON Patch** (RFC 6902, `application/json-patch+json`): a list of operations, applied atomically: `[{"op": "test", "path": "/status", "value": "PENDING"}, {"op": "replace", "path": "/seats", "value": 3}]`. The `test` operation turns it into a conditional update.
 
 ### Status codes that matter
+
+**In plain words:** the status code is the headline; pick the honest one. The "common mistake" column is the list of ways teams lie with codes.
 
 | Code | Use it when | Common mistake |
 | --- | --- | --- |
@@ -210,6 +254,8 @@ A body on `GET` has no generally defined meaning in HTTP (RFC 9110), and some se
 Errors carry a machine-readable body, normally `application/problem+json` (RFC 9457). The format, codes and Go mapping are in [[API Error Handling]].
 
 ### Conditional requests
+
+**In plain words:** an **ETag** is a version sticker on the data. "Only send if changed" saves bandwidth; "only save if unchanged" stops two editors silently overwriting each other.
 
 An **ETag** is a version label for a representation, sent in a response header. Clients send it back in two ways:
 
@@ -247,6 +293,8 @@ RETURNING version;
 
 ### Content negotiation
 
+**In plain words:** the client says which formats and languages it accepts, and the server picks one and labels its choice, like a menu offered in two languages.
+
 The client says what it accepts, and the server picks:
 
 - `Accept: text/csv` on `GET /reports/77` gets CSV. `Accept-Language` and `Accept-Encoding` work the same way.
@@ -254,6 +302,8 @@ The client says what it accepts, and the server picks:
 - `406 Not Acceptable` when no format matches; `415 Unsupported Media Type` when the request body's `Content-Type` is not supported.
 
 ### Long-running operations
+
+**In plain words:** when the work takes minutes, do not keep the phone line open. Say "accepted, here is a tracking number" (202 + an operation URL) and let the client check back.
 
 Some requests take minutes: a report export, a bulk import, a refund across banks. Holding the HTTP request open for that long hits load balancer timeouts. Return `202 Accepted` with an **operation resource** instead:
 
@@ -277,15 +327,19 @@ Clients that cannot poll can register a webhook instead (see [[Webhooks - Sendin
 
 ### Bulk endpoints
 
+**In plain words:** creating 500 things one call at a time wastes 500 round trips; accept a capped list in one call, and decide upfront whether it is all-or-nothing or item-by-item.
+
 Creating 500 items with 500 requests costs 500 round trips. A bulk endpoint takes a capped list:
 
 - `POST /products:batchCreate` (Google's custom-method style) or `POST /products/batch`, with a hard limit such as 100 items.
 - Decide and document **atomic** (all or nothing, one transaction) or **partial** (a per-item result list with each item's status and error).
 - Partial success should still return `200` with per-item results; WebDAV's `207 Multi-Status` exists but is rarely used outside WebDAV.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** optimistic locking in 25 lines: the version number is the ETag, and a stale version gets a 412.
 
 Optimistic concurrency in about 25 lines: the ETag is the version, and a `PUT` with a stale `If-Match` gets `412`. The full version below adds the production concerns.
 
@@ -326,6 +380,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 ```
 
 ### Full version
+
+**In plain words:** the production shape: proper weak/strong tag matching, 428 when the client forgot If-Match, and a test where 20 simultaneous writers produce exactly one winner.
 
 Optimistic concurrency and cache revalidation in Go 1.24 with only the standard library. The `{id}` path patterns need Go 1.22 or later.
 
@@ -564,7 +620,7 @@ func TestConcurrentWritersExactlyOneWins(t *testing.T) {
 
 Result (measured with `go test -race -count=1`, Go 1.24.4, 2026-11-02): all 4 tests pass. Of 20 concurrent `PUT`s carrying `If-Match: "v1"`, exactly one gets `200` and 19 get `412`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **Collections: pagination, filtering, sorting.** Any collection can grow without bound, so every list endpoint pages from day one. Full design is in [[Pagination, Filtering and Sorting]]; the core choice:
 
@@ -624,7 +680,7 @@ The IETF draft for this header answers `409` while the first request with that k
 
 **When another style fits better:** server push (SSE, WebSocket), many client shapes (GraphQL or a BFF), internal high-rate calls (gRPC). See [[Choosing an API Style]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Chatty clients.** A mobile screen that needs a user, their orders and each order's items makes `1 + 1 + N` calls. Use sparse fields and embedding (`?expand=items`), a BFF, or GraphQL.
 - **Actions do not fit CRUD.** "Cancel", "refund", "resend email" have side effects beyond a field change. Model them as `POST /orders/{id}/cancel` (Google's AIP-136 writes `POST /v1/orders/42:cancel`) instead of pretending with `PATCH {"status": "CANCELLED"}`, which hides the refund and notification behind a field write.
@@ -632,7 +688,7 @@ The IETF draft for this header answers `409` while the first request with that k
 - **HTTP caching needs discipline.** Personalised responses must be `Cache-Control: private` or `no-store`, and responses that vary by language or format must send `Vary`, or a CDN will serve one user's data to another.
 - **REST is not the best internal RPC.** Text JSON and per-request HTTP overhead add up at thousands of calls per second between services, where gRPC is a better fit.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **GitHub's REST API** returns `ETag` headers; a conditional request that gets `304` does not count against the primary rate limit, provided it was sent with a valid `Authorization` header. It returns `404` instead of `403` for private repositories, so their existence does not leak.
@@ -650,7 +706,7 @@ The IETF draft for this header answers `409` while the first request with that k
 	- `429` per client, and calls to deprecated versions per client (who must migrate before the sunset date).
 	- p99 latency per route, response size, and the `limit` values clients actually send.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Idempotent does not mean "same response".** The first `DELETE /bookings/42` returns `204` and the second returns `404`, yet the server state after both is the same. The guarantee is about effects, which is why retry libraries may resend `PUT` and `DELETE` but not `POST`.
 - **Why `PATCH` is not idempotent in general.** A JSON Patch `{"op": "add", "path": "/tags/-", "value": "vip"}` appends to an array on every call. A merge patch that only sets fields is idempotent in practice, but the method does not promise it, so clients cannot assume it.
@@ -664,7 +720,7 @@ The IETF draft for this header answers `409` while the first request with that k
 - **Statelessness and sessions.** Fielding's constraint puts session state on the client. A server-side session store reached through a cookie technically breaks it but scales fine if the store is shared. The practical rule: no request depends on which instance served the previous one.
 - **400 vs 422.** RFC 9110 defines `422 Unprocessable Content` for syntactically valid but semantically wrong content. Google's AIP style uses `400 INVALID_ARGUMENT` for both. Either works if the API applies one rule everywhere and puts field errors in the body.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: is `PATCH` idempotent?
 > Not necessarily. RFC 5789 does not require it. A JSON Patch `add` to the end of an array appends again on every retry. A merge patch that only sets fields happens to be idempotent, but clients cannot rely on that, so retried `PATCH`es need `If-Match` or an idempotency key.
@@ -690,7 +746,7 @@ The IETF draft for this header answers `409` while the first request with that k
 > [!question]- Which Richardson level is your API, and do you need HATEOAS?
 > Most production APIs are level 2: resources, proper methods and status codes. Full level 3 helps when generic clients must discover workflows, which is rare. Use the cheap hypermedia parts: `Location` on `201`, `next` links for pages, links for allowed actions where the UI needs them.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Nouns, plural, one canonical URL per resource; nest one level; filter instead of deep nesting.
 - Path = which resource, query = how to view the collection, body = the representation, headers = metadata.
@@ -701,7 +757,7 @@ The IETF draft for this header answers `409` while the first request with that k
 - Page with opaque cursors; avoid deep offsets and exact totals on big tables.
 - Additive changes need no new version; breaking ones do. Announce removals with `Deprecation` and `Sunset`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Choosing an API Style]]
 - **Next:** [[API Contract Design and OpenAPI]], [[API Error Handling]], [[Pagination, Filtering and Sorting]], [[API Versioning and Backward Compatibility]], [[Idempotency and Idempotency Keys]]

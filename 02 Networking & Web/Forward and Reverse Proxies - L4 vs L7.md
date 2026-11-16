@@ -23,7 +23,37 @@ updated: 2026-11-13
 > - L4 forwards bytes by IP:port (or passes TLS through using the SNI hostname) without understanding HTTP; L7 terminates the connection and reads the request to route it.
 > - Classic mistake: trusting an inbound `X-Forwarded-For` header from the client itself. Only a header appended by a proxy **you control** is trustworthy.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **proxy** is a middleman computer. Instead of two computers talking directly, their messages pass through it.
+
+There are only two kinds, named after whose side the middleman is on. A **forward proxy** works for the *asker* — like an assistant who makes your calls, so the other side only sees the assistant. A **reverse proxy** works for the *answerer* — like a receptionist who takes every call and routes it to the right desk.
+
+```mermaid
+flowchart LR
+    You["You"] --> FP["Your assistant<br/>(forward proxy)"] --> Shop["Shop"]
+```
+
+```mermaid
+flowchart LR
+    Caller["Caller"] --> RP["Receptionist<br/>(reverse proxy)"]
+    RP --> D1["Desk 1"]
+    RP --> D2["Desk 2"]
+```
+
+One more idea: some middlemen just pass sealed envelopes along without opening them (**L4** — they only see addresses). Others open the envelope, read the request, and decide where it goes (**L7** — they read the actual message).
+
+The rest of this note is just these 3 questions:
+1. Whose side is the proxy on — the client's or the server's?
+2. Does it read the message (L7) or just pass the bytes (L4)?
+3. Once a proxy is in the middle, how does the server still learn who the real client was?
 
 **The problem in one story.**
 You type `shop.com` and get a page.
@@ -68,7 +98,7 @@ Where it breaks: a receptionist cannot read a sealed letter, but an L7 proxy tha
 > [!tip] Remember
 > Forward proxy hides the client, reverse proxy hides the server; L4 moves bytes, L7 reads requests.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A company has three backend services behind three different internal addresses, and wants `api.example.com` to serve all of them over one TLS certificate, hide the internal topology, and apply one set of rate limits regardless of which service answers.
 
@@ -78,7 +108,7 @@ A **reverse proxy** in front of all three solves this: one public hostname, one 
 
 The mirror case: a company wants every employee laptop's outbound internet traffic to go through one controlled egress point, so it can block known-bad domains and log what left the network. That's a **forward proxy** — it represents the client, not the server.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Forward proxy** = a mail forwarding service you set up before you move. Nobody you write to needs to know your new address; your mail just appears to come from the forwarding service.
 - **Reverse proxy** = a company's front reception desk. Visitors only ever talk to reception; reception decides which internal office actually handles them, and nobody outside needs to know the building's internal layout.
@@ -99,9 +129,11 @@ flowchart LR
     end
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Forward proxy
+
+**In plain words:** the company sets up every laptop so all outgoing traffic goes through one guarded exit door. For encrypted traffic the door normally just passes the sealed envelope through — unless the company has installed its own seal on every laptop, in which case it can open and reseal everything.
 
 The client is configured (by OS proxy settings, or a PAC file pushed by IT) to send every outbound request to the forward proxy instead of directly to the destination.
 
@@ -139,6 +171,8 @@ Without interception, the proxy's job is simpler and more common: blind tunnelin
 
 ### Reverse proxy
 
+**In plain words:** the receptionist answers the outside call (holds the TLS padlock), decides which desk should handle it, and can do shared chores once — logging, limits, compression — so the desks don't each have to.
+
 A reverse proxy terminates the client's connection and makes its own, separate connection(s) to whichever backend it decides should handle the request:
 
 - **TLS termination**: the proxy holds the certificate and decrypts the client's TLS; traffic to the backend may be plaintext (inside a trusted network) or re-encrypted (mTLS to the backend, common in a service mesh).
@@ -148,6 +182,8 @@ A reverse proxy terminates the client's connection and makes its own, separate c
 - **Hiding topology**: clients only ever see the proxy's address, never the backend's internal IPs.
 
 ### L4 vs L7
+
+**In plain words:** L4 is a courier who only reads the address on the envelope; L7 is one who opens the letter and sorts by what it says. Opening costs effort (parsing, decrypting) but lets you route by path or header.
 
 | | L4 (transport layer) | L7 (application layer) |
 | --- | --- | --- |
@@ -172,6 +208,8 @@ flowchart TD
 ```
 
 ### Forwarded headers and trust
+
+**In plain words:** once a middleman forwards your message, the server only sees the middleman's address. So each proxy jots the sender's address on a list (`X-Forwarded-For`) — but anyone can scribble fake entries at the start of that list, so only trust the entries your own proxies wrote.
 
 A reverse proxy that terminates TLS and makes its own connection to the backend necessarily replaces the backend's view of "who is the client" — from the backend's perspective, every request now comes from the proxy's own IP. Two headers restore that information:
 
@@ -207,6 +245,8 @@ PROXY protocol prepends a small, fixed-format header (the real source/destinatio
 
 ### Timeouts, and why a proxy gives you two different error codes
 
+**In plain words:** 502 means "I knocked and nobody answered properly"; 504 means "someone answered the door but took too long to speak, so I gave up."
+
 A reverse proxy has timeouts on both of its legs — client-facing and backend-facing — and they fail differently:
 
 - **502 Bad Gateway**: the proxy could not get a valid response from the backend at all — connection refused, connection reset, or a malformed response.
@@ -220,11 +260,15 @@ A reverse proxy has timeouts on both of its legs — client-facing and backend-f
 
 ### Upstream keepalive
 
+**In plain words:** instead of dialing a fresh phone call to the backend for every request, the proxy keeps a few lines open and reuses them.
+
 Opening a new TCP (and TLS) connection per request to the backend wastes a handshake on every single request.
 
 A reverse proxy keeps a **pool** of already-connected, idle connections to each backend and reuses them (`Keep-Alive`/HTTP persistent connections), sized to roughly match the backend's own concurrency so the pool neither starves (too few, so requests queue for a free connection) nor exhausts the backend's own connection limits (too many).
 
 ### Body limits, and proxying non-HTTP/1.1 traffic
+
+**In plain words:** a proxy should refuse absurdly large uploads itself, and some traffic (WebSocket, gRPC) is a long open phone line, not a letter — the proxy has to know the difference.
 
 - A reverse proxy should enforce a maximum request body size itself (returning `413 Payload Too Large`) rather than letting an unbounded upload exhaust backend memory or disk.
 - **WebSocket**: proxying requires forwarding the `Upgrade: websocket` and `Connection: Upgrade` handshake headers and then holding the connection open as a raw bidirectional pipe — not treating it as a normal request/response cycle.
@@ -265,6 +309,8 @@ A control plane configures every sidecar's routing, retries, timeouts, and mTLS 
 
 ### Reverse proxy vs API gateway vs load balancer
 
+**In plain words:** these are three job titles, not three machines — one receptionist can forward calls (reverse proxy), spread them across desks (load balancer), and check visitor badges (API gateway) all at once.
+
 These three terms describe overlapping software doing different jobs, and the overlap is exactly why people mix them up:
 
 | | Primary job | Typically adds |
@@ -275,7 +321,7 @@ These three terms describe overlapping software doing different jobs, and the ov
 
 A single piece of software (Nginx, Envoy) is often configured to do all three jobs at once; the distinction is about which responsibility you're describing, not which binary is running it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -334,7 +380,7 @@ sequenceDiagram
     Note over P: proxy gives up waiting at 5s,<br/>backend's eventual response is discarded
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Concept | Represents | TLS | Typical tool |
 | --- | --- | --- | --- |
@@ -344,14 +390,14 @@ sequenceDiagram
 | Reverse proxy, L4 | Server (or passthrough) | Untouched (SNI-based routing only) | AWS NLB, IPVS, HAProxy (L4 mode) |
 | Sidecar proxy | Each individual service instance | Often mTLS, terminated and re-established by the sidecar | Envoy (Istio/Linkerd data plane) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Every proxy hop adds latency (a handshake, a parse, a forward) and a new single point of failure if not itself made redundant.
 - An L4 passthrough keeps end-to-end TLS (the backend, not the proxy, sees the real certificate and client), which is sometimes a requirement — but it also means the proxy cannot add any HTTP-aware feature (path routing, header rewriting, WAF rules) at all.
 - A sidecar-per-instance service mesh adds meaningful memory and CPU overhead across a large fleet, and another moving part to operate — not worth it for a handful of services that can agree on a shared library instead.
 - Trusting forwarded headers blindly is worse than not using them at all: a backend that reads `X-Forwarded-For` without validating the trusted-hop count is handing every attacker a free way to spoof their own IP.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Nginx and HAProxy as classic L7/L4 reverse proxies in front of monoliths and API fleets; Envoy as both an edge proxy (Envoy Gateway, Istio ingress) and a sidecar; AWS NLB (L4) in front of ALB or Envoy fleets for connection-level load spreading before HTTP routing; corporate forward proxies (Zscaler, Blue Coat) for egress control and TLS inspection, as measured above.
 - **Failure modes → fixes:**
@@ -362,14 +408,14 @@ sequenceDiagram
   - WebSocket drops after an idle period → the proxy's idle timeout closed a connection the application considered still alive; raise the proxy's idle timeout or add application-level pings.
 - **What to monitor:** proxy-reported 4xx/5xx split from backend-reported ones (a 502/504 at the proxy means the backend never even answered correctly, which is a different signal than the backend returning its own 500), upstream connect/response latency, active/idle connection pool size, TLS handshake failure rate, and body-size rejection count.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why SNI makes L4 TLS routing possible at all.** Before SNI, a TLS listener needed one IP per certificate, because the server had to pick a certificate before it knew which hostname the client wanted (the ClientHello came first, encryption started only after). SNI puts the hostname in the clear in the ClientHello specifically so a server — or an L4 proxy sitting in front of several TLS-terminating backends — can pick the right certificate or backend without seeing anything else about the request.
 - **Buffering's hidden cost.** A proxy that buffers the entire request body before forwarding protects backend threads from slow clients ("slowloris"-style attacks), but for large uploads it doubles memory/disk use (once at the proxy, once at the backend) and adds latency equal to the slowest part of the upload. Streaming the body through instead avoids the double-buffering but reopens the slow-client exposure, which is why proxies offer both modes and a timeout as the real defense either way.
 - **The `CONNECT` method's narrow scope.** `CONNECT` only establishes a tunnel; the proxy that issued the `200 Connection Established` response has no visibility into anything that follows unless it's also doing active TLS interception. This is exactly why a non-intercepting forward proxy can allowlist by **destination hostname** (seen in the `CONNECT` request line) but not by URL path or request body — those are inside the now-opaque tunnel.
 - **mTLS inside a service mesh changes the trust model entirely.** Instead of "trust the last N hops of a header", each sidecar presents a certificate identifying its own service identity (often SPIFFE-style), and every hop can cryptographically verify who it's actually talking to — this is a stronger and more automatically-rotated trust boundary than header-based forwarding, at the cost of mesh-wide certificate issuance and rotation infrastructure.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the core difference between a forward proxy and a reverse proxy?
 > A forward proxy is the client's agent: it sits in front of clients and forwards their outbound requests, usually so the destination server never needs to know about it. A reverse proxy is the server's agent: it sits in front of one or more backends and accepts inbound requests on their behalf, usually so clients never need to know which backend actually answered.
@@ -389,7 +435,7 @@ sequenceDiagram
 > [!question]- When would you deliberately choose an L4 passthrough over an L7 reverse proxy?
 > When you need end-to-end TLS with no intermediary able to see plaintext (regulatory or security requirement), when the backend itself needs to see the original client's TLS session (e.g. for client certificate auth it performs itself), or when you need the lowest possible added latency and have no need for path/header-based routing.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Forward proxy = client's agent (egress control, allowlists, optional TLS inspection via `CONNECT`). Reverse proxy = server's agent (TLS termination, routing, hiding backend topology).
 - L4 forwards bytes by IP:port or SNI, blind to HTTP; L7 terminates and routes by path/host/header.

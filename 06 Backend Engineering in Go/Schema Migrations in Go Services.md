@@ -25,7 +25,31 @@ updated: 2026-11-13
 > - The actual zero-downtime technique — expand, migrate, contract — is schema theory, not a Go concern; see [[Zero-Downtime Schema Migrations]] for the lock mechanics and the deploy-safety rules this note assumes.
 > - Classic mistake: `CREATE INDEX CONCURRENTLY` inside goose's default transaction wrapper. Postgres rejects it outright.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code changes; the database's table shapes (the **schema**) must change with it. A **migration** is a small numbered file that makes one such change: "003: add column due_date".
+
+Migrations run in order, exactly once each. A ledger table in the database records which numbers already ran, so a new deploy knows where to pick up.
+
+```mermaid
+flowchart LR
+    F[Numbered SQL files 001..N] --> M[Migration tool] --> L[(Ledger table: applied up to 004)]
+    M --> S[(Schema changed)]
+```
+
+Two copies of your service starting at once must not both run migration 005 — so the tool takes a database lock first.
+
+The rest of this note is just these 3 questions:
+1. How do the ledger and the "dirty" flag work?
+2. How does locking stop two replicas migrating at once?
+3. Where should migrations run — app startup, a job, or CI?
 
 **The problem in one story.**
 Your app saves invoices in a database table.
@@ -71,7 +95,7 @@ Where it breaks: a half-built window is visible in a house; a half-applied migra
 > [!tip] Remember
 > Numbered files, applied once, in order, recorded in a ledger, by one replica at a time.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps runs behind a rolling deploy with 3 replicas. A release adds a `status_new` column, backfills it from the old `status` column, and later drops the old one — three migrations shipped across three deploys. Two things go wrong without a plan for *how Go runs these files*:
 
@@ -84,7 +108,7 @@ InvoiceOps runs behind a rolling deploy with 3 replicas. A release adds a `statu
 
 A Go service's job is to run the right files, in order, exactly once per environment, with the locking and transaction-wrapping handled correctly — not to invent the expand/contract plan itself.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of migrations as **commits for the schema**: each one is a small, reviewed, ordered diff, applied once, never rewritten after it ships.
 
@@ -92,15 +116,19 @@ The `schema_migrations` table is `git log --oneline` for the database — one ro
 
 The one thing version control doesn't need and migrations do: **mutual exclusion**. Two developers can `git push` into a feature branch without stepping on each other because branches don't clash. Two replicas racing to `ALTER TABLE` the same table at once absolutely clash, so running migrations needs a lock that git commits don't.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The ledger and the dirty flag
+
+**In plain words:** the ledger is the database's own diary of applied migrations; the dirty flag means one died halfway and a human must look before anything else runs.
 
 Both libraries create a tracking table on first run (`schema_migrations` for golang-migrate, `goose_db_version` for goose) holding the current version and a `dirty` boolean. Before each migration: mark dirty. Run the file. On success: record the new version, clear dirty.
 
 If the process dies mid-file — OOM-killed, deploy rolled back, the pod evicted — the row is left with `dirty = true`, and the tool refuses to run anything else until a human runs `migrate force <version>` (or goose's equivalent) after checking by hand whether the DDL actually landed.
 
 ### Locking across replicas
+
+**In plain words:** take one named database lock before migrating, so the second replica waits or skips instead of colliding.
 
 ```mermaid
 sequenceDiagram
@@ -131,6 +159,8 @@ This is the single most important difference between the two libraries for a mul
 
 ### Where to run them
 
+**In plain words:** three places to trigger migrations, from cozy (app startup) to disciplined (a separate deploy step), and when each is fine.
+
 ```mermaid
 flowchart TD
     A{Where does migrate.Up run?} -->|app startup, every pod| B["Simplest to wire.<br/>N replicas all try at once -> needs the lock above.<br/>A slow migration delays every pod's readiness probe."]
@@ -149,9 +179,11 @@ A CI step or a one-shot Kubernetes `Job` / init container avoids that by running
 
 For a long-running batched backfill in particular, prefer a one-shot job (or a [[Scheduled Jobs|background job]]), not the request path or the startup path — see the batching code below.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** two migration files, the embed, and the run-at-startup call.
 
 The bare idea, with no transaction wrapping, no locking and no embedding — just "open a migrate instance pointed at a folder of SQL files, run it up":
 
@@ -417,7 +449,7 @@ A backfill that needs true per-batch commits belongs in its own one-shot job (se
 
 CI testing these migrations is `go test -tags=integration` against a disposable Postgres container, running up → down → up and asserting the schema matches at each step — see [[Testing Go Services]] for the testcontainers setup this reuses.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Tool            | Migration format               | Locking across replicas                              | Zero-tx DDL (`CONCURRENTLY`)                | Best fit |
 | ---------------- | ------------------------------ | ----------------------------------------------------- | -------------------------------------------- | -------- |
@@ -426,14 +458,14 @@ CI testing these migrations is `go test -tags=integration` against a disposable 
 | Atlas            | Declarative desired-state schema; generates versioned migrations | Depends on the runner wrapping Atlas's CLI/API | Atlas can generate `CONCURRENTLY` and flags destructive changes in CI lint | Teams who want schema drift caught in review, not at deploy |
 | `tern`           | SQL files, numbered             | No built-in distributed lock; wrap it yourself         | Plain SQL files, no transaction wrapper by default | Small pgx-only shops who want the thinnest possible tool |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Startup-time migrations are simple to wire but couple deploy speed to migration speed, and a long migration delays every pod's readiness probe — see "Where to run them" above.
 - `goose`'s Go-migration escape hatch is powerful but couples your schema history to your binary's compiled code: a Go migration from two years ago has to keep compiling against today's dependencies forever, unlike a SQL file that never changes meaning.
 - Declarative tools (Atlas) remove hand-written `up`/`down` pairs but hide the exact DDL that will run until you generate and read the plan — don't skip reading it.
 - For a single-instance hobby service with no rolling deploys, a locking strategy is overhead you don't need; a single `migrate up` on deploy is enough.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** golang-migrate and goose are the two most common migration runners in Go services; Atlas is increasingly used specifically for its CI-time lint step that flags locking or destructive DDL before merge.
 - **Failure modes → fixes:**
@@ -443,7 +475,7 @@ CI testing these migrations is `go test -tags=integration` against a disposable 
 	- A backfill migration runs as part of app startup and takes 10 minutes → every pod's startup probe times out and Kubernetes kills and restarts it, forever. Move it to a one-shot job instead.
 - **What to monitor:** migration duration per deploy, `schema_migrations.dirty`, and (for a long backfill job) rows migrated per minute and time-to-completion.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why golang-migrate's lock is automatic and goose's isn't.** golang-migrate's `Postgres` driver calls `Lock()`/`Unlock()` internally around every `Up`/`Down`/`Steps` call — there is no option to skip it. goose's `Provider` API was built to support multiple databases and multiple lock strategies (or none), so locking is a `SessionLocker` you opt into; the historical `goose.Up(db, dir)` package-level functions some older code still uses don't take a locker at all.
 
@@ -452,7 +484,7 @@ CI testing these migrations is `go test -tags=integration` against a disposable 
 - **MySQL has no equivalent advisory lock with the same semantics** (`GET_LOCK()` exists but behaves differently under connection pooling), and MySQL DDL implicitly commits any open transaction — a reason both tools treat Postgres as the well-trodden path and MySQL users read their driver's docs more carefully before assuming transactional DDL.
 - **Rollback strategy.** `down` migrations exist for emergencies, but in practice "roll forward" (ship a new migration that fixes the mistake) is almost always safer once the `up` migration has touched production data — a `down` migration that drops a column nobody backed up is a second way to lose data, not a safety net.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Two pods start at the same moment and both try to run pending migrations. What stops them from applying the same migration twice?
 > A Postgres session-level advisory lock. `golang-migrate` takes it automatically before touching `schema_migrations`; `goose`'s `Provider` API only takes it if you pass `WithSessionLocker(lock.NewPostgresSessionLocker())` — leaving that out is the single easiest way to get a race in production.
@@ -475,7 +507,7 @@ CI testing these migrations is `go test -tags=integration` against a disposable 
 > [!question]- What does `sqlfiles/*.sql` with `//go:embed` buy you over reading migration files off disk at runtime?
 > The compiled binary and its schema history can never drift apart — there's no separate migrations directory to forget to copy into a container image, and `go build` fails loudly if the embed path is wrong, instead of the service silently finding zero migrations at startup.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Migrations are ordered, one-way files (`NNNN_name.up.sql` / `.down.sql`), never edited once applied.
 - `schema_migrations` (or `goose_db_version`) is the ledger; `dirty = true` means a migration died mid-run — fix by hand, then force the version.
@@ -486,7 +518,7 @@ CI testing these migrations is `go test -tags=integration` against a disposable 
 - `//go:embed` the SQL files so the binary and the schema history ship together.
 - The zero-downtime technique itself — expand, migrate, contract — is [[Zero-Downtime Schema Migrations]], not this note.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Database Access (database-sql, pgx, sqlc)]], [[Zero-Downtime Schema Migrations]]
 - **Next:** [[Testing Go Services]] (testcontainers for up → down → up CI checks), [[Transactions and the Repository Pattern]]

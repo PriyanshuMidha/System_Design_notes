@@ -17,7 +17,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > The runnable side of [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]: an ordinary goroutine-per-connection TCP echo server, proven to handle 200 concurrent clients correctly and cheaply, plus a measured throughput figure for round trips per second through it — all without the application code ever mentioning `epoll`, because the netpoller hides it.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code" and "What this code shows". Stop there.
+> - 🟡 **Know the basics?** Add "Code", "Design decisions" and "Running it".
+> - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢
+
+This file is the hands-on twin of the theory note. It builds a tiny echo server in Go — a server that just sends back whatever you send it — and then proves two things with tests: 200 clients at once all work correctly and cheaply, and the server handles about 56,000 round trips per second on a laptop. Read it top to bottom; every code block is followed by a plain "How it works" list. You never see `epoll` in the code — that absence is the whole lesson.
+
+## Before the code 🟢
 
 - **Goroutines (`go func(){...}()`)**: a cheap concurrent task; the server starts one per connection.
 - **`net.Listener` / `net.Conn` (interfaces)**: the standard library's network types; `Accept`, `Read`, `Write` look blocking but park only the goroutine.
@@ -26,7 +35,7 @@ updated: 2026-11-13
 - **`defer`**: runs cleanup (like `Close`) when the function returns, on every path.
 - **What to run**: `go vet ./... && go test -race -v ./...` in a module named `iomodels`; `-race` turns on the data-race detector.
 
-## What this code shows
+## What this code shows 🟢
 
 Every call in this module that looks like it blocks — `Accept`, `Read`, `Write` — is a call into `net.Conn` or `net.Listener`. That is exactly the surface the theory note's "How Go's netpoller makes blocking-style code use epoll" section describes.
 
@@ -48,7 +57,7 @@ flowchart LR
     E --> RW["io.Copy(conn, conn)"]
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24. No external dependencies: everything is the standard library (`net`, `io`, `sync`, `runtime`, `time`).
 - Layout: a single-package module `iomodels` with `echo.go`, `echo_test.go` and `echo_bench_test.go`.
@@ -57,9 +66,11 @@ flowchart LR
 - The race detector (`-race`) is deliberately part of the standard run here, not an optional extra.
 - A shared buffer bug in this kind of concurrent networking code is exactly the class of bug `-race` exists to catch, and the Pitfalls section below shows one on purpose.
 
-## Code
+## Code 🟡
 
 ### Step 1: the echo server
+
+**In plain words:** the whole server is a loop: accept a connection, hand it to a cheap goroutine, and that goroutine copies bytes straight back to the sender.
 
 **Concept.** The theory note's whole point is that `conn.Read`, `conn.Write` and `ln.Accept` all *look* like blocking calls but never block an OS thread. The Go runtime parks the goroutine on its internal netpoller instead ([[I-O Models - Blocking, epoll, io_uring and the Go Netpoller#How Go's netpoller makes blocking-style code use epoll]]).
 
@@ -117,7 +128,7 @@ sequenceDiagram
     Conn->>Conn: io.Copy returns, defer c.Close()
 ```
 
-## Design decisions
+## Design decisions 🟡
 
 Each row below is a choice that shapes how directly this code can demonstrate the netpoller's effects rather than its internals.
 
@@ -129,9 +140,11 @@ The module is deliberately small and dependency-free so that every line a reader
 | `io.Copy(c, c)` for the echo logic | A manual `for { Read; Write }` loop | `io.Copy` is one line and handles buffer sizing and `io.EOF` correctly; a manual loop would need to do the same bookkeeping by hand |
 | Measuring with a loopback TCP server | Measuring with a mocked `net.Conn` | A real listener and real dials exercise the actual netpoller registration path; a mock would skip the exact mechanism this note is about |
 
-## Tests
+## Tests 🔴
 
 ### Test 1: many concurrent connections, proven cheap
+
+**In plain words:** fire 200 clients at the server at once, check each one gets its own message back, and check no goroutine is left hanging afterwards.
 
 **Property.** 200 concurrent clients must all round-trip their own distinct message correctly, and the goroutine count must return to (near) baseline afterward — proving no goroutine was left parked forever.
 
@@ -250,6 +263,8 @@ Finally, the test waits for every client and checks for leaks:
 
 ### Test 2: measured throughput
 
+**In plain words:** time 1,000 ping-pong exchanges across 50 connections and turn that into a round-trips-per-second number.
+
 **Property.** With a fixed connection count and round-trip count, the server sustains a measurable number of round trips per second — giving a concrete number instead of only "many connections are cheap."
 
 | Input | Measured (Go 1.24.4, darwin/arm64, `-race`, loopback, 2026-11-09) |
@@ -346,7 +361,7 @@ That is a number bounded by Go scheduling and loopback-socket overhead, since th
 
 The most likely cause after an edit here is a buffer declared *outside* the per-connection goroutine and shared across them, which both breaks correctness and triggers a data race under `-race` — exactly the bug the comment next to `buf := make(...)` warns against.
 
-## Running it
+## Running it 🟡
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -376,7 +391,7 @@ None of these four lines mention `epoll`, `kqueue`, or any syscall by name, and 
 
 The netpoller's entire job is to make this kind of ordinary-looking, blocking-style Go code scale to many connections without the application ever needing to know which readiness-notification mechanism the runtime chose underneath it on this particular operating system.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 The pitfalls below are the specific, concrete failure modes this small module can actually demonstrate.
 
@@ -387,13 +402,13 @@ Each one maps to a real line in the code above, not a generic warning, and each 
 - **`t.Error`, never `t.Fatal`, inside a non-test goroutine.** `t.Fatal` calls `runtime.Goexit`, which must happen on the test's own goroutine; calling it from a spawned goroutine silently does not fail the test the way you would expect.
 - **The goroutine-leak check allows slack (`before+5`), not an exact match.** Background runtime goroutines (GC workers, timers) can vary slightly between runs; asserting an exact count would make the test flaky for reasons unrelated to the code under test.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `TestEchoServerThroughput`'s `roundTripsPerConn` from 20 to 200 and predict whether round-trips-per-second rises, falls, or stays about the same. Run it and explain the result using "How it works."
 2. Deliberately hoist `buf` back above the `go func()` loop (making it shared) and run `go test -race`. Read the race report and map each stack frame back to the line that caused it, then explain in your own words why the shared slice is unsafe even though every goroutine only writes to the first few bytes of it.
 3. Add a variant of `EchoServer` that uses `conn.SetReadDeadline` with a short timeout instead of relying on `CloseWrite`, and write a test that proves a client that never writes gets disconnected instead of parking forever. Compare the goroutine-count check in that new test against the one in `TestEchoServerHandlesManyConcurrentConnections`.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]
 - **Before this:** [[Concurrency Primitives - Mutex, Semaphore, Atomics]], [[System Calls and User vs Kernel Mode]]

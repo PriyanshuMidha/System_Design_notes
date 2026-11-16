@@ -24,6 +24,8 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
+**In plain words:** this picture shows the whole trick in two visits — the first visit downloads the file, the second visit just asks "did it change?" and gets a tiny "no" back.
+
 One static JSON response, requested twice:
 
 ```mermaid
@@ -41,7 +43,39 @@ sequenceDiagram
 
 The second response carries no body at all — just a status line and a couple of headers — because the server can prove nothing changed.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You visit the same website every day. The logo never changes. Downloading it again every day is a waste.
+
+So your browser keeps a saved copy. That saved copy is called a **cache**.
+
+```mermaid
+flowchart LR
+    A["Day 1: download logo<br/>(slow, full file)"] --> B["Browser saves a copy"]
+    B --> C["Day 2: use the saved copy<br/>(instant, no download)"]
+```
+
+But what if the logo *did* change? The server solves this with two tools. It puts a "best before" time on the copy (**TTL**, like `max-age=60` meaning "trust this for 60 seconds"). And it gives the copy a short fingerprint (**ETag**). After the time runs out, the browser just asks "is my fingerprint still current?" — if yes, the server replies with a tiny "nothing changed" message instead of the whole file.
+
+```mermaid
+flowchart LR
+    Q{"Is my copy<br/>past its time?"} -- "no" --> U["Just use it"]
+    Q -- "yes" --> A2["Ask: still fingerprint X?"]
+    A2 -- "yes (tiny reply)" --> U
+    A2 -- "no" --> D["Download the new file"]
+```
+
+That is all of HTTP caching. The rest of this note is just these 3 questions:
+1. How long may a copy be trusted without asking? (freshness)
+2. Once that time is up, how do you check cheaply whether it changed? (validation)
+3. Who is allowed to keep a copy at all? (browser only, or shared servers too)
 
 **The problem in one story.**
 You open a shopping site every morning.
@@ -87,7 +121,7 @@ Where it breaks: milk can go bad before its date, but an HTTP copy is treated as
 > [!tip] Remember
 > Fresh copy: use it with no network call. Stale copy: ask cheaply whether it changed.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine a product page whose price rarely changes, but a thousand people load that page every minute. Without caching, every single one of those thousand loads re-fetches the same CSS, the same images, the same font, and the same price JSON from the origin server — even when nothing has changed since the visit a few seconds earlier.
 
@@ -106,7 +140,7 @@ A concrete example: an e-commerce product page's price JSON is 14 bytes.
 > [!tip] Remember
 > Caching exists to avoid paying for the same answer twice: once by skipping the trip entirely, and once by skipping the resend when the trip is unavoidable.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **In plain words:** think of a cache as a assistant sitting between you and a busy office. The assistant asks two questions, in order, every time you want something: "do I already have a recent-enough copy?" and, if not, "has it actually changed since I last checked?"
 
@@ -127,7 +161,7 @@ flowchart LR
 > [!tip] Remember
 > A cache always asks "can I skip the trip?" before it ever asks "can I skip the resend?" — freshness and validation are two separate gates, not one setting.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Cache-Control directives
 
@@ -225,7 +259,7 @@ flowchart LR
 > [!tip] Remember
 > `Vary` is a correctness tool, not a performance one by itself — it only pays off when the header it names actually has few distinct values in practice.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A handler computes a hash of the current body as its ETag, and answers `304` whenever the client already has that exact hash:
 
@@ -250,7 +284,7 @@ Trace it step by step for one resource, `price.json`, over two requests:
 
 Runnable Go version: [[HTTP Caching - Cache-Control, ETag, Conditional Requests - Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Mechanism | Answers | Saves | Cost of getting it wrong |
 | --- | --- | --- | --- |
@@ -260,14 +294,23 @@ Runnable Go version: [[HTTP Caching - Cache-Control, ETag, Conditional Requests 
 | `stale-while-revalidate` | "Can I answer instantly and check in the background?" | User-facing latency on revalidation | Serves data up to `N` seconds out of date by design — know that trade-off is intentional |
 | `Vary` | "Which request header splits the cache key?" | Nothing by itself — it's a correctness constraint | `Vary: Cookie` (or any high-cardinality header) silently defeats shared caching |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
+
+**In plain words:** caching is always the same deal — you accept slightly old data in exchange for speed. The only question is how old is acceptable for *this* data.
+
+```mermaid
+flowchart LR
+    A["Live auction bid,<br/>payment status"] --> B["no-store /<br/>max-age=0"]
+    C["Product price,<br/>news feed"] --> D["short max-age<br/>+ ETag"]
+    E["Logo, hashed<br/>app.3f8a21.js"] --> F["max-age=1 year,<br/>immutable"]
+```
 
 - Caching trades freshness for speed and origin load; anything that must reflect the absolute latest state on every read (a live auction bid count, a real-time stock ticker) should set `no-store` or a very short `max-age`, not rely on revalidation alone.
 - ETags cost a hash computation per response; for very large or expensive-to-hash bodies, `Last-Modified` (if you already track an update timestamp) is cheaper, at the cost of coarser precision.
 - `stale-while-revalidate` and `stale-if-error` intentionally serve data that is known to be out of date; never use them for anything where a stale read is a correctness bug, not just a UX nuisance (an inventory count close to zero, a payment status).
 - Application-level caching (Redis, in-memory caches) and CDN edge-caching policy are different layers with different lifetimes and invalidation tools — see [[Caching Fundamentals]] and [[CDN and Edge]]; this note covers only the HTTP-level contract between a client/cache and the origin.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** browsers, forward and reverse proxies, and CDNs (see [[CDN and Edge]]) all implement this same `Cache-Control`/validator contract; static-asset pipelines commonly pair content-hashed filenames (`app.3f8a21.js`) with `Cache-Control: public, max-age=31536000, immutable` so a changed file gets a new URL instead of ever needing revalidation, while HTML itself usually ships `no-cache` so navigation always revalidates.
 - **Failure modes → fixes:**
@@ -277,7 +320,7 @@ Runnable Go version: [[HTTP Caching - Cache-Control, ETag, Conditional Requests 
   - **ETag changes on every request even though content didn't** (a timestamp embedded in the hashed bytes, or per-process randomness) → hash only the stable, meaningful content fields, not metadata that changes incidentally.
 - **What to monitor:** cache hit ratio (requests served without reaching origin) and `304` ratio (requests that reached origin but needed no body resent) — both reduce origin load, but a persistently low `304` ratio on content that should be stable usually means an unstable ETag.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Strong vs weak validators.** An ETag without a `W/` prefix is a *strong* validator: byte-identical content guaranteed. `W/"..."` marks a *weak* validator: semantically equivalent but not necessarily byte-identical (e.g. same JSON data re-serialized with different key order).
   Range requests (`Range:`/`If-Range:`, resuming a partial download) require a strong validator, because combining two differently-ordered byte ranges from a "weakly equivalent" response would be silently wrong.
@@ -286,7 +329,7 @@ Runnable Go version: [[HTTP Caching - Cache-Control, ETag, Conditional Requests 
 - **Request collapsing** (mentioned here because it interacts directly with conditional requests): when many concurrent requests for the same stale URL arrive at a cache simultaneously, a well-built cache sends only *one* revalidation request upstream and lets the rest wait on its result, instead of a thundering herd of identical revalidations hitting the origin at once.
   This is a CDN/reverse-proxy implementation detail, not an HTTP header — see [[CDN and Edge]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the actual difference between `no-cache` and `no-store`?
 > `no-cache` allows storing the response but requires revalidating with the origin before reusing it on every single use — the cache still does its job of avoiding a full re-download on a `304`. `no-store` forbids keeping any copy of the response at all, anywhere, so there is nothing to revalidate; use it for genuinely sensitive one-time content.
@@ -312,7 +355,7 @@ Runnable Go version: [[HTTP Caching - Cache-Control, ETag, Conditional Requests 
 > [!question]- A CDN in front of your API is configured with `s-maxage=300` but the browser still seems to refetch on every page load. Why might that be correct behavior?
 > `s-maxage` governs *shared* caches (the CDN) only; it doesn't set the browser's own private cache freshness. If `max-age` is absent or `0`, the browser must revalidate on every load even though the CDN itself is serving from its 300-second-fresh copy without reaching your origin. Set both directives deliberately when the two audiences (CDN vs browser) should behave differently.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Freshness (`max-age`/`s-maxage`) skips the network call entirely; validation (`ETag`/`Last-Modified`) skips resending the body once stale.
 - `no-cache` = "store it, but always revalidate first"; `no-store` = "never keep a copy anywhere" — not two ends of one scale.

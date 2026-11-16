@@ -18,7 +18,14 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code measures the real cost of a genuine, always-trapping system call (`write` to `/dev/null`), contrasts it with a syscall-shaped library call that may be cached (`os.Getpid`), and with a pure userspace function call that touches the kernel at all. It gives the three numbers [[System Calls and User vs Kernel Mode]] reasons about.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the theory note first ([[System Calls and User vs Kernel Mode]]). Here, read "From zero" below, "Before the code" and "What this code shows", then skim the code steps.
+> - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
+> - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢: this file is the hands-on side of [[System Calls and User vs Kernel Mode]]. It measures three costs side by side: a real system call (write to /dev/null), a syscall-shaped call that may be cached (os.Getpid), and a plain function call — so 'syscalls are expensive' becomes numbers you measured yourself.
+
+## Before the code 🟢
 
 - **`syscall` package** (`syscall.Write`): calls the raw OS system call directly, skipping `os.File`'s extra layers, so the measured cost is the kernel crossing.
 - **`os` package** (`os.Getpid`): a syscall-shaped library call that may be cached and never trap.
@@ -27,7 +34,7 @@ updated: 2026-11-13
 - **Tests that compare, not assert exact numbers**: the test checks "a syscall is slower than a pure function call", which holds on any machine.
 - **What to run:** `go vet ./... && go test -race ./...` inside the module; add `-v -run TestWriteSyscallCost` to see timings.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept | Link |
 | --- | --- | --- |
@@ -36,7 +43,7 @@ updated: 2026-11-13
 | `PureCallCost` | The zero-crossing floor: no kernel involvement at all | [[System Calls and User vs Kernel Mode#Tracing the measurement by hand]] |
 | `TestWriteSyscallCostIsMeasurableAndSlowerThanPureCall` | The core claim: a real trap costs measurably more than a pure call | [[System Calls and User vs Kernel Mode#Tracing the measurement by hand]] |
 
-## Setup
+## Setup 🟢
 
 - Module: `syscalls`, Go 1.24.4, no external dependencies (standard library only: `os`, `syscall`, `time`).
 - Layout:
@@ -53,7 +60,7 @@ updated: 2026-11-13
   go test -race -v ./... -run TestWriteSyscallCost
   ```
 
-## Code
+## Code 🟡
 
 ### Step 1: measuring a real, always-trapping syscall
 
@@ -217,7 +224,7 @@ func PureCallCost(iterations int) time.Duration {
 > }
 > ```
 
-## Tests
+## Tests 🟡
 
 ### `TestWriteSyscallCostIsMeasurableAndSlowerThanPureCall`
 
@@ -248,7 +255,7 @@ func TestWriteSyscallCostIsMeasurableAndSlowerThanPureCall(t *testing.T) {
 
 A failure where `writeCost <= pureCost` would mean something is deeply wrong with either the benchmark (most likely: the compiler eliminated the loop body despite the `sink` trick) or the measurement environment (a system under such heavy noise that nanosecond-scale timing is meaningless) — not a realistic outcome under normal conditions on real hardware.
 
-## Design decisions
+## Design decisions 🟡
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -257,7 +264,7 @@ A failure where `writeCost <= pureCost` would mean something is deeply wrong wit
 | `sink` global to defeat dead-code elimination | `testing.B`'s built-in benchmark harness (`go test -bench`), which has its own anti-elision mechanisms | A plain `go test` with manual timing keeps this note's code runnable as an ordinary function from any caller, not only from `go test -bench`; the trade-off is needing the `sink` trick by hand |
 | Testing only the `write` vs. pure-call comparison, not `getpid` vs. pure-call | Also asserting a strict inequality for `GetpidCost` | `GetpidCost` is explicitly unreliable across platforms (it may or may not be cached), so asserting a strict ordering on it would make the test flaky by design — the theory note itself warns against trusting that number |
 
-## Running it
+## Running it 🟡
 
 ```bash
 $ go test -race -v ./...
@@ -271,13 +278,13 @@ Reading this output: the test passes silently, meaning the real trap (`write` to
 
 `-race` reports no data races, which is expected: this code is entirely single-goroutine, with no shared mutable state other than the package-level `sink` variable, which only this goroutine ever touches.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - Removing the `sink = acc` assignment (or otherwise never reading `acc`'s final value) lets an optimizing compiler legally delete the entire loop in `PureCallCost`, since Go's compiler is permitted to eliminate computations whose results are provably never observed — this would silently turn the "pure call" baseline into "an empty loop," invalidating the whole comparison.
 - `WriteSyscallCost` returns an error instead of calling `t.Fatal` directly, because it is library code meant to be called from a test (or anywhere else) — propagating the error lets the caller decide how to report it, which is the idiomatic Go pattern versus baking in a dependency on `testing`.
 - The measured numbers in this note's "Running it" output and in the theory note's table are specific to one machine, one Go version, and one moment in time; rerunning this exact test on different hardware will produce different absolute numbers, though the *ordering* (trap > cached call > pure call) should hold everywhere.
 
-## Exercises
+## Exercises 🔴
 
 1. **Change this, predict the result:** change `WriteSyscallCost` to write to a regular file on disk instead of `/dev/null` (clean up the file afterward). Predict whether the per-call average goes up, down, or stays about the same, and explain why using the theory note's "kernel's own work" cost component.
 2. **Change this, predict the result:** reduce `iterations` in the test from 10,000 to 10. Predict whether the test becomes more or less likely to fail, and why, in terms of what a smaller sample size does to timing noise.

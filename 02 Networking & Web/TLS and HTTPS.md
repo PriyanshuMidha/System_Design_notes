@@ -38,7 +38,39 @@ A client visiting `https://api.example.com`:
 
 That's the whole deal: identity (certificate) plus a secret only the two endpoints can derive (ECDHE) equals HTTPS.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Plain web traffic (**HTTP**) is like a postcard. Everyone who carries it — the café Wi-Fi, the ISP — can read it and even change it.
+
+```mermaid
+flowchart LR
+    Y["You"] -- "postcard: 'my password is...'" --> W["Café Wi-Fi"] --> I["ISP"] --> B["Bank"]
+    W -. "can read it" .-> X["Anyone in between"]
+```
+
+**HTTPS** puts the postcard in a locked box. Only you and the website have the key. Before locking, the website also shows an ID card (a **certificate**) signed by an authority your browser already trusts, so you know it really is your bank and not a fake.
+
+```mermaid
+flowchart LR
+    Y["You"] -- "1. check the ID card" --> B["Bank"]
+    Y -- "2. agree on a secret key<br/>(in public, but uncrackable)" --> B
+    Y == "3. locked-box traffic" ==> B
+```
+
+The clever part: the two sides agree on the secret key by talking in public, yet an eavesdropper who hears everything still cannot work the key out.
+
+The rest of this note is just these 4 questions:
+1. How do two strangers agree on a secret in public (key exchange)?
+2. How do you know the other side is really who it claims (certificates)?
+3. What exactly happens in the first few messages (the handshake)?
+4. Where does the encryption start and stop in a real setup (termination)?
 
 **The problem in one story.**
 You log in to your bank on café Wi-Fi.
@@ -84,7 +116,7 @@ Where it breaks: the ID only proves the name is real; it says nothing about whet
 > [!tip] Remember
 > A certificate proves *who* you are talking to; the key exchange makes sure *nobody else* can read it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Plain HTTP sends everything, including passwords, cookies and page content, as readable bytes on the wire.
 
@@ -94,7 +126,7 @@ TLS exists to remove both of those: confidentiality (nobody else can read it) an
 
 The practical trigger for "HTTPS everywhere" was the free, automated Let's Encrypt CA (2015) and browsers marking plain HTTP as "Not Secure" starting around 2018 — before that, a certificate cost money and required a manual yearly renewal, so a large fraction of the web stayed on HTTP by default.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Two parts, and it helps to keep them separate:
 
@@ -115,9 +147,11 @@ flowchart LR
 > [!tip] Remember
 > Key exchange and certificates solve two different problems. Key exchange (ECDHE) answers "can two strangers agree on a secret nobody else can compute?" Certificates answer "is the party on the other end who they claim to be?" HTTPS needs both; neither alone is enough.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### TLS 1.2: two round trips
+
+**In plain words: the older handshake is a slower back-and-forth — hello, your turn, my turn — costing two full round trips before any real data moves.**
 
 ```mermaid
 sequenceDiagram
@@ -136,6 +170,8 @@ sequenceDiagram
 ```
 
 ### TLS 1.3: one round trip, plus a 0-RTT option
+
+**In plain words: the newer handshake saves a trip by guessing — the client sends its half of the key in the very first message, like showing up with the paperwork already filled in.**
 
 TLS 1.3's key idea: the client guesses which key-exchange group the server supports and sends its key share **in the first message**, instead of waiting for the server to pick a cipher suite first.
 
@@ -172,12 +208,16 @@ sequenceDiagram
 
 ### SNI and ALPN happen in the same first message
 
+**In plain words: the first hello also says "I want to talk to this site" (SNI) and "here are the languages I speak" (ALPN) — and that site name goes out unencrypted.**
+
 Both ride inside the `ClientHello`, in plaintext (until TLS 1.3's Encrypted Client Hello extension, not yet widely deployed, hides SNI too):
 
 - **SNI (Server Name Indication, RFC 6066):** the hostname the client is trying to reach. Without it, a server hosting many HTTPS sites on one IP (near-universal today) wouldn't know which certificate to present before the handshake is far enough along to know — it would have to use one certificate for every site on that IP.
 - **ALPN (Application-Layer Protocol Negotiation, RFC 7301):** the client lists protocols it can speak (`h2`, `http/1.1`); the server picks one and returns it in `ServerHello`. This is how a Go server decides to speak HTTP/2 instead of HTTP/1.1 — see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]].
 
 ### Certificates: chain, SANs, validation levels
+
+**In plain words: a certificate is an ID card for a domain; what matters is the list of names on it (SAN) and the chain of signatures leading back to someone your browser already trusts.**
 
 - **Subject Alternative Name (SAN):** the actual list of hostnames (or `*.example.com` wildcard) a certificate is valid for. Browsers ignore the older `CN` (Common Name) field entirely; only SAN matters today.
 
@@ -189,6 +229,8 @@ Both ride inside the `ClientHello`, in plaintext (until TLS 1.3's Encrypted Clie
 - **Certificate Transparency (RFC 6962):** CAs publish every certificate they issue to public, append-only logs; anyone (including the legitimate domain owner) can monitor those logs and catch a mis-issued certificate for their domain, which is how several real CA mis-issuance incidents were caught.
 
 ### Termination patterns
+
+**In plain words: "termination" is where the locked box gets opened — at the front-door load balancer, or only at the app server itself. Everything after that point travels unlocked unless you re-lock it.**
 
 Where the TLS connection actually ends matters for what's encrypted and who can inspect traffic:
 
@@ -214,7 +256,7 @@ flowchart TB
 
   This is the mechanism identity systems like SPIFFE/service meshes build on; see [[Service-to-Service Auth - API Keys, HMAC, mTLS]] for how that identity is actually used for authorization, which is out of scope here.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -443,6 +485,8 @@ func (ca *testCA) issue(t *testing.T, name string, client bool) tls.Certificate 
 
 ### Representative output: inspecting a real handshake
 
+**In plain words: two one-line commands that let you watch a real handshake and read off the version, cipher and certificate a live site actually uses.**
+
 ```text
 $ openssl s_client -connect example.com:443 -tls1_3 -servername example.com </dev/null 2>&1 | grep -E "Protocol|Cipher|subject|issuer"
 Protocol  : TLSv1.3
@@ -460,7 +504,7 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 ```
 *(representative output (curl 8.x); exact cipher and ALPN result depend on server configuration.)*
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Aspect | TLS 1.2 | TLS 1.3 |
 | --- | --- | --- |
@@ -476,14 +520,14 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 | Re-encrypt | LB decrypts, then opens a new TLS session to the backend | Internal traffic must also be encrypted | Two handshakes, two certs to manage |
 | Passthrough + mTLS | Proxy routes on SNI only; backend terminates TLS and verifies the client cert | Zero-trust service meshes, strict compliance | No request inspection at the proxy layer |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - TLS costs a real handshake (even at 1-RTT) and ongoing per-connection CPU for encryption — negligible for most web traffic on modern hardware, but it matters at very high connection-churn rates (e.g. a server accepting millions of short-lived connections per second), where session resumption and connection reuse matter more than usual.
 - mTLS adds operational weight: every client needs a certificate, and certificate rotation/revocation must be automated or it becomes an outage waiting to happen. Use it where the trust model needs it (service-to-service inside a mesh), not for public-facing APIs where simpler bearer tokens suffice.
 - 0-RTT trades a round trip for a real replay window; only take that trade for genuinely idempotent, low-value requests.
 - Skipping TLS entirely is only acceptable for traffic that never leaves a single trusted process or a loopback interface you fully control — anything crossing a network boundary should be encrypted by default today.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** nearly all public HTTPS traffic today is TLS 1.3 (TLS 1.2 kept around for legacy client compatibility).
   - Let's Encrypt/ACM/ZeroSSL automate DV certificate issuance at scale.
@@ -497,7 +541,7 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
   - **TLS terminated at the wrong layer** → if a proxy strips TLS and forwards plaintext over an untrusted network segment, encryption guarantees silently stop at that hop; know exactly which hops are encrypted.
 - **What to monitor:** days until certificate expiry (alert well before 30 days out), handshake failure rate and the TLS version/cipher mix actually negotiated by real clients (to know when it's safe to drop TLS 1.2), OCSP responder latency if stapling, and HSTS header presence on every HTTPS response.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why ECDHE gives forward secrecy and RSA key exchange doesn't.** In RSA key exchange, the client encrypts the secret directly with the server's long-term public key; if that private key is ever compromised, every past session recorded by an eavesdropper can be decrypted retroactively.
 
@@ -511,7 +555,7 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 - **Post-quantum readiness:** Go 1.24's `crypto/tls` enables a hybrid key exchange (`X25519MLKEM768`, combining the classical X25519 ECDH with a post-quantum lattice-based KEM) by default on both client and server. It's hybrid specifically so that today's connections stay secure even if the post-quantum half turns out to have an undiscovered weakness — the classical half alone still protects it.
 - **DNS cutover mechanics** (A/AAAA/CNAME changes, lowering TTL before a migration) are a DNS concern, not a TLS one; see [[DNS - Resolution, Records and Caching]] for that half of what the old "Domain, DNS, HTTPS, SSL/TLS" material covered together.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is TLS 1.3's handshake one round trip instead of two?
 > The client guesses the key-exchange group and sends its key share in the very first message (`ClientHello`), instead of waiting to learn the server's choice first. If the guess matches (it almost always does), the server can derive the shared secret and reply with its certificate and `Finished` in a single flight, so application data can start after just one round trip.
@@ -534,7 +578,7 @@ $ curl -v https://example.com/ 2>&1 | grep -E "SSL connection|ALPN|subject"
 > [!question]- Why does SNI leak the hostname even over an encrypted connection?
 > SNI is sent inside the `ClientHello`, before the TLS session key exists, specifically so the server knows which certificate to present for that hostname when one IP hosts many HTTPS sites. That means anyone watching the network (without decrypting anything) can see which hostname you're connecting to, even though the request path and body that follow are encrypted. TLS 1.3's Encrypted Client Hello extension addresses this but is not yet universally deployed.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - HTTPS = HTTP over TLS: TLS gives you confidentiality (encryption), authentication (certificate chain) and integrity (tamper detection).
 - TLS 1.3: 1-RTT full handshake, 0-RTT on resumption (replay risk, idempotent requests only), ECDHE-only key exchange (mandatory forward secrecy).

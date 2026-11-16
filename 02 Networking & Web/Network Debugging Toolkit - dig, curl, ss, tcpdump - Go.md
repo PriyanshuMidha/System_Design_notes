@@ -17,7 +17,14 @@ type: implementation
 > [!summary] TL;DR
 > This code is a tiny, programmatic version of `nc -zv host port`: it dials a TCP address, classifies the result into the same open/refused/timeout buckets a human reads off `ss` or `tcpdump`, and reports how long the attempt took. It backs [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]'s "Writing the same check as a Go health probe" section.
 
-## Before the code
+## Before the code 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the "From zero" paragraph below, "Before the code" and "What this code shows", then just skim the code comments.
+> - 🟡 **Know the basics?** Read each Code section's Concept + How it works, then the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, the race-safety note, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero** 🟢 — This file is the runnable version of the debugging toolkit note. It is one tiny Go package that does what the `nc -zv host port` command does by hand: try to open a connection and say which of three things happened — it worked, it was refused, or it timed out. Read the theory note first; here, read each "Concept" line, then the code, then "How it works".
 
 - **`net.Dialer.DialContext`**: opens a TCP connection and gives up when the context ends.
 - **`context.WithTimeout`**: a context that cancels itself after a set time; always pair it with `defer cancel()`.
@@ -26,7 +33,7 @@ type: implementation
 - **Goroutine + `net.Listen` in tests**: a real local server on `127.0.0.1:0` (any free port) so the test needs no network.
 - **What to run**: `go vet ./...` then `go test -race -v ./...`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept | Theory section |
 | --- | --- | --- |
@@ -61,7 +68,7 @@ flowchart TB
 
 Why a small package instead of one `main` function: a package with exported, independently testable functions (`CheckTCP`, `classify`, `Report`) can be imported by a real health-check service or a CLI tool alike, while a single `main` would force every caller to shell out to a binary instead of calling Go code directly.
 
-## Setup
+## Setup 🟢
 
 - **Module layout:** a single package, `netdebug`, with `netdebug.go` and `netdebug_test.go` in one directory.
 - **Go version:** 1.24.
@@ -74,13 +81,15 @@ go vet ./...
 go test -race -v ./...
 ```
 
-## Code
+## Code 🟡
 
 The package is deliberately small: one file holding a closed set of outcomes, a single dialing function, a classifier, and a formatter.
 
 Each piece below maps to one playbook distinction from the theory note, so reading this section alongside [[Network Debugging Toolkit - dig, curl, ss, tcpdump#The debugging playbook]] should feel like watching that flowchart's decisions get written down as code instead of read off a terminal by eye.
 
 ### The Outcome type
+
+**In plain words:** give each of the three possible results a proper name in code, so a program can say "refused" instead of guessing from an error message.
 
 **Concept.** The theory note's playbook distinguishes exactly three ways a TCP connect attempt can end, because each one points at a different thing to check next:
 
@@ -150,6 +159,8 @@ func (o Outcome) String() string {
 
 ### Result and CheckTCP
 
+**In plain words:** this is the actual knock on the door — try to connect, time how long it took, and hand back one tidy result.
+
 **Concept.** `Result` bundles everything one health check produced — target, outcome, how long it took, and the raw error if any — so a caller gets one value back instead of three separate return values to keep in sync.
 
 `CheckTCP` is the dial itself: it wraps `net.Dialer.DialContext` with a timeout and immediately classifies whatever comes back.
@@ -194,6 +205,8 @@ func CheckTCP(ctx context.Context, addr string, timeout time.Duration) Result {
 
 ### classify and Report
 
+**In plain words:** `classify` reads a raw error and decides which of the three buckets it belongs to; `Report` just prints the result as one neat line.
+
 **Concept.** `classify` is the single place that turns a raw Go `error` into one of the three meaningful buckets.
 
 This is deliberately factored out of `CheckTCP` so it can be unit-tested directly, without needing a real socket or a real timeout to exercise each branch.
@@ -232,7 +245,7 @@ func Report(r Result) string {
 3. Order matters here: a timeout check runs before the refused check because a `net.OpError` wrapping a timeout also satisfies some generic error interfaces, so checking the more specific condition (`Timeout()`) first avoids misclassifying it.
 4. `Report`'s two format strings differ only in whether the error is appended — this keeps the common case (`Open`, no error) uncluttered while still surfacing the error detail when something went wrong.
 
-## Tests
+## Tests 🟡
 
 Four test functions cover the package end to end:
 
@@ -402,7 +415,7 @@ A failure here would mean one of `Report`'s two `fmt.Sprintf` format strings is 
 PASS
 ```
 
-## Why the tests avoid a real black-hole address
+## Why the tests avoid a real black-hole address 🔴
 
 A natural fourth test would dial an address that is known to silently drop packets, to exercise the real `Timeout` path end to end rather than only through `fakeTimeoutErr`.
 
@@ -412,7 +425,7 @@ Worse, picking a real "unreachable" address risks it becoming reachable later (o
 
 Driving `classify`'s timeout branch directly with a fake `net.Error` sidesteps that problem entirely: the test asserts the one thing this package actually controls — "does `classify` return `Timeout` when handed something whose `Timeout()` method returns true" — without needing a real network condition to reproduce it.
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative considered | Trade-off |
 | --- | --- | --- |
@@ -422,7 +435,7 @@ Driving `classify`'s timeout branch directly with a fake `net.Error` sidesteps t
 | Close the connection immediately on success | Return the open `net.Conn` to the caller | This package only proves reachability; a caller that wants to reuse the connection should dial again itself, keeping this function's contract simple |
 | Separate `Report` function instead of a `String()` method on `Result` | Implement `fmt.Stringer` on `Result` directly | Keeps the data type (`Result`) free of a specific display format, so a caller preferring JSON or a metric isn't stuck with this one text layout |
 
-## A note on what "race-safe" means here
+## A note on what "race-safe" means here 🔴
 
 Running these tests with `-race` matters specifically because `TestCheckTCPOpen` spins up a background goroutine (the `Accept` loop) that runs concurrently with the test's own goroutine.
 
@@ -434,7 +447,7 @@ Both are safe here: `net.Listener.Accept` and `net.Conn`'s methods are themselve
 
 That is exactly why `-race` reports nothing to flag: there is genuine concurrency in this test, but no unsynchronized shared mutable state underneath it.
 
-## Running it
+## Running it 🟢
 
 ```bash
 $ go test -race -v ./...
@@ -453,7 +466,7 @@ Reading it: each top-level `--- PASS` line is one test function; `TestClassify`'
 
 The overall `PASS` and `ok` line confirm every assertion across all four test functions held, and the race detector (`-race`) found nothing to report — expected, since `TestCheckTCPOpen` is the only test with any concurrency (its background `Accept` loop goroutine), and it only ever touches its own listener, never shared state with the test goroutine.
 
-## Why this matters beyond a demo
+## Why this matters beyond a demo 🟡
 
 A health-check function that only returns "up" or "down" throws away exactly the information an on-call engineer needs first when a service looks unreachable.
 
@@ -466,13 +479,13 @@ That distinction is the single most useful thing a first responder can know befo
 
 This is also why `classify` is tested on its own, with a fake error, rather than only indirectly through `CheckTCP`: a classification bug would otherwise only surface under specific, hard-to-reproduce network conditions (a real firewall drop, a real refused port) instead of in a fast, deterministic unit test that runs the same way on every machine and in CI.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Checking `Timeout()` before `ECONNREFUSED`, not after.** Some error wrappers could in principle satisfy both checks loosely; testing the more specific "was this actually a timeout" condition first keeps the classification unambiguous.
 - **Forgetting `defer cancel()` after `context.WithTimeout`** would leak the context's internal timer until the *parent* context is itself done — invisible in a short-lived CLI tool, but a real leak in a long-running service calling `CheckTCP` repeatedly.
 - **`conn.Close()` on the success path is not deferred** — it runs immediately inline, which is correct here because the function's whole job ends right there; a reader expecting every `Close()` in Go code to be a `defer` might assume this is a bug when it is deliberate.
 
-## How this reads next to the manual playbook
+## How this reads next to the manual playbook 🟢
 
 Each exported function in this package answers exactly one row of the theory note's symptom table.
 
@@ -482,7 +495,7 @@ Each exported function in this package answers exactly one row of the theory not
 
 None of the three functions tries to replace `dig`, `openssl s_client` or `tcpdump`; DNS, TLS and raw-packet inspection all need their own tools, because a TCP-level `Open`/`Refused`/`Timeout` result genuinely cannot tell you whether the name resolved correctly or whether the certificate validated — only that a byte stream could, or could not, be opened to the target.
 
-## Exercises
+## Exercises 🔴
 
 Each exercise below asks you to change one small thing and predict the result before running it.
 
@@ -494,7 +507,7 @@ Work through them in order; the first two only touch `netdebug.go`, and the thir
 2. Change `CheckTCP`'s timeout to `1 * time.Nanosecond` and rerun `TestCheckTCPOpen`. Predict whether the test still passes, and why an unrealistically short timeout changes the *outcome* this test observes.
 3. Add a `JSON() string` method to `Result` that marshals it with `encoding/json`, and a test asserting the `Outcome` field serializes as its string name (`"refused"`), not its underlying integer. Predict what you need to add to `Outcome` for `encoding/json` to pick a string over the default integer.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]
 - **Related code:** [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP - Go]] (the 5-tuple demo this package's `CheckTCP` dials against)

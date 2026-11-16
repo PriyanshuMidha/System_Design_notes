@@ -25,7 +25,38 @@ updated: 2026-11-13
 > - The cache is a copy. The database stays the source of truth, and the system must stay correct when the cache is empty, stale or down.
 > - Every cache needs four decisions: what to cache, the key, how long it stays fresh, and what happens when it fails.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your database is a filing cabinet down the hall: it has the real answer, but every trip there is slow. A **cache** is a sticky note on your monitor: a quick copy of an answer you keep fetching anyway.
+
+```mermaid
+flowchart LR
+    A["App asks for product 42"] --> C{"Sticky note<br/>has it?"}
+    C -- "yes (hit)" --> F["Answer in<br/>a flash"]
+    C -- "no (miss)" --> D["Walk to the<br/>database (slow)"] --> W["Write a note<br/>for next time"] --> F
+```
+
+A read that finds the copy is a **hit**; one that does not is a **miss** and pays the slow trip. The share of hits — the **hit ratio** — decides everything: at 95% hits, your database only sees 1 in 20 reads.
+
+The catch: the note is a copy, and copies can go **stale** when the real data changes. So every cache needs four decisions: what to cache, what to name the key, how long the copy stays trusted, and what happens when the cache is empty or down.
+
+```mermaid
+flowchart LR
+    DB[("Database:<br/>the truth")] -.-> N["Cache:<br/>a copy, safe to lose"]
+```
+
+The rest of this note is just three questions:
+1. Where can caches live (browser to database) and what goes in each?
+2. How do you measure whether a cache is helping (hit-ratio maths)?
+3. What goes wrong (staleness, eviction, stampedes) and where to read next?
+
 
 **The problem in one story.**
 A shop page shows a product's name, price and stock.
@@ -70,7 +101,7 @@ Where it breaks: a real sticky note never vanishes on its own, but cache entries
 > [!tip] Remember
 > A cache is a fast copy; the database stays the truth, and the system must work when the copy is gone.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Take a product page that needs one product row plus its price and stock. Without a cache, every view runs the queries against PostgreSQL.
 
@@ -80,7 +111,7 @@ Take a product page that needs one product row plus its price and stock. Without
 
 The same idea appears in hardware ([[Memory Hierarchy and CPU Caches]]) and in the operating system ([[Page Cache, File Systems and fsync]]). This note is about caches you design yourself in a backend system.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A cache is a **sticky note on your monitor**. The full answer lives in a filing cabinet down the hall (the database). The first time someone asks, you walk to the cabinet, read the answer and write it on a sticky note. The next ten people get the sticky-note answer in a second.
 
@@ -90,7 +121,7 @@ Three problems follow directly from the analogy:
 - **The monitor has limited space.** When it is full, some note must go. That is **eviction** (see [[Cache Eviction Policies - LRU, LFU, TTL]]).
 - **If the note falls off, many people walk to the cabinet at once.** That is a **stampede** (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### A read through a cache
 
@@ -102,6 +133,8 @@ Three problems follow directly from the analogy:
 Who performs step 4 (the application, the cache library or a background job) is what separates the patterns in [[Caching Patterns]].
 
 ### Hit-ratio maths
+
+**In plain words:** one tiny formula tells you what a cache buys: the average read pays the cache lookup always, and the slow database trip only on the misses. The database feels misses, not hits.
 
 Let `h` be the hit ratio, `t_c` the cache lookup time and `t_db` the source-of-truth time. A miss usually pays for the cache lookup as well, so:
 
@@ -126,6 +159,8 @@ Two lessons:
 - **Averages hide the tail.** If more than 1% of requests miss, the p99 latency is set by the miss path (about 20 ms here, or worse if the miss queries are slow), however fast the hits are. To improve p99, reduce misses on hot keys or make the miss path faster.
 
 ### Where caches live
+
+**In plain words:** a request can be answered from a cache at nearly every hop on its journey, from the browser all the way into the database's own memory. Each layer answers for a different audience.
 
 A request can meet a cache at almost every hop:
 
@@ -159,6 +194,8 @@ Cold caches are normal after deploys, purges and new regions.
 
 ### In-process vs distributed
 
+**In plain words:** a cache inside your program is fastest but private to each instance; a shared cache like Redis is one copy for everyone but costs a network hop. Many systems use a small one in front of the other.
+
 ```mermaid
 flowchart TB
     subgraph A["Instance A"]
@@ -176,9 +213,11 @@ flowchart TB
 - **Distributed** (Redis, Memcached): one shared copy, survives deploys of the application, one place to invalidate. But it costs a network round trip plus encoding and decoding, and it is another service that can fail.
 - **Both (two-level):** a tiny L1 with a short TTL in front of Redis. How to keep the two levels in step is covered in [[Caching Patterns]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a cache is literally a map plus expiry times plus two counters.
 
 The smallest useful cache: a map with expiry times and two counters.
 
@@ -358,11 +397,13 @@ func TestConcurrentAccess(t *testing.T) {
 
 ### Sizing a Redis cache
 
+**In plain words:** each key costs more than its value — Redis adds roughly 90 bytes of bookkeeping per key — so measure one key and multiply, then add headroom.
+
 How much memory do 1 million cached products need? Measured on Redis 8.2: 100,000 keys named like `product:42:v1`, each holding a 500-byte string, grew `used_memory` by **about 575 bytes per key** without a TTL and **about 590 bytes per key** with one (the expiry is stored in a second table). `MEMORY USAGE product:42:v1` reported 528 bytes for one key.
 
 So 1 million such products need roughly 590 MB, before replication and before the fragmentation headroom that Redis needs (an estimate: plan for 1.3–1.5× the data size). The extra ~90 bytes per key over the value size is per-key overhead, which is why caching millions of tiny values costs more than their raw size suggests.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Choice | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -372,7 +413,7 @@ So 1 million such products need roughly 590 MB, before replication and before th
 | Two-level (L1 + L2) | Short-TTL L1 in front of Redis | Very hot keys where even Redis is the bottleneck | Two places to invalidate |
 | Database-side (materialized view, buffer pool) | The database precomputes or keeps hot pages in RAM | Expensive aggregations that can be a few minutes old | Refresh cost; still a database round trip |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 Every cache adds a second copy, and second copies can disagree. Skip the cache when:
 
@@ -384,7 +425,7 @@ Every cache adds a second copy, and second copies can disagree. Skip the cache w
 
 Measure first: find the slow, hot reads in your traces, then cache those.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Facebook ran Memcached as a look-aside cache in front of MySQL at very large scale, and published the problems that followed (stale sets, thundering herds, cross-region invalidation) in *Scaling Memcache at Facebook* (NSDI 2013).
@@ -415,7 +456,7 @@ clients:ws_123:list:v1:9f2c1a        <- hash of status=active&page=1&sort=name
 	- Cache latency p99 and error rate.
 	- Miss-path latency and database QPS caused by misses.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Working set, not data size, decides cache size.** If 2% of products get 80% of views (a skewed, Zipf-like pattern that is common for popularity), caching that 2% gives most of the benefit. Plot hit ratio against cache size (the hit-ratio curve) from a replay of real traffic and stop where the curve flattens. [[Cache Eviction Policies - LRU, LFU, TTL]] shows measured curves for LRU and LFU.
 - **Serialisation is part of the hit cost.** A Redis hit returns bytes; decoding a 50 KB JSON document in Go can cost more than the network round trip. Cache the smallest shape the caller needs, and consider a binary format for large values.
@@ -423,7 +464,7 @@ clients:ws_123:list:v1:9f2c1a        <- hash of status=active&page=1&sort=name
 - **Caching writes is different from caching reads.** Read caches are safe to lose. A cache that holds writes not yet in the database (write-behind, see [[Caching Patterns]]) is no longer safe to lose and needs persistence and replication like a database.
 - **Memory hierarchy echo.** The same rules hold for CPU caches: locality makes caching work, the miss path dominates the tail, and a write must be propagated or invalidated. The vocabulary (hit, miss, write-through, write-back, eviction) comes from hardware.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your cache has a 95% hit ratio. Why might p99 latency still be bad?
 > 5% of requests miss, which is more than 1%, so the p99 request is a miss and pays the full database latency. Improve the miss path (faster query, request coalescing) or raise the hit ratio on the hot endpoints; making hits faster does nothing for p99.
@@ -443,7 +484,7 @@ clients:ws_123:list:v1:9f2c1a        <- hash of status=active&page=1&sort=name
 > [!question]- How would you size a Redis cache for 1 million product objects of about 500 bytes?
 > Measure one key with `MEMORY USAGE` and extrapolate, or load a sample and read `used_memory`. On Redis 8.2 a 500-byte value cost about 590 bytes with a TTL, so about 590 MB, plus fragmentation headroom and replicas. Then check the hit-ratio curve: you may only need the hot fraction.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Cache = a disposable copy; the database stays the source of truth.
 - Average latency = `t_c + (1 − h) · t_db`; database load is proportional to the miss ratio.
@@ -454,7 +495,7 @@ clients:ws_123:list:v1:9f2c1a        <- hash of status=active&page=1&sort=name
 - Monitor hit ratio per prefix, evictions, memory, miss latency and DB load from misses.
 - Do not cache data that changes on every read, must be exact, or is cheap to fetch.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Latency Numbers Every Engineer Should Know]], [[Memory Hierarchy and CPU Caches]]
 - **Next:** [[Caching Patterns]], [[Cache Invalidation, TTL and Consistency]], [[Cache Eviction Policies - LRU, LFU, TTL]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]

@@ -28,7 +28,42 @@ updated: 2026-11-13
 > - Rule: add fields with new numbers, never reuse a number, and `reserved` the numbers and names you delete.
 > - Classic mistake: changing a field's type or reusing a deleted number, so old readers silently decode garbage.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When one program sends data to another, the data must become bytes. JSON does this with readable text that repeats every field name in every message.
+
+**Protocol Buffers** (protobuf) does it with a form of numbered boxes. You declare the form once in a `.proto` file: box 1 is the invoice ID, box 2 is the total. On the wire only the box **numbers** and values travel — never the names — so messages are small and fast.
+
+```mermaid
+flowchart LR
+    P[".proto file:<br/>id = 1, total = 2"] --> G["code generator"]
+    G --> WR["writer program"]
+    G --> RD["reader program"]
+    WR -- "bytes: 1:'inv_1', 2:1500" --> RD
+```
+
+The magic for teams: a reader that meets a box number it has never heard of just skips it and keeps it. So the writer can add new fields on Monday while readers update on Friday, and nothing breaks.
+
+```mermaid
+flowchart LR
+    NEW["New message<br/>with field 3"] --> OLD["Old reader"]
+    OLD --> OK["reads 1 and 2,<br/>keeps 3 untouched ✅"]
+```
+
+The one deadly sin: reusing a number for a different meaning. Numbers are forever.
+
+The rest of this note is just three questions:
+1. How do the bytes actually look on the wire?
+2. Which schema changes are safe, and which silently corrupt data?
+3. How do you catch a breaking change before it ships (buf in CI)?
+
 
 **The problem in one story.**
 A billing service sends an "invoice paid" message to six other services.
@@ -72,7 +107,7 @@ Where it breaks: on paper you can see the label next to each box; on the wire on
 > [!tip] Remember
 > Field numbers are forever: add new numbers, never reuse old ones, and `reserved` what you delete.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An `InvoicePaid` event is written by the billing service and read by six consumers (email, ledger, analytics and others) that deploy on their own schedules. Billing adds a `currency` field on Monday; the ledger consumer will not redeploy until Friday.
 
@@ -83,7 +118,7 @@ Size matters too. **Measured** in section 4: `Invoice{id: "inv_1", total_cents: 
 
 In the section 4 benchmark (Go, one small message), binary parsing was about 8 times faster than protojson parsing.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A protobuf message is a **form with numbered boxes**. The `.proto` file says "box 1 holds the invoice ID, box 2 holds the total in cents". The encoded message is just a list of "box number, value" pairs.
 
@@ -91,9 +126,11 @@ A protobuf message is a **form with numbered boxes**. The `.proto` file says "bo
 - A reader that expects box 4 but finds nothing uses the default (0, empty string, false).
 - Box **numbers are forever**. Labels (field names) are for humans and for JSON, so changing them is not free either.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Messages and field numbers
+
+**In plain words:** this is what a schema file looks like. Every field gets a permanent number, deleted fields are fenced off with `reserved`, and money is an integer, never a float.
 
 ```protobuf
 syntax = "proto3";
@@ -143,6 +180,8 @@ This file was compiled with `protocompile` v0.14.1 (a pure-Go compiler) to check
 
 ### Wire format
 
+**In plain words:** each field travels as a tiny tag (which box, what kind of value) followed by the value. Small numbers squeeze into one or two bytes.
+
 Each field is encoded as a **tag**, then a value. The tag is a varint (a variable-length integer: 7 bits per byte, high bit means "more bytes follow") holding `field_number << 3 | wire_type`.
 
 | Wire type | ID | Used for | Value layout |
@@ -173,12 +212,16 @@ flowchart LR
 
 ### Presence: was the field set?
 
+**In plain words:** plain proto3 fields cannot tell "set to zero" from "never set" — zero just is not sent. Mark a field `optional` when that difference matters.
+
 - **proto3 implicit presence** (plain `string po_number = 6;`): zero values are not sent. A reader cannot tell "set to empty" from "never set". Section 4's test shows a zero-valued invoice encodes to 0 bytes.
 - **`optional` (explicit presence)** generates a `HasPoNumber`-style check (in Go, a pointer field in the classic API). Use it when "unset" and "zero" mean different things, for example in partial updates or `0%` vs "no discount".
 - **Wrapper types** (`google.protobuf.Int64Value`, `StringValue`) were the way to get presence in proto3 before protoc 3.15 (2021) enabled proto3 `optional` by default. Prefer `optional` in new schemas.
 - `oneof` fields and message fields always track presence.
 
 ### Unknown fields and enums
+
+**In plain words:** old readers do not drop what they do not understand: unknown fields ride along, and unknown enum values are kept as their number.
 
 - A parser keeps fields it does not know as **unknown fields** and writes them back when it re-encodes. A proxy built against an old schema therefore does not drop data added by newer producers (tested in section 4). proto3 runtimes before protobuf 3.5 (2017) dropped unknown fields, so very old binaries are the exception.
 - proto3 enums are **open**: an unrecognized number (a new `INVOICE_STATUS_REFUNDED = 4` read by old code) is kept in the field as that number. In Go, `String()` prints the number. Code must have a `default:` branch for unknown values.
@@ -196,15 +239,19 @@ flowchart LR
 
 ### JSON mapping (protojson)
 
+**In plain words:** protobuf has an official JSON costume for debugging and web clients: names go camelCase and 64-bit numbers become strings so JavaScript cannot mangle them.
+
 - Field names become **lowerCamelCase** (`total_cents` → `totalCents`). Parsers accept both the camelCase and the original name.
 - **64-bit integers become JSON strings** (`"1500"`), because JavaScript numbers lose precision above 2^53. Parsers accept both strings and numbers.
 - Enums become their names (`"INVOICE_STATUS_PAID"`), and bytes become base64.
 - Fields with zero values are omitted unless you set `EmitUnpopulated`.
 - Go's `protojson` deliberately adds random whitespace in some builds, so nobody can depend on byte-exact output. Compare parsed values, not strings.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** protobuf encoding by hand in 15 lines: a tag byte, then the value as a varint. That is the whole wire format.
 
 The bare idea: one field encoded by hand as a tag (`number << 3 | wire type`) plus a varint value. The full version below uses the real `google.golang.org/protobuf` library and tests evolution cases.
 
@@ -232,6 +279,8 @@ func main() {
 ```
 
 ### Full version
+
+**In plain words:** real code with the real library, proving the exact bytes, the "zero is not sent" rule, unknown-field survival, and an 8x speed gap vs JSON.
 
 The code builds the `Invoice` message (fields 1 and 2 only) at runtime from a descriptor, the same structure `protoc` produces, so the real `google.golang.org/protobuf` v1.36.10 library encodes it without code generation. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -452,7 +501,7 @@ func BenchmarkUnmarshal(b *testing.B) {
 
 These are numbers for one small message on one machine. Measure your own messages before deciding on performance grounds.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Format | Field identity on the wire | Schema needed to read? | Evolution model | Use when |
 | --- | --- | --- | --- | --- |
@@ -464,7 +513,7 @@ These are numbers for one small message on one machine. Measure your own message
 
 For how events carry schemas across teams, see [[Event Schemas and Schema Registry]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Public web APIs:** JSON is readable, works in every browser and tool, and is what partners expect. Protobuf binary needs the schema to make sense of it.
 - **Debugging and logs:** binary messages need `protoc --decode`, `buf convert` or a JSON dump. Log the protojson form.
@@ -472,11 +521,13 @@ For how events carry schemas across teams, see [[Event Schemas and Schema Regist
 - **Tiny payloads, few calls:** the size and speed gains do not matter; the toolchain cost does.
 - **Do not use `float`/`double` for money.** Use `int64` minor units (as `total_cents` does) or a decimal string.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** gRPC uses protobuf as its default format ([[gRPC]]). Google's public Cloud APIs are designed as protobuf services with JSON mappings. Confluent Schema Registry stores protobuf schemas and checks compatibility for Kafka topics.
 
 ### Evolution rules
+
+**In plain words:** five habits keep a schema safe for years: new numbers only, reserve what you delete, add instead of renaming, enums start at UNSPECIFIED, and bump the package only for a true redesign.
 
 The rules, each with its reason:
 
@@ -520,6 +571,8 @@ flowchart TD
 
 ### Catch breaks in CI with buf
 
+**In plain words:** `buf breaking` diffs your schema against the last release and fails the build on dangerous changes, with strictness levels depending on who consumes the schema.
+
 `buf breaking` compares the schema against a previous version, such as the main branch or the last release, and fails the build on incompatible changes. Its rule categories, strictest first:
 
 | Category | Protects | Allows |
@@ -532,6 +585,8 @@ flowchart TD
 Use `FILE` or `PACKAGE` for code shared through generated libraries. Use `WIRE_JSON` when other teams only see the bytes or the JSON. Use `WIRE` only when no one uses the JSON form.
 
 ### Editions
+
+**In plain words:** Editions are the new way to pick protobuf behaviours: instead of proto2 vs proto3, each behaviour is a switch with a default per edition.
 
 Protobuf **Editions** replace `syntax = "proto2"` and `syntax = "proto3"` with `edition = "2023";` (and later `"2024"`).
 
@@ -555,7 +610,7 @@ Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new editi
 - Decode errors per message type and producer version.
 - Message size percentiles: they creep up as fields accumulate. gRPC rejects messages over 4 MiB by default ([[gRPC]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Go API rules (protobuf-go):**
 	- Never copy a message by value (`*m`). Generated structs hold internal state, and `go vet`'s copylocks check flags the copy. Use `proto.Clone`.
@@ -568,7 +623,7 @@ Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new editi
 - **Recursion limit:** protobuf-go refuses nesting deeper than 10,000 levels by default (`protowire.DefaultRecursionLimit`), which stops stack-exhaustion attacks with crafted input.
 - **FieldMask semantics:** in an update, a path in the mask with no value in the message means "clear this field". A missing mask, per AIP-134, means "update every field that is set", which cannot clear implicit-presence fields. Clients that send a full object with a mask avoid that ambiguity.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: can you safely rename a protobuf field?
 > On the binary wire, yes: only numbers travel. But protojson uses names, so JSON clients and stored JSON break, and every generated accessor changes. Add a new field with a new number, deprecate the old one, migrate, then reserve the old number and name.
@@ -591,7 +646,7 @@ Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new editi
 > [!question]- Why does protojson encode `int64` as a string?
 > JSON numbers are usually parsed as IEEE-754 doubles, which hold integers exactly only up to 2^53. An `int64` ID like 9,007,199,254,740,993 would be silently rounded in JavaScript. Strings keep every digit, and parsers accept both forms.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Tag = `field_number << 3 | wire_type`; varints are 7 bits per byte; LEN fields carry a length prefix.
 - Field numbers 1–15 take a 1-byte tag; 19000–19999 are reserved; the maximum is 2^29 − 1.
@@ -602,7 +657,7 @@ Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new editi
 - protojson: lowerCamelCase names, int64 as strings, never compare output bytes.
 - `buf breaking` in CI; Editions replace `syntax`; Go: `proto.Clone`, `proto.Equal`, nil-safe getters.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[gRPC]], [[Number Representation and Text Encoding]]
 - **Next:** [[gRPC Services in Go]], [[Event Schemas and Schema Registry]], [[API Versioning and Backward Compatibility]]

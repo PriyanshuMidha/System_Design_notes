@@ -25,7 +25,38 @@ updated: 2026-11-13
 > - `GOGC` says "run again once live memory has grown by this percent"; `GOMEMLIMIT` says "never let the heap exceed this absolute size" — most services should set both.
 > - GC cost tracks **live, pointer-containing data**, not total garbage: pointer-free bytes (most byte slices, strings) are nearly free to scan.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (allocator path, tri-color GC, pacer) and 4-5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A running program constantly asks for memory: "give me room for this slice, that struct". Handing out that room is **allocation**.
+
+Later, lots of that memory is no longer needed by anyone. Memory nothing points to anymore is **garbage**, and Go has a built-in cleaner — the **garbage collector (GC)** — that finds it and frees it for you. You never call "free" yourself.
+
+```mermaid
+flowchart LR
+    A["program asks<br/>for memory"] --> B["allocator hands<br/>out a slot (fast)"]
+    B --> C["object used,<br/>then forgotten"]
+    C --> D["GC finds it unreachable<br/>and frees the slot"]
+```
+
+Two things make Go's version special: the allocator keeps a small private tray per CPU so most requests need no waiting, and the cleaner works WHILE your program keeps running — it only pauses everything for two tiny moments per cycle.
+
+```mermaid
+flowchart LR
+    GC["GC marks what is<br/>still reachable"] -. "runs alongside" .- P["your goroutines<br/>keep working"]
+```
+
+The rest of this note is just four questions:
+1. What path does an allocation take? (mcache → mcentral → mheap)
+2. How does the GC know what is garbage? (tri-color marking + write barrier)
+3. When does it run? (GOGC and GOMEMLIMIT)
+4. How do I make it cheaper? (fewer allocations, fewer pointers)
 
 **The problem in one story.**
 In an office, people keep taking new sheets of paper and leaving old ones on their desks.
@@ -69,7 +100,7 @@ Where it breaks: a real cleaner can't watch you move papers mid-cleanup; Go need
 > [!tip] Remember
 > Go allocates fast from per-P caches and collects concurrently; fewer allocations and fewer pointers mean less GC work.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Manual memory management (C's `malloc`/`free`) requires knowing exactly when nobody needs an object any more. A function that returns a pointer to a struct it allocated, stored by its caller in three different data structures, cannot know — in general — whether it is safe to free, without tracking every reference.
 
@@ -79,7 +110,7 @@ Go's answer is twofold: the compiler's **escape analysis** decides, per variable
 
 For whatever does end up on the heap, the **garbage collector** tracks reachability from a set of roots (goroutine stacks, globals) and frees anything unreachable, so application code never calls `free`.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the allocator as a warehouse with bins of fixed-size boxes (size classes): asking for an 18-byte box gets you a 24-byte bin, because the warehouse only stocks a fixed set of sizes — simpler shelving, and a next-door bin of the same size is immediately reusable for the next same-sized request.
 
@@ -87,9 +118,11 @@ The garbage collector is a (mostly) separate crew that, every so often, walks th
 
 Crucially, that crew does its walk **while the warehouse keeps operating**, not during a shutdown — it just has to coordinate carefully with whoever is actively relabeling boxes mid-walk (the write barrier).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The allocator: mcache → mcentral → mheap
+
+**In plain words:** three shelves, nearest first — a private per-CPU tray (no waiting), a shared cupboard per size, and the big warehouse that talks to the operating system.
 
 ```mermaid
 flowchart TB
@@ -131,6 +164,8 @@ Freed spans aren't handed back to the OS immediately — a background **scavenge
 
 ### The garbage collector: concurrent tri-color mark-sweep
 
+**In plain words:** the cleaner colours every object — white "maybe garbage", grey "in use, not checked inside yet", black "fully checked". When no grey is left, everything still white gets binned.
+
 Go's GC is **non-moving** (objects never relocate, so no pointer ever needs rewriting after allocation — unlike Java's or the .NET CLR's compacting collectors) and **non-generational** (it doesn't special-case young objects; every live object is re-walked every cycle). It uses the classic **tri-color abstraction**:
 
 - **White**: not yet proven reachable (candidate garbage).
@@ -155,6 +190,8 @@ Only the two **stop-the-world** pauses (sweep termination, mark termination) act
 
 ### The write barrier
 
+**In plain words:** because your program keeps moving pointers around mid-cleanup, every pointer write briefly tells the cleaner "this one is in use" — otherwise a live object could get binned.
+
 Marking concurrently with a running program creates a real hazard: a goroutine could move the only reference to a white object from an already-scanned (black) object into an unscanned (grey) one, then the mark phase could finish believing the white object is garbage, and sweep would free a reachable object.
 
 Go's **write barrier** — a few extra instructions the compiler inserts around every pointer write during the concurrent mark phase — prevents this, by shading the object being pointed to grey whenever a pointer to it is written, which guarantees the invariant "no black object points to a white object" holds throughout marking (Dijkstra's insertion barrier, specifically).
@@ -162,6 +199,8 @@ Go's **write barrier** — a few extra instructions the compiler inserts around 
 The write barrier is compiled in only while a GC cycle's mark phase is active; it costs nothing between cycles.
 
 ### The pacer: GOGC and GOMEMLIMIT
+
+**In plain words:** GOGC answers "how much may the heap grow before the next cleanup?" and GOMEMLIMIT answers "what total size must we never cross?". Containers usually need both.
 
 The **pacer** decides when the next cycle starts, aiming for a heap goal:
 
@@ -190,6 +229,8 @@ flowchart LR
 ```
 
 ### Cost model: why pointers matter more than bytes
+
+**In plain words:** the cleaner only follows pointers. A 10 MB blob of plain bytes is skipped in one glance; a small map full of pointers is walked pointer by pointer, every cycle.
 
 GC work is proportional to the number of **pointers in live objects**, not to the number of bytes or the amount of garbage. A `[]byte` holding 10 MB of pointer-free data costs the scanner nothing beyond noting "this span has no pointers, skip it" (the runtime tracks per-span pointer bitmaps precisely so it can skip pointer-free spans entirely).
 
@@ -224,7 +265,7 @@ Go 1.25 ships an experimental GC implementation, nicknamed "Green Tea," that gro
 
 As of Go 1.25 it is opt-in, not the default, and whether or when it becomes default in a later release is not yet documented (verify before relying on it in production).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -303,6 +344,8 @@ Growing without a hint costs **12 allocations** (each growth threshold crossed r
 This is the allocator's size-class and growth behaviour showing up directly in `allocs/op`; fewer, larger allocations is almost always the right GC-pressure fix, not a smaller `GOGC`.
 
 ### A sync.Pool buffer pool (logic code, tested)
+
+**In plain words:** instead of making a fresh buffer per request and throwing it away, borrow one from a shared pool and return it — far fewer allocations for the GC to clean up.
 
 `sync.Pool` is the standard tool for reusing short-lived, same-shaped buffers across requests instead of allocating fresh ones every time — its contents are *not* guaranteed to survive a GC cycle (the runtime may drop pooled items to reclaim memory, via an internal "victim cache" mechanism), so it's for optimisation, never for objects that must persist.
 
@@ -385,7 +428,7 @@ func TestConcurrentGetPut(t *testing.T) {
 
 Ran with `go vet ./...` (clean) and `go test -race ./...` (go1.24.4 darwin/arm64): **PASS**, both tests.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it decides what's garbage | Pauses | Use when |
 | --- | --- | --- | --- |
@@ -394,14 +437,14 @@ Ran with `go vet ./...` (clean) and `go test -race ./...` (go1.24.4 darwin/arm64
 | Generational, compacting (JVM G1/ZGC, .NET) | Young objects collected far more often (most die young); survivors promoted; compaction removes fragmentation | Modern collectors (ZGC, Shenandoah) achieve sub-millisecond pauses too, via different tricks (regioned, concurrent compaction) | Workloads with very high allocation churn and a clear young/old split |
 | Manual (`malloc`/`free`, Rust's ownership model) | Programmer (C) or compile-time ownership rules (Rust) decide exactly | None from a collector | Maximum control, no collector pause story at all, at the cost of manual correctness burden (or, in Rust, a stricter type system) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - **Non-moving means no compaction**: long-lived programs with a churn of different-sized allocations can fragment the heap, inflating RSS versus live-byte count, with nothing the GC itself does to fix it. The scavenger helps return *unused* pages, but it can't defragment pages still partly in use.
 - **Non-generational** re-walks every live object every cycle, even ones that haven't changed in months — a cost a generational collector would mostly skip for old, stable objects. This is a known, deliberate trade-off: generational GC in Go would need either compaction or extra write-barrier bookkeeping burden that the Go team judged not worth it for typical Go workloads.
 - Tuning `GOGC` down trades CPU for memory in the wrong direction if your workload is CPU-bound and memory-rich: you'll burn CPU on more frequent cycles for marginal RSS savings.
 - For allocation-light, short-lived CLI tools, none of this matters: the default `GOGC=100` with no `GOMEMLIMIT` is fine, and spending time tuning it is wasted effort.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** virtually every long-running Go service tunes at least `GOMEMLIMIT` once deployed in containers (Kubernetes CPU/memory limits are exactly the scenario `GOMEMLIMIT` was built for); high-throughput services (API gateways, in-memory caches written in Go) commonly raise `GOGC` well above 100 when memory headroom exists and GC CPU is the bottleneck.
 - **Failure modes → fixes:**
@@ -411,7 +454,7 @@ Ran with `go vet ./...` (clean) and `go test -race ./...` (go1.24.4 darwin/arm64
   - Misusing `sync.Pool` for objects that must persist (its contents can be dropped across any GC) → use a real cache (an LRU, or [[Hash Tables and Go Maps]] with explicit eviction) instead.
 - **What to monitor:** `/gc/heap/goal:bytes` and current heap size from `runtime/metrics`, GC CPU fraction, RSS vs heap size (divergence signals fragmentation or a slow scavenger), goroutine count (a proxy for retained stack memory), and p99 latency correlated against GC cycle timestamps if STW pauses are suspected (they're sub-millisecond by design, but assist-heavy mark phases can still show up as tail latency).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Mark assists in detail.** If background mark workers (their fixed ~25% GOMAXPROCS budget) fall behind an allocation-heavy mutator, any goroutine that allocates is required to do a proportional amount of marking work itself before its allocation is allowed to proceed — self-throttling the exact goroutines causing the heap to grow fastest, rather than letting the heap balloon unboundedly past its goal. This is why a single allocation in a hot loop can occasionally show elevated latency during a GC cycle: it may be doing someone else's mark work.
 - **Why 25% specifically.** The target is deliberately conservative — leaving most CPU for your actual program — but is itself a tunable constant in the runtime source (`gcBackgroundUtilization`), chosen empirically rather than derived from first principles.
@@ -419,7 +462,7 @@ Ran with `go vet ./...` (clean) and `go test -race ./...` (go1.24.4 darwin/arm64
 - **Why non-moving simplifies cgo.** Because Go's GC never moves an object, a pointer handed to C code via cgo stays valid for as long as C holds it (modulo the cgo rules about not storing Go pointers in C for GC's reachability purposes) — a moving/compacting collector would need a pinning mechanism for every such handoff.
 - **Swiss-table maps, Go 1.24.** Go 1.24 reimplemented the built-in `map` using a Swiss-table-style design (open addressing with SIMD-friendly control bytes) in place of the previous bucket-chaining implementation, improving map performance and memory locality without changing map semantics; this interacts with GC cost because a map's scanning cost depends on how its backing storage is laid out, and the new design was chosen partly to keep that scanning cheap. See [[Arrays, Slices and Maps (with internals)]] for the map internals themselves; this note only notes the GC-relevant angle.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk through mcache → mcentral → mheap for a small allocation.
 > The current P's `mcache` holds a per-size-class free list; a small object pops a slot from there with no lock. When that list is empty, the P refills a batch from the `mcentral` for that size class (one lock per class). When `mcentral` itself is out of spans for that class, it requests another span from `mheap`, which grows from the OS if needed.
@@ -442,7 +485,7 @@ Ran with `go vet ./...` (clean) and `go test -race ./...` (go1.24.4 darwin/arm64
 > [!question]- When would `sync.Pool` be the wrong tool?
 > When the pooled value must survive — its contents can be dropped by the runtime across any GC cycle (an internal victim-cache mechanism), so it is only for optional reuse of short-lived, recreatable buffers, never for state that must persist, like a connection or a cache entry a correctness-critical path depends on.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Small allocs: `mcache` (per-P, no lock) → `mcentral` (per size class, one lock) → `mheap` (talks to the OS); >32 KB skips size classes entirely.
 - GC is concurrent, tri-color (white/grey/black), mark-sweep, non-moving, non-generational; only two STW phases, both sub-millisecond by design.

@@ -25,7 +25,30 @@ updated: 2026-11-13
 > - Table-driven unit tests, fakes vs. mocks in general, and gRPC's own in-process `bufconn` tests are owned by other notes — this one only covers the httptest/testcontainers split and where `grpcurl` fits.
 > - Classic mistake: asserting on a handler's exact JSON string byte-for-byte, so a harmless field-order change breaks every test.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Tests for a backend stack up in layers, from fast and narrow to slow and honest.
+
+**Unit tests** check pure logic with no wires attached. **Handler tests** drive your HTTP handlers through `httptest` — a fake in-memory server — with a fake store standing in for the database. **Repository tests** run your real SQL against a real, throwaway Postgres started in a container just for the test.
+
+```mermaid
+flowchart LR
+    U[Unit: pure logic, ms] --> H[Handler: httptest + fake store] --> R[Repository: real Postgres in a container] --> E[By hand: grpcurl / Postman]
+```
+
+Why bother with the slow layer? Because only a real database catches a wrong query. A fake store happily accepts SQL that Postgres would reject.
+
+The rest of this note is just these 3 questions:
+1. What belongs in each of the four layers?
+2. How do you test a handler without a network or a database?
+3. How does testcontainers give each test run a clean real Postgres?
 
 **The problem in one story.**
 Your web server shows an invoice when someone asks for it.
@@ -69,7 +92,7 @@ Where it breaks: a parking lot never surprises you, so it can never catch the re
 > [!tip] Remember
 > Fake the database to test handlers fast; use a real throwaway database to test the SQL.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps has an HTTP handler that reads an invoice from Postgres and returns it as JSON. Two different things can be wrong with it:
 
@@ -78,7 +101,7 @@ InvoiceOps has an HTTP handler that reads an invoice from Postgres and returns i
 
 Testing both the same way is either slow (every handler test spins up Postgres) or blind (every test uses a fake and a wrong SQL query ships to production untested). The fix is to test them separately, at the layer where each kind of bug actually lives.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The `Store` interface InvoiceOps's handler depends on (see [[Transactions and the Repository Pattern]] for the same idea applied to repositories sharing a transaction) is the **seam**: everything on the handler side of it gets tested with a fake, everything on the database side of it gets tested against a real Postgres. Neither test needs to know the other exists.
 
@@ -96,9 +119,11 @@ flowchart LR
 
 Everything above the interface (`H`, the handler test) runs on every `go test ./...` in a few milliseconds. Everything below it (`PgRepo`, the repository test) needs a real database, so it runs separately — tagged, or in CI only — and is the one place a schema change or a bad query gets caught before a user does.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The four layers
+
+**In plain words:** a pyramid of trust vs speed — many fast narrow tests at the bottom, a few slow honest ones on top.
 
 ```mermaid
 flowchart LR
@@ -112,6 +137,8 @@ Each layer up the chain is slower and catches a different class of bug: logic bu
 [[Testing in Go]] owns the first layer (table-driven tests, fakes vs. mocks as a general Go topic, `t.Parallel`, golden files); this note picks up where a request or a query enters the picture.
 
 ### Handler tests: httptest + a fake Store
+
+**In plain words:** call the handler as if over HTTP, but in memory: build a request, record the response, swap the database for a hand-written fake.
 
 `httptest.NewRequest` builds an `*http.Request` with no real socket, and `httptest.NewRecorder` is an `http.ResponseWriter` that just records what got written — so a handler test calls the handler directly, in-process, with no network stack involved at all.
 
@@ -134,13 +161,17 @@ sequenceDiagram
 
 ### Repository tests: a real, disposable Postgres
 
+**In plain words:** the test itself starts a fresh Postgres container, runs the migrations, runs your queries, and throws the whole database away after.
+
 `testcontainers-go`'s `modules/postgres` helper starts a real `postgres:17-alpine` container, waits for it to report ready, and hands back a connection string — then `t.Cleanup` tears the container down whether the test passes or fails.
 
 The test applies the schema itself (or runs the actual migration files from [[Schema Migrations in Go Services]]) so it exercises the exact SQL the production code runs, against the exact engine version production uses.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** one handler test and one repository test, minimal.
 
 The bare idea for a handler test: no table, one case, enough to see the shape.
 
@@ -527,7 +558,7 @@ Neither is a `go test` replacement — they call a server that's already running
 
 The full command set, plus the production warning about leaving reflection on, is in [[gRPC Services in Go]]'s "Testing" section.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Layer | Tool | Needs | Speed | Catches |
 | --- | --- | --- | --- | --- |
@@ -538,14 +569,14 @@ The full command set, plus the production warning about leaving reflection on, i
 | Manual / exploratory | `grpcurl`, Postman | a running server | seconds, by hand | "does the deployed thing actually answer", ad hoc |
 | End-to-end | real deployed service, real client | a real environment | minutes | everything wired together, including infra |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A testcontainers-backed repository suite is the right tool for SQL correctness, but every test run pays the container-startup cost (roughly 1–3 seconds for Postgres to report ready) — run it with `-tags=integration` in CI, not on every local `go test ./...` a developer runs while iterating.
 - A hand-written fake only encodes the behavior you told it to; it won't catch a case the real store handles differently that you didn't think to simulate. That gap is exactly what the repository test layer exists to close — the two are complementary, not substitutes for each other.
 - Asserting a handler's exact JSON byte-for-byte (as the example above does) is brittle the moment a field is added; for a response with many optional fields, decode the body back into a struct and compare fields instead.
 - `grpcurl`/Postman require reflection to be enabled on the target server. That's a reasonable default in dev and staging, and a deliberate choice (usually: off, or protected) in production — see [[gRPC Services in Go]].
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** testcontainers (and its Go port specifically) is the standard way Go services get a real Postgres/MySQL/Redis into CI without a shared, stateful test database; `httptest` has been the standard for Go HTTP handler tests since before Go 1.0 modules existed.
 - **Failure modes → fixes:**
@@ -554,7 +585,7 @@ The full command set, plus the production warning about leaving reflection on, i
 	- A flaky repository test because two parallel tests share one container's database → give each test its own database name or schema inside the shared container, or don't run DB tests with `t.Parallel()` against a container started once for the whole package.
 - **What to monitor:** CI time spent in the integration-tagged suite specifically, so it's visible when it starts dominating the pipeline.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why a struct-of-funcs fake instead of a generated mock.** `go.uber.org/mock` or `mockery` pay off once an interface has many methods and many tests need different combinations of expectations recorded and verified.
   - For `Store`'s two methods, a struct literal per test case is less code, no code-generation step, and the compiler catches a method-signature mismatch immediately — there's no rule that says a backend service must use a mocking library.
@@ -565,7 +596,7 @@ The full command set, plus the production warning about leaving reflection on, i
   - CI should default to a fresh container per run for reproducibility; local dev can opt into reuse for speed.
 - **`bufconn` versus a real listening port for gRPC.** `bufconn.Listen` never touches the OS network stack, so there's no port to collide with another test running in parallel and no OS-level TCP handshake latency — the same reason `httptest.NewRecorder` is faster than `httptest.NewServer`. See [[gRPC Services in Go]] for the full setup.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does a handler test use a fake `Store` instead of a real database?
 > The handler's own logic — status codes, error-to-response mapping, serialization — has nothing to do with SQL. A fake lets that test run in milliseconds with no external dependency, and isolates handler bugs from database bugs instead of conflating the two in one slow test.
@@ -585,7 +616,7 @@ The full command set, plus the production warning about leaving reflection on, i
 > [!question]- What is `grpcurl` for, and why doesn't it belong in a `go test` suite?
 > It calls RPCs on an already-running server from the command line, using server reflection to discover the schema — useful for manual exploration, smoke tests, and incident debugging. It exercises a live, deployed process, not the compiled package under test, so it's an end-to-end/manual tool, not a `go test` replacement for correctness.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Handler tests: `httptest.NewRequest` + `httptest.NewRecorder`, no network, assert status code and body.
 - Fake the `Store` interface with a struct of function fields for 1–3 methods; reach for a mocking library once that gets repetitive.
@@ -595,7 +626,7 @@ The full command set, plus the production warning about leaving reflection on, i
 - `grpcurl`/Postman call a *running* server via reflection — manual/E2E tooling, not a correctness gate in CI.
 - Table-driven unit tests, fakes vs. mocks in general, and golden files are [[Testing in Go]]'s territory, not this note's.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Backend Request Lifecycle and Layering]], [[Transactions and the Repository Pattern]], [[Testing in Go]]
 - **Next:** [[Schema Migrations in Go Services]] (testcontainers reused for up → down → up CI checks), [[gRPC Services in Go]] (bufconn and grpcurl in full)

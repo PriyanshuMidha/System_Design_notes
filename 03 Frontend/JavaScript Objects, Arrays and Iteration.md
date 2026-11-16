@@ -21,7 +21,35 @@ updated: 2026-11-13
 > - `for...of` iterates values (arrays, strings, `Map`, `Set`); `for...in` iterates enumerable keys (plain objects); a plain object is not iterable with `for...of` at all.
 > - `map`/`filter`/`reduce` chain into a readable pipeline, at the cost of one new array per step.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Programs need to group data. An **object** groups named fields that belong together, like one product with a name and a price. An **array** is an ordered list of things, like the items in a shopping cart.
+
+```mermaid
+flowchart LR
+    O["object: one product<br/>{name: 'shoes', price: 999}"] --- A["array: the cart<br/>[product, product, product]"]
+```
+
+To work with a list you walk through it item by item. That walk is called **iterating**. JavaScript gives you loops for it, plus three shortcut methods: `map` (change every item), `filter` (keep some items), `reduce` (squash the list into one value).
+
+```mermaid
+flowchart LR
+    L["cart items"] --> F["filter: in stock?"] --> M["map: get price"] --> R["reduce: add up"] --> T["total"]
+```
+
+One trap to know from day one: some methods change the original list, others quietly give you a new one. The rest of this note is just these 4 questions:
+1. How do I store and read named fields (objects)?
+2. How do I store and change a list (arrays), and which methods mutate?
+3. How do `map`, `filter` and `reduce` work?
+4. Which loop do I use for what?
+
 
 **The problem in one story.**
 You are building an online shop.
@@ -65,7 +93,7 @@ Where it breaks: a real queue cannot hold a gap, but a JS array can have holes, 
 > [!tip] Remember
 > Objects are named fields, arrays are ordered lists; always know whether a method changes the original or returns a new one.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Programs need to model more than single values. A user has a name, an email and a login state together. A list of orders needs to stay ordered, and it needs to be searched, filtered and totalled.
 
@@ -79,7 +107,7 @@ A concrete case makes this real: a shopping cart is an array of `{ itemName, pri
 > [!tip] Remember
 > Reach for an object when you have a fixed set of named fields. Reach for an array when you have an ordered sequence you'll loop over, sort, or index by position.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An **object** is a labeled box of drawers: each drawer has a name (the key) and holds one value. You open a drawer by its label, not by its position.
 
@@ -110,7 +138,7 @@ Because an array *is* an object with numeric keys, every plain-object operation 
 > [!tip] Remember
 > An array is just an object that happens to use numbers as keys and tracks how many of them are "in use."
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Objects: literals, access, and iteration
 
@@ -396,7 +424,7 @@ flowchart LR
 > [!tip] Remember
 > `for...of` = values of an iterable. `for...in` = enumerable keys of an object, including inherited ones — guard it with `Object.hasOwn` or prefer `Object.entries`.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -420,7 +448,7 @@ The first `.map` never looks at the others' results — each element is transfor
 
 Runnable Go version: [[JavaScript Objects, Arrays and Iteration - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -431,14 +459,14 @@ Runnable Go version: [[JavaScript Objects, Arrays and Iteration - Go]]
 | `for...of` | Pulls from the iterator protocol | Arrays, strings, `Map`, `Set`; need `break`/`await` | None beyond the iterator overhead |
 | `for...in` | Walks enumerable keys, including inherited | Plain objects only, guarded by `Object.hasOwn` | Easy to misuse on arrays (iterates indices as strings, in arbitrary order for non-integer keys) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A `map`/`filter` chain is the most readable way to transform a list, but each stage allocates a full new array; for a single hot path over a huge array, one `for` loop doing everything at once avoids the intermediate allocations.
 - `Object.freeze` and spread copies are shallow; relying on them for deep immutability is a common, hard-to-spot bug once objects nest two levels deep.
 - `JSON.stringify`/`parse` drop or mangle things a plain object round-trip can't represent: `undefined` values and functions are omitted, `Date` becomes a string, `BigInt` throws.
 - `for...in` on an array works but iterates string keys in implementation-defined order for non-index properties — never use it where you mean `for...of` or a classic indexed `for`.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** React and Redux rely on the "new array/object instead of mutate" pattern from `map`/`filter`/spread so they can detect changes by reference equality (`prevState === nextState` means "nothing changed") — see [[React State Management - Props, Context, Redux]].
 - **Failure modes → fixes:**
@@ -447,14 +475,14 @@ Runnable Go version: [[JavaScript Objects, Arrays and Iteration - Go]]
   - A `TypeError: X is not iterable` in production logs → something tried `for...of` or spread on a plain object; fix with `Object.entries`/`Object.keys`.
 - **What to monitor:** unexpected array growth from accidental closures retaining large arrays (see the Core note's closure section); JSON payload size when `Map`/`Set` get `JSON.stringify`'d (they serialize to `{}`, a frequent silent bug).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Prototype chain in practice.** `Object.keys`/`values`/`entries` only ever return **own** enumerable properties, never inherited ones — that's why they're usually safer than `for...in` for plain objects.
 - **Sparse arrays.** `new Array(5)` and `delete arr[2]` both create **holes**: `map`/`forEach` skip holes entirely (they don't call the callback for them), while a `for` loop sees `undefined` at that index. `Array.from({ length: 5 })` fills holes with `undefined` instead, which is why it's preferred over `new Array(n)` when you need real values to iterate.
 - **Map/Set vs object/array performance.** `Map` and `Set` are backed by hash tables with guaranteed insertion order and O(1) average add/lookup/delete, including when keys are added and removed repeatedly — a plain object used as a cache can degrade as V8 de-optimizes its internal representation after many shape changes.
 - **Structural sharing.** Spread (`{ ...obj }`, `[...arr]`) only copies one level; this is why immutable-update libraries for nested state (Immer, Redux Toolkit) exist — they handle the "copy every level you change, share every level you don't" bookkeeping for you.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between `map` and `forEach`?
 > `map` returns a new array built from the callback's return values and never mutates the input; `forEach` always returns `undefined` and is used purely for its side effects. Chaining only works after `map` (`arr.map(...).filter(...)`), never after `forEach`.
@@ -474,7 +502,7 @@ Runnable Go version: [[JavaScript Objects, Arrays and Iteration - Go]]
 > [!question]- When would you reach for a `Map` instead of a plain object?
 > When keys aren't strings/symbols you control (numbers, objects as keys), when you need guaranteed insertion order and a reliable `.size`, or when keys are added and removed often — a `Map` is built for that; a plain object used the same way can degrade in V8's internal object representation.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `push`/`pop`/`splice`/`sort`/`reverse` mutate; `slice`/`concat`/`map`/`filter` return new arrays.
 - `shift`/`unshift` are O(n); `push`/`pop` are O(1).

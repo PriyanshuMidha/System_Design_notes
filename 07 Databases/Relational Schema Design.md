@@ -30,7 +30,39 @@ updated: 2026-11-13
 > - Use types that cannot lose information: integer minor units for money, `timestamptz` for time.
 > - Classic mistake: copying a client's email into every invoice row, then updating one copy and missing the rest.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the eight design steps), 4 (the full worked schema) and 5 (multi-tenancy options).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A database stores facts in **tables**: grids of rows and columns, like a spreadsheet per kind of thing (one for customers, one for orders).
+
+The big question of schema design is: where does each fact live? If you write a customer's email on every order, and the email changes, you must fix every copy. Miss one and your data lies to you.
+
+```mermaid
+flowchart LR
+    A["Email copied onto<br/>every order row"] -- "email changes" --> B["Some rows updated,<br/>some missed: two 'truths'"]
+```
+
+The fix: store each fact once, and let other rows point to it with an id. That pointing column is a **foreign key**.
+
+```mermaid
+flowchart LR
+    O1["Order 1: client_id = 7"] --> C["Client 7:<br/>email lives here, once"]
+    O2["Order 2: client_id = 7"] --> C
+```
+
+Storing each fact once is called **normalization**. The second tool is **constraints**: rules the database itself enforces, like "amount can never be negative", so even buggy code cannot write bad data.
+
+The rest of this note is just these 4 questions:
+1. Which tables and keys should exist, and how do you decide?
+2. Which rules can the database enforce for you?
+3. Which column types never lose money or time zones?
+4. When is copying a fact on purpose the right call?
 
 **The problem in one story.**
 A small shop keeps its customers in a notebook and writes each customer's phone number on every order slip.
@@ -81,7 +113,7 @@ Where it breaks: a filing cabinet trusts the clerk to file correctly, while a da
 > [!tip] Remember
 > Store each fact once, and let the database reject bad data with keys and constraints.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The first InvoiceOps prototype kept invoices in one wide table, the way a spreadsheet would:
 
@@ -97,7 +129,7 @@ Within a month it had three real bugs:
 
 A designed schema removes all three: the email lives in one row of `clients`, line items are rows you can filter and sum, and money is an integer that cannot drift.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **One fact, one place.** Each fact ("Acme's billing email is X") is stored once and referenced by key everywhere else. That is what normalization formalizes.
 - **The schema is the last line of defence.** Application code has bugs, scripts skip validation, and two services race. A `CHECK`, `UNIQUE` or `FOREIGN KEY` holds no matter who writes.
@@ -105,7 +137,7 @@ A designed schema removes all three: the email lives in one row of `clients`, li
 
 **Analogy:** a well-run office keeps one master contact card per client and writes the client number on every invoice. A sloppy office copies the whole address onto every document and then cannot tell which copy is current. Except for one thing: a *sent* invoice must keep the address it was sent to, because that is a different fact.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: ask the questions before drawing tables
 
@@ -122,6 +154,8 @@ A designed schema removes all three: the email lives in one row of `clients`, li
 For InvoiceOps: the objects form the chain `users → workspace_members → workspaces → clients → invoices → invoice_items`, with `payments` and `audit_logs` hanging off it. Recording a payment must update `payments`, `invoices` and `audit_logs` together, and every list screen filters by workspace first.
 
 ### Step 2: entities and relationships
+
+**In plain words: list the real things your product talks about (users, workspaces, clients, invoices) and draw arrows for how they relate — each thing becomes a table, each arrow a key.**
 
 ```mermaid
 erDiagram
@@ -164,6 +198,8 @@ erDiagram
 
 ### Step 3: normalize
 
+**In plain words: normalizing is tidying up so each fact lives in exactly one cell — the 'normal forms' (1NF, 2NF, 3NF) are just three passes of that tidy-up, each catching a different kind of duplicate.**
+
 Normal forms remove the anomalies from section 1, one kind of dependency at a time.
 
 ```mermaid
@@ -184,6 +220,8 @@ flowchart TD
 Not every repeated value is a violation. `invoice_items.unit_price_minor` looks like it duplicates a catalogue price, but it records *the price charged on this invoice*. If the catalogue price changes tomorrow, issued invoices must not. The same holds for `invoices.billing_address`, a snapshot taken when the invoice is sent.
 
 ### Step 4: keys
+
+**In plain words: every row needs a name tag that never changes — real-world names (emails, invoice numbers) change, so give rows a made-up id and keep the real name as a uniqueness rule.**
 
 - **Natural key:** a real-world identifier, such as an email or an invoice number. Natural keys change (emails do; draft numbers get corrected), and composite ones bloat every referencing table. Keep them as `UNIQUE` constraints.
 - **Surrogate key:** a meaningless generated id that never changes. Reference rows by it.
@@ -236,6 +274,8 @@ sequenceDiagram
 
 ### Step 5: constraints are invariants
 
+**In plain words: write your business rules into the schema itself, so the database acts like a strict gatekeeper that rejects impossible data no matter which code wrote it.**
+
 | Rule                                         | Constraint                                                          |
 | -------------------------------------------- | ------------------------------------------------------------------- |
 | every invoice has a status from the lifecycle | `CHECK (status IN (…))` plus `NOT NULL`                            |
@@ -275,6 +315,8 @@ flowchart LR
 
 ### Step 6: types
 
+**In plain words: pick column types that physically cannot lose information — whole-number paise for money (floats drift), and timestamps that keep the time zone.**
+
 | Data                | Use                                                         | Avoid                                                                                 |
 | ------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | money               | `bigint` minor units + `currency char(3)`; or `numeric(14,2)` | `real` / `double precision` (binary fractions drift); PostgreSQL's `money` type (format depends on `lc_monetary`, one currency) |
@@ -305,7 +347,7 @@ flowchart TD
 - **Audit columns:** `created_at` and `updated_at` on every mutable table, with `updated_at` set by a trigger so no code path forgets. `now()` returns the *transaction's* start time, so all rows changed in one transaction share it.
 - **Audit log:** an append-only `audit_logs` table written in the same transaction as the change. Its `(entity_type, entity_id)` pair is a polymorphic reference with no foreign key, on purpose: the log must outlive what it describes. Grant the application only `SELECT, INSERT` on it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -332,6 +374,8 @@ CREATE INDEX ON invoices (client_id);  -- Postgres does not index FKs for you
 The full DDL below adds workspaces (tenants), tenant-safe composite keys, soft deletes, audit logs and row-level security.
 
 ### The InvoiceOps schema (PostgreSQL 17)
+
+**In plain words: this is the whole design assembled — every table, its key, and the one or two rules that make it safe — like the final blueprint after all the sketches.**
 
 The complete DDL (about 100 lines) is in [[Relational Schema Design - Go]]. In dependency order, these are the tables and the main rules each one carries:
 
@@ -399,6 +443,8 @@ Also, `current_setting('app.workspace_id')` raises an error if the setting was n
 
 ### Money in Go: integer minor units
 
+**In plain words: the application code must follow the same money rule as the database — count whole paise as integers, because adding 0.10 ten times in a float does not make 1.00.**
+
 The Go side must keep the same discipline as the columns: an `Amount` is an `int64` of minor units, with `Split` and `Percent` helpers whose rounding rules are written down. The code and tests are in [[Relational Schema Design - Go]].
 
 **Measured** (`go test -v`, Go 1.24.4): `float64: 0.99999999999999989  int64: 100 paise`. Ten payments of ₹0.10 do not make ₹1.00 in floating point.
@@ -416,7 +462,7 @@ flowchart LR
 
 Runnable Go version: [[Relational Schema Design - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Multi-tenancy, the decision InvoiceOps makes once and lives with:
 
@@ -436,7 +482,7 @@ flowchart LR
 
 Most products start shared and move their largest tenants out later. Including `workspace_id` in every key from day one keeps that move open.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - **Normalization costs joins.** Fully normalized reads touch more tables. Denormalize only with (1) one owner of the truth, (2) a write path that updates the copy in the same transaction or a rebuild job, and (3) a reconciliation query like the one above. Read models and summary tables are in [[Materialized Views and Denormalization]].
 - **Constraints cost write time,** a little: a foreign key check is one index lookup on the parent. That is cheap insurance; skip constraints only on bulk-loaded analytics tables you can rebuild.
@@ -449,7 +495,7 @@ Most products start shared and move their largest tenants out later. Including `
 	- **Boolean soup** (`is_sent`, `is_paid`, `is_cancelled`) allows impossible combinations → one `status` column with a `CHECK`.
 	- **Floats for money** → integer minor units.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Supabase's API layer relies on Postgres row-level security for per-user access.
@@ -470,7 +516,7 @@ Most products start shared and move their largest tenants out later. Including `
 	- Rows and bytes per tenant, to spot the noisy neighbour before it hurts others.
 	- Table bloat from soft-deleted rows.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **A table in 3NF but not BCNF.** An agency assigns account managers: `account_managers(client_id, service, manager_id)`, with two rules: one manager per client per service, and each manager works in exactly one service. Dependencies: `(client_id, service) → manager_id` and `manager_id → service`. Candidate keys are `(client_id, service)` and `(client_id, manager_id)`, so every column is part of a key and 3NF holds. But `manager_id` determines `service` without being a key, which breaks BCNF: when Meera moves from design to development, every one of her rows must change. Decomposing into `managers(manager_id, service)` and `client_managers(client_id, manager_id)` fixes that, but "one manager per client per service" can no longer be a simple `UNIQUE`, because `service` now lives in another table. BCNF can cost dependency preservation; the usual fix keeps `service` in `client_managers` and guards it with a composite foreign key to `managers (manager_id, service)` plus `UNIQUE (client_id, service)`; that foreign key needs `UNIQUE (manager_id, service)` on `managers` as its target, even though `manager_id` alone is already the key.
 - **Composite foreign keys and NULL.** With the default `MATCH SIMPLE`, a foreign key is not checked if any of its columns is NULL, so `(workspace_id, parent_id)` with a NULL `parent_id` is a valid top-level client. That is also why `ON DELETE SET NULL (parent_id)` (PostgreSQL 15+) matters: plain `SET NULL` would try to null `workspace_id` too and hit its `NOT NULL`.
@@ -478,7 +524,7 @@ Most products start shared and move their largest tenants out later. Including `
 - **Partitioning and sharding want the tenant in the key.** Postgres requires the partition key in every primary key and unique constraint of a partitioned table, and Citus requires the distribution column in them. A schema that already uses `(workspace_id, id)` everywhere can be partitioned or sharded by workspace without redesign; one that relies on a bare `id` primary key cannot.
 - **Enums vs `CHECK`.** `ALTER TYPE … ADD VALUE` is easy (inside a transaction block since PostgreSQL 12, usable after commit), renaming a value works since PostgreSQL 10, but removing one is not supported. A `CHECK` constraint can be replaced in one migration, adding the new one `NOT VALID` and validating it later to avoid a long lock ([[Zero-Downtime Schema Migrations]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: a reviewer says `invoices.billing_address` duplicates the client's address and breaks 3NF. Are they right?
 > No. The column stores the address the invoice was *sent to*, a fact fixed at issue time that must not change when the client moves. Normal forms are about functional dependencies that actually hold, and "current client address" does not determine "address on invoice INV-102". The same goes for `unit_price_minor` on line items.
@@ -504,7 +550,7 @@ Most products start shared and move their largest tenants out later. Including `
 > [!question]- When is a jsonb column the right call?
 > For data that varies per tenant or per provider and is read with the row: custom fields, raw webhook payloads, snapshots. Not for anything you join, constrain with foreign keys, sort or report on. Index containment queries with GIN and promote a key to a column once queries depend on it.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Start from the 9 questions: objects, hot queries, transactional writes, consistency, growth, indexes, audit, migrations.
 - Normalize to 3NF; keep snapshots (address, price at issue time) as their own facts.
@@ -515,7 +561,7 @@ Most products start shared and move their largest tenants out later. Including `
 - Soft delete needs a partial unique index; audit logs are append-only and written in the same transaction.
 - Every denormalized copy needs an owner, a same-transaction write path and a reconciliation query.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[SQL Essentials]], [[SQL vs NoSQL]]
 - **Code:** [[Relational Schema Design - Go]] (full DDL, trigger and RLS, the `money` package with tests)

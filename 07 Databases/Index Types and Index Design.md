@@ -29,7 +29,39 @@ updated: 2026-11-13
 > - Pick a non-B-tree type only for a query a B-tree cannot answer: containment (GIN), overlap or nearest (GiST), huge time-ordered tables (BRIN).
 > - Every index costs writes, disk and RAM; find and drop the ones nobody uses.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked examples) and 5 (comparison table).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You already know an index is a sorted helper list that finds rows fast (if not, read [[Indexing Fundamentals]] first). This note answers the next question: WHICH index do you build for a given query?
+
+Most of the time the answer is the default **B-tree** index, and the real decision is the **column order**: which columns come first in the sort. The rule is simple: columns you match exactly go first, then the column you sort by, then the column you compare with a range.
+
+```mermaid
+flowchart LR
+    Q["Your query's WHERE + ORDER BY"] --> E["Equality columns first"] --> S["Sort column next"] --> R["Range column last"]
+```
+
+Some questions no B-tree can answer, like "which rows CONTAIN this word?" or "which bookings OVERLAP this time?". For those there are special index types with odd names (**GIN**, GiST, BRIN); each is just a different reference book for a different kind of question.
+
+```mermaid
+flowchart TD
+    A["=, <, >, sort"] --> BT["B-tree (default)"]
+    B["contains X"] --> G["GIN"]
+    C["overlaps / nearest"] --> GS["GiST"]
+    D["huge time-ordered log"] --> BR["BRIN"]
+```
+
+The rest of this note is just these 4 questions:
+1. Why can't one index serve every query? (sections 1-2)
+2. In what order do I put the columns? (ESR rule, section 3.2)
+3. When do I need a special type instead of a B-tree? (sections 3.4-3.5)
+4. How do I keep indexes cheap: partial, covering, and dropping unused ones? (sections 4, 6, 7)
 
 **The problem in one story.**
 Your app runs `SELECT * FROM invoices WHERE workspace_id = 7 AND status = 'overdue' ORDER BY due_date LIMIT 20`.
@@ -74,7 +106,7 @@ Where it breaks: a phone book has one fixed order; a database can keep several i
 > [!tip] Remember
 > Design the index from the query: Equality columns, then Sort, then Range, and use a special type only when a B-tree cannot answer.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps keeps 10 million rows in `invoices` across 2,000 workspaces (a workspace is one customer company, the tenant). The most called endpoint lists one workspace's overdue invoices:
 
@@ -99,7 +131,7 @@ Three other InvoiceOps questions cannot be helped by any B-tree, however the col
 | "No two bookings of meeting room 7 may overlap" | Overlap is not an ordering relation | GiST exclusion constraint |
 | 2 billion rows of `audit_logs` queried by day | A B-tree on `created_at` would be tens of GB | BRIN, a few MB |
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A B-tree is a phone book: sorted by surname, then first name. It is perfect for "Sharma, Priya", fine for "all Sharmas", useless for "everyone called Priya" (that is the *leftmost-prefix rule*: you can only seek using a leading run of the sort columns).
 
@@ -108,9 +140,11 @@ The other index types are other kinds of reference books:
 - **GiST** (Generalized Search Tree) is a map with nested boxes: each box says "everything inside me lies within this area", so you skip boxes that cannot overlap your search area.
 - **BRIN** (Block Range INdex) is the spine labels of a shelf of diaries: "volume 1 covers January–March". It is tiny, and it works only if the diaries were filed in date order.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Choosing the type from the query shape
+
+**In plain words:** look at what the WHERE clause asks and the right index type falls out. Exact matches and ranges mean B-tree; "contains" means GIN; "overlaps" means GiST; a giant append-only log means BRIN.
 
 ```mermaid
 flowchart TD
@@ -127,6 +161,8 @@ flowchart TD
 ```
 
 ### 3.2 Multicolumn B-tree: the ESR rule
+
+**In plain words:** a multicolumn index is a phone book: pick the columns you match exactly as the first sort keys, then the column you sort by, then any range. Get the order wrong and the database must re-sort every time.
 
 A multicolumn B-tree sorts entries by the first column, then by the second within equal firsts, and so on. Three consequences:
 
@@ -154,6 +190,8 @@ flowchart LR
 
 ### 3.3 Index scan vs index-only scan
 
+**In plain words:** a normal index scan finds the row's address in the index, then walks over to the table to fetch it. An index-only scan skips that walk because the answer is already inside the index.
+
 ```mermaid
 flowchart LR
     subgraph IS[Index Scan]
@@ -174,6 +212,8 @@ Pages that are not all-visible still need a heap visit, shown as `Heap Fetches` 
 
 ### 3.4 What each special type stores
 
+**In plain words:** each index type keeps a different kind of note per row: a B-tree keeps the sorted value, GIN keeps one entry per word inside the value, GiST keeps a bounding box, BRIN keeps only a min and max per big chunk of the table.
+
 | Type | One index entry is | Lookup |
 | --- | --- | --- |
 | B-tree | `(key columns, row pointer)` in sorted leaf pages | Descend 3–4 levels, walk leaves |
@@ -183,6 +223,8 @@ Pages that are not all-visible still need a heap visit, shown as `Heap Fetches` 
 | BRIN | For each range of 128 table pages (default `pages_per_range`): min and max value | Scan the whole small BRIN, read only page ranges whose min/max could match, recheck rows |
 
 ### 3.5 How GIN, GiST and BRIN find rows
+
+**In plain words:** three different reference books: GIN looks up words and intersects the page lists; GiST drills down through nested boxes; BRIN skips whole chunks whose min/max cannot match.
 
 #### GIN: element to posting list
 
@@ -237,9 +279,11 @@ flowchart TB
 
 This works only because rows were appended in time order. If dates were scattered, every range would have a min and max covering everything and nothing could be skipped.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** three real index definitions you would actually ship: the main list-page index, a smaller partial one for the hot subset, and a unique one that enforces a business rule.
 
 ```sql
 -- Query: one tenant, one status, newest due first, page of 20
@@ -262,6 +306,8 @@ CREATE UNIQUE INDEX users_ws_email_live_uidx
 `CONCURRENTLY` builds without blocking writes; it cannot run inside a transaction block, and a failed build leaves an `INVALID` index to drop (see [[Zero-Downtime Schema Migrations]]).
 
 ### 4.1 Column order against three queries
+
+**In plain words:** same table, same columns, three queries: watch how the right column order removes the Sort step and drops a 39 ms query to 0.1 ms, and what happens when the first column is skipped.
 
 All plans below are **representative output (PostgreSQL 17)** for `invoices` with 10 M rows, 2,000 workspaces, about 5,000 invoices per workspace and 6% `overdue`. The table starts with only `invoices_ws_idx (workspace_id)`.
 
@@ -349,6 +395,8 @@ flowchart LR
 
 ### 4.2 Covering index and Heap Fetches
 
+**In plain words:** put the few extra columns the page needs inside the index itself, and index only the rows the page ever shows. The query then never touches the table at all.
+
 ```sql
 CREATE INDEX CONCURRENTLY invoices_open_due_idx
     ON invoices (workspace_id, due_date DESC, id DESC)
@@ -392,6 +440,8 @@ flowchart LR
 
 ### 4.3 The other types, in InvoiceOps
 
+**In plain words:** one copy-paste example of each special index: JSON search, substring search, case-insensitive email, no-double-booking, and a tiny index on a 2-billion-row log.
+
 ```sql
 -- GIN on jsonb: containment on payment metadata
 CREATE INDEX invoices_meta_gin ON invoices USING gin (metadata jsonb_path_ops);
@@ -433,6 +483,8 @@ Notes on each:
 
 ### 4.4 Checking an index design against a query
 
+**In plain words:** a mechanical checklist you can run in code review: walk the index columns against the query and predict whether it can seek and whether it avoids a sort.
+
 Before shipping a migration, a code review can check each hot query against the proposed key. The check encodes the leftmost-prefix rule (without skip scan) and the ESR order.
 
 ```mermaid
@@ -473,7 +525,7 @@ The "gap in prefix" case is the classic mistake: `WHERE workspace_id = ? AND due
 
 Runnable Go version: [[Index Types and Index Design - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Index | Answers | Use when | Cost / limits |
 | --- | --- | --- | --- |
@@ -494,7 +546,7 @@ Runnable Go version: [[Index Types and Index Design - Go]]
 
 **Vector indexes** (HNSW, IVFFlat in `pgvector`) answer "nearest by embedding" approximately; they are covered in [[Vector Databases and ANN Indexes]]. Full search engines are in [[Search Engines and Inverted Indexes]], and geo-specific structures in [[Geospatial Indexing]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - **Write amplification.** Every `INSERT` writes one entry (plus its WAL record) into every index on the table; a GIN on a document with 40 keys writes about 40. A table with 9 indexes does about 10 page modifications per inserted row.
 - **HOT updates lost.** PostgreSQL can update a row without touching any index (a *heap-only tuple* update) only if no indexed column changes and the page has free space. Indexing a frequently updated column like `last_seen_at` turns every update into index writes.
@@ -504,7 +556,7 @@ Runnable Go version: [[Index Types and Index Design - Go]]
 - **Don't use BRIN on updated or randomly loaded data.** If `created_at` values are scattered across pages, every range's min/max covers everything and BRIN reads the whole table.
 - **Hash rarely wins.** A B-tree does equality almost as fast and also does ranges, sorting and uniqueness.
 
-## 7. In production
+## 7. In production 🔴
 
 **Design steps** (for each table):
 1. List the top queries by total time from `pg_stat_statements`.
@@ -553,7 +605,7 @@ Fix with `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12+), which builds a new copy 
 
 **What to monitor:** index size vs table size, `idx_scan` per index, `Heap Fetches` on hot index-only scans, `n_tup_hot_upd / n_tup_upd` (HOT ratio) in `pg_stat_user_tables`, and insert p99 latency after each new index.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why skip scan needs few distinct values.** Skip scan turns `WHERE status = 'overdue'` on `(workspace_id, status, …)` into "for each distinct `workspace_id`: seek to `(ws, 'overdue')`". With 2,000 workspaces that is 2,000 descents of about 4 pages, around 8,000 page reads (estimate), far less than the full index. With 5 M distinct leading values it is worse than a full index scan, and the planner picks something else.
 - **GIN fast update.** Inserting one document into a GIN means updating many posting lists. With `fastupdate` on (the default), new entries go to an unsorted *pending list* that is merged in bulk by `VACUUM` or when it exceeds `gin_pending_list_limit` (4 MB). Inserts are cheap, but every search also scans the pending list, and the insert that triggers the merge is slow.
@@ -563,7 +615,7 @@ Fix with `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12+), which builds a new copy 
 - **Index-only scans and MVCC.** The visibility map exists because a PostgreSQL index entry points to a row version without knowing whether it is visible. InnoDB secondary indexes have a similar problem and solve it by checking the page's max transaction ID, falling back to the clustered index.
 - **Too many columns in one index.** Each extra key column makes every entry larger, reducing fan-out and adding levels. Keep keys to what the queries seek or sort on, and move "just return it" columns into `INCLUDE`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the ESR rule and why does range go last?
 > In a multicolumn B-tree put equality columns first, then sort columns, then range columns. Equality columns leave one contiguous run already ordered by the next column, so a sort column there means no Sort step. A range column breaks that order for everything after it, so placing it before the sort column forces a sort.
@@ -589,7 +641,7 @@ Fix with `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12+), which builds a new copy 
 > [!question]- How do you safely remove indexes?
 > Find candidates with `pg_stat_user_indexes.idx_scan = 0` over a full business cycle on every node, excluding unique and constraint indexes. In MySQL make it invisible first; in PostgreSQL drop with `DROP INDEX CONCURRENTLY` and keep the `CREATE` statement ready to rebuild.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Design from the query: `WHERE` + `ORDER BY` + `LIMIT`. Order key columns Equality → Sort → Range; tenant key first.
 - `INCLUDE` adds return-only columns (index-only scan); `WHERE` makes a partial index; both shrink work for the hot path.

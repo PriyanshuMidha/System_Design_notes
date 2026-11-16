@@ -23,7 +23,36 @@ updated: 2026-11-13
 > - As the table fills up, it **resizes** (grows and rehashes everything) to keep lookups fast.
 > - Go's `map` is this idea, built into the language, with randomized iteration and no concurrency safety.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You have a big pile of data, say a million users. You want to find one user fast. Checking them one by one is way too slow.
+
+```mermaid
+flowchart LR
+    A["Looking for user 482913"] -- "check every row, one by one" --> B["1,000,000 checks 😫"]
+```
+
+A **hash table** fixes this with a trick: a small recipe (the **hash function**) turns the user's name into a slot number. You jump straight to that slot. One step, no searching.
+
+```mermaid
+flowchart LR
+    A["user 482913"] --> H["hash recipe"] --> S["slot 17: found, 1 step 🎉"]
+```
+
+Sometimes two names land on the same slot (a **collision**). That is fine; the table has a plan for sharing. Go's built-in `map` is exactly this, ready-made.
+
+The rest of this note is just these 4 questions:
+1. Why is searching too slow in the first place?
+2. How does the key-to-slot trick actually work, and what about collisions?
+3. What happens when the table gets full?
+4. What is special about Go's `map`?
 
 **The problem in one story.**
 You run a library with a million books.
@@ -68,7 +97,7 @@ Where it breaks: hooks never move, but a hash table sometimes rebuilds itself bi
 > [!tip] Remember
 > Hash the key, take it mod the slot count, go straight to that slot: average O(1), as long as collisions stay rare.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you need to look up a user by ID among 10 million users. An array keyed by position only works if IDs are small, dense integers — real IDs are sparse (`user:482913`), so most array slots would sit empty.
 
@@ -93,7 +122,7 @@ flowchart LR
 > [!tip] Remember
 > A hash table trades "fully sorted" for "O(1) average lookup" by computing a slot instead of searching for one.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **The restaurant-coat-check analogy:** imagine a coat check with 100 numbered hooks.
 
@@ -117,7 +146,7 @@ flowchart TD
 > [!tip] Remember
 > The hash function's whole job is to turn "search for it" into "go directly to it" — collisions are the cost of that shortcut.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Hash functions
 
@@ -242,9 +271,11 @@ The fix is to seed the hash function with a random value chosen at table-creatio
 > [!tip] Remember
 > A hash table exposed to attacker-controlled keys needs a per-instance random seed, or its O(1) guarantee is just a guarantee the attacker can break.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** this is the smallest hash table you could write on a whiteboard — hash the key, pick a bucket, hang the entry there.
 
 The bare mechanism: an array of chains, insert appends to the chain at `hash(key) mod len(buckets)`.
 
@@ -263,6 +294,8 @@ func (t *tinyTable) put(key, val string) {
 That's the whole idea: hash, mod, prepend to that bucket's list. The runnable version adds automatic resizing, update-in-place and delete — the production concerns a real hash table needs.
 
 ### Tracing an insert that triggers a resize
+
+**In plain words:** let's watch, step by step, the one unlucky insert that forces the whole table to rebuild itself bigger.
 
 Take a table that starts with 4 buckets and a resize threshold (**max load factor**) of 0.75 — so it resizes once it holds more than 3 keys.
 
@@ -291,6 +324,8 @@ sequenceDiagram
 
 ### Go's `map` is this idea, built in
 
+**In plain words:** you never write any of the above in real Go — the language ships the same machine as `map`, already tuned.
+
 ```go
 m := make(map[string]int)
 m["alice"] = 30
@@ -311,7 +346,7 @@ Runnable Go version: [[Hash Tables and Go Maps - Go]]
 > [!tip] Remember
 > A resize is O(n) for the one Put that triggers it, and that cost is what buys O(1) amortized for every Put around it.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 |---|---|---|---|
@@ -333,17 +368,24 @@ flowchart TD
     Q3 -- no --> HT["Hash table / Go map\nO(1) average"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **No ordering.** A hash table cannot answer "give me keys between X and Y" or "the smallest key" efficiently — use a sorted structure ([[Trees, BSTs and Balanced Trees]], or a sorted slice) instead.
 - **Memory overhead.** Buckets reserve capacity ahead of need; a hash table of `n` small entries typically uses more memory than a sorted array of the same entries.
 - **Hashing cost.** For very small, fixed key sets known at compile time, a `switch` statement or a perfect hash can beat a general hash table.
 - **Iteration order.** If you need stable, reproducible iteration (snapshots, tests, deterministic serialization), a hash table alone won't give it — pair it with a slice of keys in the order you want, or use an ordered-map library.
 
+```mermaid
+flowchart LR
+    Q{"What is your question?"}
+    Q -- "is key X here? what's its value?" --> HT["Hash table ✅"]
+    Q -- "what comes before/after X?\nkeys in a range?" --> SO["Sorted structure (tree / sorted slice)"]
+```
+
 > [!tip] Remember
 > Reach for a hash table when the question is "does this key exist / what's its value," not "what comes before/after this key."
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Go's `map[K]V`, Python's `dict`, Java's `HashMap`, Redis's main keyspace (itself a hash table, separate from the "hash" data type it also offers).
@@ -355,9 +397,11 @@ flowchart TD
 	- "Why did my map iteration order change between two runs of the same program?" → Go (and most modern hash maps) randomizes iteration order on purpose; never depend on it.
 - **What to monitor:** load factor (if you control the table), resize frequency, and — for a cache sitting on a hash table — hit ratio (see [[Memory Hierarchy and CPU Caches]] for the hardware-cache version of the same idea, and `08 Caching & Redis` for the application-cache version).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Go maps before 1.24: buckets with tophash bytes
+
+**In plain words:** old Go maps were a row of small 8-coat racks; when a rack filled, an extra rack was chained behind it.
 
 Up through Go 1.23, the runtime map was a chained-bucket design: each bucket held up to 8 key-value slots plus an array of 8 **tophash** bytes (the high byte of each slot's hash), used to skip most slots without a full key comparison.
 
@@ -368,6 +412,8 @@ Growth happened incrementally: a resize allocated double the buckets, but old en
 The resize trigger was a load factor of about 6.5 (yes, greater than 1 — because of the 8-slot buckets and overflow chaining, a load factor above 1 was still efficient).
 
 ### Go 1.24+: Swiss Tables
+
+**In plain words:** new Go maps keep a tiny one-byte "name tag" per slot, and the CPU can check 16 name tags in one glance before touching any real key.
 
 Starting in Go 1.24, the runtime map implementation switched to a **Swiss Table** design (the same family as Abseil's `flat_hash_map`), documented in the Go 1.24 release notes.
 
@@ -389,6 +435,8 @@ This is both faster (fewer cache misses, more work per CPU instruction) and more
 
 ### Rules every Go engineer should know
 
+**In plain words:** these are the house rules of Go maps — each one bites people in real code at least once.
+
 - **Iteration order is randomized**, deliberately, on every `range` over a map — a language guarantee, not an implementation accident, precisely so code never comes to depend on an order the runtime is free to change.
 - **Concurrent writes are not safe.** Two goroutines writing to the same map concurrently (or one writing while another reads) trigger `fatal error: concurrent map writes` — a hard runtime crash, not a recoverable `panic`, specifically so silent data races in map internals cannot go unnoticed. Protect a shared map with a `sync.Mutex`/`sync.RWMutex`, shard it across several locked sub-maps, or use `sync.Map` (see below). This is covered in depth in [[sync Primitives and Atomics]].
 - **Map values aren't addressable.** You cannot do `m["k"].field = x` for a struct value in a map — take a copy, mutate it, and write it back, or store pointers (`map[K]*V`) instead.
@@ -401,11 +449,15 @@ This is both faster (fewer cache misses, more work per CPU instruction) and more
 
 ### `sync.Map`
 
+**In plain words:** `sync.Map` is a special map for "write once, read by everyone" — not a general thread-safe map.
+
 `sync.Map` is a specialized concurrent map for two patterns the standard library docs call out explicitly: (1) a key written once and read many times by many goroutines (a cache that's populated once, read forever), or (2) disjoint sets of keys accessed by disjoint sets of goroutines.
 
 It is **not** a general drop-in replacement for `map` + mutex — under heavy concurrent writes to overlapping keys, a plain `map` guarded by a `sync.RWMutex` or sharded into several locked maps often performs better, because `sync.Map` optimizes specifically for the read-mostly case.
 
 ### Classic practice problems
+
+**In plain words:** most interview hash-table questions are one of these five patterns in disguise.
 
 These are the hash-table patterns that show up most often in interviews:
 
@@ -415,7 +467,7 @@ These are the hash-table patterns that show up most often in interviews:
 - **longest consecutive sequence** (hash set of all values, then only start counting a run from a value whose predecessor isn't in the set, giving O(n) instead of the O(n log n) a sort would cost),
 - **LRU cache** (hash map of key → list node, paired with a doubly linked list for O(1) move-to-front and evict-the-tail — see `08 Caching & Redis` for the full LRU note).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is hash table lookup O(1) on average but O(n) in the worst case?
 > The hash function distributes keys across buckets; with a good hash and a bounded load factor, each bucket holds a small, roughly constant number of entries, so a lookup touches O(1) entries on average. In the worst case — every key hashing to the same bucket, by bad luck or attack — a lookup degrades to scanning all n entries in that one bucket.
@@ -438,7 +490,7 @@ These are the hash-table patterns that show up most often in interviews:
 > [!question]- Hash table vs. BST for an in-memory index: when would you pick the BST?
 > When you need ordered operations the hash table can't give you efficiently: range scans, "next key after X", min/max, or sorted iteration. A balanced BST gives those in O(log n); a hash table gives none of them better than O(n).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `index = hash(key) mod bucket_count`; average O(1) get/put/delete, worst case O(n).
 - Collisions: separate chaining (linked lists per bucket) vs. open addressing (probe for the next free slot).
@@ -449,7 +501,7 @@ These are the hash-table patterns that show up most often in interviews:
 - Sets: `map[T]struct{}`. Bloom filters trade a small false-positive rate for O(1) space-efficient set membership at scale — see [[Bloom Filters and Probabilistic Data Structures]].
 - `hash(key) mod N` is also how naive partitioning works, and why it breaks when N changes — see [[Consistent Hashing]].
 
-## Links
+## Links 🟢
 
 - **Go implementation:** [[Hash Tables and Go Maps - Go]]
 - **Before this:** [[Arrays and Dynamic Arrays (Go Slices)]], [[Complexity Analysis - Big-O and Amortized Cost]]

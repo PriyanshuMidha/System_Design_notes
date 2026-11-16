@@ -25,7 +25,40 @@ updated: 2026-11-13
 > - A connection's identity on the wire is a **5-tuple**: protocol, source IP:port, destination IP:port.
 > - This note goes deeper than a first pass at networking: it also covers BGP route propagation between organizations and MTU/fragmentation, which is why it is tagged intermediate rather than basic.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+The internet does not send your message in one piece. It chops it into small chunks called **packets**, each about the size of a text page.
+
+Every packet gets an address label: who sent it, who should get it. That address is the **IP address**, a number that names one machine.
+
+Packets hop from machine to machine. Each hop machine is a **router**: it reads the label, picks the next hop, passes it on. No one plans the full route.
+
+```mermaid
+flowchart LR
+    A["Your laptop"] --> R1["Router"] --> R2["Router"] --> B["Server"]
+```
+
+When packets arrive, one more number on them — the port — says which program on that machine should get them (443 means the web server).
+
+```mermaid
+flowchart LR
+    P["Packet arrives<br/>at the server"] -- "port 443" --> W["Web server program"]
+    P -- "port 22" --> S["SSH program"]
+```
+
+That is the whole trick. The rest of this note is just these 4 questions:
+1. Why chop data into packets at all?
+2. What are the layers of labels wrapped around each packet?
+3. How do routers across different companies agree on where to send things (BGP)?
+4. How does one machine keep thousands of connections apart (ports and the 5-tuple)?
+
 
 **The problem in one story.**
 You type a web address and a page appears in under a second.
@@ -70,7 +103,7 @@ Where it breaks: real mail is not chopped into pieces that may take different ro
 > [!tip] Remember
 > IP address finds the machine, port finds the program, and routers pass each packet one hop at a time.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine your laptop (`192.168.1.42`) wants to fetch a page from a server (`93.184.216.34`). There is no dedicated wire running between the two machines. Your laptop talks to a home router, which talks to your ISP, which talks to other ISPs, which eventually reach the network the server lives on.
 
@@ -100,7 +133,7 @@ flowchart LR
 
 Each layer wraps the one above it in its own header. A router only ever opens the IP header; a switch only ever opens the Ethernet header. Neither one looks any deeper than it has to.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **Analogy — nested envelopes.** Picture your data as a letter. Before it goes anywhere, three people each put it inside a bigger envelope and write their own "to/from" on the outside:
 
@@ -112,7 +145,7 @@ A router, in this picture, is a post office that reads only the IP envelope's ad
 
 Where the analogy breaks down: a real post office reads a letter once and is done; a router repeats this "read IP address, repackage, forward" cycle for millions of packets per second, and it discards and rebuilds the outer envelope at *every single hop* — nothing like paper mail.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Encapsulation and decapsulation
 
@@ -291,9 +324,11 @@ The destination port (443) alone could not tell the kernel which tab's data this
 > [!tip] Remember
 > IP address → which host; port → which program; the 5-tuple is a connection's true, unique identity on the wire.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** three lines of Go are enough to watch the ideas above become real — one program listens at an address, another connects, and each prints the address pair it sees.
 
 The simplest possible socket program already makes the 5-tuple visible: one side listens, one side connects, and each end sees a different pairing of addresses and ports.
 
@@ -312,7 +347,7 @@ fmt.Println(conn.LocalAddr(), "->", conn.RemoteAddr())
 
 Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Model | Layers | Used for | Who actually implements it |
 | --- | --- | --- | --- |
@@ -325,13 +360,13 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 | TCP | Retransmits lost segments | In order | Handshake + ack overhead | Correctness matters more than latency (HTTP, SSH) |
 | UDP | None — packets may be lost | Not guaranteed | Minimal (8-byte header) | Latency matters more than occasional loss (DNS, video, QUIC's basis) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Packet switching's flexibility (any path, hop by hop) costs ordering and reliability guarantees — something above IP (TCP, or the application) must restore them if the application needs them.
 - Treating OSI as a literal implementation (rather than a teaching aid) leads to confused diagrams that invent a "session layer protocol" that doesn't exist on the wire; describe real systems with the 4-layer model and borrow OSI numbers only as shorthand.
 - BGP trusts announcements by default: a correctly behaving network has almost no way to stop a neighbor from falsely announcing someone else's prefix, which is why route-origin validation (RPKI) exists as a bolt-on fix, not a built-in protection.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every TCP/IP stack (Linux, macOS, Windows) implements the 4-layer model directly; BGP runs between every pair of ISPs and cloud providers on the internet; AWS/GCP/Azure VPC routing tables are, internally, a constrained BGP-like forwarding problem (see [[IP Addressing, Subnets, NAT and VPC Basics]]).
 - **Failure modes → fixes:**
@@ -340,7 +375,7 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 	- **Port exhaustion**: a host opening huge numbers of outbound connections to the same destination runs out of ephemeral source ports (the ~28,000 available on Linux by default) → connection pooling/reuse, or widen the ephemeral port range.
 - **What to monitor:** interface MTU mismatches (via Path MTU Discovery failures), BGP session flaps and unexpected AS-path changes for your own prefixes, and ephemeral port usage on high-connection-count hosts.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why packet switching over circuit switching:** a phone network reserves a fixed-capacity circuit for a call's whole duration, wasting it during silence.
 
@@ -356,7 +391,7 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 
   This is how DNS root servers and CDNs serve a single IP from dozens of data centers (see [[DNS - Resolution, Records and Caching]] and [[CDN and Edge]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between an IP address and a port?
 > An IP address identifies a *host* on the network; a port (0–65535, carried in the TCP/UDP header, not the IP header) identifies a *program* on that host. Routers route on IP addresses only; the destination host's kernel uses the port to hand the data to the right listening process.
@@ -376,7 +411,7 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 > [!question]- What does TTL actually do, and how does traceroute use it?
 > TTL is a hop counter in the IP header, decremented by each router; it prevents packets from looping forever on a routing misconfiguration. Traceroute sends packets with TTL = 1, 2, 3, … and records the "Time Exceeded" ICMP reply from each router along the way, reconstructing the path hop by hop.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Packets are independently routed; no end-to-end circuit is reserved.
 - Encapsulation adds a header per layer going out; decapsulation strips them in reverse coming in.

@@ -24,7 +24,36 @@ updated: 2026-11-13
 > - A few read-only, no-privilege operations (reading the time, the CPU number) are special-cased to skip the trap entirely via a **vDSO**.
 > - Go's standard library wraps almost every syscall for you, and the runtime tracks which OS thread is "stuck" in one so it can keep other goroutines running.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your program is not allowed to touch the hardware. It cannot read a disk, send a packet, or even print to the screen by itself. Only the **kernel** — the core of the operating system — may do those things.
+
+The CPU enforces this with two modes: **user mode** (your code, restricted) and **kernel mode** (OS code, full power).
+
+```mermaid
+flowchart TD
+    U["User mode: your program<br/>(no hardware access)"] -->|"asks politely"| K["Kernel mode: the OS<br/>(full hardware access)"]
+    K --> HW["Disk, network, screen"]
+```
+
+When your program needs something real done, it makes a **system call**: a formal request that switches the CPU into kernel mode, does the work, and switches back. Like a bank teller: you never enter the vault; you hand a slip to the teller.
+
+```mermaid
+flowchart LR
+    P["program calls read()"] --> T["trap into kernel"] --> W["kernel reads disk"] --> R["back to user mode<br/>with the data"]
+```
+
+The rest of this note is just three questions:
+1. What exactly happens, step by step, during one system call?
+2. Why are syscalls "expensive", and what does that cost in numbers?
+3. How does Go reduce that cost (batching, netpoller, fewer syscalls)?
 
 **The problem in one story.**
 Your Go program wants to read a file.
@@ -68,7 +97,7 @@ Where it breaks: a teller serves many customers in parallel windows, while a sys
 > [!tip] Remember
 > Programs can't touch hardware; they ask the kernel through one guarded door, the syscall, and every trip through that door costs time.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 If any program could write directly to the disk controller's registers, write to another process's memory, or mask interrupts, no multi-user, multi-process operating system could promise isolation or stability. Misbehaving code could read another user's files or freeze the whole machine.
 
@@ -93,7 +122,7 @@ So when `fmt.Println` needs to actually write bytes to a terminal, or an HTTP se
 > [!tip] Remember
 > Two privilege levels, one gate between them. Everything about system calls below is really about how that one gate is designed to be narrow, audited, and unavoidable.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### The visitor badge and the front desk
 
@@ -115,7 +144,7 @@ flowchart LR
 > [!warning] Common mistake
 > Thinking a system call is just "a function call that happens to be slow." It isn't a function call at all in the CPU's eyes — it's a hardware-enforced privilege-level change, with the CPU itself switching modes and jumping to one fixed address the kernel controls, not wherever the caller points it.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The user → kernel → user round trip
 
@@ -208,7 +237,7 @@ flowchart TD
 > [!tip] Remember
 > Almost every syscall traps. The vDSO is a small, deliberate exception for a handful of read-only clock/CPU operations — don't generalize it to "syscalls are sometimes free."
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -261,7 +290,7 @@ flowchart LR
 
 Runnable Go version: [[System Calls and User vs Kernel Mode - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Boundary-crossing mechanism | Typical cost (documented, order of magnitude) | Why |
 | --- | --- | --- |
@@ -276,7 +305,7 @@ Runnable Go version: [[System Calls and User vs Kernel Mode - Go]]
 >
 > But they rhyme in effect — both are a transition the Go scheduler cannot see inside, and both can tie up an OS thread until they return.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 You don't choose to avoid syscalls for ordinary I/O — the alternative is "don't talk to the kernel," which means no files, no network, no new memory. The real lever is **how often** you cross:
 
@@ -285,7 +314,7 @@ You don't choose to avoid syscalls for ordinary I/O — the alternative is "don'
 - A syscall that blocks ties up whatever is making it. In Go, a goroutine blocked in a syscall ties up its OS thread, not the whole scheduler — the runtime detects this and can spin up another OS thread so other goroutines keep running (see Deep dive) — but a C program with one thread blocked in `read()` is simply stuck until that read returns.
 - Checking "is this worth a syscall" matters at scale: a server doing one `write()` per log line instead of buffering can spend a surprising fraction of its CPU budget purely on trap overhead and kernel-side argument validation, invisible in a flame graph unless you look at `%system` time specifically.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every blocking network read in `net/http`'s server goes through a real syscall (`read`/`recvfrom`) mediated by the Go netpoller's `epoll`/`kqueue` wait, not a busy loop; `bufio.Writer` exists specifically to turn many small `Write` calls into fewer syscalls; database drivers batch statements partly to reduce round trips at the network layer, which rests on the same "fewer crossings, more work per crossing" idea one level up.
 - **Failure modes → fixes:**
@@ -294,7 +323,7 @@ You don't choose to avoid syscalls for ordinary I/O — the alternative is "don'
   - cgo calls in a hot path cause unexpected latency → each cgo call has fixed overhead and can block a whole OS thread the same way a syscall can; avoid cgo in very hot paths where a pure-Go path exists.
 - **What to monitor:** `strace -c` (Linux) or equivalent per-syscall counts and time in staging; `/proc/<pid>/status`'s thread count next to `runtime.NumGoroutine()`; `runtime/trace`'s "syscall" goroutine state in a captured trace.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### How Go wraps syscalls
 
@@ -348,7 +377,7 @@ flowchart LR
 
 Documented benchmarks after KPTI landed showed syscall-heavy workloads (e.g. high-rate `read`/`write`) slowing by several percent to over 20% on affected hardware — a concrete example of how the "privilege switch" part of a syscall's cost is not fixed in stone but depends on the CPU and its mitigations.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between user mode and kernel mode, mechanically?
 > They're CPU privilege levels.
@@ -387,7 +416,7 @@ Documented benchmarks after KPTI landed showed syscall-heavy workloads (e.g. hig
 >
 > A goroutine stuck in a long cgo call behaves, from the scheduler's point of view, a lot like one stuck in a blocking syscall: it pins an OS thread until it returns.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Two privilege levels matter here: user mode (restricted) and kernel mode (unrestricted). A syscall is the only sanctioned way across.
 - The crossing mechanism is a trap instruction (`syscall`/`sysenter` on x86-64, `svc` on arm64) into one fixed, kernel-owned entry point — never a direct jump into kernel code.

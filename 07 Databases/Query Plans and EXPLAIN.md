@@ -30,7 +30,43 @@ updated: 2026-11-13
 > - `EXPLAIN (ANALYZE, BUFFERS)` shows real time, real rows and how many 8 kB pages were read; it really executes the statement.
 > - Find which queries to fix first with `pg_stat_statements`, then read their plans.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (join types and tools).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You write a SQL query. It says *what* rows you want, never *how* to find them.
+
+The database has a part called the **planner** that decides the how. It can read the whole table, or jump straight to the right rows using an **index** (a sorted lookup list, like the index at the back of a book).
+
+```mermaid
+flowchart LR
+    Q["Your query:<br/>'give me overdue invoices'"] --> P{"Planner picks a way"}
+    P -- "way 1" --> A["Read all 1.2 million rows"]
+    P -- "way 2" --> B["Jump via index,<br/>read ~50 rows"]
+```
+
+Both ways return the same rows. One takes a second, the other a few milliseconds.
+
+The chosen recipe is the **query plan**. Typing `EXPLAIN` before your query prints that recipe, so you can see which way the database picked and why.
+
+```mermaid
+flowchart LR
+    E["EXPLAIN SELECT ..."] --> R["The plan, printed as text"]
+    R --> U["You spot the slow step"]
+```
+
+The planner guesses using stored facts about your data. When the guess is wrong, it picks a bad plan. That is most slow queries.
+
+The rest of this note is just these 4 questions:
+1. How does the planner guess and price its options?
+2. How do you read a printed plan, line by line?
+3. How do you fix a slow plan (index) and a wrong guess (statistics)?
+4. Which queries should you even look at first?
 
 **The problem in one story.**
 You ask a librarian for "every book by this author from 2020".
@@ -78,7 +114,7 @@ Where it breaks: a sat-nav updates traffic live, while the planner trusts statis
 > [!tip] Remember
 > When a query is slow, compare the planner's estimated rows with the actual rows: a big gap is usually the bug.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps shows each workspace an "Overdue invoices" page, the 50 oldest overdue invoices:
 
@@ -98,7 +134,7 @@ Nothing in the SQL text tells you why it is slow: the reason is the plan, which 
 
 Throughout this note, plan output is **representative output (PostgreSQL 17)**, written to be internally consistent (costs, row counts, buffer counts) but not captured from a live server. Timings are illustrative.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The planner is a route planner for data. You give a destination (the result you want). It knows the roads (tables, indexes), has a rough traffic model (statistics about how many rows match what), estimates the travel time of several routes, and picks the fastest **estimated** route. It does not drive the routes first.
 
@@ -109,9 +145,11 @@ So there are only two ways a plan goes wrong:
 
 Reading a plan means checking both: what route was chosen, and how wrong the guesses were.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 From SQL text to rows
+
+**In plain words: your SQL text goes through a short assembly line — check the grammar, expand shortcuts, pick the cheapest recipe, then run it.**
 
 ```mermaid
 flowchart LR
@@ -124,6 +162,8 @@ flowchart LR
 ```
 
 ### 3.2 Statistics and selectivity
+
+**In plain words: the database keeps a small fact sheet about each column (like a census summary), and uses it to guess how many rows a condition will match.**
 
 `ANALYZE` (run automatically by autovacuum after enough rows change) samples each table and stores per-column statistics, readable through the `pg_stats` view. With the default `default_statistics_target = 100`, it samples 30,000 rows (300 × the target) and keeps:
 
@@ -163,6 +203,8 @@ If the two columns are really correlated, the true number can be far from 480; t
 
 ### 3.3 The cost model
 
+**In plain words: the planner prices each candidate plan in made-up points, like estimating a trip by counting kilometres — the points are not milliseconds, they only exist to compare plans.**
+
 **Cost** is an abstract unit, not milliseconds. By default one sequential 8 kB page read costs `seq_page_cost = 1.0`, a random page read `random_page_cost = 4.0`, processing one row `cpu_tuple_cost = 0.01`, one index entry `cpu_index_tuple_cost = 0.005`, and one operator such as `=` `cpu_operator_cost = 0.0025`.
 
 Worked: a sequential scan of `invoices` (30,000 pages, 1,200,000 rows) with two `=` conditions costs
@@ -185,6 +227,8 @@ flowchart TB
 ```
 
 ### 3.4 Reading a plan
+
+**In plain words: a plan prints as an indented tree; read it like a family tree from the deepest child upward, and remember every number on a line is per run of that line.**
 
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
@@ -229,6 +273,8 @@ Rows flow upward: the scans at the bottom run first, the `Hash` node is built co
 
 ### 3.5 Node types you will meet
 
+**In plain words: each line of a plan is one worker with one job — scan a table, look things up in an index, sort, or join — and this table says when each worker is the right hire.**
+
 | Node | What it does | Good sign / warning sign |
 | --- | --- | --- |
 | Seq Scan | reads every page of the table | fine for small tables or when most rows match; `Rows Removed by Filter` in the millions is a warning |
@@ -245,9 +291,11 @@ Rows flow upward: the scans at the bottom run first, the `Hash` node is built co
 
 Index structure and index choice are owned by [[Indexing Fundamentals]] and [[Index Types and Index Design]]; this note only reads which index the plan used.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words: the whole fix in three steps — look at the plan, add the right index, look again and confirm it changed.**
 
 ```sql
 -- 1. See the plan and what really happened.
@@ -266,6 +314,8 @@ CREATE INDEX CONCURRENTLY invoices_ws_status_due_idx
 ```
 
 ### Plan 1: the slow version
+
+**In plain words: with no useful index, the database reads all 1.2 million rows just to keep about 5,000 — like searching a library with no catalogue.**
 
 Staging copy: 1,200,000 invoices in 30,000 pages, primary key only. For a readable single-process plan, parallel query is off (`SET max_parallel_workers_per_gather = 0`); with it on you would see a `Gather Merge` over parallel scans doing the same total work.
 
@@ -294,6 +344,8 @@ Reading it inside out:
 
 ### Plan 2: after the composite index
 
+**In plain words: with the right index, the database jumps straight to the 50 rows it needs, already in order — the same query drops from about a second to a few milliseconds.**
+
 The index puts the two equality columns first and the sort column last, so the matching entries are already in `due_date` order (why this column order works is covered in [[Index Types and Index Design]]).
 
 Representative output (PostgreSQL 17):
@@ -313,6 +365,8 @@ Execution Time: 2.903 ms
 - 53 pages instead of 30,000: about 3 index pages plus one table page per row. Time drops from about 1.2 s to about 3 ms (illustrative), almost all of it the 49 page reads from disk; a second run with a warm cache would show `hit=53` and well under a millisecond.
 
 ### Plan 3: a bad estimate
+
+**In plain words: here the plan is slow not because a road is missing, but because the planner's map is out of date — it expected 12 rows and got 48,000.**
 
 A report joins invoices to clients for workspace 77 in rupees. Workspace 77 is a new, large Indian customer that imported its whole history after the last `ANALYZE`, so the statistics still describe it as a tiny tenant (unlike workspace 42 in Plans 1 and 2, whose estimate was accurate):
 
@@ -390,6 +444,8 @@ Estimate 47,900 vs actual 48,211: within 1%. The planner now reads the table pag
 
 ### Finding misestimates mechanically
 
+**In plain words: instead of eyeballing a huge plan, get it as JSON and let a tiny program flag every step where the guess was 10 times off.**
+
 For large plans, scanning by eye is error prone. `EXPLAIN (ANALYZE, FORMAT JSON)` returns the same tree as JSON, and a small program can walk it and flag every node whose estimate is off by 10x or more.
 
 Both sides are compared per loop, exactly as PostgreSQL reports them, and a value of 0 is treated as 1 to avoid dividing by zero. The factor is `max(planned / actual, actual / planned)`, so over- and under-estimates count the same.
@@ -410,9 +466,11 @@ The helper correctly ignores the `clients` lookup (1 planned, 1 actual per loop)
 
 Runnable Go version: [[Query Plans and EXPLAIN - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Join algorithms
+
+**In plain words: a database has three ways to match rows from two tables — look each one up (nested loop), build a lookup table in memory (hash), or zip two sorted lists together (merge).**
 
 | Join | How it works | Wins when | Cost / risk |
 | --- | --- | --- | --- |
@@ -443,6 +501,8 @@ sequenceDiagram
 
 ### Tools for seeing plans
 
+**In plain words: EXPLAIN looks at one query; these tools tell you which query deserves the look in the first place.**
+
 | Tool | What it shows | Use when | Cost |
 | --- | --- | --- | --- |
 | `EXPLAIN` | estimated plan only | any statement, including dangerous writes | free; estimates can be wrong |
@@ -470,7 +530,7 @@ SELECT calls,
 
 Sort by `total_exec_time`, not `mean_exec_time`: a 2 ms query called 5 million times a day costs more than a 4 s report run twice. A very high `calls` count with tiny `rows` per call often means an [[N+1 Query Problem]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - **`EXPLAIN ANALYZE` executes.** On a `DELETE` it deletes. Use `BEGIN … ROLLBACK`, and remember that even a rolled-back write takes row locks and generates WAL.
 - **Timing overhead.** Per-node timing calls the clock twice per row per node; on very fast nodes over millions of rows the reported time can be noticeably inflated. `TIMING OFF` keeps row counts accurate.
@@ -479,7 +539,7 @@ Sort by `total_exec_time`, not `mean_exec_time`: a 2 ms query called 5 million t
 - **More indexes are not free.** Each index slows writes and takes space; see [[Index Types and Index Design]] before adding the fifth index to a hot table.
 - **Cache warmth lies.** The second run of any query is faster. Compare `shared read` counts, not only milliseconds.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `pg_stat_statements` ships with PostgreSQL as a contrib module and is available on the major managed services (Amazon RDS, Cloud SQL, Azure Database for PostgreSQL); you still run `CREATE EXTENSION` in each database. Visual tools such as explain.depesz.com and PEV2 render text or JSON plans. MySQL's equivalent of `pg_stat_statements` is `performance_schema.events_statements_summary_by_digest`.
 - **Failure modes → fixes:**
@@ -522,7 +582,7 @@ flowchart TD
     I --> D
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **How the planner searches.** For each table, it builds candidate access paths (sequential, each usable index, bitmap combinations).
 
@@ -548,7 +608,7 @@ If `Execution Time` is 3 ms and the app sees 300 ms, look at the pool wait, the 
 
 **JIT.** For expensive queries (total cost above `jit_above_cost`, 100,000 by default) PostgreSQL may compile expressions with LLVM; the plan then ends with a `JIT:` block showing compile time. On short OLTP queries that cross the threshold because of a bad estimate, JIT compile time of tens of milliseconds can exceed the query time itself.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between EXPLAIN and EXPLAIN ANALYZE?
 > `EXPLAIN` prints the chosen plan with estimated costs and row counts, without running anything. `EXPLAIN ANALYZE` runs the statement and adds actual time, rows and loops per node. Because it runs it, wrap writes in `BEGIN … ROLLBACK`. Add `BUFFERS` to see page reads.
@@ -571,7 +631,7 @@ If `Execution Time` is 3 ms and the app sees 300 ms, look at the pool wait, the 
 > [!question]- A query is fast in psql but slow from the Go service. Why might that be?
 > The driver uses prepared statements, and after five executions PostgreSQL may switch to a generic plan that ignores parameter values, which is bad for skewed data. Other causes are different `work_mem` or `search_path` settings for the app role, waiting for a pool connection, or lock waits. Compare with `EXPLAIN (GENERIC_PLAN)` and try `plan_cache_mode = force_custom_plan`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `EXPLAIN (ANALYZE, BUFFERS)`; it executes, so use `BEGIN … ROLLBACK` for writes.
 - Read inside out; `cost=startup..total` in abstract units; actual time and rows are per loop, so multiply by `loops`.
@@ -582,7 +642,7 @@ If `Execution Time` is 3 ms and the app sees 300 ms, look at the pool wait, the 
 - Find targets with `pg_stat_statements` ordered by `total_exec_time`; catch production plans with `auto_explain`.
 - Prepared statements can switch to a generic plan after 5 runs; `plan_cache_mode` controls it.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[SQL Essentials]], [[Indexing Fundamentals]]
 - **Next:** [[Index Types and Index Design]], [[Debugging Database Performance]], [[Locking - Optimistic vs Pessimistic]]

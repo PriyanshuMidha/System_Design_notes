@@ -23,7 +23,39 @@ updated: 2026-11-13
 > - A component's life has three phases: **mount**, **update**, **unmount**. Hooks (`useEffect`, cleanup functions) are how function components hook into those phases; class lifecycle methods did the same job before hooks existed.
 > - Since React 18, state updates are **batched** everywhere (not just inside event handlers), and rendering itself can be interrupted and resumed (**concurrent rendering**) so a big update doesn't freeze the page.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (diffing and keys) and 4 (lifecycle and batching).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When data changes, something must update the page. Rebuilding the whole page is slow and loses your scroll position and typed text. React's trick: keep a cheap in-memory sketch of the page — the **virtual DOM** — and when data changes, draw a new sketch and compare it with the old one.
+
+```mermaid
+flowchart LR
+    O["old sketch:<br/>button says 10"] --> D{"compare"}
+    N["new sketch:<br/>button says 11"] --> D
+    D --> P["change ONE text<br/>node on the real page"]
+```
+
+That comparing step is called **reconciliation**. React only touches the real page where the sketches differ.
+
+A component also has a life: it appears (**mount**), updates many times, and is removed (unmount).
+
+```mermaid
+flowchart LR
+    M["mount"] --> U["update, update, update..."] --> X["unmount"]
+```
+
+The rest of this note is just these 4 questions:
+1. What exactly is the virtual DOM, and why three trees?
+2. How does the diff decide what to update?
+3. Why do lists need a `key`?
+4. What runs at mount, update and unmount, and what did React 18 change?
+
 
 **The problem in one story.**
 You click a "Like" button and the count goes from 10 to 11.
@@ -83,7 +115,7 @@ Click the button and the state changes 0 → 1. React does not mutate the DOM te
 
 Nothing else on the page re-renders at the DOM level, even though in principle "the whole app" re-ran as JavaScript functions.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Before this model, UI libraries either mutated the DOM directly from scattered event handlers (jQuery-style — correct but hard to keep consistent as an app grows) or re-rendered the entire page on every change (simple but slow: full-page DOM rebuilds are visibly janky past a few hundred nodes).
 
@@ -95,7 +127,7 @@ A component re-renders (its function runs again) for three reasons: its own stat
 
 Only the first two necessarily touch the DOM; reconciliation is what decides whether a re-render actually produces a DOM write.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### Three trees, not two
 
@@ -138,7 +170,7 @@ Confusing "re-render" (function call) with "DOM write" (fiber committed a change
 
 Every render produces a fresh element tree. React diffs it against the fiber tree from last time, updates the fiber tree in place where it can, and emits a minimal list of DOM mutations.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 flowchart LR
@@ -223,9 +255,11 @@ items.map((item) => <Row key={item.id} data={item} />)
 
 With a stable `key`, React matches old and new children **by key**, so inserting at the front correctly shows "position 0 is new, everything else just moved" — one mount, zero wasted patches.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Lifecycle: class methods and their hook equivalents
+
+**In plain words:** older React used classes with named lifecycle methods ("run this when I appear", "run this when I leave"). Hooks do the same jobs now — the diagram and table below map the old names to the hook that replaced each one.
 
 ```mermaid
 stateDiagram-v2
@@ -292,6 +326,8 @@ class ErrorBoundary extends React.Component {
 
 ### React 18+: automatic batching and concurrent rendering
 
+**In plain words:** React 18 made two things smarter. Batching: several state changes in one go now cause one repaint, wherever they happen. Concurrent rendering: React can pause a big slow update to handle an urgent one first, like a waiter dropping a long order to answer a quick question.
+
 Before React 18, React only batched multiple `setState` calls inside its own event handlers; a `setState` inside a `fetch().then()` or a `setTimeout` callback triggered one re-render *per call*. Since React 18, batching applies everywhere:
 
 ```jsx
@@ -320,7 +356,7 @@ function onChange(e) {
 
 `useDeferredValue` does the same job from the consumer's side when you cannot wrap the producer's setter in `startTransition`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 |---|---|---|---|
@@ -329,14 +365,14 @@ function onChange(e) {
 | Full re-render, no diffing (naive templating) | Re-build the DOM subtree from scratch on every change | Tiny pages, or a non-reactive library with no diffing step | Simple, but doesn't scale past small trees |
 | `React.memo` / `useMemo` / React Compiler | Skip re-rendering a subtree, or re-computing a value, when inputs are referentially equal | A component or computation is provably unaffected by a parent re-render | Comparison cost; can backfire if props are new objects/functions every render |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Re-rendering is cheap relative to the DOM write it might cause, but it is not free: large component trees with expensive render functions benefit from `memo`/`useMemo`, not from "the virtual DOM will handle it."
 - The diff is a heuristic, not a true minimal edit script — a reordered list without keys, or a changed element type, forces more work than a human would choose.
 - For a handful of static DOM nodes that almost never change, plain DOM APIs or a non-VDOM library add less overhead than React's render/commit machinery.
 - The React Compiler (stable from React 19) auto-memoizes components that follow the rules of React, reducing — but not eliminating — the need to hand-write `memo`/`useMemo`/`useCallback`.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every React 18/19 app (Next.js, Remix, CRA-successors like Vite); the Fiber architecture shipped in React 16 specifically to enable interruptible rendering for concurrent features.
 - **Failure modes → fixes:**
@@ -346,14 +382,14 @@ function onChange(e) {
   - Double effect firing in development → that's `StrictMode` intentionally mounting, unmounting and remounting once to surface missing cleanup; it does not happen in production builds.
 - **What to monitor:** React DevTools Profiler flame graphs for render duration and re-render counts; Core Web Vitals (INP particularly, since it reflects render-blocking work from input to paint).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Fibers as a linked list, not a tree walk with the call stack.** Each fiber points to its child, sibling and return (parent), so React can pause work after any fiber and resume later without blowing the JS call stack recursing through a huge tree.
 - **Lanes.** React 18 assigns each update a priority "lane" (discrete, continuous, default, transition, idle). A transition-lane update can be preempted by a discrete-lane one (a click), which is the mechanism behind `startTransition` staying responsive.
 - **Batching is about commits, not renders.** "Batched" means React waits to flush DOM mutations and effects until it has processed all the synchronously-triggered state updates, producing one commit instead of several — it does not mean your component functions are called fewer times than state changes would otherwise imply.
 - **`use()` and Suspense for data** (stable since React 19) let a component "read" a promise during render and suspend, handing the tree's nearest `<Suspense>` boundary a fallback to show — closing the gap between "fetch in an effect after mount" and declaratively suspending render itself. See [[React Routing and Rendering Strategies - CSR, SSR, SSG]] for how this interacts with Server Components.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Does the virtual DOM make React faster than directly manipulating the DOM?
 > No — a hand-written, perfectly targeted DOM mutation is always at least as fast. The virtual DOM buys predictability: you write declarative code and React computes a decent diff for you, instead of you hand-tracking which DOM node needs which update.
@@ -376,7 +412,7 @@ function onChange(e) {
 > [!question]- What problem do React 18's automatic batching and transitions each solve?
 > Automatic batching reduces the number of re-renders when multiple state updates happen outside a React event handler (in a promise callback, `setTimeout`, or native event listener), collapsing them into one commit. Transitions solve a different problem: letting an expensive, non-urgent update (filtering a big list) be interrupted by an urgent one (keeping a text input responsive) instead of batching deciding priority for you.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `UI = f(state)`: React re-runs your component function and diffs the result against the previous fiber tree; it does not mutate your JSX directly.
 - Virtual DOM = predictability, not raw speed. The real DOM write still costs what it costs.

@@ -30,7 +30,38 @@ updated: 2026-11-13
 > - Allow-list filter and sort fields; never paste them into SQL.
 > - Classic mistake: deep `OFFSET`, which gets slower with every page and shifts when rows are inserted.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A list can be huge: 200,000 orders. The screen shows 20. So the server sends one **page** of 20, plus a bookmark for where to continue.
+
+There are two ways to build the bookmark. The slow one is a position number: "skip the first 100,000 rows". The database really does walk past all of them every time.
+
+```mermaid
+flowchart LR
+    O["OFFSET 100000"] --> W["DB walks 100,000 rows,<br/>throws them away"] --> R["returns 20"]
+```
+
+The fast one is a **cursor**: the sort value of the last row you saw, like a bookmark at "Sharma, Priya" in a phone book. The database jumps straight there using an **index** (its sorted lookup structure).
+
+```mermaid
+flowchart LR
+    K["cursor = last row's key"] --> J["DB jumps straight to it"] --> R2["returns next 20"]
+```
+
+The position number has a second bug: if a new row arrives between pages, everything shifts and you see a row twice or miss one. The cursor does not shift.
+
+The rest of this note is just three questions:
+1. Why exactly is offset slow and shifty, and keyset not?
+2. How do you build a correct cursor (unique sort key, limit+1, signing)?
+3. How do filtering and sorting fit in without breaking the cursor?
+
 
 **The problem in one story.**
 You open "My orders" in a shopping app and you have 200,000 old orders.
@@ -75,7 +106,7 @@ Where it breaks: a printed book never changes; a live list gains and loses rows 
 > [!tip] Remember
 > Return one page plus an opaque cursor built from a unique sort key, and seek past it with an index instead of skipping with `OFFSET`.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A customer with 200,000 orders opens "My orders". Without pagination, `GET /orders` serializes 200,000 rows (about 40 MB of JSON at 200 bytes per order, an estimate), holds them in server memory.
 
@@ -91,16 +122,18 @@ Pagination fixes the size problem. The naive fix, `LIMIT 20 OFFSET n`, creates t
 
 Keyset pagination fixes both: every page costs about the same, and inserts or deletes elsewhere in the list never shift it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Offset** is "skip the first 100,000 lines of the phone book, then read 20". You still have to count past 100,000 lines.
 - **Keyset** is "open the phone book at *Sharma, Priya* and read the next 20 names". The book is sorted, so you jump straight there.
 
 The cursor is the bookmark: the sort key of the last row the client saw. As long as the sort key is **unique** and the list is read **in index order**, the bookmark always points to the same place, no matter what is inserted before it.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Offset scan vs keyset seek
+
+**In plain words:** offset counts its way to the page; keyset jumps to it. The two boxes below show what the database actually reads for each.
 
 ```mermaid
 flowchart TB
@@ -115,6 +148,8 @@ flowchart TB
 ```
 
 ### Keyset step by step
+
+**In plain words:** six small decisions make keyset work: a unique sort key, an index in that exact order, ask for one extra row to know if more exist, and seal the bookmark so clients cannot edit it.
 
 1. **Pick a unique, stable sort key.** `created_at` alone is not unique (two orders in the same microsecond), so add the primary key as a tie-breaker: sort by `(created_at DESC, id DESC)`.
 2. **Index exactly that order**, after the equality filters:
@@ -172,6 +207,8 @@ The inner node tells the story: offset read `rows=100020` to return 20; keyset r
 
 ### A client walking the list
 
+**In plain words:** the diagram below is one phone scrolling through its orders while a new order arrives mid-scroll — and nothing shifts.
+
 ```mermaid
 sequenceDiagram
     participant C as Mobile app
@@ -193,9 +230,11 @@ sequenceDiagram
     A-->>C: 200 data[7], has_more=false (no next_cursor)
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole pattern is two SQL queries and one index.
 
 The bare idea in SQL: the first page, then every next page seeks past the last row seen. The full version below adds the production concerns.
 
@@ -218,6 +257,8 @@ CREATE INDEX orders_customer_created_id ON orders (customer_id, created_at DESC,
 ```
 
 ### Full version
+
+**In plain words:** the real handler adds the guard rails: allow-listed filters, a clamped limit, and a signed cursor that only works with the exact filter it was issued for.
 
 The list handler's core in Go: parse and allow-list the query, build the keyset SQL, apply the `limit + 1` trick, and issue an HMAC-signed cursor bound to the filter and sort. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -532,7 +573,7 @@ and, for clients that prefer headers, the same link per RFC 8288:
 Link: <https://api.example.com/v1/orders?status=paid&limit=20&cursor=eyJ0Ijoi...>; rel="next"
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -552,7 +593,7 @@ What well-known APIs do:
 | Google APIs (AIP-158) | `page_size`, `page_token` | `next_page_token`; an empty string means the end |
 | GraphQL Relay | `first: 20, after: "..."` or `last`, `before` | `edges { cursor node }`, `pageInfo { hasNextPage endCursor }` |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **No random access.** Keyset cannot jump to page 50. If the product truly needs page numbers (a back-office table), use offset with a cap on depth, or jump by value ("orders before 1 March") instead of by position.
 - **One index per sort order.** Every sort the API allows needs its own composite index ending in the tie-breaker. Five sortable fields with two directions and two filters can mean many indexes and slower writes. Allow only the sorts the product actually uses.
@@ -560,7 +601,7 @@ What well-known APIs do:
 - **Small lists do not need it.** A settings list with at most 50 items can return everything; pagination plumbing there is pure cost.
 - **Totals are not free.** `count(*)` has to visit every matching row (see section 8). Offer `has_more` by default and a total only when the product needs it.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- GitHub's REST API paginates with the RFC 8288 `Link` header, caps `per_page` at 100, and its search API returns at most 1,000 results per search, however large `total_count` is.
@@ -579,7 +620,7 @@ What well-known APIs do:
 	- 400 responses for invalid cursors after each deploy.
 	- Distribution of requested `limit` values and of page depth.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why an index cannot make `OFFSET` fast.** A B-tree is ordered but does not store how many entries sit under each subtree, so the database cannot compute "where is entry 100,000" without walking the leaves. Keyset turns the position into a **value**, and finding a value is what a B-tree does in `O(log n)`.
 
@@ -637,7 +678,7 @@ Both are keyset designs with different wrapping; see [[GraphQL]] and [[gRPC]].
 
 **Caching.** A first page with no cursor changes on every insert, so cache it briefly or not at all. Pages fetched by cursor are more stable, but with deletes they can still change; see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] before adding `Cache-Control`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is `OFFSET 100000` slow even with an index on the sort column? (trap)
 > The index gives the order, but a B-tree cannot jump to "the 100,000th entry": it has no subtree counts. The database walks and discards 100,000 entries before returning 20. Keyset turns the position into a value (`(created_at, id) < (x, y)`), which the B-tree finds in a few page reads.
@@ -664,7 +705,7 @@ Both are keyset designs with different wrapping; see [[GraphQL]] and [[gRPC]].
 > [!question]- How do you page past 10,000 results in Elasticsearch?
 > Not with `from`/`size`: each shard must return `from + size` hits to be merged, so cost grows with depth, and the default window stops at 10,000. Use `search_after` with the last hit's sort values, a unique tie-breaker, and a point in time for a consistent view.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Offset reads `offset + limit` rows and drifts under writes; keyset reads about `limit` rows and does not drift.
 - Keyset: `WHERE (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT 21`, index `(filter cols, created_at DESC, id DESC)`.
@@ -675,7 +716,7 @@ Both are keyset designs with different wrapping; see [[GraphQL]] and [[gRPC]].
 - Totals: skip, cap, estimate, or maintain a counter; exact `count(*)` is a full visit.
 - Allow-list filter and sort fields; never splice them into SQL.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[REST and HTTP API Design]], [[Indexing Fundamentals]], [[Index Types and Index Design]]
 - **Next:** [[API Versioning and Backward Compatibility]], [[Building REST Endpoints]] (the full Go handler)

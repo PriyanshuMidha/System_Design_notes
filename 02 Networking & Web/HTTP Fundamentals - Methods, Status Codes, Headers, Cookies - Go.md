@@ -18,7 +18,16 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > This code is a tiny in-memory item store exposed over `net/http` that demonstrates method semantics from [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]] directly in running behavior: `GET` is safe and supports conditional `304` requests, `PUT`/`DELETE` are idempotent, `POST` is not, and a helper sets a correctly-attributed session cookie.
 
-## Before the code
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read the "From zero" paragraph below, then "Before the code" and "What this code shows". Stop there.
+> - 🟡 **Know the basics?** Add "Code", "Tests" and "Running it".
+> - 🔴 **Interview / SDE-3 prep?** Add "Design decisions", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of the theory note. It builds a tiny toy web server in Go that stores items in a map, and uses it to *prove* the method promises with running code: `GET` never changes anything, repeating a `PUT` or `DELETE` is harmless, repeating a `POST` creates duplicates, and a login cookie gets its three safety switches set. Read top to bottom — each code block has a plain explanation right after it — and the tests at the end show each claim passing for real.
+
+## Before the code 🟢
 
 - **`net/http` handlers**: functions `func(w http.ResponseWriter, r *http.Request)` that read a request and write a status, headers and body.
 - **`r.PathValue("id")`**: Go 1.22+ routing that pulls `{id}` out of a pattern like `GET /items/{id}`.
@@ -27,7 +36,7 @@ updated: 2026-11-13
 - **`httptest`**: fake requests and a response recorder, so tests run handlers without a real network.
 - **Run it**: `go vet ./...` then `go test -race ./...` from the module root.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code piece | Theory concept | Theory section |
 | --- | --- | --- |
@@ -37,7 +46,7 @@ updated: 2026-11-13
 | `HandleDelete` | Idempotent by end state, not by response | [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies#Methods safe and idempotent are two different properties]] |
 | `SetSessionCookie` | Cookie attributes: `Secure`, `HttpOnly`, `SameSite` | [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies#Cookies how state survives a stateless protocol]] |
 
-## Setup
+## Setup 🟢
 
 - Module layout: single package `httpdemo`, handlers in one file, tests in another.
 - Go 1.24. Standard library only (`net/http`'s `PathValue` routing requires Go 1.22+).
@@ -52,9 +61,11 @@ flowchart LR
     SetSessionCookie -. "independent of Store" .-> ResponseWriter
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the store and its fingerprint helper
+
+**In plain words:** we build a tiny shelf for items (a map with a lock so two requests can't trip over each other) and a stamp function that fingerprints any item's content.
 
 **Concept.** A real resource store would be a database table; this one is a mutex-guarded map, kept deliberately simple so the test focuses on HTTP semantics rather than storage mechanics.
 
@@ -98,6 +109,8 @@ func etag(body string) string {
 
 ### Step 2: `GET` — safe, with conditional request support
 
+**In plain words:** this handler only looks at the shelf, never changes it. And if the caller already has the current version, it answers with a tiny "nothing changed" instead of resending the item.
+
 **Concept.** This is the safe-method half of [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies#Methods safe and idempotent are two different properties]]: `HandleGet` only ever reads from the store, never writes to it, which is what makes it legal for a browser or crawler to call speculatively.
 
 Layering the conditional-`304` check on top (rather than a separate endpoint) keeps the caching contract attached to the same handler that owns the data, instead of splitting cache logic into a wrapper that has to independently know the resource's shape.
@@ -134,6 +147,8 @@ func (s *Store) HandleGet(w http.ResponseWriter, r *http.Request) {
 3. The `If-None-Match` comparison and early `304` return happen before `Content-Type` is set or the body is encoded — exactly the "set headers, then decide whether to write a body" shape from [[HTTP Caching - Cache-Control, ETag, Conditional Requests - Go]].
 
 ### Step 3: `PUT` and `DELETE` — idempotent, but not safe
+
+**In plain words:** these two change the shelf, but repeating them is harmless — putting the same item in the same slot twice, or throwing away something already gone, ends in the same place either way.
 
 **Concept.** Both handlers change state, so neither is safe — but both leave the store in the same place no matter how many times they are called with the same input, which is the idempotency promise from the theory note.
 
@@ -177,6 +192,8 @@ func (s *Store) HandleDelete(w http.ResponseWriter, r *http.Request) {
 3. Neither handler is marked safe in its doc comment, because both mutate `s.items` under the lock — the comment language ("is idempotent" vs "is safe") deliberately mirrors the two-axis table in the theory note.
 
 ### Step 4: `POST` — not idempotent, and a cookie helper
+
+**In plain words:** this is the dangerous one to retry — every call adds a brand-new item with a new number, so sending it twice means two items. The cookie helper at the end just shows the three safety switches a login cookie needs.
 
 **Concept.** `HandlePost` is the counter-example: every successful call appends a brand-new resource with a freshly incremented ID, so replaying the same request body (as a naive retry-on-timeout would) creates a second, third, fourth resource. `SetSessionCookie` is unrelated to the store but demonstrates the cookie attribute table from the theory note in one call.
 
@@ -332,7 +349,7 @@ func SetSessionCookie(w http.ResponseWriter, sessionID string) {
 > }
 > ```
 
-## Tests
+## Tests 🟡
 
 ### `TestPUTIsIdempotent`
 
@@ -485,7 +502,7 @@ func TestSessionCookieAttributes(t *testing.T) {
 
 **Measured** on this machine (Go 1.24.4, darwin/arm64, scratch module, `go test -race`, 2026-11-09): all four tests pass — two `PUT`s to the same resource produce `201` then `200` with identical stored state, three `POST`s create three distinct resources, a repeated conditional `GET` returns `304` with a zero-length body, and the session cookie carries `Secure`, `HttpOnly` and `SameSite=Strict`.
 
-## Design decisions
+## Design decisions 🔴
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -494,7 +511,7 @@ func TestSessionCookieAttributes(t *testing.T) {
 | `DELETE` always returns `204` regardless of prior existence | Return `404` if the item didn't exist | Matches the idempotency contract exactly: "the resource is gone" is true either way, so the response shouldn't depend on which call happened to do the deleting |
 | Cookie built via `http.SetCookie` + `http.Cookie` struct | Hand-format the `Set-Cookie` header string | The standard library handles attribute ordering and escaping correctly; a hand-built string is an easy source of a malformed or silently-ignored attribute |
 
-## Running it
+## Running it 🟡
 
 ```text
 $ go test -race -v ./httpdemo/...
@@ -512,13 +529,13 @@ ok      roll10/httpdemo 2.280s
 
 Reading it line by line: four `PASS` lines confirm each method-semantics claim independently rather than as one combined assertion, and the overall `ok` with `-race` confirms the mutex-guarded `Store` has no data race even under the `-race` detector's instrumented, concurrency-sensitive execution.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - `HandlePost`'s `s.nextID++` and the map write happen under the same lock, but if a future change moved ID generation outside the lock (e.g. to reduce contention), two concurrent `POST`s could read the same `nextID` before either increments it, producing a duplicate ID — a classic check-then-act race.
 - `HandleGet` returns a generic `404` for "not found" without setting `Cache-Control` on the error path — a real service usually wants a short negative-cache `Cache-Control` on `404`s too, to avoid hammering the origin for a resource that doesn't exist.
 - `SetSessionCookie` hardcodes `MaxAge: 3600`; a production version would typically make this configurable rather than a literal constant.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `HandleDelete` to return `404` when the item didn't already exist, then predict (and run) whether `TestConditionalGETReturns304` or `TestPUTIsIdempotent` still pass unchanged — they should, since neither test exercises `DELETE` — and discuss why this change would still be a bad idea per the idempotency contract even though no test catches it.
 2. Move `s.nextID++` in `HandlePost` outside the `s.mu.Lock()`/`Unlock()` pair (keep the map write inside). Run `go test -race ./httpdemo/...` and read what the race detector reports.

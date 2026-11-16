@@ -27,7 +27,40 @@ updated: 2026-11-13
 > - Claim the key atomically, and reject the same key with a different body (`422`).
 > - Classic mistake: check-then-insert without a lock or unique constraint, so two concurrent retries both run.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You tap "Pay". The money leaves your account, but the reply gets lost on bad network. The app cannot tell "it failed" from "it worked but I never heard back", so it tries again.
+
+Without protection, that second try charges you twice.
+
+```mermaid
+flowchart LR
+    A["Tap Pay"] --> B["Server charges card"]
+    B -. "reply lost" .-> A
+    A -- "app retries" --> C["Server charges AGAIN ❌"]
+```
+
+**Idempotent** means: doing something twice has the same effect as doing it once. Reads already are. Payments are not, so we make them so with an **idempotency key**: the app invents one ticket number per payment and sends it with every try. The server remembers the ticket: first time it does the work, every repeat just gets the saved answer.
+
+```mermaid
+flowchart LR
+    R["Retry with same key"] --> S{"Key seen?"}
+    S -- "no" --> W["Do the work once,<br/>save the answer"]
+    S -- "yes" --> P["Replay saved answer ✅"]
+```
+
+The rest of this note is just three questions:
+1. Which operations are naturally safe to retry, and which are not?
+2. How does the key protocol work, step by step?
+3. How do you avoid the race where two retries both think they are first?
+
 
 **The problem in one story.**
 You tap "Pay" in a shopping app and the screen spins.
@@ -72,7 +105,7 @@ Where it breaks: a cloakroom never has two people showing the same ticket at the
 > [!tip] Remember
 > Retries are only safe for idempotent operations, so give every retried `POST` one key per logical operation and claim it atomically.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A user taps **Pay ₹499**. The app sends `POST /v1/payments`; the server charges the card at the payment service provider (PSP) and commits the payment.
 
@@ -84,7 +117,7 @@ This is not rare at scale. If 0.1% of payment requests time out at the client af
 
 Retries are the only cure for lost responses, and retries are only safe when the operation is idempotent. The idempotency key turns a non-idempotent `POST` into one whose retries are harmless.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Safe** means "no effect on the server": `GET` just reads.
 - **Idempotent** means "the effect of N identical requests equals the effect of one". Setting a value is idempotent (`balance = 100`); adding to it is not (`balance += 100`).
@@ -93,9 +126,11 @@ An elevator call button is idempotent: press it five times, one elevator comes. 
 
 The idempotency key is a **cloakroom ticket**. The client invents a ticket number for *one logical operation* and shows it on every attempt. The first attempt does the work and pins the result to the ticket; every later attempt with the same ticket gets that same result back.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### HTTP methods (RFC 9110)
+
+**In plain words:** some verbs are repeat-safe by their very meaning (reading, replacing, deleting), and some are not (creating). This table is the official scorecard.
 
 | Method | Safe | Idempotent | Notes |
 | --- | --- | --- | --- |
@@ -118,6 +153,8 @@ Sending the header therefore also tells Go's own client that a `POST` may be res
 
 ### Make it naturally idempotent first
 
+**In plain words:** before building key machinery, try to phrase the operation so repeating it is harmless by design, like "set the value to X" instead of "add X".
+
 Before adding keys, check whether the operation can be idempotent by design:
 
 - **PUT the full state with a client-chosen ID:** `PUT /v1/orders/7f9c…` with a UUID the client generated. A retry writes the same row.
@@ -127,6 +164,8 @@ Before adding keys, check whether the operation can be idempotent by design:
 When none of these fit ("charge this card", "send this SMS", "create a transfer"), use an idempotency key.
 
 ### The Idempotency-Key protocol
+
+**In plain words:** one ticket per payment, not per attempt. The server keeps a small record per ticket: what was asked, whether it is still running, and the answer to replay.
 
 1. The client generates a random key per **logical operation**, not per attempt. The IETF draft recommends a UUID (RFC 9562); Stripe accepts keys up to 255 characters.
 2. It persists the key with the pending operation (so an app restart reuses it), then sends `Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"`. The draft defines the value as a structured-field string, which is why it is quoted; Stripe takes it unquoted.
@@ -177,6 +216,8 @@ sequenceDiagram
 
 ### The check-then-insert race
 
+**In plain words:** "look first, then write" fails when two requests look at the same moment: both see nothing and both do the work. The check and the claim must be one atomic step.
+
 The obvious version, "look the key up; if absent, do the work and save the key", is broken. Two retries arriving together both see "absent":
 
 ```mermaid
@@ -200,6 +241,8 @@ The fix is to make the **check and the claim one atomic statement** on a unique 
 
 ### Lifecycle of a key record
 
+**In plain words:** a key record is born when a request claims it, completes when the answer is saved, gets freed if the attempt crashed, and is deleted after a day.
+
 ```mermaid
 stateDiagram-v2
     [*] --> InProgress: INSERT wins the claim
@@ -211,9 +254,11 @@ stateDiagram-v2
     Expired --> [*]: row deleted, the key would start a new request
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole idea is a map from ticket to saved answer, guarded by a lock.
 
 A map and a lock show the core idea. The full version below adds the production concerns.
 
@@ -244,6 +289,8 @@ func (s *Store) Do(key string, fn func() string) string {
 ```
 
 ### Full version
+
+**In plain words:** real middleware: fingerprint the request, claim the key atomically, replay finished answers, say "busy" while the first try runs, and refuse the same ticket with a different order.
 
 A Go middleware for `POST` and `PATCH`: it fingerprints the request, claims the key atomically, returns `409` while the first attempt runs, `422` for a reused key with a different body, replays completed responses (errors included), releases the key on `5xx`, and fences stale claims. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -608,6 +655,8 @@ func TestStaleClaimIsFenced(t *testing.T) {
 
 ### The same thing in PostgreSQL 17
 
+**In plain words:** the exact SQL the in-memory store imitates: the unique primary key is what makes the claim atomic.
+
 Not executed in this vault; this is the schema and SQL the store above stands in for.
 
 ```sql
@@ -664,7 +713,7 @@ WHERE (scope, key) IN (
 
 If step 4 updates zero rows, another attempt took over the key; do not report success from this attempt.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -675,7 +724,7 @@ If step 4 updates zero rows, another attempt took over the key; do not report su
 | Idempotency key in Redis | `SET idem:{scope}:{key} <hash> NX EX 86400` claims; a second write stores the response | High request rates, effects outside your database | Redis must be durable enough; claim and effect are not atomic together |
 | Idempotent consumer | `processed_events(event_id PRIMARY KEY)` inserted in the effect's transaction | Webhooks and queue consumers with at-least-once delivery | A dedupe table per consumer; see [[Delivery Semantics and Exactly-Once]] |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Every keyed `POST` costs at least two extra writes** (claim and complete) and a stored response body. For a high-volume, naturally idempotent endpoint, use `PUT` or a unique constraint instead.
 - **The key store is now on the critical path.** If it is down, fail closed for money movement (return 503) rather than process without protection.
@@ -683,7 +732,7 @@ If step 4 updates zero rows, another attempt took over the key; do not report su
 - **It protects one hop only.** Your API being idempotent does not stop your worker from charging the PSP twice; each downstream call needs its own key (section 8).
 - **Read-only and naturally idempotent calls do not need it.** Stripe ignores keys on `GET` and `DELETE` because they are idempotent by definition.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Stripe accepts `Idempotency-Key` on every `POST`, keys up to 255 characters, prunes keys once they are at least 24 hours old, compares parameters with the original request, and replays the first result, including `500` errors.
@@ -702,7 +751,7 @@ If step 4 updates zero rows, another attempt took over the key; do not report su
 	- Count and age of `in_progress` rows older than the lock TTL, and takeovers per hour.
 	- Key table size and sweeper lag.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Claim in the same transaction as the effect.** When the effect is purely local (rows in your database), put the claim, the effect and the stored response in **one** transaction:
 
@@ -757,7 +806,7 @@ Brokers and webhook senders deliver at least once, so "exactly-once" processing 
 
 **Where to use it:** payments and refunds, order creation, money transfers, sending emails and SMS, inventory reservations, webhook handlers, and any `POST` a client or gateway may retry.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- `DELETE /orders/7` returns 204, the retry returns 404. Is `DELETE` still idempotent? (trap)
 > Yes. Idempotency is about the server's state, not the response: after one call or two, the order is gone. A client that treats 404 on a retried `DELETE` as success is handling it correctly.
@@ -784,7 +833,7 @@ Brokers and webhook senders deliver at least once, so "exactly-once" processing 
 > [!question]- How long should you keep keys?
 > Longer than any client keeps retrying the same operation; 24 hours is the common choice (Stripe). After expiry the same key starts a new request, so the window is part of the API contract and must be published. Delete in batches or drop daily partitions.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Idempotent = same effect for one or many calls; safe = no effect. `GET`, `PUT`, `DELETE` are idempotent; `POST` and `PATCH` are not.
 - Prefer natural idempotency: `PUT` with client IDs, conditional updates, unique business keys.
@@ -794,7 +843,7 @@ Brokers and webhook senders deliver at least once, so "exactly-once" processing 
 - Store request hash, status, response, `locked_at`, `created_at`; expire after a published window (24 h).
 - Propagate deterministic keys downstream; consumers dedupe on `event_id`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]], [[Timeouts, Retries and Backoff]], [[Transactions and ACID]]
 - **Next:** [[Webhooks - Sending and Receiving]], [[Delivery Semantics and Exactly-Once]], [[Receiving Webhooks Idempotently]] (the Go service side), [[Case Study - Payment System]]

@@ -32,7 +32,39 @@ updated: 2026-11-13
 > - A status column tracks each file from `pending` to `ready`; the server always chooses the storage key.
 > - Classic mistake: trusting the client's filename or declared content type.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A user wants to upload a 2 GB video. The slow, naive way: the file travels through your API server on its way to storage. Your server spends minutes just copying bytes.
+
+```mermaid
+flowchart LR
+    U["User"] -- "2 GB" --> API["API server<br/>(choked)"] -- "2 GB again" --> S[("Storage")]
+```
+
+The better way: the API only gives permission. It hands the user a **presigned URL** — a web address with a built-in signature that allows exactly one upload, for a few minutes. The user sends the file straight to **object storage** (cloud file storage like S3).
+
+```mermaid
+flowchart LR
+    U2["User"] -- "1: may I?" --> API2["API"]
+    API2 -- "2: signed URL" --> U2
+    U2 -- "3: file bytes, direct" --> S2[("S3")]
+    S2 -- "4: 'file arrived' event" --> W["Worker checks it"]
+```
+
+A background worker then opens the file, checks it is really what it claims to be, and marks it ready. Until then, nobody can download it.
+
+The rest of this note is just three questions:
+1. How does the permission slip (presigned URL) work?
+2. How do huge files upload in parts and survive a dropped connection?
+3. How do you make sure an uploaded file is safe before anyone sees it?
+
 
 **The problem in one story.**
 Users upload profile photos and 2 GB videos to your app.
@@ -81,7 +113,7 @@ Where it breaks: a warehouse guard looks at the goods, but storage accepts any b
 > [!tip] Remember
 > The API grants permission and tracks status; the bytes go straight to storage, and nothing is trusted until a worker checks it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A user uploads a 500 MB video through `POST /v1/videos`, and the API server receives the bytes and forwards them to S3.
 
@@ -92,15 +124,17 @@ A user uploads a 500 MB video through `POST /v1/videos`, and the API server rece
 
 Object storage is built for exactly this traffic. The API only has to decide **who may upload what, where, and for how long**.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The API is a **ticket office**, not a loading dock. It checks your identity and quota, writes down "Priya may drop off one PNG, up to 10 MB, at locker `tenants/42/uploads/7Q…`, in the next 15 minutes", and hands you a signed ticket.
 
 You drive to the warehouse (S3) yourself. The warehouse checks the ticket's signature and conditions, accepts the parcel, and rings the office (an event) when it arrives. Only then does a worker open the parcel and inspect it.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Pick the path by size
+
+**In plain words:** small files may ride through the API, medium files get one signed URL, huge files get split into parts. Size decides the route.
 
 ```mermaid
 flowchart LR
@@ -116,6 +150,8 @@ flowchart LR
 AWS suggests considering multipart uploads once an object reaches 100 MB.
 
 ### Presigned PUT vs presigned POST policy
+
+**In plain words:** a presigned PUT is a ticket for one exact parcel (exact size, exact type). A presigned POST signs a small rulebook instead, so it can say "any image up to 10 MB".
 
 A **presigned PUT** is a URL with a SigV4 signature over the method, bucket, key, expiry and a list of **signed headers**. The client must send exactly those header values; anything else fails the signature check.
 
@@ -140,6 +176,8 @@ A **presigned POST** (browser form upload) signs a **policy document** with cond
 Keep both kinds short-lived (5 to 15 minutes is a common choice). A SigV4 presigned URL can live at most 7 days with long-term credentials, and it stops working when the temporary credentials that signed it expire, whatever its `X-Amz-Expires` says.
 
 ### Multipart upload, completion and processing
+
+**In plain words:** a big file is cut into pieces, each piece gets its own signed URL, and pieces upload in parallel. If the network drops, you resend only the missing pieces, never the whole file.
 
 ```mermaid
 sequenceDiagram
@@ -182,6 +220,8 @@ Use both, and make both call the same conditional transition, `UPDATE files SET 
 
 ### File lifecycle
 
+**In plain words:** every file walks a fixed path: pending, uploaded, processing, ready (or expired/failed). Users only ever see "ready" files; everything else is still untrusted.
+
 ```mermaid
 stateDiagram-v2
     [*] --> pending: API issues presigned URL, row inserted
@@ -198,9 +238,11 @@ stateDiagram-v2
 
 Readers only ever see files in `ready`. A download endpoint that serves `pending` or `failed` files serves unvalidated bytes.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the API's whole job in one function: check the size, pick the storage key itself, sign a URL, write a pending row.
 
 The API's whole job for a direct upload, with the storage SDK hidden behind an interface. The full version below adds the production concerns.
 
@@ -238,6 +280,8 @@ const errTooBig = uploadErr("file too large")
 ```
 
 ### Full version
+
+**In plain words:** two real pieces of code: a bounded, suspicious handler for small files (never trust the filename or declared type), and real S3 presigning with tests that need no AWS account.
 
 **Small files through the API.** Avatars and CSV imports of a few MiB can go through the API if the handler bounds the body, ignores the client's filename and declared type, sniffs the real type from the first bytes, and stores under a key the server chooses.
 
@@ -574,7 +618,7 @@ CREATE INDEX files_pending_created ON files (created_at) WHERE status = 'pending
 
 The partial index serves the orphan sweeper: `SELECT id, object_key, upload_id FROM files WHERE status = 'pending' AND created_at < now() - interval '24 hours' LIMIT 500`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -585,7 +629,7 @@ The partial index serves the orphan sweeper: `SELECT id, object_key, upload_id F
 | Resumable protocol (tus, GCS resumable sessions) | Server or storage tracks the byte offset; client resumes from it | Very unreliable networks; uploads that span app restarts | A tus server or vendor-specific API |
 | Temporary credentials (STS) | Client gets scoped, short-lived credentials and uses the SDK directly | Trusted desktop or backend clients doing many uploads | Credentials are broader than one URL; scope them to a prefix |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Direct uploads move validation later.** The API cannot inspect bytes it never sees, so every file is untrusted until the worker marks it `ready`. Products that need an instant "this file is invalid" message either proxy small files or validate on the client and again in the worker.
 - **More moving parts.** Presigning, events, queues, workers and sweepers replace one `POST`. For an internal tool uploading 200 KB files a few times a day, a proxied upload with `MaxBytesReader` is simpler and fine.
@@ -593,7 +637,7 @@ The partial index serves the orphan sweeper: `SELECT id, object_key, upload_id F
 - **CORS is required for browsers.** Direct browser uploads need a CORS rule on the bucket allowing your origin and the `PUT` or `POST` method; see [[CORS and Same-Origin Policy]].
 - **Cost moves, not vanishes.** You stop paying API bandwidth but pay for requests per part, incomplete multipart storage until aborted, and event and queue traffic.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** S3, Google Cloud Storage and Azure Blob Storage all offer signed upload URLs (Azure calls them SAS tokens). Large services serve user content from a separate domain; GitHub's `raw.githubusercontent.com` is the familiar example.
 - **Failure modes → fixes:**
@@ -619,7 +663,7 @@ The partial index serves the orphan sweeper: `SELECT id, object_key, upload_id F
 	- S3 `4xx` on uploads (expired or mismatched signatures) and download `403`/`404` rates.
 	- Average upload size and storage bytes per tenant.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Post-upload validation in the worker.** The worker reads the first bytes with a ranged `GET` (`Range: bytes=0-511` is enough for `http.DetectContentType`) and checks the type against the allow-list, compares `HeadObject` size with the size the API expected, and verifies the checksum.
 
@@ -643,7 +687,7 @@ Parts can be uploaded in any order and in parallel; S3 assembles them by part nu
 
 **Quotas and abuse.** Reserve quota when issuing the URL (expected size), confirm it on `uploaded` (actual size), and release it on `expired`. Rate-limit URL issuance per user, since each URL can create a billable object ([[Rate Limiting - Algorithms and Distributed Design]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not upload every file through the backend?
 > Large uploads hold API connections and memory for minutes, hit proxy and gateway body limits (nginx 1 MiB default, API Gateway 10 MB) and server read timeouts, and double the data transfer. Direct-to-storage uploads let the API authorize while object storage moves the bytes. Small files can still go through the API with `MaxBytesReader`.
@@ -663,7 +707,7 @@ Parts can be uploaded in any order and in parallel; S3 assembles them by part nu
 > [!question]- What can go wrong, and what do you monitor?
 > Orphaned pending rows and incomplete multipart uploads, lost completion calls, duplicate events, spoofed types, malware, public buckets, and worker failures. Monitor the issued-to-ready funnel, pending and processing age, orphan and incomplete-upload counts, queue lag and DLQ depth, scan failures, and upload `4xx` and download `403` rates.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - API authorizes and signs; bytes go client → S3; the worker validates; readers see only `ready`.
 - Presigned PUT pins exact headers (type, length, checksum); presigned POST policy expresses ranges (`content-length-range`, `starts-with`).
@@ -674,7 +718,7 @@ Parts can be uploaded in any order and in parallel; S3 assembles them by part nu
 - Downloads: presigned GET or CDN signed URLs, `Content-Disposition: attachment`, `nosniff`, separate user-content domain.
 - Small files via the API: `http.MaxBytesReader`, `MultipartReader`, `DetectContentType`, server-chosen keys.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[REST and HTTP API Design]], [[AWS 07 - S3]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[File Uploads and Object Storage]] (the Go service implementation), [[Webhooks - Sending and Receiving]] (notifying clients when processing finishes), [[Case Study - File Storage and Sync]]

@@ -24,7 +24,38 @@ updated: 2026-11-13
 > - When a G blocks on a syscall, its M keeps the G but hands the **P** to another M (or a freshly started one), so the P is never idle just because one M is stuck.
 > - Idle Ps **steal** half the runnable Gs from a busy P's queue instead of sitting empty.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (queues, stealing, syscall handoff) and 4-5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your computer has a few CPU cores. Your Go program may have thousands of **goroutines** — tiny tasks that all want to run.
+
+The operating system only runs **threads**, and threads are expensive. So Go does not give every goroutine a thread. It runs thousands of goroutines on a handful of threads, and does the juggling itself. That juggler is the **scheduler**.
+
+```mermaid
+flowchart LR
+    G["10,000 goroutines"] --> S["Go scheduler"]
+    S --> T["~8 OS threads"]
+    T --> C["8 CPU cores"]
+```
+
+The scheduler uses three pieces: G (a goroutine), M (an OS thread), and P (a "work permit" with its own to-do queue — there are exactly as many Ps as CPUs). A thread may only run Go code while holding a permit.
+
+```mermaid
+flowchart LR
+    P1["P: permit + queue of Gs"] --> M1["M: thread"] --> R["runs one G"]
+```
+
+The rest of this note is just four questions:
+1. How do Gs get picked from the queues? (and what is work stealing?)
+2. What happens when a goroutine blocks on a syscall?
+3. What does GOMAXPROCS actually control?
+4. How does Go stop one greedy loop from hogging a CPU? (preemption)
 
 **The problem in one story.**
 A restaurant has 4 cooks but 10,000 orders.
@@ -67,7 +98,7 @@ Where it breaks: if a cook goes to the store (a blocking syscall), the station i
 > [!tip] Remember
 > Many Gs, few Ms, exactly `GOMAXPROCS` Ps; a G runs only when an M holds a P.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A server handling 50,000 concurrent connections cannot give each one an OS thread: each thread needs a multi-KB-to-MB stack and costs microseconds to context-switch, and the kernel scheduler knows nothing about which threads are "really" blocked on a channel versus a socket.
 
@@ -77,7 +108,7 @@ Go instead starts a goroutine for a 2 KB stack and schedules **M goroutines onto
 
 A Go process on an 8-core machine typically runs with 8 OS threads actively executing Go code (`GOMAXPROCS = 8`) no matter whether it has 10 goroutines or 500,000 of them.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a kitchen with a fixed number of chef's stations (**P**, one per CPU core) and a pool of chefs (**M**, OS threads) that can stand at a station. Orders (**G**, goroutines) pile up in a queue in front of each station.
 
@@ -85,9 +116,11 @@ A chef at a station cooks one order at a time from that station's queue; when a 
 
 A chef with an empty queue walks over and grabs half the orders waiting at a busy station instead of standing around.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The three objects
+
+**In plain words:** meet the three players — G is an order ticket, M is a cook, P is a cooking station. Cooking only happens when a cook stands at a station holding a ticket.
 
 | Object | What it is | How many exist |
 | --- | --- | --- |
@@ -123,6 +156,8 @@ flowchart TB
 
 ### Local and global run queues
 
+**In plain words:** each station keeps its own short ticket pile (fast, no fighting over it), and there is one shared overflow pile checked now and then so nothing waits forever.
+
 Each P owns a **local run queue**: a fixed 256-slot ring buffer plus one `runnext` slot that holds the single G most likely to run next (usually the goroutine a `chan` send or `go` statement just made runnable, so it gets cache-warm, low-latency scheduling). An M looks in this order when picking a G to run:
 
 1. Its P's `runnext`, then its P's local queue.
@@ -151,6 +186,8 @@ sequenceDiagram
 An M that finds no work anywhere enters a brief **spinning** state (looking without parking, to avoid the latency of a wake-up) before parking on a semaphore. The runtime limits the number of spinning Ms to roughly half the number of busy Ps, not the full `GOMAXPROCS`, to avoid burning CPU looking for work that isn't there when parallelism is low relative to a high `GOMAXPROCS`.
 
 ### Blocking syscall handoff
+
+**In plain words:** when a cook gets stuck waiting on the kernel, their station is handed to another cook immediately — the stuck cook keeps only their one ticket.
 
 A goroutine calling a blocking syscall (reading a regular file, `exec`-ing a subprocess, cgo) parks its M inside the kernel for the syscall's duration. If the scheduler did nothing else, that P would sit idle for however long the syscall takes.
 
@@ -187,6 +224,8 @@ Whatever unblocks it (`ch <- v`, `Unlock`, an epoll event) calls `goready`, whic
 
 ### GOMAXPROCS
 
+**In plain words:** GOMAXPROCS is simply how many stations exist — how many goroutines can run Go code at the same instant. More stations than CPU cores just means cooks bumping into each other.
+
 `runtime.GOMAXPROCS(n)` sets the P count; `runtime.GOMAXPROCS(0)` reads it without changing it. It defaults to `runtime.NumCPU()`, the number of logical CPUs the OS reports. Inside a Linux container with a CPU quota (a Kubernetes `resources.limits.cpu: "2"`), `NumCPU()` historically reported the **host's** core count, not the quota, so a pod limited to 2 CPUs would see `GOMAXPROCS=32` on a 32-core node, over-schedule, and burn its quota as throttling instead of throughput.
 
 Uber's `automaxprocs` library fixed this by reading the cgroup quota and calling `runtime.GOMAXPROCS` at startup. **Since Go 1.25**, the runtime does this itself: `GOMAXPROCS` is derived from the cgroup CPU limit automatically and is updated at runtime if the limit changes, making `automaxprocs` unnecessary on 1.25+ (verify: confirm this on your exact container runtime before dropping the library from an existing service).
@@ -194,6 +233,8 @@ Uber's `automaxprocs` library fixed this by reading the cgroup quota and calling
 Raising `GOMAXPROCS` above the core count does not add real parallelism; it adds more Ps than cores, so Ms fight over the same CPUs and context-switch more, which helps only if goroutines spend real time blocked on something the scheduler doesn't already handle for you (rare, since locks/channels/network already yield the P).
 
 ### Preemption
+
+**In plain words:** since Go 1.14 the runtime can tap a long-running goroutine on the shoulder (~every 10 ms) and force it to yield, so a greedy loop can no longer freeze everyone else.
 
 Early Go (pre-1.14) was **cooperatively** scheduled: a goroutine only yielded at specific points — a function call prologue, a channel operation, an allocation. A goroutine running a tight loop with no function calls (`for { x++ }`) could hold its P and starve every other goroutine on it, including the garbage collector's stop-the-world phase, indefinitely.
 
@@ -221,7 +262,7 @@ SCHED 51ms: gomaxprocs=2 idleprocs=2 threads=22 spinningthreads=0 needspinning=0
 
 Add `scheddetail=1` for a per-P, per-M breakdown (status, what each P/M/G is doing); use it sparingly, it's verbose. `go tool trace` ([[Benchmarks, Profiling and Tracing]]) draws the same information as a per-P timeline you can zoom into, which reads far more easily than a schedtrace log for anything beyond "is the thread count sane".
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -320,7 +361,7 @@ func main() {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Model | How scheduling works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -329,14 +370,14 @@ func main() {
 | Single-threaded event loop (Node.js, Python `asyncio`) | One thread runs an event loop; "concurrency" is callback/coroutine interleaving, no parallelism without extra processes | I/O-bound work where you accept no CPU parallelism in one process | A single slow callback blocks everything; needs clustering for multi-core |
 | Green threads / virtual threads (Java 21+, Erlang processes) | M:N like Go's, scheduled in-language or VM-managed | Same niche as Go's model, different language ecosystem | Similar trade-offs; maturity and tooling vary by platform |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🔴
 
 - The scheduler is **not real-time**: a goroutine can wait a few milliseconds for a P even when "ready", so Go is a poor fit for hard-deadline control loops.
 - `GOMAXPROCS` is about **Go-code parallelism**, not I/O concurrency — raising it doesn't let you handle more concurrent connections; goroutine count and channel/queue design do that.
 - Blocking syscalls (not network I/O) scale the thread count linearly with concurrently blocked calls; thousands of concurrent `exec.Command` calls or blocking cgo can create thousands of OS threads and hit `debug.SetMaxThreads` (default 10,000), which crashes the process. Bound that concurrency with a semaphore.
 - If your workload is purely CPU-bound batch computation with no I/O and no concurrency requirement at all, a single goroutine with no scheduling overhead is simpler and exactly as fast.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every Go network service (Kubernetes's own control plane, Docker's dockerd, Prometheus, CockroachDB's Go layer, most gRPC services) runs on this scheduler without any application code touching it directly; `automaxprocs` (used by countless containerized Go services pre-1.25) exists purely to correct `GOMAXPROCS` for cgroup limits.
 - **Failure modes → fixes:**
@@ -346,7 +387,7 @@ func main() {
   - Oversized worker pools for CPU-bound work (e.g. `100 * NumCPU` goroutines doing matrix math) → more context switching, no more throughput; size to `GOMAXPROCS`.
 - **What to monitor:** `runtime.NumGoroutine()` (a steadily rising count across requests is a goroutine leak), the scheduling-latency runtime metric (`/sched/latencies:seconds` via `runtime/metrics`), and GC pause and CPU-throttling metrics in containers.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **`runnext` and anti-starvation.** The single `runnext` slot gives a just-woken goroutine (a channel receiver, say) a chance to run on the same P with low latency and no queue traversal — valuable for request/response-shaped code. But a P that only ever serves its own `runnext` could in principle starve the global queue, which is exactly why the scheduler forces a global-queue check every 61 ticks regardless of local queue state.
 - **Why stealing takes half, not one.** Taking a single G at a time from a victim would need many steal operations to rebalance a lopsided load and would thrash the victim's queue under contention; taking half amortizes the cost of the (lock-protected) steal operation across more rebalanced work.
@@ -354,7 +395,7 @@ func main() {
 - **cgo and `LockOSThread`.** A goroutine that calls into C via cgo pins its G to its M for the duration (C stacks and TLS assume a fixed OS thread), so a blocking C call behaves like a blocking syscall for scheduling purposes — the P is handed off, but the specific M is now unavailable for other Gs until the C call returns. `runtime.LockOSThread` does the same deliberately, for cases like `setns` or thread-local GPU contexts that require a fixed OS thread.
 - **Why this matters for pool sizing.** `database/sql`'s connection pool, HTTP client transports, and custom worker pools all implicitly answer "how many things run at once" — but that number should track the *actual* bottleneck (CPU cores for CPU work, a downstream service's capacity for I/O work), not an arbitrary constant, and GMP is why those two kinds of limits are different numbers in Go.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What do G, M, and P each stand for, and which one is the scarce resource?
 > G = goroutine, M = OS thread, P = processor (a scheduling context holding a local run queue and letting an M run Go code). P is the scarce, fixed resource — there are exactly `GOMAXPROCS` of them. Ms and Gs can both be created far more freely.
@@ -377,7 +418,7 @@ func main() {
 > [!question]- What's wrong with starting 10,000 goroutines that each call a slow external binary via `os/exec`?
 > Each concurrently blocked `exec.Command` needs its own OS thread (a real blocking syscall, not network I/O), so this can spin up thousands of Ms and risks hitting `debug.SetMaxThreads` (10,000 by default), which crashes the process. Bound the concurrency with a semaphore or a fixed-size worker pool instead.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - G = goroutine, M = OS thread, P = scheduling context; only `GOMAXPROCS` Ps exist, and only an M holding a P runs Go code.
 - Local run queue (256 slots + `runnext`) per P; global queue for overflow and fairness (checked every 61 ticks); idle Ps steal half a busy P's queue.

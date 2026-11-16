@@ -24,7 +24,40 @@ updated: 2026-11-13
 > - Bound every unbounded concurrency source — a worker pool, a semaphore, `errgroup.SetLimit` — so load has a ceiling.
 > - Cancellation is a tree: a parent `context` cancelling must reach every goroutine it started, almost always through a `case <-ctx.Done()`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (select semantics and the patterns) and 4 (worked example).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+In Go, pieces of your program can run at the same time (**goroutines**) and pass values to each other through pipes (**channels**). Normally, reading from a pipe means waiting at that one pipe.
+
+`select` is how one goroutine watches *several* pipes at once and reacts to whichever delivers first.
+
+```mermaid
+flowchart LR
+    A["service A's pipe"] --> S{"select"}
+    B["service B's pipe"] --> S
+    T["1-second clock"] --> S
+    S --> W["run whichever<br/>is ready first"]
+```
+
+If two pipes are ready at the same moment, Go picks one at random — nobody gets permanently skipped. Add a `default` case and `select` stops waiting at all: "nothing ready? fine, do this instead."
+
+```mermaid
+flowchart LR
+    S{"select with default"} -- "a pipe is ready" --> C["handle it"]
+    S -- "nothing ready" --> D["default: don't wait"]
+```
+
+Everything bigger in this note — timeouts, worker pools, pipelines — is just this one tool arranged in patterns. The rest of this note is just these 4 questions:
+1. How does `select` decide what runs (blocking, default, nil channels, timeouts)?
+2. What are the standard team shapes — pipeline, fan-out/fan-in, worker pool?
+3. How do you put a ceiling on "how many at once" (semaphores, errgroup)?
+4. How do you stop everything cleanly without leaks or panics?
 
 **The problem in one story.**
 You call two slow services and want whichever answers first, but you will not wait more than one second.
@@ -66,7 +99,7 @@ Where it breaks: a waiter can serve several tables in a row, but one `select` ha
 > [!tip] Remember
 > `select` waits on many channel operations and runs one ready case; `default` makes it non-blocking; always bound concurrency and listen on `ctx.Done()`.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A request handler that calls three downstream services wants to run them in parallel, give up with a clear error if one takes too long, and stop the other two immediately so they do not keep burning CPU and connections after the client has already gotten a timeout response.
 
@@ -74,7 +107,7 @@ Doing this with plain channels alone needs a way to wait on "whichever happens f
 
 That is exactly what `select` is for, and on top of it sit a small number of patterns — pipeline, worker pool, fan-out/fan-in, bounded parallelism — that keep reappearing because they solve the same shape of problem: process many things concurrently, but with a ceiling on how many run at once and a clean way to stop early.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 `select` is a **receptionist watching several phone lines at once**. The moment any line rings, she picks it up (if two ring in the same instant, she picks one of them at random — it is not "first line wins").
 
@@ -82,9 +115,11 @@ A `default` case means "if no line is ringing right now, don't wait — go do so
 
 The patterns below are all team structures built from that one primitive: a pipeline is workers in a row, each handing finished work to the next; a worker pool is many workers pulling from one shared queue; fan-out/fan-in is splitting work out to several workers and merging their results back into one stream.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### `select` semantics
+
+**In plain words:** one statement, four behaviors — wait on everything, send or receive, bail out on cancel, and (with `default`) never wait at all.
 
 ```go
 select {
@@ -144,6 +179,8 @@ func worker(ctx context.Context, jobs <-chan Job) {
 ```
 
 ### Pipelines
+
+**In plain words:** a pipeline is an assembly line — each station takes parts from the belt behind it, does one job, and puts the result on the belt in front; pull the plug (cancel) and every station downs tools.
 
 A pipeline is a chain of stages, each a function that takes an input channel and returns an output channel. Each stage is the **owner** of the channel it returns (see the ownership pattern in [[Goroutines and Channels]]): it alone writes to that channel and closes it once its own input is exhausted or cancelled.
 
@@ -230,6 +267,8 @@ func FanOutFanIn(ctx context.Context, in <-chan int, workers int, f func(int) in
 
 ### Worker pool with a bounded queue
 
+**In plain words:** a fixed crew of workers and an inbox with limited slots — when the inbox is full, new work is refused on the spot instead of piling up, which is what "backpressure" means.
+
 A fixed number of long-lived worker goroutines pull from one bounded job queue. Unlike an unbounded "one goroutine per job" fan-out, the number of concurrently running jobs is capped at `workers`, and the queue itself is capped so a burst of submissions cannot grow memory without limit.
 
 ```mermaid
@@ -307,6 +346,8 @@ func BoundedChanSemaphore(ctx context.Context, items []int, n int, work func(int
 
 ### `errgroup`: cancel-on-first-error fan-out
 
+**In plain words:** send out a team of runners and, the moment one trips, blow the whistle so the rest stop running too — `errgroup` is that whistle plus the first error's report.
+
 ```go
 func FetchAll(ctx context.Context, ids []string, maxInFlight int64, fetch func(context.Context, string) error) error {
     g, gctx := errgroup.WithContext(ctx)
@@ -347,6 +388,8 @@ sequenceDiagram
 
 ### Request coalescing: `singleflight`
 
+**In plain words:** when fifty people ask the same question at once, send one person to find the answer and have the other forty-nine wait for it, instead of fifty trips.
+
 `singleflight.Group.Do(key, fn)` collapses concurrent calls that share the same key into a single execution of `fn`; every caller waiting on that key gets the same result once it completes. This is the standard fix for a **cache stampede**: when a hot cache key expires, dozens of concurrent requests would otherwise all miss at once and all hit the database for the same row — `singleflight` makes exactly one of them do the work.
 
 ### Rate limiting: `time.Ticker` vs. `x/time/rate`
@@ -367,7 +410,7 @@ Shutting down a pipeline or a worker pool correctly follows one order: stop acce
 
 Doing these out of order — for example, closing a shared resource before every goroutine using it has actually stopped — is a frequent source of "panic: send on closed channel" or "use of closed connection" errors during deploys.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -579,7 +622,7 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 
 **Measured:** `go vet ./...` clean; `go test -race -v ./...` — `ok example.com/selectpatterns 1.192s`, both tests passed (Go 1.24.4, `golang.org/x/sync` v0.10.0, Apple Silicon, 2026-11-07).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Pattern | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -593,7 +636,7 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 | `time.Ticker` | Fires at a fixed interval, channel buffers 1 | "Roughly every N seconds", tolerant of a dropped tick | No burst allowance; drops ticks if the consumer falls behind |
 | `x/time/rate.Limiter` | Token bucket with configurable burst | "At most R per second, bursts of B allowed" | Per-process only; needs a shared store (Redis) across instances |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A worker pool adds a queue, a shutdown path, and backpressure decisions that a simple `errgroup` with `SetLimit` does not need — reach for the pool only when work genuinely outlives a single request (background jobs), not for "run these 5 calls in parallel and wait."
 - Picking a queue size or a worker count by guesswork just moves the saturation point without fixing it; size pools to the resource they protect (a CPU-bound pool to `GOMAXPROCS`, an I/O-bound pool to what the downstream dependency can sustain), and measure under load.
@@ -601,7 +644,7 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 - `singleflight` trades "many calls" for "a few callers wait longer than they would have alone" — one slow load now blocks every concurrent caller for that key, not just the one that triggered it. It is a good trade for a cache miss storm, a bad one if the load is itself sometimes very slow.
 - For a one-off "run these three things in parallel and collect results," three goroutines and a `sync.WaitGroup` (or three buffered channels) is simpler and clearer than reaching for a pipeline or a pool.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `errgroup` fanning out parallel backend calls behind one HTTP handler; worker pools processing webhook deliveries or outbound notifications with a bounded concurrency ceiling; `singleflight` protecting a database from a stampede when a popular cache key expires; `x/time/rate` throttling calls to a third-party API with a published rate limit.
 - **Failure modes → fixes:**
@@ -611,7 +654,7 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
   - A cache-expiry spike triggers thousands of identical database queries → add `singleflight` keyed on the cache key.
 - **What to monitor:** worker pool queue depth and the `ErrQueueFull` rate; `errgroup` task duration and failure rate; `x/time/rate.Limiter` rejection rate (`Allow()` returning false); goroutine count around each pattern (a pipeline or pool that is not draining shows up as a steady climb).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `select`'s choice among ready cases is random, not first-listed.** If it instead always preferred the first case in source order, a producer that keeps one channel slightly busier than another would starve the second case indefinitely under load. Uniform random choice among ready cases gives every ready case a fair chance each time through the loop, which avoids that starvation.
 - **The buffered-channel semaphore is a capacity-N happens-before edge, not just a counter.** Acquiring a token via `tokens <- struct{}{}` and releasing via `<-tokens` relies on the same channel happens-before guarantees as any other channel use (see [[Goroutines and Channels]] and [[Memory Model and Data Races]]): whatever the releasing goroutine wrote before its receive is visible to the goroutine whose send then succeeds.
@@ -619,7 +662,7 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 - **`singleflight`'s shared-result guarantee is per-group, not per-process-wide unless you share one `Group`.** Two different `singleflight.Group` values (for example, accidentally constructed per-request instead of once at startup) never deduplicate against each other — the whole benefit depends on one long-lived `Group` being shared by every caller.
 - **`time.Ticker` vs. a self-resetting `time.Timer`:** a `Ticker` is appropriate for "fire every interval forever," but if the work done on each tick can itself take longer than the interval, ticks queue up to exactly one pending tick (the channel has capacity 1) and then silently drop — a `for { ...; timer.Reset(interval) }` loop that resets only after the previous tick's work finished avoids overlapping runs entirely, at the cost of drifting slightly off a perfectly fixed schedule.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- `select` has three channels ready at the same instant. Which case runs?
 > One of them, chosen uniformly at random — not the first one written in source order, and not based on which channel has more buffered data. This avoids one channel's producer starving another's under sustained load.
@@ -646,7 +689,7 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 >
 > The fix is `go func() { wg.Wait(); close(out) }()` running independently of the goroutine that ranges over `out`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `select` blocks until some case is ready, then picks one at random among ready cases; `default` makes it non-blocking.
 - A nil channel's `select` case never fires — use it to disable exactly one arm at runtime.
@@ -657,7 +700,7 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 - `errgroup.WithContext` cancels on the first error, but every goroutine must itself check that derived context for cancellation to actually stop its work.
 - `singleflight` fixes cache stampedes; `x/time/rate` fixes "too many calls per second"; they solve different problems.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Goroutines and Channels]]
 - **Next:** [[sync Primitives and Atomics]], [[Context Package]]

@@ -24,7 +24,35 @@ updated: 2026-11-13
 > - A crash before `fsync` can lose data that `write()` already "succeeded" on — this is the single most common cause of "but I thought I saved it".
 > - Databases fsync their write-ahead log on every commit for exactly this reason: it is the only durability guarantee the OS gives you.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Disks are slow, so the operating system cheats. When your program "writes a file", the data usually goes into fast memory first — a waiting room called the **page cache** — and the OS writes it to the real disk later.
+
+```mermaid
+flowchart LR
+    P["Your program<br/>writes data"] --> C["Page cache<br/>(in RAM, fast)"]
+    C -. "later, in the background" .-> D["Disk (slow)"]
+```
+
+This makes everything feel fast. But there is a catch: if the power dies before the background write happens, that data is gone — even though your program was told the write "succeeded". The fix is **fsync**, a call that says "do not come back until this is truly on disk".
+
+```mermaid
+flowchart LR
+    W["write()"] --> OK1["fast, but maybe<br/>only in RAM"]
+    F["fsync()"] --> OK2["slow, but truly<br/>on the disk"]
+```
+
+The rest of this note is just three questions:
+1. How does the page cache make reads and writes fast?
+2. When exactly can you lose data, and what does fsync really promise?
+3. How do databases and Go programs use this correctly?
 
 **The problem in one story.**
 You type a long essay and press Save. The app says "Saved!" instantly.
@@ -69,7 +97,7 @@ Where it breaks: a real tray does not vanish in a fire before pickup without any
 > [!tip] Remember
 > `write()` puts your data in RAM; only `fsync()` puts it safely on disk.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say a Go service calls `file.Write([]byte("order #4471 confirmed"))` and the call returns with no error. Did that data reach the disk?
 
@@ -91,7 +119,7 @@ That is a reasonable trade for most files. It is not acceptable for a bank's led
 > [!tip] Remember
 > A successful `write()` means "the kernel has your bytes," not "your bytes are on disk." Only `fsync` (or an equivalent explicit flush) closes that gap.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the page cache as RAM standing in front of every file on the system, the same way a CPU cache stands in front of RAM (see [[Memory Hierarchy and CPU Caches]]):
 
@@ -106,7 +134,7 @@ The analogy to a CPU cache breaks down here — a CPU cache has a hard capacity 
 
 `free -h`'s "available" column already accounts for this — a high "used" number that is mostly page cache is not a sign your machine is low on memory.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
 
@@ -273,7 +301,7 @@ flowchart LR
 > [!tip] Remember
 > `fsync` cost is not a fixed constant — it ranges from under a millisecond on local NVMe with power-loss protection to several milliseconds or more on network-backed cloud storage, so always measure on the target storage tier.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -299,7 +327,7 @@ A `write()` with no `fsync` costs **under 1 µs** — it's a `memcpy` into RAM.
 
 That three-to-four-orders-of-magnitude gap is why `synchronous_commit = off` (deferring the fsync) is sometimes used in PostgreSQL for throughput, accepting that the last fraction of a second of commits can be lost on a crash.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -309,14 +337,14 @@ That three-to-four-orders-of-magnitude gap is why `synchronous_commit = off` (de
 | `O_DIRECT` | Bypasses the page cache entirely | A database or storage engine with its own buffer pool | No kernel readahead/caching; needs aligned I/O; still needs `fsync`/`fdatasync` for durability unless the device write cache is also disabled |
 | `msync` on an `mmap`'d file | Flushes dirty pages of a memory-mapped file | Memory-mapped storage engines (some LMDB configurations) | Similar cost to `fsync`, different API |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `fsync` is a per-call latency tax. Calling it on every log line in a hot path will make your service's p99 look like your disk's `fsync` latency, not your CPU's.
 - Batching commits (group commit: collect several transactions, `fsync` once) trades a little added latency per transaction for much higher throughput — PostgreSQL does this automatically for concurrent commits.
 - `O_DIRECT` only pays off once you have your own cache to replace the page cache with; using it for simple sequential log writing just removes a free layer of buffering for no benefit.
 - Skipping `fsync` entirely is fine for data you can regenerate or afford to lose up to the last flush interval (metrics batches, caches you'd rebuild anyway).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** PostgreSQL and MySQL/InnoDB `fsync`/`fdatasync` their WAL/redo log on commit.
 	- Kafka relies on the OS page cache for its hot read/write path and only optionally forces flushes (`flush.messages`), leaning on replication for durability instead.
@@ -328,7 +356,7 @@ That three-to-four-orders-of-magnitude gap is why `synchronous_commit = off` (de
 	- "Disk is full" surprises from a huge page cache → page cache is reclaimable and shown separately from "used" memory in modern `free`; the real culprit is usually dirty pages that can't be written back fast enough (`vm.dirty_bytes` tuning) or an actual full file system (`df`, not `free`).
 - **What to monitor:** `fsync` latency (histogram, not just average — tail latency is what callers feel), the dirty page ratio (`/proc/meminfo`'s `Dirty` and `Writeback`), WAL write/fsync rate, and journal commit latency on the underlying file system.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Write-back vs write-through caching, at the OS level.** The page cache is write-back by default: writes land in RAM and are flushed later. This is the same policy choice as a CPU or application cache (see [[Memory Hierarchy and CPU Caches]] and [[Cache Eviction Policies - LRU, LFU, TTL]]) — faster writes, a durability window you must close explicitly if you need it.
 - **Read-ahead.** On sequential access the kernel speculatively reads the next several pages into the cache before you ask for them, which is why a sequential scan of a cold 10 GB file is often faster per byte than random reads of the same file — it isn't really "cold" for long.
@@ -336,7 +364,7 @@ That three-to-four-orders-of-magnitude gap is why `synchronous_commit = off` (de
 - **Write amplification through the page cache.** Even a 4-byte `write()` dirties an entire 4 KB page, and ext4's journal can double-write that page's metadata (once to the journal, once in place). Combined with the SSD's own internal write amplification (see [[Storage Devices - HDD, SSD, NVMe]]), a small logical write can become a much larger physical one.
 - **`dirty_ratio` and the stampede it can cause.** If writers produce dirty pages faster than the flusher can drain them, the kernel starts throttling — even blocking — writing processes once dirty memory crosses `vm.dirty_ratio` (percentage of RAM), to stop an unbounded crash-loss window from growing. A sudden burst of synchronous writes after a long quiet period is the classic trigger.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- If `write()` returned successfully, is my data safe on disk?
 > No. It is safe in the page cache, which is RAM. It survives a process crash (another process can still read it) but not a power loss or kernel panic until the dirty page is actually flushed, which `fsync` forces and the background flusher does lazily.
@@ -357,7 +385,7 @@ That three-to-four-orders-of-magnitude gap is why `synchronous_commit = off` (de
 > [!question]- Your service's p99 latency jumped after you added `fsync()` per request to "be safe". What's the fix?
 > Group/batch commits: collect writes from a short window (or from concurrently pending callers) and `fsync` once for the batch, then acknowledge all of them. This trades a small amount of added latency for far higher throughput, which is exactly what PostgreSQL's commit grouping and most production WAL implementations do.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `write()` goes to RAM (the page cache) first; the disk write happens later, in the background.
 - `fsync` blocks until this file's dirty data and metadata are really on disk; `fdatasync` skips non-essential metadata.

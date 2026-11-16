@@ -28,7 +28,36 @@ updated: 2026-11-13
 > - IOPS × block size = throughput. A device can be throughput-bound (big sequential transfers) or IOPS-bound (small random transfers) depending on the workload.
 > - Durability on commit depends on `fsync` actually reaching persistent media, not just the OS's page cache.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Permanent storage comes in two main kinds. An **HDD** (hard disk drive) is a spinning magnetic platter with a moving arm — like a record player. Reading data means physically moving the arm and waiting for the platter to spin around, which takes milliseconds.
+
+An **SSD** (solid-state drive) has no moving parts at all — it stores bits in flash chips, so a read takes microseconds, roughly 100 times quicker.
+
+```mermaid
+flowchart LR
+    H["HDD: spinning disk + arm<br/>~ms per seek"] ~~~ S["SSD: flash chips, no moving parts<br/>~tens of us"]
+```
+
+**NVMe** is not a device, it is a faster road: a protocol that lets an SSD talk to the CPU directly over PCIe lanes instead of the old disk cable (SATA).
+
+```mermaid
+flowchart LR
+    SSD["Same SSD chips"] -- "SATA: old, narrow road" --> C1["~550 MB/s cap"]
+    SSD -- "NVMe over PCIe: highway" --> C2["several GB/s"]
+```
+
+The rest of this note is just three questions:
+1. How do HDDs and SSDs physically store and find bits?
+2. Why do SSDs have weird rules (erase blocks, write amplification, wear)?
+3. Which device for which workload, and what numbers should you remember?
 
 **The problem in one story.**
 Your service saves an order, replies "payment confirmed", and then the server loses power.
@@ -73,7 +102,7 @@ Where it breaks: SSD "mailboxes" can't be overwritten in place; a whole block mu
 > [!tip] Remember
 > HDDs pay for moving parts, SSDs pay for erasing blocks, NVMe removes the interface bottleneck, and nothing is durable until `fsync` says so.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A backend service writes an order to a database, a log line to disk, or a container image to a volume. All of it has to live somewhere after the process exits and the machine reboots.
 
@@ -90,7 +119,7 @@ Picking the wrong device class for the access pattern is one of the most common 
 > [!tip] Remember
 > Storage exists because RAM forgets. The device you choose is really a bet about your access pattern: sequential and cold data tolerates slow, cheap devices; random and hot data does not.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### The record player and the whiteboard
 
@@ -119,7 +148,7 @@ NVMe does not change either whiteboard or record player — it only changes how 
 > [!warning] Common mistake
 > Treating "SSD" and "NVMe" as synonyms. SSD describes the storage medium (NAND flash); NVMe describes the command protocol used to talk to it. A SATA SSD and an NVMe SSD can use identical flash chips — the difference is entirely in how many requests the CPU can have outstanding at once.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### HDD mechanics: three costs, paid every random access
 
@@ -209,7 +238,7 @@ flowchart TB
 
 **Why it matters:** A single queue of depth 32 becomes the bottleneck long before the flash chips themselves run out of parallelism. NVMe's many deep queues let the OS spread I/O across CPU cores so that no single queue, and no single core, becomes the choke point — matching how parallel the flash itself actually is internally.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -250,7 +279,7 @@ sequenceDiagram
 
 Runnable Go version: [[Storage Devices - HDD, SSD, NVMe - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Device | Mechanism | Typical latency | Typical throughput | Cost per GB | Use when |
 | --- | --- | --- | --- | --- | --- |
@@ -291,7 +320,7 @@ flowchart TB
 > [!tip] Remember
 > RAID 0 has zero redundancy and is not a backup strategy; RAID 1/10 trade capacity for simple, fast redundancy; RAID 5/6 trade write latency for cheaper redundancy.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - NVMe is not simply "a fast SSD" — it is a different command protocol. A SATA SSD cannot be made NVMe-fast just by changing drivers; the queue depth limit is architectural, built into the hardware.
 - Local NVMe instance storage (e.g. EC2 instance store) is often faster and cheaper per IOPS than network-attached EBS, but it is ephemeral: data is lost if the instance stops. Use it for scratch space or data you can rebuild, never the system of record.
@@ -299,7 +328,7 @@ flowchart TB
 - RAID 0 (striping) is not a backup: it has no redundancy, and a single disk failure loses everything. RAID 1 (mirroring) and RAID 10 (striped mirrors) add redundancy at the cost of usable capacity; RAID 5/6 use parity instead, trading a slower, CPU-heavier write path for less capacity overhead.
 - Choosing per data type: a database's primary data and WAL benefit most from low-latency NVMe; application logs are sequential and can tolerate HDD or object storage; backups want the cheapest durable tier (often object storage, not block storage at all).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Cloud block storage: AWS EBS (gp3 general purpose, io2 provisioned IOPS), all backed by NVMe SSDs behind a network layer.
@@ -317,7 +346,7 @@ flowchart TB
 	- SSD wear indicators: percentage of rated write endurance used, and SMART/NVMe SMART-log attributes.
 	- Queue depth and `iostat`'s `%util` / `await` to see whether the device itself, not the application, is the bottleneck.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Write amplification factor (WAF)** is formally `(host writes + GC writes) / host writes`. It is driven by three things: how full the drive is (less spare capacity means GC must reclaim blocks with more live data), how skewed the write pattern is (hot LBAs rewritten often vs. spread evenly), and whether TRIM is in use (deleted data the FTL doesn't know about gets uselessly copied forward).
 - **Power-loss protection:** enterprise SSDs include capacitors that hold enough charge to flush the device's internal write cache to NAND on sudden power loss. Consumer SSDs often lack this, meaning an `fsync` that the OS believes succeeded can still lose data if the device's own cache hadn't landed on flash yet — a real source of "the database said it committed, but the data is gone after a crash" bugs.
@@ -347,7 +376,7 @@ Any layer that lies about having persisted data (a RAID controller with a non-ba
 - **Block vs. file vs. object storage** are different abstractions over the same physical devices: block storage (EBS) exposes raw addressable blocks that the OS formats with its own filesystem; file storage (EFS) exposes a shared hierarchical namespace over NFS; object storage (S3) exposes flat key → blob access over HTTP with no partial-update semantics — you replace a whole object, you don't seek into it and overwrite bytes.
 - **USB drives and SD cards** use the same NAND flash as SSDs but pair it with much simpler, cheaper controllers: thinner wear leveling, little or no over-provisioning, and no power-loss protection — which is why they are reliable for file transfer but a poor choice for a database or anything needing write durability guarantees under power loss.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is sequential I/O so much faster than random I/O on an HDD, but the gap is much smaller on an SSD?
 > On an HDD, each random access costs a full seek (moving the arm) plus rotational latency (waiting for the sector to rotate under the head) — several milliseconds of pure mechanical delay regardless of how little data is transferred. Sequential access does one seek for a whole run of data.
@@ -384,7 +413,7 @@ Any layer that lies about having persisted data (a RAID controller with a non-ba
 >
 > RAID 10 (striped mirrors) just writes to two disks directly with no parity computation, so write latency and throughput are much better for that workload — at the cost of needing twice the raw capacity instead of just one extra parity disk.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - HDD: seek (~5–10 ms) + rotational latency (~4.2 ms avg at 7200 rpm) dominate random access; sequential is cheap. Still wins on $/GB for cold, sequential data.
 - SSD: NAND pages are written freely but erased only a whole block at a time; the FTL never overwrites in place, so garbage collection must copy live pages before erasing — that copy cost is write amplification.
